@@ -389,5 +389,16 @@
   "Choose file…": "选择文件…",
   "Loading the gallery…": "正在加载图库…",
   "The gallery is unavailable": "图库不可用",
-  "Show more": "显示更多"
+  "Show more": "显示更多",
+  "Toggle recent session": "切换到最近会话",
+  "Find in timeline…": "在时间线中查找…",
+  "Previous match": "上一个匹配",
+  "Next match": "下一个匹配",
+  "Close search": "关闭搜索",
+  "Copied code to clipboard": "已复制到剪贴板",
+  "Reverted file changes": "已放弃文件修改",
+  "Terminal switched to session folder": "终端已切换到会话目录",
+  "Sync CWD": "定位目录",
+  "Center": "居中",
+  "Dock right": "靠右"
 }

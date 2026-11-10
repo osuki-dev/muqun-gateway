@@ -389,5 +389,16 @@
   "Choose file…": "選擇檔案…",
   "Loading the gallery…": "正在載入圖庫…",
   "The gallery is unavailable": "圖庫無法使用",
-  "Show more": "顯示更多"
+  "Show more": "顯示更多",
+  "Toggle recent session": "切換到最近工作階段",
+  "Find in timeline…": "在時間軸中尋找…",
+  "Previous match": "上一個相符項目",
+  "Next match": "下一個相符項目",
+  "Close search": "關閉搜尋",
+  "Copied code to clipboard": "已複製到剪貼簿",
+  "Reverted file changes": "已放棄檔案修改",
+  "Terminal switched to session folder": "終端機已切換到工作階段資料夾",
+  "Sync CWD": "定位資料夾",
+  "Center": "置中",
+  "Dock right": "靠右"
 }

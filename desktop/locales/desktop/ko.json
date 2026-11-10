@@ -389,5 +389,16 @@
   "Choose file…": "파일 선택…",
   "Loading the gallery…": "갤러리 불러오는 중…",
   "The gallery is unavailable": "갤러리를 사용할 수 없습니다",
-  "Show more": "더 보기"
+  "Show more": "더 보기",
+  "Toggle recent session": "최근 세션 전환",
+  "Find in timeline…": "타임라인에서 찾기…",
+  "Previous match": "이전 일치",
+  "Next match": "다음 일치",
+  "Close search": "검색 닫기",
+  "Copied code to clipboard": "코드가 클립보드에 복사되었습니다",
+  "Reverted file changes": "파일 변경 사항을 취소했습니다",
+  "Terminal switched to session folder": "터미널이 세션 폴더로 전환되었습니다",
+  "Sync CWD": "디렉터리 동기화",
+  "Center": "중앙",
+  "Dock right": "오른쪽에 도킹"
 }

@@ -389,5 +389,16 @@
   "Choose file…": "Chọn tệp…",
   "Loading the gallery…": "Đang tải thư viện…",
   "The gallery is unavailable": "Thư viện không khả dụng",
-  "Show more": "Hiện thêm"
+  "Show more": "Hiện thêm",
+  "Toggle recent session": "Chuyển đổi phiên gần đây",
+  "Find in timeline…": "Tìm trong dòng thời gian…",
+  "Previous match": "Kết quả trước",
+  "Next match": "Kết quả tiếp theo",
+  "Close search": "Đóng tìm kiếm",
+  "Copied code to clipboard": "Đã sao chép mã vào khay nhớ tạm",
+  "Reverted file changes": "Đã hủy thay đổi tệp",
+  "Terminal switched to session folder": "Terminal đã chuyển sang thư mục phiên",
+  "Sync CWD": "Đồng bộ CWD",
+  "Center": "Giữa",
+  "Dock right": "Ghim sang phải"
 }

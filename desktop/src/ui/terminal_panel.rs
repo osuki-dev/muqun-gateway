@@ -62,6 +62,16 @@ pub struct TermTab {
     pub pending_command: Option<String>,
 }
 
+impl TermTab {
+    pub fn send_bytes(&self, bytes: &[u8]) {
+        if let Some(session) = &self.session {
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                session.send(Msg::Text(text.to_string()));
+            }
+        }
+    }
+}
+
 /// The grid's type: the mono slot (JetBrains Mono where installed).
 const FONT_SIZE: f32 = 13.0;
 const LINE: f32 = 17.0;
@@ -166,6 +176,10 @@ impl TermPanel {
     /// shell that keeps running).
     pub fn mounted(&self) -> bool {
         self.open || self.session.is_some() || self.fixture.is_some()
+    }
+
+    pub fn active_mut(&mut self) -> Option<&mut TermTab> {
+        self.tabs.get_mut(self.active_tab)
     }
 
     fn send(&self, msg: Msg) {
@@ -493,6 +507,39 @@ impl UiState {
             }
         }
         self.term.sink.focused = true;
+    }
+
+    /// Switch the active terminal to the focused session's workspace directory,
+    /// or open a new terminal tab in that directory.
+    pub fn term_sync_cwd(&mut self) {
+        let cwd = self.terminal_cwd();
+        let escaped = cwd.display().to_string().replace('"', "\\\"");
+        let cd_cmd = format!("cd \"{escaped}\"\n");
+        let active_running = self
+            .term
+            .session
+            .as_ref()
+            .is_some_and(|s| s.ended().is_none());
+
+        if active_running && !self.term.tabs.is_empty() {
+            if let Some(tab) = self.term.active_mut() {
+                tab.cwd = cwd.clone();
+                tab.send_bytes(cd_cmd.as_bytes());
+            } else {
+                self.term.send(Msg::Text(cd_cmd));
+            }
+        } else {
+            self.term_new_tab_in(cwd, None);
+        }
+        self.open_terminal();
+
+        self.toast(
+            super::copy::t(
+                self.cfg.general.language,
+                "Terminal switched to session folder",
+            ),
+            None,
+        );
     }
 
     /// End the shell and start a new one in the focused session's folder.
@@ -859,6 +906,15 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         .build(k)
         .key("terminal-new-tab");
     tabs_strip = tabs_strip.child(add_tab_btn);
+
+    let sync_cwd_btn = IconButton::new(&rune_kit::glyphs::FOLDER)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .label(super::copy::t_ref(language, "Sync CWD"))
+        .on_press(|s: &mut UiState| s.term_sync_cwd())
+        .build(k)
+        .key("terminal-sync-cwd");
+    tabs_strip = tabs_strip.child(sync_cwd_btn);
 
     let header = row()
         .key("terminal-head")
@@ -1479,5 +1535,18 @@ mod tests {
         // Close last tab closes the terminal panel
         state.term_close_tab(0);
         assert!(!state.term.open);
+    }
+
+    #[test]
+    fn terminal_sync_cwd_opens_or_switches_tab() {
+        let (tx, _rx) = commands::channel();
+        let mut state = UiState::new(tx);
+        state.term_sync_cwd();
+        assert!(state.term.open);
+        assert!(!state.toasts.is_empty());
+        assert_eq!(
+            state.toasts.last().unwrap().title,
+            "Terminal switched to session folder"
+        );
     }
 }

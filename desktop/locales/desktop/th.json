@@ -389,5 +389,16 @@
   "Choose file…": "เลือกไฟล์…",
   "Loading the gallery…": "กำลังโหลดแกลเลอรี…",
   "The gallery is unavailable": "ไม่สามารถใช้แกลเลอรีได้",
-  "Show more": "แสดงเพิ่มเติม"
+  "Show more": "แสดงเพิ่มเติม",
+  "Toggle recent session": "สลับไปยังเซสชันล่าสุด",
+  "Find in timeline…": "ค้นหาในไทม์ไลน์…",
+  "Previous match": "รายการที่ตรงกันก่อนหน้า",
+  "Next match": "รายการที่ตรงกันถัดไป",
+  "Close search": "ปิดการค้นหา",
+  "Copied code to clipboard": "คัดลอกโค้ดไปยังคลิปบอร์ดแล้ว",
+  "Reverted file changes": "ยกเลิกการเปลี่ยนแปลงไฟล์แล้ว",
+  "Terminal switched to session folder": "สลับเทอร์มินัลไปยังโฟลเดอร์เซสชันแล้ว",
+  "Sync CWD": "ซิงค์ CWD",
+  "Center": "กึ่งกลาง",
+  "Dock right": "ตรึงทางขวา"
 }

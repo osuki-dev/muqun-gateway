@@ -389,5 +389,16 @@
   "Choose file…": "ファイルを選択…",
   "Loading the gallery…": "ギャラリーを読み込み中…",
   "The gallery is unavailable": "ギャラリーを利用できません",
-  "Show more": "さらに表示"
+  "Show more": "さらに表示",
+  "Toggle recent session": "最近のセッションを切り替え",
+  "Find in timeline…": "タイムライン内を検索…",
+  "Previous match": "前の一致",
+  "Next match": "次の一致",
+  "Close search": "検索を閉じる",
+  "Copied code to clipboard": "コードをクリップボードにコピーしました",
+  "Reverted file changes": "ファイルの変更を破棄しました",
+  "Terminal switched to session folder": "ターミナルをセッションフォルダーに切り替えました",
+  "Sync CWD": "ディレクトリを同期",
+  "Center": "中央",
+  "Dock right": "右に固定"
 }

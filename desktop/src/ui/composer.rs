@@ -343,6 +343,7 @@ fn send_session(s: &mut UiState, queue: bool) {
     if text.is_empty() {
         return;
     }
+    s.record_prompt_history(&text);
     let Some(asid) = s.selected.clone() else {
         s.status = "Pick a session first".into();
         return;
@@ -462,6 +463,7 @@ fn ensure_mention_pills(s: &mut UiState, slot: Slot) {
 }
 
 pub(super) fn on_draft_change(s: &mut UiState, slot: Slot) {
+    s.reset_prompt_history_cursor();
     use crate::model::composer_mentions::{delete_mention_atomically, mention_ranges};
 
     let prev = s.draft_snap.clone();
@@ -1817,6 +1819,26 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             .on_change(|s: &mut UiState, _: &mut Tx| on_draft_change(s, Slot::Session))
             .on_key(|s: &mut UiState, ev: &rune::KeyEvent, tx: &mut Tx| {
                 if popup_key(s, Slot::Session, ev) {
+                    return true;
+                }
+                if ev.key == rune::Key::Up
+                    && !ev.mods.cmd
+                    && !ev.mods.alt
+                    && (s.draft.text.is_empty() || s.prompt_history_cursor.is_some())
+                    && s.prompt_history_prev()
+                {
+                    return true;
+                }
+                if ev.key == rune::Key::Down
+                    && !ev.mods.cmd
+                    && !ev.mods.alt
+                    && s.prompt_history_cursor.is_some()
+                    && s.prompt_history_next()
+                {
+                    return true;
+                }
+                if ev.key == rune::Key::Escape && s.prompt_history_cursor.is_some() {
+                    s.reset_prompt_history_cursor();
                     return true;
                 }
                 // Alt+Enter while the agent works: queue after this turn.

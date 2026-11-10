@@ -389,5 +389,16 @@
   "Choose file…": "Выбрать файл…",
   "Loading the gallery…": "Загрузка галереи…",
   "The gallery is unavailable": "Галерея недоступна",
-  "Show more": "Показать ещё"
+  "Show more": "Показать ещё",
+  "Toggle recent session": "Переключиться на недавнюю сессию",
+  "Find in timeline…": "Найти на временной шкале…",
+  "Previous match": "Предыдущее совпадение",
+  "Next match": "Следующее совпадение",
+  "Close search": "Закрыть поиск",
+  "Copied code to clipboard": "Код скопирован в буфер обмена",
+  "Reverted file changes": "Изменения файла отменены",
+  "Terminal switched to session folder": "Терминал переключен на папку сессии",
+  "Sync CWD": "Синхронизировать CWD",
+  "Center": "По центру",
+  "Dock right": "Закрепить справа"
 }

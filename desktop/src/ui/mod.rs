@@ -235,6 +235,15 @@ pub struct ComputerData {
     pub mode: Mode,
 }
 
+/// In-session timeline search state (Ctrl+F).
+#[derive(Clone, Debug, Default)]
+pub struct TimelineSearch {
+    pub active: bool,
+    pub query: TextEdit,
+    pub matches: Vec<String>,
+    pub active_index: usize,
+}
+
 /// Main-thread UI state owned by Rune.
 pub struct UiState {
     pub commands: CommandSender,
@@ -397,6 +406,14 @@ pub struct UiState {
     pub images: Option<ImageCache>,
     /// Launch / theme-switch splash while the core warms up.
     pub splash: Option<splash::Splash>,
+    /// Previous session id before last switch (for Ctrl+Tab switching).
+    pub last_selected: Option<String>,
+    /// Prompt history for up/down recall in the composer.
+    pub prompt_history: Vec<String>,
+    pub prompt_history_cursor: Option<usize>,
+    pub prompt_history_draft_stash: Option<String>,
+    /// Timeline in-session search state (Ctrl+F in session mode).
+    pub timeline_search: TimelineSearch,
     /// First agents discovery finished (empty list still counts).
     pub agents_seen: bool,
     /// A screenshot scene is showing: live core updates are ignored.
@@ -567,6 +584,11 @@ impl UiState {
             toast_seq: 0,
             images: None,
             splash: None,
+            last_selected: None,
+            prompt_history: Vec::new(),
+            prompt_history_cursor: None,
+            prompt_history_draft_stash: None,
+            timeline_search: TimelineSearch::default(),
             agents_seen: false,
             demo: false,
             storage: None,
@@ -992,7 +1014,11 @@ impl UiState {
                 return;
             }
         }
+        let prev = self.selected.clone();
         let changed = self.selected.as_deref() != Some(asid);
+        if changed && prev.as_deref() != Some(asid) && prev.is_some() {
+            self.last_selected = prev;
+        }
         self.selected = Some(asid.to_string());
         self.mode = Mode::Session;
         self.show_diff = false;
@@ -1018,6 +1044,193 @@ impl UiState {
         self.send(Command::Compose(
             crate::model::compose::ComposeCommand::ListPeers,
         ));
+    }
+
+    /// Toggle to the most recent previous session (Ctrl+Tab).
+    pub fn toggle_recent_session(&mut self) {
+        if let Some(last) = self.last_selected.clone() {
+            self.open_session(&last);
+        }
+    }
+
+    /// Record a non-empty submitted prompt into history.
+    pub fn record_prompt_history(&mut self, text: &str) {
+        let t = text.trim();
+        if t.is_empty() {
+            return;
+        }
+        if self.prompt_history.last().map(|s| s.as_str()) != Some(t) {
+            self.prompt_history.push(t.to_string());
+        }
+        self.prompt_history_cursor = None;
+        self.prompt_history_draft_stash = None;
+    }
+
+    /// Navigate backward in prompt history (Up arrow).
+    pub fn prompt_history_prev(&mut self) -> bool {
+        if self.prompt_history.is_empty() {
+            return false;
+        }
+        let current_cursor = self.prompt_history_cursor;
+        let new_cursor = match current_cursor {
+            None => {
+                self.prompt_history_draft_stash = Some(self.draft.text.clone());
+                self.prompt_history.len() - 1
+            }
+            Some(0) => 0,
+            Some(idx) => idx - 1,
+        };
+        self.prompt_history_cursor = Some(new_cursor);
+        let text = self.prompt_history[new_cursor].clone();
+        let len = text.len();
+        self.draft.text = text;
+        self.draft.set_caret(len);
+        true
+    }
+
+    /// Navigate forward in prompt history (Down arrow).
+    pub fn prompt_history_next(&mut self) -> bool {
+        let Some(idx) = self.prompt_history_cursor else {
+            return false;
+        };
+        if idx + 1 < self.prompt_history.len() {
+            let new_cursor = idx + 1;
+            self.prompt_history_cursor = Some(new_cursor);
+            let text = self.prompt_history[new_cursor].clone();
+            let len = text.len();
+            self.draft.text = text;
+            self.draft.set_caret(len);
+            true
+        } else {
+            self.prompt_history_cursor = None;
+            let text = self.prompt_history_draft_stash.take().unwrap_or_default();
+            let len = text.len();
+            self.draft.text = text;
+            self.draft.set_caret(len);
+            true
+        }
+    }
+
+    /// Reset prompt history cursor when user types or submits.
+    pub fn reset_prompt_history_cursor(&mut self) {
+        self.prompt_history_cursor = None;
+        self.prompt_history_draft_stash = None;
+    }
+
+    /// Toggle floating in-session timeline search (Ctrl+F).
+    pub fn toggle_timeline_search(&mut self) {
+        self.timeline_search.active = !self.timeline_search.active;
+        if self.timeline_search.active {
+            self.timeline_search.query.focused = true;
+            if let Some(asid) = self.selected.clone() {
+                self.update_timeline_search_matches(&asid);
+            }
+        }
+    }
+
+    /// Close floating in-session timeline search.
+    pub fn close_timeline_search(&mut self) {
+        self.timeline_search.active = false;
+        self.timeline_search.matches.clear();
+        self.timeline_search.active_index = 0;
+    }
+
+    /// Update matching items in the current session for the timeline search query.
+    pub fn update_timeline_search_matches(&mut self, asid: &str) {
+        let q = self.timeline_search.query.text.trim().to_lowercase();
+        self.timeline_search.matches.clear();
+        self.timeline_search.active_index = 0;
+        if q.is_empty() {
+            return;
+        }
+        if let Some(tl) = self.timelines.get(asid) {
+            for item in &tl.items {
+                let matches = match &item.part {
+                    muqun_gateway::agents::AgentPart::Text { text, .. } => {
+                        text.to_lowercase().contains(&q)
+                    }
+                    muqun_gateway::agents::AgentPart::Reasoning { text, .. } => {
+                        text.to_lowercase().contains(&q)
+                    }
+                    muqun_gateway::agents::AgentPart::Tool(tool) => {
+                        tool.name.to_lowercase().contains(&q)
+                            || tool
+                                .title
+                                .as_ref()
+                                .is_some_and(|t| t.to_lowercase().contains(&q))
+                            || tool.input.to_string().to_lowercase().contains(&q)
+                            || tool
+                                .output
+                                .as_ref()
+                                .is_some_and(|o| o.to_string().to_lowercase().contains(&q))
+                    }
+                    muqun_gateway::agents::AgentPart::Diff { file, diff } => {
+                        file.to_lowercase().contains(&q) || diff.to_lowercase().contains(&q)
+                    }
+                    muqun_gateway::agents::AgentPart::Status { text } => {
+                        text.to_lowercase().contains(&q)
+                    }
+                    muqun_gateway::agents::AgentPart::Synthetic { text, description } => {
+                        text.to_lowercase().contains(&q)
+                            || description
+                                .as_ref()
+                                .is_some_and(|d| d.to_lowercase().contains(&q))
+                    }
+                    muqun_gateway::agents::AgentPart::System { text, description } => {
+                        text.to_lowercase().contains(&q)
+                            || description
+                                .as_ref()
+                                .is_some_and(|d| d.to_lowercase().contains(&q))
+                    }
+                    _ => false,
+                };
+                if matches {
+                    self.timeline_search.matches.push(item.id.clone());
+                }
+            }
+        }
+    }
+
+    /// Jump to current active timeline search match.
+    pub fn timeline_search_jump_to_current(&mut self, tx: &mut rune::Tx) {
+        let Some(asid) = self.selected.clone() else {
+            return;
+        };
+        if self.timeline_search.matches.is_empty() {
+            return;
+        }
+        let idx = self.timeline_search.active_index % self.timeline_search.matches.len();
+        let key = self.timeline_search.matches[idx].clone();
+        tx.scroll_center_in(format!("feed-{asid}"), key.clone());
+        if let Some(tl) = self.timelines.get_mut(&asid) {
+            tl.selected = Some(key.clone());
+            tl.flash = Some((key, std::time::Instant::now()));
+            tl.rev += 1;
+        }
+        tx.wake_after(std::time::Duration::from_millis(800));
+    }
+
+    /// Jump to next timeline search match.
+    pub fn timeline_search_next(&mut self, tx: &mut rune::Tx) {
+        if self.timeline_search.matches.is_empty() {
+            return;
+        }
+        self.timeline_search.active_index =
+            (self.timeline_search.active_index + 1) % self.timeline_search.matches.len();
+        self.timeline_search_jump_to_current(tx);
+    }
+
+    /// Jump to previous timeline search match.
+    pub fn timeline_search_prev(&mut self, tx: &mut rune::Tx) {
+        if self.timeline_search.matches.is_empty() {
+            return;
+        }
+        if self.timeline_search.active_index == 0 {
+            self.timeline_search.active_index = self.timeline_search.matches.len() - 1;
+        } else {
+            self.timeline_search.active_index -= 1;
+        }
+        self.timeline_search_jump_to_current(tx);
     }
 
     pub fn go(&mut self, mode: Mode) {

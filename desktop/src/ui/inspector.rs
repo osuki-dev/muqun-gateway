@@ -425,12 +425,41 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
                     s.show_diff = true;
                 },
             );
+            let discard_path = f.path.clone();
+            let discard_btn = small(
+                k,
+                crate::ui::copy::t_ref(s.cfg.general.language, "Discard"),
+                ButtonVariant::Ghost,
+                format!("discard-item-{i}"),
+                move |s| {
+                    let cwd = s
+                        .current()
+                        .and_then(|info| info.directory.clone())
+                        .unwrap_or_else(|| s.terminal_cwd().display().to_string());
+                    if !cwd.is_empty() {
+                        s.send(Command::Compose(ComposeCommand::DiscardFile {
+                            cwd: cwd.clone(),
+                            path: discard_path.clone(),
+                        }));
+                        // Refresh diff and inspector
+                        if let Some(asid) = s.selected.clone() {
+                            s.send(Command::RefreshDiff(AgentSessionId(asid)));
+                        }
+                        s.refresh_inspector();
+                        s.toast(
+                            crate::ui::copy::t(s.cfg.general.language, "Reverted file changes"),
+                            None,
+                        );
+                    }
+                },
+            );
+            let actions = row().gap(4.0).center_y().child(diff_btn).child(discard_btn);
             out.push(item(
                 k,
                 format!("gf-{}", f.path),
                 f.path.clone(),
                 format!("+{} −{}", f.added, f.removed),
-                Some(diff_btn),
+                Some(actions),
             ));
         }
         out.push(small(

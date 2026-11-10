@@ -40,6 +40,7 @@ pub enum Action {
     ToggleInspector,
     FocusSearch,
     SearchMessages,
+    ToggleRecentSession,
     PrevSession,
     NextSession,
     AddSplit,
@@ -235,6 +236,13 @@ pub static ENTRIES: &[Entry] = &[
         "mod+shift+f",
         "Search in messages",
         "搜索消息内容",
+    ),
+    e(
+        A::ToggleRecentSession,
+        G::Panels,
+        "ctrl+tab",
+        "Toggle recent session",
+        "",
     ),
     e(
         A::PrevSession,
@@ -439,7 +447,12 @@ impl Entry {
 
     /// What it does, in the owner's language.
     pub fn what(&self, language: Language) -> String {
-        tr(language, self.en, self.zh)
+        let text = crate::ui::copy::t(language, self.en);
+        if text != self.en || self.zh.is_empty() {
+            text
+        } else {
+            tr(language, self.en, self.zh)
+        }
     }
 
     /// Each chord's keycaps on `platform`.
@@ -634,8 +647,15 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
                 return false;
             }
         }
-        A::FocusSearch => s.focus_search(false),
+        A::FocusSearch => {
+            if s.mode == Mode::Session && s.selected.is_some() {
+                s.toggle_timeline_search();
+            } else {
+                s.focus_search(false);
+            }
+        }
         A::SearchMessages => s.focus_search(true),
+        A::ToggleRecentSession => s.toggle_recent_session(),
         A::PrevSession | A::NextSession => {
             return step_session(s, action == A::NextSession);
         }
@@ -735,6 +755,8 @@ pub enum EscStep {
     Dialog,
     /// The timeline row's detail pane.
     Pane,
+    /// In-session timeline search.
+    TimelineSearch,
     /// The sidebar's search: cleared, back to the session list.
     Search,
     /// A page other than the session: back to the last session (or Home).
@@ -757,6 +779,9 @@ pub fn esc_step(s: &UiState) -> Option<EscStep> {
     }
     if s.inspect.is_some() {
         return Some(EscStep::Pane);
+    }
+    if s.timeline_search.active {
+        return Some(EscStep::TimelineSearch);
     }
     if s.searching() {
         return Some(EscStep::Search);
@@ -805,6 +830,7 @@ pub fn escape(s: &mut UiState) -> bool {
             }
         }
         EscStep::Pane => s.close_inspect(),
+        EscStep::TimelineSearch => s.close_timeline_search(),
         EscStep::Search => s.close_search(),
         EscStep::Page => match last_session(s) {
             Some(_) if s.in_split() => s.mode = Mode::Session,

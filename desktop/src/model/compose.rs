@@ -337,6 +337,11 @@ pub enum ComposeCommand {
         cwd: String,
         branch: String,
     },
+    /// Revert changes to a single file.
+    DiscardFile {
+        cwd: String,
+        path: String,
+    },
     /// Computers `@` may name (this machine + linked peers when available).
     ListPeers,
 }
@@ -553,6 +558,21 @@ pub async fn run(
                     push(&inbox, ComposerUpdate::Branch { cwd, info });
                     None
                 }
+                Ok(Err(why)) => Some(HubError::Agent(
+                    muqun_gateway::agents::ports::AgentError::RequestFailed(why),
+                )),
+                Err(err) => Some(HubError::Agent(
+                    muqun_gateway::agents::ports::AgentError::RequestFailed(err.to_string()),
+                )),
+            }
+        }
+        ComposeCommand::DiscardFile { cwd, path } => {
+            let path_buf = PathBuf::from(&cwd);
+            let target = path.clone();
+            let result =
+                tokio::task::spawn_blocking(move || discard_file(&path_buf, &target)).await;
+            match result {
+                Ok(Ok(())) => None,
                 Ok(Err(why)) => Some(HubError::Agent(
                     muqun_gateway::agents::ports::AgentError::RequestFailed(why),
                 )),
@@ -853,6 +873,46 @@ pub fn checkout_branch(cwd: &std::path::Path, branch: &str) -> Result<(), String
     }
 }
 
+/// `git checkout HEAD -- <file_path>` at the repository root of `cwd`.
+pub fn discard_file(cwd: &std::path::Path, file_path: &str) -> Result<(), String> {
+    let root = git_root(cwd).ok_or_else(|| "not a git checkout".to_string())?;
+    let file_path = file_path.trim();
+    if file_path.is_empty() {
+        return Err("invalid file path".into());
+    }
+    let output = std::process::Command::new("git")
+        .args(["checkout", "HEAD", "--", file_path])
+        .current_dir(&root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|err| format!("git checkout: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    // Fallback if HEAD does not exist (e.g. unborn branch before initial commit)
+    if let Ok(fallback) = std::process::Command::new("git")
+        .args(["checkout", "--", file_path])
+        .current_dir(&root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        if fallback.status.success() {
+            return Ok(());
+        }
+    }
+    let err = String::from_utf8_lossy(&output.stderr);
+    let err = err.trim();
+    if err.is_empty() {
+        Err("git checkout failed".into())
+    } else {
+        Err(err.lines().next().unwrap_or(err).to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -945,5 +1005,16 @@ mod tests {
             parse_repo_web_url("https://gitlab.com/group/project").as_deref(),
             Some("https://gitlab.com/group/project")
         );
+    }
+
+    #[test]
+    fn discard_file_validates_inputs() {
+        assert!(discard_file(std::path::Path::new("/nonexistent"), "test.txt").is_err());
+        let dir = std::env::temp_dir().join(format!("muqun-discard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        assert!(discard_file(&dir, "").is_err());
+        assert!(discard_file(&dir, "   ").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

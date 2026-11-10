@@ -746,6 +746,7 @@ fn viewer_with(s: &mut UiState, name: &str, kind: crate::model::viewer::FileKind
         body: text_body(body.into(), false),
         zoom: None,
         source: false,
+        docked: false,
     });
 }
 

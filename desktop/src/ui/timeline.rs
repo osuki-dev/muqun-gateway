@@ -27,8 +27,8 @@ use muqun_gateway::agents::{
 use rune::{col, el, icon, row, text, Cursor, El, GrowthSpec, ScrollSpec};
 use rune_kit::diff::{DiffMode, DiffState, DiffView, FileDiff, FileStatus};
 use rune_kit::{
-    Badge, BadgeVariant, Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit,
-    ScrollBar, Spinner,
+    glyphs, Badge, BadgeVariant, Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant,
+    Kit, ScrollBar, Spinner, TextInput,
 };
 
 use super::copy::tr_ref;
@@ -498,6 +498,9 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
     if tl.away {
         stage = stage.child(latest_pill(s, k, asid, tl.unseen));
     }
+    if s.timeline_search.active && s.selected.as_deref() == Some(asid) {
+        stage = stage.child(timeline_search_bar(s, k, asid));
+    }
     stage
 }
 
@@ -570,6 +573,102 @@ fn latest_pill(s: &UiState, k: &Kit, asid: &str, unseen: usize) -> El {
         .justify_center()
         .px(16.0)
         .child(row().w_full().max_w(FEED_MAX_W).justify_end().child(pill))
+}
+
+/// Floating in-session search bar pinned at the top of the timeline feed.
+fn timeline_search_bar(s: &UiState, k: &Kit, asid: &str) -> El {
+    let language = s.cfg.general.language;
+    let match_count = format!(
+        "{}/{}",
+        if s.timeline_search.matches.is_empty() {
+            0
+        } else {
+            s.timeline_search.active_index + 1
+        },
+        s.timeline_search.matches.len(),
+    );
+    let field = TextInput::new(&s.timeline_search.query)
+        .placeholder(super::copy::t_ref(language, "Find in timeline…"))
+        .leading_icon(&glyphs::SEARCH)
+        .leading_icon_size(14.0)
+        .width(Some(160.0))
+        .plain()
+        .on_edit(|s: &mut UiState| &mut s.timeline_search.query)
+        .on_change(|s: &mut UiState, tx: &mut rune::Tx| {
+            if let Some(asid) = s.selected.clone() {
+                s.update_timeline_search_matches(&asid);
+                s.timeline_search_jump_to_current(tx);
+            }
+        })
+        .on_key(|s: &mut UiState, ev: &rune::KeyEvent, tx: &mut rune::Tx| {
+            if ev.key == rune::Key::Enter {
+                if ev.mods.shift {
+                    s.timeline_search_prev(tx);
+                } else {
+                    s.timeline_search_next(tx);
+                }
+                return true;
+            }
+            if ev.key == rune::Key::Escape {
+                s.close_timeline_search();
+                return true;
+            }
+            false
+        })
+        .build(k)
+        .key("timeline-search-input");
+
+    let counter = text(match_count).font(k.ty.small).color(k.c.text_faint);
+
+    let prev_btn = IconButton::new(&glyphs::CHEVRON_UP)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .label(super::copy::t_ref(language, "Previous match"))
+        .on_press_tx(|s: &mut UiState, tx: &mut rune::Tx| s.timeline_search_prev(tx))
+        .build(k)
+        .key("timeline-search-prev");
+
+    let next_btn = IconButton::new(&glyphs::CHEVRON_DOWN)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .label(super::copy::t_ref(language, "Next match"))
+        .on_press_tx(|s: &mut UiState, tx: &mut rune::Tx| s.timeline_search_next(tx))
+        .build(k)
+        .key("timeline-search-next");
+
+    let close_btn = IconButton::new(&glyphs::CLOSE)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .label(super::copy::t_ref(language, "Close search"))
+        .on_press(|s: &mut UiState| s.close_timeline_search())
+        .build(k)
+        .key("timeline-search-close");
+
+    let mut bar = row()
+        .key("timeline-search-bar")
+        .gap(6.0)
+        .center_y()
+        .px(10.0)
+        .py(4.0)
+        .radius(crate::theme::look::CARD_RADIUS)
+        .fill(k.c.layer_01)
+        .border(1.0, k.c.border_muted)
+        .child(field)
+        .child(counter)
+        .child(prev_btn)
+        .child(next_btn)
+        .child(close_btn);
+
+    for shadow in k.shadow_layers(&k.elevation.overlay) {
+        bar = bar.box_shadow(shadow);
+    }
+
+    row()
+        .key(format!("search-band-{asid}"))
+        .pin(Some(0.0), Some(12.0), Some(0.0), None)
+        .justify_center()
+        .px(16.0)
+        .child(row().w_full().max_w(FEED_MAX_W).justify_end().child(bar))
 }
 
 impl UiState {

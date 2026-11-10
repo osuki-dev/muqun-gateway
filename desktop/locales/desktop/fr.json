@@ -389,5 +389,16 @@
   "Choose file…": "Choisir un fichier…",
   "Loading the gallery…": "Chargement de la galerie…",
   "The gallery is unavailable": "La galerie est indisponible",
-  "Show more": "Afficher plus"
+  "Show more": "Afficher plus",
+  "Toggle recent session": "Basculer vers la session récente",
+  "Find in timeline…": "Rechercher dans la chronologie…",
+  "Previous match": "Correspondance précédente",
+  "Next match": "Correspondance suivante",
+  "Close search": "Fermer la recherche",
+  "Copied code to clipboard": "Code copié dans le presse-papiers",
+  "Reverted file changes": "Modifications du fichier annulées",
+  "Terminal switched to session folder": "Terminal basculé vers le dossier de session",
+  "Sync CWD": "Synchroniser CWD",
+  "Center": "Centrer",
+  "Dock right": "Ancrer à droite"
 }

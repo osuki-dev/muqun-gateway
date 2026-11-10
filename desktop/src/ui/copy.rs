@@ -15,6 +15,24 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::config::Language;
 
+/// Look up a string from the multi-language catalog by its English key.
+pub fn t(language: Language, en: &str) -> String {
+    match language {
+        Language::En => en.to_string(),
+        other => crate::ui::i18n::lookup(other, en)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| en.to_string()),
+    }
+}
+
+/// Look up a static string from the multi-language catalog by its English key.
+pub fn t_ref(language: Language, en: &'static str) -> &'static str {
+    match language {
+        Language::En => en,
+        other => crate::ui::i18n::lookup(other, en).unwrap_or(en),
+    }
+}
+
 /// Pick the owner's language for a string written in English and Simplified Chinese.
 pub fn tr(language: Language, en: &str, zh: &str) -> String {
     match language {

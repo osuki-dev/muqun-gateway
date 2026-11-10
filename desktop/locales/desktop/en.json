@@ -389,5 +389,16 @@
   "Choose file…": "Choose file…",
   "Loading the gallery…": "Loading the gallery…",
   "The gallery is unavailable": "The gallery is unavailable",
-  "Show more": "Show more"
+  "Show more": "Show more",
+  "Toggle recent session": "Toggle recent session",
+  "Find in timeline…": "Find in timeline…",
+  "Previous match": "Previous match",
+  "Next match": "Next match",
+  "Close search": "Close search",
+  "Copied code to clipboard": "Copied code to clipboard",
+  "Reverted file changes": "Reverted file changes",
+  "Terminal switched to session folder": "Terminal switched to session folder",
+  "Sync CWD": "Sync CWD",
+  "Center": "Center",
+  "Dock right": "Dock right"
 }

@@ -40,6 +40,8 @@ pub struct Viewer {
     pub zoom: Option<f32>,
     /// Markdown: show the source instead of the rendering.
     pub source: bool,
+    /// Side-docked mode: sits as a right-hand drawer without obscuring the chat/composer.
+    pub docked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +144,7 @@ impl UiState {
             body,
             zoom: None,
             source: false,
+            docked: false,
         });
     }
 
@@ -262,54 +265,88 @@ pub fn mount(s: &UiState, k: &Kit, scale: f32, layer: &mut Vec<El>) {
         return;
     };
     let language = s.cfg.general.language;
-    let mut scrim = el()
-        .key("viewer-scrim")
-        .absolute(0.0, 0.0)
-        .w_full()
-        .h_full()
-        .fill(k.c.scrim)
-        .token_motion(k.motion.overlay)
-        .a11y_hidden();
-    if s.look().blur {
-        scrim = scrim.backdrop_blur(14.0);
-    }
-    layer.push(scrim);
-
     let look = s.look();
-    let panel = col()
-        .key("viewer-panel")
-        .role("dialog")
-        .label(v.name.clone())
-        .w_full()
-        .h_full()
-        .max_w(1180.0)
-        .max_h(900.0);
-    // The sheet: frosted over the blurred window, a top-lit rim; solid under
-    // reduce transparency.
-    let mut panel = look
-        .panel(k, panel, k.radius.xl)
-        .child(header(v, k, language))
-        .child(
-            el().key("viewer-rule")
-                .w_full()
-                .h(1.0)
-                .fill(k.c.border_muted),
-        )
-        .child(body(s, v, k, scale, language))
-        .token_motion(k.motion.overlay)
-        .modal(true, |s: &mut UiState| s.close_viewer());
-    for shadow in k.shadow_layers(&k.elevation.overlay) {
-        panel = panel.box_shadow(shadow);
-    }
-    layer.push(
-        el().key("viewer-layer")
+
+    if !v.docked {
+        let mut scrim = el()
+            .key("viewer-scrim")
             .absolute(0.0, 0.0)
             .w_full()
             .h_full()
-            .padding(28.0)
-            .center()
-            .child(panel),
-    );
+            .fill(k.c.scrim)
+            .token_motion(k.motion.overlay)
+            .a11y_hidden();
+        if look.blur {
+            scrim = scrim.backdrop_blur(14.0);
+        }
+        layer.push(scrim);
+
+        let panel = col()
+            .key("viewer-panel")
+            .role("dialog")
+            .label(v.name.clone())
+            .w_full()
+            .h_full()
+            .max_w(1180.0)
+            .max_h(900.0);
+        let mut panel = look
+            .panel(k, panel, k.radius.xl)
+            .child(header(v, k, language))
+            .child(
+                el().key("viewer-rule")
+                    .w_full()
+                    .h(1.0)
+                    .fill(k.c.border_muted),
+            )
+            .child(body(s, v, k, scale, language))
+            .token_motion(k.motion.overlay)
+            .modal(true, |s: &mut UiState| s.close_viewer());
+        for shadow in k.shadow_layers(&k.elevation.overlay) {
+            panel = panel.box_shadow(shadow);
+        }
+        layer.push(
+            el().key("viewer-layer")
+                .absolute(0.0, 0.0)
+                .w_full()
+                .h_full()
+                .padding(28.0)
+                .center()
+                .child(panel),
+        );
+    } else {
+        // Docked to the right side (Drawer mode):
+        // Leaves the left timeline and bottom composer completely interactive!
+        let panel = col()
+            .key("viewer-panel")
+            .role("region")
+            .label(v.name.clone())
+            .w(640.0)
+            .h_full();
+        let mut panel = look
+            .panel(k, panel, 0.0)
+            .border(1.0, k.c.border_base)
+            .child(header(v, k, language))
+            .child(
+                el().key("viewer-rule")
+                    .w_full()
+                    .h(1.0)
+                    .fill(k.c.border_muted),
+            )
+            .child(body(s, v, k, scale, language))
+            .token_motion(k.motion.overlay);
+        for shadow in k.shadow_layers(&k.elevation.overlay) {
+            panel = panel.box_shadow(shadow);
+        }
+        layer.push(
+            row()
+                .key("viewer-layer-docked")
+                .absolute(0.0, 0.0)
+                .w_full()
+                .h_full()
+                .child(el().grow(1.0))
+                .child(panel),
+        );
+    }
 }
 
 fn kind_label(kind: FileKind, language: Language) -> String {
@@ -525,6 +562,22 @@ fn header(v: &Viewer, k: &Kit, language: Language) -> El {
                     .key("viewer-save"),
             );
     }
+    let docked = v.docked;
+    bar = bar.child(
+        Button::new(if docked {
+            crate::ui::copy::t_ref(language, "Center")
+        } else {
+            crate::ui::copy::t_ref(language, "Dock right")
+        })
+        .variant(ButtonVariant::Ghost)
+        .on_press(|s: &mut UiState| {
+            if let Some(v) = s.viewer.as_mut() {
+                v.docked = !v.docked;
+            }
+        })
+        .build(k)
+        .key("viewer-dock-toggle"),
+    );
     bar.child(
         IconButton::new(k.glyph.close)
             .variant(IconButtonVariant::Ghost)
