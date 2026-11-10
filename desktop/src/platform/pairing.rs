@@ -102,6 +102,51 @@ pub async fn request_app_pairing(url: &str, device_name: &str) -> Result<Pairing
     })
 }
 
+/// Normalize a pairing code to `XXXX-XXXX` format:
+/// - Filters alphanumeric characters and uppercases them
+/// - Automatically inserts '-' after the 4th character if omitted or typed
+/// - Preserves trailing '-' if typed right after the 4th character
+/// - Bounds to at most 9 characters (`XXXX-XXXX`)
+pub fn normalize_pairing_code(input: &str) -> String {
+    let alphanumeric: Vec<char> = input
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+
+    if alphanumeric.is_empty() {
+        return String::new();
+    }
+
+    if alphanumeric.len() < 4 {
+        alphanumeric.into_iter().collect()
+    } else if alphanumeric.len() == 4 {
+        let s: String = alphanumeric.into_iter().collect();
+        if input.ends_with('-') {
+            format!("{s}-")
+        } else {
+            s
+        }
+    } else {
+        let first_four: String = alphanumeric.iter().take(4).collect();
+        let rest: String = alphanumeric.iter().skip(4).take(4).collect();
+        format!("{first_four}-{rest}")
+    }
+}
+
+/// Formats a code into spaced terminal display format: `V D K Q - 7 Q U F`.
+pub fn format_spaced_code(code: &str) -> String {
+    let clean = normalize_pairing_code(code);
+    if clean.is_empty() {
+        return String::new();
+    }
+    clean
+        .chars()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Claim an app token using a pairing code (`POST /api/pair/claim`).
 pub async fn claim_app_pairing(
     url: &str,
@@ -111,7 +156,7 @@ pub async fn claim_app_pairing(
 ) -> Result<ClaimedToken> {
     let client = http_client()?;
     let url_trimmed = url.trim_end_matches('/');
-    let clean_code = code.trim().to_ascii_uppercase();
+    let clean_code = normalize_pairing_code(code);
 
     let claim_body = json!({
         "request_id": request_id,
@@ -206,4 +251,31 @@ pub async fn verify_token(url: &str, token: &str) -> Result<bool> {
         .await
         .context("connection failed")?;
     Ok(res.status().is_success())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_pairing_code() {
+        assert_eq!(normalize_pairing_code(""), "");
+        assert_eq!(normalize_pairing_code("v"), "V");
+        assert_eq!(normalize_pairing_code("vdk"), "VDK");
+        assert_eq!(normalize_pairing_code("vdkq"), "VDKQ");
+        assert_eq!(normalize_pairing_code("vdkq-"), "VDKQ-");
+        assert_eq!(normalize_pairing_code("vdkq7"), "VDKQ-7");
+        assert_eq!(normalize_pairing_code("vdkq7quf"), "VDKQ-7QUF");
+        assert_eq!(normalize_pairing_code("vdkq-7quf"), "VDKQ-7QUF");
+        assert_eq!(normalize_pairing_code("V D K Q - 7 Q U F"), "VDKQ-7QUF");
+        assert_eq!(normalize_pairing_code("vdkq7qufextra"), "VDKQ-7QUF");
+    }
+
+    #[test]
+    fn test_format_spaced_code() {
+        assert_eq!(format_spaced_code(""), "");
+        assert_eq!(format_spaced_code("vdkq"), "V D K Q");
+        assert_eq!(format_spaced_code("vdkq7quf"), "V D K Q - 7 Q U F");
+        assert_eq!(format_spaced_code("VDKQ-7QUF"), "V D K Q - 7 Q U F");
+    }
 }

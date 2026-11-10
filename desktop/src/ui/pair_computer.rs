@@ -1,6 +1,6 @@
 //! Computer Pairing Modal: shown when the user chooses an unpaired remote computer.
 
-use rune::{col, row, text, El};
+use rune::{col, row, text, El, TextStyle, Tx};
 use rune_kit::{Button, ButtonVariant, Kit, TextInput};
 
 use super::copy::tr;
@@ -242,31 +242,91 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
             let claim_target = target.clone();
             let claim_url = target_url.clone();
             let claim_req_id = req_id.clone();
-            let claim_code = s.pairing_code_input.text.trim().to_string();
             let transport_req = s.pairing_transport_required;
+
+            let clean_code =
+                crate::platform::pairing::normalize_pairing_code(&s.pairing_code_input.text);
+            let is_empty = clean_code.is_empty();
+            let spaced = if is_empty {
+                "V D K Q - 7 Q U F".to_string()
+            } else {
+                crate::platform::pairing::format_spaced_code(&clean_code)
+            };
+
+            let preview_slab = col()
+                .key("pair-code-preview-slab")
+                .w_full()
+                .items_center()
+                .justify_center()
+                .py(16.0)
+                .px(20.0)
+                .radius(10.0)
+                .fill(if s.dark {
+                    k.c.layer_01
+                } else {
+                    k.c.surface_base
+                })
+                .border(
+                    1.5,
+                    if !is_empty && clean_code.len() == 9 {
+                        k.c.border_focus
+                    } else {
+                        k.c.border_base
+                    },
+                )
+                .child(
+                    text(spaced)
+                        .font(TextStyle::new(24.0, 700.0).mono().lh(30.0))
+                        .color(if is_empty {
+                            k.c.text_faint
+                        } else {
+                            k.c.text_base
+                        }),
+                );
 
             let form = col()
                 .gap(12.0)
                 .child(
-                    text(format!(
-                        "{}:",
-                        tr(
-                            language,
-                            "Pairing code requested! Please enter the code shown on the remote machine",
-                            "已发起配对请求！请输入远端机器上显示的配对码",
-                        )
+                    text(tr(
+                        language,
+                        "Type the pairing code shown on the remote screen:",
+                        "输入远端屏幕显示的配对码：",
                     ))
                     .font(k.ty.ui_medium)
                     .color(k.c.text_base)
                     .wrap()
                     .w_full(),
                 )
+                .child(preview_slab)
                 .child(
                     TextInput::new(&s.pairing_code_input)
-                        .placeholder("ABCD-1234")
+                        .placeholder("VDKQ-7QUF")
+                        .label(super::copy::tr_ref(language, "Pairing code", "配对码"))
+                        .text_style(TextStyle::new(16.0, 600.0).mono().lh(22.0))
+                        .height(42.0)
+                        .width(None)
                         .on_edit(|s: &mut UiState| &mut s.pairing_code_input)
+                        .on_change(|s: &mut UiState, _: &mut Tx| {
+                            let normalized = crate::platform::pairing::normalize_pairing_code(
+                                &s.pairing_code_input.text,
+                            );
+                            if normalized != s.pairing_code_input.text {
+                                s.pairing_code_input.text = normalized;
+                            }
+                        })
                         .build(k)
                         .key("pair-code-input"),
+                )
+                .child(
+                    text(tr(
+                        language,
+                        "Format: 8 characters with hyphen (e.g. VDKQ-7QUF, hyphen added automatically)",
+                        "格式：8位字符加连字符（如 VDKQ-7QUF，输入时自动补齐连字符）",
+                    ))
+                    .font(k.ty.caption())
+                    .color(k.c.text_muted)
+                    .wrap()
+                    .w_full(),
                 )
                 .child(
                     row()
@@ -282,16 +342,28 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                             .build(k)
                             .key("pair-code-submit")
                             .on_press(move |s: &mut UiState| {
-                                if !busy && !claim_code.is_empty() {
+                                let final_code = crate::platform::pairing::normalize_pairing_code(
+                                    &s.pairing_code_input.text,
+                                );
+                                if !busy && final_code.len() == 9 {
                                     s.pairing_busy = true;
                                     s.pairing_error = None;
                                     s.send(Command::PairComputerClaim {
                                         server_id: claim_target.clone(),
                                         url: claim_url.clone(),
                                         request_id: claim_req_id.clone(),
-                                        code: claim_code.clone(),
+                                        code: final_code,
                                         transport_required: transport_req,
                                     });
+                                } else if final_code.len() < 9 {
+                                    s.pairing_error = Some(
+                                        tr(
+                                            language,
+                                            "Please enter the complete 8-character code with hyphen (e.g. VDKQ-7QUF)",
+                                            "请输入完整的 8 位配对码（包含连字符，如 VDKQ-7QUF）",
+                                        )
+                                        .to_string(),
+                                    );
                                 }
                             }),
                         )
