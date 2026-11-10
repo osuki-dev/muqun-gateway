@@ -933,4 +933,75 @@ mod tests {
         assert_eq!(files[0].additions(), 1);
         assert_eq!(files[0].deletions(), 1);
     }
+
+    #[test]
+    fn test_no_index_diff() {
+        use muqun_gateway::agents::{AgentPart, TimelineItem, TimelineRole, ToolCall};
+        use serde_json::json;
+
+        let diff_text = r#"diff --git 1/home/ryu/Work/osuki/apps/server/src/adapters/kms/vault-transit-envelope-kms.ts 2/apps/server/src/adapters/kms/vault-transit-envelope-kms.ts
+index cd5e778..0d09cd9 100644
+--- 1/home/ryu/Work/osuki/apps/server/src/adapters/kms/vault-transit-envelope-kms.ts
++++ 2/apps/server/src/adapters/kms/vault-transit-envelope-kms.ts
+@@ -2,7 +2,6 @@ import { EnvelopeKeyManagement } from "@osuki/kernel"
+ import { base64Decode, base64Encode, CryptoError, outboundHttp, RetryPolicies, utf8, utf8String } from "@osuki/sdk"
+ import { Effect, Layer, Redacted, Schema, Stream } from "effect"
+ import { FetchHttpClient, HttpClient, HttpClientRequest, type HttpClientResponse } from "effect/http"
+-import { createHash } from "node:crypto"
+
+ const MAX_RESPONSE_BYTES = 64 * 1_024
+ const DATA_KEY_BYTES = 32
+@@ -137,10 +136,8 @@ const keyVersion = (ciphertext: string): number | undefined => {
+   return Number.isSafeInteger(version) && version > 0 ? version : undefined
+ }
+
+-// Field envelopes delimit their fields with colons and bound key ids to 128 bytes.
+-// Hash the unambiguous locator, keeping version identity without delimiter collisions.
+ const keyIdFor = (config: VaultTransitEnvelopeKmsConfig, version: number) =>
+-  `vault-transit-${createHash("sha256").update(`${config.mount}:${config.wrappingKey}`).digest("hex")}-v${version}`
++  `vault-transit:${config.mount}:${config.wrappingKey}:v${version}`
+
+ const expectedKeyId = (config: VaultTransitEnvelopeKmsConfig, ciphertext: string) => {
+   const version = keyVersion(ciphertext)
+name: Quality
+on:
+  push:
+    branches:
+      - main
+.gitea/workflows/quality.yml
+"#;
+
+        let call: ToolCall = serde_json::from_value(json!({
+            "id": "call_1",
+            "name": "run_command",
+            "state": "completed",
+            "status": "completed",
+            "input": {
+                "command": "git diff --no-index /home/ryu/Work/osuki/apps/server/src/adapters/kms/vault-transit-envelope-kms.ts apps/server/src/adapters/kms/vault-transit-envelope-kms.ts | head -75; sed -n '1,80p' /home/ryu/Work/osuki/.gitea/workflows/quality.yml 2>/dev/null; rg --files /home/ryu/Work/osuki/.gitea/workflows"
+            },
+            "output": diff_text,
+        }))
+        .expect("valid tool call");
+
+        let item = TimelineItem {
+            id: "item_1".into(),
+            message_id: "m-item_1".into(),
+            role: TimelineRole::Assistant,
+            part: AgentPart::Tool(call),
+            seq: 0,
+            updated_ms: 0,
+            ordinal: 0,
+            attachments: None,
+            image_assets: None,
+            generation: None,
+            origin: None,
+        };
+
+        let res = super::files::diff_source(&item);
+        assert!(res.is_some());
+        let (_, build) = res.unwrap();
+        let files = build();
+        assert!(!files.is_empty());
+        assert!(!files[0].hunks.is_empty());
+    }
 }
