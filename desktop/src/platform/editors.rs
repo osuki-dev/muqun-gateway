@@ -298,12 +298,12 @@ pub fn detect_default_terminal_editor() -> Option<String> {
             }
         }
         // 4. Default to nvim if installed on PATH
-        if Command::new("which")
-            .arg("nvim")
-            .output()
-            .is_ok_and(|o| o.status.success())
-        {
-            return Some("nvim".into());
+        if let Ok(path_var) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                if dir.join("nvim").is_file() {
+                    return Some("nvim".into());
+                }
+            }
         }
     }
     #[cfg(target_os = "macos")]

@@ -1877,4 +1877,37 @@ mod tests {
         let pills: Vec<_> = draft.pills().map(|(_, id)| id).collect();
         assert_eq!(pills, vec!["image:101", "image:102"]);
     }
+
+    #[test]
+    fn prompt_history_recall_and_escape_restore() {
+        let (tx, _rx) = crate::ui::commands::channel();
+        let mut s = UiState::new(tx);
+        s.record_prompt_history("echo hello");
+        s.record_prompt_history("git status");
+
+        s.draft.text = "my unfinished prompt".to_string();
+        s.draft.set_caret(s.draft.text.len());
+
+        // Up recalls "git status" and stashes "my unfinished prompt"
+        assert!(s.prompt_history_prev());
+        assert_eq!(s.draft.text, "git status");
+        assert_eq!(
+            s.prompt_history_draft_stash.as_deref(),
+            Some("my unfinished prompt")
+        );
+
+        // Up recalls "echo hello"
+        assert!(s.prompt_history_prev());
+        assert_eq!(s.draft.text, "echo hello");
+
+        // Down goes back to "git status"
+        assert!(s.prompt_history_next());
+        assert_eq!(s.draft.text, "git status");
+
+        // Escape restores stashed "my unfinished prompt"
+        s.reset_prompt_history_cursor();
+        assert_eq!(s.draft.text, "my unfinished prompt");
+        assert!(s.prompt_history_cursor.is_none());
+        assert!(s.prompt_history_draft_stash.is_none());
+    }
 }

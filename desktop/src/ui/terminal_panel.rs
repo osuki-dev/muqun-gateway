@@ -390,25 +390,32 @@ impl UiState {
         let path_str = path.to_string_lossy();
         let escaped_shell = format!("'{}'", path_str.replace('\'', "'\\''"));
         let cmd = format!("{editor} {escaped_shell}\n");
+        let cwd = path
+            .parent()
+            .filter(|p| p.is_dir())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.terminal_cwd());
 
         self.open_terminal();
 
-        if let Some(session) = &self.term.session {
-            if session.ended().is_some() {
-                self.term.pending_command = Some(cmd);
-                self.restart_terminal();
-            } else if self.term.frame.as_ref().is_some_and(|f| f.alternate_screen) {
-                // If an editor (like nvim) is already running in alternate screen,
-                // send Esc to exit to normal mode and `:e <path>` to edit buffer.
-                let escaped_vim = path_str.replace(' ', "\\ ");
-                self.term.send(Msg::Text(format!("\x1b:e {escaped_vim}\r")));
-            } else {
-                // Shell is active: clear line with Ctrl+C, Ctrl+U and send command.
-                self.term.send(Msg::Text(format!("\x03\x15{cmd}")));
-            }
-        } else {
+        if self
+            .term
+            .session
+            .as_ref()
+            .is_some_and(|s| s.ended().is_some())
+        {
             self.term.pending_command = Some(cmd);
+            self.restart_terminal();
+            return;
         }
+
+        if self.term.session.is_none() {
+            self.term.pending_command = Some(cmd);
+            self.start_terminal_in(cwd);
+            return;
+        }
+
+        self.term_new_tab_in(cwd, Some(cmd));
     }
 
     /// Open a new terminal tab in `cwd`, optionally executing `command`.
@@ -591,18 +598,27 @@ impl UiState {
         if self.term.fixture.is_some() || self.term.session.is_some() {
             return;
         }
-        let (Some(size), Some(colors), Some(waker)) = (
-            self.term.size,
-            self.term.want.get(),
-            self.term.waker.clone(),
-        ) else {
+        let Some(waker) = self.term.waker.clone() else {
             return;
         };
+        let size = self.term.size.unwrap_or(Size {
+            cols: 80,
+            rows: 24,
+            cell_w: 8,
+            cell_h: 17,
+        });
+        let colors = self.term.want.get().unwrap_or_else(|| {
+            colors(
+                &Kit::neutral(self.dark),
+                if self.dark {
+                    ColorScheme::Dark
+                } else {
+                    ColorScheme::Light
+                },
+            )
+        });
         match Session::start(cwd.clone(), size, colors, waker) {
             Ok(session) => {
-                if let Some(cmd) = self.term.pending_command.take() {
-                    session.send(Msg::Text(cmd));
-                }
                 self.term.session = Some(session.clone());
                 if self.term.tabs.is_empty() {
                     let id = self.term.next_tab_id;
@@ -613,12 +629,13 @@ impl UiState {
                         frame: None,
                         cwd,
                         title: None,
-                        pending_command: None,
+                        pending_command: self.term.pending_command.clone(),
                     });
                     self.term.active_tab = 0;
                 } else if let Some(active) = self.term.tabs.get_mut(self.term.active_tab) {
                     active.session = Some(session);
                     active.cwd = cwd;
+                    active.pending_command = self.term.pending_command.clone();
                 }
                 self.term.sent = Some(colors);
                 self.term.error = None;
@@ -691,8 +708,14 @@ impl UiState {
             }
         }
         if let Some(frame) = self.term.session.as_ref().and_then(Session::take_frame) {
+            if let Some(cmd) = self.term.pending_command.take() {
+                if let Some(sess) = &self.term.session {
+                    sess.send(Msg::Text(cmd));
+                }
+            }
             self.term.frame = Some(frame.clone());
             if let Some(active) = self.term.tabs.get_mut(self.term.active_tab) {
+                active.pending_command = None;
                 active.frame = Some(frame);
             }
             changed = true;
@@ -700,6 +723,11 @@ impl UiState {
         for (i, tab) in self.term.tabs.iter_mut().enumerate() {
             if i != self.term.active_tab {
                 if let Some(frame) = tab.session.as_ref().and_then(Session::take_frame) {
+                    if let Some(cmd) = tab.pending_command.take() {
+                        if let Some(sess) = &tab.session {
+                            sess.send(Msg::Text(cmd));
+                        }
+                    }
                     tab.frame = Some(frame);
                 }
             }
@@ -1514,6 +1542,43 @@ mod tests {
         assert_eq!(
             state.term.pending_command.as_deref(),
             Some("nvim '/tmp/test_file.rs'\n")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_file_in_terminal_with_active_session_opens_new_tab() {
+        let (tx, _rx) = commands::channel();
+        let mut state = UiState::new(tx);
+        let size = grid_size(560.0, 340.0, Metrics { cw: 8.0, ch: 17.0 }, 1.0);
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 10"]);
+        let s0 = Session::start_command(
+            cmd,
+            size,
+            colors(&Kit::neutral(false), ColorScheme::Light),
+            std::sync::Arc::new(|| {}),
+        )
+        .unwrap();
+        state.term.session = Some(s0.clone());
+        state.term.tabs.push(TermTab {
+            id: 1,
+            session: Some(s0),
+            frame: None,
+            cwd: PathBuf::from("/tmp"),
+            title: None,
+            pending_command: None,
+        });
+        state.term.active_tab = 0;
+
+        let test_path = std::path::Path::new("/tmp/another_file.rs");
+        state.open_file_in_terminal(test_path, "nvim");
+
+        assert_eq!(state.term.tabs.len(), 2);
+        assert_eq!(state.term.active_tab, 1);
+        assert_eq!(
+            state.term.pending_command.as_deref(),
+            Some("nvim '/tmp/another_file.rs'\n")
         );
     }
 

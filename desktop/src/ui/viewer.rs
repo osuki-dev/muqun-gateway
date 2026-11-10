@@ -183,6 +183,15 @@ impl UiState {
                 gui_editor => match crate::platform::editors::try_editor_choice(gui_editor, path) {
                     Ok(true) => {}
                     _ => {
+                        if let Ok(true) = crate::platform::editors::try_open_editor(path) {
+                            return;
+                        }
+                        if let Some(term_ed) =
+                            crate::platform::editors::detect_default_terminal_editor()
+                        {
+                            self.open_file_in_terminal(path, &term_ed);
+                            return;
+                        }
                         let name = gui_editor.product().unwrap_or("Editor");
                         let title = crate::ui::copy::tr(language, "Could not open editor");
                         let detail = crate::ui::copy::tr(

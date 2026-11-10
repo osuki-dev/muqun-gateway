@@ -1117,10 +1117,14 @@ impl UiState {
         }
     }
 
-    /// Reset prompt history cursor when user types or submits.
+    /// Reset prompt history cursor when user types or submits, restoring draft if stashed.
     pub fn reset_prompt_history_cursor(&mut self) {
+        if let Some(stash) = self.prompt_history_draft_stash.take() {
+            let len = stash.len();
+            self.draft.text = stash;
+            self.draft.set_caret(len);
+        }
         self.prompt_history_cursor = None;
-        self.prompt_history_draft_stash = None;
     }
 
     /// Toggle floating in-session timeline search (Ctrl+F).
@@ -1139,6 +1143,9 @@ impl UiState {
         self.timeline_search.active = false;
         self.timeline_search.matches.clear();
         self.timeline_search.active_index = 0;
+        if self.mode == Mode::Session {
+            self.draft.focused = true;
+        }
     }
 
     /// Update matching items in the current session for the timeline search query.
