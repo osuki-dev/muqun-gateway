@@ -592,14 +592,38 @@ pub fn call_diff_files(call: &ToolCall) -> Vec<FileDiff> {
 /// An edit's before and after from its input (`old_string` / `new_string`).
 pub fn edit_strings(rec: Option<&Map<String, Value>>) -> Option<(String, String)> {
     let rec = rec?;
-    let old = rec
-        .get("oldString")
-        .or_else(|| rec.get("old_string"))
-        .and_then(Value::as_str);
-    let new = rec
-        .get("newString")
-        .or_else(|| rec.get("new_string"))
-        .and_then(Value::as_str);
+    let old = pick(
+        rec,
+        &[
+            "oldString",
+            "old_string",
+            "oldStr",
+            "old_str",
+            "old_text",
+            "oldText",
+            "Target",
+            "target",
+            "search",
+            "originalContent",
+            "original_content",
+        ],
+    );
+    let new = pick(
+        rec,
+        &[
+            "newString",
+            "new_string",
+            "newStr",
+            "new_str",
+            "new_text",
+            "newText",
+            "Replacement",
+            "replacement",
+            "replace",
+            "newContent",
+            "new_content",
+        ],
+    );
     (old.is_some() || new.is_some())
         .then(|| (old.unwrap_or("").to_string(), new.unwrap_or("").to_string()))
 }
@@ -1823,5 +1847,17 @@ mod tests {
         ] {
             assert!(dangerous_shell_reason(ok).is_none(), "{ok}");
         }
+    }
+
+    #[test]
+    fn edit_strings_supports_target_and_replacement() {
+        let rec = json!({
+            "Path": "src/main.rs",
+            "Target": "println!(\"hello\");",
+            "Replacement": "println!(\"world\");",
+        });
+        let (old, new) = edit_strings(rec.as_object()).unwrap();
+        assert_eq!(old, "println!(\"hello\");");
+        assert_eq!(new, "println!(\"world\");");
     }
 }

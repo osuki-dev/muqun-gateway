@@ -73,8 +73,9 @@ pub use settings::SettingsTab;
 pub use tray::words as tray_words;
 
 /// What the main pane shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
+    #[default]
     Home,
     Session,
     Inbox,
@@ -195,6 +196,7 @@ pub struct SessionSlot {
 
 /// One pane of the split session view. `asid` is `None` while the tile
 /// waits for a session to be picked into it.
+#[derive(Default)]
 pub struct Tile {
     pub asid: Option<String>,
     pub slot: SessionSlot,
@@ -223,6 +225,9 @@ pub struct ComputerData {
     pub tasks: Vec<TaskRow>,
     pub staged: Vec<StagedFile>,
     pub branches: HashMap<String, BranchInfo>,
+    pub tiles: Vec<Tile>,
+    pub focus: usize,
+    pub mode: Mode,
 }
 
 /// Main-thread UI state owned by Rune.
@@ -750,6 +755,9 @@ impl UiState {
                 tasks: std::mem::take(&mut self.tasks),
                 staged: std::mem::take(&mut self.staged),
                 branches: std::mem::take(&mut self.branches),
+                tiles: std::mem::take(&mut self.tiles),
+                focus: self.focus,
+                mode: self.mode,
             };
             self.computer_data.insert(prev, data);
 
@@ -767,6 +775,10 @@ impl UiState {
                 }
                 all_sess.sort_by_key(|a| std::cmp::Reverse(a.updated_ms));
                 self.sessions = all_sess;
+                self.tiles = vec![Tile::default()];
+                self.focus = 0;
+                self.selected = None;
+                self.mode = Mode::Home;
             } else if let Some(restored) = self.computer_data.remove(&id) {
                 self.sessions = restored.sessions;
                 self.directories = restored.directories;
@@ -778,6 +790,18 @@ impl UiState {
                 self.tasks = restored.tasks;
                 self.staged = restored.staged;
                 self.branches = restored.branches;
+                self.tiles = if restored.tiles.is_empty() {
+                    vec![Tile::default()]
+                } else {
+                    restored.tiles
+                };
+                self.focus = restored.focus;
+                self.mode = restored.mode;
+            } else {
+                self.tiles = vec![Tile::default()];
+                self.focus = 0;
+                self.selected = None;
+                self.mode = Mode::Home;
             }
         }
 
@@ -1440,12 +1464,42 @@ impl UiState {
                 }
                 Update::AgentSessions { agent, sessions } => {
                     self.listed_agents.insert(agent.clone());
-                    self.sessions.retain(|s| s.agent_id != agent);
-                    self.merge_sessions(sessions);
-                    if self.error.as_ref().is_some_and(|e| e.unreachable) {
-                        self.error = None;
+                    let curr = self.current_computer().to_string();
+                    if curr == "local" || curr == "self" {
+                        self.sessions.retain(|s| s.agent_id != agent);
+                        self.merge_sessions(sessions);
+                        if self.error.as_ref().is_some_and(|e| e.unreachable) {
+                            self.error = None;
+                        }
+                        self.restore_tiles();
+                    } else {
+                        let local_data = self.computer_data.entry("local".to_string()).or_default();
+                        local_data.sessions.retain(|s| s.agent_id != agent);
+                        for s in sessions {
+                            if let Some(existing) =
+                                local_data.sessions.iter_mut().find(|x| x.asid == s.asid)
+                            {
+                                *existing = s;
+                            } else {
+                                local_data.sessions.push(s);
+                            }
+                        }
+                        if curr == "all" {
+                            let mut all_sess = Vec::new();
+                            for cdata in self.computer_data.values() {
+                                for sess in &cdata.sessions {
+                                    if !all_sess
+                                        .iter()
+                                        .any(|x: &AgentSessionInfo| x.asid == sess.asid)
+                                    {
+                                        all_sess.push(sess.clone());
+                                    }
+                                }
+                            }
+                            all_sess.sort_by_key(|a| std::cmp::Reverse(a.updated_ms));
+                            self.sessions = all_sess;
+                        }
                     }
-                    self.restore_tiles();
                 }
                 Update::SessionCreated(info) => self.merge_sessions(vec![*info]),
                 Update::SessionGone(asid) => {

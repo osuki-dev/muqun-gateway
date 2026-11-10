@@ -889,4 +889,48 @@ mod tests {
         let path = target.split('#').next().unwrap_or(target);
         assert_eq!(path, "/path/to/file.rs");
     }
+
+    #[test]
+    fn tool_stdout_with_git_diff_is_parsed_as_diff() {
+        use muqun_gateway::agents::{AgentPart, TimelineItem, TimelineRole, ToolCall};
+        use serde_json::json;
+
+        let diff_text = "diff --git a/src/main.rs b/src/main.rs\nindex 1234567..89abcdef 100644\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,3 +1,3 @@\n-fn old() {}\n+fn new() {}\n";
+
+        let call: ToolCall = serde_json::from_value(json!({
+            "id": "call_1",
+            "name": "run_command",
+            "state": "completed",
+            "status": "completed",
+            "input": {"command": "git diff"},
+            "output": diff_text,
+        }))
+        .expect("valid tool call");
+
+        let item = TimelineItem {
+            id: "item_1".into(),
+            message_id: "m-item_1".into(),
+            role: TimelineRole::Assistant,
+            part: AgentPart::Tool(call),
+            seq: 0,
+            updated_ms: 0,
+            ordinal: 0,
+            attachments: None,
+            image_assets: None,
+            generation: None,
+            origin: None,
+        };
+
+        let res = super::files::diff_source(&item);
+        assert!(
+            res.is_some(),
+            "expected git diff to be extracted as diff source"
+        );
+        let (_, build) = res.unwrap();
+        let files = build();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path(), "src/main.rs");
+        assert_eq!(files[0].additions(), 1);
+        assert_eq!(files[0].deletions(), 1);
+    }
 }

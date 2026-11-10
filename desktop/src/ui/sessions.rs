@@ -8,7 +8,9 @@ use rune::El;
 use rune::{el, TextEdit, Tx};
 use rune_kit::glyphs::{FOLDER, FOLDER_OPEN, SEARCH, TRIANGLE_DOWN};
 use rune_kit::shell::{Sidebar, SidebarRow};
-use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem, TextInput};
+use rune_kit::{
+    ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem, SegmentedControl, TextInput,
+};
 
 use super::icons::{INBOX, SETTINGS, TASK};
 use super::{ago, now_ms, title_of, Activity, Mode, OpenMenu, UiState};
@@ -485,99 +487,43 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     })
 }
 
-fn segment_item(
-    k: &Kit,
-    key: &str,
-    label: &str,
-    active: bool,
-    press: impl Fn(&mut UiState) + 'static,
-) -> El {
-    let mut btn = rune::row()
-        .key(key)
-        .h(26.0)
-        .px(8.0)
-        .center()
-        .grow(1.0)
-        .radius(6.0)
-        .cursor(rune::Cursor::Pointer)
-        .role("tab")
-        .child(
-            rune::text(label.to_string())
-                .font(if active { k.ty.ui_medium } else { k.ty.small })
-                .color(if active {
-                    k.c.text_base
-                } else {
-                    k.c.text_muted
-                })
-                .truncate(),
-        )
-        .on_press(press);
-
-    if active {
-        btn = btn
-            .fill(k.c.surface_raised_base)
-            .border(1.0, k.c.border_base);
-    }
-
-    btn
-}
-
 fn computer_segmented_bar(s: &UiState, k: &Kit) -> El {
     let language = s.cfg.general.language;
     let curr = s.current_computer();
 
-    let mut segments = Vec::new();
+    let mut ids = vec!["all".to_string(), "local".to_string()];
+    let mut labels = vec![
+        super::copy::tr(language, "All computers", "所有电脑"),
+        super::copy::tr(language, "This computer", "本机"),
+    ];
 
-    // 1. All computers
-    let is_all = curr == "all";
-    segments.push(segment_item(
-        k,
-        "comp-tab-all",
-        &super::copy::tr(language, "All computers", "全部电脑"),
-        is_all,
-        |s| s.switch_computer("all".to_string()),
-    ));
-
-    // 2. This computer
-    let is_this = curr == "local" || curr == "self";
-    segments.push(segment_item(
-        k,
-        "comp-tab-local",
-        &super::copy::tr(language, "This computer", "本机"),
-        is_this,
-        |s| s.switch_computer("local".to_string()),
-    ));
-
-    // 3. Linked peers (e.g. mini)
     for comp in s.all_computers() {
         let cid = comp.server_id.clone();
         if cid == "self" || cid == "local" || cid == "all" {
             continue;
         }
-        let is_curr = curr == cid || curr == comp.name;
-        let select_id = cid.clone();
-        let name = comp.name.clone();
-        segments.push(segment_item(
-            k,
-            &format!("comp-tab-{}", cid),
-            &name,
-            is_curr,
-            move |s| s.switch_computer(select_id.clone()),
-        ));
+        labels.push(comp.name.clone());
+        ids.push(cid);
     }
 
-    rune::row()
-        .key("computer-segmented-bar")
-        .w_full()
-        .h(30.0)
-        .px(2.0)
-        .py(2.0)
-        .gap(2.0)
-        .center_y()
-        .radius(7.0)
-        .fill(k.c.layer_01)
-        .border(1.0, k.c.border_muted)
-        .children(segments)
+    let at = if curr == "all" {
+        Some(0)
+    } else if curr == "local" || curr == "self" {
+        Some(1)
+    } else {
+        ids.iter().position(|id| id == curr)
+    };
+
+    SegmentedControl::new(&labels, at)
+        .width(None)
+        .label(super::copy::tr_ref(language, "Computer", "电脑"))
+        .on_pick(move |s: &mut UiState, i, _: &mut Tx| {
+            if let Some(target_id) = ids.get(i) {
+                s.switch_computer(target_id.clone());
+            }
+        })
+        .build(k)
+        .key("sidebar-computer-segmented")
 }
 
 pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {

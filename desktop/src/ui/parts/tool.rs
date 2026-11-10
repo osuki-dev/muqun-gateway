@@ -218,7 +218,12 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
             if !target.is_empty() && !cx.pane {
                 body = body.child(command_line(cx, &target));
             }
-            if !out.stdout.trim().is_empty() {
+            if let Some(diff) = files::inline_diff(cx, &item.id) {
+                body = body.child(diff);
+                if let Some((_, a, r)) = files::diff_rows(cx, &item.id) {
+                    card.chips.extend(files::diff_chips(cx, a, r));
+                }
+            } else if !out.stdout.trim().is_empty() {
                 body = body.child(mono(cx, "out", &out.stdout, OUTPUT_LINES));
             }
             card.body = Some(body);
@@ -341,7 +346,7 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
             if !items.is_empty() {
                 return todo_card(cx, id, &items);
             }
-            card.body = generic_body(cx, call, &out);
+            card.body = generic_body(cx, item, call, &out);
         }
         ToolKind::Question => {
             super::question::question_card(cx, item, call, rec.as_ref(), &out, &mut card)
@@ -373,7 +378,10 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
             card.body = Some(body);
         }
         ToolKind::Browser | ToolKind::Mcp => {
-            card.body = generic_body(cx, call, &out);
+            if let Some((_, a, r)) = files::diff_rows(cx, &item.id) {
+                card.chips.extend(files::diff_chips(cx, a, r));
+            }
+            card.body = generic_body(cx, item, call, &out);
         }
     }
 
@@ -459,7 +467,7 @@ fn command_line(cx: &Tcx, command: &str) -> El {
 }
 
 /// Unknown tools: their arguments (as JSON) and what they returned.
-fn generic_body(cx: &Tcx, call: &ToolCall, out: &Output) -> Option<El> {
+fn generic_body(cx: &Tcx, item: &TimelineItem, call: &ToolCall, out: &Output) -> Option<El> {
     let mut body = col().key("generic").w_full().gap(8.0);
     let mut any = false;
     let input = match &call.input {
@@ -487,7 +495,11 @@ fn generic_body(cx: &Tcx, call: &ToolCall, out: &Output) -> Option<El> {
         body = body.child(code(cx, "input", &pretty, Some("json"), 40));
         any = true;
     }
-    if !out.stdout.trim().is_empty() {
+    if let Some(diff) = files::inline_diff(cx, &item.id) {
+        body = body.child(caption(cx.k, cx.t("Output", "输出")));
+        body = body.child(diff);
+        any = true;
+    } else if !out.stdout.trim().is_empty() {
         body = body.child(caption(cx.k, cx.t("Output", "输出")));
         let marked = ["\n#", "\n- ", "\n* ", "```", "|---", "**"]
             .iter()

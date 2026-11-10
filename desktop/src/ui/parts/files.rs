@@ -158,11 +158,26 @@ fn call_diff_source(call: &ToolCall) -> Option<(u64, BuildFiles)> {
             return Some((hash_of(&[&patch]), Box::new(move || parse(&patch))));
         }
     }
+    let out = tv::output_text(call);
+    let stdout = out.stdout.trim();
+    if !stdout.is_empty()
+        && (stdout.contains("diff --git ")
+            || ((stdout.starts_with("--- ") || stdout.contains("\n--- "))
+                && (stdout.starts_with("+++ ") || stdout.contains("\n+++ "))
+                && stdout.contains("\n@@ ")))
+    {
+        let parsed = parse(stdout);
+        if !parsed.is_empty() && parsed.iter().any(|f| !f.hunks.is_empty()) {
+            let source = hash_of(&[stdout]);
+            let patch = stdout.to_string();
+            return Some((source, Box::new(move || parse(&patch))));
+        }
+    }
     None
 }
 
 /// Lines and file headers a parsed diff draws, for the inline box's height.
-fn diff_rows(cx: &Tcx, id: &str) -> Option<(usize, usize, usize)> {
+pub fn diff_rows(cx: &Tcx, id: &str) -> Option<(usize, usize, usize)> {
     let files = cx.tl()?.diffs.get(id)?.files();
     if files.is_empty() {
         return None;
