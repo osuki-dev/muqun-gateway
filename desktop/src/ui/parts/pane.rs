@@ -243,11 +243,19 @@ impl UiState {
             self.toggle_group(&asid, &sel, tx);
             return true;
         }
-        let detail = self
-            .timelines
-            .get(&asid)
-            .and_then(|t| item(t, &sel))
-            .is_some_and(has_detail);
+        let item_opt = self.timelines.get(&asid).and_then(|t| item(t, &sel));
+        if let Some(item) = item_opt {
+            let (_copy, open) = row_targets(item);
+            if let AgentPart::Tool(call) = &item.part {
+                if activity::tool_kind(call) == tv::ToolKind::Read {
+                    if let Some(path) = open {
+                        self.open_timeline_file(&path);
+                        return true;
+                    }
+                }
+            }
+        }
+        let detail = item_opt.is_some_and(has_detail);
         if detail {
             self.inspect = Some(Inspect { asid, id: sel });
             self.inspect_pane.set_open(true);
@@ -502,5 +510,50 @@ mod tests {
             })
         );
         assert!(s.inspect_pane.is_open());
+    }
+
+    #[test]
+    fn open_selected_for_read_tool_opens_file() {
+        use muqun_gateway::agents::{AgentPart, TimelineItem, TimelineRole, ToolCall};
+        use serde_json::json;
+
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let asid = "s1";
+        s.selected = Some(asid.to_string());
+
+        let call: ToolCall = serde_json::from_value(json!({
+            "id": "call_read_1",
+            "name": "read_file",
+            "state": "completed",
+            "status": "completed",
+            "input": {"path": "/tmp/test_file.rs"},
+            "output": "fn main() {}",
+        }))
+        .expect("valid tool call");
+
+        let item = TimelineItem {
+            id: "row-read".into(),
+            message_id: "m-1".into(),
+            role: TimelineRole::Assistant,
+            part: AgentPart::Tool(call),
+            seq: 0,
+            updated_ms: 0,
+            ordinal: 0,
+            attachments: None,
+            image_assets: None,
+            generation: None,
+            origin: None,
+        };
+
+        let mut tl = SessionTimeline::default();
+        tl.items.push(item);
+        tl.selected = Some("row-read".to_string());
+        s.timelines.insert(asid.to_string(), tl);
+
+        let mut rune_tx = Tx::default();
+        let handled = s.open_selected(&mut rune_tx);
+        assert!(handled);
+        assert_eq!(s.inspect, None);
     }
 }

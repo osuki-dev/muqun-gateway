@@ -247,6 +247,7 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
             }
         }
         ToolKind::Read => {
+            card.open_file_on_press = true;
             card.body = files::read_body(cx, call, &target);
         }
         ToolKind::Edit | ToolKind::Write | ToolKind::Patch => {

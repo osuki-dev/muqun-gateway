@@ -315,6 +315,8 @@ pub struct ToolCard<'a> {
     pub open: Option<String>,
     /// A file the row's Diff button shows in the session diff reviewer.
     pub diff: Option<String>,
+    /// When pressed, directly open the file (e.g. for `Read` tool calls) instead of toggling body.
+    pub open_file_on_press: bool,
 }
 
 impl<'a> ToolCard<'a> {
@@ -337,6 +339,7 @@ impl<'a> ToolCard<'a> {
             copy: None,
             open: None,
             diff: None,
+            open_file_on_press: false,
         }
     }
 
@@ -368,7 +371,10 @@ impl<'a> ToolCard<'a> {
     fn build_row(self, cx: &Tcx) -> El {
         let k = cx.k;
         let id = self.id.to_string();
-        let has_body = self.body.is_some() || self.error.is_some();
+        let open_path = self.open.clone();
+        let open_file_on_press =
+            self.open_file_on_press && self.state != CardState::Failed && open_path.is_some();
+        let has_body = !open_file_on_press && (self.body.is_some() || self.error.is_some());
         let open = has_body && cx.is_open(&id, self.open_default);
         let failed = self.state == CardState::Failed;
         let glyph_color = if failed {
@@ -501,15 +507,30 @@ impl<'a> ToolCard<'a> {
             line = line.fill(k.c.surface_raised_hover);
         }
         let (asid, open_id) = (cx.asid.to_string(), id.clone());
-        let line = k
+        let mut line = k
             .interactive(line)
             .cursor(Cursor::Pointer)
             .hover_group()
             .role("button")
-            .expanded(open)
-            .on_press_tx(move |s: &mut UiState, tx: &mut rune::Tx| {
-                s.press_row_inline(&asid, &open_id, has_body, tx)
-            });
+            .expanded(open);
+        if open_file_on_press {
+            let label = format!("{}: {}", cx.t("Open file", "打开文件"), self.title);
+            line = line.label(label.clone()).help(label);
+        }
+        let line = line.on_press_tx(move |s: &mut UiState, tx: &mut rune::Tx| {
+            if open_file_on_press {
+                if let Some(path) = &open_path {
+                    tx.blur();
+                    s.draft.focused = false;
+                    if let Some(tl) = s.timelines.get_mut(&asid) {
+                        tl.selected = Some(open_id.clone());
+                    }
+                    s.open_timeline_file(path);
+                    return;
+                }
+            }
+            s.press_row_inline(&asid, &open_id, has_body, tx)
+        });
         let asid = cx.asid.to_string();
         let menu_id = id.clone();
         let line = line.on_secondary_press(move |s: &mut UiState, press, _tx: &mut rune::Tx| {
