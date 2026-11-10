@@ -84,10 +84,12 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     // Settings, Inbox and Tasks have none either: their panes take the
     // whole card. Nor has split view: each pane's header is its toolbar.
     split = split.toolbar(
-        if matches!(
-            s.mode,
-            Mode::Home | Mode::Settings | Mode::Inbox | Mode::Tasks
-        ) || (s.mode == Mode::Session && s.in_split())
+        if is_unpaired_remote
+            || matches!(
+                s.mode,
+                Mode::Home | Mode::Settings | Mode::Inbox | Mode::Tasks
+            )
+            || (s.mode == Mode::Session && s.in_split())
         {
             Toolbar::new()
         } else {

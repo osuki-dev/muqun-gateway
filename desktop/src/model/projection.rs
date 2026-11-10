@@ -931,6 +931,7 @@ impl Core {
             *at = Some(std::time::Instant::now());
         }
         tokio::spawn(self.clone().refresh_tasks());
+        tokio::spawn(self.clone().refresh_peers());
         if let Ok(agents) = self.hub.agents().await {
             self.inbox.push(Update::Agents(agents));
         }
@@ -946,6 +947,14 @@ impl Core {
         }
         self.clone().read_tasks().await;
         self.tasks_reading.store(false, Ordering::Release);
+    }
+
+    async fn refresh_peers(self: Arc<Self>) {
+        if let Ok(peers) = self.hub.list_peers().await {
+            self.inbox.push(Update::Composer(Box::new(
+                crate::model::compose::ComposerUpdate::Peers { peers },
+            )));
+        }
     }
 
     async fn read_tasks(self: Arc<Self>) {

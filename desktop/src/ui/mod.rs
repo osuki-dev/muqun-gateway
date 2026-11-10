@@ -338,6 +338,7 @@ pub struct UiState {
     pub pairing_request_id: Option<String>,
     pub pairing_code_input: TextEdit,
     pub pairing_token_input: TextEdit,
+    pub pairing_url_input: TextEdit,
     pub pairing_manual_token_mode: bool,
     pub pairing_transport_required: bool,
     pub pairing_busy: bool,
@@ -524,6 +525,7 @@ impl UiState {
             pairing_request_id: None,
             pairing_code_input: TextEdit::new(""),
             pairing_token_input: TextEdit::new(""),
+            pairing_url_input: TextEdit::new(""),
             pairing_manual_token_mode: false,
             pairing_transport_required: false,
             pairing_busy: false,
@@ -871,6 +873,13 @@ impl UiState {
         self.edit(ConfigEdit::CurrentComputer(id.clone()));
         self.agent_inputs.clear();
         self.agent_errors.clear();
+        self.pairing_request_id = None;
+        self.pairing_busy = false;
+        self.pairing_error = None;
+        self.pairing_code_input.clear();
+        self.pairing_token_input.clear();
+        let default_url = self.peer_url(&id).unwrap_or_default();
+        self.pairing_url_input = TextEdit::new(default_url);
 
         if id != "all" {
             let theme_id = self.cfg.theme_for(&id).to_string();
@@ -1549,9 +1558,11 @@ impl UiState {
                     error,
                 } => {
                     self.pairing_busy = false;
-                    if let Some(_tok) = token {
+                    if let Some(tok) = token {
                         self.pairing_request_id = None;
                         self.pairing_error = None;
+                        let comp = self.cfg.computers.entry(server_id.clone()).or_default();
+                        comp.token = Some(tok);
                         let name = self.computer_name(&server_id);
                         self.toast(
                             format!(
@@ -2122,7 +2133,20 @@ impl UiState {
             ComposerUpdate::Branch { cwd, info } => {
                 self.branches.insert(cwd, info);
             }
-            ComposerUpdate::Peers { peers } => self.peers = peers,
+            ComposerUpdate::Peers { peers } => {
+                for p in &peers {
+                    if p.server_id != "self" && p.server_id != "local" {
+                        let entry = self.cfg.computers.entry(p.server_id.clone()).or_default();
+                        if !p.name.is_empty() {
+                            entry.name = p.name.clone();
+                        }
+                        if let Some(url) = &p.url {
+                            entry.url = Some(url.clone());
+                        }
+                    }
+                }
+                self.peers = peers;
+            }
             ComposerUpdate::AutoApprove { asid, enabled } => {
                 if let Some(on) = enabled {
                     self.auto_approve.insert(asid, on);

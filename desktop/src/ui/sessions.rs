@@ -571,7 +571,8 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                         "关联此桌面即可在此浏览并操作该电脑的会话。",
                     ))
                     .font(k.ty.small)
-                    .color(k.c.text_muted),
+                    .color(k.c.text_muted)
+                    .wrap(),
                 ),
         );
     } else if s.sessions.is_empty() {
