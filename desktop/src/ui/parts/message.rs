@@ -22,13 +22,24 @@ fn rich(cx: &Tcx, id: &str, body: &str) -> El {
     }
 }
 
-/// Drop Codex-style `[Image #N]` tokens once the real pictures are shown.
+/// Drop Codex-style `[Image #N]` (and `[图片 #N]`) tokens once the real pictures are shown.
 pub fn strip_image_placeholders(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(at) = rest.find("[Image #") {
+    while let Some((at, prefix_len)) = match (rest.find("[Image #"), rest.find("[图片 #")) {
+        (Some(a), Some(b)) => {
+            if a <= b {
+                Some((a, "[Image #".len()))
+            } else {
+                Some((b, "[图片 #".len()))
+            }
+        }
+        (Some(a), None) => Some((a, "[Image #".len())),
+        (None, Some(b)) => Some((b, "[图片 #".len())),
+        (None, None) => None,
+    } {
         out.push_str(&rest[..at]);
-        let after = &rest[at + "[Image #".len()..];
+        let after = &rest[at + prefix_len..];
         match after.find(']') {
             Some(end) => rest = after[end + 1..].trim_start(),
             None => {
@@ -402,6 +413,7 @@ mod tests {
     fn picture_tokens_give_way_to_the_thumbnails() {
         for (given, want) in [
             ("[Image #1] what is this", "what is this"),
+            ("[图片 #1] what is this", "what is this"),
             ("before [Image #2] after", "before after"),
             ("![](<file:///tmp/a b.png>)", ""),
             ("see ![chart](out/flow.png) here", "see  here"),

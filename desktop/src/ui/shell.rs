@@ -44,7 +44,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         ),
         Mode::Session => session(s, k, &look, layer),
         Mode::Inbox => inbox::view(s, k),
-        Mode::Tasks => tasks::view(s, k),
+        Mode::Tasks => tasks::view(s, k, layer),
         Mode::Settings => settings::view(s, k, layer),
     };
     let mut main = col().key("main").w_full().h_full().min_h(0.0);

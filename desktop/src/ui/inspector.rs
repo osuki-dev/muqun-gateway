@@ -1,5 +1,7 @@
 //! The right-hand inspector: Queue, Git (with worktrees), Subagents, Saved, Shells.
 
+use std::path::PathBuf;
+
 use muqun_gateway::agents::AgentSessionId;
 use rune::{col, el, row, text, El, ScrollSpec};
 use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, ScrollBar};
@@ -293,15 +295,86 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
     let mut out = vec![heading(k, t("Branch", "分支"))];
     let info = s.current();
     let cwd = info.and_then(|i| i.directory.clone());
+
+    let git_dir = cwd
+        .as_ref()
+        .and_then(|c| crate::model::compose::git_dir(std::path::Path::new(c)));
+    let remote_url = git_dir
+        .as_ref()
+        .and_then(|g| crate::model::compose::parse_git_remote_url(g));
+    let web_url = remote_url
+        .as_deref()
+        .and_then(crate::model::compose::parse_repo_web_url);
+
     match cwd.as_ref().and_then(|c| s.branches.get(c)) {
         Some(b) => {
+            let cur_branch = b.current.clone().unwrap_or_else(|| "detached".into());
             out.push(
-                Badge::new(b.current.clone().unwrap_or_else(|| "detached".into()))
+                Badge::new(cur_branch.clone())
                     .variant(BadgeVariant::Accent)
                     .build(k),
             );
             if !b.local.is_empty() {
                 out.push(muted(k, format!("{} local branch(es)", b.local.len())));
+            }
+
+            let cwd_path = cwd.as_ref().map(PathBuf::from);
+            out.push(small(
+                k,
+                t("Open in Terminal", "在终端中打开 Git"),
+                ButtonVariant::Ghost,
+                "git-open-term".into(),
+                move |s| {
+                    let dir = cwd_path.clone().unwrap_or_else(|| s.terminal_cwd());
+                    s.term_new_tab_in(dir, Some("git status\n".into()));
+                },
+            ));
+
+            if let Some(repo_url) = &web_url {
+                out.push(heading(
+                    k,
+                    t("Remote & Pull Request", "远程与 Pull Request"),
+                ));
+                let host_name = repo_url
+                    .strip_prefix("https://")
+                    .or_else(|| repo_url.strip_prefix("http://"))
+                    .unwrap_or(repo_url);
+                out.push(muted(k, format!("origin: {host_name}")));
+
+                if cur_branch != "main" && cur_branch != "master" && cur_branch != "detached" {
+                    let pr_url = format!("{repo_url}/pull/new/{cur_branch}");
+                    out.push(small(
+                        k,
+                        t("Create Pull Request", "创建 Pull Request"),
+                        ButtonVariant::Outline,
+                        "git-create-pr".into(),
+                        move |_| {
+                            crate::platform::shell::open_url(&pr_url);
+                        },
+                    ));
+                } else {
+                    let pr_list_url = format!("{repo_url}/pulls");
+                    out.push(small(
+                        k,
+                        t("View Pull Requests", "查看 Pull Request 列表"),
+                        ButtonVariant::Outline,
+                        "git-view-prs".into(),
+                        move |_| {
+                            crate::platform::shell::open_url(&pr_list_url);
+                        },
+                    ));
+                }
+
+                let repo_view_url = repo_url.clone();
+                out.push(small(
+                    k,
+                    t("View on GitHub", "在 GitHub 上查看仓库"),
+                    ButtonVariant::Ghost,
+                    "git-view-repo".into(),
+                    move |_| {
+                        crate::platform::shell::open_url(&repo_view_url);
+                    },
+                ));
             }
         }
         None => out.push(empty(

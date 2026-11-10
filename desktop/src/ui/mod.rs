@@ -173,6 +173,8 @@ pub enum OpenMenu {
     Setting(String),
     /// The sidebar's computer picker.
     ComputerPicker,
+    /// The tasks page's computer filter picker.
+    TasksComputerPicker,
 }
 
 /// The view state of one open session: what the timeline and composer read.
@@ -2077,7 +2079,16 @@ impl UiState {
                 }
                 self.draft = TextEdit::new(text);
             }
-            UiAction::ImagePasted(png) => composer::stage_png(self, png),
+            UiAction::ImagePasted(png) => {
+                let token = self.next_token;
+                composer::stage_png(self, png);
+                let draft = if self.mode == Mode::Session {
+                    &mut self.draft
+                } else {
+                    &mut self.start_draft
+                };
+                composer::insert_image_pill(draft, token);
+            }
             UiAction::FilesPicked(paths) => {
                 for path in paths {
                     composer::stage_path(self, path);

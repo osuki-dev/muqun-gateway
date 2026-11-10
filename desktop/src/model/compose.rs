@@ -117,7 +117,7 @@ impl InboxItem {
     }
 }
 
-fn image_name(name: &str) -> bool {
+pub(crate) fn image_name(name: &str) -> bool {
     matches!(
         PathBuf::from(name)
             .extension()
@@ -702,7 +702,7 @@ fn git_root(cwd: &std::path::Path) -> Option<PathBuf> {
     None
 }
 
-fn git_dir(cwd: &std::path::Path) -> Option<PathBuf> {
+pub(crate) fn git_dir(cwd: &std::path::Path) -> Option<PathBuf> {
     for dir in cwd.ancestors().take(24) {
         let dot_git = dir.join(".git");
         if dot_git.is_dir() {
@@ -718,6 +718,37 @@ fn git_dir(cwd: &std::path::Path) -> Option<PathBuf> {
                 dir.join(target)
             });
         }
+    }
+    None
+}
+
+pub(crate) fn parse_git_remote_url(git_dir: &std::path::Path) -> Option<String> {
+    let config = std::fs::read_to_string(git_dir.join("config")).ok()?;
+    let mut in_origin = false;
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_origin = line.eq_ignore_ascii_case(r#"[remote "origin"]"#);
+        } else if in_origin && line.starts_with("url") {
+            if let Some((_, val)) = line.split_once('=') {
+                return Some(val.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn parse_repo_web_url(remote_url: &str) -> Option<String> {
+    let url = remote_url.trim();
+    if let Some(rest) = url.strip_prefix("git@") {
+        if let Some((host, path)) = rest.split_once(':') {
+            let path = path.trim_end_matches(".git");
+            return Some(format!("https://{host}/{path}"));
+        }
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        let clean = url.trim_end_matches(".git");
+        return Some(clean.to_string());
     }
     None
 }
@@ -898,5 +929,21 @@ mod tests {
         assert_eq!(current_branch(&dir).as_deref(), Some("0123456"));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(current_branch(std::path::Path::new("/nonexistent/x")), None);
+    }
+
+    #[test]
+    fn repo_urls_parse_ssh_and_https() {
+        assert_eq!(
+            parse_repo_web_url("git@github.com:muqun/desktop.git").as_deref(),
+            Some("https://github.com/muqun/desktop")
+        );
+        assert_eq!(
+            parse_repo_web_url("https://github.com/muqun/desktop.git").as_deref(),
+            Some("https://github.com/muqun/desktop")
+        );
+        assert_eq!(
+            parse_repo_web_url("https://gitlab.com/group/project").as_deref(),
+            Some("https://gitlab.com/group/project")
+        );
     }
 }

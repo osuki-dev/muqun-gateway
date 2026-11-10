@@ -76,6 +76,7 @@ impl Drop for Release {
     }
 }
 
+#[derive(Clone)]
 pub struct Session {
     tx: mpsc::Sender<Msg>,
     latest: Arc<Mutex<Option<Frame>>>,
@@ -83,6 +84,15 @@ pub struct Session {
     pub cwd: PathBuf,
     /// When the shell started.
     pub started: Instant,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("cwd", &self.cwd)
+            .field("started", &self.started)
+            .finish()
+    }
 }
 
 impl Session {

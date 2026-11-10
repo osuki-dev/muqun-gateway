@@ -1148,6 +1148,28 @@ fn base_scenes() -> &'static [Scene] {
             s.cfg.general.language = crate::config::Language::ZhCn;
         }),
         ("terminal", |s| terminal_scene(s, shell_fixture)),
+        ("terminal-tabs", |s| {
+            terminal_scene(s, shell_fixture);
+            s.term.tabs = vec![
+                super::terminal_panel::TermTab {
+                    id: 1,
+                    session: None,
+                    frame: None,
+                    cwd: std::path::PathBuf::from("/home/ryu/Work/muqun/gateway-desktop"),
+                    title: Some("muqun/gateway-desktop".into()),
+                    pending_command: None,
+                },
+                super::terminal_panel::TermTab {
+                    id: 2,
+                    session: None,
+                    frame: None,
+                    cwd: std::path::PathBuf::from("/home/ryu/Work/muqun/server"),
+                    title: Some("nvim src/main.rs".into()),
+                    pending_command: None,
+                },
+            ];
+            s.term.active_tab = 0;
+        }),
         ("terminal-vim", |s| terminal_scene(s, vim_fixture)),
         ("terminal-ended", |s| {
             terminal_scene(s, shell_fixture);

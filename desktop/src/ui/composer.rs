@@ -32,6 +32,28 @@ fn fresh(text: String) -> TextEdit {
     edit
 }
 
+pub static PHOTO: rune::Icon = rune::Icon {
+    name: "composer-photo",
+    view: 24.0,
+    body: r#"<rect width="18" height="18" x="3" y="3" rx="2" ry="2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="8.5" cy="8.5" r="1.5" fill="none" stroke="currentColor" stroke-width="2"/><polyline points="21 15 16 10 5 21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
+pub fn insert_image_pill(draft: &mut TextEdit, token: u64) -> usize {
+    let count = draft
+        .pills()
+        .filter(|(_, id)| id.starts_with("image:"))
+        .count()
+        + 1;
+    let label = format!("[Image #{count}]");
+    let (_, b) = draft.range();
+    let tail_space = draft.text.get(b..).is_some_and(|t| t.starts_with(' '));
+    draft.insert_pill(format!("image:{token}"), &label);
+    if !tail_space {
+        draft.insert(" ");
+    }
+    count
+}
+
 pub fn stage_png(s: &mut UiState, png: Vec<u8>) {
     let id = s.next_token;
     s.next_token += 1;
@@ -60,19 +82,48 @@ pub fn stage_path(s: &mut UiState, path: PathBuf) {
 pub fn take_paste(s: &mut UiState, content: &rune::ClipboardContent) -> bool {
     let files = content.files();
     if !files.is_empty() {
+        let mut attached_images = 0;
         for path in files {
+            let is_img = crate::model::compose::image_name(&path.to_string_lossy());
+            let token = s.next_token;
             stage_path(s, path.clone());
+            if is_img {
+                attached_images += 1;
+                let draft = if s.mode == super::Mode::Session {
+                    &mut s.draft
+                } else {
+                    &mut s.start_draft
+                };
+                insert_image_pill(draft, token);
+            }
         }
         s.status = if files.len() == 1 {
-            "Attached file".into()
+            if attached_images > 0 {
+                "Attached image".into()
+            } else {
+                "Attached file".into()
+            }
+        } else if attached_images > 0 {
+            format!(
+                "Attached {} files ({} images)",
+                files.len(),
+                attached_images
+            )
         } else {
             format!("Attached {} files", files.len())
         };
         return true;
     }
     if let Some(image) = content.image() {
+        let token = s.next_token;
         stage_png(s, image.png().to_vec());
-        s.status = "Attached image".into();
+        let draft = if s.mode == super::Mode::Session {
+            &mut s.draft
+        } else {
+            &mut s.start_draft
+        };
+        let count = insert_image_pill(draft, token);
+        s.status = format!("Attached image #{}", count);
         return true;
     }
     false
@@ -360,9 +411,18 @@ fn mention_tokens(s: &UiState) -> Vec<crate::model::composer_mentions::MentionTo
     let mut tokens: Vec<_> = s
         .all_computers()
         .iter()
-        .map(|p| MentionToken {
-            text: format!("@{}", p.name),
-            kind: MentionKind::Computer,
+        .flat_map(|p| {
+            let mut list = vec![MentionToken {
+                text: format!("@{}", p.name),
+                kind: MentionKind::Computer,
+            }];
+            if p.server_id != p.name && !p.server_id.is_empty() {
+                list.push(MentionToken {
+                    text: format!("@{}", p.server_id),
+                    kind: MentionKind::Computer,
+                });
+            }
+            list
         })
         .collect();
     tokens.extend(s.mention_file_tokens.iter().map(|path| MentionToken {
@@ -1528,8 +1588,8 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let placeholder = if has_session {
         let full = tr_ref(
             language,
-            "Message…  (/ commands, $ skills, @ files)",
-            "发消息…（/ 命令，$ 技能，@ 文件）",
+            "Message…  (/ commands, $ skills, @ mentions)",
+            "发消息…（/ 命令，$ 技能，@ 电脑或文件）",
         );
         // A narrow card keeps the hint to one line.
         if rune::text::measure(full, &[], k.ty.ui, None).0 + 24.0 <= inner {
@@ -1556,6 +1616,11 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                     PillStyle::default().bg(accent.alpha(0.22)).fg(accent)
                 } else if id.starts_with("file:") {
                     PillStyle::default().bg(info.alpha(0.18)).fg(info)
+                } else if id.starts_with("image:") {
+                    PillStyle::default()
+                        .bg(info.mix(accent, 0.4).alpha(0.22))
+                        .fg(accent)
+                        .icon(&PHOTO)
                 } else {
                     PillStyle::default()
                 }
@@ -1599,4 +1664,22 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .pt(6.0)
         .pb(14.0)
         .child(card.w_full().max_w(column))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inserting_multiple_images_paces_and_numbers_them() {
+        let mut draft = TextEdit::new("Problem 1: ");
+        draft.set_caret(draft.text.len());
+        insert_image_pill(&mut draft, 101);
+        draft.insert("Problem 2: ");
+        insert_image_pill(&mut draft, 102);
+
+        assert_eq!(draft.text, "Problem 1: [Image #1] Problem 2: [Image #2] ");
+        let pills: Vec<_> = draft.pills().map(|(_, id)| id).collect();
+        assert_eq!(pills, vec!["image:101", "image:102"]);
+    }
 }

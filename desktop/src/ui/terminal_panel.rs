@@ -44,6 +44,24 @@ static RESTART: rune::Icon = rune::Icon {
     body: r#"<path d="M4 9a8 8 0 0 1 14-3l3 3M3 15l3 3a8 8 0 0 0 14-3M21 4v5h-5M3 20v-5h5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
+static PLUS: rune::Icon = rune::Icon {
+    name: "plus",
+    view: 24.0,
+    body: r#"<path d="M12 5v14m-7-7h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
+/// One tab within the terminal panel.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct TermTab {
+    pub id: u64,
+    pub session: Option<Session>,
+    pub frame: Option<Frame>,
+    pub cwd: PathBuf,
+    pub title: Option<String>,
+    pub pending_command: Option<String>,
+}
+
 /// The grid's type: the mono slot (JetBrains Mono where installed).
 const FONT_SIZE: f32 = 13.0;
 const LINE: f32 = 17.0;
@@ -79,6 +97,9 @@ pub fn metrics() -> Metrics {
 pub struct TermPanel {
     pub open: bool,
     pub pane: PaneState,
+    pub tabs: Vec<TermTab>,
+    pub active_tab: usize,
+    pub next_tab_id: u64,
     pub session: Option<Session>,
     pub frame: Option<Frame>,
     /// The keyboard sink on the cursor cell (see the module docs).
@@ -120,6 +141,9 @@ impl TermPanel {
                 .range(360.0, super::panes::UNBOUNDED)
                 .with_width(width)
                 .collapsed(),
+            tabs: Vec::new(),
+            active_tab: 0,
+            next_tab_id: 1,
             session: None,
             frame: None,
             sink: TextEdit::new(""),
@@ -375,16 +399,124 @@ impl UiState {
         }
     }
 
+    /// Open a new terminal tab in `cwd`, optionally executing `command`.
+    pub fn term_new_tab(&mut self) {
+        let cwd = self.terminal_cwd();
+        self.term_new_tab_in(cwd, None);
+    }
+
+    pub fn term_new_tab_in(&mut self, cwd: PathBuf, command: Option<String>) {
+        self.open_terminal();
+        if self.term.tabs.is_empty() {
+            if self.term.session.is_some() || self.term.frame.is_some() {
+                let id = self.term.next_tab_id;
+                self.term.next_tab_id += 1;
+                let cur_cwd = self
+                    .term
+                    .session
+                    .as_ref()
+                    .map(|s| s.cwd.clone())
+                    .unwrap_or_else(|| self.terminal_cwd());
+                self.term.tabs.push(TermTab {
+                    id,
+                    session: self.term.session.clone(),
+                    frame: self.term.frame.clone(),
+                    cwd: cur_cwd,
+                    title: None,
+                    pending_command: None,
+                });
+            }
+        } else if let Some(cur) = self.term.tabs.get_mut(self.term.active_tab) {
+            cur.session = self.term.session.clone();
+            cur.frame = self.term.frame.clone();
+        }
+
+        let id = self.term.next_tab_id;
+        self.term.next_tab_id += 1;
+        self.term.tabs.push(TermTab {
+            id,
+            session: None,
+            frame: None,
+            cwd: cwd.clone(),
+            title: None,
+            pending_command: command.clone(),
+        });
+        self.term.active_tab = self.term.tabs.len() - 1;
+        self.term.session = None;
+        self.term.frame = None;
+        self.term.pending_command = command;
+        self.start_terminal_in(cwd);
+        self.term.sink.focused = true;
+    }
+
+    pub fn term_switch_tab(&mut self, index: usize) {
+        if index >= self.term.tabs.len() || index == self.term.active_tab {
+            return;
+        }
+        if let Some(cur) = self.term.tabs.get_mut(self.term.active_tab) {
+            cur.session = self.term.session.clone();
+            cur.frame = self.term.frame.clone();
+        }
+        self.term.active_tab = index;
+        self.term.session = self.term.tabs[index].session.clone();
+        self.term.frame = self.term.tabs[index].frame.clone();
+        if let Some(size) = self.term.size {
+            self.term.send(Msg::Resize(size));
+        }
+        self.term.sink.focused = true;
+    }
+
+    pub fn term_close_tab(&mut self, index: usize) {
+        if index >= self.term.tabs.len() {
+            if self.term.tabs.is_empty() {
+                self.close_terminal();
+            }
+            return;
+        }
+        if self.term.tabs.len() <= 1 {
+            self.term.tabs.clear();
+            self.close_terminal();
+            return;
+        }
+        if index == self.term.active_tab {
+            if let Some(session) = &self.term.session {
+                session.send(Msg::Shutdown);
+            }
+            self.term.tabs.remove(index);
+            self.term.active_tab = self.term.active_tab.min(self.term.tabs.len() - 1);
+            self.term.session = self.term.tabs[self.term.active_tab].session.clone();
+            self.term.frame = self.term.tabs[self.term.active_tab].frame.clone();
+            if let Some(size) = self.term.size {
+                self.term.send(Msg::Resize(size));
+            }
+        } else {
+            let tab = self.term.tabs.remove(index);
+            if let Some(s) = tab.session {
+                s.send(Msg::Shutdown);
+            }
+            if index < self.term.active_tab {
+                self.term.active_tab -= 1;
+            }
+        }
+        self.term.sink.focused = true;
+    }
+
     /// End the shell and start a new one in the focused session's folder.
     pub fn restart_terminal(&mut self) {
         self.term.session = None;
         self.term.frame = None;
         self.term.error = None;
-        self.start_terminal();
+        let cwd = self
+            .term
+            .tabs
+            .get(self.term.active_tab)
+            .map(|t| t.cwd.clone())
+            .unwrap_or_else(|| self.terminal_cwd());
+        self.start_terminal_in(cwd);
     }
 
     /// Where a new shell starts: the focused session's folder, else home.
-    fn terminal_cwd(&self) -> PathBuf {
+    pub fn terminal_cwd(&self) -> PathBuf {
         self.current()
             .and_then(|info| info.directory.clone())
             .map(PathBuf::from)
@@ -394,6 +526,11 @@ impl UiState {
     }
 
     fn start_terminal(&mut self) {
+        let cwd = self.terminal_cwd();
+        self.start_terminal_in(cwd);
+    }
+
+    fn start_terminal_in(&mut self, cwd: PathBuf) {
         if self.term.fixture.is_some() || self.term.session.is_some() {
             return;
         }
@@ -404,12 +541,28 @@ impl UiState {
         ) else {
             return;
         };
-        match Session::start(self.terminal_cwd(), size, colors, waker) {
+        match Session::start(cwd.clone(), size, colors, waker) {
             Ok(session) => {
                 if let Some(cmd) = self.term.pending_command.take() {
                     session.send(Msg::Text(cmd));
                 }
-                self.term.session = Some(session);
+                self.term.session = Some(session.clone());
+                if self.term.tabs.is_empty() {
+                    let id = self.term.next_tab_id;
+                    self.term.next_tab_id += 1;
+                    self.term.tabs.push(TermTab {
+                        id,
+                        session: Some(session),
+                        frame: None,
+                        cwd,
+                        title: None,
+                        pending_command: None,
+                    });
+                    self.term.active_tab = 0;
+                } else if let Some(active) = self.term.tabs.get_mut(self.term.active_tab) {
+                    active.session = Some(session);
+                    active.cwd = cwd;
+                }
                 self.term.sent = Some(colors);
                 self.term.error = None;
             }
@@ -481,8 +634,18 @@ impl UiState {
             }
         }
         if let Some(frame) = self.term.session.as_ref().and_then(Session::take_frame) {
-            self.term.frame = Some(frame);
+            self.term.frame = Some(frame.clone());
+            if let Some(active) = self.term.tabs.get_mut(self.term.active_tab) {
+                active.frame = Some(frame);
+            }
             changed = true;
+        }
+        for (i, tab) in self.term.tabs.iter_mut().enumerate() {
+            if i != self.term.active_tab {
+                if let Some(frame) = tab.session.as_ref().and_then(Session::take_frame) {
+                    tab.frame = Some(frame);
+                }
+            }
         }
         self.settle_terminal() | changed
     }
@@ -498,10 +661,16 @@ impl UiState {
             Some(ended) if ended_well(ended, session.started.elapsed()) => {
                 self.term.session = None;
                 self.term.frame = None;
-                if self.term.open {
-                    self.close_terminal();
+                if self.term.tabs.len() > 1 {
+                    self.term_close_tab(self.term.active_tab);
+                    true
+                } else {
+                    self.term.tabs.clear();
+                    if self.term.open {
+                        self.close_terminal();
+                    }
+                    true
                 }
-                true
             }
             _ => false,
         }
@@ -510,6 +679,20 @@ impl UiState {
     /// A key while the terminal has the keyboard (the sink's key handler).
     fn terminal_key(&mut self, ev: &KeyEvent, tx: &mut Tx) -> bool {
         let mac = crate::platform::keys::Style::current() == crate::platform::keys::Style::Symbols;
+        let letter =
+            |c: char| matches!(&ev.key, rune::Key::Command(k) if k.eq_ignore_ascii_case(&c));
+        // Tab shortcuts: Ctrl+Shift+T (new tab) and Ctrl+Shift+W (close tab)
+        if (ev.mods.ctrl && ev.mods.shift && !ev.mods.alt) || (mac && ev.mods.logo && ev.mods.shift)
+        {
+            if letter('t') {
+                self.term_new_tab();
+                return true;
+            }
+            if letter('w') {
+                self.term_close_tab(self.term.active_tab);
+                return true;
+            }
+        }
         match input::route(ev, tx.physical_key(), mac) {
             Route::Toggle => self.toggle_terminal(),
             Route::Copy => {
@@ -582,48 +765,121 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         .and_then(Session::ended)
         .or(s.term.fixture_ended);
 
-    let title = frame
-        .map(|f| f.title.clone())
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| {
-            let cwd = s
-                .term
-                .session
+    let tab_count = s.term.tabs.len().max(1);
+    let mut tabs_strip = row()
+        .key("terminal-tabs-strip")
+        .gap(4.0)
+        .center_y()
+        .shrink()
+        .min_w(0.0)
+        .grow(1.0);
+
+    for i in 0..tab_count {
+        let is_active = i == s.term.active_tab;
+        let tab_title = if is_active {
+            frame
+                .map(|f| f.title.clone())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| {
+                    let cwd = s
+                        .term
+                        .session
+                        .as_ref()
+                        .map(|x| x.cwd.clone())
+                        .unwrap_or_else(|| s.terminal_cwd());
+                    short_path(&cwd)
+                })
+        } else if let Some(tab) = s.term.tabs.get(i) {
+            tab.frame
                 .as_ref()
-                .map(|x| x.cwd.clone())
-                .unwrap_or_else(|| s.terminal_cwd());
-            short_path(&cwd)
-        });
-    // The title strip: on the panel's floor, as tall as the main card's
-    // toolbar so the two rows line up; then the grid, inset in the floor.
+                .map(|f| f.title.clone())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| short_path(&tab.cwd))
+        } else {
+            format!("Tab {}", i + 1)
+        };
+
+        let (bg_color, fg_color, border_color) = if is_active {
+            (k.c.layer_01, k.c.text_base, k.c.border_base)
+        } else {
+            (
+                k.c.bg_base.alpha(0.0),
+                k.c.text_muted,
+                k.c.border_base.alpha(0.0),
+            )
+        };
+
+        let mut tab_pill = row()
+            .key(format!("terminal-tab-{i}"))
+            .h(26.0)
+            .pl(8.0)
+            .pr(if tab_count > 1 { 2.0 } else { 8.0 })
+            .gap(5.0)
+            .center_y()
+            .fill(bg_color)
+            .border(1.0, border_color)
+            .clip_rounded(6.0)
+            .cursor(rune::Cursor::Pointer)
+            .on_press(move |s: &mut UiState| s.term_switch_tab(i))
+            .child(
+                rune::icon(&TERMINAL_WINDOW, 12.0)
+                    .color(if is_active {
+                        k.c.text_accent
+                    } else {
+                        k.c.icon_muted
+                    })
+                    .a11y_hidden(),
+            )
+            .child(
+                text(tab_title)
+                    .font(k.ty.caption())
+                    .color(fg_color)
+                    .truncate()
+                    .shrink()
+                    .max_w(130.0),
+            );
+
+        if tab_count > 1 {
+            let close_tab = IconButton::new(k.glyph.close)
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .label(tr_ref(language, "Close tab", "关闭标签页"))
+                .on_press(move |s: &mut UiState| s.term_close_tab(i))
+                .build(k)
+                .key(format!("terminal-tab-close-{i}"));
+            tab_pill = tab_pill.child(close_tab);
+        }
+
+        tabs_strip = tabs_strip.child(tab_pill);
+    }
+
+    let add_tab_btn = IconButton::new(&PLUS)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .label(tr_ref(
+            language,
+            "New tab (Ctrl+Shift+T)",
+            "新建标签页 (Ctrl+Shift+T)",
+        ))
+        .on_press(|s: &mut UiState| s.term_new_tab())
+        .build(k)
+        .key("terminal-new-tab");
+    tabs_strip = tabs_strip.child(add_tab_btn);
+
     let header = row()
         .key("terminal-head")
         .w_full()
         .h(HEAD)
-        .pl(INSET + 4.0)
+        .pl(INSET)
         .pr(INSET)
         .gap(6.0)
         .center_y()
-        .child(
-            rune::icon(&TERMINAL_WINDOW, 14.0)
-                .color(k.c.icon_muted)
-                .a11y_hidden(),
-        )
-        .child(
-            text(title)
-                .key("terminal-title")
-                .font(k.ty.caption())
-                .color(k.c.text_base)
-                .truncate()
-                .shrink()
-                .min_w(0.0)
-                .grow(1.0),
-        )
+        .child(tabs_strip)
         .child(
             IconButton::new(&RESTART)
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
-                .label(tr_ref(language, "New shell", "新的 Shell"))
+                .label(tr_ref(language, "Restart shell", "重启 Shell"))
                 .on_press(|s: &mut UiState| s.restart_terminal())
                 .build(k)
                 .key("terminal-restart"),
@@ -1197,5 +1453,38 @@ mod tests {
             state.term.pending_command.as_deref(),
             Some("nvim '/tmp/test_file.rs'\n")
         );
+    }
+
+    #[test]
+    fn terminal_tabs_lifecycle_new_switch_close() {
+        let (tx, _rx) = commands::channel();
+        let mut state = UiState::new(tx);
+        state.open_terminal();
+        assert!(state.term.open);
+
+        // Initially 0 or 1 tab
+        state.term_new_tab_in(PathBuf::from("/tmp"), None);
+        assert_eq!(state.term.tabs.len(), 1);
+        assert_eq!(state.term.active_tab, 0);
+
+        // Open second tab
+        state.term_new_tab_in(PathBuf::from("/home"), Some("echo tab2\n".into()));
+        assert_eq!(state.term.tabs.len(), 2);
+        assert_eq!(state.term.active_tab, 1);
+        assert_eq!(state.term.tabs[1].cwd, PathBuf::from("/home"));
+
+        // Switch back to tab 0
+        state.term_switch_tab(0);
+        assert_eq!(state.term.active_tab, 0);
+        assert_eq!(state.term.tabs[0].cwd, PathBuf::from("/tmp"));
+
+        // Close tab 1
+        state.term_close_tab(1);
+        assert_eq!(state.term.tabs.len(), 1);
+        assert_eq!(state.term.active_tab, 0);
+
+        // Close last tab closes the terminal panel
+        state.term_close_tab(0);
+        assert!(!state.term.open);
     }
 }

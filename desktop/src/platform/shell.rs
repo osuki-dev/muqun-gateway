@@ -180,3 +180,27 @@ pub fn open_path(path: &Path) {
         Err(err) => tracing::warn!(opener, "could not open {}: {err}", path.display()),
     }
 }
+
+/// Open an HTTP(S) URL in the user's default browser.
+pub fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(target_os = "windows")]
+    let opener = "explorer";
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let opener = "xdg-open";
+    match std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(err) => tracing::warn!(opener, "could not open url {url}: {err}"),
+    }
+}

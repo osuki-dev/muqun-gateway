@@ -690,8 +690,8 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
     composer::popup(s, k, layer, Slot::Start);
     let placeholder = tr_ref(
         language,
-        "Describe the task…  (/ commands, $ skills, @ files)",
-        "描述任务…（/ 命令，$ 技能，@ 文件）",
+        "Describe the task…  (/ commands, $ skills, @ mentions)",
+        "描述任务…（/ 命令，$ 技能，@ 电脑或文件）",
     );
     let accent = k.c.bg_accent;
     let info = k.c.info.icon;
@@ -706,6 +706,11 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
                     rune::PillStyle::default().bg(accent.alpha(0.22)).fg(accent)
                 } else if id.starts_with("file:") {
                     rune::PillStyle::default().bg(info.alpha(0.18)).fg(info)
+                } else if id.starts_with("image:") {
+                    rune::PillStyle::default()
+                        .bg(info.mix(accent, 0.4).alpha(0.22))
+                        .fg(accent)
+                        .icon(&composer::PHOTO)
                 } else {
                     rune::PillStyle::default()
                 }

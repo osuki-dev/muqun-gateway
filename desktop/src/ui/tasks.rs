@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use rune::{col, el, row, text, El, TextEdit, Tx};
 use rune_kit::{
-    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Keybind, Kit, ScrollBar,
-    SegmentedControl, Spinner, TextInput,
+    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Keybind, Kit, Menu,
+    MenuItem, ScrollBar, SegmentedControl, Spinner, TextInput,
 };
 
 use super::copy::{tr, tr_ref};
@@ -269,7 +269,7 @@ const AGENT_W: f32 = 128.0;
 const STATE_W: f32 = 104.0;
 const TIME_W: f32 = 64.0;
 
-pub fn view(s: &UiState, k: &Kit) -> El {
+pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let language = s.cfg.general.language;
     // On a very wide card the table and its detail stay together.
     let card_w = rune::memo::layout_with("main", |r| r[2])
@@ -310,7 +310,7 @@ pub fn view(s: &UiState, k: &Kit) -> El {
         .key("tasks")
         .max_w(MAX_W)
         .child(head(s, k, card_w < STACK_AT))
-        .children((!s.tasks.is_empty()).then(|| filters(s, k)))
+        .children((!s.tasks.is_empty()).then(|| filters(s, k, layer)))
         .children(error_line(s, k))
         .child(body);
     super::card_stage(
@@ -409,7 +409,7 @@ fn head(s: &UiState, k: &Kit, stacked: bool) -> El {
         .child(delegate)
 }
 
-fn filters(s: &UiState, k: &Kit) -> El {
+fn filters(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let language = s.cfg.general.language;
     let v = &s.tasks_view;
     let labels: Vec<String> = Filter::ALL
@@ -444,33 +444,105 @@ fn filters(s: &UiState, k: &Kit) -> El {
                 .key("tasks-state"),
         );
     let mut machines: Vec<String> = s.tasks.iter().filter_map(|t| t.machine.clone()).collect();
+    for comp in s.all_computers() {
+        if comp.server_id != "local" && comp.server_id != "self" && comp.server_id != "all" {
+            machines.push(comp.name.clone());
+        }
+    }
     machines.sort();
     machines.dedup();
     if !machines.is_empty() {
-        let mut labels = vec![
-            tr(language, "All computers", "所有电脑"),
-            tr(language, "This computer", "本机"),
-        ];
-        labels.extend(machines.iter().cloned());
-        let at = match &v.machine {
-            None => 0,
-            Some(None) => 1,
-            Some(Some(m)) => machines.iter().position(|x| x == m).map_or(0, |i| i + 2),
+        let open = s.menu == Some(super::OpenMenu::TasksComputerPicker);
+        let (icon_glyph, display_name) = match &v.machine {
+            None => (
+                &super::parts::glyphs::NETWORK,
+                tr(language, "All computers", "所有电脑"),
+            ),
+            Some(None) => (
+                &super::parts::glyphs::COMPUTER,
+                tr(language, "This computer", "本机"),
+            ),
+            Some(Some(m)) => (&super::parts::glyphs::COMPUTER, m.clone()),
         };
-        bar = bar.child(
-            SegmentedControl::new(&labels, Some(at))
-                .fit()
-                .label(tr_ref(language, "Computer", "电脑"))
-                .on_pick(move |s: &mut UiState, i, _: &mut Tx| {
-                    s.tasks_view.machine = match i {
-                        0 => None,
-                        1 => Some(None),
-                        n => Some(machines.get(n - 2).cloned()),
-                    };
-                })
-                .build(k)
-                .key("tasks-machine"),
+
+        let trigger = rune::row()
+            .key("tasks-computer-picker-trigger")
+            .h(32.0)
+            .px(10.0)
+            .gap(8.0)
+            .center_y()
+            .radius(k.radius.md)
+            .fill(k.c.layer_01)
+            .border(
+                1.0,
+                if open {
+                    k.c.border_focus
+                } else {
+                    k.c.border_weak
+                },
+            )
+            .cursor(rune::Cursor::Pointer)
+            .role("button")
+            .label(tr_ref(language, "Filter by computer", "按电脑筛选"))
+            .child(rune::icon(icon_glyph, 14.0).color(k.c.text_base))
+            .child(
+                rune::text(display_name)
+                    .font(k.ty.ui_medium)
+                    .color(k.c.text_base),
+            )
+            .child(
+                rune::text(if open { "▴" } else { "▾" })
+                    .font(k.ty.small)
+                    .color(k.c.text_muted),
+            )
+            .on_press(|s: &mut UiState| {
+                let open = s.menu == Some(super::OpenMenu::TasksComputerPicker);
+                s.menu = (!open).then_some(super::OpenMenu::TasksComputerPicker);
+            });
+
+        let mut menu = Menu::new("tasks-computer-picker-menu")
+            .trigger(trigger)
+            .open(open)
+            .min_width(200.0)
+            .placement(rune_kit::Placement::BottomStart)
+            .on_close(|s: &mut UiState| s.menu = None);
+
+        menu = menu.item(
+            MenuItem::new(super::copy::tr_ref(language, "All computers", "所有电脑"))
+                .lead(rune::icon(&super::parts::glyphs::NETWORK, 15.0).color(k.c.text_accent))
+                .checked(v.machine.is_none())
+                .on_select(|s: &mut UiState| {
+                    s.menu = None;
+                    s.tasks_view.machine = None;
+                }),
         );
+
+        menu = menu.item(
+            MenuItem::new(super::copy::tr_ref(language, "This computer", "本机"))
+                .lead(rune::icon(&super::parts::glyphs::COMPUTER, 15.0).color(k.c.text_base))
+                .checked(v.machine == Some(None))
+                .on_select(|s: &mut UiState| {
+                    s.menu = None;
+                    s.tasks_view.machine = Some(None);
+                }),
+        );
+
+        menu = menu.separator();
+        for m in machines {
+            let is_curr = v.machine == Some(Some(m.clone()));
+            let target = m.clone();
+            menu = menu.item(
+                MenuItem::new(m)
+                    .lead(rune::icon(&super::parts::glyphs::COMPUTER, 15.0).color(k.c.text_base))
+                    .checked(is_curr)
+                    .on_select(move |s: &mut UiState| {
+                        s.menu = None;
+                        s.tasks_view.machine = Some(Some(target.clone()));
+                    }),
+            );
+        }
+
+        bar = bar.child(menu.build(k, layer).key("tasks-machine"));
     }
     bar.child(el().grow(1.0)).child(
         IconButton::new(&super::icons::REFRESH)
