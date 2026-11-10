@@ -73,6 +73,416 @@ pub fn open(editor: Editor, folder: &Path) -> std::io::Result<()> {
     Err(err)
 }
 
+/// Open `path` with an editor or appropriate system app.
+pub fn open_file(
+    path: &Path,
+    custom_command: Option<&str>,
+    choice: Option<Editor>,
+) -> std::io::Result<()> {
+    let abs_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+
+    if is_text_or_code(&abs_path) {
+        if let Some(cmd) = custom_command.filter(|c| !c.trim().is_empty()) {
+            if try_custom_command(cmd, &abs_path)? {
+                return Ok(());
+            }
+        }
+
+        if let Some(editor) = choice {
+            if matches!(editor, Editor::VsCode | Editor::Zed | Editor::Cursor)
+                && try_editor_choice(editor, &abs_path)?
+            {
+                return Ok(());
+            }
+        }
+
+        if try_open_editor(&abs_path)? {
+            return Ok(());
+        }
+    }
+
+    super::shell::open_path(&abs_path);
+    Ok(())
+}
+
+/// Try opening a code/text file with the system's default editor (Omarchy launcher, $EDITOR, or terminal).
+pub fn try_open_editor(path: &Path) -> std::io::Result<bool> {
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        if try_omarchy_launcher(path)? {
+            return Ok(true);
+        }
+        if try_env_editor(path)? {
+            return Ok(true);
+        }
+        if try_xdg_mime_editor(path)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub fn is_text_or_code(path: &Path) -> bool {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        return matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "rs" | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "py"
+                | "c"
+                | "cpp"
+                | "cc"
+                | "cxx"
+                | "h"
+                | "hpp"
+                | "go"
+                | "rb"
+                | "php"
+                | "java"
+                | "kt"
+                | "swift"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "fish"
+                | "lua"
+                | "zig"
+                | "nim"
+                | "json"
+                | "jsonc"
+                | "json5"
+                | "toml"
+                | "yaml"
+                | "yml"
+                | "xml"
+                | "html"
+                | "htm"
+                | "css"
+                | "scss"
+                | "sass"
+                | "less"
+                | "sql"
+                | "md"
+                | "markdown"
+                | "txt"
+                | "log"
+                | "conf"
+                | "cfg"
+                | "ini"
+                | "env"
+                | "diff"
+                | "patch"
+                | "lock"
+                | "dockerfile"
+                | "graphql"
+                | "proto"
+                | "svg"
+        );
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "makefile" | "dockerfile" | "license" | "readme" | "gemfile" | "rakefile" | "vagrantfile"
+    )
+}
+
+pub fn is_terminal_editor(program: &str) -> bool {
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "nvim" | "vim" | "vi" | "nano" | "micro" | "hx" | "helix" | "fresh" | "emacs"
+    )
+}
+
+fn try_custom_command(cmd: &str, path: &Path) -> std::io::Result<bool> {
+    let path_str = path.to_string_lossy();
+    let full = if cmd.contains("{}") {
+        cmd.replace("{}", &path_str)
+    } else {
+        format!("{cmd} {path_str}")
+    };
+    let parts: Vec<&str> = full.split_whitespace().collect();
+    let Some(prog) = parts.first() else {
+        return Ok(false);
+    };
+    let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    if is_terminal_editor(prog) {
+        return launch_in_terminal(prog, &args, path.parent());
+    }
+
+    let mut command = Command::new(prog);
+    command.args(&args);
+    if let Some(dir) = path.parent() {
+        command.current_dir(dir);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    match command.spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
+}
+
+fn try_editor_choice(editor: Editor, path: &Path) -> std::io::Result<bool> {
+    let p = path.to_string_lossy();
+    let cmds: Vec<(&str, Vec<&str>)> = if cfg!(target_os = "macos") {
+        match editor {
+            Editor::VsCode => vec![("open", vec!["-a", "Visual Studio Code", p.as_ref()])],
+            Editor::Zed => vec![("open", vec!["-a", "Zed", p.as_ref()])],
+            Editor::Cursor => vec![("open", vec!["-a", "Cursor", p.as_ref()])],
+            _ => Vec::new(),
+        }
+    } else if cfg!(target_os = "windows") {
+        match editor {
+            Editor::VsCode => vec![("code.cmd", vec![p.as_ref()])],
+            Editor::Zed => vec![("zed", vec![p.as_ref()])],
+            Editor::Cursor => vec![("cursor.cmd", vec![p.as_ref()])],
+            _ => Vec::new(),
+        }
+    } else {
+        match editor {
+            Editor::VsCode => vec![("code", vec![p.as_ref()])],
+            Editor::Zed => vec![("zed", vec![p.as_ref()]), ("zeditor", vec![p.as_ref()])],
+            Editor::Cursor => vec![("cursor", vec![p.as_ref()])],
+            _ => Vec::new(),
+        }
+    };
+
+    for (bin, args) in cmds {
+        let mut cmd = Command::new(bin);
+        cmd.args(&args);
+        if let Some(dir) = path.parent() {
+            cmd.current_dir(dir);
+        }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Ok(mut child) = cmd.spawn() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn try_omarchy_launcher(path: &Path) -> std::io::Result<bool> {
+    let mut cmd = Command::new("omarchy-launch-editor");
+    cmd.arg(path);
+    if let Some(dir) = path.parent() {
+        cmd.current_dir(dir);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    match cmd.spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn try_env_editor(path: &Path) -> std::io::Result<bool> {
+    let env_ed = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .ok();
+    let Some(raw) = env_ed.filter(|e| !e.trim().is_empty()) else {
+        return Ok(false);
+    };
+
+    if raw.contains("omarchy-launch-editor") {
+        return try_omarchy_launcher(path);
+    }
+
+    let parts: Vec<&str> = raw.split_whitespace().collect();
+    let Some(prog) = parts.first() else {
+        return Ok(false);
+    };
+    let mut args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+    args.push(path.to_string_lossy().to_string());
+
+    if is_terminal_editor(prog) {
+        launch_in_terminal(prog, &args, path.parent())
+    } else {
+        let mut cmd = Command::new(prog);
+        cmd.args(&args);
+        if let Some(dir) = path.parent() {
+            cmd.current_dir(dir);
+        }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        match cmd.spawn() {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn try_xdg_mime_editor(path: &Path) -> std::io::Result<bool> {
+    let Ok(out) = Command::new("xdg-mime")
+        .args(["query", "default", "text/plain"])
+        .output()
+    else {
+        return Ok(false);
+    };
+    let desktop = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if desktop.is_empty() {
+        return Ok(false);
+    }
+
+    let lower = desktop.to_ascii_lowercase();
+    let prog = if lower.contains("nvim") {
+        Some("nvim")
+    } else if lower.contains("vim") {
+        Some("vim")
+    } else if lower.contains("nano") {
+        Some("nano")
+    } else if lower.contains("helix") || lower.contains("hx") {
+        Some("hx")
+    } else {
+        None
+    };
+
+    if let Some(editor) = prog {
+        let p = path.to_string_lossy().to_string();
+        return launch_in_terminal(editor, &[p], path.parent());
+    }
+
+    Ok(false)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn launch_in_terminal(program: &str, args: &[String], cwd: Option<&Path>) -> std::io::Result<bool> {
+    // 1. Try omarchy-launch-tui
+    let mut cmd = Command::new("omarchy-launch-tui");
+    cmd.arg(program).args(args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Ok(mut child) = cmd.spawn() {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        return Ok(true);
+    }
+
+    // 2. Try xdg-terminal-exec
+    let mut cmd = Command::new("xdg-terminal-exec");
+    cmd.arg("-e").arg(program).args(args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Ok(mut child) = cmd.spawn() {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        return Ok(true);
+    }
+
+    // 3. Try $TERMINAL
+    if let Ok(term) = std::env::var("TERMINAL") {
+        if !term.trim().is_empty() {
+            let mut cmd = Command::new(&term);
+            cmd.arg("-e").arg(program).args(args);
+            if let Some(dir) = cwd {
+                cmd.current_dir(dir);
+            }
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Ok(mut child) = cmd.spawn() {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Ok(true);
+            }
+        }
+    }
+
+    // 4. Try common terminals
+    for term in [
+        "ghostty",
+        "kitty",
+        "alacritty",
+        "foot",
+        "wezterm",
+        "gnome-terminal",
+        "konsole",
+        "x-terminal-emulator",
+    ] {
+        let mut cmd = Command::new(term);
+        match term {
+            "kitty" | "foot" => {
+                cmd.arg(program).args(args);
+            }
+            "wezterm" => {
+                cmd.arg("start").arg("--").arg(program).args(args);
+            }
+            "gnome-terminal" => {
+                cmd.arg("--").arg(program).args(args);
+            }
+            _ => {
+                cmd.arg("-e").arg(program).args(args);
+            }
+        }
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Ok(mut child) = cmd.spawn() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 /// The commands to try for `folder`, the first that starts wins.
 fn commands(editor: Editor, folder: &str) -> Vec<(String, Vec<String>)> {
     let run = |program: &str, args: &[&str]| {
@@ -152,5 +562,29 @@ mod tests {
         assert_eq!(json, "\"vs-code\"");
         let back: Editor = serde_json::from_str("\"file-manager\"").unwrap();
         assert_eq!(back, Editor::FileManager);
+    }
+
+    #[test]
+    fn test_is_text_or_code() {
+        assert!(is_text_or_code(Path::new("main.rs")));
+        assert!(is_text_or_code(Path::new("src/ui/pane.rs")));
+        assert!(is_text_or_code(Path::new("config.toml")));
+        assert!(is_text_or_code(Path::new("Dockerfile")));
+        assert!(is_text_or_code(Path::new("Makefile")));
+        assert!(!is_text_or_code(Path::new("photo.png")));
+        assert!(!is_text_or_code(Path::new("video.mp4")));
+    }
+
+    #[test]
+    fn test_is_terminal_editor() {
+        assert!(is_terminal_editor("nvim"));
+        assert!(is_terminal_editor("/usr/bin/nvim"));
+        assert!(is_terminal_editor("vim"));
+        assert!(is_terminal_editor("nano"));
+        assert!(is_terminal_editor("hx"));
+        assert!(is_terminal_editor("helix"));
+        assert!(!is_terminal_editor("code"));
+        assert!(!is_terminal_editor("zed"));
+        assert!(!is_terminal_editor("cursor"));
     }
 }

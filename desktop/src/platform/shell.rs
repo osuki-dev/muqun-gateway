@@ -150,6 +150,14 @@ pub fn relaunch_self() {
 
 /// Open a file or folder with the OS default handler (images, video, …).
 pub fn open_path(path: &Path) {
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        if path.is_file() && super::editors::is_text_or_code(path) {
+            if let Ok(true) = super::editors::try_open_editor(path) {
+                return;
+            }
+        }
+    }
     #[cfg(target_os = "macos")]
     let opener = "open";
     #[cfg(target_os = "windows")]

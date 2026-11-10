@@ -439,14 +439,25 @@ fn header(v: &Viewer, k: &Kit, language: Language) -> El {
     if let Some(path) = v.path.clone() {
         let open = path.clone();
         let reveal = path.clone();
+        let is_text = v.kind.reads_text();
         bar = bar
             .child(
-                Button::new(tr_ref(language, "Open with system app", "用系统应用打开"))
-                    .icon(&OPEN_EXTERNAL)
-                    .variant(ButtonVariant::Ghost)
-                    .on_press(move |_: &mut UiState| crate::platform::shell::open_path(&open))
-                    .build(k)
-                    .key("viewer-open"),
+                Button::new(if is_text {
+                    tr_ref(language, "Open in editor", "在编辑器中打开")
+                } else {
+                    tr_ref(language, "Open with system app", "用系统应用打开")
+                })
+                .icon(&OPEN_EXTERNAL)
+                .variant(ButtonVariant::Ghost)
+                .on_press(move |s: &mut UiState| {
+                    let _ = crate::platform::editors::open_file(
+                        &open,
+                        s.cfg.general.editor_command.as_deref(),
+                        Some(s.cfg.general.editor),
+                    );
+                })
+                .build(k)
+                .key("viewer-open"),
             )
             .child(
                 Button::new(tr_ref(language, "Reveal in folder", "在文件夹中显示"))
@@ -792,14 +803,25 @@ fn external(v: &Viewer, k: &Kit, language: Language) -> El {
         )
         .child(text(what).font(k.ty.ui).color(k.c.text_muted));
     if let Some(path) = v.path.clone() {
+        let is_text = v.kind.reads_text();
         card = card.child(
-            Button::new(tr_ref(language, "Open with system app", "用系统应用打开"))
-                .icon(&OPEN_EXTERNAL)
-                .variant(ButtonVariant::Contrast)
-                .on_press(move |_: &mut UiState| crate::platform::shell::open_path(&path))
-                .build(k)
-                .key("viewer-external-open")
-                .mt(6.0),
+            Button::new(if is_text {
+                tr_ref(language, "Open in editor", "在编辑器中打开")
+            } else {
+                tr_ref(language, "Open with system app", "用系统应用打开")
+            })
+            .icon(&OPEN_EXTERNAL)
+            .variant(ButtonVariant::Contrast)
+            .on_press(move |s: &mut UiState| {
+                let _ = crate::platform::editors::open_file(
+                    &path,
+                    s.cfg.general.editor_command.as_deref(),
+                    Some(s.cfg.general.editor),
+                );
+            })
+            .build(k)
+            .key("viewer-external-open")
+            .mt(6.0),
         );
     }
     card
