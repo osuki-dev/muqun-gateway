@@ -8,9 +8,7 @@ use rune::El;
 use rune::{el, TextEdit, Tx};
 use rune_kit::glyphs::{FOLDER, FOLDER_OPEN, SEARCH, TRIANGLE_DOWN};
 use rune_kit::shell::{Sidebar, SidebarRow};
-use rune_kit::{
-    ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem, SegmentedControl, TextInput,
-};
+use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem, TextInput};
 
 use super::icons::{INBOX, SETTINGS, TASK};
 use super::{ago, now_ms, title_of, Activity, Mode, OpenMenu, UiState};
@@ -491,47 +489,150 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     })
 }
 
-fn computer_segmented_bar(s: &UiState, k: &Kit) -> El {
+fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let language = s.cfg.general.language;
     let curr = s.current_computer();
+    let open = s.menu == Some(OpenMenu::ComputerPicker);
 
-    let mut ids = vec!["all".to_string(), "local".to_string()];
-    let mut labels = vec![
-        super::copy::tr(language, "All computers", "所有电脑"),
-        super::copy::tr(language, "This computer", "本机"),
-    ];
-
-    for comp in s.all_computers() {
-        let cid = comp.server_id.clone();
-        if cid == "self" || cid == "local" || cid == "all" {
-            continue;
-        }
-        labels.push(comp.name.clone());
-        ids.push(cid);
-    }
-
-    let at = if curr == "all" {
-        Some(0)
-    } else if curr == "local" || curr == "self" {
-        Some(1)
+    let (icon_el, display_name, status_desc) = if curr == "all" {
+        (
+            rune::icon(&super::parts::glyphs::NETWORK, 15.0).color(k.c.text_accent),
+            super::copy::tr(language, "All computers", "全部电脑"),
+            super::copy::tr(language, "Fleet", "舰队"),
+        )
     } else {
-        ids.iter().position(|id| id == curr)
+        let name = s.computer_name(curr);
+        let peer = s.peer_by_id(curr);
+        let reachable = peer.map(|p| p.reachable).unwrap_or(true);
+        let status_color = if reachable {
+            k.c.success.fg
+        } else {
+            k.c.warning.fg
+        };
+        (
+            rune::icon(&super::parts::glyphs::COMPUTER, 16.0).color(status_color),
+            name,
+            if reachable {
+                super::copy::tr(language, "Online", "在线")
+            } else {
+                super::copy::tr(language, "Offline", "离线")
+            },
+        )
     };
 
-    SegmentedControl::new(&labels, at)
-        .width(None)
-        .label(super::copy::tr_ref(language, "Computer", "电脑"))
-        .on_pick(move |s: &mut UiState, i, _: &mut Tx| {
-            if let Some(target_id) = ids.get(i) {
-                if s.is_computer_paired(target_id) {
-                    s.switch_computer(target_id.clone());
-                } else {
-                    s.open_pairing(target_id.clone());
-                }
-            }
-        })
-        .build(k)
-        .key("sidebar-computer-segmented")
+    let trigger = rune::row()
+        .key("computer-switcher-trigger")
+        .w_full()
+        .h(32.0)
+        .px(10.0)
+        .gap(8.0)
+        .center_y()
+        .radius(k.radius.md)
+        .fill(k.c.layer_01)
+        .border(
+            1.0,
+            if open {
+                k.c.border_focus
+            } else {
+                k.c.border_weak
+            },
+        )
+        .cursor(rune::Cursor::Pointer)
+        .role("button")
+        .label(super::copy::tr_ref(language, "Switch computer", "切换电脑"))
+        .child(icon_el)
+        .child(
+            rune::text(display_name)
+                .font(k.ty.ui_medium)
+                .color(k.c.text_base)
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0),
+        )
+        .child(
+            rune::text(status_desc)
+                .font(k.ty.caption())
+                .color(k.c.text_muted),
+        )
+        .child(
+            rune::text(if open { "▴" } else { "▾" })
+                .font(k.ty.small)
+                .color(k.c.text_muted),
+        )
+        .on_press(|s: &mut UiState| {
+            let open = s.menu == Some(OpenMenu::ComputerPicker);
+            s.menu = (!open).then_some(OpenMenu::ComputerPicker);
+        });
+
+    let mut menu = Menu::new("computer-switcher-menu")
+        .trigger(trigger)
+        .open(open)
+        .min_width(240.0)
+        .placement(rune_kit::Placement::BottomStart)
+        .on_close(|s: &mut UiState| s.menu = None);
+
+    // 1. All computers option
+    menu = menu.item(
+        MenuItem::new(super::copy::tr_ref(language, "All computers", "全部电脑"))
+            .description(super::copy::tr_ref(
+                language,
+                "Show all sessions",
+                "聚合所有电脑会话",
+            ))
+            .lead(rune::icon(&super::parts::glyphs::NETWORK, 15.0).color(k.c.text_accent))
+            .checked(curr == "all")
+            .on_select(|s: &mut UiState| {
+                s.menu = None;
+                s.switch_computer("all".to_string());
+            }),
+    );
+
+    menu = menu.separator();
+
+    // 2. Individual computers
+    for comp in s.all_computers() {
+        let cid = comp.server_id.clone();
+        if cid == "all" {
+            continue;
+        }
+        let is_curr = curr == cid || (curr == "local" && cid == "self");
+        let reachable = comp.reachable;
+        let is_paired = s.is_computer_paired(&cid);
+
+        let desc = if !reachable {
+            super::copy::tr(language, "Offline", "离线")
+        } else if !is_paired {
+            super::copy::tr(language, "Unpaired · Click to link", "未配对 · 点击授权")
+        } else if cid == "local" || cid == "self" {
+            super::copy::tr(language, "This computer", "本机")
+        } else {
+            super::copy::tr(language, "Online", "在线")
+        };
+
+        let target_id = cid.clone();
+        let status_color = if reachable {
+            k.c.success.fg
+        } else {
+            k.c.warning.fg
+        };
+
+        menu = menu.item(
+            MenuItem::new(comp.name.clone())
+                .description(desc)
+                .lead(rune::icon(&super::parts::glyphs::COMPUTER, 16.0).color(status_color))
+                .checked(is_curr)
+                .on_select(move |s: &mut UiState| {
+                    s.menu = None;
+                    if s.is_computer_paired(&target_id) {
+                        s.switch_computer(target_id.clone());
+                    } else {
+                        s.open_pairing(target_id.clone());
+                    }
+                }),
+        );
+    }
+
+    menu.build(k, layer)
 }
 
 pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
@@ -540,7 +641,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .key("sidebar-header-box")
         .w_full()
         .gap(8.0)
-        .child(computer_segmented_bar(s, k))
+        .child(computer_switcher(s, k, layer))
         .child(search(s, k));
 
     let mut sidebar = Sidebar::new()

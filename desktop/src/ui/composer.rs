@@ -358,7 +358,7 @@ fn mention_search_target(s: &UiState, slot: Slot) -> Option<(String, String)> {
 fn mention_tokens(s: &UiState) -> Vec<crate::model::composer_mentions::MentionToken> {
     use crate::model::composer_mentions::{MentionKind, MentionToken};
     let mut tokens: Vec<_> = s
-        .peers
+        .all_computers()
         .iter()
         .map(|p| MentionToken {
             text: format!("@{}", p.name),
@@ -877,10 +877,14 @@ fn mention_popup(s: &UiState, slot: Slot) -> PopupState {
     }
     let language = s.cfg.general.language;
     let term = query.term.to_lowercase();
-    let mut peers: Vec<_> = s
-        .peers
-        .iter()
-        .filter(|p| p.name.to_lowercase().starts_with(&term))
+    let all_comps = s.all_computers();
+    let mut peers: Vec<_> = all_comps
+        .into_iter()
+        .filter(|p| {
+            p.name.to_lowercase().starts_with(&term)
+                || p.server_id.to_lowercase().starts_with(&term)
+                || term.is_empty()
+        })
         .collect();
     peers.sort_by_key(|p| match (p.current, p.reachable) {
         (true, _) => 0,

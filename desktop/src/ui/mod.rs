@@ -171,6 +171,8 @@ pub enum OpenMenu {
     Tile(usize),
     /// A dropdown on a Settings page (by its key).
     Setting(String),
+    /// The sidebar's computer picker.
+    ComputerPicker,
 }
 
 /// The view state of one open session: what the timeline and composer read.
@@ -1000,7 +1002,6 @@ impl UiState {
             }
             self.load_draft(asid);
             self.menu = None;
-            self.peers.clear();
             self.timelines.remove(asid);
             self.retain_timelines();
             self.queue.clear();
@@ -1012,6 +1013,9 @@ impl UiState {
         }
         self.status = format!("Opening {asid}");
         self.send(Command::OpenSession(AgentSessionId(asid.to_string())));
+        self.send(Command::Compose(
+            crate::model::compose::ComposeCommand::ListPeers,
+        ));
     }
 
     pub fn go(&mut self, mode: Mode) {
