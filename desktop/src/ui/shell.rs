@@ -25,33 +25,27 @@ use crate::theme::look::Look;
 
 pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> El {
     let look = s.look();
-    let curr = s.current_computer();
-    let is_unpaired_remote = !s.is_computer_paired(curr);
 
-    let page = if is_unpaired_remote && s.mode != Mode::Settings {
-        super::pair_computer::view(s, k)
-    } else {
-        match s.mode {
-            // Composed for the card's size: the first frame guesses, the
-            // layout read re-runs the view once the card is laid out.
-            Mode::Home => home::view(
-                s,
-                k,
-                cx.layout_size("main-pane").unwrap_or([1080.0, 860.0]),
-                cx.layout_size("home-dock"),
-                layer,
-            ),
-            Mode::Session if s.in_split() => tiles::view(
-                s,
-                k,
-                tiles::toggle_clearance(s, crate::platform::titlebar_inset(cx.titlebar_inset())),
-                layer,
-            ),
-            Mode::Session => session(s, k, &look, layer),
-            Mode::Inbox => inbox::view(s, k),
-            Mode::Tasks => tasks::view(s, k),
-            Mode::Settings => settings::view(s, k, layer),
-        }
+    let page = match s.mode {
+        // Composed for the card's size: the first frame guesses, the
+        // layout read re-runs the view once the card is laid out.
+        Mode::Home => home::view(
+            s,
+            k,
+            cx.layout_size("main-pane").unwrap_or([1080.0, 860.0]),
+            cx.layout_size("home-dock"),
+            layer,
+        ),
+        Mode::Session if s.in_split() => tiles::view(
+            s,
+            k,
+            tiles::toggle_clearance(s, crate::platform::titlebar_inset(cx.titlebar_inset())),
+            layer,
+        ),
+        Mode::Session => session(s, k, &look, layer),
+        Mode::Inbox => inbox::view(s, k),
+        Mode::Tasks => tasks::view(s, k),
+        Mode::Settings => settings::view(s, k, layer),
     };
     let mut main = col().key("main").w_full().h_full().min_h(0.0);
     if let Some(alert) = alert(s, k) {
@@ -84,12 +78,10 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     // Settings, Inbox and Tasks have none either: their panes take the
     // whole card. Nor has split view: each pane's header is its toolbar.
     split = split.toolbar(
-        if is_unpaired_remote
-            || matches!(
-                s.mode,
-                Mode::Home | Mode::Settings | Mode::Inbox | Mode::Tasks
-            )
-            || (s.mode == Mode::Session && s.in_split())
+        if matches!(
+            s.mode,
+            Mode::Home | Mode::Settings | Mode::Inbox | Mode::Tasks
+        ) || (s.mode == Mode::Session && s.in_split())
         {
             Toolbar::new()
         } else {

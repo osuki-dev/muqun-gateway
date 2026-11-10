@@ -743,6 +743,9 @@ pub enum EscStep {
 
 /// The step Esc would take now; `None` leaves it alone.
 pub fn esc_step(s: &UiState) -> Option<EscStep> {
+    if s.pairing_target.is_some() {
+        return Some(EscStep::Dialog);
+    }
     if s.keys_sheet.is_some() || s.palette.is_some() {
         return Some(EscStep::Sheet);
     }
@@ -791,7 +794,9 @@ pub fn escape(s: &mut UiState) -> bool {
             }
         }
         EscStep::Dialog => {
-            if s.voice.is_some() {
+            if s.pairing_target.is_some() {
+                s.close_pairing();
+            } else if s.voice.is_some() {
                 s.cancel_voice();
             } else if s.viewer.is_some() {
                 s.close_viewer();

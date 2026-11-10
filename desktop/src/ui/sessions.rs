@@ -523,7 +523,11 @@ fn computer_segmented_bar(s: &UiState, k: &Kit) -> El {
         .label(super::copy::tr_ref(language, "Computer", "电脑"))
         .on_pick(move |s: &mut UiState, i, _: &mut Tx| {
             if let Some(target_id) = ids.get(i) {
-                s.switch_computer(target_id.clone());
+                if s.is_computer_paired(target_id) {
+                    s.switch_computer(target_id.clone());
+                } else {
+                    s.open_pairing(target_id.clone());
+                }
             }
         })
         .build(k)
@@ -542,40 +546,8 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let mut sidebar = Sidebar::new()
         .label(super::copy::tr_ref(language, "Sessions", "会话"))
         .header(header_box);
-    let curr = s.current_computer();
-    let is_unpaired_remote = !s.is_computer_paired(curr);
 
-    if is_unpaired_remote {
-        sidebar = sidebar.child(
-            rune::col()
-                .key("sidebar-unpaired-box")
-                .px(12.0)
-                .py(12.0)
-                .gap(6.0)
-                .radius(8.0)
-                .fill(k.c.layer_01)
-                .border(1.0, k.c.border_muted)
-                .child(
-                    rune::text(super::copy::tr(
-                        language,
-                        "Computer not linked",
-                        "电脑尚未关联会话",
-                    ))
-                    .font(k.ty.ui_medium)
-                    .color(k.c.text_base),
-                )
-                .child(
-                    rune::text(super::copy::tr(
-                        language,
-                        "Authorize this desktop to see sessions on this machine.",
-                        "关联此桌面即可在此浏览并操作该电脑的会话。",
-                    ))
-                    .font(k.ty.small)
-                    .color(k.c.text_muted)
-                    .wrap(),
-                ),
-        );
-    } else if s.sessions.is_empty() {
+    if s.sessions.is_empty() {
         sidebar = sidebar.child(
             rune::text(super::copy::tr_ref(
                 language,
@@ -788,6 +760,16 @@ mod tests {
         let k = Kit::neutral(s.dark);
         let mut layer = Vec::new();
         let _el = view(&s, &k, &mut layer);
+
+        // Unpaired computer does not switch directly, it opens pairing dialog
+        assert!(!s.is_computer_paired("m2"));
+        s.open_pairing("m2".into());
+        assert_eq!(s.pairing_target.as_deref(), Some("m2"));
+        let mut modal_layer = Vec::new();
+        crate::ui::pair_computer::mount(&s, &k, &mut modal_layer);
+        assert!(!modal_layer.is_empty());
+        s.close_pairing();
+        assert_eq!(s.pairing_target, None);
 
         // Switch to mini
         s.switch_computer("m2".into());

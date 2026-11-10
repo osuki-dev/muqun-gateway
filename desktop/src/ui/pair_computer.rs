@@ -1,4 +1,4 @@
-//! Computer Pairing View: shown when a selected remote computer is not yet paired.
+//! Computer Pairing Modal: shown when the user chooses an unpaired remote computer.
 
 use rune::{col, row, text, El};
 use rune_kit::{Button, ButtonVariant, Kit, TextInput};
@@ -7,13 +7,16 @@ use super::copy::tr;
 use super::UiState;
 use crate::model::commands::Command;
 
-pub fn view(s: &UiState, k: &Kit) -> El {
+pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
+    let Some(target_id) = &s.pairing_target else {
+        return;
+    };
+
     let look = s.look();
     let language = s.cfg.general.language;
-    let curr = s.current_computer().to_string();
-    let name = s.computer_name(&curr);
-    let peer = s.peer_by_id(&curr);
-    let url = s.peer_url(&curr).unwrap_or_default();
+    let name = s.computer_name(target_id);
+    let peer = s.peer_by_id(target_id);
+    let url = s.peer_url(target_id).unwrap_or_default();
     let reachable = peer.map(|p| p.reachable).unwrap_or(true);
 
     let effective_url = if !s.pairing_url_input.text.trim().is_empty() {
@@ -30,7 +33,7 @@ pub fn view(s: &UiState, k: &Kit) -> El {
         .px(32.0)
         .py(32.0);
 
-    // 1. Header with Title & Computer Badge
+    // 1. Header with Title, Status & Close Button
     let status_color = if reachable {
         k.c.success.fg
     } else {
@@ -46,24 +49,39 @@ pub fn view(s: &UiState, k: &Kit) -> El {
         .gap(8.0)
         .child(
             row()
-                .gap(10.0)
+                .w_full()
                 .center_y()
                 .child(
-                    text(format!("💻 {}", name))
-                        .font(k.ty.ui_medium)
-                        .color(k.c.text_base),
-                )
-                .child(
                     row()
-                        .gap(6.0)
+                        .gap(10.0)
                         .center_y()
-                        .px(8.0)
-                        .py(2.0)
-                        .radius(999.0)
-                        .fill(k.c.layer_01)
-                        .border(1.0, k.c.border_muted)
-                        .child(rune::el().w(6.0).h(6.0).radius(3.0).fill(status_color))
-                        .child(text(status_text).font(k.ty.caption()).color(k.c.text_muted)),
+                        .child(
+                            text(format!("💻 {}", name))
+                                .font(k.ty.ui_medium)
+                                .color(k.c.text_base),
+                        )
+                        .child(
+                            row()
+                                .gap(6.0)
+                                .center_y()
+                                .px(8.0)
+                                .py(2.0)
+                                .radius(999.0)
+                                .fill(k.c.layer_01)
+                                .border(1.0, k.c.border_muted)
+                                .child(rune::el().w(6.0).h(6.0).radius(3.0).fill(status_color))
+                                .child(
+                                    text(status_text).font(k.ty.caption()).color(k.c.text_muted),
+                                ),
+                        ),
+                )
+                .child(rune::el().grow(1.0))
+                .child(
+                    Button::new("✕")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(|s: &mut UiState| s.close_pairing())
+                        .build(k)
+                        .key("pair-close-x"),
                 ),
         )
         .child(
@@ -139,12 +157,12 @@ pub fn view(s: &UiState, k: &Kit) -> El {
 
     // 5. Pairing Form: Mode A (Pairing Code) vs Mode B (Manual Token)
     let busy = s.pairing_busy;
-    let target_id = curr.clone();
+    let target = target_id.clone();
     let target_url = effective_url.clone();
 
     if s.pairing_manual_token_mode {
         // Mode B: Manual Token
-        let token_target = target_id.clone();
+        let token_target = target.clone();
         let token_url = target_url.clone();
         let token_val = s.pairing_token_input.text.trim().to_string();
 
@@ -207,6 +225,13 @@ pub fn view(s: &UiState, k: &Kit) -> El {
                                 s.pairing_manual_token_mode = false;
                                 s.pairing_error = None;
                             }),
+                    )
+                    .child(
+                        Button::new(tr(language, "Cancel", "取消"))
+                            .variant(ButtonVariant::Ghost)
+                            .build(k)
+                            .key("pair-token-cancel")
+                            .on_press(|s: &mut UiState| s.close_pairing()),
                     ),
             );
 
@@ -214,7 +239,7 @@ pub fn view(s: &UiState, k: &Kit) -> El {
     } else {
         // Mode A: Pairing Code
         if let Some(req_id) = &s.pairing_request_id {
-            let claim_target = target_id.clone();
+            let claim_target = target.clone();
             let claim_url = target_url.clone();
             let claim_req_id = req_id.clone();
             let claim_code = s.pairing_code_input.text.trim().to_string();
@@ -285,7 +310,7 @@ pub fn view(s: &UiState, k: &Kit) -> El {
 
             card = card.child(form);
         } else {
-            let req_target = target_id.clone();
+            let req_target = target.clone();
             let req_url = target_url.clone();
 
             let form = col().gap(12.0).child(
@@ -328,6 +353,13 @@ pub fn view(s: &UiState, k: &Kit) -> El {
                                 s.pairing_manual_token_mode = true;
                                 s.pairing_error = None;
                             }),
+                    )
+                    .child(
+                        Button::new(tr(language, "Cancel", "取消"))
+                            .variant(ButtonVariant::Ghost)
+                            .build(k)
+                            .key("pair-request-cancel")
+                            .on_press(|s: &mut UiState| s.close_pairing()),
                     ),
             );
 
@@ -342,15 +374,31 @@ pub fn view(s: &UiState, k: &Kit) -> El {
         panel = panel.box_shadow(shadow);
     }
 
-    let container = col()
-        .key("pair-computer-container")
-        .w_full()
-        .h_full()
-        .items_center()
-        .justify_center()
-        .px(24.0)
-        .py(24.0)
-        .child(panel);
+    let panel = panel.modal(true, |s: &mut UiState| s.close_pairing());
 
-    super::card_stage("pair-computer", container)
+    // Scrim overlay
+    layer.push(
+        rune::el()
+            .key("pair-scrim")
+            .absolute(0.0, 0.0)
+            .w_full()
+            .h_full()
+            .fill(k.c.black.alpha(if s.dark { 0.5 } else { 0.26 }))
+            .token_motion(k.motion.overlay)
+            .a11y_hidden(),
+    );
+
+    // Modal dialog centered
+    layer.push(
+        col()
+            .key("pair-layer")
+            .absolute(0.0, 0.0)
+            .w_full()
+            .h_full()
+            .items_center()
+            .justify_center()
+            .px(32.0)
+            .py(48.0)
+            .child(panel),
+    );
 }

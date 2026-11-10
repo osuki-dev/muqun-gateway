@@ -335,6 +335,7 @@ pub struct UiState {
     pub worktrees: Vec<WorktreeRow>,
 
     pub search: TextEdit,
+    pub pairing_target: Option<String>,
     pub pairing_request_id: Option<String>,
     pub pairing_code_input: TextEdit,
     pub pairing_token_input: TextEdit,
@@ -522,6 +523,7 @@ impl UiState {
             shells: Vec::new(),
             worktrees: Vec::new(),
             search: TextEdit::new(""),
+            pairing_target: None,
             pairing_request_id: None,
             pairing_code_input: TextEdit::new(""),
             pairing_token_input: TextEdit::new(""),
@@ -803,6 +805,28 @@ impl UiState {
             return Some("local".to_string());
         }
         None
+    }
+
+    pub fn open_pairing(&mut self, target_id: String) {
+        let default_url = self.peer_url(&target_id).unwrap_or_default();
+        self.pairing_target = Some(target_id);
+        self.pairing_request_id = None;
+        self.pairing_busy = false;
+        self.pairing_error = None;
+        self.pairing_manual_token_mode = false;
+        self.pairing_code_input.clear();
+        self.pairing_token_input.clear();
+        self.pairing_url_input = TextEdit::new(default_url);
+    }
+
+    pub fn close_pairing(&mut self) {
+        self.pairing_target = None;
+        self.pairing_request_id = None;
+        self.pairing_busy = false;
+        self.pairing_error = None;
+        self.pairing_manual_token_mode = false;
+        self.pairing_code_input.clear();
+        self.pairing_token_input.clear();
     }
 
     pub fn switch_computer(&mut self, id: String) {
@@ -1559,8 +1583,7 @@ impl UiState {
                 } => {
                     self.pairing_busy = false;
                     if let Some(tok) = token {
-                        self.pairing_request_id = None;
-                        self.pairing_error = None;
+                        self.close_pairing();
                         let comp = self.cfg.computers.entry(server_id.clone()).or_default();
                         comp.token = Some(tok);
                         let name = self.computer_name(&server_id);
@@ -2466,6 +2489,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     viewer::mount(s, &k, cx.env().scale, &mut layer);
     palette::mount(s, &k, &mut layer);
     shortcuts::mount(s, &k, &mut layer);
+    pair_computer::mount(s, &k, &mut layer);
     if !s.toasts.is_empty() {
         let mut region = ToastRegion::new();
         for t in &s.toasts {
