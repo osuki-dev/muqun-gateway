@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use muqun_gateway::agents::{AgentSessionId, ModelRef};
-use rune::{col, el, row, El, ImageCache, PillStyle, SurfaceFit, TextEdit, Tx};
+use rune::{col, el, row, text, El, ImageCache, PillStyle, SurfaceFit, TextEdit, Tx};
 use rune_kit::{
-    Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, Menu, MenuItem, PopupItem,
-    PopupList, TextArea,
+    Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, Menu, MenuItem, ScrollBar,
+    TextArea,
 };
 
 use super::art;
@@ -1063,8 +1063,8 @@ fn choose(s: &mut UiState, slot: Slot, query: &crate::model::composer_popup::Pop
     apply_pick(s, slot, query, &insert, kind);
 }
 
-/// The draft field's keys while a popup is open: ↑ ↓ move (wrapping, over
-/// headers and offline computers), Tab or Return pick, Esc dismisses.
+/// The draft field's keys while a popup is open: ↑ ↓ and Tab switch (wrapping, over
+/// headers and offline computers), Enter picks, Esc dismisses.
 pub(super) fn popup_key(s: &mut UiState, slot: Slot, ev: &rune::KeyEvent) -> bool {
     if ev.mods.cmd || ev.mods.ctrl || ev.mods.alt {
         return false;
@@ -1093,7 +1093,32 @@ pub(super) fn popup_key(s: &mut UiState, slot: Slot, ev: &rune::KeyEvent) -> boo
             s.popup_active = Some((query.start, query.term.clone(), picks[next]));
             true
         }
-        rune::Key::Tab | rune::Key::Enter if !ev.mods.shift => {
+        rune::Key::Tab => {
+            if picks.is_empty() {
+                return true;
+            }
+            if ev.mods.shift {
+                let here = at
+                    .and_then(|a| picks.iter().position(|p| *p == a))
+                    .unwrap_or(0);
+                let next = (here + picks.len() - 1) % picks.len();
+                s.popup_active = Some((query.start, query.term.clone(), picks[next]));
+                true
+            } else if picks.len() == 1 {
+                let at = picks[0];
+                let (query, id) = (query.clone(), rows[at].id.clone());
+                choose(s, slot, &query, &id);
+                true
+            } else {
+                let here = at
+                    .and_then(|a| picks.iter().position(|p| *p == a))
+                    .unwrap_or(0);
+                let next = (here + 1) % picks.len();
+                s.popup_active = Some((query.start, query.term.clone(), picks[next]));
+                true
+            }
+        }
+        rune::Key::Enter if !ev.mods.shift => {
             let Some(at) = at else {
                 return false;
             };
@@ -1110,18 +1135,6 @@ pub(super) fn popup_key(s: &mut UiState, slot: Slot, ev: &rune::KeyEvent) -> boo
     }
 }
 
-fn popup_rows(state: &PopupState) -> Vec<PopupItem> {
-    state
-        .rows()
-        .iter()
-        .map(|r| {
-            PopupItem::new(r.id.clone(), r.label.clone())
-                .description(r.description.clone())
-                .disabled(r.disabled)
-        })
-        .collect()
-}
-
 fn mount_popup(
     s: &UiState,
     k: &Kit,
@@ -1134,43 +1147,218 @@ fn mount_popup(
     if !state.open() {
         return;
     }
-    let items = popup_rows(&state);
-    if items.is_empty() {
+    let PopupState::Open { query, rows } = &state else {
+        return;
+    };
+    if rows.is_empty() {
         return;
     }
     let active = active_row(s, &state);
-    let query = state.query().cloned();
-    let hover_query = query.clone();
-    // Over the field the draft is typed in (below it when the window has
-    // no room above), never the window's corner: Home's field is not the
-    // session composer.
+    let look = s.look();
     let anchor = match slot {
         Slot::Session => "draft",
         Slot::Start => "start-draft",
     };
-    PopupList::<UiState>::new(key, anchor)
-        .anchored(anchor, rune::Side::Top, rune::Align::Start, 6.0)
-        .width(380.0)
-        .max_height(300.0)
+
+    let close_query = query.clone();
+    layer.push(
+        el().key(format!("{key}-scrim"))
+            .absolute(0.0, 0.0)
+            .w_full()
+            .h_full()
+            .on_press(move |s: &mut UiState| {
+                s.popup_dismissed_at = Some(close_query.start);
+                s.popup_active = None;
+            }),
+    );
+
+    let header = row()
+        .key(format!("{key}-header"))
+        .w_full()
+        .px(10.0)
+        .py(4.0)
+        .center_y()
+        .child(
+            text(label.to_string())
+                .font(k.ty.small_medium)
+                .color(k.c.text_faint),
+        );
+
+    let mut row_els = col()
+        .key("popup-rows")
+        .w_full()
+        .growth(rune::GrowthSpec::default());
+
+    for (i, r) in rows.iter().enumerate() {
+        let is_active = active == Some(i);
+        let id = r.id.clone();
+
+        if r.id.starts_with("hdr:") {
+            let hdr = row()
+                .key(format!("{key}-hdr-{i}"))
+                .w_full()
+                .h(24.0)
+                .px(10.0)
+                .center_y()
+                .child(text(&r.label).font(k.ty.small_medium).color(k.c.text_faint));
+            row_els = row_els.child(hdr);
+            continue;
+        }
+
+        let glyph = if id.starts_with("c:") {
+            &super::parts::glyphs::TERMINAL
+        } else if id.starts_with("s:") {
+            &super::parts::glyphs::WORKFLOW
+        } else if id.starts_with("p:") {
+            &super::parts::glyphs::COMPUTER
+        } else {
+            &super::parts::glyphs::DOCUMENT
+        };
+
+        let icon_color = if is_active {
+            k.c.text_accent
+        } else {
+            k.c.icon_muted
+        };
+
+        let mut item = row()
+            .key(format!("{key}-opt-{id}"))
+            .role("option")
+            .label(&r.label)
+            .description(&r.description)
+            .position_in_set(i + 1, rows.len())
+            .focus_selected(is_active)
+            .w_full()
+            .h(30.0)
+            .px(8.0)
+            .gap(8.0)
+            .center_y()
+            .radius(k.radius.md);
+
+        if is_active {
+            item = item.child(
+                el().key("accent-bar")
+                    .w(3.0)
+                    .h(14.0)
+                    .radius(1.5)
+                    .fill(k.c.bg_accent),
+            );
+        } else {
+            item = item.child(el().key("indent").w(3.0).h(14.0));
+        }
+
+        item = item.child(rune::icon(glyph, 14.0).color(icon_color).a11y_hidden());
+
+        if !r.description.is_empty() {
+            item = item
+                .child(
+                    text(&r.label)
+                        .font(k.ty.ui_compact)
+                        .color(if is_active {
+                            k.c.text_accent
+                        } else {
+                            k.c.text_base
+                        })
+                        .shrink()
+                        .truncate()
+                        .a11y_hidden(),
+                )
+                .child(
+                    text(&r.description)
+                        .key("desc")
+                        .font(k.ty.ui_compact)
+                        .color(if is_active {
+                            k.c.text_muted
+                        } else {
+                            k.c.text_weak
+                        })
+                        .grow(1.0)
+                        .shrink()
+                        .truncate()
+                        .a11y_hidden(),
+                );
+        } else {
+            item = item.child(
+                text(&r.label)
+                    .font(k.ty.ui_compact)
+                    .color(if is_active {
+                        k.c.text_accent
+                    } else {
+                        k.c.text_base
+                    })
+                    .grow(1.0)
+                    .shrink()
+                    .truncate()
+                    .a11y_hidden(),
+            );
+        }
+
+        if r.disabled {
+            item = item.layer_opacity(0.45).disabled(true);
+        } else {
+            if is_active {
+                item = item.fill(k.c.bg_accent.alpha(if s.dark { 0.20 } else { 0.14 }));
+                item = look.accent_rim(k, item, k.c.bg_accent);
+            } else {
+                item = item.hover(k.c.hover);
+            }
+
+            let q_hover = query.clone();
+            let q_press = query.clone();
+            let id_clone = id.clone();
+            item = item
+                .on_hover(move |s: &mut UiState| {
+                    s.popup_active = Some((q_hover.start, q_hover.term.clone(), i));
+                })
+                .on_press_tx(move |s: &mut UiState, _tx: &mut Tx| {
+                    choose(s, slot, &q_press, &id_clone);
+                });
+        }
+
+        row_els = row_els.child(item);
+    }
+
+    let viewport = col()
+        .key("popup-viewport")
+        .role("listbox")
         .label(label)
-        .items(items)
-        .active(active)
-        .on_active(move |s: &mut UiState, at: usize| {
-            if let Some(q) = hover_query.as_ref() {
-                s.popup_active = Some((q.start, q.term.clone(), at));
-            }
+        .w_full()
+        .h((rows.len() as f32 * 30.0).min(300.0))
+        .min_h(30.0)
+        .scroll(rune::ScrollSpec {
+            stick_bottom: false,
         })
-        .on_choose(move |s: &mut UiState, id: &str, _: &mut Tx| {
-            if let Some(query) = query.as_ref() {
-                choose(s, slot, query, id);
-            }
-        })
-        .on_close(move |s: &mut UiState| {
-            if let Some((_, _, PopupState::Open { query, .. })) = current_popup(s, slot) {
-                s.popup_dismissed_at = Some(query.start);
-            }
-        })
-        .build(k, layer);
+        .clip_soft(0.0)
+        .child(row_els)
+        .scroll_bar(k)
+        .w_full()
+        .shrink()
+        .min_h(0.0);
+
+    let mut panel = col()
+        .key(format!("{key}-panel"))
+        .preserve_focus_on_press(true)
+        .w(380.0)
+        .padding(4.0)
+        .radius(k.radius.md)
+        .fill(look.panel_fill(k))
+        .border(1.0, k.c.border_strong)
+        .on_press(|_: &mut UiState| {})
+        .child(header)
+        .child(el().w_full().h(1.0).fill(k.c.border_weak).mb(2.0))
+        .child(viewport);
+
+    panel = look.accent_rim(k, panel, k.c.bg_accent);
+    for shadow in k.shadow_layers(&k.elevation.overlay) {
+        panel = panel.box_shadow(shadow);
+    }
+
+    let anchored_panel = panel
+        .anchored_fit(anchor, rune::Side::Top, rune::Align::Start, 6.0)
+        .transition(rune::Transition::opacity().combined(rune::Transition::scale(0.97)))
+        .token_motion(k.motion.overlay);
+
+    layer.push(anchored_panel);
 }
 
 /// Mount whichever popup the draft calls for, at its field.
@@ -1628,6 +1816,9 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             .on_edit(|s: &mut UiState| &mut s.draft)
             .on_change(|s: &mut UiState, _: &mut Tx| on_draft_change(s, Slot::Session))
             .on_key(|s: &mut UiState, ev: &rune::KeyEvent, tx: &mut Tx| {
+                if popup_key(s, Slot::Session, ev) {
+                    return true;
+                }
                 // Alt+Enter while the agent works: queue after this turn.
                 let alt_enter = ev.key == rune::Key::Enter && ev.mods.alt && !ev.mods.cmd;
                 if alt_enter && s.busy() {

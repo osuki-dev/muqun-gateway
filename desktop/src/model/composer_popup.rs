@@ -65,6 +65,7 @@ impl PopupState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn rows(&self) -> &[PopupRow] {
         match self {
             Self::Open { rows, .. } => rows,

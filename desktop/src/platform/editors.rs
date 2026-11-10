@@ -16,18 +16,23 @@ pub enum Editor {
     VsCode,
     Zed,
     Cursor,
+    Neovim,
     Terminal,
     FileManager,
 }
 
 impl Editor {
-    pub const ALL: [Editor; 5] = [
+    pub const ALL: [Editor; 6] = [
         Self::VsCode,
         Self::Zed,
         Self::Cursor,
+        Self::Neovim,
         Self::Terminal,
         Self::FileManager,
     ];
+
+    pub const LABELS: [&'static str; 6] =
+        ["VS Code", "Zed", "Cursor", "Neovim", "Terminal", "Files"];
 
     /// The product name (the same in every language) or `None` for the two
     /// the UI words itself (terminal, file manager).
@@ -36,6 +41,7 @@ impl Editor {
             Self::VsCode => Some("VS Code"),
             Self::Zed => Some("Zed"),
             Self::Cursor => Some("Cursor"),
+            Self::Neovim => Some("Neovim"),
             Self::Terminal | Self::FileManager => None,
         }
     }
@@ -92,18 +98,55 @@ pub fn open_file(
             if try_custom_command(cmd, &abs_path)? {
                 return Ok(());
             }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("command failed: {cmd}"),
+            ));
         }
 
         if let Some(editor) = choice {
-            if matches!(editor, Editor::VsCode | Editor::Zed | Editor::Cursor)
-                && try_editor_choice(editor, &abs_path)?
-            {
-                return Ok(());
+            match editor {
+                Editor::VsCode | Editor::Zed | Editor::Cursor => {
+                    if try_editor_choice(editor, &abs_path)? {
+                        return Ok(());
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("{} editor not found", editor.product().unwrap_or("GUI")),
+                    ));
+                }
+                Editor::Neovim => {
+                    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                    {
+                        let p = abs_path.to_string_lossy().to_string();
+                        if launch_in_terminal("nvim", &[p], abs_path.parent())? {
+                            return Ok(());
+                        }
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "nvim not found",
+                    ));
+                }
+                Editor::Terminal => {
+                    let term_ed = detect_default_terminal_editor().unwrap_or_else(|| "nvim".into());
+                    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                    {
+                        let p = abs_path.to_string_lossy().to_string();
+                        if launch_in_terminal(&term_ed, &[p], abs_path.parent())? {
+                            return Ok(());
+                        }
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("{term_ed} not found"),
+                    ));
+                }
+                Editor::FileManager => {
+                    super::shell::reveal(&abs_path);
+                    return Ok(());
+                }
             }
-        }
-
-        if try_open_editor(&abs_path)? {
-            return Ok(());
         }
     }
 
@@ -293,21 +336,23 @@ pub fn resolve_terminal_editor(
         return None;
     }
 
-    // 2. Explicit choice of GUI editor
+    // 2. Explicit choice of editor
     if let Some(c) = choice {
-        if matches!(c, Editor::VsCode | Editor::Zed | Editor::Cursor) {
-            return None;
-        }
-        if c == Editor::Terminal {
-            return detect_default_terminal_editor().or_else(|| Some("nvim".into()));
+        match c {
+            Editor::Neovim => return Some("nvim".into()),
+            Editor::Terminal => {
+                return detect_default_terminal_editor().or_else(|| Some("nvim".into()));
+            }
+            Editor::VsCode | Editor::Zed | Editor::Cursor | Editor::FileManager => {
+                return None;
+            }
         }
     }
 
-    // 3. System default editor
-    detect_default_terminal_editor()
+    None
 }
 
-fn try_custom_command(cmd: &str, path: &Path) -> std::io::Result<bool> {
+pub fn try_custom_command(cmd: &str, path: &Path) -> std::io::Result<bool> {
     let path_str = path.to_string_lossy();
     let full = if cmd.contains("{}") {
         cmd.replace("{}", &path_str)
@@ -345,13 +390,14 @@ fn try_custom_command(cmd: &str, path: &Path) -> std::io::Result<bool> {
     }
 }
 
-fn try_editor_choice(editor: Editor, path: &Path) -> std::io::Result<bool> {
+pub fn try_editor_choice(editor: Editor, path: &Path) -> std::io::Result<bool> {
     let p = path.to_string_lossy();
     let cmds: Vec<(&str, Vec<&str>)> = if cfg!(target_os = "macos") {
         match editor {
             Editor::VsCode => vec![("open", vec!["-a", "Visual Studio Code", p.as_ref()])],
             Editor::Zed => vec![("open", vec!["-a", "Zed", p.as_ref()])],
             Editor::Cursor => vec![("open", vec!["-a", "Cursor", p.as_ref()])],
+            Editor::Neovim => vec![("nvim", vec![p.as_ref()])],
             _ => Vec::new(),
         }
     } else if cfg!(target_os = "windows") {
@@ -359,6 +405,7 @@ fn try_editor_choice(editor: Editor, path: &Path) -> std::io::Result<bool> {
             Editor::VsCode => vec![("code.cmd", vec![p.as_ref()])],
             Editor::Zed => vec![("zed", vec![p.as_ref()])],
             Editor::Cursor => vec![("cursor.cmd", vec![p.as_ref()])],
+            Editor::Neovim => vec![("nvim", vec![p.as_ref()])],
             _ => Vec::new(),
         }
     } else {
@@ -366,6 +413,7 @@ fn try_editor_choice(editor: Editor, path: &Path) -> std::io::Result<bool> {
             Editor::VsCode => vec![("code", vec![p.as_ref()])],
             Editor::Zed => vec![("zed", vec![p.as_ref()]), ("zeditor", vec![p.as_ref()])],
             Editor::Cursor => vec![("cursor", vec![p.as_ref()])],
+            Editor::Neovim => vec![("nvim", vec![p.as_ref()])],
             _ => Vec::new(),
         }
     };
@@ -598,6 +646,7 @@ fn commands(editor: Editor, folder: &str) -> Vec<(String, Vec<String>)> {
             Editor::VsCode => app("Visual Studio Code"),
             Editor::Zed => app("Zed"),
             Editor::Cursor => app("Cursor"),
+            Editor::Neovim => vec![run("nvim", &["{}"])],
             Editor::Terminal => app("Terminal"),
             Editor::FileManager => Vec::new(),
         };
@@ -607,6 +656,7 @@ fn commands(editor: Editor, folder: &str) -> Vec<(String, Vec<String>)> {
             Editor::VsCode => vec![run("code.cmd", &["{}"])],
             Editor::Zed => vec![run("zed", &["{}"])],
             Editor::Cursor => vec![run("cursor.cmd", &["{}"])],
+            Editor::Neovim => vec![run("nvim", &["{}"])],
             Editor::Terminal => vec![
                 run("wt", &["-d", "{}"]),
                 run("cmd", &["/c", "start", "cmd", "/k", "cd", "/d", "{}"]),
@@ -619,6 +669,7 @@ fn commands(editor: Editor, folder: &str) -> Vec<(String, Vec<String>)> {
         // Arch packages Zed's CLI as `zeditor`.
         Editor::Zed => vec![run("zed", &["{}"]), run("zeditor", &["{}"])],
         Editor::Cursor => vec![run("cursor", &["{}"])],
+        Editor::Neovim => vec![run("nvim", &["{}"])],
         // Every terminal also starts in the folder (`current_dir`); the flag
         // is for those that would otherwise open in home.
         Editor::Terminal => {
@@ -661,6 +712,8 @@ mod tests {
     fn the_choice_round_trips_through_the_config() {
         let json = serde_json::to_string(&Editor::VsCode).unwrap();
         assert_eq!(json, "\"vs-code\"");
+        let nvim: Editor = serde_json::from_str("\"neovim\"").unwrap();
+        assert_eq!(nvim, Editor::Neovim);
         let back: Editor = serde_json::from_str("\"file-manager\"").unwrap();
         assert_eq!(back, Editor::FileManager);
     }
@@ -698,5 +751,14 @@ mod tests {
         assert_eq!(resolve_terminal_editor(Some("code"), None), None);
         assert_eq!(resolve_terminal_editor(None, Some(Editor::VsCode)), None);
         assert_eq!(resolve_terminal_editor(None, Some(Editor::Cursor)), None);
+        assert_eq!(resolve_terminal_editor(None, Some(Editor::Zed)), None);
+        assert_eq!(
+            resolve_terminal_editor(None, Some(Editor::Neovim)),
+            Some("nvim".into())
+        );
+        assert_eq!(
+            resolve_terminal_editor(None, Some(Editor::Terminal)),
+            detect_default_terminal_editor().or_else(|| Some("nvim".into()))
+        );
     }
 }

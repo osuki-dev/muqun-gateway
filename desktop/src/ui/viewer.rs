@@ -154,12 +154,49 @@ impl UiState {
     pub fn open_editor_file(&mut self, path: &Path) {
         let custom = self.cfg.general.editor_command.clone();
         let choice = Some(self.cfg.general.editor);
+        let language = self.cfg.general.language;
+
         if let Some(editor) =
             crate::platform::editors::resolve_terminal_editor(custom.as_deref(), choice)
         {
             self.open_file_in_terminal(path, &editor);
-        } else {
-            let _ = crate::platform::editors::open_file(path, custom.as_deref(), choice);
+        } else if let Some(cmd) = custom.as_deref().filter(|c| !c.trim().is_empty()) {
+            match crate::platform::editors::try_custom_command(cmd, path) {
+                Ok(true) => {}
+                _ => {
+                    let title =
+                        crate::ui::copy::tr(language, "Could not open editor", "无法打开编辑器");
+                    let detail = crate::ui::copy::tr(
+                        language,
+                        "Command failed to launch. Check Settings > General.",
+                        "命令无法启动，请检查「设置 > 常规」。",
+                    );
+                    self.toast(title, Some(format!("{detail} ({cmd})")));
+                }
+            }
+        } else if let Some(c) = choice {
+            match c {
+                crate::platform::editors::Editor::FileManager => {
+                    crate::platform::shell::reveal(path);
+                }
+                gui_editor => match crate::platform::editors::try_editor_choice(gui_editor, path) {
+                    Ok(true) => {}
+                    _ => {
+                        let name = gui_editor.product().unwrap_or("Editor");
+                        let title = crate::ui::copy::tr(
+                            language,
+                            "Could not open editor",
+                            "无法打开编辑器",
+                        );
+                        let detail = crate::ui::copy::tr(
+                            language,
+                            "Application not found. Check Settings > General.",
+                            "未找到该应用，请检查「设置 > 常规」。",
+                        );
+                        self.toast(title, Some(format!("{name}: {detail}")));
+                    }
+                },
+            }
         }
     }
 

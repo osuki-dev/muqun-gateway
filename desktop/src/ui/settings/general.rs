@@ -95,7 +95,7 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                         k,
                         layer,
                         "open-in",
-                        &["VS Code", "Zed", "Cursor", "Terminal", "Files"],
+                        &Editor::LABELS,
                         Editor::ALL
                             .iter()
                             .position(|e| *e == s.cfg.general.editor)
@@ -115,7 +115,7 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                     field(
                         TextInput::new(&editor)
                             .label(tr_ref(language, "Editor command", "编辑器命令"))
-                            .placeholder("code, zed, …")
+                            .placeholder("code, zed, nvim, …")
                             .on_edit(|s: &mut UiState| {
                                 let stored =
                                     s.cfg.general.editor_command.clone().unwrap_or_default();

@@ -1218,6 +1218,12 @@ mod tests {
         .unwrap();
         assert_eq!(config.ui.projects["/w/x"].name.as_deref(), Some("X"));
         assert_eq!(config.general.editor, crate::platform::editors::Editor::Zed);
+        let config: DesktopConfig =
+            serde_json::from_str(r#"{"general":{"editor":"neovim"}}"#).unwrap();
+        assert_eq!(
+            config.general.editor,
+            crate::platform::editors::Editor::Neovim
+        );
     }
 
     #[test]

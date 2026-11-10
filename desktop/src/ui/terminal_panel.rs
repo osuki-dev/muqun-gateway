@@ -111,8 +111,6 @@ pub struct TermPanel {
     /// Screenshot scenes: how the fixture's shell ended.
     pub fixture_ended: Option<Ended>,
     pub error: Option<String>,
-    /// Instant layout without slide motion (used when launching code editors).
-    pub instant: bool,
     /// A command queued to run as soon as the shell session starts.
     pub pending_command: Option<String>,
     /// The grid's size the shell and emulator have, in cells.
@@ -151,7 +149,6 @@ impl TermPanel {
             fixture: None,
             fixture_ended: None,
             error: None,
-            instant: false,
             pending_command: None,
             size: None,
             resize: Resizer::default(),
@@ -360,7 +357,6 @@ impl UiState {
 
     /// Hide the panel; the shell keeps running.
     pub fn close_terminal(&mut self) {
-        self.term.instant = false;
         self.term.open = false;
         self.term.pane.set_open(false);
         self.term.sink.focused = false;
@@ -370,10 +366,8 @@ impl UiState {
     }
 
     /// Open a file in the embedded terminal using a terminal editor (e.g. nvim).
-    /// Opens the panel instantly without slide animation so it does not distract from editing.
     pub fn open_file_in_terminal(&mut self, path: &std::path::Path, editor: &str) {
         self.close_viewer();
-        self.term.instant = true;
 
         let path_str = path.to_string_lossy();
         let escaped_shell = format!("'{}'", path_str.replace('\'', "'\\''"));
@@ -1439,14 +1433,13 @@ mod tests {
     }
 
     #[test]
-    fn open_file_in_terminal_sets_instant_and_queues_command() {
+    fn open_file_in_terminal_opens_terminal_and_queues_command() {
         let (tx, _rx) = commands::channel();
         let mut state = UiState::new(tx);
         let test_path = std::path::Path::new("/tmp/test_file.rs");
         state.open_file_in_terminal(test_path, "nvim");
 
         assert!(state.term.open);
-        assert!(state.term.instant);
         assert!(state.term.sink.focused);
         assert!(state.viewer.is_none());
         assert_eq!(
