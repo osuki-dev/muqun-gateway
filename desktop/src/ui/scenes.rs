@@ -984,6 +984,11 @@ fn base_scenes() -> &'static [Scene] {
             s.settings_tab = SettingsTab::General;
             s.menu = Some(super::OpenMenu::Setting("open-in".into()));
         }),
+        ("settings-language", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::General;
+            s.menu = Some(super::OpenMenu::Setting("language".into()));
+        }),
         ("settings-agents-zh", |s| {
             settings(s);
             s.cfg.general.language = crate::config::Language::ZhCn;

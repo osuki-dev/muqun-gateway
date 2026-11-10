@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use rune::{El, TextEdit, Tx};
 use rune_kit::{Kit, TextInput};
 
-use super::{choice, edit_of, field, flag, group, row, select};
+use super::{edit_of, field, flag, group, row, select};
 use crate::config::{ConfigEdit, Language};
 use crate::platform::editors::Editor;
 use crate::ui::copy::tr_ref;
@@ -38,8 +38,10 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                     "Applies at once to everything in this window.",
                     "立即作用于窗口中的所有文字。",
                 ),
-                choice(
+                select(
+                    s,
                     k,
+                    layer,
                     "language",
                     Language::LABELS,
                     lang_at,
