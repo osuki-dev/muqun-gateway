@@ -39,21 +39,21 @@ pub fn pending_permission(s: &UiState, request: &PermissionRequest) -> bool {
 
 /// App `permissionActionPhrase`; an unknown key spelled out.
 pub fn action_phrase(language: Language, action: &str) -> String {
-    let t = |en, zh| tr_ref(language, en, zh).to_string();
+    let t = |en| tr_ref(language, en).to_string();
     match action {
-        "external_directory" => t("Read outside the workspace", "读取工作区之外的内容"),
-        "external_write" => t("Write outside the workspace", "写入工作区之外的位置"),
-        "bash" | "shell" | "command" | "execute" => t("Run a command", "执行命令"),
-        "read" => t("Read a file", "读取文件"),
-        "write" => t("Write a file", "写入文件"),
-        "edit" => t("Edit a file", "编辑文件"),
-        "patch" => t("Apply a patch", "应用补丁"),
-        "webfetch" | "fetch" => t("Fetch a web page", "获取网页"),
-        "network" => t("Reach the network", "访问网络"),
-        "install" => t("Install a package", "安装软件包"),
-        "task" => t("Start a subagent", "启动子代理"),
-        "question" => t("Ask you a question", "向你提出一个问题"),
-        "" => t("Permission required", "需要权限"),
+        "external_directory" => t("Read outside the workspace"),
+        "external_write" => t("Write outside the workspace"),
+        "bash" | "shell" | "command" | "execute" => t("Run a command"),
+        "read" => t("Read a file"),
+        "write" => t("Write a file"),
+        "edit" => t("Edit a file"),
+        "patch" => t("Apply a patch"),
+        "webfetch" | "fetch" => t("Fetch a web page"),
+        "network" => t("Reach the network"),
+        "install" => t("Install a package"),
+        "task" => t("Start a subagent"),
+        "question" => t("Ask you a question"),
+        "" => t("Permission required"),
         other => crate::ui::labels::readable_catalog_id(other),
     }
 }
@@ -63,48 +63,31 @@ pub fn action_phrase(language: Language, action: &str) -> String {
 pub fn option_label(language: Language, option: &PermissionOption) -> String {
     let label = option.label.trim();
     let lower = label.to_ascii_lowercase();
-    let t = |en, zh| tr_ref(language, en, zh).to_string();
+    let t = |en| tr_ref(language, en).to_string();
     match option.decision {
-        PermissionDecision::Allow if lower == "allow once" => t("Allow once", "允许一次"),
-        PermissionDecision::Allow if lower == "allow for this turn" => {
-            t("Allow for this turn", "允许本轮使用")
-        }
-        PermissionDecision::Allow if label.is_empty() || lower == "allow" => t("Allow", "允许"),
+        PermissionDecision::Allow if lower == "allow once" => t("Allow once"),
+        PermissionDecision::Allow if lower == "allow for this turn" => t("Allow for this turn"),
+        PermissionDecision::Allow if label.is_empty() || lower == "allow" => t("Allow"),
         PermissionDecision::AllowAlways
             if label.is_empty() || lower == "allow_always" || lower == "always allow" =>
         {
-            t("Always allow", "始终允许")
+            t("Always allow")
         }
-        PermissionDecision::Deny if label.is_empty() || lower == "deny" => t("Deny", "拒绝"),
+        PermissionDecision::Deny if label.is_empty() || lower == "deny" => t("Deny"),
         _ => label.replace('`', ""),
     }
 }
 
 pub fn danger_reason(language: Language, reason: &str) -> &'static str {
-    let t = |en, zh| tr_ref(language, en, zh);
+    let t = |en| tr_ref(language, en);
     match reason {
-        "rm-system-root" => t(
-            "Deletes a system folder or your whole home folder.",
-            "会删除系统目录或整个主目录。",
-        ),
-        "fork-bomb" => t(
-            "Starts processes until the computer stalls.",
-            "会不断创建进程直到电脑卡死。",
-        ),
-        "block-device-write" => t("Writes straight onto a disk.", "会直接写入磁盘设备。"),
-        "disk-format" => t("Formats a disk.", "会格式化磁盘。"),
-        "chmod-system-root" => t(
-            "Changes permissions of the whole filesystem.",
-            "会更改整个文件系统的权限。",
-        ),
-        "remote-pipe-shell" => t(
-            "Runs a script downloaded from the internet.",
-            "会运行从网上下载的脚本。",
-        ),
-        _ => t(
-            "This command can do serious damage.",
-            "此命令可能造成严重破坏。",
-        ),
+        "rm-system-root" => t("Deletes a system folder or your whole home folder."),
+        "fork-bomb" => t("Starts processes until the computer stalls."),
+        "block-device-write" => t("Writes straight onto a disk."),
+        "disk-format" => t("Formats a disk."),
+        "chmod-system-root" => t("Changes permissions of the whole filesystem."),
+        "remote-pipe-shell" => t("Runs a script downloaded from the internet."),
+        _ => t("This command can do serious damage."),
     }
 }
 
@@ -169,9 +152,9 @@ pub fn permission_card(s: &UiState, k: &Kit, request: &PermissionRequest) -> El 
                 .grow(1.0)
                 .child(
                     text(if pending {
-                        tr_ref(language, "Permission required", "需要权限")
+                        tr_ref(language, "Permission required")
                     } else {
-                        tr_ref(language, "Permission answered", "权限已答复")
+                        tr_ref(language, "Permission answered")
                     })
                     .font(k.ty.ui_medium)
                     .color(k.c.text_base),
@@ -271,7 +254,7 @@ pub fn permission_card(s: &UiState, k: &Kit, request: &PermissionRequest) -> El 
         card = card.child(
             text(format!(
                 "{} {}",
-                tr_ref(language, "Always allow covers", "始终允许将涵盖"),
+                tr_ref(language, "Always allow covers"),
                 request.save.join(", ")
             ))
             .font(k.ty.small)

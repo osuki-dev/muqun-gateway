@@ -884,7 +884,7 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
             let close_tab = IconButton::new(k.glyph.close)
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Close tab", "关闭标签页"))
+                .label(tr_ref(language, "Close tab"))
                 .on_press(move |s: &mut UiState| s.term_close_tab(i))
                 .build(k)
                 .key(format!("terminal-tab-close-{i}"));
@@ -897,11 +897,7 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
     let add_tab_btn = IconButton::new(&PLUS)
         .variant(IconButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
-        .label(tr_ref(
-            language,
-            "New tab (Ctrl+Shift+T)",
-            "新建标签页 (Ctrl+Shift+T)",
-        ))
+        .label(tr_ref(language, "New tab (Ctrl+Shift+T)"))
         .on_press(|s: &mut UiState| s.term_new_tab())
         .build(k)
         .key("terminal-new-tab");
@@ -929,7 +925,7 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
             IconButton::new(&RESTART)
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Restart shell", "重启 Shell"))
+                .label(tr_ref(language, "Restart shell"))
                 .on_press(|s: &mut UiState| s.restart_terminal())
                 .build(k)
                 .key("terminal-restart"),
@@ -938,7 +934,7 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
             IconButton::new(k.glyph.close)
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Hide terminal", "隐藏终端"))
+                .label(tr_ref(language, "Hide terminal"))
                 .on_press(|s: &mut UiState| s.close_terminal())
                 .build(k)
                 .key("terminal-close"),
@@ -979,17 +975,9 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
 fn ended_notice(k: &Kit, language: crate::config::Language, ended: Ended) -> El {
     use super::copy::tr;
     let what = match ended {
-        Ended::Shell(Exit::Code(n)) => tr(
-            language,
-            &format!("Shell exited (code {n})"),
-            &format!("Shell 已退出（代码 {n}）"),
-        ),
-        Ended::Shell(Exit::Signal(n)) => tr(
-            language,
-            &format!("Shell exited (signal {n})"),
-            &format!("Shell 已退出（信号 {n}）"),
-        ),
-        Ended::Broken => tr(language, "The terminal stopped", "终端已停止"),
+        Ended::Shell(Exit::Code(n)) => tr(language, &format!("Shell exited (code {n})")),
+        Ended::Shell(Exit::Signal(n)) => tr(language, &format!("Shell exited (signal {n})")),
+        Ended::Broken => tr(language, "The terminal stopped"),
     };
     row()
         .key("terminal-ended")
@@ -1007,7 +995,7 @@ fn ended_notice(k: &Kit, language: crate::config::Language, ended: Ended) -> El 
                 .grow(1.0),
         )
         .child(
-            Button::new(tr_ref(language, "Restart", "重新启动"))
+            Button::new(tr_ref(language, "Restart"))
                 .variant(ButtonVariant::Outline)
                 .control_size(ControlSize::Small)
                 .on_press(|s: &mut UiState| s.restart_terminal())
@@ -1029,7 +1017,7 @@ fn context_menu(s: &UiState, k: &Kit, grid: El, layer: &mut Vec<El>) -> El {
         .min_width(220.0)
         .on_close(|s: &mut UiState| s.term.menu_at = None)
         .item(
-            MenuItem::new(tr_ref(language, "Copy", "复制"))
+            MenuItem::new(tr_ref(language, "Copy"))
                 .shortcut(label(Action::TermCopy))
                 .disabled(!has_selection)
                 .on_select_tx(|s: &mut UiState, tx: &mut Tx| {
@@ -1040,7 +1028,7 @@ fn context_menu(s: &UiState, k: &Kit, grid: El, layer: &mut Vec<El>) -> El {
                 }),
         )
         .item(
-            MenuItem::new(tr_ref(language, "Paste", "粘贴"))
+            MenuItem::new(tr_ref(language, "Paste"))
                 .shortcut(label(Action::TermPaste))
                 .on_select_tx(|s: &mut UiState, tx: &mut Tx| {
                     s.term.menu_at = None;
@@ -1048,14 +1036,14 @@ fn context_menu(s: &UiState, k: &Kit, grid: El, layer: &mut Vec<El>) -> El {
                 }),
         )
         .item(
-            MenuItem::new(tr_ref(language, "Clear", "清屏")).on_select(|s: &mut UiState| {
+            MenuItem::new(tr_ref(language, "Clear")).on_select(|s: &mut UiState| {
                 s.term.menu_at = None;
                 s.term.send(Msg::Clear);
             }),
         )
         .separator()
         .item(
-            MenuItem::new(tr_ref(language, "New shell", "新的 Shell"))
+            MenuItem::new(tr_ref(language, "New shell"))
                 .shortcut(label(Action::NewShell))
                 .on_select(|s: &mut UiState| {
                     s.term.menu_at = None;
@@ -1063,7 +1051,7 @@ fn context_menu(s: &UiState, k: &Kit, grid: El, layer: &mut Vec<El>) -> El {
                 }),
         )
         .item(
-            MenuItem::new(tr_ref(language, "Hide terminal", "隐藏终端"))
+            MenuItem::new(tr_ref(language, "Hide terminal"))
                 .shortcut(label(Action::ToggleTerminal))
                 .on_select(|s: &mut UiState| {
                     s.term.menu_at = None;
@@ -1452,7 +1440,7 @@ mod tests {
             rt.frame(1.0 / 60.0);
         }
         // An input method's commit goes to the shell as typed.
-        rt.ime(Ime::Commit("中文".into()));
+        rt.ime(Ime::Commit("test".into()));
         rt.frame(1.0 / 60.0);
         if crate::platform::is_macos() {
             let mut cmd_k = key(Key::Command('k'), false, false);
@@ -1472,7 +1460,7 @@ mod tests {
                 "key C ctrl=true",
                 "key X ctrl=false",
                 "key B ctrl=true",
-                "text 中文",
+                "text test",
             ]
         );
         // Ctrl+Shift+K on Linux (Cmd+K on macOS) reached the app: the palette.

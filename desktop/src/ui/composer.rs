@@ -686,11 +686,7 @@ fn staged_chip(s: &UiState, k: &Kit, i: usize, file: &crate::model::compose::Sta
     let remove = rune_kit::IconButton::new(k.glyph.close)
         .variant(rune_kit::IconButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
-        .label(format!(
-            "{} {}",
-            tr_ref(language, "Remove", "移除"),
-            file.name
-        ))
+        .label(format!("{} {}", tr_ref(language, "Remove"), file.name))
         .on_press(move |s: &mut UiState| {
             if i < s.staged.len() {
                 s.staged.remove(i);
@@ -729,9 +725,9 @@ fn queued_chip(
     let label = format!(
         "{} {}",
         if item.steer {
-            tr_ref(language, "Steer:", "插队：")
+            tr_ref(language, "Steer:")
         } else {
-            tr_ref(language, "Queued:", "已排队：")
+            tr_ref(language, "Queued:")
         },
         super::timeline::clip(&item.text, 32)
     );
@@ -756,23 +752,23 @@ fn queued_chip(
     if item.files.is_empty() {
         let (edit_id, text) = (id.clone(), item.text.clone());
         menu = menu.item(
-            MenuItem::new(tr_ref(language, "Edit", "编辑"))
+            MenuItem::new(tr_ref(language, "Edit"))
                 .on_select(move |s: &mut UiState| edit_queued(s, &edit_id, text.clone())),
         );
     }
     let (steer_id, next_steer) = (id.clone(), !item.steer);
     menu = menu.item(
         MenuItem::new(if item.steer {
-            tr_ref(language, "Keep queued", "保持排队")
+            tr_ref(language, "Keep queued")
         } else {
-            tr_ref(language, "Send next", "下一个发送")
+            tr_ref(language, "Send next")
         })
         .on_select(move |s: &mut UiState| toggle_queued_steer(s, &steer_id, next_steer)),
     );
     let cancel_id = id.clone();
     let pill = menu
         .item(
-            MenuItem::new(tr_ref(language, "Cancel", "取消"))
+            MenuItem::new(tr_ref(language, "Cancel"))
                 .danger(true)
                 .on_select(move |s: &mut UiState| cancel_queued(s, &cancel_id)),
         )
@@ -955,14 +951,14 @@ fn mention_popup(s: &UiState, slot: Slot) -> PopupState {
     });
     let mut rows: Vec<PopupRow> = Vec::new();
     if !peers.is_empty() {
-        rows.push(section_header("hdr:computers", tr_ref(language, "Computers", "电脑")).row);
+        rows.push(section_header("hdr:computers", tr_ref(language, "Computers")).row);
         rows.extend(peers.into_iter().map(|p| {
             let detail = if p.current {
-                tr_ref(language, "This computer", "本机")
+                tr_ref(language, "This computer")
             } else if p.reachable {
                 ""
             } else {
-                tr_ref(language, "Offline", "离线")
+                tr_ref(language, "Offline")
             };
             PopupRow {
                 id: format!("p:{}", p.name),
@@ -975,13 +971,7 @@ fn mention_popup(s: &UiState, slot: Slot) -> PopupState {
     }
     let files = s.file_hits.iter().take(MAX_FILE_ROWS);
     if !s.file_hits.is_empty() && term.is_empty() {
-        rows.push(
-            section_header(
-                "hdr:files",
-                tr_ref(language, "Files in this project", "此项目中的文件"),
-            )
-            .row,
-        );
+        rows.push(section_header("hdr:files", tr_ref(language, "Files in this project")).row);
     }
     rows.extend(files.map(|h| PopupRow {
         id: format!("f:{}", h.path),
@@ -1007,20 +997,16 @@ fn current_popup(s: &UiState, slot: Slot) -> Option<(&'static str, &'static str,
     let language = s.cfg.general.language;
     let slash = read_popup(&draft.text, caret, &slash_trigger(s, slot), dismissed, true);
     if slash.open() {
-        return Some(("slash-popup", tr_ref(language, "Commands", "命令"), slash));
+        return Some(("slash-popup", tr_ref(language, "Commands"), slash));
     }
     let skills = read_popup(&draft.text, caret, &skill_trigger(s, slot), dismissed, true);
     if skills.open() {
-        return Some(("skill-popup", tr_ref(language, "Skills", "技能"), skills));
+        return Some(("skill-popup", tr_ref(language, "Skills"), skills));
     }
     let mentions = mention_popup(s, slot);
-    mentions.open().then(|| {
-        (
-            "mention-popup",
-            tr_ref(language, "Mentions", "提及"),
-            mentions,
-        )
-    })
+    mentions
+        .open()
+        .then(|| ("mention-popup", tr_ref(language, "Mentions"), mentions))
 }
 
 fn pickable(row: &PopupRow) -> bool {
@@ -1645,7 +1631,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     // `composer_row`), the actions on the right.
     let attach_help = format!(
         "{} · {}",
-        tr_ref(language, "Add files or an image", "添加文件或图片"),
+        tr_ref(language, "Add files or an image"),
         crate::platform::keys::label("Primary+V")
     );
     let attach_press = move |_: &mut UiState| {
@@ -1653,17 +1639,17 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     };
     let attach = rune_kit::IconButton::new(&super::parts::glyphs::ATTACH)
         .variant(rune_kit::IconButtonVariant::GhostMuted)
-        .label(tr_ref(language, "Attach", "附件"))
+        .label(tr_ref(language, "Attach"))
         .help(attach_help)
         .disabled(!has_session)
         .on_press(attach_press)
         .build(k)
         .key("attach");
-    let stop_label = tr_ref(language, "Stop", "停止");
+    let stop_label = tr_ref(language, "Stop");
     let send_label = if busy {
-        tr_ref(language, "Steer", "插话")
+        tr_ref(language, "Steer")
     } else {
-        tr_ref(language, "Send", "发送")
+        tr_ref(language, "Send")
     };
 
     // The controls fold to fit beside the buttons, measured on the card
@@ -1747,12 +1733,12 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .help(if busy {
             format!(
                 "{} · {} {}",
-                tr_ref(language, "Steer the running turn", "对运行中的回合插话"),
+                tr_ref(language, "Steer the running turn"),
                 crate::platform::keys::label("Alt+Enter"),
-                tr_ref(language, "queues it instead", "改为排队")
+                tr_ref(language, "queues it instead")
             )
         } else {
-            tr_ref(language, "Send", "发送").to_string()
+            tr_ref(language, "Send").to_string()
         })
         .on_press(submit_session)
         .build(k)
@@ -1776,19 +1762,15 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         card = card.child(chips);
     }
     let placeholder = if has_session {
-        let full = tr_ref(
-            language,
-            "Message…  (/ commands, $ skills, @ mentions)",
-            "发消息…（/ 命令，$ 技能，@ 电脑或文件）",
-        );
+        let full = tr_ref(language, "Message…  (/ commands, $ skills, @ mentions)");
         // A narrow card keeps the hint to one line.
         if rune::text::measure(full, &[], k.ty.ui, None).0 + 24.0 <= inner {
             full
         } else {
-            tr_ref(language, "Message…  (/ $ @)", "发消息…（/ $ @）")
+            tr_ref(language, "Message…  (/ $ @)")
         }
     } else {
-        tr_ref(language, "Pick a session first", "先选一个会话")
+        tr_ref(language, "Pick a session first")
     };
     let accent = k.c.bg_accent;
     let info = k.c.info.icon;
@@ -1798,7 +1780,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     card = card.child(
         TextArea::new(&s.draft)
             .placeholder(placeholder)
-            .label(tr_ref(language, "Draft", "草稿"))
+            .label(tr_ref(language, "Draft"))
             .width(None)
             .auto_grow(2, 8)
             .pill_style(move |id| {

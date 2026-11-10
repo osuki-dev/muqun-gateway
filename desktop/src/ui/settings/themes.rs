@@ -167,7 +167,7 @@ fn tile(s: &UiState, k: &Kit, t: Tile, w: f32) -> El {
             el().key("current")
                 .pin(None, Some(8.0), Some(8.0), None)
                 .child(
-                    Badge::new(tr_ref(s.cfg.general.language, "In use", "使用中"))
+                    Badge::new(tr_ref(s.cfg.general.language, "In use"))
                         .variant(BadgeVariant::Accent)
                         .build(k),
                 ),
@@ -187,7 +187,7 @@ fn tile(s: &UiState, k: &Kit, t: Tile, w: f32) -> El {
             .role("button")
             .label(format!(
                 "{} {}",
-                tr_ref(s.cfg.general.language, "Apply", "应用"),
+                tr_ref(s.cfg.general.language, "Apply"),
                 t.name
             ))
             .on_press(move |s: &mut UiState| apply(s)),
@@ -267,19 +267,15 @@ fn library_tile(s: &UiState, k: &Kit, entry: &ThemeEntry, w: f32) -> El {
         IconButton::new(&crate::ui::icons::DELETE)
             .variant(IconButtonVariant::GhostMuted)
             .control_size(ControlSize::Small)
-            .label(tr_ref(language, "Remove", "移除"))
-            .help(tr(
-                language,
-                &format!("Remove {}", entry.name),
-                &format!("移除 {}", entry.name),
-            ))
+            .label(tr_ref(language, "Remove"))
+            .help(tr(language, &format!("Remove {}", entry.name)))
             .on_press(move |s: &mut UiState| s.send(Command::ThemeRemove(remove_id.clone())))
             .build(k)
             .key(format!("remove-{}", entry.id))
     });
     let trailing = if !current {
         let btn_apply_id = entry.id.clone();
-        let apply_btn = Button::new(tr_ref(language, "Apply", "应用"))
+        let apply_btn = Button::new(tr_ref(language, "Apply"))
             .variant(ButtonVariant::Submit)
             .control_size(ControlSize::Small)
             .on_press(move |s: &mut UiState| {
@@ -337,28 +333,14 @@ fn job_label(language: Language, job: &Job) -> (Tone, String) {
     match job {
         Job::Downloading { read, total } if *total > 0 => (
             Tone::Quiet,
-            tr(
-                language,
-                &format!("Downloading {}%", read * 100 / total),
-                &format!("下载中 {}%", read * 100 / total),
-            ),
+            tr(language, &format!("Downloading {}%", read * 100 / total)),
         ),
-        Job::Downloading { .. } => (Tone::Quiet, tr(language, "Downloading…", "下载中…")),
-        Job::Verifying => (Tone::Quiet, tr(language, "Verifying…", "校验中…")),
-        Job::Installing => (Tone::Quiet, tr(language, "Installing…", "安装中…")),
-        Job::Done { verified: true } => (
-            Tone::Good,
-            tr(language, "Installed, checksum verified", "已安装，校验通过"),
-        ),
-        Job::Done { verified: false } => (Tone::Good, tr(language, "Installed", "已安装")),
-        Job::Failed { message } => (
-            Tone::Bad,
-            tr(
-                language,
-                &format!("Failed: {message}"),
-                &format!("失败：{message}"),
-            ),
-        ),
+        Job::Downloading { .. } => (Tone::Quiet, tr(language, "Downloading…")),
+        Job::Verifying => (Tone::Quiet, tr(language, "Verifying…")),
+        Job::Installing => (Tone::Quiet, tr(language, "Installing…")),
+        Job::Done { verified: true } => (Tone::Good, tr(language, "Installed, checksum verified")),
+        Job::Done { verified: false } => (Tone::Good, tr(language, "Installed")),
+        Job::Failed { message } => (Tone::Bad, tr(language, &format!("Failed: {message}"))),
     }
 }
 
@@ -381,7 +363,7 @@ fn gallery_tile(s: &UiState, k: &Kit, entry: &IndexEntry, w: f32) -> El {
 
     let trailing = if running {
         Some(
-            Button::new(tr_ref(language, "Installing…", "安装中…"))
+            Button::new(tr_ref(language, "Installing…"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
                 .disabled(true)
@@ -395,12 +377,12 @@ fn gallery_tile(s: &UiState, k: &Kit, entry: &IndexEntry, w: f32) -> El {
                 .gap(6.0)
                 .center_y()
                 .child(
-                    Badge::new(tr_ref(language, "In use", "使用中"))
+                    Badge::new(tr_ref(language, "In use"))
                         .variant(BadgeVariant::Accent)
                         .build(k),
                 )
                 .child(
-                    Button::new(tr_ref(language, "Reinstall", "重新安装"))
+                    Button::new(tr_ref(language, "Reinstall"))
                         .variant(ButtonVariant::GhostMuted)
                         .control_size(ControlSize::Small)
                         .on_press(move |s: &mut UiState| {
@@ -418,7 +400,7 @@ fn gallery_tile(s: &UiState, k: &Kit, entry: &IndexEntry, w: f32) -> El {
                 .gap(6.0)
                 .center_y()
                 .child(
-                    Button::new(tr_ref(language, "Apply", "应用"))
+                    Button::new(tr_ref(language, "Apply"))
                         .variant(ButtonVariant::Submit)
                         .control_size(ControlSize::Small)
                         .on_press(move |s: &mut UiState| {
@@ -433,7 +415,7 @@ fn gallery_tile(s: &UiState, k: &Kit, entry: &IndexEntry, w: f32) -> El {
                         .key(format!("apply-{}", entry.id)),
                 )
                 .child(
-                    Button::new(tr_ref(language, "Reinstall", "重新安装"))
+                    Button::new(tr_ref(language, "Reinstall"))
                         .variant(ButtonVariant::GhostMuted)
                         .control_size(ControlSize::Small)
                         .on_press(move |s: &mut UiState| {
@@ -445,7 +427,7 @@ fn gallery_tile(s: &UiState, k: &Kit, entry: &IndexEntry, w: f32) -> El {
         )
     } else {
         Some(
-            Button::new(tr_ref(language, "Install", "安装"))
+            Button::new(tr_ref(language, "Install"))
                 .variant(ButtonVariant::Outline)
                 .control_size(ControlSize::Small)
                 .on_press(move |s: &mut UiState| s.send(Command::ThemeInstall(id.clone())))
@@ -519,8 +501,8 @@ fn grid(key: &str, tiles: Vec<El>, columns: usize) -> El {
 pub(super) fn actions(s: &UiState, k: &Kit) -> Vec<El> {
     let language = s.cfg.general.language;
     let mut search = TextInput::new(&s.theme_query)
-        .label(tr_ref(language, "Search themes", "搜索主题"))
-        .placeholder(tr_ref(language, "Search themes", "搜索主题"))
+        .label(tr_ref(language, "Search themes"))
+        .placeholder(tr_ref(language, "Search themes"))
         .leading_icon(&rune_kit::glyphs::SEARCH)
         .leading_icon_size(14.0)
         .width(Some(220.0))
@@ -533,8 +515,8 @@ pub(super) fn actions(s: &UiState, k: &Kit) -> Vec<El> {
         IconButton::new(&crate::ui::icons::REFRESH)
             .variant(IconButtonVariant::Ghost)
             .control_size(super::CONTROL_SIZE)
-            .label(tr_ref(language, "Refresh", "刷新"))
-            .help(tr_ref(language, "Look for new themes", "查找新主题"))
+            .label(tr_ref(language, "Refresh"))
+            .help(tr_ref(language, "Look for new themes"))
             .on_press(|s: &mut UiState| s.send(Command::ThemeRefresh))
             .build(k)
             .key("theme-refresh"),
@@ -593,22 +575,19 @@ pub(super) fn sub_header(s: &UiState, k: &Kit) -> El {
     };
 
     let gallery_label = if gallery.loading && gallery.entries.is_empty() {
-        tr_ref(language, "Gallery", "图库").to_string()
+        tr_ref(language, "Gallery").to_string()
     } else {
-        format!("{} ({gallery_count})", tr_ref(language, "Gallery", "图库"))
+        format!("{} ({gallery_count})", tr_ref(language, "Gallery"))
     };
 
     let labels = [
-        format!(
-            "{} ({library_count})",
-            tr_ref(language, "On this computer", "本机主题")
-        ),
+        format!("{} ({library_count})", tr_ref(language, "On this computer")),
         gallery_label,
     ];
 
     let seg = SegmentedControl::new(&labels, Some(at))
         .fit()
-        .label(tr_ref(language, "Theme sources", "主题来源"))
+        .label(tr_ref(language, "Theme sources"))
         .on_pick(|s: &mut UiState, i, _: &mut Tx| {
             s.theme_tab = match i {
                 0 => ThemeTab::Installed,
@@ -627,7 +606,7 @@ pub(super) fn sub_header(s: &UiState, k: &Kit) -> El {
 
     if s.theme_tab == ThemeTab::Gallery {
         bar = bar.child(
-            text(tr(language, "from muqun.dev", "来自 muqun.dev"))
+            text(tr(language, "from muqun.dev"))
                 .font(k.ty.small)
                 .color(k.c.text_faint),
         );
@@ -671,11 +650,10 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                 out.push(super::empty(
                     k,
                     "library-empty",
-                    tr_ref(language, "No themes yet", "还没有主题"),
+                    tr_ref(language, "No themes yet"),
                     tr_ref(
                         language,
                         "Install one from the Gallery tab, or import a package.",
-                        "从“图库”标签页安装，或导入主题包。",
                     ),
                 ));
             } else if library.is_empty() {
@@ -688,24 +666,20 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                 )));
             }
 
-            let import = tr_ref(language, "Import", "导入");
+            let import = tr_ref(language, "Import");
             out.push(super::group(
                 k,
                 "themes-import",
-                tr_ref(language, "Import", "导入"),
+                tr_ref(language, "Import"),
                 vec![
                     row(
                         k,
                         "import-link",
-                        tr_ref(language, "From a link", "从链接导入"),
-                        tr_ref(
-                            language,
-                            "A .muqun-theme address someone shared.",
-                            "别人分享的 .muqun-theme 地址。",
-                        ),
+                        tr_ref(language, "From a link"),
+                        tr_ref(language, "A .muqun-theme address someone shared."),
                         super::field_button(
                             TextInput::new(&s.theme_url)
-                                .label(tr_ref(language, "Theme link", "主题链接"))
+                                .label(tr_ref(language, "Theme link"))
                                 .placeholder("https://… .muqun-theme")
                                 .on_edit(|s: &mut UiState| &mut s.theme_url)
                                 .on_submit(import_url),
@@ -721,13 +695,9 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                     row(
                         k,
                         "import-file",
-                        tr_ref(language, "From a file", "从文件导入"),
-                        tr_ref(
-                            language,
-                            "A .muqun-theme package on this computer.",
-                            "这台电脑上的 .muqun-theme 主题包。",
-                        ),
-                        super::button(tr_ref(language, "Choose file…", "选择文件…"))
+                        tr_ref(language, "From a file"),
+                        tr_ref(language, "A .muqun-theme package on this computer."),
+                        super::button(tr_ref(language, "Choose file…"))
                             .on_press(|_: &mut UiState| {
                                 crate::platform::dialogs::import_theme_file()
                             })
@@ -761,16 +731,16 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                     k,
                     "loading",
                     Tone::Quiet,
-                    tr(language, "Loading the gallery…", "正在加载图库…"),
+                    tr(language, "Loading the gallery…"),
                 )));
             }
             if let Some(err) = &gallery.error {
                 out.push(row(
                     k,
                     "gallery-error",
-                    tr_ref(language, "The gallery is unavailable", "图库不可用"),
+                    tr_ref(language, "The gallery is unavailable"),
                     err,
-                    super::button(tr_ref(language, "Try again", "重试"))
+                    super::button(tr_ref(language, "Try again"))
                         .on_press(|s: &mut UiState| s.send(Command::ThemeRefresh))
                         .build(k)
                         .key("gallery-retry"),
@@ -781,11 +751,7 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                     k,
                     "stale",
                     Tone::Quiet,
-                    tr(
-                        language,
-                        &format!("Showing the saved list: {why}"),
-                        &format!("显示已保存的列表：{why}"),
-                    ),
+                    tr(language, &format!("Showing the saved list: {why}")),
                 )));
             }
             if !found.is_empty() {
@@ -806,7 +772,7 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                 if found.len() > s.gallery_limit {
                     block = block.child(
                         hrow().key("more").w_full().justify_center().child(
-                            Button::new(tr_ref(language, "Show more", "显示更多"))
+                            Button::new(tr_ref(language, "Show more"))
                                 .variant(ButtonVariant::Ghost)
                                 .control_size(ControlSize::Regular)
                                 .on_press(|s: &mut UiState| {
@@ -832,11 +798,7 @@ fn nothing_found(k: &Kit, language: Language) -> El {
         k,
         "none",
         Tone::Quiet,
-        tr(
-            language,
-            "No theme matches the search.",
-            "没有符合搜索的主题。",
-        ),
+        tr(language, "No theme matches the search."),
     ))
 }
 

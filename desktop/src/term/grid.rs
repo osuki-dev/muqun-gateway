@@ -291,9 +291,9 @@ mod tests {
         let row = build_row(vec![
             cell("$", W, None),
             cell(" ", W, None),
-            wide("中"),
+            wide("\u{4e2d}"),
             tail,
-            wide("文"),
+            wide("\u{6587}"),
             tail,
             cell("o", W, None),
             cell("k", W, None),
@@ -304,8 +304,8 @@ mod tests {
             texts(&row),
             vec![
                 (0, 1, "$"),
-                (2, 2, "中"),
-                (4, 2, "文"),
+                (2, 2, "\u{4e2d}"),
+                (4, 2, "\u{6587}"),
                 (6, 2, "ok"),
                 (9, 1, "\u{e0b0}")
             ]

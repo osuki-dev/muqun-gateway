@@ -120,7 +120,7 @@ fn file_header(cx: &Tcx, fi: usize, file: &FileDiff) -> El {
 
     let p = path.clone();
     let asid_c = asid.clone();
-    let diff_btn = Button::new(cx.t("Diff", "差异"))
+    let diff_btn = Button::new(cx.t("Diff"))
         .variant(ButtonVariant::Ghost)
         .control_size(ControlSize::Small)
         .on_press_tx(move |s: &mut crate::ui::UiState, tx: &mut rune::Tx| {
@@ -150,7 +150,7 @@ fn file_header(cx: &Tcx, fi: usize, file: &FileDiff) -> El {
         )
         .cursor(Cursor::Pointer)
         .role("button")
-        .label(cx.t("Copy path", "复制路径").to_string())
+        .label(cx.t("Copy path").to_string())
         .on_press_tx(move |_: &mut crate::ui::UiState, tx: &mut rune::Tx| {
             tx.copy(copy_path.clone())
         })
@@ -323,14 +323,12 @@ pub fn rows(cx: &Tcx, id: &str, files: &[FileDiff]) -> El {
         .child(block);
     if total > LINES_SHOWN {
         let label = if show_all {
-            cx.t("Show less", "收起").to_string()
+            cx.t("Show less").to_string()
         } else if cx.zh() {
-            crate::ui::copy::localize(
-                cx.lang,
-                format!(
-                    "展开剩余 {} 行（共 {total} 行）",
-                    total.saturating_sub(shown)
-                ),
+            format!(
+                "{}: {} / {total}",
+                cx.t("Expand remaining lines:"),
+                total.saturating_sub(shown)
             )
         } else {
             format!(

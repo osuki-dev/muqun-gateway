@@ -272,11 +272,8 @@ impl UiState {
         match resolved.filter(|p| p.exists()) {
             Some(p) => self.open_file(p),
             None => {
-                let title = super::copy::tr(
-                    self.cfg.general.language,
-                    "File not found on this computer",
-                    "这台电脑上找不到该文件",
-                );
+                let title =
+                    super::copy::tr(self.cfg.general.language, "File not found on this computer");
                 self.toast(title, Some(path.to_string()));
             }
         }
@@ -327,13 +324,9 @@ fn empty(s: &UiState, k: &Kit, key: &str) -> El {
         .center()
         .child(
             text(if s.selected.is_some() {
-                tr_ref(language, "No messages yet.", "还没有消息。")
+                tr_ref(language, "No messages yet.")
             } else {
-                tr_ref(
-                    language,
-                    "Select a session or start a new one.",
-                    "选择一个会话，或开始新会话。",
-                )
+                tr_ref(language, "Select a session or start a new one.")
             })
             .key("empty-feed")
             .font(k.ty.ui)
@@ -386,7 +379,7 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
                 .center_y()
                 .child(Spinner::new().size(14.0).build(k))
                 .child(
-                    text(tr_ref(language, "Opening the session…", "正在打开会话…"))
+                    text(tr_ref(language, "Opening the session…"))
                         .font(k.ty.ui)
                         .color(k.c.text_muted),
                 ),
@@ -509,13 +502,9 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
 fn latest_pill(s: &UiState, k: &Kit, asid: &str, unseen: usize) -> El {
     let language = s.cfg.general.language;
     let words = if unseen == 0 {
-        tr_ref(language, "Latest", "最新").to_string()
+        tr_ref(language, "Latest").to_string()
     } else {
-        super::copy::tr(
-            language,
-            &format!("{unseen} new"),
-            &format!("{unseen} 条新消息"),
-        )
+        super::copy::tr(language, &format!("{unseen} new"))
     };
     let tip = super::keymap::tip(
         &super::keymap::entry(super::keymap::Action::JumpLatest).what(language),
@@ -692,14 +681,14 @@ fn top_row(cx: &Tcx) -> El {
         line = line
             .child(Spinner::new().size(12.0).build(cx.k).key("top-spin"))
             .child(
-                text(cx.t("Loading earlier messages…", "正在载入更早的消息…"))
+                text(cx.t("Loading earlier messages…"))
                     .font(cx.k.ty.small)
                     .color(cx.k.c.text_faint),
             );
     } else {
         let asid = cx.asid.to_string();
         line = line.child(
-            Button::new(cx.t("Load earlier messages", "载入更早的消息"))
+            Button::new(cx.t("Load earlier messages"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
                 .on_press(move |s: &mut UiState| {
@@ -723,7 +712,7 @@ fn working_row(cx: &Tcx) -> El {
         .py(4.0)
         .child(Spinner::new().size(12.0).build(cx.k).key("work-spin"))
         .child(
-            text(cx.t("Working…", "正在工作…"))
+            text(cx.t("Working…"))
                 .font(cx.k.ty.small)
                 .color(cx.k.c.text_muted),
         )
@@ -749,7 +738,7 @@ fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
     if text.is_empty() {
         return el();
     }
-    let copied_label = cx.t("Copied to clipboard", "已复制到剪贴板");
+    let copied_label = cx.t("Copied to clipboard");
     let copy_id = it.id.clone();
     let chip = row()
         .key(format!("actions-{}", it.id))
@@ -764,7 +753,7 @@ fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
             IconButton::new(&rune_kit::glyphs::COPY)
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
-                .label(cx.t("Copy", "复制"))
+                .label(cx.t("Copy"))
                 .on_press_tx(move |s: &mut UiState, tx: &mut rune::Tx| {
                     tx.copy(text.clone());
                     s.status = copied_label.to_string();
@@ -776,7 +765,7 @@ fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
             IconButton::new(&super::icons::UNDO)
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
-                .label(cx.t("Roll back to here", "回滚到这里"))
+                .label(cx.t("Roll back to here"))
                 .on_press(move |s: &mut UiState| {
                     s.send(Command::StageRevert {
                         asid: rollback_asid.clone(),
@@ -790,7 +779,7 @@ fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
             IconButton::new(&super::icons::FORK)
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
-                .label(cx.t("Fork from here", "从这里分叉"))
+                .label(cx.t("Fork from here"))
                 .on_press(move |s: &mut UiState| {
                     s.send(Command::ForkSession {
                         asid: asid.clone(),
@@ -896,14 +885,14 @@ fn changes_toolbar(s: &UiState, k: &Kit, asid: &str) -> El {
         .map(|d| d.files().iter().map(|f| f.deletions()).sum::<usize>())
         .unwrap_or(s.diff_stat.removed);
 
-    let back_btn = Button::new(tr_ref(language, "← Chat", "← 对话"))
+    let back_btn = Button::new(tr_ref(language, "← Chat"))
         .variant(ButtonVariant::Ghost)
         .control_size(ControlSize::Small)
         .on_press(|s: &mut UiState| s.show_diff = false)
         .build(k)
         .key("back-to-chat");
 
-    let title = text(tr_ref(language, "Working Tree Changes", "工作区改动"))
+    let title = text(tr_ref(language, "Working Tree Changes"))
         .font(k.ty.ui_medium)
         .color(k.c.text_base)
         .single_line();
@@ -911,7 +900,7 @@ fn changes_toolbar(s: &UiState, k: &Kit, asid: &str) -> El {
     let stats_badge = Badge::new(format!(
         "{} {}  +{} −{}",
         files_count,
-        tr_ref(language, "files", "个文件"),
+        tr_ref(language, "files"),
         added,
         removed
     ))
@@ -930,7 +919,7 @@ fn changes_toolbar(s: &UiState, k: &Kit, asid: &str) -> El {
         .child(stats_badge);
 
     let unified_active = mode == DiffMode::Unified;
-    let unified_btn = Button::new(tr_ref(language, "Unified", "单栏"))
+    let unified_btn = Button::new(tr_ref(language, "Unified"))
         .variant(if unified_active {
             ButtonVariant::Contrast
         } else {
@@ -945,7 +934,7 @@ fn changes_toolbar(s: &UiState, k: &Kit, asid: &str) -> El {
         .build(k)
         .key("btn-unified");
 
-    let split_btn = Button::new(tr_ref(language, "Split", "双栏"))
+    let split_btn = Button::new(tr_ref(language, "Split"))
         .variant(if !unified_active {
             ButtonVariant::Contrast
         } else {
@@ -960,7 +949,7 @@ fn changes_toolbar(s: &UiState, k: &Kit, asid: &str) -> El {
         .build(k)
         .key("btn-split");
 
-    let wrap_btn = Button::new(tr_ref(language, "Wrap", "换行"))
+    let wrap_btn = Button::new(tr_ref(language, "Wrap"))
         .variant(if wrap {
             ButtonVariant::Contrast
         } else {
@@ -976,7 +965,7 @@ fn changes_toolbar(s: &UiState, k: &Kit, asid: &str) -> El {
         .key("btn-wrap");
 
     let asid_str = asid.to_string();
-    let refresh_btn = Button::new(tr_ref(language, "Refresh", "刷新"))
+    let refresh_btn = Button::new(tr_ref(language, "Refresh"))
         .variant(ButtonVariant::Ghost)
         .control_size(ControlSize::Small)
         .on_press(move |s: &mut UiState| {
@@ -987,14 +976,14 @@ fn changes_toolbar(s: &UiState, k: &Kit, asid: &str) -> El {
         .build(k)
         .key("btn-refresh");
 
-    let commit_btn = Button::new(tr_ref(language, "Commit with agent", "让 agent 提交"))
+    let commit_btn = Button::new(tr_ref(language, "Commit with agent"))
         .variant(ButtonVariant::Ghost)
         .control_size(ControlSize::Small)
         .on_press(move |s: &mut UiState| {
             let msg = if language == crate::config::Language::En {
                 "Commit the working tree changes with a descriptive conventional commit message"
             } else {
-                "请使用规范的 commit message 提交当前工作区的修改"
+                "Please write a proper commit message for workspace changes"
             };
             s.draft = rune::TextEdit::new(msg);
             s.draft.focused = true;
@@ -1197,19 +1186,14 @@ fn empty_changes_placeholder(k: &Kit, language: crate::config::Language) -> El {
                 .a11y_hidden(),
         )
         .child(
-            text(tr_ref(
-                language,
-                "No working tree changes",
-                "工作区没有未提交的改动",
-            ))
-            .font(k.ty.ui_medium)
-            .color(k.c.text_muted),
+            text(tr_ref(language, "No working tree changes"))
+                .font(k.ty.ui_medium)
+                .color(k.c.text_muted),
         )
         .child(
             text(tr_ref(
                 language,
                 "Changes made by the agent will appear here for review.",
-                "Agent 修改的文件差异将在此处展示以供审查。",
             ))
             .font(k.ty.small)
             .color(k.c.text_faint),
@@ -1230,11 +1214,7 @@ fn changes_file_list(s: &UiState, k: &Kit, language: crate::config::Language, as
                 "{} changed file(s); the agent gave no patch.",
                 s.diff_stat.files
             ),
-            _ => super::copy::tr(
-                language,
-                "",
-                &format!("{} 个文件有改动；agent 没有给出补丁。", s.diff_stat.files),
-            ),
+            _ => super::copy::tr(language, ""),
         },
     ));
     for f in &s.diff_stat.paths {

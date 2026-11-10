@@ -184,9 +184,9 @@ fn stage(
     pose: Pose,
 ) -> El {
     let subtitle = if pose.loading {
-        tr_ref(language, "Warming up agents…", "正在准备 Agents…")
+        tr_ref(language, "Warming up agents…")
     } else {
-        tr_ref(language, "Ready", "已就绪")
+        tr_ref(language, "Ready")
     };
     let title_font = TextStyle {
         size: 30.0,

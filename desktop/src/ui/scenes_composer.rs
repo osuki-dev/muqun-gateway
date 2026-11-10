@@ -123,7 +123,7 @@ fn composer_scenes() -> Vec<Scene> {
             s.echo_submitted(token, false);
         }),
         ("echo-failed-zh", |s| {
-            let token = echo_scene(s, false, "再跑一遍完整测试。", false);
+            let token = echo_scene(s, false, "Run the full test suite again.", false);
             s.echo_submitted(token, false);
             zh(s);
         }),

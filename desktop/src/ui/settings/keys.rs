@@ -18,11 +18,7 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
             k,
             "sc-check-ok",
             Tone::Good,
-            tr(
-                language,
-                "No conflicts: every chord does one thing.",
-                "没有冲突：每个组合键只做一件事。",
-            ),
+            tr(language, "No conflicts: every chord does one thing."),
         ));
     }
     for (i, words) in clashes.into_iter().enumerate() {
@@ -56,7 +52,7 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
         out.push(group(
             k,
             "shortcuts-notes",
-            tr_ref(language, "Good to know", "提示"),
+            tr_ref(language, "Good to know"),
             notes,
         ));
     }

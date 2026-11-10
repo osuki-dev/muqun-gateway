@@ -128,14 +128,11 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         "Every coding agent on this computer in one window: start sessions, \
          watch several at once, answer approvals, and keep the history. \
          Nothing leaves this machine unless an agent sends it.",
-        "这台电脑上的所有编程 Agent 都在一个窗口里：开始会话、同时看几个、处理审批、保留历史。\
-         除非 Agent 自己发送，否则数据不会离开本机。",
     );
     let agents_line = if usable == 0 {
         tr(
             language,
             "No agent is ready yet. Install one, or enable it in Settings → Agents.",
-            "还没有可用的 Agent。安装一个，或在「设置 → Agents」中启用。",
         )
     } else {
         super::copy::localize(
@@ -146,7 +143,6 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                     "{usable} agent{} ready to go.",
                     if usable == 1 { "" } else { "s" }
                 ),
-                &format!("{usable} 个 Agent 已就绪。"),
             ),
         )
     };
@@ -159,14 +155,14 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .py(28.0)
         .items_center()
         .role("dialog")
-        .label(tr(language, "Welcome", "欢迎"))
+        .label(tr(language, "Welcome"))
         .child(badge)
         .child(
             col()
                 .gap(6.0)
                 .items_center()
                 .child(
-                    text(tr(language, "Welcome to Muqun", "欢迎使用 Muqun"))
+                    text(tr(language, "Welcome to Muqun"))
                         .font(title_font)
                         .color(k.c.text_base),
                 )
@@ -193,7 +189,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                         .w_full()
                         .center_y()
                         .child(
-                            text(tr(language, "Agents found", "检测到的 Agents"))
+                            text(tr(language, "Agents found"))
                                 .font(k.ty.body_medium)
                                 .color(k.c.text_base)
                                 .grow(1.0),
@@ -208,7 +204,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                 .gap(10.0)
                 .center_y()
                 .child(
-                    Button::new(tr_ref(language, "Not now", "稍后"))
+                    Button::new(tr_ref(language, "Not now"))
                         .variant(ButtonVariant::Ghost)
                         .control_size(ControlSize::Large)
                         .on_press(|s: &mut UiState| s.dismiss_welcome(false))
@@ -217,7 +213,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                 )
                 .child(
                     look.glow(
-                        Button::new(tr_ref(language, "Start a session", "开始一个会话"))
+                        Button::new(tr_ref(language, "Start a session"))
                             .variant(ButtonVariant::Submit)
                             .control_size(ControlSize::Large)
                             .on_press(|s: &mut UiState| s.dismiss_welcome(true))

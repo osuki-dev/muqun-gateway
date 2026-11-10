@@ -350,9 +350,9 @@ impl Language {
     /// Native names for each language, matching App's `LOCALE_LABELS`.
     pub const LABELS: &'static [&'static str] = &[
         "English",
-        "繁體中文",
-        "简体中文",
-        "日本語",
+        "\u{7e41}\u{9ad4}\u{4e2d}\u{6587}",
+        "\u{7b80}\u{4f53}\u{4e2d}\u{6587}",
+        "\u{65e5}\u{672c}\u{8a9e}",
         "한국어",
         "Deutsch",
         "Français",
@@ -386,9 +386,9 @@ impl Language {
     pub fn native_label(self) -> &'static str {
         match self {
             Self::En => "English",
-            Self::ZhTw => "繁體中文",
-            Self::ZhCn => "简体中文",
-            Self::Ja => "日本語",
+            Self::ZhTw => "\u{7e41}\u{9ad4}\u{4e2d}\u{6587}",
+            Self::ZhCn => "\u{7b80}\u{4f53}\u{4e2d}\u{6587}",
+            Self::Ja => "\u{65e5}\u{672c}\u{8a9e}",
             Self::Ko => "한국어",
             Self::De => "Deutsch",
             Self::Fr => "Français",

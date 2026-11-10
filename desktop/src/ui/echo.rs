@@ -350,13 +350,10 @@ pub fn view(cx: &Tcx, echo: &Echo) -> El {
                 .gap(6.0)
                 .center_y()
                 .child(Spinner::new().size(10.0).build(k).key("echo-spin"))
-                .child(note(cx.t("Sending…", "发送中…"), k.c.text_faint)),
+                .child(note(cx.t("Sending…"), k.c.text_faint)),
         ),
         EchoState::Sent if echo.inbox.is_some() => Some(row().child(note(
-            cx.t(
-                "Steered · the agent reads it at its next step",
-                "已插话 · 智能体下一步会读到",
-            ),
+            cx.t("Steered · the agent reads it at its next step"),
             k.c.text_faint,
         ))),
         EchoState::Sent => None,
@@ -368,9 +365,9 @@ pub fn view(cx: &Tcx, echo: &Echo) -> El {
                 row()
                     .gap(4.0)
                     .center_y()
-                    .child(note(cx.t("Not sent", "未发送"), k.c.danger.fg).mr(4.0))
+                    .child(note(cx.t("Not sent"), k.c.danger.fg).mr(4.0))
                     .child(
-                        Button::new(cx.t("Retry", "重试"))
+                        Button::new(cx.t("Retry"))
                             .variant(ButtonVariant::Ghost)
                             .control_size(ControlSize::Small)
                             .on_press(move |s: &mut UiState| s.retry_echo(&retry_asid, token))
@@ -378,7 +375,7 @@ pub fn view(cx: &Tcx, echo: &Echo) -> El {
                             .key("echo-retry"),
                     )
                     .child(
-                        Button::new(cx.t("Discard", "丢弃"))
+                        Button::new(cx.t("Discard"))
                             .variant(ButtonVariant::GhostMuted)
                             .control_size(ControlSize::Small)
                             .on_press(move |s: &mut UiState| s.discard_echo(&asid, token))

@@ -72,7 +72,7 @@ pub fn question_card(
             );
         }
         if q.multiple {
-            head = head.child(caption(k, cx.t("Several answers", "可多选")));
+            head = head.child(caption(k, cx.t("Several answers")));
         }
         block = block.child(head);
         if !q.question.is_empty() {
@@ -353,11 +353,7 @@ fn field_input(s: &UiState, k: &Kit, form: &FormRequest, field: &FormField) -> E
         FormField::External { url, .. } => crate::ui::muted(k, url.clone()),
         FormField::Unknown { .. } => crate::ui::muted(
             k,
-            tr_ref(
-                language,
-                "This question needs a newer app to answer.",
-                "需要更新版本的应用才能回答此问题。",
-            ),
+            tr_ref(language, "This question needs a newer app to answer."),
         ),
         _ if !options.is_empty() => {
             let chosen: Vec<&str> = current.split(',').collect();
@@ -395,7 +391,7 @@ fn field_input(s: &UiState, k: &Kit, form: &FormRequest, field: &FormField) -> E
                     k,
                     &slot,
                     &typed,
-                    tr_ref(language, "Or type an answer", "或输入回答"),
+                    tr_ref(language, "Or type an answer"),
                 ));
             }
             list
@@ -407,7 +403,7 @@ fn field_input(s: &UiState, k: &Kit, form: &FormRequest, field: &FormField) -> E
             &current,
             placeholder
                 .as_deref()
-                .unwrap_or(tr_ref(language, "Type here", "在此输入")),
+                .unwrap_or(tr_ref(language, "Type here")),
         ),
         _ => text_input(s, k, &slot, &current, title),
     };
@@ -440,7 +436,7 @@ pub fn form_fields(s: &UiState, k: &Kit, form: &FormRequest, compact: bool) -> E
     let blocked = missing_required(s, form);
     body.child(
         row().key("submit-row").w_full().child(
-            Button::new(tr_ref(language, "Submit", "提交"))
+            Button::new(tr_ref(language, "Submit"))
                 .variant(ButtonVariant::Submit)
                 .control_size(ControlSize::Small)
                 .disabled(blocked)
@@ -499,9 +495,9 @@ pub fn form_card(s: &UiState, k: &Kit, form: &FormRequest) -> El {
                 )
                 .child(
                     text(if pending {
-                        tr_ref(language, "The agent is asking you", "Agent 在向你提问")
+                        tr_ref(language, "The agent is asking you")
                     } else {
-                        tr_ref(language, "Answered", "已回答")
+                        tr_ref(language, "Answered")
                     })
                     .font(k.ty.small)
                     .color(k.c.text_faint),

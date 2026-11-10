@@ -41,9 +41,9 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         k.c.warning.fg
     };
     let status_text = if reachable {
-        tr(language, "Online", "在线")
+        tr(language, "Online")
     } else {
-        tr(language, "Offline", "离线")
+        tr(language, "Offline")
     };
 
     let device_badge = col()
@@ -89,7 +89,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                                 .fill(k.c.layer_01)
                                 .border(1.0, k.c.border_weak)
                                 .child(
-                                    text(tr(language, "Peer", "对等节点"))
+                                    text(tr(language, "Peer"))
                                         .font(k.ty.caption())
                                         .color(k.c.text_muted),
                                 ),
@@ -104,7 +104,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                         .child(text("·").font(k.ty.caption()).color(k.c.text_faint))
                         .child(
                             text(if effective_url.is_empty() {
-                                tr(language, "Fleet gateway", "网关舰队").to_string()
+                                tr(language, "Fleet gateway").to_string()
                             } else {
                                 effective_url.clone()
                             })
@@ -130,7 +130,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                 .gap(6.0)
                 .w_full()
                 .child(
-                    text(tr(language, "Gateway URL:", "网关地址（URL）："))
+                    text(tr(language, "Gateway URL:"))
                         .font(k.ty.caption())
                         .color(k.c.text_muted),
                 )
@@ -181,13 +181,9 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         let form = col()
             .gap(14.0)
             .child(
-                text(tr(
-                    language,
-                    "Enter App Token for this computer:",
-                    "输入此电脑的 App 客户端凭据（Token）：",
-                ))
-                .font(k.ty.ui_medium)
-                .color(k.c.text_base),
+                text(tr(language, "Enter App Token for this computer:"))
+                    .font(k.ty.ui_medium)
+                    .color(k.c.text_base),
             )
             .child(
                 TextInput::new(&s.pairing_token_input)
@@ -202,19 +198,17 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                     .center_y()
                     .child(
                         Button::new(if busy {
-                            tr(language, "Connecting…", "连接中…")
+                            tr(language, "Connecting…")
                         } else {
-                            tr(language, "Verify & Connect", "验证并连接")
+                            tr(language, "Verify & Connect")
                         })
                         .variant(ButtonVariant::Submit)
                         .build(k)
                         .key("pair-token-submit")
                         .on_press(move |s: &mut UiState| {
                             if token_url.is_empty() {
-                                s.pairing_error = Some(
-                                    tr(language, "Please provide a gateway URL", "请提供网关地址")
-                                        .to_string(),
-                                );
+                                s.pairing_error =
+                                    Some(tr(language, "Please provide a gateway URL").to_string());
                                 return;
                             }
                             if !busy && !token_val.is_empty() {
@@ -229,7 +223,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                         }),
                     )
                     .child(
-                        Button::new(tr(language, "Use Pairing Code instead", "切换为配对码关联"))
+                        Button::new(tr(language, "Use Pairing Code instead"))
                             .variant(ButtonVariant::Ghost)
                             .build(k)
                             .key("pair-toggle-to-code")
@@ -239,7 +233,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                             }),
                     )
                     .child(
-                        Button::new(tr(language, "Cancel", "取消"))
+                        Button::new(tr(language, "Cancel"))
                             .variant(ButtonVariant::Ghost)
                             .build(k)
                             .key("pair-token-cancel")
@@ -271,7 +265,6 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                     text(tr(
                         language,
                         "Code complete! Click Confirm & Connect below.",
-                        "配对码完整！请点击下方按钮完成加密授权。",
                     ))
                     .font(k.ty.caption())
                     .color(k.c.success.fg),
@@ -287,8 +280,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                         chars.len(),
                         tr(
                             language,
-                            "Hyphen is handled automatically. Case-insensitive.",
-                            "连字符自动处理，不区分大小写",
+                            "Hyphen is handled automatically. Case-insensitive."
                         )
                     ))
                     .font(k.ty.caption())
@@ -310,7 +302,6 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                 text(tr(
                     language,
                     "Zero-Trust Handshake: Key derived locally via Argon2id (ChaCha20-Poly1305).",
-                    "零信任加密握手：通过 Argon2id 本地派生端到端传输密钥。",
                 ))
                 .font(k.ty.caption())
                 .color(k.c.text_muted),
@@ -329,7 +320,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                             .radius(4.0)
                             .fill(k.c.bg_contrast)
                             .child(
-                                text(tr(language, "CODE", "配对码"))
+                                text(tr(language, "CODE"))
                                     .font(TextStyle::new(10.0, 800.0).mono())
                                     .color(k.c.text_contrast),
                             ),
@@ -337,8 +328,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                     .child(
                         text(tr(
                             language,
-                            "Enter the 8-character code shown on the remote screen:",
-                            "输入远端屏幕显示的 8 位配对码：",
+                            "Enter the 8-character code shown on the remote screen:"
                         ))
                         .font(k.ty.ui_medium)
                         .color(k.c.text_base),
@@ -348,7 +338,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
             .child(
                 TextInput::new(&s.pairing_code_input)
                     .placeholder("VDKQ-7QUF")
-                    .label(super::copy::tr_ref(language, "Direct Input / Paste", "键盘输入或粘贴"))
+                    .label(super::copy::tr_ref(language, "Direct Input / Paste"))
                     .text_style(TextStyle::new(15.0, 600.0).mono().lh(20.0))
                     .height(38.0)
                     .width(None)
@@ -372,9 +362,9 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                     .center_y()
                     .child(
                         Button::new(if busy {
-                            tr(language, "Claiming…", "正在验证…")
+                            tr(language, "Claiming…")
                         } else {
-                            tr(language, "Confirm & Connect", "确认并连接")
+                            tr(language, "Confirm & Connect")
                         })
                         .variant(ButtonVariant::Submit)
                         .build(k)
@@ -397,8 +387,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                                 s.pairing_error = Some(
                                     tr(
                                         language,
-                                        "Please enter the complete 8-character code with hyphen (e.g. VDKQ-7QUF)",
-                                        "请输入完整的 8 位配对码（如 VDKQ-7QUF）",
+                                        "Please enter the complete 8-character code with hyphen (e.g. VDKQ-7QUF)"
                                     )
                                     .to_string(),
                                 );
@@ -406,7 +395,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                         }),
                     )
                     .child(
-                        Button::new(tr(language, "Cancel", "取消"))
+                        Button::new(tr(language, "Cancel"))
                             .variant(ButtonVariant::Ghost)
                             .build(k)
                             .key("pair-code-cancel")
@@ -454,7 +443,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                                     .child(icon(&glyphs::COMPUTER, 22.0).color(k.c.text_base)),
                             )
                             .child(
-                                text(tr(language, "Desktop", "桌面端"))
+                                text(tr(language, "Desktop"))
                                     .font(k.ty.caption())
                                     .color(k.c.text_muted),
                             ),
@@ -469,7 +458,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                                     .color(k.c.border_focus),
                             )
                             .child(
-                                text(tr(language, "P2P Link", "直连信道"))
+                                text(tr(language, "P2P Link"))
                                     .font(k.ty.caption())
                                     .color(k.c.border_focus),
                             ),
@@ -499,8 +488,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
             .child(
                 text(tr(
                     language,
-                    "Link this desktop to browse and run sessions on this remote computer. Click below to request a one-time pairing code from the remote terminal.",
-                    "完成一次性配对授权，即可在本地桌面端直接浏览、创建和管理远端会话。点击下方按钮即可向远端网关请求配对码并在屏幕上查看。",
+                    "Link this desktop to browse and run sessions on this remote computer. Click below to request a one-time pairing code from the remote terminal."
                 ))
                 .font(k.ty.small)
                 .color(k.c.text_muted)
@@ -514,19 +502,17 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                 .center_y()
                 .child(
                     Button::new(if busy {
-                        tr(language, "Requesting…", "请求中…")
+                        tr(language, "Requesting…")
                     } else {
-                        tr(language, "Request Pairing Code", "发起配对请求")
+                        tr(language, "Request Pairing Code")
                     })
                     .variant(ButtonVariant::Submit)
                     .build(k)
                     .key("pair-request-btn")
                     .on_press(move |s: &mut UiState| {
                         if req_url.is_empty() {
-                            s.pairing_error = Some(
-                                tr(language, "Please provide a gateway URL", "请提供网关地址")
-                                    .to_string(),
-                            );
+                            s.pairing_error =
+                                Some(tr(language, "Please provide a gateway URL").to_string());
                             return;
                         }
                         if !busy {
@@ -540,7 +526,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                     }),
                 )
                 .child(
-                    Button::new(tr(language, "Enter Token directly", "直接输入 Token"))
+                    Button::new(tr(language, "Enter Token directly"))
                         .variant(ButtonVariant::Ghost)
                         .build(k)
                         .key("pair-toggle-to-token")
@@ -550,7 +536,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                         }),
                 )
                 .child(
-                    Button::new(tr(language, "Cancel", "取消"))
+                    Button::new(tr(language, "Cancel"))
                         .variant(ButtonVariant::Ghost)
                         .build(k)
                         .key("pair-request-cancel")

@@ -25,34 +25,28 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
     let kinds: [(&str, &str, &str, u64, Color); 3] = [
         (
             "cache",
-            tr_ref(language, "Cache", "缓存"),
+            tr_ref(language, "Cache"),
             tr_ref(
                 language,
                 "Theme previews and the gallery list. Rebuilt when needed.",
-                "主题预览与图库列表，需要时会重新生成。",
             ),
             report.cache(),
             accent,
         ),
         (
             "uploads",
-            tr_ref(language, "Attachments", "附件副本"),
+            tr_ref(language, "Attachments"),
             tr_ref(
                 language,
                 "Copies of files and pictures you attached to prompts.",
-                "你在提示中附加的文件与图片的副本。",
             ),
             report.uploads,
             accent.alpha(0.55),
         ),
         (
             "other",
-            tr_ref(language, "Sessions and settings", "会话与设置"),
-            tr_ref(
-                language,
-                "Window state, drafts and this configuration.",
-                "窗口状态、草稿与这些设置。",
-            ),
+            tr_ref(language, "Sessions and settings"),
+            tr_ref(language, "Window state, drafts and this configuration."),
             report.other,
             k.c.text_faint,
         ),
@@ -108,7 +102,7 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                         .color(k.c.text_base),
                 )
                 .child(
-                    text(tr_ref(language, "on this computer", "存放在这台电脑上"))
+                    text(tr_ref(language, "on this computer"))
                         .font(k.ty.ui)
                         .color(k.c.text_muted)
                         .pb(5.0),
@@ -150,23 +144,22 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
         group(
             k,
             "storage-kinds",
-            tr_ref(language, "What takes the space", "占用明细"),
+            tr_ref(language, "What takes the space"),
             legend,
         ),
         group(
             k,
             "storage-clean",
-            tr_ref(language, "Clean up", "清理"),
+            tr_ref(language, "Clean up"),
             vec![row(
                 k,
                 "storage-clear",
-                tr_ref(language, "Clear cache", "清除缓存"),
+                tr_ref(language, "Clear cache"),
                 tr_ref(
                     language,
                     "Frees the cache now. Sessions, attachments and settings stay.",
-                    "立即释放缓存。会话、附件与设置不受影响。",
                 ),
-                super::button(tr_ref(language, "Clear cache", "清除缓存"))
+                super::button(tr_ref(language, "Clear cache"))
                     .variant(ButtonVariant::Danger)
                     .disabled(!scanned || report.cache() == 0)
                     .on_press(|s: &mut UiState| {

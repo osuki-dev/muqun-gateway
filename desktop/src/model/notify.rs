@@ -261,7 +261,7 @@ pub fn compose(
         title,
         body: i18n::t_slots(locale, body, &[("name", &name)]),
         waiting: attention.kind != AttentionKind::Finished,
-        action: crate::ui::copy::tr(language, "Open", "打开"),
+        action: crate::ui::copy::tr(language, "Open"),
     })
 }
 

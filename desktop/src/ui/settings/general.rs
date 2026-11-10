@@ -22,21 +22,20 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
     });
     let notify = s.cfg.notifications.enabled;
     let tray = s.cfg.general.close_to_tray;
-    let notify_title = tr_ref(language, "System notifications", "系统通知");
-    let tray_title = tr_ref(language, "Keep running in the tray", "关闭窗口后留在托盘");
+    let notify_title = tr_ref(language, "System notifications");
+    let tray_title = tr_ref(language, "Keep running in the tray");
     vec![
         group(
             k,
             "general-language",
-            tr_ref(language, "Language", "语言"),
+            tr_ref(language, "Language"),
             vec![row(
                 k,
                 "language",
-                tr_ref(language, "Interface language", "界面语言"),
+                tr_ref(language, "Interface language"),
                 tr_ref(
                     language,
-                    "Applies at once to everything in this window.",
-                    "立即作用于窗口中的所有文字。",
+                    "Applies at once to everything in this window."
                 ),
                 select(
                     s,
@@ -54,21 +53,20 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
         group(
             k,
             "general-workspace",
-            tr_ref(language, "New sessions", "新会话"),
+            tr_ref(language, "New sessions"),
             vec![
                 row(
                     k,
                     "cwd",
-                    tr_ref(language, "Default folder", "默认文件夹"),
+                    tr_ref(language, "Default folder"),
                     tr_ref(
                         language,
-                        "Where a new session starts when its agent remembers no folder.",
-                        "Agent 没有记住文件夹时，新会话从这里开始。",
+                        "Where a new session starts when its agent remembers no folder."
                     ),
                     field(
                         TextInput::new(&s.cwd_input)
-                            .label(tr_ref(language, "Default folder", "默认文件夹"))
-                            .placeholder(tr_ref(language, "Home folder", "用户主目录"))
+                            .label(tr_ref(language, "Default folder"))
+                            .placeholder(tr_ref(language, "Home folder"))
                             .on_edit(|s: &mut UiState| &mut s.cwd_input)
                             .on_change(|s: &mut UiState, _: &mut Tx| {
                                 let text = s.cwd_input.text.trim().to_string();
@@ -84,11 +82,10 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                 row(
                     k,
                     "open-in",
-                    tr_ref(language, "Open projects in", "打开项目的应用"),
+                    tr_ref(language, "Open projects in"),
                     tr_ref(
                         language,
-                        "What “Open in editor” opens a project folder with.",
-                        "「在编辑器中打开」使用的应用。",
+                        "What “Open in editor” opens a project folder with."
                     ),
                     select(
                         s,
@@ -106,15 +103,14 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                 row(
                     k,
                     "editor",
-                    tr_ref(language, "Editor command", "编辑器命令"),
+                    tr_ref(language, "Editor command"),
                     tr_ref(
                         language,
-                        "Optional: a command to run instead, given the folder.",
-                        "可选：改用这条命令打开文件夹。",
+                        "Optional: a command to run instead, given the folder."
                     ),
                     field(
                         TextInput::new(&editor)
-                            .label(tr_ref(language, "Editor command", "编辑器命令"))
+                            .label(tr_ref(language, "Editor command"))
                             .placeholder("code, zed, nvim, …")
                             .on_edit(|s: &mut UiState| {
                                 let stored =
@@ -145,7 +141,7 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
         group(
             k,
             "general-notify",
-            tr_ref(language, "Notifications", "通知"),
+            tr_ref(language, "Notifications"),
             vec![
                 row(
                     k,
@@ -153,8 +149,7 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                     notify_title,
                     tr_ref(
                         language,
-                        "When a session you are not looking at needs approval, asks a question or finishes.",
-                        "不在眼前的会话需要审批、提问或完成时提醒你。",
+                        "When a session you are not looking at needs approval, asks a question or finishes."
                     ),
                     flag(k, "notify", notify, notify_title, move |s| {
                         s.edit(ConfigEdit::Notifications(!notify))
@@ -166,8 +161,7 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                     tray_title,
                     tr_ref(
                         language,
-                        "Closing the window leaves Muqun in the tray, still notifying. Quit from the tray's menu.",
-                        "关闭窗口后 Muqun 留在托盘并继续提醒；从托盘菜单退出。",
+                        "Closing the window leaves Muqun in the tray, still notifying. Quit from the tray's menu."
                     ),
                     flag(k, "tray", tray, tray_title, move |s| {
                         s.edit(ConfigEdit::CloseToTray(!tray))

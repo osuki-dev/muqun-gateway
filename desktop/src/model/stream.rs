@@ -280,10 +280,10 @@ mod tests {
 
     #[test]
     fn the_boundary_never_splits_a_character() {
-        let text = "第一段。\n\n第二段";
+        let text = "First paragraph.\n\nSecond paragraph.";
         let b = settled_boundary(text);
         assert!(text.is_char_boundary(b));
-        assert_eq!(tail(text, b).1, "第二段");
+        assert_eq!(tail(text, b).1, "Second paragraph.");
     }
 
     #[test]

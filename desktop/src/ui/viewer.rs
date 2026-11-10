@@ -167,12 +167,10 @@ impl UiState {
             match crate::platform::editors::try_custom_command(cmd, path) {
                 Ok(true) => {}
                 _ => {
-                    let title =
-                        crate::ui::copy::tr(language, "Could not open editor", "无法打开编辑器");
+                    let title = crate::ui::copy::tr(language, "Could not open editor");
                     let detail = crate::ui::copy::tr(
                         language,
                         "Command failed to launch. Check Settings > General.",
-                        "命令无法启动，请检查「设置 > 常规」。",
                     );
                     self.toast(title, Some(format!("{detail} ({cmd})")));
                 }
@@ -186,15 +184,10 @@ impl UiState {
                     Ok(true) => {}
                     _ => {
                         let name = gui_editor.product().unwrap_or("Editor");
-                        let title = crate::ui::copy::tr(
-                            language,
-                            "Could not open editor",
-                            "无法打开编辑器",
-                        );
+                        let title = crate::ui::copy::tr(language, "Could not open editor");
                         let detail = crate::ui::copy::tr(
                             language,
                             "Application not found. Check Settings > General.",
-                            "未找到该应用，请检查「设置 > 常规」。",
                         );
                         self.toast(title, Some(format!("{name}: {detail}")));
                     }
@@ -228,11 +221,8 @@ impl UiState {
     pub fn file_saved(&mut self, result: Result<PathBuf, String>) {
         let language = self.cfg.general.language;
         match result {
-            Ok(path) => self.toast(
-                tr(language, "Saved", "已保存"),
-                Some(path.display().to_string()),
-            ),
-            Err(err) => self.toast(tr(language, "Could not save", "无法保存"), Some(err)),
+            Ok(path) => self.toast(tr(language, "Saved"), Some(path.display().to_string())),
+            Err(err) => self.toast(tr(language, "Could not save"), Some(err)),
         }
     }
 }
@@ -352,13 +342,13 @@ pub fn mount(s: &UiState, k: &Kit, scale: f32, layer: &mut Vec<El>) {
 fn kind_label(kind: FileKind, language: Language) -> String {
     match kind {
         FileKind::Text(Some(lang)) => lang_label(lang).to_string(),
-        FileKind::Text(None) => tr(language, "Text", "文本"),
+        FileKind::Text(None) => tr(language, "Text"),
         FileKind::Markdown => "Markdown".into(),
-        FileKind::Image => tr(language, "Image", "图片"),
-        FileKind::Video => tr(language, "Video", "视频"),
-        FileKind::Audio => tr(language, "Audio", "音频"),
+        FileKind::Image => tr(language, "Image"),
+        FileKind::Video => tr(language, "Video"),
+        FileKind::Audio => tr(language, "Audio"),
         FileKind::Pdf => "PDF".into(),
-        FileKind::Other => tr(language, "File", "文件"),
+        FileKind::Other => tr(language, "File"),
     }
 }
 
@@ -402,11 +392,7 @@ fn meta_line(v: &Viewer, language: Language) -> String {
         parts.push(files::human_size(size));
     }
     if let Body::Text { lines, .. } = &v.body {
-        parts.push(tr(
-            language,
-            &format!("{lines} lines"),
-            &format!("{lines} 行"),
-        ));
+        parts.push(tr(language, &format!("{lines} lines")));
     }
     if let Some(when) = v.meta.modified {
         parts.push(modified_label(when, SystemTime::now(), language));
@@ -416,26 +402,17 @@ fn meta_line(v: &Viewer, language: Language) -> String {
 
 fn modified_label(when: SystemTime, now: SystemTime, language: Language) -> String {
     let secs = now.duration_since(when).map_or(0, |d| d.as_secs());
-    let (en, zh) = match secs {
-        0..=59 => ("modified just now".into(), "刚刚修改".into()),
-        60..=3599 => (
-            format!("modified {} min ago", secs / 60),
-            format!("{} 分钟前修改", secs / 60),
-        ),
-        3600..=86_399 => (
-            format!("modified {} h ago", secs / 3600),
-            format!("{} 小时前修改", secs / 3600),
-        ),
-        86_400..=604_799 => (
-            format!("modified {} d ago", secs / 86_400),
-            format!("{} 天前修改", secs / 86_400),
-        ),
+    let en = match secs {
+        0..=59 => tr(language, "modified just now"),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86_399 => format!("{}h ago", secs / 3600),
+        86_400..=604_799 => format!("{}d ago", secs / 86_400),
         _ => {
             let date = civil_date(when);
-            (format!("modified {date}"), format!("{date} 修改"))
+            format!("modified {date}")
         }
     };
-    tr(language, &en, &zh)
+    tr(language, &en)
 }
 
 /// `YYYY-MM-DD` (UTC) of `when`.
@@ -504,14 +481,11 @@ fn header(v: &Viewer, k: &Kit, language: Language) -> El {
         .child(title);
 
     if v.kind == FileKind::Markdown && matches!(v.body, Body::Text { .. }) {
-        let labels = [
-            tr_ref(language, "Rendered", "渲染"),
-            tr_ref(language, "Source", "源码"),
-        ];
+        let labels = [tr_ref(language, "Rendered"), tr_ref(language, "Source")];
         bar = bar.child(
             SegmentedControl::new(&labels, Some(usize::from(v.source)))
                 .fit()
-                .label(tr_ref(language, "Show", "显示"))
+                .label(tr_ref(language, "Show"))
                 .on_pick(|s: &mut UiState, i, _: &mut rune::Tx| {
                     if let Some(v) = s.viewer.as_mut() {
                         v.source = i == 1;
@@ -531,9 +505,9 @@ fn header(v: &Viewer, k: &Kit, language: Language) -> El {
         bar = bar
             .child(
                 Button::new(if is_text {
-                    tr_ref(language, "Open in editor", "在编辑器中打开")
+                    tr_ref(language, "Open in editor")
                 } else {
-                    tr_ref(language, "Open with system app", "用系统应用打开")
+                    tr_ref(language, "Open with system app")
                 })
                 .icon(&OPEN_EXTERNAL)
                 .variant(ButtonVariant::Ghost)
@@ -544,7 +518,7 @@ fn header(v: &Viewer, k: &Kit, language: Language) -> El {
                 .key("viewer-open"),
             )
             .child(
-                Button::new(tr_ref(language, "Reveal in folder", "在文件夹中显示"))
+                Button::new(tr_ref(language, "Reveal in folder"))
                     .icon(&OPEN_FOLDER)
                     .variant(ButtonVariant::Ghost)
                     .on_press(move |_: &mut UiState| crate::platform::shell::reveal(&reveal))
@@ -552,7 +526,7 @@ fn header(v: &Viewer, k: &Kit, language: Language) -> El {
                     .key("viewer-reveal"),
             )
             .child(
-                Button::new(tr_ref(language, "Save as…", "另存为…"))
+                Button::new(tr_ref(language, "Save as…"))
                     .icon(&DOWNLOAD)
                     .variant(ButtonVariant::Outline)
                     .on_press(move |_: &mut UiState| {
@@ -581,7 +555,7 @@ fn header(v: &Viewer, k: &Kit, language: Language) -> El {
     bar.child(
         IconButton::new(k.glyph.close)
             .variant(IconButtonVariant::Ghost)
-            .label(tr_ref(language, "Close", "关闭"))
+            .label(tr_ref(language, "Close"))
             .on_press(|s: &mut UiState| s.close_viewer())
             .build(k)
             .key("viewer-close"),
@@ -604,7 +578,7 @@ fn zoom_controls(v: &Viewer, k: &Kit, language: Language) -> El {
     };
     let fit = v.zoom.is_none();
     let label = match v.zoom {
-        None => tr(language, "Fit", "适应"),
+        None => tr(language, "Fit"),
         Some(z) => format!("{:.0}%", z * 100.0),
     };
     row()
@@ -621,11 +595,7 @@ fn zoom_controls(v: &Viewer, k: &Kit, language: Language) -> El {
         .child(
             Button::new(label)
                 .variant(ButtonVariant::Ghost)
-                .help(tr(
-                    language,
-                    "Fit to the window / actual size",
-                    "适应窗口 / 实际大小",
-                ))
+                .help(tr(language, "Fit to the window / actual size"))
                 .on_press(move |s: &mut UiState| {
                     if let Some(v) = s.viewer.as_mut() {
                         v.zoom = if fit { Some(1.0) } else { None };
@@ -655,7 +625,7 @@ fn body(s: &UiState, v: &Viewer, k: &Kit, scale: f32, language: Language) -> El 
     let frame = col().key("viewer-body").w_full().grow(1.0).min_h(0.0);
     match &v.body {
         Body::Loading => frame.center().child(
-            text(tr(language, "Opening…", "正在打开…"))
+            text(tr(language, "Opening…"))
                 .font(k.ty.ui)
                 .color(k.c.text_muted),
         ),
@@ -684,16 +654,15 @@ fn body(s: &UiState, v: &Viewer, k: &Kit, scale: f32, language: Language) -> El 
         Body::External => frame.center().child(external(v, k, language)),
         Body::Missing => frame.center().child(notice(
             k,
-            tr(language, "Not on this computer", "不在这台电脑上"),
+            tr(language, "Not on this computer"),
             tr(
                 language,
-                "The file is on another computer or no longer exists. Open it from the App paired with that computer.",
-                "文件在另一台电脑上，或已不存在。请在与那台电脑配对的 App 中打开。",
+                "The file is on another computer or no longer exists. Open it from the App paired with that computer."
             ),
         )),
         Body::Failed(err) => frame.center().child(notice(
             k,
-            tr(language, "Could not read the file", "无法读取文件"),
+            tr(language, "Could not read the file"),
             err.clone(),
         )),
     }
@@ -802,10 +771,6 @@ fn truncation_note(k: &Kit, language: Language) -> El {
                     "Showing the first {}. Open with system app to see the whole file.",
                     files::human_size(files::MAX_TEXT_BYTES)
                 ),
-                &format!(
-                    "仅显示前 {}。用系统应用打开可查看完整文件。",
-                    files::human_size(files::MAX_TEXT_BYTES)
-                ),
             ))
             .font(k.ty.small)
             .color(k.c.text_muted),
@@ -856,26 +821,10 @@ fn image(s: &UiState, v: &Viewer, k: &Kit, scale: f32, language: Language) -> El
 
 fn external(v: &Viewer, k: &Kit, language: Language) -> El {
     let what = match v.kind {
-        FileKind::Video => tr(
-            language,
-            "Videos play in your system player.",
-            "视频在系统播放器中播放。",
-        ),
-        FileKind::Audio => tr(
-            language,
-            "Audio plays in your system player.",
-            "音频在系统播放器中播放。",
-        ),
-        FileKind::Pdf => tr(
-            language,
-            "PDFs open in your system viewer.",
-            "PDF 在系统阅读器中打开。",
-        ),
-        _ => tr(
-            language,
-            "Muqun can't show this kind of file.",
-            "Muqun 无法显示这种文件。",
-        ),
+        FileKind::Video => tr(language, "Videos play in your system player."),
+        FileKind::Audio => tr(language, "Audio plays in your system player."),
+        FileKind::Pdf => tr(language, "PDFs open in your system viewer."),
+        _ => tr(language, "Muqun can't show this kind of file."),
     };
     let mut card = col()
         .key("viewer-external")
@@ -906,9 +855,9 @@ fn external(v: &Viewer, k: &Kit, language: Language) -> El {
         let is_text = v.kind.reads_text();
         card = card.child(
             Button::new(if is_text {
-                tr_ref(language, "Open in editor", "在编辑器中打开")
+                tr_ref(language, "Open in editor")
             } else {
-                tr_ref(language, "Open with system app", "用系统应用打开")
+                tr_ref(language, "Open with system app")
             })
             .icon(&OPEN_EXTERNAL)
             .variant(ButtonVariant::Contrast)

@@ -811,7 +811,7 @@ fn voice_realtime_scene(s: &mut UiState) {
     s.voice = Some(super::voice::Dictation::preview(
         VoiceMode::Realtime,
         voice_meter(),
-        "Rename the greet helper and 顺便把测试也更新一下, then run the checks",
+        "Rename the greet helper and also update the tests, then run the checks",
     ));
 }
 

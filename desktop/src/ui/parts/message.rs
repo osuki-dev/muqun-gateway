@@ -234,22 +234,12 @@ fn rich(cx: &Tcx, id: &str, body: &str) -> El {
     block
 }
 
-/// Drop Codex-style `[Image #N]` (and `[图片 #N]`) tokens once the real pictures are shown.
+/// Drop Codex-style `[Image #N]` tokens once the real pictures are shown.
 pub fn strip_image_placeholders(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some((at, prefix_len)) = match (rest.find("[Image #"), rest.find("[图片 #")) {
-        (Some(a), Some(b)) => {
-            if a <= b {
-                Some((a, "[Image #".len()))
-            } else {
-                Some((b, "[图片 #".len()))
-            }
-        }
-        (Some(a), None) => Some((a, "[Image #".len())),
-        (None, Some(b)) => Some((b, "[图片 #".len())),
-        (None, None) => None,
-    } {
+    while let Some(at) = rest.find("[Image #") {
+        let prefix_len = "[Image #".len();
         out.push_str(&rest[..at]);
         let after = &rest[at + prefix_len..];
         match after.find(']') {
@@ -319,8 +309,8 @@ fn reasoning(cx: &Tcx, item: &TimelineItem, body: &str, duration_ms: Option<u64>
     let k = cx.k;
     let id = item.id.as_str();
     let label = match duration_ms {
-        Some(ms) => format!("{} · {:.1}s", cx.t("Thought", "思考"), ms as f32 / 1000.0),
-        None => cx.t("Thought", "思考过程").to_string(),
+        Some(ms) => format!("{} · {:.1}s", cx.t("Thought"), ms as f32 / 1000.0),
+        None => cx.t("Thought").to_string(),
     };
     if cx.pane {
         return col()
@@ -431,10 +421,10 @@ fn compaction(
     let k = cx.k;
     let id = item.id.as_str();
     let state = match status {
-        CompactionStatus::Running => cx.t("Compacting the conversation…", "正在压缩对话…"),
-        CompactionStatus::Completed => cx.t("Conversation compacted", "对话已压缩"),
-        CompactionStatus::Failed => cx.t("Compaction failed", "压缩失败"),
-        _ => cx.t("Compaction", "压缩"),
+        CompactionStatus::Running => cx.t("Compacting the conversation…"),
+        CompactionStatus::Completed => cx.t("Conversation compacted"),
+        CompactionStatus::Failed => cx.t("Compaction failed"),
+        _ => cx.t("Compaction"),
     };
     let mut label = state.to_string();
     if let Some(r) = reason.filter(|r| !r.is_empty()) {
@@ -461,11 +451,7 @@ fn compaction(
                         .grow(1.0)
                         .shrink(),
                 )
-                .child(
-                    text(cx.t("Summary", "摘要"))
-                        .font(k.ty.small)
-                        .color(k.c.text_faint),
-                ),
+                .child(text(cx.t("Summary")).font(k.ty.small).color(k.c.text_faint)),
         )
         .cursor(Cursor::Pointer)
         .on_press(flip(cx.asid, id)),
@@ -550,7 +536,7 @@ pub fn part(cx: &Tcx, item: &TimelineItem) -> El {
                         .center_y()
                         .child(icon(&glyphs::WORKFLOW, 13.0).color(k.c.icon_accent))
                         .child(
-                            text(cx.t("Skill", "技能"))
+                            text(cx.t("Skill"))
                                 .font(k.ty.small_medium)
                                 .color(k.c.text_muted),
                         )
@@ -582,7 +568,7 @@ pub fn part(cx: &Tcx, item: &TimelineItem) -> El {
             format!("ms-{id}"),
             format!(
                 "{} {}",
-                cx.t("Model →", "模型 →"),
+                cx.t("Model →"),
                 crate::ui::labels::format_model_name(model, &model.model_id, None)
             ),
         ),
@@ -591,14 +577,14 @@ pub fn part(cx: &Tcx, item: &TimelineItem) -> El {
             format!("as-{id}"),
             format!(
                 "{} {}",
-                cx.t("Mode →", "模式 →"),
+                cx.t("Mode →"),
                 crate::ui::labels::readable_catalog_id(mode)
             ),
         ),
         AgentPart::LocationSwitched { directory, .. } => marker(
             cx,
             format!("ls-{id}"),
-            format!("{} {directory}", cx.t("Moved to", "已移到")),
+            format!("{} {directory}", cx.t("Moved to")),
         ),
         AgentPart::Synthetic { text, description } | AgentPart::System { text, description } => {
             let mut block = col().key(format!("sys-{id}")).w_full().gap(4.0);
@@ -628,7 +614,7 @@ mod tests {
     fn picture_tokens_give_way_to_the_thumbnails() {
         for (given, want) in [
             ("[Image #1] what is this", "what is this"),
-            ("[图片 #1] what is this", "what is this"),
+            ("[Image #1] what is this", "what is this"),
             ("before [Image #2] after", "before after"),
             ("![](<file:///tmp/a b.png>)", ""),
             ("see ![chart](out/flow.png) here", "see  here"),

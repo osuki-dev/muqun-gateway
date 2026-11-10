@@ -22,30 +22,30 @@ pub fn verb_of(cx: &Tcx, kind: ToolKind, call: &ToolCall) -> String {
 }
 
 fn verb(cx: &Tcx, kind: ToolKind, call: &ToolCall) -> String {
-    let w = |en, zh| cx.t(en, zh).to_string();
+    let w = |en| cx.t(en).to_string();
     match kind {
-        ToolKind::Shell => w("Run", "运行"),
-        ToolKind::Read => w("Read", "读取"),
-        ToolKind::Edit => w("Edit", "编辑"),
-        ToolKind::Write => w("Write", "写入"),
-        ToolKind::Patch => w("Patch", "补丁"),
-        ToolKind::Glob => w("Find files", "查找文件"),
-        ToolKind::Grep => w("Search", "搜索"),
-        ToolKind::Search => w("Search code", "搜索代码"),
+        ToolKind::Shell => w("Run"),
+        ToolKind::Read => w("Read"),
+        ToolKind::Edit => w("Edit"),
+        ToolKind::Write => w("Write"),
+        ToolKind::Patch => w("Patch"),
+        ToolKind::Glob => w("Find files"),
+        ToolKind::Grep => w("Search"),
+        ToolKind::Search => w("Search code"),
         ToolKind::Web => {
             let n = call.name.to_ascii_lowercase();
             if n.contains("search") {
-                w("Web search", "网页搜索")
+                w("Web search")
             } else {
-                w("Fetch", "获取")
+                w("Fetch")
             }
         }
-        ToolKind::Subagent => w("Subagent", "子代理"),
-        ToolKind::Skill => w("Skill", "技能"),
-        ToolKind::Todo => w("Tasks", "任务"),
-        ToolKind::Question => w("Question", "提问"),
-        ToolKind::Execute => w("Code", "代码"),
-        ToolKind::Browser => w("Browser", "浏览器"),
+        ToolKind::Subagent => w("Subagent"),
+        ToolKind::Skill => w("Skill"),
+        ToolKind::Todo => w("Tasks"),
+        ToolKind::Question => w("Question"),
+        ToolKind::Execute => w("Code"),
+        ToolKind::Browser => w("Browser"),
         ToolKind::Mcp => mcp_name(&call.name),
     }
 }
@@ -96,7 +96,7 @@ fn error_line(cx: &Tcx, call: &ToolCall) -> Option<String> {
         return None;
     }
     Some(if tv::declined_by_user(message) {
-        cx.t("Denied by you", "已被你拒绝").to_string()
+        cx.t("Denied by you").to_string()
     } else {
         message.to_string()
     })
@@ -192,7 +192,7 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
 
     if let Some(ms) = tv::sleep_ms(call, rec.as_ref()) {
         card.glyph = &glyphs::TIME;
-        card.verb = format!("{} · {}", cx.t("Wait", "等待"), seconds(ms));
+        card.verb = format!("{} · {}", cx.t("Wait"), seconds(ms));
         card.title.clear();
         card.state = card_state(cx, call, false);
         card.body = output_body(cx, &out);
@@ -210,7 +210,7 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
             }
             if timed_out {
                 card.chips
-                    .push(chip(cx.k, cx.t("timed out", "已超时"), cx.k.c.warning.fg));
+                    .push(chip(cx.k, cx.t("timed out"), cx.k.c.warning.fg));
             }
             failed = exit.is_some_and(|c| c != 0) || timed_out;
             let mut body = col().key("shell").w_full().gap(8.0);
@@ -234,7 +234,7 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
             if tv::pending(call.state) && !cx.stopped() && !detached {
                 let asid = cx.asid.to_string();
                 card.actions.push(
-                    Button::new(cx.t("Run in background", "转入后台运行"))
+                    Button::new(cx.t("Run in background"))
                         .variant(ButtonVariant::Ghost)
                         .control_size(ControlSize::Small)
                         .on_press(move |s: &mut UiState| {
@@ -355,8 +355,7 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
         ToolKind::Execute => {
             failed = tv::execute_errored(call);
             if failed {
-                card.chips
-                    .push(chip(cx.k, cx.t("error", "出错"), cx.k.c.danger.fg));
+                card.chips.push(chip(cx.k, cx.t("error"), cx.k.c.danger.fg));
             }
             let mut body = col().key("exec").w_full().gap(8.0);
             if let Some(code_text) = rec
@@ -424,7 +423,7 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
     }
     if out.truncated && card.body.is_some() {
         card.chips
-            .push(chip(cx.k, cx.t("Truncated", "已截断"), cx.k.c.warning.fg));
+            .push(chip(cx.k, cx.t("Truncated"), cx.k.c.warning.fg));
     }
     card.state = card_state(cx, call, failed);
     card.build(cx)
@@ -435,12 +434,10 @@ fn count_chip(cx: &Tcx, call: &ToolCall, card: &mut ToolCard, counted: usize) {
     if n == 0 && tv::pending(call.state) {
         return;
     }
-    let label = if cx.zh() {
-        crate::ui::copy::localize(cx.lang, format!("{n} 个结果"))
-    } else if n == 1 {
-        "1 result".to_string()
+    let label = if n == 1 {
+        cx.t("1 result").to_string()
     } else {
-        format!("{n} results")
+        format!("{n} {}", cx.t("results"))
     };
     card.chips.push(chip(cx.k, label, cx.k.c.text_muted));
 }
@@ -492,16 +489,16 @@ fn generic_body(cx: &Tcx, item: &TimelineItem, call: &ToolCall, out: &Output) ->
     }
     if let Some(input) = input {
         let pretty = serde_json::to_string_pretty(&input).unwrap_or_default();
-        body = body.child(caption(cx.k, cx.t("Input", "输入")));
+        body = body.child(caption(cx.k, cx.t("Input")));
         body = body.child(code(cx, "input", &pretty, Some("json"), 40));
         any = true;
     }
     if let Some(diff) = files::inline_diff(cx, &item.id) {
-        body = body.child(caption(cx.k, cx.t("Output", "输出")));
+        body = body.child(caption(cx.k, cx.t("Output")));
         body = body.child(diff);
         any = true;
     } else if !out.stdout.trim().is_empty() {
-        body = body.child(caption(cx.k, cx.t("Output", "输出")));
+        body = body.child(caption(cx.k, cx.t("Output")));
         let marked = ["\n#", "\n- ", "\n* ", "```", "|---", "**"]
             .iter()
             .any(|m| out.stdout.contains(m))
@@ -731,14 +728,12 @@ fn subagent(
         .or(envelope_state);
     if let Some(state) = state.as_deref() {
         let (label, color) = match state {
-            "busy" | "working" | "starting" | "retry" => {
-                (cx.t("Working", "工作中"), k.c.warning.fg)
-            }
-            "idle" => (cx.t("Idle", "空闲"), k.c.text_muted),
-            "completed" => (cx.t("Completed", "已完成"), k.c.success.fg),
-            "failed" | "error" => (cx.t("Failed", "失败"), k.c.danger.fg),
-            "interrupted" | "shutdown" | "stopped" => (cx.t("Stopped", "已停止"), k.c.text_muted),
-            "blocked" => (cx.t("Needs input", "需要输入"), k.c.warning.fg),
+            "busy" | "working" | "starting" | "retry" => (cx.t("Working"), k.c.warning.fg),
+            "idle" => (cx.t("Idle"), k.c.text_muted),
+            "completed" => (cx.t("Completed"), k.c.success.fg),
+            "failed" | "error" => (cx.t("Failed"), k.c.danger.fg),
+            "interrupted" | "shutdown" | "stopped" => (cx.t("Stopped"), k.c.text_muted),
+            "blocked" => (cx.t("Needs input"), k.c.warning.fg),
             _ => ("", k.c.text_muted),
         };
         if !label.is_empty() {
@@ -755,18 +750,17 @@ fn subagent(
     } else {
         if let Some(prompt) = get("prompt") {
             body = body
-                .child(caption(k, cx.t("Prompt", "提示词")))
+                .child(caption(k, cx.t("Prompt")))
                 .child(prose(cx, "prompt", prompt));
         }
         body = body.child(caption(
             k,
             if call.child_session_id.is_some() {
                 cx.t(
-                    "This activity has no result attached. Open the session to read the conversation.",
-                    "此活动记录未附带结果。打开会话查看对话。",
+                    "This activity has no result attached. Open the session to read the conversation."
                 )
             } else {
-                cx.t("This activity has no result attached.", "此活动记录未附带结果")
+                cx.t("This activity has no result attached.")
             },
         ));
     }
@@ -777,9 +771,9 @@ fn subagent(
         let in_tile = cx.s.tile_of(&child_id).is_some();
         card.actions.push(
             Button::new(if in_tile {
-                cx.t("Tiled", "已分屏")
+                cx.t("Tiled")
             } else {
-                cx.t("Split view", "加入分屏")
+                cx.t("Split view")
             })
             .variant(if in_tile {
                 ButtonVariant::Outline
@@ -791,14 +785,14 @@ fn subagent(
             .build(k),
         );
         card.actions.push(
-            Button::new(cx.t("Details", "详情"))
+            Button::new(cx.t("Details"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
                 .on_press(move |s: &mut UiState| s.open_detail(&view))
                 .build(k),
         );
         card.actions.push(
-            Button::new(cx.t("Open session", "打开会话"))
+            Button::new(cx.t("Open session"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
                 .on_press(move |s: &mut UiState| s.open_session(&child_id))
@@ -811,12 +805,8 @@ fn subagent(
 pub fn todo_card(cx: &Tcx, id: &str, items: &[(String, bool)]) -> El {
     let k = cx.k;
     let done = items.iter().filter(|(_, d)| *d).count();
-    let mut card = ToolCard::new(id, &glyphs::TASK_LIST, cx.t("Tasks", "任务"));
-    card.title = if cx.zh() {
-        crate::ui::copy::localize(cx.lang, format!("已完成 {done}/{}", items.len()))
-    } else {
-        format!("{done} of {} done", items.len())
-    };
+    let mut card = ToolCard::new(id, &glyphs::TASK_LIST, cx.t("Tasks"));
+    card.title = format!("{done}/{} {}", items.len(), cx.t("done"));
     card.open_default = true;
     let mut list = col().key("todo").w_full().gap(4.0);
     for (i, (label, finished)) in items.iter().enumerate() {
@@ -880,7 +870,7 @@ pub fn shell_part(cx: &Tcx, item: &TimelineItem) -> El {
         return col();
     };
     let k = cx.k;
-    let mut card = ToolCard::new(&item.id, &glyphs::TERMINAL, cx.t("Shell", "终端"));
+    let mut card = ToolCard::new(&item.id, &glyphs::TERMINAL, cx.t("Shell"));
     card.title = command.clone();
     if let Some(code) = exit.filter(|c| *c != 0.0) {
         card.chips
@@ -888,8 +878,7 @@ pub fn shell_part(cx: &Tcx, item: &TimelineItem) -> El {
     }
     card.copy = Some(command.clone());
     if *truncated {
-        card.chips
-            .push(chip(k, cx.t("Truncated", "已截断"), k.c.warning.fg));
+        card.chips.push(chip(k, cx.t("Truncated"), k.c.warning.fg));
     }
     card.state = match status.as_str() {
         "running" | "pending" if !cx.stopped() => CardState::Running,

@@ -75,7 +75,7 @@ fn shell_fixture(cols: u16, _rows: u16) -> Vec<u8> {
     o.push_str("test result: \x1b[32mok\x1b[0m. 154 passed; \x1b[1m0\x1b[22m failed\r\n");
     prompt(&mut o, "echo styles");
     o.push_str("\x1b[1mbold\x1b[0m \x1b[3mitalic\x1b[0m \x1b[4munderline\x1b[0m \x1b[9mstrike\x1b[0m \x1b[2mfaint\x1b[0m \x1b[7minverse\x1b[0m\r\n");
-    o.push_str("中文 宽字符 · 日本語 ✓ → ⚡\r\n");
+    o.push_str("Wide chars · Unicode ✓ → ⚡\r\n");
     prompt(&mut o, "");
     o.truncate(o.len() - 2);
     o.into_bytes()

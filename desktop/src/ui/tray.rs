@@ -9,18 +9,14 @@ use crate::platform::tray::Words;
 pub fn words(language: crate::config::Language, count: usize) -> Words {
     let waiting = (count > 0).then(|| {
         if count == 1 {
-            tr(language, "1 session needs you", "1 个会话需要你")
+            tr(language, "1 session needs you")
         } else {
-            tr(
-                language,
-                &format!("{count} sessions need you"),
-                &format!("{count} 个会话需要你"),
-            )
+            tr(language, &format!("{count} sessions need you"))
         }
     });
     Words {
-        open: tr(language, "Open Muqun", "打开 Muqun"),
-        quit: tr(language, "Quit Muqun", "退出 Muqun"),
+        open: tr(language, "Open Muqun"),
+        quit: tr(language, "Quit Muqun"),
         tooltip: match &waiting {
             Some(w) => format!("Muqun · {w}"),
             None => "Muqun".into(),

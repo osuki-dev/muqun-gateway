@@ -168,14 +168,10 @@ fn agents(s: &UiState, k: &Kit, layer: &mut Vec<El>, room: f32) -> El {
             .flex_wrap()
             .child(muted(
                 k,
-                tr(
-                    language,
-                    "No agent is ready. Turn one on, or install one.",
-                    "还没有可用的 Agent。启用一个，或先安装。",
-                ),
+                tr(language, "No agent is ready. Turn one on, or install one."),
             ))
             .child(
-                Button::new(tr_ref(language, "Open Agents settings", "打开 Agents 设置"))
+                Button::new(tr_ref(language, "Open Agents settings"))
                     .variant(ButtonVariant::Outline)
                     .control_size(ControlSize::Small)
                     .on_press(|s: &mut UiState| {
@@ -196,12 +192,8 @@ fn agents(s: &UiState, k: &Kit, layer: &mut Vec<El>, room: f32) -> El {
         .iter()
         .map(|n| rune::text::measure(n, &[], k.ty.ui, None).0 + 12.0 * 2.0 + 15.0 + 7.0 + 2.0)
         .collect();
-    let more_label = |n: usize| {
-        super::copy::localize(
-            language,
-            tr(language, &format!("+{n} more"), &format!("另外 {n} 个")),
-        )
-    };
+    let more_label =
+        |n: usize| super::copy::localize(language, format!("+{} {}", n, tr(language, "more")));
     let more_w = rune::text::measure(&more_label(widths.len()), &[], k.ty.small, None).0 + 40.0;
     let picked = usable.iter().position(|a| a.id == s.start_agent);
     let shown = fit_on_line(&widths, room, 8.0, more_w, picked);
@@ -343,7 +335,7 @@ fn folder(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| tr(language, "Choose a folder", "选择文件夹"));
+        .unwrap_or_else(|| tr(language, "Choose a folder"));
     let trigger = Button::new(name.clone())
         .variant(ButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
@@ -355,7 +347,7 @@ fn folder(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .child(text(super::timeline::clip(&name, 28)).font(font).color(ink))
         })
         .help(if cwd.is_empty() {
-            tr(language, "Project folder", "项目文件夹")
+            tr(language, "Project folder")
         } else {
             cwd.clone()
         })
@@ -375,19 +367,15 @@ fn folder(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .trigger(trigger)
         .open(open)
         .padding(6.0)
-        .label(tr(language, "Project folder", "项目文件夹"))
+        .label(tr(language, "Project folder"))
         .on_close(close_folders);
     if open {
         let choices = folder_choices(s, &s.folder_query.text);
         let first = choices.first().map(|c| c.path.clone());
         pop = pop.child(
             TextInput::new(&s.folder_query)
-                .placeholder(tr_ref(
-                    language,
-                    "Filter, or type a path",
-                    "筛选，或输入路径",
-                ))
-                .label(tr_ref(language, "Filter folders", "筛选文件夹"))
+                .placeholder(tr_ref(language, "Filter, or type a path"))
+                .label(tr_ref(language, "Filter folders"))
                 .leading_icon(&rune_kit::glyphs::SEARCH)
                 .leading_icon_size(14.0)
                 .width(Some(FOLDER_PICKER_W))
@@ -492,7 +480,7 @@ fn folder(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .child(list),
         );
         pop = pop.child(
-            Button::new(tr_ref(language, "Choose folder…", "选择文件夹…"))
+            Button::new(tr_ref(language, "Choose folder…"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
                 .on_press(move |s: &mut UiState| {
@@ -513,7 +501,7 @@ fn folder(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
 fn worktree(s: &UiState, k: &Kit) -> El {
     let language = s.cfg.general.language;
     let on = s.start_worktree;
-    Button::new(tr(language, "Worktree", "Worktree"))
+    Button::new(tr(language, "Worktree"))
         .variant(if on {
             ButtonVariant::Outline
         } else {
@@ -525,17 +513,9 @@ fn worktree(s: &UiState, k: &Kit) -> El {
                 .gap(6.0)
                 .center_y()
                 .child(rune::icon(&super::icons::BRANCH, 14.0).color(ink))
-                .child(
-                    text(tr(language, "Worktree", "Worktree"))
-                        .font(font)
-                        .color(ink),
-                )
+                .child(text(tr(language, "Worktree")).font(font).color(ink))
         })
-        .help(tr(
-            language,
-            "Start in a new git worktree",
-            "在新的 git worktree 中开始",
-        ))
+        .help(tr(language, "Start in a new git worktree"))
         .on_press(|s: &mut UiState| s.start_worktree = !s.start_worktree)
         .build(k)
         .role("switch")
@@ -581,9 +561,9 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
                                 == super::labels::bare_catalog_id(&m.model_id))
                     })
                     .map(|(_, _, n)| n.as_str());
-                super::labels::format_model_name(m, tr_ref(language, "Model", "模型"), catalog)
+                super::labels::format_model_name(m, tr_ref(language, "Model"), catalog)
             })
-            .unwrap_or_else(|| tr(language, "Model", "模型"));
+            .unwrap_or_else(|| tr(language, "Model"));
         line = line.child(model_menu(
             k,
             layer,
@@ -634,7 +614,7 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
             line = line.child(
                 SegmentedControl::new(&labels, at)
                     .fit()
-                    .label(tr_ref(language, "Mode", "模式"))
+                    .label(tr_ref(language, "Mode"))
                     .on_pick(move |s: &mut UiState, i, _: &mut Tx| {
                         s.start_mode = Some(ids[i].clone());
                     })
@@ -643,7 +623,7 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
             );
         } else {
             let open = s.menu == Some(OpenMenu::StartMode);
-            let label = at.map_or_else(|| tr(language, "Mode", "模式"), |i| modes[i].1.clone());
+            let label = at.map_or_else(|| tr(language, "Mode"), |i| modes[i].1.clone());
             let mut menu = rune_kit::Menu::new("start-mode")
                 .placement(rune_kit::Placement::TopStart)
                 .trigger(super::composer::pill(
@@ -691,14 +671,13 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
     let placeholder = tr_ref(
         language,
         "Describe the task…  (/ commands, $ skills, @ mentions)",
-        "描述任务…（/ 命令，$ 技能，@ 电脑或文件）",
     );
     let accent = k.c.bg_accent;
     let info = k.c.info.icon;
     card = card.child(
         TextArea::new(&s.start_draft)
             .placeholder(placeholder)
-            .label(tr_ref(language, "First prompt", "第一条消息"))
+            .label(tr_ref(language, "First prompt"))
             .width(None)
             .auto_grow(3, 12)
             .pill_style(move |id| {
@@ -745,7 +724,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
         actions = actions.child(
             rune_kit::Badge::new(format!(
                 "{} {}",
-                tr_ref(language, "into split view pane", "放入分屏窗格"),
+                tr_ref(language, "into split view pane"),
                 i + 1
             ))
             .variant(rune_kit::BadgeVariant::Accent)
@@ -760,14 +739,14 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
                 format!(
                     "{} {}",
                     crate::platform::keys::label("Primary+Enter"),
-                    tr_ref(language, "to start", "开始")
+                    tr_ref(language, "to start")
                 ),
             )
             .mr(8.0),
         )
         .child(
             look.glow(
-                Button::new(tr_ref(language, "Start", "开始"))
+                Button::new(tr_ref(language, "Start"))
                     .variant(ButtonVariant::Submit)
                     .control_size(ControlSize::Large)
                     .disabled(s.pending_submit.is_some())

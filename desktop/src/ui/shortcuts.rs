@@ -111,7 +111,7 @@ fn keys(k: &Kit, language: Language, entry: &Entry) -> El {
     for (i, caps) in chords.iter().enumerate() {
         if i > 0 {
             line = line.child(
-                text(tr_ref(language, "or", "或"))
+                text(tr_ref(language, "or"))
                     .font(k.ty.small)
                     .color(k.c.text_faint),
             );
@@ -145,13 +145,11 @@ fn terminal_note(language: Language) -> String {
         tr(
             language,
             "Every other key goes to the shell; ⌘ shortcuts stay the app's.",
-            "其他按键都交给 Shell；⌘ 快捷键仍归应用。",
         )
     } else {
         tr(
             language,
-            "Every other key goes to the shell. Add Shift for the app's Ctrl shortcuts (Ctrl+Shift+K for the palette).",
-            "其他按键都交给 Shell。应用的 Ctrl 快捷键加上 Shift 即可（Ctrl+Shift+K 打开命令面板）。",
+            "Every other key goes to the shell. Add Shift for the app's Ctrl shortcuts (Ctrl+Shift+K for the palette)."
         )
     }
 }
@@ -202,7 +200,6 @@ pub fn conflicts(language: Language) -> (Vec<String>, Vec<String>) {
             tr(
                 language,
                 &format!("{keys} is both “{}” and “{}”.", what(a), what(b)),
-                &format!("{keys} 同时是“{}”和“{}”。", what(a), what(b)),
             )
         })
         .collect();
@@ -213,11 +210,6 @@ pub fn conflicts(language: Language) -> (Vec<String>, Vec<String>) {
                 language,
                 &format!(
                     "In the terminal {keys} is “{}”, so “{}” needs the terminal unfocused.",
-                    what(winner),
-                    what(lost)
-                ),
-                &format!(
-                    "在终端里 {keys} 是“{}”，所以“{}”要在终端外使用。",
                     what(winner),
                     what(lost)
                 ),
@@ -233,7 +225,6 @@ pub fn field_notes(language: Language) -> Vec<String> {
         tr(
             language,
             "In a text field, Esc leaves the field (or closes its suggestions) first.",
-            "在输入框中，Esc 先离开输入框（或关闭其建议列表）。",
         ),
         {
             let jump = keymap::entry(keymap::Action::JumpLatest)
@@ -242,16 +233,11 @@ pub fn field_notes(language: Language) -> Vec<String> {
                 .last()
                 .map(|c| c.label())
                 .unwrap_or_default();
-            tr(
-                language,
-                &format!("In a text field, End moves the caret; {jump} jumps to the latest message once the caret is already at the end."),
-                &format!("在输入框中，End 移动光标；光标已在末尾时，{jump} 跳到最新消息。"),
-            )
+            tr(language, &format!("In a text field, End moves the caret; {jump} jumps to the latest message once the caret is already at the end."))
         },
         tr(
             language,
             "j, k, Space, Enter, [ ] and ? work when no text field has the keyboard.",
-            "j、k、空格、Enter、[ ] 和 ? 在没有输入框获得键盘时生效。",
         ),
     ]
 }
@@ -263,10 +249,10 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
     };
     let language = s.cfg.general.language;
     let look = s.look();
-    let title = tr_ref(language, "Keyboard shortcuts", "键盘快捷键");
+    let title = tr_ref(language, "Keyboard shortcuts");
     let field = TextInput::new(&sheet.query)
-        .placeholder(tr_ref(language, "Search shortcuts", "搜索快捷键"))
-        .label(tr_ref(language, "Search shortcuts", "搜索快捷键"))
+        .placeholder(tr_ref(language, "Search shortcuts"))
+        .label(tr_ref(language, "Search shortcuts"))
         .leading_icon(&rune_kit::glyphs::SEARCH)
         .leading_icon_size(14.0)
         .width(None)
@@ -328,7 +314,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
             .px(20.0)
             .py(24.0)
             .child(
-                text(tr(language, "No shortcut matches", "没有匹配的快捷键"))
+                text(tr(language, "No shortcut matches"))
                     .font(k.ty.ui)
                     .color(k.c.text_faint),
             )
@@ -356,16 +342,12 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .gap(16.0)
         .px(20.0)
         .py(10.0)
-        .child(hint(k, "Esc", tr(language, "close", "关闭")))
+        .child(hint(k, "Esc", tr(language, "close")))
         .child(el().grow(1.0))
         .child(
-            text(tr(
-                language,
-                "Settings → Shortcuts lists these too",
-                "设置 → 快捷键 中也能查看",
-            ))
-            .font(k.ty.small)
-            .color(k.c.text_faint),
+            text(tr(language, "Settings → Shortcuts lists these too"))
+                .font(k.ty.small)
+                .color(k.c.text_faint),
         );
 
     let panel = col()

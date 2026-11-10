@@ -437,7 +437,7 @@ fn home_brand(s: &UiState, k: &Kit, look: &Look, lights: f32) -> El {
         .h(MARK)
         .center_y()
         .role("button")
-        .label(tr_ref(language, "Home", "首页"))
+        .label(tr_ref(language, "Home"))
         .child(mark)
         .child(
             text(APP_NAME)
@@ -455,10 +455,10 @@ fn home_brand(s: &UiState, k: &Kit, look: &Look, lights: f32) -> El {
 fn page_title(s: &UiState) -> String {
     let language = s.cfg.general.language;
     match s.mode {
-        Mode::Home => tr(language, "New session", "新建会话"),
-        Mode::Inbox => tr(language, "Inbox", "收件箱"),
-        Mode::Tasks => tr(language, "Tasks", "任务"),
-        Mode::Settings => tr(language, "Settings", "设置"),
+        Mode::Home => tr(language, "New session"),
+        Mode::Inbox => tr(language, "Inbox"),
+        Mode::Tasks => tr(language, "Tasks"),
+        Mode::Settings => tr(language, "Settings"),
         Mode::Session => s
             .current()
             .map_or_else(|| s.status.clone(), super::title_of),
@@ -567,7 +567,7 @@ fn session_more(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str, busy: boo
             IconButton::new(&TRIANGLE_DOWN)
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
-                .label(tr_ref(language, "More", "更多"))
+                .label(tr_ref(language, "More"))
                 .expanded(open)
                 .on_press(move |s: &mut UiState| {
                     s.menu = (!open).then_some(OpenMenu::SessionMore);
@@ -578,18 +578,16 @@ fn session_more(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str, busy: boo
         .open(open)
         .on_close(|s: &mut UiState| s.menu = None)
         .item(
-            MenuItem::new(tr(language, "Fork session", "分叉会话")).on_select(
-                move |s: &mut UiState| {
-                    s.menu = None;
-                    s.send(Command::ForkSession {
-                        asid: muqun_gateway::agents::AgentSessionId(fork_id.clone()),
-                        message_id: None,
-                    });
-                },
-            ),
+            MenuItem::new(tr(language, "Fork session")).on_select(move |s: &mut UiState| {
+                s.menu = None;
+                s.send(Command::ForkSession {
+                    asid: muqun_gateway::agents::AgentSessionId(fork_id.clone()),
+                    message_id: None,
+                });
+            }),
         )
         .item(
-            MenuItem::new(tr(language, "Compact history", "压缩历史"))
+            MenuItem::new(tr(language, "Compact history"))
                 .disabled(busy)
                 .on_select(move |s: &mut UiState| {
                     s.menu = None;
@@ -599,8 +597,8 @@ fn session_more(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str, busy: boo
                 }),
         )
         .separator()
-        .item(MenuItem::new(tr(language, "Rename…", "重命名…")).on_select(
-            move |s: &mut UiState| {
+        .item(
+            MenuItem::new(tr(language, "Rename…")).on_select(move |s: &mut UiState| {
                 s.menu = None;
                 let title = s
                     .session_by_id(&rename_id)
@@ -609,13 +607,13 @@ fn session_more(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str, busy: boo
                 s.rename_asid = Some(rename_id.clone());
                 s.rename_edit = rune::TextEdit::new(title);
                 s.rename_edit.focused = true;
-            },
-        ))
+            }),
+        )
         .item(
             MenuItem::new(if pinned {
-                tr(language, "Unpin", "取消置顶")
+                tr(language, "Unpin")
             } else {
-                tr(language, "Pin", "置顶")
+                tr(language, "Pin")
             })
             .on_select(move |s: &mut UiState| {
                 s.menu = None;
@@ -624,7 +622,7 @@ fn session_more(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str, busy: boo
         )
         .separator()
         .item(
-            MenuItem::new(tr(language, "Delete session", "删除会话"))
+            MenuItem::new(tr(language, "Delete session"))
                 .danger(true)
                 .on_select(move |s: &mut UiState| {
                     s.menu = None;
@@ -663,7 +661,7 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
                         .help(format!(
                             "{} {}",
                             s.diff_stat.files,
-                            tr_ref(language, "changed file(s)", "个文件有改动")
+                            tr_ref(language, "changed file(s)")
                         ))
                         .on_press(|s: &mut UiState| match s.selected.clone() {
                             Some(asid) => s.send(Command::OpenDiff {
@@ -678,15 +676,11 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
             }
             if fit == super::Fit::Wide {
                 bar = bar.trailing(
-                    Button::new(tr_ref(language, "Split view", "分屏"))
+                    Button::new(tr_ref(language, "Split view"))
                         .variant(ButtonVariant::Ghost)
                         .control_size(ControlSize::Small)
                         .disabled(asid.is_empty())
-                        .help(tr_ref(
-                            language,
-                            "Open another session beside this one",
-                            "在旁边打开另一个会话",
-                        ))
+                        .help(tr_ref(language, "Open another session beside this one"))
                         .shortcut(super::keymap::label(super::keymap::Action::AddSplit))
                         .on_press(|s: &mut UiState| s.split())
                         .build(k)
@@ -717,9 +711,9 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
                 } else {
                     IconButtonVariant::Ghost
                 })
-                .label(tr_ref(language, "Terminal", "终端"))
+                .label(tr_ref(language, "Terminal"))
                 .help(super::keymap::tip(
-                    tr_ref(language, "Terminal", "终端"),
+                    tr_ref(language, "Terminal"),
                     super::keymap::Action::ToggleTerminal,
                 ))
                 .on_press(|s: &mut UiState| {
@@ -741,9 +735,9 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
                 } else {
                     IconButtonVariant::Ghost
                 })
-                .label(tr_ref(language, "Inspector", "检查器"))
+                .label(tr_ref(language, "Inspector"))
                 .help(super::keymap::tip(
-                    tr_ref(language, "Inspector", "检查器"),
+                    tr_ref(language, "Inspector"),
                     super::keymap::Action::ToggleInspector,
                 ))
                 .on_press(|s: &mut UiState| s.toggle_inspector())
@@ -762,7 +756,7 @@ fn alert(s: &UiState, k: &Kit) -> Option<El> {
         .accent(k.c.danger.icon)
         .title(err.message.clone(), None)
         .action(
-            Button::new(tr_ref(language, "Dismiss", "关闭"))
+            Button::new(tr_ref(language, "Dismiss"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
                 .on_press(|s: &mut UiState| s.error = None)
@@ -774,7 +768,7 @@ fn alert(s: &UiState, k: &Kit) -> Option<El> {
     }
     if err.unreachable {
         card = card.action(
-            Button::new(tr_ref(language, "Retry", "重试"))
+            Button::new(tr_ref(language, "Retry"))
                 .variant(ButtonVariant::Outline)
                 .control_size(ControlSize::Small)
                 .on_press(|s: &mut UiState| s.send(Command::Refresh))
@@ -833,14 +827,13 @@ fn revert_banner(s: &UiState, k: &Kit) -> El {
     let language = s.cfg.general.language;
     Card::new()
         .accent(k.c.warning.icon)
-        .title(tr_ref(language, "Rollback staged", "已暂存回滚"), None)
+        .title(tr_ref(language, "Rollback staged"), None)
         .description(tr(
             language,
             "Confirm to restore files to the marked message, or cancel.",
-            "确认后会把文件恢复到标记的消息，或取消。",
         ))
         .action(
-            Button::new(tr_ref(language, "Confirm", "确认"))
+            Button::new(tr_ref(language, "Confirm"))
                 .variant(ButtonVariant::Submit)
                 .control_size(ControlSize::Small)
                 .on_press(|s: &mut UiState| {
@@ -854,7 +847,7 @@ fn revert_banner(s: &UiState, k: &Kit) -> El {
                 .key("revert-commit"),
         )
         .action(
-            Button::new(tr_ref(language, "Cancel", "取消"))
+            Button::new(tr_ref(language, "Cancel"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
                 .on_press(|s: &mut UiState| {

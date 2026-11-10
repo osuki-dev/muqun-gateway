@@ -45,11 +45,7 @@ fn banner(s: &UiState, k: &Kit) -> El {
     }
     let curr_comp = s.current_computer();
     let comp_name = s.computer_name(curr_comp);
-    let theme_tag = format!(
-        "{} · {}",
-        tr(language, "Theme", "主题").to_uppercase(),
-        comp_name
-    );
+    let theme_tag = format!("{} · {}", tr(language, "Theme").to_uppercase(), comp_name);
     let copy = col()
         .key("theme-banner-copy")
         .h_full()
@@ -93,7 +89,7 @@ fn banner(s: &UiState, k: &Kit) -> El {
         }))
         .child(
             hrow().pt(10.0).child(
-                Button::new(tr_ref(language, "Browse themes", "浏览主题"))
+                Button::new(tr_ref(language, "Browse themes"))
                     .variant(ButtonVariant::Neutral)
                     .control_size(ControlSize::Small)
                     .on_press(|s: &mut UiState| super::open(s, SettingsTab::Themes))
@@ -114,31 +110,27 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
     };
     let density = usize::from(ap.density == Density::Compact);
     let (motion, glass) = (ap.reduced_motion, ap.reduced_transparency);
-    let motion_title = tr_ref(language, "Reduce motion", "减少动态");
-    let glass_title = tr_ref(language, "Reduce transparency", "减少透明");
+    let motion_title = tr_ref(language, "Reduce motion");
+    let glass_title = tr_ref(language, "Reduce transparency");
     vec![
         banner(s, k),
         group(
             k,
             "appearance-look",
-            tr_ref(language, "Look", "外观"),
+            tr_ref(language, "Look"),
             vec![
                 row(
                     k,
                     "scheme",
-                    tr_ref(language, "Color scheme", "配色"),
-                    tr_ref(
-                        language,
-                        "Follow the system, or keep it light or dark.",
-                        "跟随系统，或固定浅色 / 深色。",
-                    ),
+                    tr_ref(language, "Color scheme"),
+                    tr_ref(language, "Follow the system, or keep it light or dark."),
                     choice(
                         k,
                         "scheme",
                         &[
-                            tr_ref(language, "Light", "浅色"),
-                            tr_ref(language, "Dark", "深色"),
-                            tr_ref(language, "System", "系统"),
+                            tr_ref(language, "Light"),
+                            tr_ref(language, "Dark"),
+                            tr_ref(language, "System"),
                         ],
                         scheme,
                         |s, i| s.set_scheme([Scheme::Light, Scheme::Dark, Scheme::System][i]),
@@ -147,12 +139,8 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                 row(
                     k,
                     "text-size",
-                    tr_ref(language, "Text size", "文字大小"),
-                    tr_ref(
-                        language,
-                        "Labels, messages and code scale together.",
-                        "文字、消息与代码一起缩放。",
-                    ),
+                    tr_ref(language, "Text size"),
+                    tr_ref(language, "Labels, messages and code scale together."),
                     choice(
                         k,
                         "text-size",
@@ -167,15 +155,12 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                 row(
                     k,
                     "density",
-                    tr_ref(language, "Density", "密度"),
-                    tr_ref(language, "Row heights and spacing.", "行高与间距。"),
+                    tr_ref(language, "Density"),
+                    tr_ref(language, "Row heights and spacing."),
                     choice(
                         k,
                         "density",
-                        &[
-                            tr_ref(language, "Comfortable", "舒适"),
-                            tr_ref(language, "Compact", "紧凑"),
-                        ],
+                        &[tr_ref(language, "Comfortable"), tr_ref(language, "Compact")],
                         density,
                         |s, i| {
                             s.edit(ConfigEdit::Density(
@@ -187,19 +172,15 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                 row(
                     k,
                     "shape",
-                    tr_ref(language, "Corners", "圆角"),
-                    tr_ref(
-                        language,
-                        "How rounded panels, cards and controls are.",
-                        "面板、卡片与控件的圆角程度。",
-                    ),
+                    tr_ref(language, "Corners"),
+                    tr_ref(language, "How rounded panels, cards and controls are."),
                     choice(
                         k,
                         "shape",
                         &[
-                            tr_ref(language, "Sharp", "锐利"),
-                            tr_ref(language, "Soft", "柔和"),
-                            tr_ref(language, "Round", "圆润"),
+                            tr_ref(language, "Sharp"),
+                            tr_ref(language, "Soft"),
+                            tr_ref(language, "Round"),
                         ],
                         [Shape::Sharp, Shape::Soft, Shape::Round]
                             .iter()
@@ -217,17 +198,13 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
         group(
             k,
             "appearance-access",
-            tr_ref(language, "Accessibility", "辅助功能"),
+            tr_ref(language, "Accessibility"),
             vec![
                 row(
                     k,
                     "motion",
                     motion_title,
-                    tr_ref(
-                        language,
-                        "Large movements become short fades.",
-                        "大幅动画改为短暂淡入淡出。",
-                    ),
+                    tr_ref(language, "Large movements become short fades."),
                     flag(k, "motion", motion, motion_title, move |s| {
                         s.edit(ConfigEdit::ReducedMotion(!motion))
                     }),
@@ -236,11 +213,7 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                     k,
                     "glass",
                     glass_title,
-                    tr_ref(
-                        language,
-                        "Glass surfaces and cover art become solid.",
-                        "玻璃表面与封面插图改为不透明。",
-                    ),
+                    tr_ref(language, "Glass surfaces and cover art become solid."),
                     flag(k, "glass", glass, glass_title, move |s| {
                         s.edit(ConfigEdit::ReducedTransparency(!glass))
                     }),

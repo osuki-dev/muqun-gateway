@@ -116,13 +116,11 @@ pub fn meter(s: &UiState, k: &Kit, asid: &str) -> Option<El> {
                     compact(used),
                     compact(limit)
                 ),
-                _ => crate::ui::copy::localize(
-                    language,
-                    format!(
-                        "上下文：模型可容纳 {} 中的 {}",
-                        compact(limit),
-                        compact(used)
-                    ),
+                _ => format!(
+                    "{}: {} / {}",
+                    crate::ui::copy::t(language, "Context:"),
+                    compact(used),
+                    compact(limit)
                 ),
             }
         }
@@ -132,12 +130,7 @@ pub fn meter(s: &UiState, k: &Kit, asid: &str) -> Option<El> {
                     .font(k.ty.small_medium)
                     .color(k.c.text_muted),
             );
-            tr_ref(
-                language,
-                "Tokens the model last read",
-                "模型最近读取的 tokens",
-            )
-            .to_string()
+            tr_ref(language, "Tokens the model last read").to_string()
         }
     };
     let asid = asid.to_string();
@@ -145,7 +138,7 @@ pub fn meter(s: &UiState, k: &Kit, asid: &str) -> Option<El> {
         k.interactive(line.radius(k.radius.md))
             .cursor(Cursor::Pointer)
             .help(help)
-            .label(tr_ref(language, "Context", "上下文"))
+            .label(tr_ref(language, "Context"))
             .on_press(move |s: &mut UiState| open(s, &asid)),
     )
 }
@@ -189,13 +182,13 @@ fn until(language: Language, at_ms: u64) -> String {
         Language::En if d > 0 => format!("{d}d {h}h"),
         Language::En if h > 0 => format!("{h}h {m}m"),
         Language::En => format!("{m}m"),
-        _ if d > 0 => format!("{d} 天 {h} 小时"),
-        _ if h > 0 => format!("{h} 小时 {m} 分"),
-        _ => format!("{m} 分钟"),
+        _ if d > 0 => format!("{d}d {h}h"),
+        _ if h > 0 => format!("{h}h {m}m"),
+        _ => format!("{m}m"),
     };
     match language {
         Language::En => format!("Resets in {span}"),
-        _ => crate::ui::copy::localize(language, format!("{span}后重置")),
+        _ => format!("{span} {}", crate::ui::copy::t(language, "remaining")),
     }
 }
 
@@ -204,28 +197,22 @@ fn limits_section(s: &UiState, k: &Kit, agent: &str) -> Option<El> {
         return None;
     }
     let language = s.cfg.general.language;
-    let t = |en, zh| tr_ref(language, en, zh);
+    let t = |en| tr_ref(language, en);
     let mut block = col()
         .key("limits")
         .w_full()
         .gap(8.0)
-        .child(heading(k, t("Account limits", "账户额度")));
+        .child(heading(k, t("Account limits")));
     let Some(loaded) = s.account_limits.get(agent) else {
         return Some(block.child(Spinner::new().size(14.0).build(k)));
     };
     let Some(limits) = loaded.as_ref() else {
-        return Some(block.child(crate::ui::muted(
-            k,
-            t("Could not read account limits", "无法读取账户额度"),
-        )));
+        return Some(block.child(crate::ui::muted(k, t("Could not read account limits"))));
     };
     if limits.get("status").and_then(Value::as_str) != Some("available") {
         let why = match limits.get("reason").and_then(Value::as_str) {
-            Some("not_authenticated") => t("Not signed in on the host", "主机上未登录"),
-            _ => t(
-                "Account limits temporarily unavailable",
-                "账户额度暂时不可用",
-            ),
+            Some("not_authenticated") => t("Not signed in on the host"),
+            _ => t("Account limits temporarily unavailable"),
         };
         return Some(block.child(crate::ui::muted(k, why)));
     }
@@ -233,7 +220,6 @@ fn limits_section(s: &UiState, k: &Kit, agent: &str) -> Option<El> {
         block = block.child(
             text(t(
                 "Included usage is restricted. Paid or alternative usage may still be available.",
-                "套餐内额度已受限，付费或其他额度可能仍可使用。",
             ))
             .font(k.ty.small)
             .color(k.c.warning.fg)
@@ -277,27 +263,35 @@ fn limits_section(s: &UiState, k: &Kit, agent: &str) -> Option<El> {
                         .map(|m| match (m >= 1440, language) {
                             (true, Language::En) => format!("{} day window", m / 1440),
                             (true, _) => {
-                                crate::ui::copy::localize(language, format!("{} 天周期", m / 1440))
+                                format!(
+                                    "{} {}",
+                                    m / 1440,
+                                    crate::ui::copy::t(language, "day window")
+                                )
                             }
                             (false, Language::En) => format!("{} hour window", m / 60),
                             (false, _) => {
-                                crate::ui::copy::localize(language, format!("{} 小时周期", m / 60))
+                                format!(
+                                    "{} {}",
+                                    m / 60,
+                                    crate::ui::copy::t(language, "hour window")
+                                )
                             }
                         })
                 })
-                .unwrap_or_else(|| t("Quota", "额度").to_string());
+                .unwrap_or_else(|| t("Quota").to_string());
             let unit = w.get("unit").and_then(Value::as_str).unwrap_or("");
             let remaining = w.get("remaining").and_then(Value::as_f64);
             let value = match (remaining, unit) {
                 (Some(r), "percent") => match language {
                     Language::En => format!("{r:.0}% left"),
-                    _ => crate::ui::copy::localize(language, format!("剩余 {r:.0}%")),
+                    _ => format!("{r:.0}% {}", crate::ui::copy::t(language, "left")),
                 },
                 (Some(r), unit) => match language {
                     Language::En => format!("{r} {unit} left"),
-                    _ => crate::ui::copy::localize(language, format!("剩余 {r} {unit}")),
+                    _ => format!("{r} {unit} {}", crate::ui::copy::t(language, "left")),
                 },
-                (None, _) => t("Remaining unknown", "剩余未知").to_string(),
+                (None, _) => t("Remaining unknown").to_string(),
             };
             let mut row_block = col()
                 .key(format!("w{bi}-{wi}"))
@@ -319,10 +313,7 @@ fn limits_section(s: &UiState, k: &Kit, agent: &str) -> Option<El> {
         }
     }
     if !any {
-        block = block.child(crate::ui::muted(
-            k,
-            t("No quota values reported", "没有报告额度数值"),
-        ));
+        block = block.child(crate::ui::muted(k, t("No quota values reported")));
     }
     Some(block)
 }
@@ -332,7 +323,7 @@ pub fn sheet(s: &UiState, k: &Kit) -> Option<El> {
     let asid = s.context_open.as_deref()?;
     let info = s.session_by_id(asid)?;
     let language = s.cfg.general.language;
-    let t = |en, zh| tr_ref(language, en, zh);
+    let t = |en| tr_ref(language, en);
     let close = |s: &mut UiState| s.context_open = None;
     let mut body = col()
         .key("context-body")
@@ -345,7 +336,7 @@ pub fn sheet(s: &UiState, k: &Kit) -> Option<El> {
             .w_full()
             .center_y()
             .child(
-                text(t("Context", "上下文"))
+                text(t("Context"))
                     .font(k.ty.ui_medium)
                     .color(k.c.text_base)
                     .grow(1.0),
@@ -360,7 +351,7 @@ pub fn sheet(s: &UiState, k: &Kit) -> Option<El> {
                         .child(icon(&glyphs::CLOSE, 14.0).color(k.c.icon_muted)),
                 )
                 .cursor(Cursor::Pointer)
-                .label(t("Close", "关闭"))
+                .label(t("Close"))
                 .on_press(close),
             ),
     );
@@ -386,13 +377,11 @@ pub fn sheet(s: &UiState, k: &Kit) -> Option<El> {
                             compact(used),
                             compact(limit)
                         ),
-                        _ => crate::ui::copy::localize(
-                            language,
-                            format!(
-                                "模型可容纳 {} tokens，已用 {}",
-                                compact(limit),
-                                compact(used)
-                            ),
+                        _ => format!(
+                            "{}: {} / {}",
+                            crate::ui::copy::t(language, "Context:"),
+                            compact(used),
+                            compact(limit)
                         ),
                     },
                 ));
@@ -407,46 +396,43 @@ pub fn sheet(s: &UiState, k: &Kit) -> Option<El> {
                             compact(used)
                         )
                     }
-                    _ => crate::ui::copy::localize(
-                        language,
-                        format!("模型最近读取了 {} tokens；未报告上限", compact(used)),
+                    _ => format!(
+                        "{} {}",
+                        compact(used),
+                        crate::ui::copy::t(language, "tokens read; no window reported")
                     ),
                 },
             ));
         }
-        None => body = body.child(crate::ui::muted(k, t("Not available", "不可用"))),
+        None => body = body.child(crate::ui::muted(k, t("Not available"))),
     }
-    body = body.child(heading(k, t("This session", "本会话")));
+    body = body.child(heading(k, t("This session")));
     if let Some(model) = &info.model {
         body = body.child(fact(
             k,
-            t("Model", "模型"),
+            t("Model"),
             crate::ui::labels::format_model_name(model, &model.model_id, None),
         ));
     }
     if let Some(dir) = &info.directory {
-        body = body.child(fact(k, t("Project", "项目"), dir.clone()));
+        body = body.child(fact(k, t("Project"), dir.clone()));
     }
     if let Some(tokens) = info.context_usage.as_ref().and_then(|c| c.tokens.as_ref()) {
         body = body
-            .child(fact(k, t("Input", "输入"), compact(tokens.input)))
-            .child(fact(k, t("Output", "输出"), compact(tokens.output)));
+            .child(fact(k, t("Input"), compact(tokens.input)))
+            .child(fact(k, t("Output"), compact(tokens.output)));
         if let Some(n) = tokens.cache_read.filter(|n| *n > 0) {
-            body = body.child(fact(k, t("Cache read", "缓存读取"), compact(n)));
+            body = body.child(fact(k, t("Cache read"), compact(n)));
         }
         if let Some(n) = tokens.cache_write.filter(|n| *n > 0) {
-            body = body.child(fact(k, t("Cache write", "缓存写入"), compact(n)));
+            body = body.child(fact(k, t("Cache write"), compact(n)));
         }
         if let Some(n) = tokens.reasoning.filter(|n| *n > 0) {
-            body = body.child(fact(k, t("Reasoning", "推理"), compact(n)));
+            body = body.child(fact(k, t("Reasoning"), compact(n)));
         }
     }
     if let Some(cost) = info.cost.filter(|c| *c > 0.0) {
-        body = body.child(fact(
-            k,
-            t("Estimated cost", "预估费用"),
-            format!("${cost:.2}"),
-        ));
+        body = body.child(fact(k, t("Estimated cost"), format!("${cost:.2}")));
     }
     if let Some(limits) = limits_section(s, k, &info.agent_id) {
         body = body.child(limits);

@@ -109,11 +109,10 @@ impl UiState {
         if !config.usable() {
             let language = self.cfg.general.language;
             self.toast(
-                tr(language, "Set up voice input first", "请先设置语音输入"),
+                tr(language, "Set up voice input first"),
                 Some(tr(
                     language,
                     "Settings → Voice: the speech service's address.",
-                    "设置 → 语音：填写语音服务地址。",
                 )),
             );
             self.go(super::Mode::Settings);
@@ -169,14 +168,7 @@ impl UiState {
             VoiceEvent::Text(text) => {
                 self.voice = None;
                 if text.trim().is_empty() {
-                    self.toast(
-                        tr(
-                            language,
-                            "No speech detected. Please try again.",
-                            "没有听到语音，请再试一次。",
-                        ),
-                        None,
-                    );
+                    self.toast(tr(language, "No speech detected. Please try again."), None);
                 } else {
                     self.insert_dictation(text.trim());
                 }
@@ -185,22 +177,19 @@ impl UiState {
                 self.voice = None;
                 let message = match failure {
                     VoiceFailure::Microphone(why) => {
-                        return self.toast(tr(language, "Recording failed.", "录音失败。"), Some(why));
+                        return self.toast(tr(language, "Recording failed."), Some(why));
                     }
                     VoiceFailure::Connection => tr(
                         language,
-                        "Realtime transcription disconnected. Check your connection and speech service, then try again.",
-                        "实时转写已断开。请检查网络和语音服务后重试。",
+                        "Realtime transcription disconnected. Check your connection and speech service, then try again."
                     ),
                     VoiceFailure::Response => tr(
                         language,
-                        "The speech service returned an invalid transcript.",
-                        "语音服务返回的转写结果无效。",
+                        "The speech service returned an invalid transcript."
                     ),
                     VoiceFailure::Transcription => tr(
                         language,
-                        "Transcription failed. Check your speech service and try again.",
-                        "转写失败。请检查语音服务后重试。",
+                        "Transcription failed. Check your speech service and try again."
                     ),
                 };
                 self.toast(message, None);
@@ -280,9 +269,9 @@ pub fn mic_button(s: &UiState, k: &Kit) -> El {
     let language = s.cfg.general.language;
     let recording = s.voice.as_ref().map(|v| v.phase);
     let label = match recording {
-        Some(Phase::Recording) => tr(language, "Finish dictation", "结束听写"),
-        Some(_) => tr(language, "Transcribing…", "转写中…"),
-        None => tr(language, "Dictate", "语音输入"),
+        Some(Phase::Recording) => tr(language, "Finish dictation"),
+        Some(_) => tr(language, "Transcribing…"),
+        None => tr(language, "Dictate"),
     };
     IconButton::new(&MIC)
         .variant(if recording.is_some() {
@@ -398,9 +387,9 @@ pub fn strip(s: &UiState, k: &Kit) -> Option<El> {
     let language = s.cfg.general.language;
     let secs = v.meter.now() as u64;
     let status = match v.phase {
-        Phase::Starting => tr(language, "Starting…", "准备中…"),
+        Phase::Starting => tr(language, "Starting…"),
         Phase::Recording => format!("{}:{:02}", secs / 60, secs % 60),
-        Phase::Transcribing => tr(language, "Transcribing…", "转写中…"),
+        Phase::Transcribing => tr(language, "Transcribing…"),
     };
     let dot =
         el().key("voice-dot")
@@ -437,7 +426,7 @@ pub fn strip(s: &UiState, k: &Kit) -> Option<El> {
                 .child(waveform(k, v)),
         )
         .child(
-            Button::new(tr_ref(language, "Cancel", "取消"))
+            Button::new(tr_ref(language, "Cancel"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
                 .shortcut("Escape")
@@ -447,7 +436,7 @@ pub fn strip(s: &UiState, k: &Kit) -> Option<El> {
         );
     if v.phase == Phase::Recording {
         head = head.child(
-            Button::new(tr_ref(language, "Done", "完成"))
+            Button::new(tr_ref(language, "Done"))
                 .variant(ButtonVariant::Submit)
                 .control_size(ControlSize::Small)
                 .on_press(|s: &mut UiState| s.finish_voice())
@@ -465,8 +454,8 @@ pub fn strip(s: &UiState, k: &Kit) -> Option<El> {
     if v.mode == VoiceMode::Realtime {
         let words = if v.partial.trim().is_empty() {
             text(match v.phase {
-                Phase::Starting => tr(language, "Connecting…", "连接中…"),
-                _ => tr(language, "Listening…", "正在听…"),
+                Phase::Starting => tr(language, "Connecting…"),
+                _ => tr(language, "Listening…"),
             })
             .key("voice-words")
             .font(k.ty.body)
@@ -484,9 +473,9 @@ pub fn strip(s: &UiState, k: &Kit) -> Option<El> {
 const LANGUAGES: [(&str, &str); 6] = [
     ("auto", "Auto"),
     ("en", "English"),
-    ("zh-CN", "简体中文"),
-    ("zh-TW", "繁體中文"),
-    ("ja", "日本語"),
+    ("zh-CN", "\u{7b80}\u{4f53}\u{4e2d}\u{6587}"),
+    ("zh-TW", "\u{7e41}\u{9ad4}\u{4e2d}\u{6587}"),
+    ("ja", "\u{65e5}\u{672c}\u{8a9e}"),
     ("ko", "한국어"),
 ];
 
@@ -501,13 +490,13 @@ pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
     let (preset_url, preset_model) = VoiceConfig::preset(voice.mode);
     let mode = SegmentedControl::new(
         &[
-            tr_ref(language, "After recording", "录完再转写"),
-            tr_ref(language, "Realtime", "实时"),
+            tr_ref(language, "After recording"),
+            tr_ref(language, "Realtime"),
         ],
         Some(mode_at),
     )
     .fit()
-    .label(tr_ref(language, "Mode", "模式"))
+    .label(tr_ref(language, "Mode"))
     .on_pick(|s: &mut UiState, i, _: &mut Tx| {
         let to = [VoiceMode::File, VoiceMode::Realtime][i];
         let from = s.cfg.voice.mode;
@@ -539,7 +528,7 @@ pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
         .iter()
         .map(|(id, l)| {
             if *id == "auto" {
-                tr_ref(language, "Auto", "自动")
+                tr_ref(language, "Auto")
             } else {
                 *l
             }
@@ -552,7 +541,7 @@ pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
     let url_ok = voice.url.trim().is_empty() || voice.usable();
     let url = TextInput::new(&s.voice_form.url)
         .placeholder(preset_url)
-        .label(tr_ref(language, "Service URL", "服务地址"))
+        .label(tr_ref(language, "Service URL"))
         .invalid(!url_ok)
         .on_edit(|s: &mut UiState| &mut s.voice_form.url)
         .on_change(|s: &mut UiState, _: &mut Tx| {
@@ -561,7 +550,7 @@ pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
         });
     let model = TextInput::new(&s.voice_form.model)
         .placeholder(preset_model)
-        .label(tr_ref(language, "Model", "模型"))
+        .label(tr_ref(language, "Model"))
         .on_edit(|s: &mut UiState| &mut s.voice_form.model)
         .on_change(|s: &mut UiState, _: &mut Tx| {
             let model = s.voice_form.model.text.trim().to_string();
@@ -571,12 +560,10 @@ pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
         VoiceMode::File => tr_ref(
             language,
             "An OpenAI-compatible /v1/audio/transcriptions endpoint (https).",
-            "兼容 OpenAI 的 /v1/audio/transcriptions 地址（https）。",
         ),
         VoiceMode::Realtime => tr_ref(
             language,
             "An OpenAI Realtime-compatible WebSocket in transcription mode (wss).",
-            "兼容 OpenAI Realtime 的转写 WebSocket（wss）。",
         ),
     };
     let url_control = if url_ok {
@@ -593,8 +580,7 @@ pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                 Tone::Bad,
                 tr(
                     language,
-                    "Needs https:// (after recording) or wss:// (realtime), with no credentials in it.",
-                    "需要 https://（录完再转写）或 wss://（实时），且地址中不能包含凭据。",
+                    "Needs https:// (after recording) or wss:// (realtime), with no credentials in it."
                 ),
             ))
     };
@@ -604,10 +590,7 @@ pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
     // saved.
     let typed = !s.voice_form.key.text.trim().is_empty();
     let saved = s.voice_form.key_saved;
-    let (save, remove) = (
-        tr_ref(language, "Save", "保存"),
-        tr_ref(language, "Remove", "删除"),
-    );
+    let (save, remove) = (tr_ref(language, "Save"), tr_ref(language, "Remove"));
     let key_button = if typed || saved.is_none() {
         button(save)
             .variant(ButtonVariant::Submit)
@@ -627,7 +610,7 @@ pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
             } else {
                 "sk-…"
             })
-            .label(tr_ref(language, "API key", "API 密钥"))
+            .label(tr_ref(language, "API key"))
             .on_edit(|s: &mut UiState| &mut s.voice_form.key)
             .on_submit(|s: &mut UiState, _: &mut Tx| s.save_voice_key()),
         &s.voice_form.key,
@@ -638,25 +621,16 @@ pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
     );
     let mut key_label = label(
         k,
-        tr_ref(language, "API key", "API 密钥"),
+        tr_ref(language, "API key"),
         tr_ref(
             language,
             "Sent as a Bearer token. Kept in the system keyring, never in config.json.",
-            "以 Bearer 令牌发送。保存在系统钥匙串中，不写入 config.json。",
         ),
     );
     if let Some(store) = saved {
         let words = match store {
-            Store::Keyring => tr(
-                language,
-                "Saved in the system keyring",
-                "已保存在系统钥匙串",
-            ),
-            Store::File => tr(
-                language,
-                "Saved in a file only you can read",
-                "已保存在仅你可读的文件中",
-            ),
+            Store::Keyring => tr(language, "Saved in the system keyring"),
+            Store::File => tr(language, "Saved in a file only you can read"),
         };
         key_label = key_label.child(status(k, "voice-key-saved", Tone::Good, words).pt(4.0));
     }
@@ -670,34 +644,32 @@ pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
         group(
             k,
             "voice-service",
-            tr_ref(language, "Speech service", "语音服务"),
+            tr_ref(language, "Speech service"),
             vec![
                 row(
                     k,
                     "voice-mode",
-                    tr_ref(language, "Mode", "模式"),
+                    tr_ref(language, "Mode"),
                     tr_ref(
                         language,
-                        "Realtime shows the words as you speak; after recording sends the whole clip when you finish.",
-                        "实时模式边说边显示文字；录完再转写会在结束后上传整段录音。",
+                        "Realtime shows the words as you speak; after recording sends the whole clip when you finish."
                     ),
                     mode,
                 ),
                 row(
                     k,
                     "voice-url",
-                    tr_ref(language, "Service URL", "服务地址"),
+                    tr_ref(language, "Service URL"),
                     url_detail,
                     url_control,
                 ),
                 row(
                     k,
                     "voice-model",
-                    tr_ref(language, "Model", "模型"),
+                    tr_ref(language, "Model"),
                     tr_ref(
                         language,
-                        "Optional; empty uses the service's default.",
-                        "可选；留空使用服务默认模型。",
+                        "Optional; empty uses the service's default."
                     ),
                     field(model, &s.voice_form.model, k, "voice-model"),
                 ),
@@ -707,27 +679,25 @@ pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
         group(
             k,
             "voice-dictation",
-            tr_ref(language, "Dictation", "听写"),
+            tr_ref(language, "Dictation"),
             vec![
                 row(
                     k,
                     "voice-lang",
-                    tr_ref(language, "Spoken language", "说话语言"),
+                    tr_ref(language, "Spoken language"),
                     tr_ref(
                         language,
-                        "Auto lets the service decide.",
-                        "自动由服务判断。",
+                        "Auto lets the service decide."
                     ),
                     lang,
                 ),
                 row(
                     k,
                     "voice-shortcut",
-                    tr_ref(language, "Start and finish", "开始与结束"),
+                    tr_ref(language, "Start and finish"),
                     tr_ref(
                         language,
-                        "Or the mic button. Escape cancels. The words land in the draft and are never sent on their own.",
-                        "也可用麦克风按钮，Esc 取消。文字只放进草稿，不会自动发送。",
+                        "Or the mic button. Escape cancels. The words land in the draft and are never sent on their own."
                     ),
                     super::shortcuts::keycaps(k, &caps),
                 ),
@@ -741,6 +711,5 @@ pub fn subtitle(language: Language) -> &'static str {
     tr_ref(
         language,
         "Dictation into the composer: the speech service and its key.",
-        "在输入框中语音听写：语音服务与密钥。",
     )
 }

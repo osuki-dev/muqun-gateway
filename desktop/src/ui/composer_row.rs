@@ -267,8 +267,8 @@ impl Controls {
         })
     }
 
-    fn tr(&self, en: &'static str, zh: &'static str) -> &'static str {
-        tr_ref(self.language, en, zh)
+    fn tr(&self, en: &'static str) -> &'static str {
+        tr_ref(self.language, en)
     }
 
     /// The current mode's id (as the catalogue spells it) and label.
@@ -348,7 +348,7 @@ impl Controls {
             } else if self.mode.is_some() || self.modes.len() > 1 {
                 let label = self
                     .current_mode()
-                    .map_or_else(|| self.tr("Mode", "模式").to_string(), |(_, l)| l);
+                    .map_or_else(|| self.tr("Mode").to_string(), |(_, l)| l);
                 items.push(GLYPH + 4.0 + text_w(&label, small) + PILL_PAD);
             }
         }
@@ -357,7 +357,7 @@ impl Controls {
                 ICON_PILL
             } else {
                 // The switch's label, its gap and the small track.
-                text_w(self.tr("Auto-approve", "自动批准"), small) + 8.0 + 44.0
+                text_w(self.tr("Auto-approve"), small) + 8.0 + 44.0
             });
         }
         if self.has_more(f) {
@@ -511,8 +511,8 @@ fn model_items(menu: Menu, c: &Controls, m: &ModelChip, with_effort: bool) -> Me
         if !m.models.is_empty() {
             menu = menu.separator();
         }
-        menu = menu.group_label(c.tr("Effort", "推理强度")).item(
-            MenuItem::new(c.tr("Default", "默认"))
+        menu = menu.group_label(c.tr("Effort")).item(
+            MenuItem::new(c.tr("Default"))
                 .checked(m.variant.is_none())
                 .on_select(|s: &mut UiState| switch_effort(s, None)),
         );
@@ -563,7 +563,7 @@ fn model_chips(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold,
         return line;
     }
     let whole = joined(m);
-    let help = format!("{} {whole}", c.tr("Model:", "模型："));
+    let help = format!("{} {whole}", c.tr("Model:"));
     let face = match f.model {
         ModelLook::Joined => Face::Text(whole.clone()),
         ModelLook::Name => Face::Text(m.name.clone()),
@@ -614,7 +614,7 @@ fn mode_items(menu: Menu, c: &Controls, k: &Kit) -> Menu {
             .checked(current.as_deref() == Some(id.as_str()))
             .on_select(move |s: &mut UiState| switch_mode(s, pick.clone()));
         if warn {
-            item = item.description(c.tr("Nothing asks first", "不经询问直接执行"));
+            item = item.description(c.tr("Nothing asks first"));
         }
         menu = menu.item(item);
     }
@@ -633,7 +633,7 @@ fn mode_control(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold
         return Some(
             SegmentedControl::new(&labels, at)
                 .fit()
-                .label(c.tr("Mode", "模式"))
+                .label(c.tr("Mode"))
                 .on_pick(move |s: &mut UiState, i, _: &mut Tx| switch_mode(s, ids[i].clone()))
                 .build(k)
                 .key("modes"),
@@ -641,10 +641,10 @@ fn mode_control(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold
     }
     let (id, label) = c
         .current_mode()
-        .unwrap_or_else(|| (String::new(), c.tr("Mode", "模式").to_string()));
+        .unwrap_or_else(|| (String::new(), c.tr("Mode").to_string()));
     let (glyph, warn) = mode_glyph(&id);
     let tone = warn.then_some(k.c.warning.icon);
-    let help = format!("{} {label}", c.tr("Permission mode:", "权限模式："));
+    let help = format!("{} {label}", c.tr("Permission mode:"));
     if c.modes.len() < 2 {
         // Nothing to switch to: say what it is.
         c.mode.as_ref()?;
@@ -705,21 +705,18 @@ fn set_auto(s: &mut UiState, asid: &muqun_gateway::agents::AgentSessionId, on: b
 fn auto_help(c: &Controls) -> String {
     format!(
         "{} · {}",
-        c.tr("Auto-approve", "自动批准"),
+        c.tr("Auto-approve"),
         if c.auto_on {
-            c.tr(
-                "on: requests are approved without asking",
-                "已开：请求不再询问，直接批准",
-            )
+            c.tr("on: requests are approved without asking")
         } else {
-            c.tr("off: requests wait for you", "已关：请求等你批准")
+            c.tr("off: requests wait for you")
         }
     )
 }
 
 fn auto_control(c: &Controls, k: &Kit, f: Fold) -> El {
     let (on, asid) = (c.auto_on, c.asid.clone());
-    let label = c.tr("Auto-approve", "自动批准");
+    let label = c.tr("Auto-approve");
     if !f.auto_icon {
         return rune_kit::Switch::new(on)
             .label(label)
@@ -760,7 +757,7 @@ fn branch_control(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fo
         );
     }
     let current = info.current.clone()?;
-    let help = format!("{} {current}", c.tr("Branch:", "分支："));
+    let help = format!("{} {current}", c.tr("Branch:"));
     if info.local.len() < 2 {
         return Some(
             row()
@@ -795,7 +792,7 @@ fn branch_control(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fo
 /// The "…" menu: whatever the fold moved out of the row.
 fn more_menu(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -> El {
     let open = s.menu == Some(OpenMenu::ComposerMore);
-    let label = c.tr("More controls", "更多控制");
+    let label = c.tr("More controls");
     let trigger = pill_button(
         k,
         "composer-more-pill",
@@ -825,11 +822,7 @@ fn more_menu(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -
         );
     }
     if f.more_mode && c.modes.len() > 1 {
-        menu = mode_items(
-            section(menu).group_label(c.tr("Permission mode", "权限模式")),
-            c,
-            k,
-        );
+        menu = mode_items(section(menu).group_label(c.tr("Permission mode")), c, k);
     } else if f.more_mode {
         if let Some((id, label)) = c.current_mode() {
             let (glyph, warn) = mode_glyph(&id);
@@ -846,17 +839,15 @@ fn more_menu(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -
     }
     if f.more_auto {
         let (on, asid) = (c.auto_on, c.asid.clone());
-        menu = section(menu).item(
-            MenuItem::new(c.tr("Auto-approve", "自动批准"))
-                .checked(on)
-                .on_select(move |s: &mut UiState| {
-                    s.menu = None;
-                    set_auto(s, &asid, !on);
-                }),
-        );
+        menu = section(menu).item(MenuItem::new(c.tr("Auto-approve")).checked(on).on_select(
+            move |s: &mut UiState| {
+                s.menu = None;
+                set_auto(s, &asid, !on);
+            },
+        ));
     }
     if let (true, Some((cwd, info))) = (f.more_branch, c.branch.as_ref()) {
-        menu = section(menu).group_label(c.tr("Branch", "分支"));
+        menu = section(menu).group_label(c.tr("Branch"));
         menu = if info.local.len() < 2 {
             menu.item(
                 MenuItem::new(info.current.clone().unwrap_or_default())

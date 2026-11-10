@@ -14,66 +14,30 @@ use crate::ui::UiState;
 
 /// What a field is called and what it is for.
 fn words(language: Language, field: Field) -> (&'static str, &'static str) {
-    let t = |en, zh| tr_ref(language, en, zh);
+    let t = |en| tr_ref(language, en);
     match field {
         Field::Binary => (
-            t("Executable", "可执行文件"),
-            t(
-                "A command or path. Empty looks it up on PATH.",
-                "命令或路径。留空则在 PATH 中查找。",
-            ),
+            t("Executable"),
+            t("A command or path. Empty looks it up on PATH."),
         ),
         Field::Autostart => (
-            t("Start with Muqun", "随 Muqun 启动"),
-            t(
-                "Launch its server when Muqun starts.",
-                "Muqun 启动时一并启动它的服务。",
-            ),
+            t("Start with Muqun"),
+            t("Launch its server when Muqun starts."),
         ),
-        Field::Url => (
-            t("Server address", "服务地址"),
-            t("Where its server listens.", "它的服务监听的地址。"),
-        ),
-        Field::Endpoint => (
-            t("Endpoint", "接口地址"),
-            t("The harness's HTTP address.", "Harness 的 HTTP 地址。"),
-        ),
-        Field::RuntimeMode => (
-            t("Runtime mode", "运行模式"),
-            t(
-                "How much it may do without asking.",
-                "无需询问即可执行的范围。",
-            ),
-        ),
+        Field::Url => (t("Server address"), t("Where its server listens.")),
+        Field::Endpoint => (t("Endpoint"), t("The harness's HTTP address.")),
+        Field::RuntimeMode => (t("Runtime mode"), t("How much it may do without asking.")),
         Field::AcpPackage => (
-            t("ACP package", "ACP 包"),
-            t(
-                "The npm package that speaks ACP for it.",
-                "为它提供 ACP 的 npm 包。",
-            ),
+            t("ACP package"),
+            t("The npm package that speaks ACP for it."),
         ),
-        Field::SessionDir => (
-            t("Session folder", "会话目录"),
-            t("Where it keeps its sessions.", "它保存会话的目录。"),
-        ),
-        Field::Approvals => (
-            t("Approvals", "审批"),
-            t(
-                "Ask before tools run, or never ask.",
-                "工具运行前询问，或从不询问。",
-            ),
-        ),
+        Field::SessionDir => (t("Session folder"), t("Where it keeps its sessions.")),
+        Field::Approvals => (t("Approvals"), t("Ask before tools run, or never ask.")),
         Field::IdleTimeout => (
-            t("Idle timeout", "空闲超时"),
-            t(
-                "Seconds before an idle agent process stops.",
-                "Agent 进程空闲多少秒后停止。",
-            ),
+            t("Idle timeout"),
+            t("Seconds before an idle agent process stops."),
         ),
-        Field::PairingToken => (
-            t("Pairing token", "配对令牌"),
-            t("From `t3 pair`; used once.", "来自 `t3 pair`，仅使用一次。"),
-        ),
+        Field::PairingToken => (t("Pairing token"), t("From `t3 pair`; used once.")),
     }
 }
 
@@ -209,7 +173,7 @@ fn head(s: &UiState, k: &Kit, id: &str, standing: Standing, version: Option<&str
             k,
             &format!("on-{id}"),
             enabled,
-            tr_ref(language, "Enabled", "启用"),
+            tr_ref(language, "Enabled"),
             move |s| {
                 s.edit(ConfigEdit::AgentEnabled {
                     agent: toggle_id.clone(),
@@ -222,13 +186,9 @@ fn head(s: &UiState, k: &Kit, id: &str, standing: Standing, version: Option<&str
 
 pub(super) fn actions(s: &UiState, k: &Kit) -> Vec<El> {
     let language = s.cfg.general.language;
-    vec![super::button(tr_ref(language, "Look again", "重新发现"))
+    vec![super::button(tr_ref(language, "Look again"))
         .icon(&crate::ui::icons::REFRESH)
-        .help(tr_ref(
-            language,
-            "Probe this computer for agents again",
-            "重新探测这台电脑上的 Agents",
-        ))
+        .help(tr_ref(language, "Probe this computer for agents again"))
         .on_press(|s: &mut UiState| s.send(Command::Refresh))
         .build(k)
         .key("agents-refresh")]
@@ -240,11 +200,10 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
         return vec![empty(
             k,
             "agents-empty",
-            tr_ref(language, "Looking for agents…", "正在发现 Agents…"),
+            tr_ref(language, "Looking for agents…"),
             tr_ref(
                 language,
                 "Muqun probes the agents installed on this computer.",
-                "Muqun 会探测这台电脑上已安装的 Agents。",
             ),
         )];
     }

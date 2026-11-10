@@ -11,32 +11,32 @@ use crate::ui::UiState;
 
 fn op_word(cx: &Tcx, op: MuqunOp) -> &'static str {
     match op {
-        MuqunOp::ExecRun => cx.t("Run command", "运行命令"),
-        MuqunOp::FilesPresent => cx.t("Preview file", "预览文件"),
-        MuqunOp::TasksDelegate => cx.t("Start task", "开始任务"),
-        MuqunOp::TasksWait => cx.t("Wait for task", "等待任务"),
-        MuqunOp::TasksRead => cx.t("Read task", "读取任务"),
-        MuqunOp::TasksCancel => cx.t("Cancel task", "取消任务"),
-        MuqunOp::TasksComplete => cx.t("Complete task", "完成任务"),
-        MuqunOp::FleetList => cx.t("Computers", "电脑"),
-        MuqunOp::FleetDescribe => cx.t("Computer details", "电脑详情"),
+        MuqunOp::ExecRun => cx.t("Run command"),
+        MuqunOp::FilesPresent => cx.t("Preview file"),
+        MuqunOp::TasksDelegate => cx.t("Start task"),
+        MuqunOp::TasksWait => cx.t("Wait for task"),
+        MuqunOp::TasksRead => cx.t("Read task"),
+        MuqunOp::TasksCancel => cx.t("Cancel task"),
+        MuqunOp::TasksComplete => cx.t("Complete task"),
+        MuqunOp::FleetList => cx.t("Computers"),
+        MuqunOp::FleetDescribe => cx.t("Computer details"),
     }
 }
 
 fn status_word(cx: &Tcx, status: MuqunStatus) -> &'static str {
     match status {
-        MuqunStatus::Calling => cx.t("Running", "运行中"),
-        MuqunStatus::Started => cx.t("Started", "已启动"),
-        MuqunStatus::Working => cx.t("Running when checked", "查询时运行中"),
-        MuqunStatus::Queued => cx.t("Queued when checked", "查询时排队中"),
-        MuqunStatus::Waiting => cx.t("Waiting when checked", "查询时等待中"),
-        MuqunStatus::Unconfirmed => cx.t("Completion unconfirmed", "尚未确认完成"),
-        MuqunStatus::Done => cx.t("Completed", "已完成"),
-        MuqunStatus::Failed => cx.t("Failed", "失败"),
-        MuqunStatus::Cancelled => cx.t("Cancelled", "已取消"),
-        MuqunStatus::Returned => cx.t("Received", "已收到"),
-        MuqunStatus::Unassigned => cx.t("No assigned task", "没有分配的任务"),
-        MuqunStatus::Unknown => cx.t("Unknown", "未知"),
+        MuqunStatus::Calling => cx.t("Running"),
+        MuqunStatus::Started => cx.t("Started"),
+        MuqunStatus::Working => cx.t("Running when checked"),
+        MuqunStatus::Queued => cx.t("Queued when checked"),
+        MuqunStatus::Waiting => cx.t("Waiting when checked"),
+        MuqunStatus::Unconfirmed => cx.t("Completion unconfirmed"),
+        MuqunStatus::Done => cx.t("Completed"),
+        MuqunStatus::Failed => cx.t("Failed"),
+        MuqunStatus::Cancelled => cx.t("Cancelled"),
+        MuqunStatus::Returned => cx.t("Received"),
+        MuqunStatus::Unassigned => cx.t("No assigned task"),
+        MuqunStatus::Unknown => cx.t("Unknown"),
     }
 }
 
@@ -118,7 +118,7 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall, m: &Muqun) -> El {
     card.accent = Some(k.c.icon_accent);
     card.title = match &m.machine {
         Some(machine) if machine != "self" => machine.clone(),
-        Some(_) => cx.t("This computer", "本机").to_string(),
+        Some(_) => cx.t("This computer").to_string(),
         None => String::new(),
     };
     card.caption = m
@@ -167,13 +167,13 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall, m: &Muqun) -> El {
     let mut body = col().key("muqun").w_full().gap(8.0);
     let mut any = false;
     if let Some(cwd) = &m.cwd {
-        body = body.child(fact(cx, cx.t("Working directory", "工作目录"), cwd.clone()));
+        body = body.child(fact(cx, cx.t("Working directory"), cwd.clone()));
         any = true;
     }
     if let Some(ms) = tv::duration_ms(call) {
         body = body.child(fact(
             cx,
-            cx.t("Call duration", "调用耗时"),
+            cx.t("Call duration"),
             format!("{:.1} s", ms as f32 / 1000.0),
         ));
         any = true;
@@ -212,7 +212,7 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall, m: &Muqun) -> El {
     }
     if let Some(output) = &m.output {
         body = body
-            .child(caption(k, cx.t("Output", "输出")))
+            .child(caption(k, cx.t("Output")))
             .child(mono(cx, "out", output, 16));
         any = true;
     }
@@ -226,11 +226,7 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall, m: &Muqun) -> El {
         any = true;
     }
     if let Some(n) = m.timeline_count {
-        body = body.child(fact(
-            cx,
-            cx.t("Timeline entries", "时间线条目"),
-            n.to_string(),
-        ));
+        body = body.child(fact(cx, cx.t("Timeline entries"), n.to_string()));
         any = true;
     }
     if let Some(v) = &m.gateway_version {
@@ -238,27 +234,27 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall, m: &Muqun) -> El {
         any = true;
     }
     if let Some(v) = &m.agents {
-        body = body.child(fact(cx, cx.t("Agents", "代理"), v.clone()));
+        body = body.child(fact(cx, cx.t("Agents"), v.clone()));
         any = true;
     }
     if let Some(v) = &m.toolchains {
-        body = body.child(fact(cx, cx.t("Toolchains", "工具链"), v.clone()));
+        body = body.child(fact(cx, cx.t("Toolchains"), v.clone()));
         any = true;
     }
     if let Some(code) = m.exit {
-        body = body.child(fact(cx, cx.t("Exit code", "退出码"), code.to_string()));
+        body = body.child(fact(cx, cx.t("Exit code"), code.to_string()));
         any = true;
     }
     for (i, machine) in m.machines.iter().enumerate() {
         let state = if m.op != MuqunOp::FleetList {
             ""
         } else if machine.unauthorized {
-            cx.t("Permission required", "需要权限")
+            cx.t("Permission required")
         } else {
             match machine.online {
-                Some(true) => cx.t("Online", "在线"),
-                Some(false) => cx.t("Offline", "离线"),
-                None => cx.t("Unknown", "未知"),
+                Some(true) => cx.t("Online"),
+                Some(false) => cx.t("Offline"),
+                None => cx.t("Unknown"),
             }
         };
         let dot = match machine.online {
@@ -288,7 +284,7 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall, m: &Muqun) -> El {
         any = true;
     }
     if !any && m.files.is_empty() && m.status != MuqunStatus::Calling {
-        body = body.child(caption(k, cx.t("No details returned.", "没有返回详情。")));
+        body = body.child(caption(k, cx.t("No details returned.")));
         any = true;
     }
     if any {

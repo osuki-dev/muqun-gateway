@@ -91,11 +91,7 @@ fn reach(language: crate::config::Language, i: usize) -> String {
         "{} · {} {}",
         crate::platform::keys::label(&format!("Primary+{}", i + 1)),
         crate::platform::keys::label("Primary+Alt"),
-        tr_ref(
-            language,
-            "+ arrows to move between panes",
-            "+ 方向键在窗格间切换"
-        ),
+        tr_ref(language, "+ arrows to move between panes"),
     )
 }
 
@@ -153,7 +149,7 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
         }
     } else {
         head = head.child(
-            text(tr(language, "Pick a session", "选择一个会话"))
+            text(tr(language, "Pick a session"))
                 .key("tile-title")
                 .font(title_font)
                 .color(k.c.text_muted),
@@ -175,7 +171,7 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
             IconButton::new(&TRIANGLE_DOWN)
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Pane actions", "窗格操作"))
+                .label(tr_ref(language, "Pane actions"))
                 .expanded(menu_open)
                 .on_press(move |s: &mut UiState| {
                     s.menu = (!menu_open).then_some(OpenMenu::Tile(i));
@@ -188,26 +184,18 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
     // Swap places with a neighbour, as the panes sit.
     let tree = s.tile_layout();
     let chords = super::keymap::labels(super::keymap::Action::SwapPaneToward);
-    for (n, (key, en, zh)) in [
-        (
-            Key::Left,
-            "Swap with the pane on the left",
-            "与左侧窗格互换",
-        ),
-        (
-            Key::Right,
-            "Swap with the pane on the right",
-            "与右侧窗格互换",
-        ),
-        (Key::Up, "Swap with the pane above", "与上方窗格互换"),
-        (Key::Down, "Swap with the pane below", "与下方窗格互换"),
+    for (n, (key, en)) in [
+        (Key::Left, "Swap with the pane on the left"),
+        (Key::Right, "Swap with the pane on the right"),
+        (Key::Up, "Swap with the pane above"),
+        (Key::Down, "Swap with the pane below"),
     ]
     .into_iter()
     .enumerate()
     {
         if let Some(j) = super::dwindle::neighbour(&tree, s.tile_grid, i, &key) {
             menu = menu.item(
-                MenuItem::new(tr(language, en, zh))
+                MenuItem::new(tr(language, en))
                     .shortcut(if focused {
                         chords.get(n).cloned().unwrap_or_default()
                     } else {
@@ -218,31 +206,29 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
         }
     }
     if let Some(a) = asid.clone() {
-        menu = menu.item(
-            MenuItem::new(tr(language, "Show only this one", "只留这一个")).on_select(
-                move |s: &mut UiState| {
-                    // Keep this session, drop the other panes.
-                    if let Some(at) = s.tile_of(&a) {
-                        s.focus_tile(at);
+        menu = menu.item(MenuItem::new(tr(language, "Show only this one")).on_select(
+            move |s: &mut UiState| {
+                // Keep this session, drop the other panes.
+                if let Some(at) = s.tile_of(&a) {
+                    s.focus_tile(at);
+                }
+                let mut j = s.tiles.len();
+                while j > 0 {
+                    j -= 1;
+                    if s.tiles
+                        .get(j)
+                        .is_some_and(|t| t.asid.as_deref() != Some(a.as_str()))
+                    {
+                        s.close_tile(j);
                     }
-                    let mut j = s.tiles.len();
-                    while j > 0 {
-                        j -= 1;
-                        if s.tiles
-                            .get(j)
-                            .is_some_and(|t| t.asid.as_deref() != Some(a.as_str()))
-                        {
-                            s.close_tile(j);
-                        }
-                    }
-                },
-            ),
-        );
+                }
+            },
+        ));
     }
     menu = menu
         .separator()
         .item(
-            MenuItem::new(tr(language, "Remove from split view", "移出分屏"))
+            MenuItem::new(tr(language, "Remove from split view"))
                 .shortcut(if focused {
                     super::keymap::label(super::keymap::Action::RemoveSplit)
                 } else {
@@ -251,7 +237,7 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
                 .on_select(move |s: &mut UiState| s.close_tile(i)),
         )
         .item(
-            MenuItem::new(tr(language, "Close split view", "退出分屏"))
+            MenuItem::new(tr(language, "Close split view"))
                 .on_select(|s: &mut UiState| s.unsplit()),
         );
     let menu = menu.build(k, layer);
@@ -264,7 +250,7 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
         IconButton::new(&CLOSE)
             .variant(IconButtonVariant::GhostMuted)
             .control_size(ControlSize::Small)
-            .label(tr_ref(language, "Remove from split view", "移出分屏"))
+            .label(tr_ref(language, "Remove from split view"))
             .shortcut(if focused {
                 super::keymap::label(super::keymap::Action::RemoveSplit)
             } else {
@@ -306,11 +292,8 @@ fn window_actions(s: &UiState, k: &Kit) -> El {
             IconButton::new(&super::icons::PLUS)
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Add to split view", "加入分屏"))
-                .help(tip(
-                    tr_ref(language, "Add to split view", "加入分屏"),
-                    Action::AddSplit,
-                ))
+                .label(tr_ref(language, "Add to split view"))
+                .help(tip(tr_ref(language, "Add to split view"), Action::AddSplit))
                 .on_press(|s: &mut UiState| s.split())
                 .build(k)
                 .key("split-add"),
@@ -324,11 +307,8 @@ fn window_actions(s: &UiState, k: &Kit) -> El {
                 IconButtonVariant::GhostMuted
             })
             .control_size(ControlSize::Small)
-            .label(tr_ref(language, "Terminal", "终端"))
-            .help(tip(
-                tr_ref(language, "Terminal", "终端"),
-                Action::ToggleTerminal,
-            ))
+            .label(tr_ref(language, "Terminal"))
+            .help(tip(tr_ref(language, "Terminal"), Action::ToggleTerminal))
             .on_press(|s: &mut UiState| {
                 if s.term.open {
                     s.close_terminal();
@@ -359,13 +339,13 @@ fn status_mark(
                 .size(10.0)
                 .color(k.c.text_accent)
                 .build(k),
-            tr(language, "Working", "工作中"),
+            tr(language, "Working"),
         ),
         Activity::NeedsYou => (
             look.breathe(dot(k.c.warning.icon)),
-            tr(language, "Needs you", "等你处理"),
+            tr(language, "Needs you"),
         ),
-        Activity::Failed => (dot(k.c.danger.icon), tr(language, "Failed", "失败")),
+        Activity::Failed => (dot(k.c.danger.icon), tr(language, "Failed")),
     };
     Some(
         row()
@@ -398,11 +378,7 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         (draft, k.c.text_base)
     } else {
         (
-            tr(
-                language,
-                &format!("Message {agent_name}…"),
-                &format!("给 {agent_name} 发送消息…"),
-            ),
+            tr(language, &format!("Message {agent_name}…")),
             k.c.text_faint,
         )
     };
@@ -426,7 +402,7 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         .gap(8.0)
         .center_y()
         .role("button")
-        .label(tr_ref(language, "Focus this pane", "聚焦此窗格"))
+        .label(tr_ref(language, "Focus this pane"))
         .cursor(Cursor::Text)
         .on_press(move |s: &mut UiState| s.focus_tile(i))
         .child(mark_box)
@@ -442,14 +418,14 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
 
     if is_draft {
         strip = strip.child(
-            rune_kit::Badge::new(tr_ref(language, "Draft", "草稿"))
+            rune_kit::Badge::new(tr_ref(language, "Draft"))
                 .variant(rune_kit::BadgeVariant::Subtle)
                 .build(k),
         );
     }
     if queued > 0 {
         strip = strip.child(
-            rune_kit::Badge::new(format!("{queued} {}", tr_ref(language, "queued", "排队")))
+            rune_kit::Badge::new(format!("{queued} {}", tr_ref(language, "queued")))
                 .variant(rune_kit::BadgeVariant::Subtle)
                 .build(k),
         );
@@ -530,17 +506,13 @@ fn picker(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         .gap(16.0)
         .px(20.0)
         .child(
-            text(tr(
-                language,
-                "Open a session in this pane",
-                "在这个窗格打开一个会话",
-            ))
-            .font(k.ty.body_medium)
-            .color(k.c.text_base),
+            text(tr(language, "Open a session in this pane"))
+                .font(k.ty.body_medium)
+                .color(k.c.text_base),
         )
         .child(list)
         .child(
-            Button::new(tr_ref(language, "New session…", "新建会话…"))
+            Button::new(tr_ref(language, "New session…"))
                 .variant(ButtonVariant::Outline)
                 .control_size(ControlSize::Regular)
                 .on_press(move |s: &mut UiState| {
@@ -632,7 +604,7 @@ fn tile(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut V
     );
     body.role("region").label(format!(
         "{} {}",
-        tr_ref(s.cfg.general.language, "Pane", "窗格"),
+        tr_ref(s.cfg.general.language, "Pane"),
         i + 1
     ))
 }
@@ -651,11 +623,7 @@ fn gap(s: &UiState, path: &[bool], across: bool, ratio: f32, room: f32) -> El {
             Cursor::ResizeRow
         })
         .role("separator")
-        .label(tr_ref(
-            s.cfg.general.language,
-            "Resize split view",
-            "调整分屏",
-        ))
+        .label(tr_ref(s.cfg.general.language, "Resize split view"))
         .a11y_value(format!("{:.0}%", ratio * 100.0))
         .on_drag(
             move |s: &mut UiState, d: &mut rune::Drag, _: &mut Tx| match d.phase {

@@ -201,7 +201,7 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
                 .filter(|p| !p.is_empty())
                 .collect::<Vec<_>>()
                 .join(" · "),
-            hint: tr(language, "Session", "会话"),
+            hint: tr(language, "Session"),
             act: Act::Session(info.asid.0.clone()),
             agent: Some(info.agent_id.clone()),
         });
@@ -209,7 +209,7 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
     if s.palette.as_ref().is_some_and(|p| p.sessions) {
         return out;
     }
-    let new = tr(language, "New session", "新建会话");
+    let new = tr(language, "New session");
     out.push(action(
         new.clone(),
         &keymap::label(Action::NewSession),
@@ -225,13 +225,9 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
     for agent in &usable {
         let name = s.agent_name(&agent.id);
         out.push(Entry {
-            label: tr(
-                language,
-                &format!("New {name} session"),
-                &format!("新建 {name} 会话"),
-            ),
+            label: tr(language, &format!("New {name} session")),
             detail: String::new(),
-            hint: tr(language, "Action", "操作"),
+            hint: tr(language, "Action"),
             act: Act::NewSession {
                 agent: Some(agent.id.clone()),
                 cwd: None,
@@ -241,13 +237,9 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
         for folder in folders.iter().take(6) {
             let shown = folder_name(&folder.display().to_string());
             out.push(Entry {
-                label: tr(
-                    language,
-                    &format!("New {name} session in {shown}"),
-                    &format!("在 {shown} 新建 {name} 会话"),
-                ),
+                label: tr(language, &format!("New {name} session in {shown}")),
                 detail: folder.display().to_string(),
-                hint: tr(language, "Action", "操作"),
+                hint: tr(language, "Action"),
                 act: Act::NewSession {
                     agent: Some(agent.id.clone()),
                     cwd: Some(folder.clone()),
@@ -256,24 +248,24 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
             });
         }
     }
-    let act = tr(language, "Action", "操作");
+    let act = tr(language, "Action");
     if s.mode == Mode::Session && s.selected.is_some() {
         out.push(action(
-            tr(language, "Add to split view", "加入分屏"),
+            tr(language, "Add to split view"),
             &keymap::label(Action::AddSplit),
             Act::Split,
         ));
         out.push(action(
-            tr(language, "Toggle inspector", "显示或隐藏检查器"),
+            tr(language, "Toggle inspector"),
             &keymap::label(Action::ToggleInspector),
             Act::Inspector,
         ));
         let dictating = s.voice.is_some();
         out.push(action(
             if dictating {
-                tr(language, "Stop dictation", "停止听写")
+                tr(language, "Stop dictation")
             } else {
-                tr(language, "Start dictation", "开始听写")
+                tr(language, "Start dictation")
             },
             &keymap::label(Action::Dictation),
             Act::Dictation,
@@ -287,11 +279,7 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
         }
         if s.in_split() {
             here.push(Action::RemoveSplit);
-            out.push(action(
-                tr(language, "Close split view", "退出分屏"),
-                &act,
-                Act::Unsplit,
-            ));
+            out.push(action(tr(language, "Close split view"), &act, Act::Unsplit));
         }
         for a in here {
             out.push(action(
@@ -302,20 +290,12 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
         }
     }
     for (label, mode, key) in [
-        (tr_ref(language, "Home", "首页"), Mode::Home, Action::Home),
-        (
-            tr_ref(language, "Inbox", "收件箱"),
-            Mode::Inbox,
-            Action::Inbox,
-        ),
-        (
-            tr_ref(language, "Tasks", "任务"),
-            Mode::Tasks,
-            Action::Tasks,
-        ),
+        (tr_ref(language, "Home"), Mode::Home, Action::Home),
+        (tr_ref(language, "Inbox"), Mode::Inbox, Action::Inbox),
+        (tr_ref(language, "Tasks"), Mode::Tasks, Action::Tasks),
     ] {
         out.push(action(
-            tr(language, &format!("Go to {label}"), &format!("前往{label}")),
+            format!("{} {label}", tr(language, "Go to")),
             &keymap::label(key),
             Act::Go(mode),
         ));
@@ -338,36 +318,28 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
     }
     for (label, tab) in super::settings::tabs(language) {
         out.push(action(
-            tr(
-                language,
-                &format!("Settings: {label}"),
-                &format!("设置：{label}"),
-            ),
+            tr(language, &format!("Settings: {label}")),
             &act,
             Act::Settings(tab),
         ));
     }
     out.push(action(
         if s.dark {
-            tr(language, "Switch to light appearance", "切换到浅色外观")
+            tr(language, "Switch to light appearance")
         } else {
-            tr(language, "Switch to dark appearance", "切换到深色外观")
+            tr(language, "Switch to dark appearance")
         },
         &act,
         Act::ToggleScheme,
     ));
     for theme in s.theme_library.iter() {
         out.push(Entry {
-            label: tr(
-                language,
-                &format!("Theme: {}", theme.name),
-                &format!("主题：{}", theme.name),
-            ),
+            label: tr(language, &format!("Theme: {}", theme.name)),
             detail: theme.author.clone().unwrap_or_default(),
             hint: if theme.id == s.cfg.appearance.theme_id {
-                tr(language, "Current", "当前")
+                tr(language, "Current")
             } else {
-                tr(language, "Theme", "主题")
+                tr(language, "Theme")
             },
             act: Act::Theme(theme.id.clone()),
             agent: None,
@@ -524,19 +496,11 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
 
     let field = TextInput::new(&p.query)
         .placeholder(if p.sessions {
-            tr_ref(
-                language,
-                "Go to a session by title or folder…",
-                "按标题或文件夹跳转到会话…",
-            )
+            tr_ref(language, "Go to a session by title or folder…")
         } else {
-            tr_ref(
-                language,
-                "Jump to a session or run a command…",
-                "跳转到会话或执行命令…",
-            )
+            tr_ref(language, "Jump to a session or run a command…")
         })
-        .label(tr_ref(language, "Command palette", "命令面板"))
+        .label(tr_ref(language, "Command palette"))
         .plain()
         .large()
         .on_edit(|s: &mut UiState| &mut s.palette.as_mut().expect("palette open").query)
@@ -569,7 +533,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
     let mut list = col().key("palette-list").w_full().gap(2.0).px(8.0).py(8.0);
     if results.is_empty() {
         list = list.child(
-            text(tr(language, "Nothing matches", "没有匹配项"))
+            text(tr(language, "Nothing matches"))
                 .font(k.ty.ui)
                 .color(k.c.text_faint)
                 .px(12.0)
@@ -589,13 +553,10 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
     };
     for (i, (entry, hits)) in results.iter().enumerate().skip(first).take(SHOWN) {
         if recents && i == 0 {
-            list = list.child(section(k, tr(language, "Recent", "最近")));
+            list = list.child(section(k, tr(language, "Recent")));
         }
         if recents && i == recent_count && i > 0 {
-            list = list.child(section(
-                k,
-                tr(language, "Sessions and actions", "会话与操作"),
-            ));
+            list = list.child(section(k, tr(language, "Sessions and actions")));
         }
         let on = i == selected;
         let mark = match &entry.agent {
@@ -654,24 +615,20 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .gap(16.0)
         .px(18.0)
         .py(8.0)
-        .child(hint(k, "↑ ↓", tr(language, "move", "移动")))
-        .child(hint(k, "↵", tr(language, "run", "执行")))
-        .child(hint(k, "Esc", tr(language, "close", "关闭")))
+        .child(hint(k, "↑ ↓", tr(language, "move")))
+        .child(hint(k, "↵", tr(language, "run")))
+        .child(hint(k, "Esc", tr(language, "close")))
         .child(el().grow(1.0))
         .child(
-            text(format!(
-                "{} {}",
-                results.len(),
-                tr(language, "results", "项结果")
-            ))
-            .font(k.ty.small)
-            .color(k.c.text_faint),
+            text(format!("{} {}", results.len(), tr(language, "results")))
+                .font(k.ty.small)
+                .color(k.c.text_faint),
         );
 
     let panel = col()
         .key("palette")
         .role("dialog")
-        .label(tr(language, "Command palette", "命令面板"))
+        .label(tr(language, "Command palette"))
         .w_full()
         .max_w(640.0)
         .child(

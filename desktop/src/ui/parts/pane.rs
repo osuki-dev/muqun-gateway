@@ -342,7 +342,7 @@ pub fn row_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
     let Some(found) = s.timelines.get(&menu.asid).and_then(|t| item(t, &menu.id)) else {
         return;
     };
-    let t = |en, zh| crate::ui::copy::tr_ref(s.cfg.general.language, en, zh);
+    let t = |en| crate::ui::copy::tr_ref(s.cfg.general.language, en);
     let (copy, open) = row_targets(found);
     let close = |s: &mut UiState| s.row_menu = None;
     let (asid, id) = (menu.asid.clone(), menu.id.clone());
@@ -355,7 +355,7 @@ pub fn row_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
     .on_close(close);
     if detail {
         m = m.item(
-            MenuItem::new(t("Show details", "查看详情"))
+            MenuItem::new(t("Show details"))
                 .shortcut("Enter")
                 .on_select(move |s: &mut UiState| {
                     s.row_menu = None;
@@ -368,16 +368,16 @@ pub fn row_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         );
     }
     if let Some(copy) = copy.filter(|c| !c.is_empty()) {
-        m = m.item(MenuItem::new(t("Copy", "复制")).on_select_tx(
-            move |s: &mut UiState, tx: &mut Tx| {
+        m = m.item(
+            MenuItem::new(t("Copy")).on_select_tx(move |s: &mut UiState, tx: &mut Tx| {
                 s.row_menu = None;
                 tx.copy(copy.clone());
-            },
-        ));
+            }),
+        );
     }
     if let Some(path) = open {
         m = m.item(
-            MenuItem::new(t("Open file", "打开文件")).on_select(move |s: &mut UiState| {
+            MenuItem::new(t("Open file")).on_select(move |s: &mut UiState| {
                 s.row_menu = None;
                 s.open_timeline_file(&path);
             }),
@@ -404,7 +404,7 @@ pub fn view(s: &UiState, k: &Kit) -> Option<El> {
         .gap(8.0)
         .center_y()
         .child(
-            text(cx.t("Details", "详情"))
+            text(cx.t("Details"))
                 .font(k.ty.small_medium)
                 .color(k.c.text_muted)
                 .grow(1.0),
@@ -420,8 +420,8 @@ pub fn view(s: &UiState, k: &Kit) -> Option<El> {
             )
             .cursor(Cursor::Pointer)
             .role("button")
-            .label(cx.t("Close", "关闭"))
-            .help(cx.t("Close (Esc)", "关闭 (Esc)"))
+            .label(cx.t("Close"))
+            .help(cx.t("Close (Esc)"))
             .on_press(|s: &mut UiState| s.close_inspect()),
         );
     let body = col()

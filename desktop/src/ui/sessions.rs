@@ -77,9 +77,9 @@ fn projects(s: &UiState) -> Vec<Project> {
 
 fn project_label(language: crate::config::Language, p: &Project) -> String {
     if p.is_no_folder() {
-        super::copy::tr(language, "No folder", "无文件夹")
+        super::copy::tr(language, "No folder")
     } else if p.is_other() {
-        super::copy::tr(language, "Other", "其他")
+        super::copy::tr(language, "Other")
     } else {
         format!("{}{}", p.display.0, p.display.1)
     }
@@ -164,11 +164,7 @@ fn tree(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                 let key = format!("more-{project}");
                 SidebarRow::new(super::copy::localize(
                     s.cfg.general.language,
-                    super::copy::tr(
-                        s.cfg.general.language,
-                        &format!("More ({hidden})"),
-                        &format!("更多（{hidden}）"),
-                    ),
+                    super::copy::tr(s.cfg.general.language, &format!("More ({hidden})")),
                 ))
                 .depth(1)
                 .select_only()
@@ -213,12 +209,12 @@ fn project_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>, p: &Project) -> El {
     let name = prefs.name.clone().unwrap_or_else(|| p.display.1.clone());
     let (pin_id, hide_id, reset_id) = (id.clone(), id.clone(), id.clone());
     let language = s.cfg.general.language;
-    let t = |en: &'static str, zh: &'static str| super::copy::tr_ref(language, en, zh);
+    let t = |en: &'static str| super::copy::tr_ref(language, en);
     let mut menu = Menu::new(format!("pmenu-{id}"))
         .trigger(menu_button(
             k,
             &format!("pbtn-{id}"),
-            t("Project actions", "项目操作"),
+            t("Project actions"),
             open,
             {
                 let id = id.clone();
@@ -229,22 +225,22 @@ fn project_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>, p: &Project) -> El {
         .on_close(|s: &mut UiState| s.menu = None)
         .item(
             MenuItem::new(if prefs.pinned {
-                t("Unpin project", "取消置顶项目")
+                t("Unpin project")
             } else {
-                t("Pin project", "置顶项目")
+                t("Pin project")
             })
             .on_select(move |s: &mut UiState| set_prefs(s, &pin_id, |p| p.pinned = !p.pinned)),
         )
         .item(
             MenuItem::new(if prefs.hidden {
-                t("Show project", "显示项目")
+                t("Show project")
             } else {
-                t("Hide project", "隐藏项目")
+                t("Hide project")
             })
             .on_select(move |s: &mut UiState| set_prefs(s, &hide_id, |p| p.hidden = !p.hidden)),
         )
         .item(
-            MenuItem::new(t("Rename…", "重命名…")).on_select(move |s: &mut UiState| {
+            MenuItem::new(t("Rename…")).on_select(move |s: &mut UiState| {
                 s.menu = None;
                 s.rename_project = Some(id.clone());
                 s.project_edit = TextEdit::new(name.clone());
@@ -253,7 +249,7 @@ fn project_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>, p: &Project) -> El {
         );
     if prefs.name.is_some() {
         menu = menu.item(
-            MenuItem::new(t("Reset name", "恢复名称"))
+            MenuItem::new(t("Reset name"))
                 .on_select(move |s: &mut UiState| set_prefs(s, &reset_id, |p| p.name = None)),
         );
     }
@@ -316,59 +312,55 @@ fn session_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     let (rename_id, pin_id, fork_id, delete_id) = (id.clone(), id.clone(), id.clone(), id.clone());
     let split_id = id.clone();
     let language = s.cfg.general.language;
-    let t = |en: &'static str, zh: &'static str| super::copy::tr_ref(language, en, zh);
-    let trigger =
-        Menu::new(format!("smenu-{id}"))
-            .trigger(menu_button(
-                k,
-                &format!("sbtn-{id}"),
-                t("Session actions", "会话操作"),
-                open,
-                {
-                    let id = id.clone();
-                    move |s: &mut UiState| s.menu = (!open).then(|| OpenMenu::Session(id.clone()))
-                },
-            ))
-            .open(open)
-            .on_close(|s: &mut UiState| s.menu = None)
-            .item(
-                MenuItem::new(t("Rename…", "重命名…"))
-                    .on_select(move |s: &mut UiState| start_rename(s, &rename_id)),
-            )
-            .item(
-                MenuItem::new(if pinned {
-                    t("Unpin", "取消置顶")
-                } else {
-                    t("Pin", "置顶")
-                })
-                .on_select(move |s: &mut UiState| {
+    let t = |en: &'static str| super::copy::tr_ref(language, en);
+    let trigger = Menu::new(format!("smenu-{id}"))
+        .trigger(menu_button(
+            k,
+            &format!("sbtn-{id}"),
+            t("Session actions"),
+            open,
+            {
+                let id = id.clone();
+                move |s: &mut UiState| s.menu = (!open).then(|| OpenMenu::Session(id.clone()))
+            },
+        ))
+        .open(open)
+        .on_close(|s: &mut UiState| s.menu = None)
+        .item(
+            MenuItem::new(t("Rename…"))
+                .on_select(move |s: &mut UiState| start_rename(s, &rename_id)),
+        )
+        .item(
+            MenuItem::new(if pinned { t("Unpin") } else { t("Pin") }).on_select(
+                move |s: &mut UiState| {
                     s.menu = None;
                     s.edit(ConfigEdit::TogglePin(pin_id.clone()));
-                }),
-            )
-            .item(MenuItem::new(t("Add to split view", "加入分屏")).on_select(
-                move |s: &mut UiState| {
-                    s.menu = None;
-                    s.open_in_tile(&split_id);
                 },
-            ))
-            .item(
-                MenuItem::new(t("Fork", "分叉")).on_select(move |s: &mut UiState| {
-                    s.menu = None;
-                    s.send(Command::ForkSession {
-                        asid: AgentSessionId(fork_id.clone()),
-                        message_id: None,
-                    });
-                }),
-            )
-            .separator()
-            .item(MenuItem::new(t("Delete", "删除")).danger(true).on_select(
-                move |s: &mut UiState| {
+            ),
+        )
+        .item(
+            MenuItem::new(t("Add to split view")).on_select(move |s: &mut UiState| {
+                s.menu = None;
+                s.open_in_tile(&split_id);
+            }),
+        )
+        .item(MenuItem::new(t("Fork")).on_select(move |s: &mut UiState| {
+            s.menu = None;
+            s.send(Command::ForkSession {
+                asid: AgentSessionId(fork_id.clone()),
+                message_id: None,
+            });
+        }))
+        .separator()
+        .item(
+            MenuItem::new(t("Delete"))
+                .danger(true)
+                .on_select(move |s: &mut UiState| {
                     s.menu = None;
                     s.send(Command::DeleteSession(AgentSessionId(delete_id.clone())));
-                },
-            ))
-            .build(k, layer);
+                }),
+        )
+        .build(k, layer);
     if open {
         trigger
     } else {
@@ -432,13 +424,13 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
         Activity::Working => {
             subtitle = format!(
                 "{} · {subtitle}",
-                super::copy::tr(s.cfg.general.language, "Working", "工作中")
+                super::copy::tr(s.cfg.general.language, "Working")
             );
         }
         Activity::NeedsYou => {
             subtitle = format!(
                 "{} · {subtitle}",
-                super::copy::tr(s.cfg.general.language, "Needs you", "等你处理")
+                super::copy::tr(s.cfg.general.language, "Needs you")
             );
         }
         _ => {}
@@ -454,7 +446,7 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     .subtitle(subtitle)
     .selected(super::search::row_selected(s, asid));
     if in_tile {
-        row = row.detail(super::copy::tr(s.cfg.general.language, "split", "分屏"));
+        row = row.detail(super::copy::tr(s.cfg.general.language, "split"));
     } else if s.current_computer() == "all" {
         if let Some(comp) = s.computer_of_session(asid) {
             row = row.detail(s.computer_name(&comp));
@@ -497,8 +489,8 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let (icon_el, display_name, status_desc) = if curr == "all" {
         (
             rune::icon(&super::parts::glyphs::NETWORK, 15.0).color(k.c.text_accent),
-            super::copy::tr(language, "All computers", "全部电脑"),
-            super::copy::tr(language, "Fleet", "舰队"),
+            super::copy::tr(language, "All computers"),
+            super::copy::tr(language, "Fleet"),
         )
     } else {
         let name = s.computer_name(curr);
@@ -513,9 +505,9 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             rune::icon(&super::parts::glyphs::COMPUTER, 16.0).color(status_color),
             name,
             if reachable {
-                super::copy::tr(language, "Online", "在线")
+                super::copy::tr(language, "Online")
             } else {
-                super::copy::tr(language, "Offline", "离线")
+                super::copy::tr(language, "Offline")
             },
         )
     };
@@ -539,7 +531,7 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         )
         .cursor(rune::Cursor::Pointer)
         .role("button")
-        .label(super::copy::tr_ref(language, "Switch computer", "切换电脑"))
+        .label(super::copy::tr_ref(language, "Switch computer"))
         .child(icon_el)
         .child(
             rune::text(display_name)
@@ -573,12 +565,8 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
 
     // 1. All computers option
     menu = menu.item(
-        MenuItem::new(super::copy::tr_ref(language, "All computers", "全部电脑"))
-            .description(super::copy::tr_ref(
-                language,
-                "Show all sessions",
-                "聚合所有电脑会话",
-            ))
+        MenuItem::new(super::copy::tr_ref(language, "All computers"))
+            .description(super::copy::tr_ref(language, "Show all sessions"))
             .lead(rune::icon(&super::parts::glyphs::NETWORK, 15.0).color(k.c.text_accent))
             .checked(curr == "all")
             .on_select(|s: &mut UiState| {
@@ -600,13 +588,13 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         let is_paired = s.is_computer_paired(&cid);
 
         let desc = if !reachable {
-            super::copy::tr(language, "Offline", "离线")
+            super::copy::tr(language, "Offline")
         } else if !is_paired {
-            super::copy::tr(language, "Unpaired · Click to link", "未配对 · 点击授权")
+            super::copy::tr(language, "Unpaired · Click to link")
         } else if cid == "local" || cid == "self" {
-            super::copy::tr(language, "This computer", "本机")
+            super::copy::tr(language, "This computer")
         } else {
-            super::copy::tr(language, "Online", "在线")
+            super::copy::tr(language, "Online")
         };
 
         let target_id = cid.clone();
@@ -645,21 +633,17 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .child(search(s, k));
 
     let mut sidebar = Sidebar::new()
-        .label(super::copy::tr_ref(language, "Sessions", "会话"))
+        .label(super::copy::tr_ref(language, "Sessions"))
         .header(header_box);
 
     if s.sessions.is_empty() {
         sidebar = sidebar.child(
-            rune::text(super::copy::tr_ref(
-                language,
-                "No sessions yet",
-                "还没有会话",
-            ))
-            .key("empty-sessions")
-            .font(k.ty.small)
-            .color(k.c.text_faint)
-            .px(12.0)
-            .py(8.0),
+            rune::text(super::copy::tr_ref(language, "No sessions yet"))
+                .key("empty-sessions")
+                .font(k.ty.small)
+                .color(k.c.text_faint)
+                .px(12.0)
+                .py(8.0),
         );
     }
     let searching = !s.search.text.trim().is_empty();
@@ -669,7 +653,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             sidebar = sidebar.child(super::search::note(
                 k,
                 "no-titles",
-                super::copy::tr(language, "No session titles match", "没有标题匹配的会话"),
+                super::copy::tr(language, "No session titles match"),
             ));
         }
         for row in rows {
@@ -686,21 +670,21 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .footer(nav(
             s,
             k,
-            super::copy::tr_ref(language, "Inbox", "收件箱"),
+            super::copy::tr_ref(language, "Inbox"),
             &INBOX,
             Mode::Inbox,
         ))
         .footer(nav(
             s,
             k,
-            super::copy::tr_ref(language, "Tasks", "任务"),
+            super::copy::tr_ref(language, "Tasks"),
             &TASK,
             Mode::Tasks,
         ))
         .footer(nav(
             s,
             k,
-            super::copy::tr_ref(language, "Settings", "设置"),
+            super::copy::tr_ref(language, "Settings"),
             &SETTINGS,
             Mode::Settings,
         ));
@@ -718,11 +702,11 @@ fn search(s: &UiState, k: &Kit) -> El {
     let only = s.content.only;
     let mut field = TextInput::new(&s.search)
         .placeholder(if only {
-            super::copy::tr_ref(language, "Search in messages", "搜索消息内容")
+            super::copy::tr_ref(language, "Search in messages")
         } else if s.content.supported {
-            super::copy::tr_ref(language, "Search sessions and messages", "搜索会话和消息")
+            super::copy::tr_ref(language, "Search sessions and messages")
         } else {
-            super::copy::tr_ref(language, "Search sessions", "搜索会话")
+            super::copy::tr_ref(language, "Search sessions")
         })
         .leading_icon(&SEARCH)
         .leading_icon_size(14.0)
@@ -756,13 +740,13 @@ fn search(s: &UiState, k: &Kit) -> El {
                     .radius(10.0)
                     .fill(k.c.bg_accent.alpha(if s.dark { 0.22 } else { 0.14 }))
                     .role("button")
-                    .label(super::copy::tr(language, "Messages only", "仅消息"))
+                    .label(super::copy::tr(language, "Messages only"))
                     .help(super::keymap::tip(
                         &super::keymap::entry(super::keymap::Action::FocusSearch).what(language),
                         super::keymap::Action::FocusSearch,
                     ))
                     .child(
-                        rune::text(super::copy::tr(language, "Messages", "消息"))
+                        rune::text(super::copy::tr(language, "Messages"))
                             .font(k.ty.caption())
                             .color(k.c.text_accent)
                             .a11y_hidden(),
@@ -783,7 +767,7 @@ fn search(s: &UiState, k: &Kit) -> El {
 fn link_warning(s: &UiState, k: &Kit) -> Option<El> {
     let why = s.hub_down.as_ref()?;
     let language = s.cfg.general.language;
-    let word = super::copy::tr(language, "Gateway disconnected", "Gateway 已断开");
+    let word = super::copy::tr(language, "Gateway disconnected");
     let dot = el().size(6.0, 6.0).radius(3.0).fill(k.c.warning.icon);
     let look = s.look();
     Some(
@@ -802,7 +786,6 @@ fn link_warning(s: &UiState, k: &Kit) -> Option<El> {
                 .help(super::copy::tr(
                     language,
                     &format!("Reconnecting on its own. Click to retry now.\n{why}"),
-                    &format!("正在自动重连，点击立即重试。\n{why}"),
                 ))
                 .child(look.pulse(look.spark(dot, k.c.warning.icon)).a11y_hidden())
                 .child(
@@ -815,7 +798,7 @@ fn link_warning(s: &UiState, k: &Kit) -> Option<El> {
                         .a11y_hidden(),
                 )
                 .child(
-                    rune::text(super::copy::tr(language, "Retry", "重试"))
+                    rune::text(super::copy::tr(language, "Retry"))
                         .font(k.ty.caption())
                         .color(k.c.text_muted)
                         .a11y_hidden(),
@@ -854,7 +837,7 @@ mod tests {
         assert_eq!(comps.len(), 2);
         assert_eq!(
             s.computer_name("self"),
-            crate::ui::copy::tr(s.cfg.general.language, "This computer", "本机")
+            crate::ui::copy::tr(s.cfg.general.language, "This computer")
         );
         assert_eq!(s.computer_name("m2"), "mini");
 

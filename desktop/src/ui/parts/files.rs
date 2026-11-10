@@ -211,7 +211,7 @@ pub fn inline_diff(cx: &Tcx, id: &str) -> Option<El> {
 
 /// A `Diff` part: the file and its change.
 pub fn diff_part(cx: &Tcx, item: &TimelineItem, file: &str) -> El {
-    let mut card = ToolCard::new(&item.id, &glyphs::EDIT_FILE, cx.t("Changed", "已更改"));
+    let mut card = ToolCard::new(&item.id, &glyphs::EDIT_FILE, cx.t("Changed"));
     card.title = tv::basename(file).to_string();
     card.caption = tv::dirname(file).to_string();
     card.open = Some(file.to_string());
@@ -271,7 +271,7 @@ pub fn read_body(cx: &Tcx, call: &ToolCall, path: &str) -> Option<El> {
         CODE_LINES,
     ));
     if out.truncated {
-        block = block.child(super::caption(cx.k, cx.t("Truncated", "已截断")));
+        block = block.child(super::caption(cx.k, cx.t("Truncated")));
     }
     Some(block)
 }

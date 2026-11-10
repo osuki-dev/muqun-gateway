@@ -55,11 +55,11 @@ impl Filter {
 
     fn word(self, language: Language) -> &'static str {
         match self {
-            Filter::All => tr_ref(language, "All", "全部"),
-            Filter::Active => tr_ref(language, "Active", "进行中"),
-            Filter::Paused => tr_ref(language, "Paused", "已暂停"),
-            Filter::Done => tr_ref(language, "Done", "完成"),
-            Filter::Stopped => tr_ref(language, "Stopped", "已中止"),
+            Filter::All => tr_ref(language, "All"),
+            Filter::Active => tr_ref(language, "Active"),
+            Filter::Paused => tr_ref(language, "Paused"),
+            Filter::Done => tr_ref(language, "Done"),
+            Filter::Stopped => tr_ref(language, "Stopped"),
         }
     }
 
@@ -76,16 +76,16 @@ impl Filter {
 
 /// A task's state in the App's words (`taskStateWord`).
 fn state_word(language: Language, state: &str) -> String {
-    let t = |en, zh| tr(language, en, zh);
+    let t = |en| tr(language, en);
     match state {
-        "queued" => t("Queued", "排队中"),
-        "dispatching" => t("Starting", "启动中"),
-        "working" => t("Working", "工作中"),
-        "waiting" => t("Needs you", "等你处理"),
-        "idle_unconfirmed" => t("Paused", "已暂停"),
-        "done" => t("Done", "完成"),
-        "failed" => t("Failed", "失败"),
-        "cancelled" => t("Cancelled", "已取消"),
+        "queued" => t("Queued"),
+        "dispatching" => t("Starting"),
+        "working" => t("Working"),
+        "waiting" => t("Needs you"),
+        "idle_unconfirmed" => t("Paused"),
+        "done" => t("Done"),
+        "failed" => t("Failed"),
+        "cancelled" => t("Cancelled"),
         other => other.replace('_', " "),
     }
 }
@@ -124,7 +124,7 @@ fn place(s: &UiState, t: &TaskRow) -> String {
     match (&t.machine, &t.agent_id) {
         (Some(m), _) => format!("→ {m}"),
         (None, Some(a)) => s.agent_name(a),
-        (None, None) if t.kind == "command" => tr(language, "Terminal", "终端"),
+        (None, None) if t.kind == "command" => tr(language, "Terminal"),
         _ => String::new(),
     }
 }
@@ -300,7 +300,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                     .h_full()
                     .center()
                     .child(
-                        text(tr_ref(language, "No task selected", "未选择任务"))
+                        text(tr_ref(language, "No task selected"))
                             .font(k.ty.small)
                             .color(k.c.text_faint),
                     ),
@@ -331,12 +331,8 @@ const STACK_AT: f32 = 900.0;
 fn head(s: &UiState, k: &Kit, stacked: bool) -> El {
     let language = s.cfg.general.language;
     let placeholder = match &s.task_cwd {
-        Some(cwd) => tr(
-            language,
-            &format!("Delegate a goal… (runs in {cwd})"),
-            &format!("委派一个目标…（在 {cwd} 运行）"),
-        ),
-        None => tr(language, "Delegate a goal…", "委派一个目标…"),
+        Some(cwd) => tr(language, &format!("Delegate a goal… (runs in {cwd})")),
+        None => tr(language, "Delegate a goal…"),
     };
     let delegate = if stacked {
         row().w_full()
@@ -352,7 +348,7 @@ fn head(s: &UiState, k: &Kit, stacked: bool) -> El {
         .child(
             TextInput::new(&s.task_goal)
                 .placeholder(placeholder)
-                .label(tr_ref(language, "Task goal", "任务目标"))
+                .label(tr_ref(language, "Task goal"))
                 .on_edit(|s: &mut UiState| &mut s.task_goal)
                 .on_submit(|s: &mut UiState, _: &mut Tx| create(s))
                 .build(k)
@@ -363,7 +359,7 @@ fn head(s: &UiState, k: &Kit, stacked: bool) -> El {
         )
         // The button shows once there is a goal to send; Enter sends it too.
         .children((!s.task_goal.text.trim().is_empty()).then(|| {
-            Button::new(tr_ref(language, "Delegate", "委派"))
+            Button::new(tr_ref(language, "Delegate"))
                 .variant(ButtonVariant::Submit)
                 .shortcut("↵")
                 .on_press(create)
@@ -385,7 +381,7 @@ fn head(s: &UiState, k: &Kit, stacked: bool) -> El {
                 .min_w(0.0)
                 .gap(4.0)
                 .child(
-                    text(tr_ref(language, "Tasks", "任务"))
+                    text(tr_ref(language, "Tasks"))
                         .key("page-title")
                         .font(rune::TextStyle {
                             size: 22.0,
@@ -398,7 +394,6 @@ fn head(s: &UiState, k: &Kit, stacked: bool) -> El {
                     text(tr_ref(
                         language,
                         "Work handed to agents, here and on linked computers.",
-                        "交给 Agent 的工作，包括本机与已连接的电脑。",
                     ))
                     .key("page-subtitle")
                     .font(k.ty.small)
@@ -435,7 +430,7 @@ fn filters(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .child(
             SegmentedControl::new(&labels, at)
                 .fit()
-                .label(tr_ref(language, "State", "状态"))
+                .label(tr_ref(language, "State"))
                 .on_pick(|s: &mut UiState, i, _: &mut Tx| {
                     s.tasks_view.filter = Filter::ALL[i];
                     s.tasks_view.arm_cancel = None;
@@ -456,11 +451,11 @@ fn filters(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         let (icon_glyph, display_name) = match &v.machine {
             None => (
                 &super::parts::glyphs::NETWORK,
-                tr(language, "All computers", "所有电脑"),
+                tr(language, "All computers"),
             ),
             Some(None) => (
                 &super::parts::glyphs::COMPUTER,
-                tr(language, "This computer", "本机"),
+                tr(language, "This computer"),
             ),
             Some(Some(m)) => (&super::parts::glyphs::COMPUTER, m.clone()),
         };
@@ -483,7 +478,7 @@ fn filters(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             )
             .cursor(rune::Cursor::Pointer)
             .role("button")
-            .label(tr_ref(language, "Filter by computer", "按电脑筛选"))
+            .label(tr_ref(language, "Filter by computer"))
             .child(rune::icon(icon_glyph, 14.0).color(k.c.text_base))
             .child(
                 rune::text(display_name)
@@ -508,7 +503,7 @@ fn filters(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             .on_close(|s: &mut UiState| s.menu = None);
 
         menu = menu.item(
-            MenuItem::new(super::copy::tr_ref(language, "All computers", "所有电脑"))
+            MenuItem::new(super::copy::tr_ref(language, "All computers"))
                 .lead(rune::icon(&super::parts::glyphs::NETWORK, 15.0).color(k.c.text_accent))
                 .checked(v.machine.is_none())
                 .on_select(|s: &mut UiState| {
@@ -518,7 +513,7 @@ fn filters(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         );
 
         menu = menu.item(
-            MenuItem::new(super::copy::tr_ref(language, "This computer", "本机"))
+            MenuItem::new(super::copy::tr_ref(language, "This computer"))
                 .lead(rune::icon(&super::parts::glyphs::COMPUTER, 15.0).color(k.c.text_base))
                 .checked(v.machine == Some(None))
                 .on_select(|s: &mut UiState| {
@@ -547,8 +542,8 @@ fn filters(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     bar.child(el().grow(1.0)).child(
         IconButton::new(&super::icons::REFRESH)
             .variant(IconButtonVariant::Ghost)
-            .label(tr_ref(language, "Refresh", "刷新"))
-            .help(tr_ref(language, "Refresh", "刷新"))
+            .label(tr_ref(language, "Refresh"))
+            .help(tr_ref(language, "Refresh"))
             .on_press(|s: &mut UiState| s.send(Command::RefreshTasks))
             .build(k)
             .key("task-refresh"),
@@ -574,20 +569,16 @@ fn error_line(s: &UiState, k: &Kit) -> Option<El> {
                     .a11y_hidden(),
             )
             .child(
-                text(tr(
-                    language,
-                    &format!("Couldn't refresh tasks: {why}"),
-                    &format!("无法刷新任务：{why}"),
-                ))
-                .font(k.ty.small)
-                .color(k.c.text_muted)
-                .truncate()
-                .help_when_truncated(why.clone())
-                .shrink()
-                .min_w(0.0),
+                text(tr(language, &format!("Couldn't refresh tasks: {why}")))
+                    .font(k.ty.small)
+                    .color(k.c.text_muted)
+                    .truncate()
+                    .help_when_truncated(why.clone())
+                    .shrink()
+                    .min_w(0.0),
             )
             .child(
-                Button::new(tr_ref(language, "Retry", "重试"))
+                Button::new(tr_ref(language, "Retry"))
                     .variant(ButtonVariant::Ghost)
                     .control_size(ControlSize::Small)
                     .on_press(|s: &mut UiState| s.send(Command::RefreshTasks))
@@ -624,30 +615,25 @@ fn table(s: &UiState, k: &Kit, list: &[&TaskRow], at: Option<usize>, cols: Cols)
         .px(12.0)
         .gap(12.0)
         .center_y()
-        .child(header_cell(
-            k,
-            tr_ref(language, "Task", "任务"),
-            None,
-            false,
-        ));
+        .child(header_cell(k, tr_ref(language, "Task"), None, false));
     if cols.agent {
         header = header.child(header_cell(
             k,
-            tr_ref(language, "Runs on", "运行于"),
+            tr_ref(language, "Runs on"),
             Some(AGENT_W),
             false,
         ));
     }
     header = header.child(header_cell(
         k,
-        tr_ref(language, "State", "状态"),
+        tr_ref(language, "State"),
         Some(STATE_W),
         false,
     ));
     if cols.updated {
         header = header.child(header_cell(
             k,
-            tr_ref(language, "Updated", "更新"),
+            tr_ref(language, "Updated"),
             Some(TIME_W),
             true,
         ));
@@ -655,7 +641,7 @@ fn table(s: &UiState, k: &Kit, list: &[&TaskRow], at: Option<usize>, cols: Cols)
     if cols.duration {
         header = header.child(header_cell(
             k,
-            tr_ref(language, "Duration", "耗时"),
+            tr_ref(language, "Duration"),
             Some(TIME_W),
             true,
         ));
@@ -667,20 +653,16 @@ fn table(s: &UiState, k: &Kit, list: &[&TaskRow], at: Option<usize>, cols: Cols)
         .pb(16.0)
         .gap(1.0)
         .role("list")
-        .label(tr_ref(language, "Tasks", "任务"));
+        .label(tr_ref(language, "Tasks"));
     if list.is_empty() {
         let word = s.tasks_view.filter.word(language);
         rows = rows.child(
-            text(tr(
-                language,
-                &format!("Nothing in “{word}”."),
-                &format!("“{word}”中没有任务。"),
-            ))
-            .key("tasks-none")
-            .font(k.ty.small)
-            .color(k.c.text_faint)
-            .px(12.0)
-            .py(16.0),
+            text(tr(language, &format!("Nothing in “{word}”.")))
+                .key("tasks-none")
+                .font(k.ty.small)
+                .color(k.c.text_faint)
+                .px(12.0)
+                .py(16.0),
         );
     }
     for (i, t) in list.iter().enumerate() {
@@ -813,10 +795,10 @@ fn foot(s: &UiState, k: &Kit, wide: bool) -> El {
         .px(12.0)
         .gap(16.0)
         .center_y()
-        .child(hint(&["J", "K"], tr_ref(language, "Move", "移动")))
-        .child(hint(&["↵"], tr_ref(language, "Open session", "打开会话")))
-        .children(wide.then(|| hint(&["M"], tr_ref(language, "Mark done", "标记完成"))))
-        .children(wide.then(|| hint(&["X"], tr_ref(language, "Cancel", "取消"))));
+        .child(hint(&["J", "K"], tr_ref(language, "Move")))
+        .child(hint(&["↵"], tr_ref(language, "Open session")))
+        .children(wide.then(|| hint(&["M"], tr_ref(language, "Mark done"))))
+        .children(wide.then(|| hint(&["X"], tr_ref(language, "Cancel"))));
     col()
         .key("tasks-foot")
         .w_full()
@@ -871,9 +853,9 @@ fn detail(s: &UiState, k: &Kit, t: &TaskRow, w: f32) -> El {
     let language = s.cfg.general.language;
     let now = super::now_ms();
     let kind = if t.kind == "command" {
-        tr(language, "Command", "命令")
+        tr(language, "Command")
     } else {
-        tr(language, "Delegation", "委派")
+        tr(language, "Delegation")
     };
     let mut body = col()
         .key(format!("task-detail-{}", t.id))
@@ -916,32 +898,28 @@ fn detail(s: &UiState, k: &Kit, t: &TaskRow, w: f32) -> El {
     let mut facts = col().key("task-facts").w_full().gap(4.0);
     let where_ = place(s, t);
     if !where_.is_empty() {
-        facts = facts.child(fact(k, tr_ref(language, "Runs on", "运行于"), where_));
+        facts = facts.child(fact(k, tr_ref(language, "Runs on"), where_));
     }
     if t.started_ms > 0 {
         facts = facts.child(fact(
             k,
-            tr_ref(language, "Started", "开始"),
+            tr_ref(language, "Started"),
             super::ago(t.started_ms, now, language),
         ));
     }
     if t.updated_ms > 0 {
         facts = facts.child(fact(
             k,
-            tr_ref(language, "Updated", "更新"),
+            tr_ref(language, "Updated"),
             super::ago(t.updated_ms, now, language),
         ));
     }
     let ran = duration(t, now, language);
     if !ran.is_empty() {
-        facts = facts.child(fact(k, tr_ref(language, "Duration", "耗时"), ran));
+        facts = facts.child(fact(k, tr_ref(language, "Duration"), ran));
     }
     if let Some(code) = t.exit_code {
-        facts = facts.child(fact(
-            k,
-            tr_ref(language, "Exit code", "退出码"),
-            code.to_string(),
-        ));
+        facts = facts.child(fact(k, tr_ref(language, "Exit code"), code.to_string()));
     }
     body = body.child(facts);
     if !t.goal.trim().is_empty() && t.goal.trim() != t.title.trim() {
@@ -949,9 +927,9 @@ fn detail(s: &UiState, k: &Kit, t: &TaskRow, w: f32) -> El {
             k,
             "task-goal-text",
             if t.kind == "command" {
-                tr_ref(language, "Command line", "命令行")
+                tr_ref(language, "Command line")
             } else {
-                tr_ref(language, "Goal", "目标")
+                tr_ref(language, "Goal")
             },
             text(t.goal.clone())
                 .font(if t.kind == "command" {
@@ -969,7 +947,7 @@ fn detail(s: &UiState, k: &Kit, t: &TaskRow, w: f32) -> El {
         body = body.child(section(
             k,
             "task-progress",
-            tr_ref(language, "Now", "当前"),
+            tr_ref(language, "Now"),
             text(now_doing.clone())
                 .font(k.ty.ui)
                 .color(k.c.text_muted)
@@ -981,7 +959,7 @@ fn detail(s: &UiState, k: &Kit, t: &TaskRow, w: f32) -> El {
         body = body.child(section(
             k,
             "task-summary",
-            tr_ref(language, "Summary", "总结"),
+            tr_ref(language, "Summary"),
             text(summary.clone())
                 .font(k.ty.ui)
                 .color(k.c.text_base)
@@ -1026,28 +1004,15 @@ fn children(s: &UiState, k: &Kit, t: &TaskRow) -> El {
             c.total,
             if c.total == 1 { "" } else { "s" }
         ),
-        &format!("{} 个子任务", c.total),
     )];
     if c.active > 0 {
-        parts.push(tr(
-            language,
-            &format!("{} active", c.active),
-            &format!("{} 个进行中", c.active),
-        ));
+        parts.push(tr(language, &format!("{} active", c.active)));
     }
     if c.waiting > 0 {
-        parts.push(tr(
-            language,
-            &format!("{} waiting", c.waiting),
-            &format!("{} 个等待中", c.waiting),
-        ));
+        parts.push(format!("{} {}", c.waiting, tr(language, "waiting")));
     }
     if c.failed > 0 {
-        parts.push(tr(
-            language,
-            &format!("{} failed", c.failed),
-            &format!("{} 个失败", c.failed),
-        ));
+        parts.push(format!("{} {}", c.failed, tr(language, "failed")));
     }
     let mut list = col().key("task-children").w_full().gap(2.0).child(
         text(parts.join(" · "))
@@ -1084,12 +1049,7 @@ fn children(s: &UiState, k: &Kit, t: &TaskRow) -> El {
             .on_press(move |s: &mut UiState| select(s, id.clone())),
         );
     }
-    section(
-        k,
-        "task-subtasks",
-        tr_ref(language, "Sub-tasks", "子任务"),
-        list,
-    )
+    section(k, "task-subtasks", tr_ref(language, "Sub-tasks"), list)
 }
 
 /// The latest state changes, newest first, as a thin timeline.
@@ -1125,12 +1085,7 @@ fn history(s: &UiState, k: &Kit, steps: &[TaskStep], now: u64) -> El {
                 ),
         );
     }
-    section(
-        k,
-        "task-timeline",
-        tr_ref(language, "Timeline", "时间线"),
-        list,
-    )
+    section(k, "task-timeline", tr_ref(language, "Timeline"), list)
 }
 
 fn actions(s: &UiState, k: &Kit, t: &TaskRow) -> El {
@@ -1145,7 +1100,7 @@ fn actions(s: &UiState, k: &Kit, t: &TaskRow) -> El {
         .center_y()
         .flex_wrap();
     if let Some(asid) = t.asid.clone() {
-        let label = tr(language, "Open session", "打开会话");
+        let label = tr(language, "Open session");
         line = line.child(
             Button::new(label.clone())
                 .variant(ButtonVariant::Outline)
@@ -1157,7 +1112,7 @@ fn actions(s: &UiState, k: &Kit, t: &TaskRow) -> El {
     }
     if t.completable {
         let id = t.id.clone();
-        let label = tr(language, "Mark done", "标记完成");
+        let label = tr(language, "Mark done");
         line = line.child(
             Button::new(label.clone())
                 .variant(ButtonVariant::Submit)
@@ -1171,9 +1126,9 @@ fn actions(s: &UiState, k: &Kit, t: &TaskRow) -> El {
         let armed = s.tasks_view.arm_cancel.as_deref() == Some(t.id.as_str());
         let id = t.id.clone();
         let label = if armed {
-            tr(language, "Confirm cancel", "确认取消")
+            tr(language, "Confirm cancel")
         } else {
-            tr(language, "Cancel task", "取消任务")
+            tr(language, "Cancel task")
         };
         line = line.child(
             Button::new(label.clone())
@@ -1206,20 +1161,18 @@ fn empty(s: &UiState, k: &Kit) -> El {
     let language = s.cfg.general.language;
     let (title, detail) = if s.tasks_view.error.is_some() {
         (
-            tr_ref(language, "Tasks are unavailable", "暂时无法读取任务"),
+            tr_ref(language, "Tasks are unavailable"),
             tr_ref(
                 language,
                 "The gateway didn't answer. Retry, or check that it is running.",
-                "Gateway 没有响应。请重试，或检查它是否在运行。",
             ),
         )
     } else {
         (
-            tr_ref(language, "No tasks yet", "还没有任务"),
+            tr_ref(language, "No tasks yet"),
             tr_ref(
                 language,
                 "Delegate a goal above, or ask an agent to hand work to another computer.",
-                "在上方委派一个目标，或让 Agent 把工作交给另一台电脑。",
             ),
         )
     };

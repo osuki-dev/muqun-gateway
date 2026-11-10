@@ -41,16 +41,16 @@ impl Standing {
     }
 
     pub fn word(self, language: Language) -> &'static str {
-        let (en, zh) = match self {
-            Self::Usable => ("Available", "可用"),
-            Self::NeedsSetup => ("Needs setup", "需要设置"),
-            Self::NotRunning => ("Not running", "未运行"),
-            Self::NotInstalled => ("Not installed", "未安装"),
-            Self::NeedsUpdate => ("Needs update", "需要更新"),
-            Self::Disabled => ("Disabled", "已关闭"),
-            Self::Checking => ("Checking…", "检查中…"),
+        let en = match self {
+            Self::Usable => "Available",
+            Self::NeedsSetup => "Needs setup",
+            Self::NotRunning => "Not running",
+            Self::NotInstalled => "Not installed",
+            Self::NeedsUpdate => "Needs update",
+            Self::Disabled => "Disabled",
+            Self::Checking => "Checking…",
         };
-        super::copy::tr_ref(language, en, zh)
+        super::copy::tr_ref(language, en)
     }
 }
 

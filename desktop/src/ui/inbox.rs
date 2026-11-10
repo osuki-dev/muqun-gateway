@@ -46,10 +46,10 @@ pub enum Kind {
 impl Kind {
     fn word(self, language: Language) -> &'static str {
         match self {
-            Kind::Permission => tr_ref(language, "Permission", "权限"),
-            Kind::Plan => tr_ref(language, "Plan", "计划"),
-            Kind::Question => tr_ref(language, "Question", "提问"),
-            Kind::Task => tr_ref(language, "Paused task", "已暂停的任务"),
+            Kind::Permission => tr_ref(language, "Permission"),
+            Kind::Plan => tr_ref(language, "Plan"),
+            Kind::Question => tr_ref(language, "Question"),
+            Kind::Task => tr_ref(language, "Paused task"),
         }
     }
 
@@ -304,7 +304,7 @@ pub fn view(s: &UiState, k: &Kit) -> El {
 
 fn page_head(k: &Kit, language: Language, count: usize) -> El {
     let mut title = row().key("inbox-title-line").gap(8.0).center_y().child(
-        text(tr_ref(language, "Inbox", "收件箱"))
+        text(tr_ref(language, "Inbox"))
             .key("page-title")
             .font(rune::TextStyle {
                 size: 22.0,
@@ -330,15 +330,11 @@ fn page_head(k: &Kit, language: Language, count: usize) -> El {
         .gap(4.0)
         .child(title)
         .child(
-            text(tr_ref(
-                language,
-                "Approvals and questions waiting on you.",
-                "等待你批准或回答的事项。",
-            ))
-            .key("page-subtitle")
-            .font(k.ty.small)
-            .color(k.c.text_muted)
-            .wrap(),
+            text(tr_ref(language, "Approvals and questions waiting on you."))
+                .key("page-subtitle")
+                .font(k.ty.small)
+                .color(k.c.text_muted)
+                .wrap(),
         )
 }
 
@@ -349,7 +345,7 @@ fn headline(language: Language, item: &Item<'_>) -> (String, String) {
             let subject = tv::permission_subject(p);
             let phrase = approval::action_phrase(language, &p.action);
             if item.kind == Kind::Plan {
-                (tr(language, "Review the plan", "审阅计划"), subject)
+                (tr(language, "Review the plan"), subject)
             } else {
                 (phrase, subject)
             }
@@ -361,7 +357,6 @@ fn headline(language: Language, item: &Item<'_>) -> (String, String) {
                 tr(
                     language,
                     &format!("{n} field{}", if n == 1 { "" } else { "s" }),
-                    &format!("{n} 项"),
                 ),
             )
         }
@@ -382,7 +377,7 @@ fn list_pane(s: &UiState, k: &Kit, list: &[Item<'_>], at: Option<usize>, w: f32)
         .pb(16.0)
         .gap(1.0)
         .role("list")
-        .label(tr_ref(language, "Waiting on you", "等你处理"));
+        .label(tr_ref(language, "Waiting on you"));
     let mut group = String::new();
     for (i, item) in list.iter().enumerate() {
         let g = item.group();
@@ -452,8 +447,8 @@ fn group_head(s: &UiState, k: &Kit, item: &Item<'_>, first: bool) -> El {
                 .as_deref()
                 .map(|a| super::agents::mark(a, 12.0, s.dark).a11y_hidden()),
             t.machine.clone().map_or_else(
-                || tr(language, "Tasks", "任务"),
-                |m| tr(language, &format!("Tasks on {m}"), &format!("{m} 上的任务")),
+                || tr(language, "Tasks"),
+                |m| format!("{}: {m}", tr(language, "Tasks on")),
             ),
         ),
         (None, _) => (None, item.asid.unwrap_or_default().to_string()),
@@ -636,7 +631,7 @@ fn detail(s: &UiState, k: &Kit, item: &Item<'_>) -> El {
                 actions = actions.child(button(
                     k,
                     "task-done".into(),
-                    tr(language, "Mark done", "标记完成"),
+                    tr(language, "Mark done"),
                     &["M"],
                     ButtonVariant::Submit,
                     move |s: &mut UiState| s.send(Command::CompleteTask { id: id.clone() }),
@@ -708,10 +703,10 @@ fn session_line(s: &UiState, k: &Kit, info: &muqun_gateway::agents::AgentSession
         )
         .child(el().grow(1.0))
         .child(
-            Button::new(tr(language, "Open session", "打开会话"))
+            Button::new(tr(language, "Open session"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
-                .label_with(keyed(tr(language, "Open session", "打开会话"), &["↵"]))
+                .label_with(keyed(tr(language, "Open session"), &["↵"]))
                 .on_press(move |s: &mut UiState| s.open_session(&asid))
                 .build(k)
                 .key("open-session"),
@@ -740,7 +735,7 @@ fn said(s: &UiState, k: &Kit, asid: Option<&str>) -> Option<El> {
             .w_full()
             .gap(6.0)
             .child(
-                text(tr_ref(language, "The agent said", "Agent 说"))
+                text(tr_ref(language, "The agent said"))
                     .font(k.ty.small_medium)
                     .color(k.c.text_faint),
             )
@@ -807,7 +802,7 @@ fn answers(s: &UiState, k: &Kit, request: &PermissionRequest) -> El {
         block = block.child(
             text(format!(
                 "{} {}",
-                tr_ref(language, "Always allow covers", "始终允许将涵盖"),
+                tr_ref(language, "Always allow covers"),
                 request.save.join(", ")
             ))
             .font(k.ty.small)
@@ -839,16 +834,16 @@ fn hints(s: &UiState, k: &Kit, item: &Item<'_>) -> El {
         .px(20.0)
         .gap(16.0)
         .center_y()
-        .child(hint(&["J", "K"], tr_ref(language, "Move", "移动")));
+        .child(hint(&["J", "K"], tr_ref(language, "Move")));
     if matches!(item.what, What::Permission(_)) {
         line = line
-            .child(hint(&["A"], tr_ref(language, "Allow", "允许")))
-            .child(hint(&["D"], tr_ref(language, "Deny", "拒绝")));
+            .child(hint(&["A"], tr_ref(language, "Allow")))
+            .child(hint(&["D"], tr_ref(language, "Deny")));
     }
-    line = line.child(hint(&["↵"], tr_ref(language, "Open session", "打开会话")));
+    line = line.child(hint(&["↵"], tr_ref(language, "Open session")));
     let card_w = rune::memo::layout_with("main", |r| r[2]).unwrap_or(1080.0);
     if card_w >= 760.0 {
-        line = line.child(hint(&["Esc"], tr_ref(language, "Back", "返回")));
+        line = line.child(hint(&["Esc"], tr_ref(language, "Back")));
     }
     col()
         .key("inbox-foot")
@@ -875,7 +870,7 @@ fn empty(k: &Kit, language: Language) -> El {
                 .a11y_hidden(),
         )
         .child(
-            text(tr_ref(language, "Nothing needs you", "没有需要你处理的事"))
+            text(tr_ref(language, "Nothing needs you"))
                 .font(k.ty.ui_medium)
                 .color(k.c.text_base),
         )
@@ -883,7 +878,6 @@ fn empty(k: &Kit, language: Language) -> El {
             text(tr_ref(
                 language,
                 "Approvals and questions from your agents land here.",
-                "Agent 的审批请求与提问会出现在这里。",
             ))
             .font(k.ty.small)
             .color(k.c.text_muted),

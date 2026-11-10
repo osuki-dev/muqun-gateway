@@ -45,14 +45,14 @@ pub enum SettingsTab {
 pub(super) fn tabs(language: Language) -> [(&'static str, SettingsTab); 8] {
     use SettingsTab as T;
     [
-        (tr_ref(language, "General", "通用"), T::General),
-        (tr_ref(language, "Appearance", "外观"), T::Appearance),
-        (tr_ref(language, "Themes", "主题"), T::Themes),
-        (tr_ref(language, "Agents", "Agents"), T::Agents),
-        (tr_ref(language, "Voice", "语音"), T::Voice),
-        (tr_ref(language, "Shortcuts", "快捷键"), T::Shortcuts),
-        (tr_ref(language, "Storage", "存储"), T::Storage),
-        (tr_ref(language, "About", "关于"), T::About),
+        (tr_ref(language, "General"), T::General),
+        (tr_ref(language, "Appearance"), T::Appearance),
+        (tr_ref(language, "Themes"), T::Themes),
+        (tr_ref(language, "Agents"), T::Agents),
+        (tr_ref(language, "Voice"), T::Voice),
+        (tr_ref(language, "Shortcuts"), T::Shortcuts),
+        (tr_ref(language, "Storage"), T::Storage),
+        (tr_ref(language, "About"), T::About),
     ]
 }
 
@@ -77,39 +77,20 @@ impl SettingsTab {
             Self::General => tr_ref(
                 language,
                 "Language, where new sessions start, and notifications.",
-                "界面语言、新会话的起点与通知。",
             ),
-            Self::Appearance => tr_ref(
-                language,
-                "Light or dark, text size, density and motion.",
-                "浅色或深色、文字大小、密度与动效。",
-            ),
+            Self::Appearance => tr_ref(language, "Light or dark, text size, density and motion."),
             Self::Themes => tr_ref(
                 language,
                 "Restyle the whole window: colours, artwork and type.",
-                "更换整个窗口的配色、插图与字体。",
             ),
             Self::Agents => tr_ref(
                 language,
                 "The coding agents found on this computer. Changes save as you type.",
-                "在这台电脑上发现的编程 Agents。修改随输入保存。",
             ),
             Self::Voice => super::voice::subtitle(language),
-            Self::Shortcuts => tr_ref(
-                language,
-                "Every key the window answers to.",
-                "窗口响应的所有按键。",
-            ),
-            Self::Storage => tr_ref(
-                language,
-                "What Muqun keeps on this computer.",
-                "Muqun 在这台电脑上保存的内容。",
-            ),
-            Self::About => tr_ref(
-                language,
-                "Version, connection, links and licences.",
-                "版本、连接、链接与许可。",
-            ),
+            Self::Shortcuts => tr_ref(language, "Every key the window answers to."),
+            Self::Storage => tr_ref(language, "What Muqun keeps on this computer."),
+            Self::About => tr_ref(language, "Version, connection, links and licences."),
         }
     }
 }
@@ -518,7 +499,7 @@ fn nav(s: &UiState, k: &Kit, rail: bool) -> El {
         .px(if rail { 10.0 } else { 12.0 })
         .gap(2.0)
         .role("tablist")
-        .label(tr_ref(language, "Settings", "设置"));
+        .label(tr_ref(language, "Settings"));
     for (i, (name, tab)) in tabs(language).into_iter().enumerate() {
         // A breath between what the window looks like, what it runs, and
         // what it keeps.

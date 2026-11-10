@@ -723,9 +723,9 @@ impl UiState {
     pub fn computer_name(&self, id: &str) -> String {
         let language = self.cfg.general.language;
         if id == "all" {
-            copy::tr(language, "All computers", "全部电脑")
+            copy::tr(language, "All computers")
         } else if id == "local" || id == "self" {
-            copy::tr(language, "This computer", "本机")
+            copy::tr(language, "This computer")
         } else if let Some(peer) = self
             .peers
             .iter()
@@ -950,7 +950,13 @@ impl UiState {
         }
 
         let name = self.computer_name(&id);
-        self.toast(format!("已切换到 {}", name), None);
+        self.toast(
+            format!(
+                "{} {name}",
+                copy::t(self.cfg.general.language, "Switched to")
+            ),
+            None,
+        );
     }
 
     pub fn toast(&mut self, title: impl Into<String>, detail: Option<String>) {
@@ -1793,7 +1799,6 @@ impl UiState {
                         copy::tr(
                             self.cfg.general.language,
                             "Pairing code requested. Check the remote computer.",
-                            "已发起配对请求，请在远端电脑查看配对码",
                         ),
                         None,
                     );
@@ -1813,11 +1818,7 @@ impl UiState {
                             format!(
                                 "{}: {}",
                                 name,
-                                copy::tr(
-                                    self.cfg.general.language,
-                                    "Connected successfully",
-                                    "关联连接成功"
-                                )
+                                copy::tr(self.cfg.general.language, "Connected successfully")
                             ),
                             None,
                         );
@@ -2560,16 +2561,15 @@ pub fn now_ms() -> u64 {
 
 /// `updated_ms` as a short relative time ("now", "4m", "3h", "2d").
 pub fn ago(updated_ms: u64, now: u64, language: crate::config::Language) -> String {
-    let zh = language.is_zh();
     if updated_ms == 0 {
         return String::new();
     }
     let secs = now.saturating_sub(updated_ms) / 1000;
     match secs {
-        0..=59 => tr(language, "now", "刚刚"),
-        60..=3599 => format!("{}{}", secs / 60, if zh { " 分钟前" } else { "m" }),
-        3600..=86_399 => format!("{}{}", secs / 3600, if zh { " 小时前" } else { "h" }),
-        _ => format!("{}{}", secs / 86_400, if zh { " 天前" } else { "d" }),
+        0..=59 => tr(language, "now"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
     }
 }
 
@@ -2622,10 +2622,10 @@ pub fn activity_mark(
     word_shown: bool,
 ) -> El {
     let (color, word) = match activity {
-        Activity::Working => (k.c.text_accent, tr(language, "Working", "工作中")),
-        Activity::NeedsYou => (k.c.warning.icon, tr(language, "Needs you", "等你处理")),
-        Activity::Failed => (k.c.danger.icon, tr(language, "Failed", "失败")),
-        Activity::Idle => (k.c.text_faint, tr(language, "Idle", "空闲")),
+        Activity::Working => (k.c.text_accent, tr(language, "Working")),
+        Activity::NeedsYou => (k.c.warning.icon, tr(language, "Needs you")),
+        Activity::Failed => (k.c.danger.icon, tr(language, "Failed")),
+        Activity::Idle => (k.c.text_faint, tr(language, "Idle")),
     };
     let mark = match activity {
         Activity::Working => rune_kit::Spinner::new().size(10.0).color(color).build(k),

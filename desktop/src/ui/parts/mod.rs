@@ -69,9 +69,9 @@ impl<'a> Tcx<'a> {
                 .is_some_and(|i| i.asid == self.asid && i.id == id)
     }
 
-    /// English or 简体中文, by the owner's language.
-    pub fn t(&self, en: &'static str, zh: &'static str) -> &'static str {
-        tr_ref(self.lang, en, zh)
+    /// Localized string for the owner's language.
+    pub fn t(&self, en: &'static str) -> &'static str {
+        tr_ref(self.lang, en)
     }
 
     pub fn zh(&self) -> bool {
@@ -224,12 +224,10 @@ pub fn prose(cx: &Tcx, key: &str, body: &str) -> El {
 }
 
 pub fn more_lines(cx: &Tcx, hidden: usize) -> El {
-    text(if cx.zh() {
-        crate::ui::copy::localize(cx.lang, format!("还有 {hidden} 行"))
-    } else if hidden == 1 {
-        "1 more line".to_string()
+    text(if hidden == 1 {
+        cx.t("1 more line").to_string()
     } else {
-        format!("{hidden} more lines")
+        format!("{hidden} {}", cx.t("more lines"))
     })
     .font(cx.k.ty.small)
     .color(cx.k.c.text_faint)
@@ -448,7 +446,7 @@ impl<'a> ToolCard<'a> {
                 cx,
                 "open",
                 &glyphs::OPEN,
-                cx.t("Open file", "打开文件"),
+                cx.t("Open file"),
                 move |s: &mut UiState, _tx: &mut rune::Tx| s.open_timeline_file(&path),
             ));
         }
@@ -459,7 +457,7 @@ impl<'a> ToolCard<'a> {
                 cx,
                 "diff",
                 &glyphs::DIFF,
-                cx.t("View in Diff", "查看差异"),
+                cx.t("View in Diff"),
                 move |s: &mut UiState, tx: &mut rune::Tx| {
                     s.send(crate::model::commands::Command::OpenDiff {
                         asid: muqun_gateway::agents::AgentSessionId(asid.clone()),
@@ -480,7 +478,7 @@ impl<'a> ToolCard<'a> {
                 cx,
                 "copy",
                 &rune_kit::glyphs::COPY,
-                cx.t("Copy", "复制"),
+                cx.t("Copy"),
                 move |_: &mut UiState, tx: &mut rune::Tx| tx.copy(copy.clone()),
             ));
         }
@@ -514,7 +512,7 @@ impl<'a> ToolCard<'a> {
             .role("button")
             .expanded(open);
         if open_file_on_press {
-            let label = format!("{}: {}", cx.t("Open file", "打开文件"), self.title);
+            let label = format!("{}: {}", cx.t("Open file"), self.title);
             line = line.label(label.clone()).help(label);
         }
         let line = line.on_press_tx(move |s: &mut UiState, tx: &mut rune::Tx| {
@@ -660,7 +658,7 @@ impl<'a> ToolCard<'a> {
             let asid = cx.asid.to_string();
             let p = path.clone();
             actions.push(
-                rune_kit::Button::new(cx.t("View in Diff", "查看差异"))
+                rune_kit::Button::new(cx.t("View in Diff"))
                     .variant(rune_kit::ButtonVariant::Ghost)
                     .control_size(rune_kit::ControlSize::Small)
                     .on_press_tx(move |s: &mut UiState, tx: &mut rune::Tx| {
@@ -855,8 +853,8 @@ fn state_mark(cx: &Tcx, state: CardState) -> El {
         CardState::Failed => icon(&glyphs::DISMISS, 13.0)
             .key("state")
             .color(k.c.danger.icon)
-            .help(cx.t("Failed", "失败")),
-        CardState::Stopped => text(cx.t("Stopped", "已停止"))
+            .help(cx.t("Failed")),
+        CardState::Stopped => text(cx.t("Stopped"))
             .key("state")
             .font(k.ty.small)
             .color(k.c.text_faint)

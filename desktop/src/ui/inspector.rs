@@ -37,11 +37,11 @@ fn small(
 
 fn tab_label(language: Language, en: &'static str) -> &'static str {
     match en {
-        "Queue" => tr_ref(language, "Queue", "队列"),
+        "Queue" => tr_ref(language, "Queue"),
         "Git" => "Git",
-        "Sub-agents" => tr_ref(language, "Sub-agents", "子 Agent"),
-        "Saved" => tr_ref(language, "Saved", "已保存"),
-        "Shells" => tr_ref(language, "Shells", "后台命令"),
+        "Sub-agents" => tr_ref(language, "Sub-agents"),
+        "Saved" => tr_ref(language, "Saved"),
+        "Shells" => tr_ref(language, "Shells"),
         other => other,
     }
 }
@@ -158,7 +158,7 @@ fn heading(k: &Kit, label: &str) -> El {
 
 fn queue(s: &UiState, k: &Kit) -> Vec<El> {
     let language = s.cfg.general.language;
-    let t = |en: &'static str, zh: &'static str| tr_ref(language, en, zh);
+    let t = |en: &'static str| tr_ref(language, en);
     let mut out = Vec::new();
     let asid = s.selected.clone().unwrap_or_default();
     let perms = s
@@ -172,7 +172,7 @@ fn queue(s: &UiState, k: &Kit) -> Vec<El> {
         .map(Vec::as_slice)
         .unwrap_or_default();
     if !perms.is_empty() || !forms.is_empty() {
-        out.push(heading(k, t("Waiting on you", "等你处理")));
+        out.push(heading(k, t("Waiting on you")));
         out.extend(
             perms
                 .iter()
@@ -184,16 +184,13 @@ fn queue(s: &UiState, k: &Kit) -> Vec<El> {
                 .map(|f| timeline::form_card(s, k, f).key(format!("wf-{}", f.id))),
         );
     }
-    out.push(heading(k, t("Queued prompts", "排队的消息")));
+    out.push(heading(k, t("Queued prompts")));
     if s.queue.is_empty() {
         out.push(empty(
             k,
             "queue",
-            t("Nothing queued", "没有排队的消息"),
-            t(
-                "Messages sent while the agent works line up here.",
-                "Agent 工作时发送的消息会在这里排队。",
-            ),
+            t("Nothing queued"),
+            t("Messages sent while the agent works line up here."),
         ));
     }
     for q in &s.queue {
@@ -205,7 +202,7 @@ fn queue(s: &UiState, k: &Kit) -> Vec<El> {
             let (edit_id, text) = (q.id.clone(), q.text.clone());
             action = action.child(small(
                 k,
-                t("Edit", "编辑"),
+                t("Edit"),
                 ButtonVariant::Ghost,
                 format!("ed-{edit_id}"),
                 move |s| {
@@ -217,9 +214,9 @@ fn queue(s: &UiState, k: &Kit) -> Vec<El> {
             .child(small(
                 k,
                 if steer {
-                    t("Keep queued", "保持排队")
+                    t("Keep queued")
                 } else {
-                    t("Send next", "下一个发送")
+                    t("Send next")
                 },
                 ButtonVariant::Ghost,
                 format!("dl-{id}"),
@@ -236,7 +233,7 @@ fn queue(s: &UiState, k: &Kit) -> Vec<El> {
             ))
             .child(small(
                 k,
-                t("Cancel", "取消"),
+                t("Cancel"),
                 ButtonVariant::Ghost,
                 format!("cx-{id2}"),
                 move |s| {
@@ -251,9 +248,9 @@ fn queue(s: &UiState, k: &Kit) -> Vec<El> {
         let detail = format!(
             "{}{}",
             if q.steer {
-                t("sends next", "下一个发送")
+                t("sends next")
             } else {
-                t("queued", "已排队")
+                t("queued")
             },
             if q.files.is_empty() {
                 String::new()
@@ -291,8 +288,8 @@ fn queue(s: &UiState, k: &Kit) -> Vec<El> {
 
 fn git(s: &UiState, k: &Kit) -> Vec<El> {
     let language = s.cfg.general.language;
-    let t = |en: &'static str, zh: &'static str| tr_ref(language, en, zh);
-    let mut out = vec![heading(k, t("Branch", "分支"))];
+    let t = |en: &'static str| tr_ref(language, en);
+    let mut out = vec![heading(k, t("Branch"))];
     let info = s.current();
     let cwd = info.and_then(|i| i.directory.clone());
 
@@ -321,7 +318,7 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
             let cwd_path = cwd.as_ref().map(PathBuf::from);
             out.push(small(
                 k,
-                t("Open in Terminal", "在终端中打开 Git"),
+                t("Open in Terminal"),
                 ButtonVariant::Ghost,
                 "git-open-term".into(),
                 move |s| {
@@ -331,10 +328,7 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
             ));
 
             if let Some(repo_url) = &web_url {
-                out.push(heading(
-                    k,
-                    t("Remote & Pull Request", "远程与 Pull Request"),
-                ));
+                out.push(heading(k, t("Remote & Pull Request")));
                 let host_name = repo_url
                     .strip_prefix("https://")
                     .or_else(|| repo_url.strip_prefix("http://"))
@@ -345,7 +339,7 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
                     let pr_url = format!("{repo_url}/pull/new/{cur_branch}");
                     out.push(small(
                         k,
-                        t("Create Pull Request", "创建 Pull Request"),
+                        t("Create Pull Request"),
                         ButtonVariant::Outline,
                         "git-create-pr".into(),
                         move |_| {
@@ -356,7 +350,7 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
                     let pr_list_url = format!("{repo_url}/pulls");
                     out.push(small(
                         k,
-                        t("View Pull Requests", "查看 Pull Request 列表"),
+                        t("View Pull Requests"),
                         ButtonVariant::Outline,
                         "git-view-prs".into(),
                         move |_| {
@@ -368,7 +362,7 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
                 let repo_view_url = repo_url.clone();
                 out.push(small(
                     k,
-                    t("View on GitHub", "在 GitHub 上查看仓库"),
+                    t("View on GitHub"),
                     ButtonVariant::Ghost,
                     "git-view-repo".into(),
                     move |_| {
@@ -380,23 +374,17 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
         None => out.push(empty(
             k,
             "branch",
-            t("No repository", "没有仓库"),
-            t(
-                "This folder is not a git checkout.",
-                "这个文件夹不是 git 检出。",
-            ),
+            t("No repository"),
+            t("This folder is not a git checkout."),
         )),
     }
-    out.push(heading(k, t("Changes", "变更")));
+    out.push(heading(k, t("Changes")));
     if s.diff_stat.files == 0 {
         out.push(empty(
             k,
             "changes",
-            t("Working tree is clean", "工作区没有改动"),
-            t(
-                "Edits the agent makes show up here.",
-                "Agent 的修改会显示在这里。",
-            ),
+            t("Working tree is clean"),
+            t("Edits the agent makes show up here."),
         ));
     } else {
         out.push(muted(
@@ -411,7 +399,7 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
             let asid = s.selected.clone().unwrap_or_default();
             let diff_btn = small(
                 k,
-                t("Diff", "差异"),
+                t("Diff"),
                 ButtonVariant::Ghost,
                 format!("open-diff-item-{i}"),
                 move |s| {
@@ -464,7 +452,7 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
         }
         out.push(small(
             k,
-            t("View changes", "查看变更"),
+            t("View changes"),
             ButtonVariant::Outline,
             "view-changes".into(),
             |s| {
@@ -473,16 +461,13 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
             },
         ));
     }
-    out.push(heading(k, t("Worktrees", "Worktree")));
+    out.push(heading(k, t("Worktrees")));
     if s.worktrees.is_empty() {
         out.push(empty(
             k,
             "worktrees",
-            t("No linked worktrees", "没有关联的 worktree"),
-            t(
-                "Start a session in a new worktree from Home.",
-                "在首页用新的 worktree 开始一个会话。",
-            ),
+            t("No linked worktrees"),
+            t("Start a session in a new worktree from Home."),
         ));
     }
     let (agent, dir) = info
@@ -493,7 +478,7 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
         let dir_path = PathBuf::from(&w.directory);
         actions = actions.child(small(
             k,
-            t("Terminal", "终端"),
+            t("Terminal"),
             ButtonVariant::Ghost,
             format!("term-wt-{}", w.directory),
             move |s| {
@@ -504,7 +489,7 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
             let (agent, project, worktree) = (agent.clone(), dir.clone(), w.directory.clone());
             actions = actions.child(small(
                 k,
-                t("Remove", "移除"),
+                t("Remove"),
                 ButtonVariant::Ghost,
                 format!("rmw-{}", w.directory),
                 move |s| {
@@ -521,9 +506,7 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
             k,
             format!("wt-{}", w.directory),
             w.directory.clone(),
-            w.strategy
-                .clone()
-                .unwrap_or_else(|| tr(language, "root", "主目录")),
+            w.strategy.clone().unwrap_or_else(|| tr(language, "root")),
             Some(actions),
         ));
     }
@@ -531,7 +514,7 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
         let (agent, directory) = (agent.clone(), dir.clone());
         out.push(small(
             k,
-            t("Rediscover", "重新发现"),
+            t("Rediscover"),
             ButtonVariant::Ghost,
             "wt-refresh".into(),
             move |s| {
@@ -551,12 +534,8 @@ fn subagents(s: &UiState, k: &Kit) -> Vec<El> {
         return vec![empty(
             k,
             "subagents",
-            tr_ref(language, "No sub-agents", "没有子 Agent"),
-            tr_ref(
-                language,
-                "Sessions this one delegates to appear here.",
-                "这个会话委派出去的会话会显示在这里。",
-            ),
+            tr_ref(language, "No sub-agents"),
+            tr_ref(language, "Sessions this one delegates to appear here."),
         )];
     }
     let mut out = Vec::new();
@@ -569,7 +548,7 @@ fn subagents(s: &UiState, k: &Kit) -> Vec<El> {
             .collect();
         let tile_all_btn = small(
             k,
-            tr_ref(language, "Tile all", "全部同屏"),
+            tr_ref(language, "Tile all"),
             ButtonVariant::Outline,
             "tile-all-subagents".into(),
             move |s| {
@@ -588,7 +567,7 @@ fn subagents(s: &UiState, k: &Kit) -> Vec<El> {
                 text(format!(
                     "{} {}",
                     s.descendants.len(),
-                    tr_ref(language, "sub-agents", "个子 Agent")
+                    tr_ref(language, "sub-agents")
                 ))
                 .font(k.ty.ui_medium)
                 .color(k.c.text_base),
@@ -602,9 +581,9 @@ fn subagents(s: &UiState, k: &Kit) -> Vec<El> {
         let asid_split = asid.clone();
         let in_tile = s.tile_of(&asid).is_some();
         let split_label = if in_tile {
-            tr_ref(language, "Tiled", "已分屏")
+            tr_ref(language, "Tiled")
         } else {
-            tr_ref(language, "Split", "分屏")
+            tr_ref(language, "Split")
         };
         let split_btn = small(
             k,
@@ -619,7 +598,7 @@ fn subagents(s: &UiState, k: &Kit) -> Vec<El> {
         );
         let open_btn = small(
             k,
-            tr_ref(language, "Open", "打开"),
+            tr_ref(language, "Open"),
             ButtonVariant::Ghost,
             format!("open-{}", d.asid.0),
             move |s| s.open_session(&asid),
@@ -628,12 +607,12 @@ fn subagents(s: &UiState, k: &Kit) -> Vec<El> {
 
         use muqun_gateway::agents::domain::session::AgentSessionStatus;
         let status_text = match d.status {
-            AgentSessionStatus::Busy => tr_ref(language, "Running", "运行中"),
-            AgentSessionStatus::Idle => tr_ref(language, "Idle", "空闲"),
-            AgentSessionStatus::Retry => tr_ref(language, "Retrying", "重试中"),
-            AgentSessionStatus::Failed => tr_ref(language, "Failed", "失败"),
-            AgentSessionStatus::Interrupted => tr_ref(language, "Stopped", "已停止"),
-            AgentSessionStatus::Unknown => tr_ref(language, "Unknown", "未知"),
+            AgentSessionStatus::Busy => tr_ref(language, "Running"),
+            AgentSessionStatus::Idle => tr_ref(language, "Idle"),
+            AgentSessionStatus::Retry => tr_ref(language, "Retrying"),
+            AgentSessionStatus::Failed => tr_ref(language, "Failed"),
+            AgentSessionStatus::Interrupted => tr_ref(language, "Stopped"),
+            AgentSessionStatus::Unknown => tr_ref(language, "Unknown"),
         };
 
         item(
@@ -653,11 +632,10 @@ fn saved(s: &UiState, k: &Kit) -> Vec<El> {
         return vec![empty(
             k,
             "saved",
-            tr_ref(language, "Nothing remembered", "没有记住的决定"),
+            tr_ref(language, "Nothing remembered"),
             tr_ref(
                 language,
                 "\"Always allow\" answers for this project are kept here.",
-                "这个项目的「始终允许」会记在这里。",
             ),
         )];
     }
@@ -668,7 +646,7 @@ fn saved(s: &UiState, k: &Kit) -> Vec<El> {
             let (id, a) = (p.id.clone(), AgentSessionId(asid.clone()));
             let forget = small(
                 k,
-                tr_ref(language, "Forget", "忘记"),
+                tr_ref(language, "Forget"),
                 ButtonVariant::Ghost,
                 format!("fg-{}", p.id),
                 move |s| {
@@ -701,19 +679,15 @@ fn shells(s: &UiState, k: &Kit) -> Vec<El> {
         out.push(empty(
             k,
             "shells",
-            tr_ref(language, "No background shells", "没有后台命令"),
-            tr_ref(
-                language,
-                "Long commands the agent parks keep running here.",
-                "Agent 放到后台的长命令会在这里继续运行。",
-            ),
+            tr_ref(language, "No background shells"),
+            tr_ref(language, "Long commands the agent parks keep running here."),
         ));
     }
     for sh in &s.shells {
         let (agent, id, dir) = (agent.clone(), sh.id.clone(), dir.clone());
         let kill = small(
             k,
-            tr_ref(language, "Stop", "停止"),
+            tr_ref(language, "Stop"),
             ButtonVariant::Ghost,
             format!("kill-{}", sh.id),
             move |s| {
@@ -739,7 +713,7 @@ fn shells(s: &UiState, k: &Kit) -> Vec<El> {
     if let Some(asid) = s.selected.clone() {
         out.push(small(
             k,
-            tr_ref(language, "Move turn to background", "把当前回合移到后台"),
+            tr_ref(language, "Move turn to background"),
             ButtonVariant::Ghost,
             "background".into(),
             move |s| {
@@ -767,7 +741,7 @@ pub fn view(s: &UiState, k: &Kit) -> El {
     let mut strip = row()
         .key("inspector-tabs")
         .role("tablist")
-        .label(tr_ref(language, "Inspector", "检查器"))
+        .label(tr_ref(language, "Inspector"))
         .w_full()
         .h(TOOLBAR_H)
         .px(8.0)

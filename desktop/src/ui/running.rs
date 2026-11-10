@@ -97,17 +97,17 @@ pub fn elapsed(ms: u64, language: Language) -> String {
     let mins = ms / 60_000;
     let zh = language.is_zh();
     let text = match mins {
-        0 => tr(language, "<1m", "<1 分"),
-        1..=59 => format!("{mins}{}", if zh { " 分" } else { "m" }),
+        0 => tr(language, "<1m"),
+        1..=59 => format!("{mins}m"),
         60..=1439 => {
             let (h, m) = (mins / 60, mins % 60);
             if zh {
-                format!("{h} 小时 {m} 分")
+                format!("{h}h {m}m")
             } else {
                 format!("{h}h {m:02}m")
             }
         }
-        _ => format!("{}{}", mins / 1440, if zh { " 天" } else { "d" }),
+        _ => format!("{}d", mins / 1440),
     };
     localize(language, text)
 }
@@ -141,25 +141,22 @@ fn entry_row(s: &UiState, k: &Kit, e: &Entry<'_>, now: u64) -> El {
         Entry::Task(t) => {
             let mut parts = Vec::new();
             if let Some(m) = &t.machine {
-                parts.push(localize(
-                    language,
-                    tr(language, &format!("on {m}"), &format!("在 {m}")),
-                ));
+                parts.push(localize(language, format!("{} {m}", tr(language, "on"))));
             } else if let Some(a) = &t.agent_id {
                 parts.push(s.agent_name(a));
             }
             match t.progress.as_deref().filter(|p| !p.is_empty()) {
                 Some(p) => parts.push(p.to_string()),
                 None if t.state != "working" && t.state != "waiting" => {
-                    parts.push(tr(language, "Starting…", "启动中…"));
+                    parts.push(tr(language, "Starting…"));
                 }
                 None => {}
             }
             if parts.is_empty() {
                 parts.push(if t.kind == "command" {
-                    tr(language, "Command", "命令")
+                    tr(language, "Command")
                 } else {
-                    tr(language, "Task", "任务")
+                    tr(language, "Task")
                 });
             }
             (
@@ -172,7 +169,7 @@ fn entry_row(s: &UiState, k: &Kit, e: &Entry<'_>, now: u64) -> El {
         }
     };
     if waiting {
-        step = tr(language, "Needs you", "等你处理");
+        step = tr(language, "Needs you");
     }
     let lit = if waiting {
         k.c.warning.icon
@@ -249,7 +246,7 @@ pub fn view(s: &UiState, k: &Kit) -> Option<El> {
         trailing = trailing.child(look.pulse(el().size(6.0, 6.0).radius(3.0).fill(warn)));
     }
     let trailing = trailing.child(chevron);
-    let words = tr_ref(language, "Running", "运行中");
+    let words = tr_ref(language, "Running");
     let head = SidebarRow::new(words)
         .avatar(lead)
         .badge(list.len().to_string())
@@ -267,11 +264,10 @@ pub fn view(s: &UiState, k: &Kit) -> Option<El> {
                 tr(
                     language,
                     &format!("{} running, {waiting} waiting on you", list.len()),
-                    &format!("{} 项运行中，{waiting} 项等你处理", list.len()),
                 ),
             )
         } else {
-            tr(language, "What is executing now", "正在执行的内容")
+            tr(language, "What is executing now")
         });
     let mut block = col().key("running").w_full().child(head);
     if open {
@@ -312,6 +308,6 @@ mod tests {
         ] {
             assert_eq!(elapsed(ms, Language::En), en);
         }
-        assert_eq!(elapsed(65 * 60_000, Language::ZhCn), "1 小时 5 分");
+        assert_eq!(elapsed(65 * 60_000, Language::ZhCn), "1h 5m");
     }
 }

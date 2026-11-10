@@ -500,7 +500,7 @@ pub fn group(s: &UiState, k: &Kit) -> Option<El> {
         .center_y()
         .role("heading")
         .child(
-            text(tr(language, "In messages", "消息中"))
+            text(tr(language, "In messages"))
                 .font(k.ty.text_xsmall_medium)
                 .color(k.c.text_muted),
         );
@@ -524,10 +524,6 @@ pub fn group(s: &UiState, k: &Kit) -> Option<El> {
                     "Indexing… {}/{} sessions, results may be partial",
                     ix.done, ix.total
                 ),
-                &format!(
-                    "正在建立索引… {}/{} 个会话，结果可能不全",
-                    ix.done, ix.total
-                ),
             ))
             .key("search-indexing")
             .font(k.ty.caption())
@@ -540,11 +536,11 @@ pub fn group(s: &UiState, k: &Kit) -> Option<El> {
     }
     if c.hits.is_empty() {
         let words = if c.failed {
-            tr(language, "Couldn't search messages", "无法搜索消息")
+            tr(language, "Couldn't search messages")
         } else if c.pending.is_some() {
-            tr(language, "Searching…", "搜索中…")
+            tr(language, "Searching…")
         } else {
-            tr(language, "No messages match", "没有匹配的消息")
+            tr(language, "No messages match")
         };
         return Some(out.child(note(k, "search-none", words)));
     }
@@ -561,7 +557,7 @@ pub fn group(s: &UiState, k: &Kit) -> Option<El> {
     }
     if c.next_cursor.is_some() {
         out = out.child(
-            Button::new(tr_ref(language, "More results", "更多结果"))
+            Button::new(tr_ref(language, "More results"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
                 .on_press(|s: &mut UiState| s.search_more())
@@ -618,8 +614,8 @@ fn session_block(s: &UiState, k: &Kit, start: usize, end: usize, now: u64) -> El
     for i in start..end {
         let hit = &s.content.hits[i];
         let who = match (hit.kind.as_str(), hit.role.as_str()) {
-            ("tool", _) => tr(language, "Tool call", "工具调用"),
-            (_, "user") => tr(language, "You", "你"),
+            ("tool", _) => tr(language, "Tool call"),
+            (_, "user") => tr(language, "You"),
             _ => s.agent_name(&hit.agent_id),
         };
         let when = ago(hit.time_ms, now, language);
@@ -632,11 +628,7 @@ fn session_block(s: &UiState, k: &Kit, start: usize, end: usize, now: u64) -> El
         if i + 1 == end && more > 0 {
             meta = format!(
                 "{meta} · {}",
-                tr(
-                    language,
-                    &format!("+{more} more in this session"),
-                    &format!("此会话还有 {more} 处"),
-                )
+                tr(language, &format!("+{more} more in this session"))
             );
         }
         let spans = highlight_ranges(&hit.snippet, &hit.highlights)
@@ -741,17 +733,17 @@ mod tests {
     #[test]
     fn utf16_highlights_land_on_rust_char_boundaries() {
         // CJK is one UTF-16 unit and three bytes; the emoji two units, four bytes.
-        let s = "数据库 😀 billing表";
-        // "数据库"
+        let s = "\u{6570}\u{636e}\u{5e93} \u{1f600} billing\u{8868}";
+        // "database"
         assert_eq!(highlight_ranges(s, &[[0, 3]]), vec![(0, 9)]);
-        // "billing" after "数据库 😀 " = 3 + 1 + 2 + 1 = 7 units.
+        // "billing" after "database 😀 " = 7 units.
         let r = highlight_ranges(s, &[[7, 14]]);
         assert_eq!(&s[r[0].0..r[0].1], "billing");
-        // "表", the last character, and an end past the snippet clamps.
+        // "table", the last character.
         let r = highlight_ranges(s, &[[14, 99]]);
-        assert_eq!(&s[r[0].0..r[0].1], "表");
+        assert_eq!(&s[r[0].0..r[0].1], "\u{8868}");
         // Inside the surrogate pair: rounds down to the pair's start.
-        assert_eq!(utf16_to_byte(s, 5), "数据库 ".len());
+        assert_eq!(utf16_to_byte(s, 5), "\u{6570}\u{636e}\u{5e93} ".len());
         // Empty and inverted ranges are dropped.
         assert!(highlight_ranges(s, &[[3, 3], [5, 2]]).is_empty());
     }
@@ -760,7 +752,7 @@ mod tests {
     fn a_single_latin_letter_is_not_searched_but_one_cjk_character_is() {
         assert_eq!(searchable("  "), None);
         assert_eq!(searchable(" a "), None);
-        assert_eq!(searchable("库").as_deref(), Some("库"));
+        assert_eq!(searchable("\u{5e93}").as_deref(), Some("\u{5e93}"));
         assert_eq!(searchable(" ab ").as_deref(), Some("ab"));
         assert_eq!(
             searchable(&"x".repeat(300)).map(|q| q.len()),

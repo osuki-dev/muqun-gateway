@@ -75,20 +75,20 @@ fn search_en(s: &mut UiState) {
 }
 
 fn search_zh(s: &mut UiState) {
-    let t = ["数据库", "迁移"];
+    let t = ["database", "migration"];
     search_scene(
         s,
-        "数据库 迁移",
+        "database migration",
         vec![
-            search_hit("s4", "opencode", "迁移配置加载器", "z1", "user", "text",
-                "把配置从 JSON 迁移到数据库，旧文件保留一个版本 😀 以便回滚。", &t, 4, 120_000),
-            search_hit("s4", "opencode", "迁移配置加载器", "z2", "assistant", "text",
-                "已完成数据库迁移脚本：新增 settings 表，启动时自动迁移旧的 config.json。", &t, 4, 100_000),
+            search_hit("s4", "opencode", "Migration config loader", "z1", "user", "text",
+                "Migrate configuration from JSON to database, keeping a backup for rollback.", &t, 4, 120_000),
+            search_hit("s4", "opencode", "Migration config loader", "z2", "assistant", "text",
+                "Completed database migration script: added settings table, auto-migrating legacy config.json on startup.", &t, 4, 100_000),
             search_hit("s2", "opencode", "Review the release notes", "z3", "assistant", "text",
-                "发布说明里补充一句：首次启动会执行数据库迁移，耗时约几秒。", &t, 1, 2 * 86_400_000),
+                "Added release note: database migration runs on first startup and takes a few seconds.", &t, 1, 2 * 86_400_000),
         ],
     );
-    s.sessions.push(session("s4", "迁移配置加载器", "opencode", "idle", "/home/demo/rune", 120_000));
+    s.sessions.push(session("s4", "Migration config loader", "opencode", "idle", "/home/demo/rune", 120_000));
     s.cfg.general.language = crate::config::Language::ZhCn;
 }
 
@@ -118,7 +118,7 @@ fn search_scenes() -> Vec<Scene> {
             search_scene(s, "kubernetes", Vec::new());
         }),
         ("search-none-zh", |s| {
-            search_scene(s, "部署脚本", Vec::new());
+            search_scene(s, "deploy script", Vec::new());
             s.cfg.general.language = crate::config::Language::ZhCn;
         }),
         // Ctrl+Shift+F: message hits only.

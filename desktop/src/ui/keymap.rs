@@ -18,7 +18,6 @@ use std::sync::OnceLock;
 
 use rune::{KeyEvent, KeyPlatform, Keybind, Tx};
 
-use super::copy::tr;
 use super::{Mode, OpenMenu, UiState};
 use crate::config::Language;
 
@@ -94,16 +93,16 @@ impl Group {
     ];
 
     pub fn title(self, language: Language) -> String {
-        let (en, zh) = match self {
-            Group::Global => ("Global", "全局"),
-            Group::Panels => ("Panels", "面板"),
-            Group::Session => ("Session", "会话"),
-            Group::Timeline => ("Timeline", "时间线"),
-            Group::Split => ("Split view", "分屏"),
-            Group::Terminal => ("Terminal", "终端"),
-            Group::Lists => ("Inbox and Tasks", "收件箱与任务"),
+        let en = match self {
+            Group::Global => "Global",
+            Group::Panels => "Panels",
+            Group::Session => "Session",
+            Group::Timeline => "Timeline",
+            Group::Split => "Split view",
+            Group::Terminal => "Terminal",
+            Group::Lists => "Inbox and Tasks",
         };
-        tr(language, en, zh)
+        crate::ui::copy::t(language, en)
     }
 }
 
@@ -126,16 +125,9 @@ pub struct Entry {
     /// The chords on macOS, where they differ.
     mac: Option<&'static str>,
     pub en: &'static str,
-    pub zh: &'static str,
 }
 
-const fn e(
-    action: Action,
-    group: Group,
-    spec: &'static str,
-    en: &'static str,
-    zh: &'static str,
-) -> Entry {
+const fn e(action: Action, group: Group, spec: &'static str, en: &'static str) -> Entry {
     Entry {
         action,
         group,
@@ -143,7 +135,6 @@ const fn e(
         spec,
         mac: None,
         en,
-        zh,
     }
 }
 
@@ -162,108 +153,74 @@ use Group as G;
 
 /// The keymap. One row per command; its first chord is the one hints show.
 pub static ENTRIES: &[Entry] = &[
-    e(
-        A::Shortcuts,
-        G::Global,
-        "mod+/, ?",
-        "Keyboard shortcuts",
-        "键盘快捷键",
-    ),
+    e(A::Shortcuts, G::Global, "mod+/, ?", "Keyboard shortcuts"),
     e(
         A::Palette,
         G::Global,
         "mod+k, mod+shift+p",
         "Command palette",
-        "命令面板",
     ),
-    e(
-        A::QuickOpen,
-        G::Global,
-        "mod+p",
-        "Go to session…",
-        "跳转到会话…",
-    ),
-    e(A::NewSession, G::Global, "mod+n", "New session", "新建会话"),
-    e(A::Home, G::Global, "mod+shift+h", "Home", "首页"),
-    e(A::Inbox, G::Global, "mod+shift+i", "Inbox", "收件箱"),
-    e(A::Tasks, G::Global, "mod+shift+t", "Tasks", "任务"),
-    e(A::Settings, G::Global, "mod+comma", "Settings", "设置"),
+    e(A::QuickOpen, G::Global, "mod+p", "Go to session…"),
+    e(A::NewSession, G::Global, "mod+n", "New session"),
+    e(A::Home, G::Global, "mod+shift+h", "Home"),
+    e(A::Inbox, G::Global, "mod+shift+i", "Inbox"),
+    e(A::Tasks, G::Global, "mod+shift+t", "Tasks"),
+    e(A::Settings, G::Global, "mod+comma", "Settings"),
     e(
         A::Back,
         G::Global,
         "escape",
         "Close the innermost popup or the search, then back to the session",
-        "关闭最上层弹窗或搜索，再返回会话",
     ),
     e(
         A::ToggleSidebar,
         G::Panels,
         "mod+b",
         "Show or hide the sidebar",
-        "显示或隐藏侧边栏",
     ),
     e(
         A::ToggleTerminal,
         G::Panels,
         "ctrl+`",
         "Show or hide the terminal",
-        "显示或隐藏终端",
     ),
-    e(
-        A::NewShell,
-        G::Panels,
-        "ctrl+shift+`",
-        "New shell",
-        "新的 Shell",
-    ),
+    e(A::NewShell, G::Panels, "ctrl+shift+`", "New shell"),
     e(
         A::ToggleInspector,
         G::Panels,
         "mod+alt+b",
         "Show or hide the inspector or detail pane",
-        "显示或隐藏检查器或详情窗格",
     ),
-    e(
-        A::FocusSearch,
-        G::Panels,
-        "mod+f",
-        "Search sessions",
-        "搜索会话",
-    ),
+    e(A::FocusSearch, G::Panels, "mod+f", "Search sessions"),
     e(
         A::SearchMessages,
         G::Panels,
         "mod+shift+f",
         "Search in messages",
-        "搜索消息内容",
     ),
     e(
         A::ToggleRecentSession,
         G::Panels,
         "ctrl+tab",
         "Toggle recent session",
-        "",
     ),
     e(
         A::PrevSession,
         G::Panels,
         "alt+up",
         "Previous session in the sidebar",
-        "侧边栏上一个会话",
     ),
     e(
         A::NextSession,
         G::Panels,
         "alt+down",
         "Next session in the sidebar",
-        "侧边栏下一个会话",
     ),
     e(
         A::FocusComposer,
         G::Session,
         "mod+l",
         "Focus the message field",
-        "聚焦消息输入框",
     ),
     owned(
         e(
@@ -271,7 +228,6 @@ pub static ENTRIES: &[Entry] = &[
             G::Session,
             "mod+enter",
             "Send (steer while the agent works)",
-            "发送（Agent 工作时插话）",
         ),
         Owner::Composer,
     ),
@@ -281,131 +237,76 @@ pub static ENTRIES: &[Entry] = &[
             G::Session,
             "alt+enter",
             "Queue after the running turn",
-            "排到当前回合之后",
         ),
         Owner::Composer,
     ),
-    e(
-        A::Stop,
-        G::Session,
-        "mod+period",
-        "Stop the agent",
-        "停止 Agent",
-    ),
+    e(A::Stop, G::Session, "mod+period", "Stop the agent"),
     e(
         A::ModelPicker,
         G::Session,
         "mod+shift+m",
         "Choose the model",
-        "选择模型",
     ),
     e(
         A::Dictation,
         G::Session,
         "mod+shift+space",
         "Start or finish dictation",
-        "开始 / 结束语音输入",
     ),
     e(
         A::JumpLatest,
         G::Session,
         "end, mod+end",
         "Jump to the latest message",
-        "跳到最新消息",
     ),
-    e(A::NextRow, G::Timeline, "j", "Next row", "下一行"),
-    e(A::PrevRow, G::Timeline, "k", "Previous row", "上一行"),
-    e(
-        A::ToggleRow,
-        G::Timeline,
-        "space",
-        "Open or fold the row",
-        "展开或折叠该行",
-    ),
-    e(
-        A::OpenRow,
-        G::Timeline,
-        "enter",
-        "Show the row's details",
-        "查看该行详情",
-    ),
-    e(
-        A::NextMessage,
-        G::Timeline,
-        "]",
-        "Next message",
-        "下一条消息",
-    ),
-    e(
-        A::PrevMessage,
-        G::Timeline,
-        "[",
-        "Previous message",
-        "上一条消息",
-    ),
-    e(A::Allow, G::Lists, "a", "Allow", "允许"),
-    e(
-        A::AllowAlways,
-        G::Lists,
-        "shift+a",
-        "Always allow",
-        "始终允许",
-    ),
-    e(A::Deny, G::Lists, "d", "Deny", "拒绝"),
-    e(
-        A::MarkDone,
-        G::Lists,
-        "m",
-        "Mark the paused task done",
-        "将暂停的任务标记完成",
-    ),
+    e(A::NextRow, G::Timeline, "j", "Next row"),
+    e(A::PrevRow, G::Timeline, "k", "Previous row"),
+    e(A::ToggleRow, G::Timeline, "space", "Open or fold the row"),
+    e(A::OpenRow, G::Timeline, "enter", "Show the row's details"),
+    e(A::NextMessage, G::Timeline, "]", "Next message"),
+    e(A::PrevMessage, G::Timeline, "[", "Previous message"),
+    e(A::Allow, G::Lists, "a", "Allow"),
+    e(A::AllowAlways, G::Lists, "shift+a", "Always allow"),
+    e(A::Deny, G::Lists, "d", "Deny"),
+    e(A::MarkDone, G::Lists, "m", "Mark the paused task done"),
     e(
         A::CancelTask,
         G::Lists,
         "x",
         "Cancel the task (press twice)",
-        "取消任务（按两次）",
     ),
     e(
         A::AddSplit,
         G::Split,
         "mod+\\",
         "Add a session to split view",
-        "加入分屏",
     ),
     e(
         A::RemoveSplit,
         G::Split,
         "mod+w",
         "Remove the pane from split view",
-        "把窗格移出分屏",
     ),
     e(
         A::FocusPane,
         G::Split,
         "mod+1, mod+2, mod+3, mod+4",
         "Focus pane 1–4",
-        "聚焦第 1–4 个窗格",
     ),
     e(
         A::FocusPaneToward,
         G::Split,
         "mod+alt+left, mod+alt+right, mod+alt+up, mod+alt+down",
         "Focus the pane that way",
-        "聚焦该方向的窗格",
     ),
     e(
         A::SwapPaneToward,
         G::Split,
         "mod+alt+shift+left, mod+alt+shift+right, mod+alt+shift+up, mod+alt+shift+down",
         "Swap the pane with the one that way",
-        "与该方向的窗格互换",
     ),
     owned(
-        on_mac(
-            e(A::TermCopy, G::Terminal, "ctrl+shift+c", "Copy", "复制"),
-            "mod+c",
-        ),
+        on_mac(e(A::TermCopy, G::Terminal, "ctrl+shift+c", "Copy"), "mod+c"),
         Owner::Terminal,
     ),
     owned(
@@ -415,7 +316,6 @@ pub static ENTRIES: &[Entry] = &[
                 G::Terminal,
                 "ctrl+shift+v, shift+insert",
                 "Paste",
-                "粘贴",
             ),
             "mod+v, shift+insert",
         ),
@@ -447,12 +347,7 @@ impl Entry {
 
     /// What it does, in the owner's language.
     pub fn what(&self, language: Language) -> String {
-        let text = crate::ui::copy::t(language, self.en);
-        if text != self.en || self.zh.is_empty() {
-            text
-        } else {
-            tr(language, self.en, self.zh)
-        }
+        crate::ui::copy::t(language, self.en)
     }
 
     /// Each chord's keycaps on `platform`.

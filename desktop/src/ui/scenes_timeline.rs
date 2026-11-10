@@ -219,7 +219,7 @@ fn timeline_narrow(s: &mut UiState) {
     s.sidebar.set_open(false);
 }
 
-/// The narrow tile in 简体中文.
+/// The narrow tile in Simplified Chinese.
 fn timeline_zh(s: &mut UiState) {
     timeline_narrow(s);
     s.cfg.general.language = crate::config::Language::ZhCn;

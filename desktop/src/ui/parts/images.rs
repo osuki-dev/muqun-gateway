@@ -320,7 +320,7 @@ pub fn zoom_overlay(s: &UiState, k: &Kit) -> Option<El> {
                     .child(icon(&glyphs::CLOSE, 16.0).color(k.c.white)),
             )
             .cursor(Cursor::Pointer)
-            .label(crate::ui::copy::tr_ref(language, "Close", "关闭"))
+            .label(crate::ui::copy::tr_ref(language, "Close"))
             .on_press(close),
         );
     let mut stage = col()

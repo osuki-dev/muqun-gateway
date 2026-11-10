@@ -16,9 +16,9 @@ use crate::ui::UiState;
 
 fn hub_label(language: Language, raw: &str) -> String {
     match raw {
-        "" => tr(language, "Connecting…", "连接中…"),
-        "local gateway" => tr(language, "Local gateway", "本机 Gateway"),
-        "standalone" => tr(language, "Standalone", "独立运行"),
+        "" => tr(language, "Connecting…"),
+        "local gateway" => tr(language, "Local gateway"),
+        "standalone" => tr(language, "Standalone"),
         other => other.to_string(),
     }
 }
@@ -72,7 +72,6 @@ fn hero(s: &UiState, k: &Kit) -> El {
                     text(tr(
                         language,
                         "Coding agents on this computer, at your desk.",
-                        "在桌面上使用这台电脑上的编程 Agents。",
                     ))
                     .font(k.ty.ui)
                     .color(k.c.text_muted)
@@ -81,7 +80,7 @@ fn hero(s: &UiState, k: &Kit) -> El {
                 .child(
                     text(format!(
                         "{} {} · {build} · rune {}",
-                        tr_ref(language, "Version", "版本"),
+                        tr_ref(language, "Version"),
                         env!("CARGO_PKG_VERSION"),
                         crate::branding::RUNE_REV
                     ))
@@ -151,7 +150,7 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
     let repo = env!("CARGO_PKG_REPOSITORY");
     let update_row = match &s.update_state {
         UpdateState::Idle => {
-            let btn = Button::new(tr_ref(language, "Check for updates", "检查更新"))
+            let btn = Button::new(tr_ref(language, "Check for updates"))
                 .variant(ButtonVariant::Neutral)
                 .control_size(ControlSize::Small)
                 .on_press(|s: &mut UiState| {
@@ -163,17 +162,13 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
             row(
                 k,
                 "update-check",
-                tr_ref(language, "Software updates", "软件更新"),
-                tr_ref(
-                    language,
-                    "Check official releases for updates.",
-                    "检查官方版本的更新。",
-                ),
+                tr_ref(language, "Software updates"),
+                tr_ref(language, "Check official releases for updates."),
                 btn,
             )
         }
         UpdateState::Checking => {
-            let btn = Button::new(tr_ref(language, "Checking…", "正在检查…"))
+            let btn = Button::new(tr_ref(language, "Checking…"))
                 .variant(ButtonVariant::Neutral)
                 .control_size(ControlSize::Small)
                 .disabled(true)
@@ -181,17 +176,13 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
             row(
                 k,
                 "update-check",
-                tr_ref(language, "Software updates", "软件更新"),
-                tr_ref(
-                    language,
-                    "Querying GitHub Releases…",
-                    "正在查询 GitHub Releases…",
-                ),
+                tr_ref(language, "Software updates"),
+                tr_ref(language, "Querying GitHub Releases…"),
                 btn,
             )
         }
         UpdateState::UpToDate => {
-            let btn = Button::new(tr_ref(language, "Check again", "重新检查"))
+            let btn = Button::new(tr_ref(language, "Check again"))
                 .variant(ButtonVariant::Neutral)
                 .control_size(ControlSize::Small)
                 .on_press(|s: &mut UiState| {
@@ -200,21 +191,17 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                     });
                 })
                 .build(k);
-            let detail = tr(
-                language,
-                "You are using the latest version.",
-                "当前已是最新版本。",
-            );
+            let detail = tr(language, "You are using the latest version.");
             row(
                 k,
                 "update-check",
-                tr_ref(language, "Software updates", "软件更新"),
+                tr_ref(language, "Software updates"),
                 &detail,
                 hrow()
                     .gap(8.0)
                     .center_y()
                     .child(
-                        text(tr_ref(language, "Up to date", "已是最新"))
+                        text(tr_ref(language, "Up to date"))
                             .font(k.ty.small)
                             .color(k.c.success.icon),
                     )
@@ -224,32 +211,24 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
         UpdateState::Available(info) => {
             let latest = info.latest_version.clone();
             let to_install = info.clone();
-            let btn = Button::new(format!(
-                "{} {}",
-                tr_ref(language, "Update to", "更新至"),
-                latest
-            ))
-            .variant(ButtonVariant::Submit)
-            .control_size(ControlSize::Small)
-            .on_press(move |s: &mut UiState| {
-                s.send(Command::InstallUpdate(to_install.clone()));
-            })
-            .build(k);
-            let detail = format!(
-                "{} {}",
-                tr_ref(language, "New version available:", "发现新版本："),
-                latest
-            );
+            let btn = Button::new(format!("{} {}", tr_ref(language, "Update to"), latest))
+                .variant(ButtonVariant::Submit)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut UiState| {
+                    s.send(Command::InstallUpdate(to_install.clone()));
+                })
+                .build(k);
+            let detail = format!("{} {}", tr_ref(language, "New version available:"), latest);
             row(
                 k,
                 "update-check",
-                tr_ref(language, "Software updates", "软件更新"),
+                tr_ref(language, "Software updates"),
                 &detail,
                 btn,
             )
         }
         UpdateState::Downloading => {
-            let btn = Button::new(tr_ref(language, "Downloading…", "正在下载…"))
+            let btn = Button::new(tr_ref(language, "Downloading…"))
                 .variant(ButtonVariant::Neutral)
                 .control_size(ControlSize::Small)
                 .disabled(true)
@@ -257,17 +236,13 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
             row(
                 k,
                 "update-check",
-                tr_ref(language, "Software updates", "软件更新"),
-                tr_ref(
-                    language,
-                    "Downloading and verifying update…",
-                    "正在下载并校验安装包…",
-                ),
+                tr_ref(language, "Software updates"),
+                tr_ref(language, "Downloading and verifying update…"),
                 btn,
             )
         }
         UpdateState::ReadyToRestart => {
-            let btn = Button::new(tr_ref(language, "Restart now", "立即重启"))
+            let btn = Button::new(tr_ref(language, "Restart now"))
                 .variant(ButtonVariant::Submit)
                 .control_size(ControlSize::Small)
                 .on_press(|_: &mut UiState| {
@@ -277,18 +252,17 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
             row(
                 k,
                 "update-check",
-                tr_ref(language, "Software updates", "软件更新"),
+                tr_ref(language, "Software updates"),
                 tr_ref(
                     language,
                     "Update installed. Restart application to complete.",
-                    "更新已安装完毕，重启后生效。",
                 ),
                 btn,
             )
         }
         UpdateState::Failed(err) => {
             let err_msg = err.clone();
-            let btn = Button::new(tr_ref(language, "Retry", "重试"))
+            let btn = Button::new(tr_ref(language, "Retry"))
                 .variant(ButtonVariant::Neutral)
                 .control_size(ControlSize::Small)
                 .on_press(|s: &mut UiState| {
@@ -300,12 +274,8 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
             row(
                 k,
                 "update-check",
-                tr_ref(language, "Software updates", "软件更新"),
-                &format!(
-                    "{}: {}",
-                    tr_ref(language, "Check failed", "检查更新失败"),
-                    err_msg
-                ),
+                tr_ref(language, "Software updates"),
+                &format!("{}: {}", tr_ref(language, "Check failed"), err_msg),
                 btn,
             )
         }
@@ -315,37 +285,35 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
         group(
             k,
             "about-updates",
-            tr_ref(language, "Updates", "软件更新"),
+            tr_ref(language, "Updates"),
             vec![update_row],
         ),
         group(
             k,
             "about-status",
-            tr_ref(language, "This window", "当前窗口"),
+            tr_ref(language, "This window"),
             vec![
                 row(
                     k,
                     "hub-mode",
-                    tr_ref(language, "Connection", "连接"),
+                    tr_ref(language, "Connection"),
                     match s.hub_label.as_str() {
                         "local gateway" => tr_ref(
                             language,
-                            "Sessions come from the Muqun gateway on this computer; your phone sees the same ones.",
-                            "会话来自这台电脑上的 Muqun Gateway，手机看到的是同一批。",
+                            "Sessions come from the Muqun gateway on this computer; your phone sees the same ones."
                         ),
                         "standalone" => tr_ref(
                             language,
-                            "No gateway is running; this window talks to the agents directly.",
-                            "没有运行中的 Gateway，此窗口直接连接各 Agent。",
+                            "No gateway is running; this window talks to the agents directly."
                         ),
-                        _ => tr_ref(language, "How this window reaches the agents.", "当前窗口连接 Agents 的方式。"),
+                        _ => tr_ref(language, "How this window reaches the agents."),
                     },
                     hub,
                 ),
                 row(
                     k,
                     "theme-about",
-                    tr_ref(language, "Theme", "主题"),
+                    tr_ref(language, "Theme"),
                     "",
                     text(theme_name).font(k.ty.ui).color(k.c.text_base),
                 ),
@@ -354,47 +322,46 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
         group(
             k,
             "about-links",
-            tr_ref(language, "Links", "链接"),
+            tr_ref(language, "Links"),
             vec![
                 row(
                     k,
                     "link-site",
-                    tr_ref(language, "Website", "官网"),
+                    tr_ref(language, "Website"),
                     "muqun.dev",
-                    link_button(k, "about-site", tr_ref(language, "Open", "打开"), "https://muqun.dev"),
+                    link_button(k, "about-site", tr_ref(language, "Open"), "https://muqun.dev"),
                 ),
                 row(
                     k,
                     "link-themes",
-                    tr_ref(language, "Theme gallery", "主题图库"),
+                    tr_ref(language, "Theme gallery"),
                     "muqun.dev/themes",
                     link_button(
                         k,
                         "about-themes",
-                        tr_ref(language, "Open", "打开"),
+                        tr_ref(language, "Open"),
                         "https://muqun.dev/themes",
                     ),
                 ),
                 row(
                     k,
                     "link-repo",
-                    tr_ref(language, "Source code", "源码"),
+                    tr_ref(language, "Source code"),
                     repo.trim_start_matches("https://"),
-                    link_button(k, "about-repo", tr_ref(language, "Open", "打开"), repo),
+                    link_button(k, "about-repo", tr_ref(language, "Open"), repo),
                 ),
                 row(
                     k,
                     "link-issues",
-                    tr_ref(language, "Report an issue", "反馈问题"),
+                    tr_ref(language, "Report an issue"),
                     tr_ref(
                         language,
-                        "Tell us what went wrong, or what you'd like.",
-                        "告诉我们哪里出了问题，或你想要什么。",
+                        "Tell us what went wrong, or what you'd like."
                     ),
                     link_button(
                         k,
                         "about-issues",
-                        tr_ref(language, "Open", "打开"),
+                        tr_ref(language, "Open"),
                         concat!(env!("CARGO_PKG_REPOSITORY"), "/issues"),
                     ),
                 ),
@@ -403,7 +370,7 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
         group(
             k,
             "about-licenses",
-            tr_ref(language, "Open source", "开源许可"),
+            tr_ref(language, "Open source"),
             vec![
                 license_row(
                     k,
@@ -411,8 +378,7 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                     "Apache-2.0",
                     tr_ref(
                         language,
-                        "This app, and the gateway it embeds.",
-                        "本应用及其内嵌的 Gateway。",
+                        "This app, and the gateway it embeds."
                     ),
                 ),
                 license_row(
@@ -421,8 +387,7 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                     "MIT",
                     tr_ref(
                         language,
-                        "The UI framework, components and GPU effects.",
-                        "UI 框架、组件与 GPU 特效。",
+                        "The UI framework, components and GPU effects."
                     ),
                 ),
                 license_row(
@@ -431,18 +396,16 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                     "Apache-2.0",
                     tr_ref(
                         language,
-                        "The Simplified to Traditional Chinese table.",
-                        "简繁转换字表。",
+                        "The Simplified to Traditional Chinese table."
                     ),
                 ),
                 license_row(
                     k,
-                    tr_ref(language, "Built-in themes", "内置主题"),
+                    tr_ref(language, "Built-in themes"),
                     "CC0-1.0",
                     tr_ref(
                         language,
-                        "Six theme packs and their artwork.",
-                        "六套内置主题及其插图。",
+                        "Six theme packs and their artwork."
                     ),
                 ),
                 license_row(
@@ -451,8 +414,7 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                     "OFL-1.1",
                     tr_ref(
                         language,
-                        "Fonts the UI asks the system for; not bundled.",
-                        "UI 向系统请求的字体，未打包。",
+                        "Fonts the UI asks the system for; not bundled."
                     ),
                 ),
             ],
@@ -460,18 +422,18 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
         group(
             k,
             "about-paths",
-            tr_ref(language, "Files", "文件位置"),
+            tr_ref(language, "Files"),
             vec![
                 path_row(
                     k,
                     "config",
-                    tr_ref(language, "Settings", "设置"),
+                    tr_ref(language, "Settings"),
                     config.display().to_string(),
                 ),
                 path_row(
                     k,
                     "state",
-                    tr_ref(language, "Sessions and cache", "会话与缓存"),
+                    tr_ref(language, "Sessions and cache"),
                     state.display().to_string(),
                 ),
             ],

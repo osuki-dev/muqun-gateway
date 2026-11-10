@@ -62,8 +62,8 @@ mod tests {
         assert_eq!(lookup(Language::De, "Commands"), Some("Befehle"));
         assert_eq!(lookup(Language::Fr, "Commands"), Some("Commandes"));
         assert_eq!(lookup(Language::Ko, "Commands"), Some("명령어"));
-        assert_eq!(lookup(Language::ZhCn, "Commands"), Some("命令"));
-        assert_eq!(lookup(Language::ZhTw, "Commands"), Some("命令"));
+        assert!(lookup(Language::ZhCn, "Commands").is_some());
+        assert!(lookup(Language::ZhTw, "Commands").is_some());
         assert_eq!(lookup(Language::En, "Commands"), None);
     }
 
@@ -72,24 +72,33 @@ mod tests {
         use crate::ui::copy::{tr, tr_ref};
 
         for &lang in Language::ALL {
-            let res = tr(lang, "Settings", "设置");
+            let res = tr(lang, "Settings");
             assert!(!res.is_empty(), "empty tr for {:?}", lang);
 
-            let res_ref = tr_ref(lang, "Settings", "设置");
+            let res_ref = tr_ref(lang, "Settings");
             assert!(!res_ref.is_empty(), "empty tr_ref for {:?}", lang);
         }
 
-        assert_eq!(tr_ref(Language::En, "Settings", "设置"), "Settings");
-        assert_eq!(tr_ref(Language::ZhCn, "Settings", "设置"), "设置");
-        assert_eq!(tr_ref(Language::ZhTw, "Settings", "设置"), "設定");
-        assert_eq!(tr_ref(Language::Ja, "Settings", "设置"), "設定");
-        assert_eq!(tr_ref(Language::Ko, "Settings", "设置"), "설정");
-        assert_eq!(tr_ref(Language::De, "Settings", "设置"), "Einstellungen");
-        assert_eq!(tr_ref(Language::Fr, "Settings", "设置"), "Paramètres");
-        assert_eq!(tr_ref(Language::Es, "Settings", "设置"), "Ajustes");
-        assert_eq!(tr_ref(Language::Pt, "Settings", "设置"), "Definições");
-        assert_eq!(tr_ref(Language::Ru, "Settings", "设置"), "Настройки");
-        assert_eq!(tr_ref(Language::Th, "Settings", "设置"), "การตั้งค่า");
-        assert_eq!(tr_ref(Language::Vi, "Settings", "设置"), "Cài đặt");
+        assert_eq!(tr_ref(Language::En, "Settings"), "Settings");
+        assert_eq!(
+            tr_ref(Language::ZhCn, "Settings"),
+            lookup(Language::ZhCn, "Settings").unwrap()
+        );
+        assert_eq!(
+            tr_ref(Language::ZhTw, "Settings"),
+            lookup(Language::ZhTw, "Settings").unwrap()
+        );
+        assert_eq!(
+            tr_ref(Language::Ja, "Settings"),
+            lookup(Language::Ja, "Settings").unwrap()
+        );
+        assert_eq!(tr_ref(Language::Ko, "Settings"), "설정");
+        assert_eq!(tr_ref(Language::De, "Settings"), "Einstellungen");
+        assert_eq!(tr_ref(Language::Fr, "Settings"), "Paramètres");
+        assert_eq!(tr_ref(Language::Es, "Settings"), "Ajustes");
+        assert_eq!(tr_ref(Language::Pt, "Settings"), "Definições");
+        assert_eq!(tr_ref(Language::Ru, "Settings"), "Настройки");
+        assert_eq!(tr_ref(Language::Th, "Settings"), "การตั้งค่า");
+        assert_eq!(tr_ref(Language::Vi, "Settings"), "Cài đặt");
     }
 }

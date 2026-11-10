@@ -94,13 +94,13 @@ impl UiState {
 
 fn header(s: &UiState, k: &Kit, sheet: &DetailSheet, asid: &str) -> El {
     let language = s.cfg.general.language;
-    let t = |en, zh| tr_ref(language, en, zh);
+    let t = |en| tr_ref(language, en);
     let info = s.session_by_id(asid);
     let title = info
         .map(|i| i.title.trim().to_string())
         .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| t("Subagent", "子代理").to_string());
-    let mut facts = vec![t("Subagent", "子代理").to_string()];
+        .unwrap_or_else(|| t("Subagent").to_string());
+    let mut facts = vec![t("Subagent").to_string()];
     if let Some(i) = info {
         if let Some(role) = i.agent_role.as_ref().or(i.agent_name.as_ref()) {
             facts.push(role.clone());
@@ -130,7 +130,7 @@ fn header(s: &UiState, k: &Kit, sheet: &DetailSheet, asid: &str) -> El {
         .center_y();
     if sheet.stack.len() > 1 {
         bar = bar.child(
-            Button::new(t("Back", "返回"))
+            Button::new(t("Back"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
                 .on_press(|s: &mut UiState| s.detail_back())
@@ -160,7 +160,7 @@ fn header(s: &UiState, k: &Kit, sheet: &DetailSheet, asid: &str) -> El {
     );
     let (refresh, open) = (asid.to_string(), asid.to_string());
     bar.child(
-        Button::new(t("Refresh", "刷新"))
+        Button::new(t("Refresh"))
             .variant(ButtonVariant::Ghost)
             .control_size(ControlSize::Small)
             .on_press(move |s: &mut UiState| s.open_detail(&refresh))
@@ -168,7 +168,7 @@ fn header(s: &UiState, k: &Kit, sheet: &DetailSheet, asid: &str) -> El {
             .key("detail-refresh"),
     )
     .child(
-        Button::new(t("Open session", "打开会话"))
+        Button::new(t("Open session"))
             .variant(ButtonVariant::Outline)
             .control_size(ControlSize::Small)
             .on_press(move |s: &mut UiState| {
@@ -188,7 +188,7 @@ fn header(s: &UiState, k: &Kit, sheet: &DetailSheet, asid: &str) -> El {
                 .child(icon(&glyphs::CLOSE, 14.0).color(k.c.icon_muted)),
         )
         .cursor(Cursor::Pointer)
-        .label(t("Close", "关闭"))
+        .label(t("Close"))
         .on_press(|s: &mut UiState| s.close_detail()),
     )
 }
@@ -207,17 +207,13 @@ pub fn sheet(s: &UiState, k: &Kit) -> Option<El> {
             .center()
             .gap(10.0)
             .child(
-                text(tr_ref(
-                    language,
-                    "Could not load the session",
-                    "无法载入会话",
-                ))
-                .font(k.ty.ui_medium)
-                .color(k.c.text_base),
+                text(tr_ref(language, "Could not load the session"))
+                    .font(k.ty.ui_medium)
+                    .color(k.c.text_base),
             )
             .child(crate::ui::muted(k, err.clone()))
             .child(
-                Button::new(tr_ref(language, "Try again", "重试"))
+                Button::new(tr_ref(language, "Try again"))
                     .variant(ButtonVariant::Outline)
                     .control_size(ControlSize::Small)
                     .on_press(move |s: &mut UiState| s.open_detail(&retry))
