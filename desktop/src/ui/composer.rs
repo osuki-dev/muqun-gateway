@@ -26,7 +26,7 @@ const CHIP_THUMB_H: f32 = 40.0;
 /// list scrolls, as `/` and `$` (uncapped, as the App) do.
 const MAX_FILE_ROWS: usize = 20;
 
-fn fresh(text: String) -> TextEdit {
+pub(crate) fn fresh(text: String) -> TextEdit {
     let mut edit = TextEdit::new(text);
     edit.focused = true;
     edit

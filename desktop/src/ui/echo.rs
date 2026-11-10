@@ -277,6 +277,34 @@ impl UiState {
         }
     }
 
+    /// Pull a steered echo back into the composer draft for editing before the agent reads it.
+    pub fn edit_steered_echo(&mut self, asid: &str, token: u64, inbox_id: &str, text: String) {
+        if !inbox_id.is_empty() {
+            self.send(Command::Compose(ComposeCommand::InboxCancel {
+                asid: AgentSessionId(asid.to_string()),
+                item: inbox_id.to_string(),
+            }));
+            self.queue.retain(|q| q.id != inbox_id);
+        }
+        self.discard_echo(asid, token);
+        let len = text.len();
+        self.draft = super::composer::fresh(text);
+        self.draft.set_caret(len);
+        self.persist_draft(super::Slot::Session);
+    }
+
+    /// Cancel a steered echo before the agent reads it.
+    pub fn cancel_steered_echo(&mut self, asid: &str, token: u64, inbox_id: &str) {
+        if !inbox_id.is_empty() {
+            self.send(Command::Compose(ComposeCommand::InboxCancel {
+                asid: AgentSessionId(asid.to_string()),
+                item: inbox_id.to_string(),
+            }));
+            self.queue.retain(|q| q.id != inbox_id);
+        }
+        self.discard_echo(asid, token);
+    }
+
     /// Before each frame: let go of delivered echoes whose row never came.
     pub fn poll_echoes(&mut self, tx: &mut rune::Tx) -> bool {
         let busy: HashSet<String> = self
@@ -352,10 +380,47 @@ pub fn view(cx: &Tcx, echo: &Echo) -> El {
                 .child(Spinner::new().size(10.0).build(k).key("echo-spin"))
                 .child(note(cx.t("Sending…"), k.c.text_faint)),
         ),
-        EchoState::Sent if echo.inbox.is_some() => Some(row().child(note(
-            cx.t("Steered · the agent reads it at its next step"),
-            k.c.text_faint,
-        ))),
+        EchoState::Sent if echo.inbox.is_some() => {
+            let asid = cx.asid.to_string();
+            let token = echo.token;
+            let inbox_id = echo.inbox.clone().unwrap_or_default();
+            let text = echo.text.clone();
+            let mut status_row = row().gap(6.0).center_y().child(note(
+                cx.t("Steered · the agent reads it at its next step"),
+                k.c.text_faint,
+            ));
+            if echo.files.is_empty() {
+                let edit_asid = asid.clone();
+                let edit_inbox_id = inbox_id.clone();
+                let edit_text = text;
+                status_row = status_row.child(
+                    Button::new(cx.t("Edit"))
+                        .variant(ButtonVariant::Ghost)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut UiState| {
+                            s.edit_steered_echo(
+                                &edit_asid,
+                                token,
+                                &edit_inbox_id,
+                                edit_text.clone(),
+                            );
+                        })
+                        .build(k)
+                        .key(format!("echo-edit-{token}")),
+                );
+            }
+            status_row = status_row.child(
+                Button::new(cx.t("Cancel"))
+                    .variant(ButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
+                    .on_press(move |s: &mut UiState| {
+                        s.cancel_steered_echo(&asid, token, &inbox_id);
+                    })
+                    .build(k)
+                    .key(format!("echo-cancel-{token}")),
+            );
+            Some(status_row)
+        }
         EchoState::Sent => None,
         EchoState::Failed => {
             let asid = cx.asid.to_string();
@@ -494,5 +559,40 @@ mod tests {
         assert!(reconcile(&mut echoes, &[user("u3", "stop and explain")]));
         assert_eq!(echoes.len(), 1);
         assert_eq!(echoes[0].state, EchoState::Failed);
+    }
+
+    #[test]
+    fn edit_and_cancel_steered_echo_restores_draft_or_discards() {
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.selected = Some("s1".into());
+        let token = 42;
+        s.echo_sent("s1", token, "typo in my prompt".into(), &[], true);
+        s.queue.push(steer("inbox-1", "typo in my prompt"));
+        s.echo_inbox("s1", &s.queue.clone());
+        assert_eq!(s.echoes_of("s1")[0].inbox.as_deref(), Some("inbox-1"));
+
+        // User edits the steered echo
+        s.edit_steered_echo("s1", token, "inbox-1", "typo in my prompt".into());
+
+        // Echo is removed and draft is restored with the text
+        assert!(s.echoes_of("s1").is_empty());
+        assert_eq!(s.draft.text, "typo in my prompt");
+        assert!(s.draft.focused);
+        assert!(s.queue.is_empty());
+
+        // Gateway received InboxCancel command
+        let mut found = false;
+        while let Ok(cmd) = rx.try_recv() {
+            if matches!(
+                cmd,
+                Command::Compose(ComposeCommand::InboxCancel { asid, item })
+                    if asid.0 == "s1" && item == "inbox-1"
+            ) {
+                found = true;
+                break;
+            }
+        }
+        assert!(found);
     }
 }
