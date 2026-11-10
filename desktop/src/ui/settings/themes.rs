@@ -711,7 +711,9 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                             Button::new(tr_ref(language, "Show more", "显示更多"))
                                 .variant(ButtonVariant::Ghost)
                                 .control_size(ControlSize::Regular)
-                                .on_press(|s: &mut UiState| s.gallery_limit += 8)
+                                .on_press(|s: &mut UiState| {
+                                    s.gallery_limit += super::super::GALLERY_PAGE
+                                })
                                 .build(k)
                                 .key("gallery-more"),
                         ),

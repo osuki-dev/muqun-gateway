@@ -112,7 +112,7 @@ pub struct ToastItem {
 const MAX_TOASTS: usize = 3;
 
 /// How many gallery themes the Themes tab lists before "Show more".
-const GALLERY_PAGE: usize = 8;
+pub(crate) const GALLERY_PAGE: usize = 36;
 
 /// A pane's grip or toggle was touched: the width may have changed and
 /// [`UiState::persist_layout`] should look (set from the pane access
