@@ -269,7 +269,8 @@ fn start_core(
         .spawn(move || {
             runtime.block_on(async move {
                 let hub = select_hub(settings, &state_dir).await;
-                projection::spawn(hub, inbox, store, commands);
+                let dynamic_hub = hub::DynamicHub::new(hub);
+                projection::spawn(dynamic_hub, inbox, store, commands);
                 std::future::pending::<()>().await;
             });
         })?;

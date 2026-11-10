@@ -6,6 +6,7 @@
 //! plane in this process; a `RemoteHub` over the App's HTTP contract can
 //! implement the same trait later without the UI changing.
 
+mod dynamic;
 mod local;
 mod remote;
 
@@ -23,8 +24,9 @@ use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 use muqun_gateway::platform::StoredUpload;
 use tokio::sync::broadcast;
 
+pub use dynamic::DynamicHub;
 pub use local::LocalHub;
-pub use remote::{discover_local_gateway, RemoteHub};
+pub use remote::{discover_local_gateway, LocalGateway, RemoteHub};
 
 /// The agent a fresh install suggests first.
 pub const OPENCODE: &str = "opencode";

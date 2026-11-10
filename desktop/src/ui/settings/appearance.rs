@@ -43,6 +43,13 @@ fn banner(s: &UiState, k: &Kit) -> El {
                 .pin(None, None, Some(16.0), Some(0.0))
         });
     }
+    let curr_comp = s.current_computer();
+    let comp_name = s.computer_name(curr_comp);
+    let theme_tag = format!(
+        "{} · {}",
+        tr(language, "Theme", "主题").to_uppercase(),
+        comp_name
+    );
     let copy = col()
         .key("theme-banner-copy")
         .h_full()
@@ -60,7 +67,7 @@ fn banner(s: &UiState, k: &Kit) -> El {
             ],
         )
         .child(
-            text(tr(language, "Current theme", "当前主题").to_uppercase())
+            text(theme_tag)
                 .font(rune::TextStyle {
                     tracking: 1.2,
                     ..k.ty.small_medium

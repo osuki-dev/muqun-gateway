@@ -16,7 +16,7 @@ use rune_kit::{
 };
 
 use super::{row, status, Tone};
-use crate::config::Language;
+use crate::config::{ConfigEdit, Language};
 use crate::model::commands::Command;
 use crate::theme::gallery::IndexEntry;
 use crate::theme::service::Job;
@@ -297,6 +297,11 @@ fn library_tile(s: &UiState, k: &Kit, entry: &ThemeEntry, w: f32) -> El {
             current,
             apply: (!current).then(|| {
                 Box::new(move |s: &mut UiState| {
+                    let comp = s.current_computer().to_string();
+                    s.edit(ConfigEdit::ComputerTheme {
+                        computer: comp,
+                        theme_id: apply_id.clone(),
+                    });
                     s.send(Command::ThemeApply(apply_id.clone(), scheme))
                 }) as Apply
             }),

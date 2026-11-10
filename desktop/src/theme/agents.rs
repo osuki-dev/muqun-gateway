@@ -60,6 +60,37 @@ pub fn brand(agent: &str, dark: bool) -> Color {
         .unwrap_or(Color::WHITE)
 }
 
+/// Known computer identities and their distinct accent hues (sRGB hex).
+const COMPUTERS: [(&str, u32); 6] = [
+    ("local", 0x4F6BFE),  // Indigo / Blue for local workstation
+    ("self", 0x4F6BFE),   // Same for self
+    ("mini", 0x10A37F),   // Emerald / Jade for Mac mini
+    ("server", 0xF59E0B), // Amber for server
+    ("cloud", 0x06B6D4),  // Cyan
+    ("remote", 0x8B5CF6), // Violet
+];
+
+/// The distinct accent colour for a computer/machine in dark or light scheme.
+pub fn computer_color(name_or_id: &str, dark: bool) -> Color {
+    let lower = name_or_id.to_lowercase();
+    let base = COMPUTERS
+        .iter()
+        .find(|(id, _)| lower == *id || lower.contains(*id))
+        .map(|(_, c)| *c)
+        .unwrap_or_else(|| {
+            // Stable hash to pick one of the computer hues
+            let hash = lower
+                .bytes()
+                .fold(0u32, |acc, b| acc.wrapping_add(b as u32));
+            let hues = [0x4F6BFE, 0x10A37F, 0xF59E0B, 0x06B6D4, 0x8B5CF6, 0xEC4899];
+            hues[(hash as usize) % hues.len()]
+        });
+    let (r, g, b) = adapt(base, dark);
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    rune::color::hex(&format!("#{:02x}{:02x}{:02x}", byte(r), byte(g), byte(b)))
+        .unwrap_or(Color::WHITE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +138,18 @@ mod tests {
     #[test]
     fn an_unknown_agent_gets_the_neutral() {
         assert_eq!(brand("nobody", true), brand("other", true));
+    }
+
+    #[test]
+    fn computer_colors_are_opaque_and_distinct() {
+        for name in ["local", "self", "mini", "server", "remote-gpu", "other-box"] {
+            for dark in [false, true] {
+                let c = computer_color(name, dark);
+                assert_eq!(c.a, 1.0);
+            }
+        }
+        let local = computer_color("local", true);
+        let mini = computer_color("mini", true);
+        assert_ne!(local, mini);
     }
 }

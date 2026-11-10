@@ -97,7 +97,7 @@ fn set_field(s: &mut UiState, agent: &str, field: Field, value: String) {
 fn agent_field(s: &UiState, k: &Kit, layer: &mut Vec<El>, agent: &str, field: Field) -> El {
     let language = s.cfg.general.language;
     let slot = format!("{agent}.{}", field.key());
-    let stored = s.cfg.agents.value(agent, field);
+    let stored = s.cfg.agents_for(s.current_computer()).value(agent, field);
     let (title, detail) = words(language, field);
     let (a, f) = (agent.to_string(), field);
     let control = match field.kind() {
@@ -128,7 +128,7 @@ fn agent_field(s: &UiState, k: &Kit, layer: &mut Vec<El>, agent: &str, field: Fi
                 })
                 .invalid(s.agent_errors.contains_key(&slot))
                 .on_edit(move |s: &mut UiState| {
-                    let stored = s.cfg.agents.value(&agent_in, f);
+                    let stored = s.cfg.agents_for(s.current_computer()).value(&agent_in, f);
                     s.agent_inputs
                         .entry(key_in.clone())
                         .or_insert_with(|| TextEdit::new(stored))
@@ -248,33 +248,103 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
             ),
         )];
     }
-    crate::ui::agents::by_standing(&s.agents)
-        .into_iter()
-        .map(|(a, standing)| {
-            let mut rows: Vec<El> = Vec::new();
-            if let Some(reason) = &a.reason {
-                rows.push(el().key("reason").w_full().py(10.0).child(status(
-                    k,
-                    "reason",
-                    Tone::Quiet,
-                    reason.clone(),
-                )));
-            }
-            for f in fields(&a.id) {
-                rows.push(agent_field(s, k, layer, &a.id, *f));
-            }
-            let enabled = s.cfg.agents.enabled(&a.id);
-            let group = group_with(
-                k,
-                &format!("agent-{}", a.id),
-                head(s, k, &a.id, standing, a.version.as_deref()),
-                rows,
-            );
-            if enabled {
-                group
+
+    let mut elements: Vec<El> = Vec::new();
+
+    // If multiple computers are known, show target computer picker
+    let all_comps = s.all_computers();
+    if all_comps.len() > 1 {
+        let curr_comp = s.current_computer();
+        let mut bar = hrow()
+            .key("settings-agents-computer-bar")
+            .w_full()
+            .gap(8.0)
+            .center_y();
+
+        bar = bar.child(
+            text(tr_ref(language, "Target computer:", "配置目标电脑："))
+                .font(k.ty.ui_medium)
+                .color(k.c.text_muted),
+        );
+
+        for comp in all_comps {
+            let cid = comp.server_id.clone();
+            let cname = comp.name.clone();
+            let c_color = s.computer_color(&cid);
+            let is_curr = cid == curr_comp || (curr_comp == "local" && cid == "self");
+            let select_id = if cid == "self" {
+                "local".to_string()
             } else {
-                group.opacity(0.72)
-            }
-        })
-        .collect()
+                cid
+            };
+
+            let pill = hrow()
+                .key(format!("agent-comp-{}", select_id))
+                .px(10.0)
+                .py(4.0)
+                .gap(6.0)
+                .center_y()
+                .radius(6.0)
+                .fill(if is_curr {
+                    c_color.alpha(if s.dark { 0.18 } else { 0.12 })
+                } else {
+                    k.c.layer_01
+                })
+                .border(
+                    1.0,
+                    if is_curr {
+                        c_color.alpha(if s.dark { 0.45 } else { 0.30 })
+                    } else {
+                        k.c.border_muted
+                    },
+                )
+                .cursor(rune::Cursor::Pointer)
+                .child(el().size(6.0, 6.0).radius(3.0).fill(c_color))
+                .child(text(cname).font(k.ty.small_medium).color(if is_curr {
+                    k.c.text_base
+                } else {
+                    k.c.text_muted
+                }))
+                .on_press(move |s: &mut UiState| {
+                    s.switch_computer(select_id.clone());
+                });
+
+            bar = bar.child(pill);
+        }
+
+        elements.push(bar);
+    }
+
+    let agent_groups =
+        crate::ui::agents::by_standing(&s.agents)
+            .into_iter()
+            .map(|(a, standing)| {
+                let mut rows: Vec<El> = Vec::new();
+                if let Some(reason) = &a.reason {
+                    rows.push(el().key("reason").w_full().py(10.0).child(status(
+                        k,
+                        "reason",
+                        Tone::Quiet,
+                        reason.clone(),
+                    )));
+                }
+                for f in fields(&a.id) {
+                    rows.push(agent_field(s, k, layer, &a.id, *f));
+                }
+                let enabled = s.cfg.agents_for(s.current_computer()).enabled(&a.id);
+                let group = group_with(
+                    k,
+                    &format!("agent-{}", a.id),
+                    head(s, k, &a.id, standing, a.version.as_deref()),
+                    rows,
+                );
+                if enabled {
+                    group
+                } else {
+                    group.opacity(0.72)
+                }
+            });
+
+    elements.extend(agent_groups);
+    elements
 }

@@ -18,7 +18,7 @@ use super::compose::{self, ComposeCommand, ComposerUpdate, Deliver, Target};
 use super::inbox::{Inbox, SearchOutcome, UiError, Update, UpdateState};
 use super::types::{DiffStat, SESSION_LIST_LIMIT};
 use crate::config::{ConfigEdit, DesktopConfig};
-use crate::hub::{HubError, SessionHub, TaskHubEvent, OPENCODE};
+use crate::hub::{DynamicHub, HubError, SessionHub, TaskHubEvent, OPENCODE};
 
 /// How long the typed prefix must stand still before folders are listed.
 const COMPLETION_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -174,7 +174,7 @@ impl Coalesce {
 }
 
 struct Core {
-    hub: Arc<dyn SessionHub>,
+    hub: Arc<DynamicHub>,
     inbox: Arc<Inbox>,
     config: Arc<ConfigStore>,
     /// The session the user is looking at, for resyncs.
@@ -209,7 +209,7 @@ struct Core {
 /// Start the core side. Returns at once; the tasks live as long as the
 /// runtime does.
 pub fn spawn(
-    hub: Arc<dyn SessionHub>,
+    hub: Arc<DynamicHub>,
     inbox: Arc<Inbox>,
     config: Arc<ConfigStore>,
     commands: CommandReceiver,
@@ -307,6 +307,7 @@ impl Core {
     async fn run(self: Arc<Self>, command: Command) {
         match command {
             Command::Refresh => self.refresh().await,
+            Command::SwitchComputer(target) => self.switch_computer(target).await,
             Command::OpenSession(asid) => {
                 *self.active.lock().unwrap() = Some(asid.clone());
                 self.open(&asid).await;
@@ -779,6 +780,49 @@ impl Core {
                 token,
                 ok,
             })));
+    }
+
+    /// Switch active computer target: reconnect or swap the hub and reload data.
+    async fn switch_computer(self: Arc<Self>, target: String) {
+        tracing::info!(computer = %target, "switching active computer hub");
+        *self.active.lock().unwrap() = None;
+        self.watched.lock().unwrap().clear();
+        self.resolved.lock().unwrap().clear();
+        self.last_seq.lock().unwrap().clear();
+
+        let cfg = self.config.get();
+        let maybe_new_hub: Option<Arc<dyn SessionHub>> = if target == "local" || target == "self" {
+            if let Some(gw) = crate::hub::discover_local_gateway().await {
+                crate::hub::RemoteHub::start(gw)
+                    .ok()
+                    .map(|h| h as Arc<dyn SessionHub>)
+            } else {
+                None
+            }
+        } else if let Some(profile) = cfg.computers.get(&target) {
+            if let (Some(url), Some(token)) = (&profile.url, &profile.token) {
+                if !url.is_empty() && !token.is_empty() {
+                    crate::hub::RemoteHub::start(crate::hub::LocalGateway {
+                        url: url.clone(),
+                        token: token.clone(),
+                    })
+                    .ok()
+                    .map(|h| h as Arc<dyn SessionHub>)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(new_hub) = maybe_new_hub {
+            self.hub.switch(new_hub);
+            self.inbox.push(Update::HubMode(self.hub.mode()));
+            self.refresh().await;
+        }
     }
 
     /// Agents and every attached agent's sessions. Each agent's list is

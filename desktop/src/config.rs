@@ -22,7 +22,7 @@ use crate::model::projects::ProjectPrefs;
 
 pub const CONFIG_FILE: &str = "config.json";
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DesktopConfig {
     pub agents: AgentConfigs,
@@ -33,6 +33,93 @@ pub struct DesktopConfig {
     pub notifications: Notifications,
     /// Dictation's speech service (the API key lives in the keyring).
     pub voice: VoiceConfig,
+    /// Per-computer profiles (theme, accent, agent configs) by computer id / server_id.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub computers: HashMap<String, ComputerProfile>,
+    /// Currently active computer id ("local" or peer server_id / name).
+    #[serde(default = "default_computer")]
+    pub current_computer: String,
+}
+
+fn default_computer() -> String {
+    "local".to_string()
+}
+
+/// A computer's custom profile: distinct theme, accent color, and agent configs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ComputerProfile {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agents: Option<AgentConfigs>,
+}
+
+impl Default for DesktopConfig {
+    fn default() -> Self {
+        Self {
+            agents: AgentConfigs::default(),
+            general: General::default(),
+            appearance: Appearance::default(),
+            ui: UiPrefs::default(),
+            window: WindowGeometry::default(),
+            notifications: Notifications::default(),
+            voice: VoiceConfig::default(),
+            computers: HashMap::new(),
+            current_computer: default_computer(),
+        }
+    }
+}
+
+impl DesktopConfig {
+    /// Return the agent configs for `computer`.
+    pub fn agents_for(&self, computer: &str) -> &AgentConfigs {
+        if computer == "local" || computer == "self" || computer.is_empty() {
+            &self.agents
+        } else if let Some(p) = self.computers.get(computer) {
+            p.agents.as_ref().unwrap_or(&self.agents)
+        } else {
+            &self.agents
+        }
+    }
+
+    /// Return the mutable agent configs for `computer`, creating the profile if needed.
+    pub fn agents_for_mut(&mut self, computer: &str) -> &mut AgentConfigs {
+        if computer == "local" || computer == "self" || computer.is_empty() {
+            &mut self.agents
+        } else {
+            let profile = self.computers.entry(computer.to_string()).or_default();
+            if profile.agents.is_none() {
+                profile.agents = Some(self.agents.clone());
+            }
+            profile.agents.as_mut().unwrap()
+        }
+    }
+
+    /// Return the theme chosen for `computer`, falling back to global appearance.
+    pub fn theme_for(&self, computer: &str) -> &str {
+        if let Some(p) = self.computers.get(computer) {
+            if let Some(t) = &p.theme_id {
+                return t.as_str();
+            }
+        }
+        &self.appearance.theme_id
+    }
+
+    /// Return the accent hue chosen for `computer`, if any.
+    pub fn accent_for(&self, computer: &str) -> Option<&str> {
+        self.computers
+            .get(computer)
+            .and_then(|p| p.accent.as_deref())
+    }
 }
 
 /// How dictation transcribes (the App's Settings → Voice).
@@ -634,6 +721,19 @@ pub enum ConfigEdit {
         field: crate::agent_fields::Field,
         value: String,
     },
+    /// Switch active computer target.
+    CurrentComputer(String),
+    /// Set a per-computer theme.
+    ComputerTheme {
+        computer: String,
+        theme_id: String,
+    },
+    /// Set a per-computer accent hue.
+    #[allow(dead_code)]
+    ComputerAccent {
+        computer: String,
+        accent: String,
+    },
 }
 
 impl DesktopConfig {
@@ -714,13 +814,35 @@ impl DesktopConfig {
                     }
                 }
             }
-            ConfigEdit::AgentEnabled { agent, on } => self.agents.set_enabled(&agent, on),
+            ConfigEdit::CurrentComputer(id) => {
+                self.current_computer = id;
+            }
+            ConfigEdit::ComputerTheme { computer, theme_id } => {
+                if computer == "local" || computer == "self" {
+                    self.appearance.theme_id = theme_id;
+                } else {
+                    let p = self.computers.entry(computer).or_default();
+                    p.theme_id = Some(theme_id);
+                }
+            }
+            ConfigEdit::ComputerAccent { computer, accent } => {
+                let p = self.computers.entry(computer).or_default();
+                p.accent = Some(accent);
+            }
+            ConfigEdit::AgentEnabled { agent, on } => {
+                let target = self.current_computer.clone();
+                self.agents_for_mut(&target).set_enabled(&agent, on);
+            }
             ConfigEdit::AgentValue {
                 agent,
                 field,
                 value,
             } => {
-                if let Err(err) = self.agents.set_value(&agent, field, &value) {
+                let target = self.current_computer.clone();
+                if let Err(err) = self
+                    .agents_for_mut(&target)
+                    .set_value(&agent, field, &value)
+                {
                     tracing::debug!(agent, ?field, %err, "an invalid value was not applied");
                 }
             }
@@ -1080,5 +1202,46 @@ mod tests {
         .unwrap();
         assert_eq!(config.ui.projects["/w/x"].name.as_deref(), Some("X"));
         assert_eq!(config.general.editor, crate::platform::editors::Editor::Zed);
+    }
+
+    #[test]
+    fn computer_profiles_isolate_agent_configs_and_theme() {
+        let mut config = DesktopConfig::default();
+        assert_eq!(config.current_computer, "local");
+        assert_eq!(config.theme_for("local"), "cover-courier");
+
+        // Set theme and agent for remote "mini"
+        config.apply(ConfigEdit::CurrentComputer("mini".into()));
+        assert_eq!(config.current_computer, "mini");
+
+        config.apply(ConfigEdit::ComputerTheme {
+            computer: "mini".into(),
+            theme_id: "jade-tempest".into(),
+        });
+        assert_eq!(config.theme_for("mini"), "jade-tempest");
+        assert_eq!(config.theme_for("local"), "cover-courier"); // local is unchanged!
+
+        // Modify agent setting on "mini"
+        config.apply(ConfigEdit::AgentEnabled {
+            agent: "claude".into(),
+            on: false,
+        });
+
+        assert!(!config.agents_for("mini").claude.enabled);
+        assert!(
+            config.agents_for("local").claude.enabled,
+            "local claude remains enabled!"
+        );
+
+        config.apply(ConfigEdit::ComputerAccent {
+            computer: "mini".into(),
+            accent: "emerald".into(),
+        });
+        assert_eq!(config.accent_for("mini"), Some("emerald"));
+
+        // Switch back to local
+        config.apply(ConfigEdit::CurrentComputer("local".into()));
+        assert_eq!(config.current_computer, "local");
+        assert!(config.agents_for(&config.current_computer).claude.enabled);
     }
 }

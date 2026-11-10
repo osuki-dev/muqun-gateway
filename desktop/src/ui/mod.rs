@@ -169,6 +169,8 @@ pub enum OpenMenu {
     Tile(usize),
     /// A dropdown on a Settings page (by its key).
     Setting(String),
+    /// The computer/device switcher dropdown in the sidebar.
+    ComputerPicker,
 }
 
 /// The view state of one open session: what the timeline and composer read.
@@ -208,6 +210,21 @@ static INITIAL_CONFIG: OnceLock<DesktopConfig> = OnceLock::new();
 /// Hand the loaded config to the UI before the window opens.
 pub fn seed_config(config: DesktopConfig) {
     let _ = INITIAL_CONFIG.set(config);
+}
+
+/// Cached per-computer workspace state so switching machines is instant.
+#[derive(Default)]
+pub struct ComputerData {
+    pub sessions: Vec<AgentSessionInfo>,
+    pub directories: HashMap<String, DirInfo>,
+    pub known_projects: HashMap<String, Vec<AgentProject>>,
+    pub agent_projects: HashMap<String, Vec<AgentProject>>,
+    pub agents: Vec<AgentDiscoveryInfo>,
+    pub selected: Option<String>,
+    pub timelines: HashMap<String, timeline::SessionTimeline>,
+    pub tasks: Vec<TaskRow>,
+    pub staged: Vec<StagedFile>,
+    pub branches: HashMap<String, BranchInfo>,
 }
 
 /// Main-thread UI state owned by Rune.
@@ -274,6 +291,8 @@ pub struct UiState {
     pub branches: HashMap<String, BranchInfo>,
     /// Computers `@` may name.
     pub peers: Vec<PeerMention>,
+    /// Per-computer cached state for instant switching between workspaces.
+    pub computer_data: HashMap<String, ComputerData>,
     /// Esc dismissed a composer popup at this query start; forgotten when the
     /// trigger leaves the draft (App `dismissedAt`).
     pub popup_dismissed_at: Option<usize>,
@@ -466,6 +485,7 @@ impl UiState {
             catalog: None,
             branches: HashMap::new(),
             peers: Vec::new(),
+            computer_data: HashMap::new(),
             popup_dismissed_at: None,
             popup_active: None,
             mention_file_tokens: Vec::new(),
@@ -642,6 +662,129 @@ impl UiState {
 
     pub fn agent_name(&self, id: &str) -> String {
         agents::name(id, &self.agents)
+    }
+
+    pub fn current_computer(&self) -> &str {
+        if self.cfg.current_computer.is_empty() {
+            "local"
+        } else {
+            &self.cfg.current_computer
+        }
+    }
+
+    pub fn computer_name(&self, id: &str) -> String {
+        let language = self.cfg.general.language;
+        if id == "local" || id == "self" {
+            copy::tr(language, "This computer", "本机")
+        } else if let Some(peer) = self
+            .peers
+            .iter()
+            .find(|p| p.server_id == id || p.name == id)
+        {
+            peer.name.clone()
+        } else if let Some(p) = self.cfg.computers.get(id) {
+            if !p.name.is_empty() {
+                p.name.clone()
+            } else {
+                id.to_string()
+            }
+        } else {
+            id.to_string()
+        }
+    }
+
+    pub fn computer_color(&self, id: &str) -> rune::Color {
+        if let Some(accent) = self.cfg.accent_for(id) {
+            crate::theme::agents::computer_color(accent, self.dark)
+        } else {
+            crate::theme::agents::computer_color(id, self.dark)
+        }
+    }
+
+    pub fn all_computers(&self) -> Vec<crate::hub::PeerMention> {
+        let mut list = self.peers.clone();
+        let curr = self.current_computer();
+        if !list
+            .iter()
+            .any(|p| p.server_id == "self" || p.server_id == "local")
+        {
+            list.insert(
+                0,
+                crate::hub::PeerMention {
+                    server_id: "local".into(),
+                    name: self.computer_name("local"),
+                    reachable: true,
+                    current: curr == "local" || curr == "self",
+                },
+            );
+        }
+        for (id, profile) in &self.cfg.computers {
+            if !list.iter().any(|p| &p.server_id == id) {
+                list.push(crate::hub::PeerMention {
+                    server_id: id.clone(),
+                    name: if profile.name.is_empty() {
+                        id.clone()
+                    } else {
+                        profile.name.clone()
+                    },
+                    reachable: true,
+                    current: curr == id,
+                });
+            }
+        }
+        list
+    }
+
+    pub fn switch_computer(&mut self, id: String) {
+        let prev = self.current_computer().to_string();
+        if prev != id {
+            let data = ComputerData {
+                sessions: std::mem::take(&mut self.sessions),
+                directories: std::mem::take(&mut self.directories),
+                known_projects: std::mem::take(&mut self.known_projects),
+                agent_projects: std::mem::take(&mut self.agent_projects),
+                agents: std::mem::take(&mut self.agents),
+                selected: self.selected.take(),
+                timelines: std::mem::take(&mut self.timelines),
+                tasks: std::mem::take(&mut self.tasks),
+                staged: std::mem::take(&mut self.staged),
+                branches: std::mem::take(&mut self.branches),
+            };
+            self.computer_data.insert(prev, data);
+
+            if let Some(restored) = self.computer_data.remove(&id) {
+                self.sessions = restored.sessions;
+                self.directories = restored.directories;
+                self.known_projects = restored.known_projects;
+                self.agent_projects = restored.agent_projects;
+                self.agents = restored.agents;
+                self.selected = restored.selected;
+                self.timelines = restored.timelines;
+                self.tasks = restored.tasks;
+                self.staged = restored.staged;
+                self.branches = restored.branches;
+            }
+        }
+
+        self.cfg.current_computer = id.clone();
+        self.edit(ConfigEdit::CurrentComputer(id.clone()));
+        self.agent_inputs.clear();
+        self.agent_errors.clear();
+
+        let theme_id = self.cfg.theme_for(&id).to_string();
+        if theme_id != self.cfg.appearance.theme_id {
+            self.cfg.appearance.theme_id = theme_id.clone();
+            self.send(Command::ThemeApply(theme_id, self.cfg.appearance.scheme));
+        }
+        for peer in &mut self.peers {
+            peer.current = peer.server_id == id || (id == "local" && peer.server_id == "self");
+        }
+
+        self.send(Command::SwitchComputer(id.clone()));
+        self.send(Command::Refresh);
+
+        let name = self.computer_name(&id);
+        self.toast(format!("已切换到 {}", name), None);
     }
 
     pub fn toast(&mut self, title: impl Into<String>, detail: Option<String>) {

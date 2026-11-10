@@ -30,6 +30,8 @@ pub enum Command {
     Voice(std::sync::Arc<VoiceStart>),
     /// Re-read agent status and the session list.
     Refresh,
+    /// Switch active computer target: reconnect or swap the hub and reload data.
+    SwitchComputer(String),
     /// Make a session the active one and read its snapshot.
     OpenSession(AgentSessionId),
     /// Read a session's snapshot for a read-only look (a subagent's detail

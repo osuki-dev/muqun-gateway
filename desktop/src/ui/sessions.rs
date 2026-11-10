@@ -485,11 +485,94 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     })
 }
 
+fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+    let language = s.cfg.general.language;
+    let current_id = s.current_computer();
+    let current_name = s.computer_name(current_id);
+    let color = s.computer_color(current_id);
+    let open = s.menu == Some(OpenMenu::ComputerPicker);
+
+    let dot = el().key("comp-dot").size(8.0, 8.0).radius(4.0).fill(color);
+
+    let comp_pill = rune::row()
+        .key("computer-switcher-pill")
+        .w_full()
+        .h(30.0)
+        .px(10.0)
+        .gap(8.0)
+        .center_y()
+        .radius(7.0)
+        .fill(color.alpha(if s.dark { 0.12 } else { 0.08 }))
+        .border(1.0, color.alpha(if open { 0.45 } else { 0.18 }))
+        .cursor(rune::Cursor::Pointer)
+        .role("button")
+        .label(super::copy::tr_ref(language, "Switch computer", "切换电脑"))
+        .child(dot)
+        .child(
+            rune::text(current_name)
+                .font(k.ty.ui_medium)
+                .color(k.c.text_base)
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0),
+        )
+        .child(rune::text("▾").font(k.ty.small).color(k.c.text_muted));
+
+    let mut menu = Menu::new("computer-switcher-menu")
+        .trigger(comp_pill.on_press(|s: &mut UiState| {
+            let open = s.menu == Some(OpenMenu::ComputerPicker);
+            s.menu = (!open).then_some(OpenMenu::ComputerPicker);
+        }))
+        .open(open)
+        .on_close(|s: &mut UiState| s.menu = None);
+
+    for comp in s.all_computers() {
+        let cid = comp.server_id.clone();
+        let cname = comp.name.clone();
+        let is_current = cid == current_id || (current_id == "local" && cid == "self");
+        let reachable = comp.reachable;
+
+        let label = format!(
+            "{}{}{}",
+            if is_current { "✓ " } else { "    " },
+            cname,
+            if !reachable {
+                format!(" ({})", super::copy::tr(language, "offline", "离线"))
+            } else {
+                "".into()
+            }
+        );
+
+        let select_id = if cid == "self" {
+            "local".to_string()
+        } else {
+            cid
+        };
+        menu = menu.item(
+            MenuItem::new(label)
+                .disabled(!reachable && !is_current)
+                .on_select(move |s: &mut UiState| {
+                    s.menu = None;
+                    s.switch_computer(select_id.clone());
+                }),
+        );
+    }
+
+    menu.build(k, layer)
+}
+
 pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let language = s.cfg.general.language;
+    let header_box = rune::col()
+        .key("sidebar-header-box")
+        .w_full()
+        .gap(8.0)
+        .child(computer_switcher(s, k, layer))
+        .child(search(s, k));
+
     let mut sidebar = Sidebar::new()
         .label(super::copy::tr_ref(language, "Sessions", "会话"))
-        .header(search(s, k));
+        .header(header_box);
     if s.sessions.is_empty() {
         sidebar = sidebar.child(
             rune::text(super::copy::tr_ref(
@@ -665,4 +748,47 @@ fn link_warning(s: &UiState, k: &Kit) -> Option<El> {
         )
         .on_press(|s: &mut UiState| s.send(Command::Refresh)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn computer_switcher_lists_and_switches_computers() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.peers = vec![
+            crate::hub::PeerMention {
+                server_id: "self".into(),
+                name: "studio".into(),
+                reachable: true,
+                current: true,
+            },
+            crate::hub::PeerMention {
+                server_id: "m2".into(),
+                name: "mini".into(),
+                reachable: true,
+                current: false,
+            },
+        ];
+
+        let comps = s.all_computers();
+        assert_eq!(comps.len(), 2);
+        assert_eq!(
+            s.computer_name("self"),
+            crate::ui::copy::tr(s.cfg.general.language, "This computer", "本机")
+        );
+        assert_eq!(s.computer_name("m2"), "mini");
+
+        let k = Kit::neutral(s.dark);
+        let mut layer = Vec::new();
+        let _el = view(&s, &k, &mut layer);
+
+        // Switch to mini
+        s.switch_computer("m2".into());
+        assert_eq!(s.current_computer(), "m2");
+        assert!(s.peers[1].current);
+        assert!(!s.peers[0].current);
+    }
 }
