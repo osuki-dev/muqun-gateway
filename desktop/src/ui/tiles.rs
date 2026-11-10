@@ -379,24 +379,49 @@ fn status_mark(
     )
 }
 
-/// A quiet one-line composer for an unfocused tile: shows its draft and
-/// brings the tile into focus when pressed.
+/// A smart folded composer for an unfocused tile: shows identity mark,
+/// dynamic agent placeholder or draft, status/queue badges, and brings
+/// the tile into focus when pressed.
 fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
     let language = s.cfg.general.language;
+    let asid = s.tiles[i].asid.as_deref().unwrap_or_default();
+    let info = s.session_by_id(asid);
+    let agent_id = info.map(|x| x.agent_id.as_str()).unwrap_or("claude");
+    let agent_name = info
+        .map(|x| s.agent_name(&x.agent_id))
+        .unwrap_or_else(|| "Agent".to_string());
+    let activity = info.map(|x| s.activity(x)).unwrap_or(Activity::Idle);
+
     let draft = s.tiles[i].slot.draft.text.trim().to_string();
-    let (line, ink) = if draft.is_empty() {
+    let is_draft = !draft.is_empty();
+    let (line, ink) = if is_draft {
+        (draft, k.c.text_base)
+    } else {
         (
-            tr(language, "Click to type here…", "点击在此输入…"),
+            tr(
+                language,
+                &format!("Message {agent_name}…"),
+                &format!("给 {agent_name} 发送消息…"),
+            ),
             k.c.text_faint,
         )
-    } else {
-        (draft, k.c.text_muted)
     };
     let queued = s.tiles[i].slot.queue.len();
+
+    let brand_c = super::agents::color(agent_id, s.dark);
+    let mark_box = el()
+        .key("parked-agent-mark")
+        .size(22.0, 22.0)
+        .radius(6.0)
+        .fill(brand_c.alpha(if s.dark { 0.16 } else { 0.10 }))
+        .border(0.5, brand_c.alpha(if s.dark { 0.32 } else { 0.22 }))
+        .center()
+        .child(super::agents::mark(agent_id, 12.0, s.dark).a11y_hidden());
+
     let mut strip = row()
         .key("tile-composer")
         .w_full()
-        .h(44.0)
+        .h(42.0)
         .px(12.0)
         .gap(8.0)
         .center_y()
@@ -404,6 +429,7 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         .label(tr_ref(language, "Focus this pane", "聚焦此窗格"))
         .cursor(Cursor::Text)
         .on_press(move |s: &mut UiState| s.focus_tile(i))
+        .child(mark_box)
         .child(
             text(line)
                 .font(k.ty.ui)
@@ -413,6 +439,14 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
                 .shrink()
                 .min_w(0.0),
         );
+
+    if is_draft {
+        strip = strip.child(
+            rune_kit::Badge::new(tr_ref(language, "Draft", "草稿"))
+                .variant(rune_kit::BadgeVariant::Subtle)
+                .build(k),
+        );
+    }
     if queued > 0 {
         strip = strip.child(
             rune_kit::Badge::new(format!("{queued} {}", tr_ref(language, "queued", "排队")))
@@ -420,12 +454,18 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
                 .build(k),
         );
     }
+    if activity != Activity::Idle {
+        strip = strip.child(activity_pill(k, look, activity, language).key("parked-activity"));
+    }
+
+    let column = super::timeline::FEED_MAX_W;
     col()
         .key("tile-composer-pad")
         .w_full()
-        .px(12.0)
-        .pb(12.0)
-        .child(look.row_card(k, strip, 10.0))
+        .items_center()
+        .px(16.0)
+        .pb(14.0)
+        .child(look.pressable(k, look.row_card(k, strip.w_full().max_w(column), 10.0)))
 }
 
 /// An empty tile: pick a recent session or start a new one into it.
@@ -749,4 +789,47 @@ pub fn view(s: &UiState, k: &Kit, clear: f32, layer: &mut Vec<El>) -> El {
             .on_layout(|s: &mut UiState, rect: [f32; 4]| s.tile_grid = [rect[2], rect[3]])
             .child(body),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::{SessionSlot, Tile};
+    use muqun_gateway::agents::AgentSessionInfo;
+    use rune::TextEdit;
+
+    #[test]
+    fn parked_composer_shows_agent_identity_and_dynamic_placeholder() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let session: AgentSessionInfo = serde_json::from_value(serde_json::json!({
+            "asid": "s1",
+            "agent_id": "claude",
+            "title": "Fix bug",
+            "status": "idle",
+            "updated_ms": 1000u64,
+        }))
+        .unwrap();
+        s.sessions = vec![session];
+        s.tiles = vec![Tile {
+            asid: Some("s1".into()),
+            slot: SessionSlot::default(),
+        }];
+
+        let k = Kit::neutral(s.dark);
+        let look = s.look();
+        let _el = parked_composer(&s, &k, &look, 0);
+
+        // Test in Chinese
+        s.cfg.general.language = crate::config::Language::ZhCn;
+        let _el_zh = parked_composer(&s, &k, &look, 0);
+
+        // Test with draft
+        s.tiles[0].slot.draft = TextEdit::new("Draft message to Claude");
+        let _el_draft = parked_composer(&s, &k, &look, 0);
+
+        // Test with busy status
+        s.sessions[0].status = muqun_gateway::agents::AgentSessionStatus::Busy;
+        let _el_busy = parked_composer(&s, &k, &look, 0);
+    }
 }
