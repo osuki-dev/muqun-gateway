@@ -277,6 +277,29 @@ fn library_tile(s: &UiState, k: &Kit, entry: &ThemeEntry, w: f32) -> El {
             .build(k)
             .key(format!("remove-{}", entry.id))
     });
+    let trailing = if !current {
+        let btn_apply_id = entry.id.clone();
+        let apply_btn = Button::new(tr_ref(language, "Apply", "应用"))
+            .variant(ButtonVariant::Submit)
+            .control_size(ControlSize::Small)
+            .on_press(move |s: &mut UiState| {
+                let comp = s.current_computer().to_string();
+                s.edit(ConfigEdit::ComputerTheme {
+                    computer: comp,
+                    theme_id: btn_apply_id.clone(),
+                });
+                s.send(Command::ThemeApply(btn_apply_id.clone(), scheme));
+            })
+            .build(k)
+            .key(format!("apply-{}", entry.id));
+        if let Some(rm) = remove {
+            Some(hrow().gap(6.0).center_y().child(apply_btn).child(rm))
+        } else {
+            Some(apply_btn)
+        }
+    } else {
+        remove
+    };
     tile(
         s,
         k,
@@ -292,7 +315,7 @@ fn library_tile(s: &UiState, k: &Kit, entry: &ThemeEntry, w: f32) -> El {
                 w,
             ),
             chips: Some(scheme_chips(k, &entry.light, &entry.dark)),
-            trailing: remove,
+            trailing,
             status: None,
             current,
             apply: (!current).then(|| {
@@ -341,6 +364,7 @@ fn job_label(language: Language, job: &Job) -> (Tone, String) {
 
 fn gallery_tile(s: &UiState, k: &Kit, entry: &IndexEntry, w: f32) -> El {
     let language = s.cfg.general.language;
+    let current = entry.id == s.cfg.appearance.theme_id;
     let installed = s.theme_library.iter().any(|t| t.id == entry.id);
     let job = s.theme_jobs.get(&entry.id);
     let running = job.is_some_and(|j| {
@@ -353,21 +377,95 @@ fn gallery_tile(s: &UiState, k: &Kit, entry: &IndexEntry, w: f32) -> El {
     about.extend(entry.author.clone());
     about.push(format!("{} KB", entry.bytes / 1024));
     let id = entry.id.clone();
-    let install = Button::new(if installed {
-        tr_ref(language, "Reinstall", "重新安装")
+    let scheme = s.cfg.appearance.scheme;
+
+    let trailing = if running {
+        Some(
+            Button::new(tr_ref(language, "Installing…", "安装中…"))
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Small)
+                .disabled(true)
+                .build(k)
+                .key(format!("install-{}", entry.id)),
+        )
+    } else if current {
+        let reinstall_id = entry.id.clone();
+        Some(
+            hrow()
+                .gap(6.0)
+                .center_y()
+                .child(
+                    Badge::new(tr_ref(language, "In use", "使用中"))
+                        .variant(BadgeVariant::Accent)
+                        .build(k),
+                )
+                .child(
+                    Button::new(tr_ref(language, "Reinstall", "重新安装"))
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut UiState| {
+                            s.send(Command::ThemeInstall(reinstall_id.clone()))
+                        })
+                        .build(k)
+                        .key(format!("reinstall-{}", entry.id)),
+                ),
+        )
+    } else if installed {
+        let apply_id = entry.id.clone();
+        let reinstall_id = entry.id.clone();
+        Some(
+            hrow()
+                .gap(6.0)
+                .center_y()
+                .child(
+                    Button::new(tr_ref(language, "Apply", "应用"))
+                        .variant(ButtonVariant::Submit)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut UiState| {
+                            let comp = s.current_computer().to_string();
+                            s.edit(ConfigEdit::ComputerTheme {
+                                computer: comp,
+                                theme_id: apply_id.clone(),
+                            });
+                            s.send(Command::ThemeApply(apply_id.clone(), scheme));
+                        })
+                        .build(k)
+                        .key(format!("apply-{}", entry.id)),
+                )
+                .child(
+                    Button::new(tr_ref(language, "Reinstall", "重新安装"))
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut UiState| {
+                            s.send(Command::ThemeInstall(reinstall_id.clone()))
+                        })
+                        .build(k)
+                        .key(format!("reinstall-{}", entry.id)),
+                ),
+        )
     } else {
-        tr_ref(language, "Install", "安装")
-    })
-    .variant(if installed {
-        ButtonVariant::Ghost
-    } else {
-        ButtonVariant::Outline
-    })
-    .control_size(ControlSize::Small)
-    .disabled(running)
-    .on_press(move |s: &mut UiState| s.send(Command::ThemeInstall(id.clone())))
-    .build(k)
-    .key(format!("install-{}", entry.id));
+        Some(
+            Button::new(tr_ref(language, "Install", "安装"))
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut UiState| s.send(Command::ThemeInstall(id.clone())))
+                .build(k)
+                .key(format!("install-{}", entry.id)),
+        )
+    };
+
+    let apply: Option<Apply> = (installed && !current).then(|| {
+        let apply_id = entry.id.clone();
+        Box::new(move |s: &mut UiState| {
+            let comp = s.current_computer().to_string();
+            s.edit(ConfigEdit::ComputerTheme {
+                computer: comp,
+                theme_id: apply_id.clone(),
+            });
+            s.send(Command::ThemeApply(apply_id.clone(), scheme));
+        }) as Apply
+    });
+
     tile(
         s,
         k,
@@ -383,13 +481,13 @@ fn gallery_tile(s: &UiState, k: &Kit, entry: &IndexEntry, w: f32) -> El {
                 w,
             ),
             chips: None,
-            trailing: Some(install),
+            trailing,
             status: job.map(|job| {
                 let (tone, words) = job_label(language, job);
                 status(k, "job", tone, words)
             }),
-            current: false,
-            apply: None,
+            current,
+            apply,
         },
         w,
     )
@@ -749,4 +847,61 @@ fn import_url(s: &mut UiState, _: &mut Tx) {
     }
     s.theme_url = TextEdit::new("");
     s.send(Command::ThemeImportUrl(url));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gallery_tile_installed_offers_apply() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let entry: IndexEntry = serde_json::from_value(serde_json::json!({
+            "id": "tokyo-night",
+            "name": "Tokyo Night",
+            "version": "1.0.0",
+            "package": "dist/tokyo-night.muqun-theme",
+            "bytes": 1024,
+            "tags": [],
+        }))
+        .unwrap();
+
+        // Not installed
+        let k = Kit::neutral(false);
+        let _el = gallery_tile(&s, &k, &entry, 240.0);
+
+        // Mark installed
+        s.theme_library = Arc::new(vec![ThemeEntry {
+            id: "tokyo-night".into(),
+            name: "Tokyo Night".into(),
+            version: "1.0.0".into(),
+            author: Some("Author".into()),
+            license: None,
+            description: None,
+            tags: vec![],
+            origin: crate::theme::store::Origin::Installed,
+            light: Swatch {
+                background: "white".into(),
+                surface: "gray".into(),
+                primary: "black".into(),
+                text: "black".into(),
+            },
+            dark: Swatch {
+                background: "black".into(),
+                surface: "gray".into(),
+                primary: "blue".into(),
+                text: "white".into(),
+            },
+            thumbnail: None,
+        }]);
+        let _el_installed = gallery_tile(&s, &k, &entry, 240.0);
+
+        // Mark current in use
+        s.cfg.appearance.theme_id = "tokyo-night".into();
+        let _el_current = gallery_tile(&s, &k, &entry, 240.0);
+
+        // Also test library_tile
+        let _el_lib = library_tile(&s, &k, &s.theme_library[0], 240.0);
+    }
 }

@@ -1797,7 +1797,17 @@ impl UiState {
                 self.theme_previews.insert(id, path);
             }
             ThemeUpdate::Job { id, job } => {
-                self.theme_jobs.insert(id, job);
+                let done = matches!(&job, Job::Done { .. });
+                self.theme_jobs.insert(id.clone(), job);
+                if done && !id.starts_with("import:") {
+                    let comp = self.current_computer().to_string();
+                    let scheme = self.cfg.appearance.scheme;
+                    self.edit(ConfigEdit::ComputerTheme {
+                        computer: comp,
+                        theme_id: id.clone(),
+                    });
+                    self.send(Command::ThemeApply(id, scheme));
+                }
             }
             ThemeUpdate::Applied(applied) => {
                 let (id, scheme) = (applied.manifest.id.clone(), applied.scheme);
