@@ -858,6 +858,9 @@ fn session(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> El {
     } else {
         timeline::view(s, k)
     };
+    let body = body
+        .on_drop_files(|s: &mut UiState, files, _| composer::attach_dropped_files(s, files))
+        .on_drop_hover(|s: &mut UiState, over, _| s.drop_hover = over);
     let mut page = col().key("session").w_full().min_h(0.0);
     if let Some(info) = s.current() {
         let working = s.activity(info) == Activity::Working;

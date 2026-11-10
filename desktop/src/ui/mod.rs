@@ -318,6 +318,8 @@ pub struct UiState {
     /// File paths inserted as `@` mentions (App `fileTokens`), for highlight /
     /// atomic delete of typed paths still standing in the draft.
     pub mention_file_tokens: Vec<String>,
+    /// Whether a file drag from the OS is hovering over an attachment drop zone.
+    pub drop_hover: bool,
     /// Previous draft text + caret, for App-style atomic mention backspace.
     pub draft_snap: String,
     pub draft_snap_caret: usize,
@@ -523,6 +525,7 @@ impl UiState {
             popup_dismissed_at: None,
             popup_active: None,
             mention_file_tokens: Vec::new(),
+            drop_hover: false,
             draft_snap: String::new(),
             draft_snap_caret: 0,
             auto_approve: HashMap::new(),

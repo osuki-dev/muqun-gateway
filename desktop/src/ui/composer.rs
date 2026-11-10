@@ -38,6 +38,12 @@ pub static PHOTO: rune::Icon = rune::Icon {
     body: r#"<rect width="18" height="18" x="3" y="3" rx="2" ry="2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="8.5" cy="8.5" r="1.5" fill="none" stroke="currentColor" stroke-width="2"/><polyline points="21 15 16 10 5 21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
+pub static DROP_ICON: rune::Icon = rune::Icon {
+    name: "composer-drop-icon",
+    view: 24.0,
+    body: r#"<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>"#,
+};
+
 pub fn insert_image_pill(draft: &mut TextEdit, token: u64) -> usize {
     let count = draft
         .pills()
@@ -77,41 +83,51 @@ pub fn stage_path(s: &mut UiState, path: PathBuf) {
     }));
 }
 
+/// Attach files dropped from the OS or file manager into the active draft.
+pub fn attach_dropped_files(s: &mut UiState, files: &[PathBuf]) {
+    s.drop_hover = false;
+    if files.is_empty() {
+        return;
+    }
+    let mut attached_images = 0;
+    for path in files {
+        let is_img = crate::model::compose::image_name(&path.to_string_lossy());
+        let token = s.next_token;
+        stage_path(s, path.clone());
+        if is_img {
+            attached_images += 1;
+            let draft = if s.mode == super::Mode::Session {
+                &mut s.draft
+            } else {
+                &mut s.start_draft
+            };
+            insert_image_pill(draft, token);
+        }
+    }
+    let language = s.cfg.general.language;
+    let msg = if files.len() == 1 {
+        if attached_images > 0 {
+            crate::ui::copy::t(language, "Attached image")
+        } else {
+            crate::ui::copy::t(language, "Attached file")
+        }
+    } else {
+        format!(
+            "{} ({})",
+            crate::ui::copy::t(language, "Attached files"),
+            files.len()
+        )
+    };
+    s.status = msg.clone();
+    s.toast(msg, None);
+}
+
 /// Ctrl/Cmd+V into the draft: stage copied files or a clipboard image; leave
 /// plain text to the editor. Returns true when the paste was consumed.
 pub fn take_paste(s: &mut UiState, content: &rune::ClipboardContent) -> bool {
     let files = content.files();
     if !files.is_empty() {
-        let mut attached_images = 0;
-        for path in files {
-            let is_img = crate::model::compose::image_name(&path.to_string_lossy());
-            let token = s.next_token;
-            stage_path(s, path.clone());
-            if is_img {
-                attached_images += 1;
-                let draft = if s.mode == super::Mode::Session {
-                    &mut s.draft
-                } else {
-                    &mut s.start_draft
-                };
-                insert_image_pill(draft, token);
-            }
-        }
-        s.status = if files.len() == 1 {
-            if attached_images > 0 {
-                "Attached image".into()
-            } else {
-                "Attached file".into()
-            }
-        } else if attached_images > 0 {
-            format!(
-                "Attached {} files ({} images)",
-                files.len(),
-                attached_images
-            )
-        } else {
-            format!("Attached {} files", files.len())
-        };
+        attach_dropped_files(s, files);
         return true;
     }
     if let Some(image) = content.image() {
@@ -123,7 +139,14 @@ pub fn take_paste(s: &mut UiState, content: &rune::ClipboardContent) -> bool {
             &mut s.start_draft
         };
         let count = insert_image_pill(draft, token);
-        s.status = format!("Attached image #{}", count);
+        let language = s.cfg.general.language;
+        let msg = format!(
+            "{} #{}",
+            crate::ui::copy::t(language, "Attached image"),
+            count
+        );
+        s.status = msg.clone();
+        s.toast(msg, None);
         return true;
     }
     false
@@ -218,6 +241,7 @@ pub fn composer_card(
     card: El,
     focused: bool,
     busy: bool,
+    drop_hover: bool,
 ) -> El {
     let radius = crate::theme::look::PANEL_RADIUS + 2.0;
     let accent = k.c.bg_accent;
@@ -229,8 +253,11 @@ pub fn composer_card(
         e = e.backdrop_blur(18.0);
     }
 
-    // Surface fill: follows theme surfaces, stepped toward accent on focus / busy
-    let fill = if focused {
+    // Surface fill: follows theme surfaces, stepped toward accent on focus / busy / drop_hover
+    let fill = if drop_hover {
+        look.panel_fill(k)
+            .mix(accent, if dark { 0.16 } else { 0.10 })
+    } else if focused {
         look.emphasis(look.panel_fill(k), accent)
     } else if busy {
         look.emphasis(look.panel_fill(k), accent.alpha(0.4))
@@ -240,7 +267,9 @@ pub fn composer_card(
     e = e.fill(fill);
 
     // Border: top edge catching theme accent light
-    if focused {
+    if drop_hover {
+        e = e.border(2.0, accent);
+    } else if focused {
         let top = accent.alpha(if dark { 0.85 } else { 0.75 });
         let bottom = accent.alpha(if dark { 0.30 } else { 0.20 });
         e = e.border_gradient(1.2, top, bottom);
@@ -283,7 +312,16 @@ pub fn composer_card(
             inset: false,
         });
 
-    if focused {
+    if drop_hover {
+        e = e.box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 0.0,
+            blur: 28.0,
+            spread: 2.0,
+            color: accent.alpha(if dark { 0.45 } else { 0.30 }),
+            inset: false,
+        });
+    } else if focused {
         e = e.box_shadow(rune::Shadow {
             x: 0.0,
             y: 0.0,
@@ -308,8 +346,9 @@ pub fn composer_card(
 
 /// A composer card (a [`Look::panel`](crate::theme::look::Look::panel))
 /// while its field has focus: the surface a faint step toward the accent.
+#[allow(dead_code)]
 pub fn focus_tone(k: &Kit, look: &crate::theme::look::Look, card: El, focused: bool) -> El {
-    composer_card(k, look, card, focused, false)
+    composer_card(k, look, card, focused, false, false)
 }
 
 /// The kit a composer's text field is built with: the field draws no box of
@@ -795,7 +834,7 @@ fn queued_chip(
     }
 }
 
-fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
+pub(super) fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
     // A steer the timeline already shows as its echo is not listed twice.
     let queue: Vec<_> = s.queue.iter().filter(|q| !s.echoed(&q.id)).collect();
     if s.staged.is_empty() && queue.is_empty() {
@@ -809,6 +848,31 @@ fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
         line = line.child(queued_chip(s, k, layer, item));
     }
     Some(line)
+}
+
+/// A visual indicator bar shown when dragged files are hovering over the composer.
+pub fn drop_hint(
+    k: &Kit,
+    look: &crate::theme::look::Look,
+    language: crate::config::Language,
+) -> El {
+    let accent = k.c.bg_accent;
+    let dark = look.dark;
+    row()
+        .key("composer-drop-hint")
+        .w_full()
+        .center()
+        .gap(8.0)
+        .py(6.0)
+        .radius(crate::theme::look::PANEL_RADIUS)
+        .fill(accent.alpha(if dark { 0.20 } else { 0.12 }))
+        .border(1.0, accent.alpha(0.6))
+        .child(rune::icon(&DROP_ICON, 14.0).color(accent))
+        .child(
+            rune::text(tr_ref(language, "Drop files or images here to attach"))
+                .font(k.ty.small_medium)
+                .color(accent),
+        )
 }
 
 // ---- popups -------------------------------------------------------------------------
@@ -1761,6 +1825,9 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     if let Some(chips) = chips(s, k, layer) {
         card = card.child(chips);
     }
+    if s.drop_hover {
+        card = card.child(drop_hint(k, &look, language));
+    }
     let placeholder = if has_session {
         let full = tr_ref(language, "Message…  (/ commands, $ skills, @ mentions)");
         // A narrow card keeps the hint to one line.
@@ -1845,8 +1912,10 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     card = card.child(actions);
 
     // The floating card: theme-accent border rim, elevation shadows,
-    // and illuminated accent glow while focused or while the agent is busy.
-    let card = composer_card(k, &look, card, focused, busy);
+    // and illuminated accent glow while focused, busy, or drop hovering.
+    let card = composer_card(k, &look, card, focused, busy, s.drop_hover)
+        .on_drop_files(|s: &mut UiState, files, _| attach_dropped_files(s, files))
+        .on_drop_hover(|s: &mut UiState, over, _| s.drop_hover = over);
 
     // The messages' reading column: as wide and as centred as they are on
     // a wide window, the whole width on a narrow one.
@@ -1909,5 +1978,37 @@ mod tests {
         assert_eq!(s.draft.text, "my unfinished prompt");
         assert!(s.prompt_history_cursor.is_none());
         assert!(s.prompt_history_draft_stash.is_none());
+    }
+
+    #[test]
+    fn attach_dropped_files_stages_files_and_inserts_image_pills() {
+        let (tx, mut rx) = crate::ui::commands::channel();
+        let mut s = UiState::new(tx);
+        s.mode = crate::ui::Mode::Session;
+        s.drop_hover = true;
+
+        let files = vec![
+            PathBuf::from("/tmp/test-screenshot.png"),
+            PathBuf::from("/tmp/app.log"),
+        ];
+
+        attach_dropped_files(&mut s, &files);
+
+        // drop_hover should be cleared
+        assert!(!s.drop_hover);
+
+        // Draft should contain pill for the image
+        assert!(s.draft.text.contains("[Image #1]"));
+        let pills: Vec<_> = s.draft.pills().map(|(_, id)| id).collect();
+        assert_eq!(pills, vec!["image:1"]);
+
+        // Staging commands should be sent over channel
+        let mut staged_names = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            if let Command::Compose(ComposeCommand::Stage { name, .. }) = cmd {
+                staged_names.push(name);
+            }
+        }
+        assert_eq!(staged_names, vec!["test-screenshot.png", "app.log"]);
     }
 }

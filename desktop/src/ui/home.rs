@@ -668,6 +668,12 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
         .pb(START_PAD - 6.0)
         .child(agents(s, k, layer, size[0] - START_PAD * 2.0));
     composer::popup(s, k, layer, Slot::Start);
+    if let Some(chips) = composer::chips(s, k, layer) {
+        card = card.child(chips);
+    }
+    if s.drop_hover {
+        card = card.child(composer::drop_hint(k, look, language));
+    }
     let placeholder = tr_ref(
         language,
         "Describe the task…  (/ commands, $ skills, @ mentions)",
@@ -763,7 +769,9 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
         );
     card = card.child(actions);
     let card = look.panel(k, card, PANEL_RADIUS).motion(k.motion.control);
-    let card = composer::focus_tone(k, look, card, s.start_draft.focused);
+    let card = composer::composer_card(k, look, card, s.start_draft.focused, false, s.drop_hover)
+        .on_drop_files(|s: &mut UiState, files, _| composer::attach_dropped_files(s, files))
+        .on_drop_hover(|s: &mut UiState, over, _| s.drop_hover = over);
     // A frame the pack drew to reach past the field sits over its edges.
     el().key("home-dock")
         .w_full()
@@ -1006,7 +1014,12 @@ pub fn view(
                 .pb(bottom)
                 .child(look.arrive(composer.w(dock_w), 1)),
         );
-    el().key("home-page").w_full().h_full().child(stage)
+    el().key("home-page")
+        .w_full()
+        .h_full()
+        .child(stage)
+        .on_drop_files(|s: &mut UiState, files, _| composer::attach_dropped_files(s, files))
+        .on_drop_hover(|s: &mut UiState, over, _| s.drop_hover = over)
 }
 
 #[cfg(test)]

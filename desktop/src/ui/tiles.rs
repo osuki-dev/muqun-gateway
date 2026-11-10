@@ -582,6 +582,9 @@ fn tile(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut V
             } else {
                 timeline::view(s, k)
             };
+            let feed = feed
+                .on_drop_files(|s: &mut UiState, files, _| composer::attach_dropped_files(s, files))
+                .on_drop_hover(|s: &mut UiState, over, _| s.drop_hover = over);
             body = body.child(feed).child(composer::view(s, k, layer));
         }
         (Some(asid), false) => {
