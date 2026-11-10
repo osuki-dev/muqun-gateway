@@ -20,6 +20,7 @@ mod inbox;
 mod inspector;
 pub mod keymap;
 mod labels;
+pub mod pair_computer;
 mod palette;
 mod panes;
 mod parts;
@@ -334,6 +335,13 @@ pub struct UiState {
     pub worktrees: Vec<WorktreeRow>,
 
     pub search: TextEdit,
+    pub pairing_request_id: Option<String>,
+    pub pairing_code_input: TextEdit,
+    pub pairing_token_input: TextEdit,
+    pub pairing_manual_token_mode: bool,
+    pub pairing_transport_required: bool,
+    pub pairing_busy: bool,
+    pub pairing_error: Option<String>,
     /// The sidebar's "In messages" hits (`ui/search.rs`).
     pub content: search::ContentSearch,
     /// A hit being opened: its row is revealed once its session is loaded.
@@ -513,6 +521,13 @@ impl UiState {
             shells: Vec::new(),
             worktrees: Vec::new(),
             search: TextEdit::new(""),
+            pairing_request_id: None,
+            pairing_code_input: TextEdit::new(""),
+            pairing_token_input: TextEdit::new(""),
+            pairing_manual_token_mode: false,
+            pairing_transport_required: false,
+            pairing_busy: false,
+            pairing_error: None,
             content: Default::default(),
             jump: None,
             hub_down: None,
@@ -721,6 +736,7 @@ impl UiState {
                     name: self.computer_name("local"),
                     reachable: true,
                     current: curr == "local" || curr == "self",
+                    url: None,
                 },
             );
         }
@@ -735,10 +751,56 @@ impl UiState {
                     },
                     reachable: true,
                     current: curr == id,
+                    url: profile.url.clone(),
                 });
             }
         }
         list
+    }
+
+    pub fn is_computer_paired(&self, computer_id: &str) -> bool {
+        if computer_id == "local" || computer_id == "self" || computer_id == "all" {
+            return true;
+        }
+        self.cfg
+            .computers
+            .get(computer_id)
+            .and_then(|p| p.token.as_ref())
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    pub fn peer_by_id(&self, computer_id: &str) -> Option<&PeerMention> {
+        self.peers
+            .iter()
+            .find(|p| p.server_id == computer_id || p.name == computer_id)
+    }
+
+    pub fn peer_url(&self, computer_id: &str) -> Option<String> {
+        self.peer_by_id(computer_id)
+            .and_then(|p| p.url.clone())
+            .or_else(|| {
+                self.cfg
+                    .computers
+                    .get(computer_id)
+                    .and_then(|p| p.url.clone())
+            })
+    }
+
+    pub fn computer_of_session(&self, asid: &str) -> Option<String> {
+        let curr = self.current_computer();
+        if curr != "all" && self.sessions.iter().any(|s| s.asid.0 == asid) {
+            return Some(curr.to_string());
+        }
+        for (cid, cdata) in &self.computer_data {
+            if cdata.sessions.iter().any(|s| s.asid.0 == asid) {
+                return Some(cid.clone());
+            }
+        }
+        if self.sessions.iter().any(|s| s.asid.0 == asid) {
+            return Some("local".to_string());
+        }
+        None
     }
 
     pub fn switch_computer(&mut self, id: String) {
@@ -1462,10 +1524,56 @@ impl UiState {
                     self.on_agents(agents);
                     self.restore_tiles();
                 }
+                Update::ComputerPairingRequested {
+                    server_id: _,
+                    request_id,
+                    expires_in_ms: _,
+                    transport_required,
+                } => {
+                    self.pairing_busy = false;
+                    self.pairing_request_id = Some(request_id);
+                    self.pairing_transport_required = transport_required;
+                    self.pairing_error = None;
+                    self.toast(
+                        copy::tr(
+                            self.cfg.general.language,
+                            "Pairing code requested. Check the remote computer.",
+                            "已发起配对请求，请在远端电脑查看配对码",
+                        ),
+                        None,
+                    );
+                }
+                Update::ComputerPairingOutcome {
+                    server_id,
+                    token,
+                    error,
+                } => {
+                    self.pairing_busy = false;
+                    if let Some(_tok) = token {
+                        self.pairing_request_id = None;
+                        self.pairing_error = None;
+                        let name = self.computer_name(&server_id);
+                        self.toast(
+                            format!(
+                                "{}: {}",
+                                name,
+                                copy::tr(
+                                    self.cfg.general.language,
+                                    "Connected successfully",
+                                    "关联连接成功"
+                                )
+                            ),
+                            None,
+                        );
+                        self.switch_computer(server_id);
+                    } else if let Some(err) = error {
+                        self.pairing_error = Some(err);
+                    }
+                }
                 Update::AgentSessions { agent, sessions } => {
                     self.listed_agents.insert(agent.clone());
                     let curr = self.current_computer().to_string();
-                    if curr == "local" || curr == "self" {
+                    if curr != "all" {
                         self.sessions.retain(|s| s.agent_id != agent);
                         self.merge_sessions(sessions);
                         if self.error.as_ref().is_some_and(|e| e.unreachable) {
@@ -1484,21 +1592,19 @@ impl UiState {
                                 local_data.sessions.push(s);
                             }
                         }
-                        if curr == "all" {
-                            let mut all_sess = Vec::new();
-                            for cdata in self.computer_data.values() {
-                                for sess in &cdata.sessions {
-                                    if !all_sess
-                                        .iter()
-                                        .any(|x: &AgentSessionInfo| x.asid == sess.asid)
-                                    {
-                                        all_sess.push(sess.clone());
-                                    }
+                        let mut all_sess = Vec::new();
+                        for cdata in self.computer_data.values() {
+                            for sess in &cdata.sessions {
+                                if !all_sess
+                                    .iter()
+                                    .any(|x: &AgentSessionInfo| x.asid == sess.asid)
+                                {
+                                    all_sess.push(sess.clone());
                                 }
                             }
-                            all_sess.sort_by_key(|a| std::cmp::Reverse(a.updated_ms));
-                            self.sessions = all_sess;
                         }
+                        all_sess.sort_by_key(|a| std::cmp::Reverse(a.updated_ms));
+                        self.sessions = all_sess;
                     }
                 }
                 Update::SessionCreated(info) => self.merge_sessions(vec![*info]),

@@ -800,6 +800,7 @@ impl SessionHub for LocalHub {
                 name: computer_name(),
                 reachable: true,
                 current: true,
+                url: None,
             }])
         })
     }

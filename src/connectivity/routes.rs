@@ -91,7 +91,7 @@ const CODE_KDF_TIME_COST: u32 = 2;
 const CODE_KDF_PARALLELISM: u32 = 1;
 const CODE_KDF_OUTPUT_LEN: usize = 32;
 
-pub fn mount(router: Router<AppState>) -> Router<AppState> {
+pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/api/pair/request", post(pair_request))
         .route("/api/pair/claim", post(pair_claim))
@@ -539,7 +539,7 @@ fn pairing_response(value: Value, aad: &[u8], request_nonce: Option<&str>) -> Ap
 /// generated fresh, minus the round trip. It is hashed to a fixed 32 bytes
 /// first because Argon2's own salt floor is 8 bytes and `request_id` is only
 /// guaranteed to be 1-80.
-pub(crate) fn code_pairing_material(code: &str, request_id: &str) -> anyhow::Result<[u8; 32]> {
+pub fn code_pairing_material(code: &str, request_id: &str) -> anyhow::Result<[u8; 32]> {
     use argon2::{Algorithm, Argon2, Params, Version};
     use sha2::{Digest as _, Sha256};
 

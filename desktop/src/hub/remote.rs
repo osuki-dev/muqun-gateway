@@ -1335,6 +1335,7 @@ impl SessionHub for RemoteHub {
                 name: super::local::computer_name(),
                 reachable: true,
                 current: true,
+                url: Some(self.base.to_string()),
             }];
             if let Ok(json) = self.call(Method::GET, &["api", "peers"], &[], None).await {
                 for peer in json
@@ -1353,6 +1354,7 @@ impl SessionHub for RemoteHub {
                                 .and_then(Value::as_bool)
                                 .unwrap_or(false),
                             current: false,
+                            url: text("url").map(|u| u.to_string()),
                         });
                     }
                 }

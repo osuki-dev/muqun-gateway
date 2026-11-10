@@ -472,9 +472,9 @@ fn scene_catalog() -> std::sync::Arc<crate::hub::CatalogView> {
 
 fn scene_mentions(s: &mut UiState) {
     s.peers = vec![
-        crate::hub::PeerMention { server_id: "local".into(), name: "studio".into(), reachable: true, current: true },
-        crate::hub::PeerMention { server_id: "m2".into(), name: "mini".into(), reachable: true, current: false },
-        crate::hub::PeerMention { server_id: "m3".into(), name: "build-box".into(), reachable: false, current: false },
+        crate::hub::PeerMention { server_id: "local".into(), name: "studio".into(), reachable: true, current: true, url: None },
+        crate::hub::PeerMention { server_id: "m2".into(), name: "mini".into(), reachable: true, current: false, url: None },
+        crate::hub::PeerMention { server_id: "m3".into(), name: "build-box".into(), reachable: false, current: false, url: None },
     ];
     s.file_hits = ["src/main.rs", "src/ui/composer.rs", "src/ui/timeline.rs", "README.md"]
         .iter()

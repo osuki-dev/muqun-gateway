@@ -11,6 +11,7 @@ pub mod keys;
 pub mod media;
 pub mod mic;
 pub mod notify;
+pub mod pairing;
 pub mod pty;
 pub mod secrets;
 pub mod shell;

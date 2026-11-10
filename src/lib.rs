@@ -11,7 +11,7 @@ use serde_json::Value;
 
 pub mod agents;
 pub(crate) mod cli;
-pub(crate) mod connectivity;
+pub mod connectivity;
 pub(crate) mod fleet;
 pub(crate) mod mcp;
 pub mod platform;

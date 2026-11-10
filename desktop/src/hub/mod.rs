@@ -52,6 +52,7 @@ pub struct PeerMention {
     pub reachable: bool,
     /// The computer this composer already talks to.
     pub current: bool,
+    pub url: Option<String>,
 }
 
 /// One delegated task, as `GET /api/tasks` lists it (the gateway's `TaskView`,

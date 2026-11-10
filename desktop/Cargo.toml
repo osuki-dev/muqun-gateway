@@ -23,6 +23,7 @@ rune-fx = { git = "https://github.com/ryuhzk/rune", rev = "030e916c5531a0defe625
 rune-i18n = { git = "https://github.com/ryuhzk/rune", rev = "030e916c5531a0defe6255fd2b29bfc2ae076827" }
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl"] }
 anyhow = "1.0.103"
+uuid = { version = "1.29.0", features = ["v4"] }
 base64 = "0.23.1"
 dirs = "7.0.0"
 libc = "0.2.191"

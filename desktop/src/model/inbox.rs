@@ -127,6 +127,21 @@ pub enum Update {
         entries: Vec<DirectoryEntry>,
     },
     Ui(UiAction),
+    /// A computer pairing request response.
+    ComputerPairingRequested {
+        #[allow(dead_code)]
+        server_id: String,
+        request_id: String,
+        #[allow(dead_code)]
+        expires_in_ms: u64,
+        transport_required: bool,
+    },
+    /// An attempt to claim or verify a computer token succeeded or failed.
+    ComputerPairingOutcome {
+        server_id: String,
+        token: Option<String>,
+        error: Option<String>,
+    },
     /// A read-only snapshot for a detail sheet (`Command::ReadDetail`), or
     /// why it could not be read.
     Detail {

@@ -308,6 +308,99 @@ impl Core {
         match command {
             Command::Refresh => self.refresh().await,
             Command::SwitchComputer(target) => self.switch_computer(target).await,
+            Command::PairComputerRequest { server_id, url } => {
+                match crate::platform::pairing::request_app_pairing(&url, "Muqun Desktop").await {
+                    Ok(offer) => {
+                        self.inbox.push(Update::ComputerPairingRequested {
+                            server_id,
+                            request_id: offer.request_id,
+                            expires_in_ms: offer.expires_in_ms,
+                            transport_required: offer.transport_required,
+                        });
+                    }
+                    Err(err) => {
+                        self.inbox.push(Update::ComputerPairingOutcome {
+                            server_id,
+                            token: None,
+                            error: Some(err.to_string()),
+                        });
+                    }
+                }
+            }
+            Command::PairComputerClaim {
+                server_id,
+                url,
+                request_id,
+                code,
+                transport_required,
+            } => {
+                match crate::platform::pairing::claim_app_pairing(
+                    &url,
+                    &request_id,
+                    &code,
+                    transport_required,
+                )
+                .await
+                {
+                    Ok(claimed) => {
+                        self.config.change(|c| {
+                            c.apply(crate::config::ConfigEdit::ComputerToken {
+                                computer: server_id.clone(),
+                                url,
+                                token: claimed.token.clone(),
+                            })
+                        });
+                        self.inbox.push(Update::ComputerPairingOutcome {
+                            server_id: server_id.clone(),
+                            token: Some(claimed.token),
+                            error: None,
+                        });
+                        self.switch_computer(server_id).await;
+                    }
+                    Err(err) => {
+                        self.inbox.push(Update::ComputerPairingOutcome {
+                            server_id,
+                            token: None,
+                            error: Some(err.to_string()),
+                        });
+                    }
+                }
+            }
+            Command::PairComputerToken {
+                server_id,
+                url,
+                token,
+            } => match crate::platform::pairing::verify_token(&url, &token).await {
+                Ok(true) => {
+                    self.config.change(|c| {
+                        c.apply(crate::config::ConfigEdit::ComputerToken {
+                            computer: server_id.clone(),
+                            url,
+                            token: token.clone(),
+                        })
+                    });
+                    self.inbox.push(Update::ComputerPairingOutcome {
+                        server_id: server_id.clone(),
+                        token: Some(token),
+                        error: None,
+                    });
+                    self.switch_computer(server_id).await;
+                }
+                Ok(false) => {
+                    self.inbox.push(Update::ComputerPairingOutcome {
+                        server_id,
+                        token: None,
+                        error: Some("Token is invalid or refused by remote gateway".into()),
+                    });
+                }
+                Err(err) => {
+                    self.inbox.push(Update::ComputerPairingOutcome {
+                        server_id,
+                        token: None,
+                        error: Some(format!("Connection error: {err}")),
+                    });
+                }
+            },
             Command::OpenSession(asid) => {
                 *self.active.lock().unwrap() = Some(asid.clone());
                 self.open(&asid).await;

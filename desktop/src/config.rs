@@ -735,6 +735,12 @@ pub enum ConfigEdit {
         computer: String,
         accent: String,
     },
+    /// Configure a computer's URL and token.
+    ComputerToken {
+        computer: String,
+        url: String,
+        token: String,
+    },
 }
 
 impl DesktopConfig {
@@ -829,6 +835,15 @@ impl DesktopConfig {
             ConfigEdit::ComputerAccent { computer, accent } => {
                 let p = self.computers.entry(computer).or_default();
                 p.accent = Some(accent);
+            }
+            ConfigEdit::ComputerToken {
+                computer,
+                url,
+                token,
+            } => {
+                let p = self.computers.entry(computer).or_default();
+                p.url = Some(url);
+                p.token = Some(token);
             }
             ConfigEdit::AgentEnabled { agent, on } => {
                 let target = self.current_computer.clone();

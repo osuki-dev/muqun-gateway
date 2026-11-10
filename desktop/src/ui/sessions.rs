@@ -457,6 +457,10 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     .selected(super::search::row_selected(s, asid));
     if in_tile {
         row = row.detail(super::copy::tr(s.cfg.general.language, "split", "分屏"));
+    } else if s.current_computer() == "all" {
+        if let Some(comp) = s.computer_of_session(asid) {
+            row = row.detail(s.computer_name(&comp));
+        }
     }
     let id = asid.to_string();
     if s.rename_asid.as_deref() == Some(asid) {
@@ -538,7 +542,39 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let mut sidebar = Sidebar::new()
         .label(super::copy::tr_ref(language, "Sessions", "会话"))
         .header(header_box);
-    if s.sessions.is_empty() {
+    let curr = s.current_computer();
+    let is_unpaired_remote = !s.is_computer_paired(curr);
+
+    if is_unpaired_remote {
+        sidebar = sidebar.child(
+            rune::col()
+                .key("sidebar-unpaired-box")
+                .px(12.0)
+                .py(12.0)
+                .gap(6.0)
+                .radius(8.0)
+                .fill(k.c.layer_01)
+                .border(1.0, k.c.border_muted)
+                .child(
+                    rune::text(super::copy::tr(
+                        language,
+                        "Computer not linked",
+                        "电脑尚未关联会话",
+                    ))
+                    .font(k.ty.ui_medium)
+                    .color(k.c.text_base),
+                )
+                .child(
+                    rune::text(super::copy::tr(
+                        language,
+                        "Authorize this desktop to see sessions on this machine.",
+                        "关联此桌面即可在此浏览并操作该电脑的会话。",
+                    ))
+                    .font(k.ty.small)
+                    .color(k.c.text_muted),
+                ),
+        );
+    } else if s.sessions.is_empty() {
         sidebar = sidebar.child(
             rune::text(super::copy::tr_ref(
                 language,
@@ -729,12 +765,14 @@ mod tests {
                 name: "studio".into(),
                 reachable: true,
                 current: true,
+                url: None,
             },
             crate::hub::PeerMention {
                 server_id: "m2".into(),
                 name: "mini".into(),
                 reachable: true,
                 current: false,
+                url: None,
             },
         ];
 

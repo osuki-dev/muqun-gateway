@@ -32,6 +32,25 @@ pub enum Command {
     Refresh,
     /// Switch active computer target: reconnect or swap the hub and reload data.
     SwitchComputer(String),
+    /// Request a pairing code from a remote computer.
+    PairComputerRequest {
+        server_id: String,
+        url: String,
+    },
+    /// Claim pairing token with code.
+    PairComputerClaim {
+        server_id: String,
+        url: String,
+        request_id: String,
+        code: String,
+        transport_required: bool,
+    },
+    /// Save a manually entered or verified token.
+    PairComputerToken {
+        server_id: String,
+        url: String,
+        token: String,
+    },
     /// Make a session the active one and read its snapshot.
     OpenSession(AgentSessionId),
     /// Read a session's snapshot for a read-only look (a subagent's detail
