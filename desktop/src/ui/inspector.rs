@@ -460,9 +460,20 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
         .map(|i| (i.agent_id.clone(), i.directory.clone().unwrap_or_default()))
         .unwrap_or_default();
     for w in &s.worktrees {
-        let action = (!w.is_root()).then(|| {
+        let mut actions = row().gap(6.0).center_y();
+        let dir_path = PathBuf::from(&w.directory);
+        actions = actions.child(small(
+            k,
+            t("Terminal", "终端"),
+            ButtonVariant::Ghost,
+            format!("term-wt-{}", w.directory),
+            move |s| {
+                s.term_new_tab_in(dir_path.clone(), None);
+            },
+        ));
+        if !w.is_root() {
             let (agent, project, worktree) = (agent.clone(), dir.clone(), w.directory.clone());
-            small(
+            actions = actions.child(small(
                 k,
                 t("Remove", "移除"),
                 ButtonVariant::Ghost,
@@ -475,8 +486,8 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
                         worktree: worktree.clone(),
                     });
                 },
-            )
-        });
+            ));
+        }
         out.push(item(
             k,
             format!("wt-{}", w.directory),
@@ -484,7 +495,7 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
             w.strategy
                 .clone()
                 .unwrap_or_else(|| tr(language, "root", "主目录")),
-            action,
+            Some(actions),
         ));
     }
     if !dir.is_empty() {
@@ -519,26 +530,92 @@ fn subagents(s: &UiState, k: &Kit) -> Vec<El> {
             ),
         )];
     }
-    s.descendants
-        .iter()
-        .map(|d| {
-            let asid = d.asid.0.clone();
-            let open = small(
-                k,
-                tr_ref(language, "Open", "打开"),
-                ButtonVariant::Ghost,
-                format!("open-{}", d.asid.0),
-                move |s| s.open_session(&asid),
-            );
-            item(
-                k,
-                format!("sub-{}", d.asid.0),
-                title_of(d),
-                format!("{} · {:?}", s.agent_name(&d.agent_id), d.status).to_lowercase(),
-                Some(open),
+    let mut out = Vec::new();
+    if s.descendants.len() > 1 {
+        let sub_ids: Vec<String> = s
+            .descendants
+            .iter()
+            .take(super::MAX_TILES.saturating_sub(1))
+            .map(|d| d.asid.0.clone())
+            .collect();
+        let tile_all_btn = small(
+            k,
+            tr_ref(language, "Tile all", "全部同屏"),
+            ButtonVariant::Outline,
+            "tile-all-subagents".into(),
+            move |s| {
+                for id in &sub_ids {
+                    s.open_in_tile(id);
+                }
+            },
+        );
+        let header_row = row()
+            .key("subagents-header-actions")
+            .w_full()
+            .center_y()
+            .px(4.0)
+            .py(2.0)
+            .child(
+                text(format!(
+                    "{} {}",
+                    s.descendants.len(),
+                    tr_ref(language, "sub-agents", "个子 Agent")
+                ))
+                .font(k.ty.ui_medium)
+                .color(k.c.text_base),
             )
-        })
-        .collect()
+            .child(el().grow(1.0))
+            .child(tile_all_btn);
+        out.push(header_row);
+    }
+    out.extend(s.descendants.iter().map(|d| {
+        let asid = d.asid.0.clone();
+        let asid_split = asid.clone();
+        let in_tile = s.tile_of(&asid).is_some();
+        let split_label = if in_tile {
+            tr_ref(language, "Tiled", "已分屏")
+        } else {
+            tr_ref(language, "Split", "分屏")
+        };
+        let split_btn = small(
+            k,
+            split_label,
+            if in_tile {
+                ButtonVariant::Outline
+            } else {
+                ButtonVariant::Ghost
+            },
+            format!("split-{}", d.asid.0),
+            move |s| s.open_in_tile(&asid_split),
+        );
+        let open_btn = small(
+            k,
+            tr_ref(language, "Open", "打开"),
+            ButtonVariant::Ghost,
+            format!("open-{}", d.asid.0),
+            move |s| s.open_session(&asid),
+        );
+        let actions = row().gap(6.0).center_y().child(split_btn).child(open_btn);
+
+        use muqun_gateway::agents::domain::session::AgentSessionStatus;
+        let status_text = match d.status {
+            AgentSessionStatus::Busy => tr_ref(language, "Running", "运行中"),
+            AgentSessionStatus::Idle => tr_ref(language, "Idle", "空闲"),
+            AgentSessionStatus::Retry => tr_ref(language, "Retrying", "重试中"),
+            AgentSessionStatus::Failed => tr_ref(language, "Failed", "失败"),
+            AgentSessionStatus::Interrupted => tr_ref(language, "Stopped", "已停止"),
+            AgentSessionStatus::Unknown => tr_ref(language, "Unknown", "未知"),
+        };
+
+        item(
+            k,
+            format!("sub-{}", d.asid.0),
+            title_of(d),
+            format!("{} · {}", s.agent_name(&d.agent_id), status_text),
+            Some(actions),
+        )
+    }));
+    out
 }
 
 fn saved(s: &UiState, k: &Kit) -> Vec<El> {
@@ -706,4 +783,36 @@ pub fn view(s: &UiState, k: &Kit) -> El {
                 .min_h(0.0)
                 .scroll_bar(k),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use muqun_gateway::agents::AgentSessionInfo;
+
+    #[test]
+    fn subagents_renders_items_and_tile_all() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let sub1: AgentSessionInfo = serde_json::from_value(serde_json::json!({
+            "asid": "sub-1",
+            "agent_id": "opencode",
+            "title": "Fix bug in parser",
+            "status": "busy",
+            "updated_ms": 1000u64,
+        }))
+        .unwrap();
+        let sub2: AgentSessionInfo = serde_json::from_value(serde_json::json!({
+            "asid": "sub-2",
+            "agent_id": "deepseek",
+            "title": "Add tests for API",
+            "status": "idle",
+            "updated_ms": 1000u64,
+        }))
+        .unwrap();
+        s.descendants = vec![sub1, sub2];
+        let k = Kit::neutral(s.dark);
+        let els = subagents(&s, &k);
+        assert_eq!(els.len(), 3); // 1 header banner with "Tile all" + 2 subagent rows
+    }
 }

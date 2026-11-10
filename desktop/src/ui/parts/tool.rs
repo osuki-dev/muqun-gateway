@@ -773,6 +773,23 @@ fn subagent(
     card.body = Some(body);
     if let Some(child_id) = call.child_session_id.clone() {
         let view = child_id.clone();
+        let split_id = child_id.clone();
+        let in_tile = cx.s.tile_of(&child_id).is_some();
+        card.actions.push(
+            Button::new(if in_tile {
+                cx.t("Tiled", "已分屏")
+            } else {
+                cx.t("Split view", "加入分屏")
+            })
+            .variant(if in_tile {
+                ButtonVariant::Outline
+            } else {
+                ButtonVariant::Ghost
+            })
+            .control_size(ControlSize::Small)
+            .on_press(move |s: &mut UiState| s.open_in_tile(&split_id))
+            .build(k),
+        );
         card.actions.push(
             Button::new(cx.t("Details", "详情"))
                 .variant(ButtonVariant::Ghost)
