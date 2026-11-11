@@ -684,6 +684,8 @@ pub enum EscStep {
     TimelineSearch,
     /// The sidebar's search: cleared, back to the session list.
     Search,
+    /// An error alert banner.
+    Alert,
     /// A page other than the session: back to the last session (or Home).
     Page,
 }
@@ -710,6 +712,9 @@ pub fn esc_step(s: &UiState) -> Option<EscStep> {
     }
     if s.searching() {
         return Some(EscStep::Search);
+    }
+    if s.error.is_some() {
+        return Some(EscStep::Alert);
     }
     let session = last_session(s).is_some();
     match s.mode {
@@ -757,6 +762,7 @@ pub fn escape(s: &mut UiState) -> bool {
         EscStep::Pane => s.close_inspect(),
         EscStep::TimelineSearch => s.close_timeline_search(),
         EscStep::Search => s.close_search(),
+        EscStep::Alert => s.error = None,
         EscStep::Page => match last_session(s) {
             Some(_) if s.in_split() => s.mode = Mode::Session,
             Some(asid) => s.open_session(&asid),
@@ -899,6 +905,17 @@ mod tests {
         s.go(Mode::Settings);
         assert!(escape(&mut s));
         assert_eq!(s.mode, Mode::Home);
+        assert_eq!(esc_step(&s), None);
+
+        // Alert dismiss via Esc
+        s.error = Some(crate::model::inbox::UiError {
+            message: "Network request failed".into(),
+            detail: None,
+            unreachable: false,
+        });
+        assert_eq!(esc_step(&s), Some(EscStep::Alert));
+        assert!(escape(&mut s));
+        assert!(s.error.is_none());
         assert_eq!(esc_step(&s), None);
     }
 }

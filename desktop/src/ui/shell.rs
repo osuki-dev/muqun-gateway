@@ -800,22 +800,32 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
 fn alert(s: &UiState, k: &Kit) -> Option<El> {
     let language = s.cfg.general.language;
     let err = s.error.as_ref()?;
-    let mut card = Card::new()
-        .accent(k.c.danger.icon)
-        .title(err.message.clone(), None)
-        .action(
-            Button::new(tr_ref(language, "Dismiss"))
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Small)
-                .on_press(|s: &mut UiState| s.error = None)
-                .build(k)
-                .key("dismiss-error"),
+    let danger = k.c.danger.icon;
+    let dark = s.dark;
+
+    let mut content = row()
+        .gap(8.0)
+        .center_y()
+        .grow(1.0)
+        .min_w(0.0)
+        .child(el().size(6.0, 6.0).radius(3.0).fill(danger).a11y_hidden())
+        .child(
+            text(err.message.clone())
+                .font(k.ty.small_medium)
+                .color(k.c.text_base),
         );
+
     if let Some(detail) = &err.detail {
-        card = card.description(detail.clone());
+        content = content.child(
+            Badge::new(detail.clone())
+                .variant(BadgeVariant::Neutral)
+                .build(k),
+        );
     }
+
+    let mut actions = row().gap(6.0).center_y();
     if err.unreachable {
-        card = card.action(
+        actions = actions.child(
             Button::new(tr_ref(language, "Retry"))
                 .variant(ButtonVariant::Outline)
                 .control_size(ControlSize::Small)
@@ -824,13 +834,39 @@ fn alert(s: &UiState, k: &Kit) -> Option<El> {
                 .key("retry-error"),
         );
     }
+
+    let dismiss_label = format!("{} (Esc)", tr_ref(language, "Dismiss"));
+    actions = actions.child(
+        IconButton::new(k.glyph.close)
+            .variant(IconButtonVariant::GhostMuted)
+            .control_size(ControlSize::Small)
+            .label(dismiss_label)
+            .on_press(|s: &mut UiState| s.error = None)
+            .build(k)
+            .key("dismiss-error"),
+    );
+
+    let bar = row()
+        .key("alert-bar")
+        .w_full()
+        .min_h(32.0)
+        .px(12.0)
+        .py(4.0)
+        .center_y()
+        .radius(k.radius.md)
+        .fill(danger.alpha(if dark { 0.14 } else { 0.08 }))
+        .border(1.0, danger.alpha(if dark { 0.35 } else { 0.22 }))
+        .child(content)
+        .child(actions);
+
     Some(
         col()
             .key("alert")
             .w_full()
             .px(16.0)
-            .pt(8.0)
-            .child(card.build(k)),
+            .pt(6.0)
+            .pb(2.0)
+            .child(bar),
     )
 }
 
