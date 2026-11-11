@@ -445,7 +445,14 @@ impl UiState {
         recent.truncate(RECENT);
         self.edit(ConfigEdit::RecentCommands(recent));
         match act {
-            Act::Session(asid) => self.open_session(&asid),
+            Act::Session(asid) => {
+                let mods = tx.mods();
+                if mods.ctrl || mods.cmd || mods.alt || mods.shift {
+                    self.open_in_tile(&asid);
+                } else {
+                    self.open_session(&asid);
+                }
+            }
             Act::NewSession { agent, cwd } => {
                 if let Some(agent) = agent {
                     self.start_agent = agent;

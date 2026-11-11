@@ -171,12 +171,17 @@ fn header(s: &UiState, k: &Kit, sheet: &DetailSheet, asid: &str) -> El {
         Button::new(t("Open session"))
             .variant(ButtonVariant::Outline)
             .control_size(ControlSize::Small)
-            .on_press(move |s: &mut UiState| {
-                s.close_detail();
-                s.open_session(&open);
-            })
             .build(k)
-            .key("detail-open"),
+            .key("detail-open")
+            .on_press_tx(move |s: &mut UiState, tx: &mut rune::Tx| {
+                let mods = tx.mods();
+                s.close_detail();
+                if mods.ctrl || mods.cmd || mods.alt || mods.shift {
+                    s.open_in_tile(&open);
+                } else {
+                    s.open_session(&open);
+                }
+            }),
     )
     .child(
         k.interactive(

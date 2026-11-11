@@ -1894,6 +1894,10 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                     s.error = None;
                     return true;
                 }
+                if ev.key == rune::Key::Escape && s.show_diff {
+                    s.show_diff = false;
+                    return true;
+                }
                 // Alt+Enter while the agent works: queue after this turn.
                 let alt_enter = ev.key == rune::Key::Enter && ev.mods.alt && !ev.mods.cmd;
                 if alt_enter && s.busy() {

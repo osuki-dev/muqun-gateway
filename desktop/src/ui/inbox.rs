@@ -707,9 +707,16 @@ fn session_line(s: &UiState, k: &Kit, info: &muqun_gateway::agents::AgentSession
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
                 .label_with(keyed(tr(language, "Open session"), &["↵"]))
-                .on_press(move |s: &mut UiState| s.open_session(&asid))
                 .build(k)
-                .key("open-session"),
+                .key("open-session")
+                .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
+                    let mods = tx.mods();
+                    if mods.ctrl || mods.cmd || mods.alt || mods.shift {
+                        s.open_in_tile(&asid);
+                    } else {
+                        s.open_session(&asid);
+                    }
+                }),
         )
 }
 

@@ -1105,9 +1105,16 @@ fn actions(s: &UiState, k: &Kit, t: &TaskRow) -> El {
             Button::new(label.clone())
                 .variant(ButtonVariant::Outline)
                 .label_with(keyed(label, &["↵"]))
-                .on_press(move |s: &mut UiState| s.open_session(&asid))
                 .build(k)
-                .key("task-open"),
+                .key("task-open")
+                .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
+                    let mods = tx.mods();
+                    if mods.ctrl || mods.cmd || mods.alt || mods.shift {
+                        s.open_in_tile(&asid);
+                    } else {
+                        s.open_session(&asid);
+                    }
+                }),
         );
     }
     if t.completable {

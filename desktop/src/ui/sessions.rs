@@ -464,10 +464,10 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
         row = row.trailing(session_menu(s, k, layer, asid));
     }
     let (menu_id, rename_id) = (id.clone(), id.clone());
-    // Alt- or Shift-click opens the session beside the current one.
+    // Ctrl-, Cmd-, Alt-, or Shift-click opens the session beside the current one.
     row.on_select(move |s: &mut UiState, tx: &mut Tx| {
         let mods = tx.mods();
-        if mods.alt || mods.shift {
+        if mods.ctrl || mods.cmd || mods.alt || mods.shift {
             s.open_in_tile(&id);
         } else {
             s.open_session(&id);
@@ -860,5 +860,21 @@ mod tests {
         assert_eq!(s.current_computer(), "m2");
         assert!(s.peers[1].current);
         assert!(!s.peers[0].current);
+    }
+
+    #[test]
+    fn ctrl_click_session_opens_in_split_view() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.open_session("session-1");
+        assert_eq!(s.selected.as_deref(), Some("session-1"));
+        assert!(!s.in_split());
+
+        // Opening another session with open_in_tile enters split view
+        s.open_in_tile("session-2");
+        assert!(s.in_split());
+        assert_eq!(s.tiles.len(), 2);
+        assert_eq!(s.tiles[0].asid.as_deref(), Some("session-1"));
+        assert_eq!(s.tiles[1].asid.as_deref(), Some("session-2"));
     }
 }

@@ -473,6 +473,16 @@ pub fn dispatch(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         s.toggle_terminal();
         return true;
     }
+    if s.show_diff
+        && ev.key == rune::Key::Escape
+        && !(ev.mods.shift || ev.mods.alt || ev.mods.ctrl || ev.mods.cmd)
+        && s.palette.is_none()
+        && s.keys_sheet.is_none()
+        && !s.timeline_search.active
+    {
+        s.show_diff = false;
+        return true;
+    }
     if s.term.open && !s.draft.focused && s.palette.is_none() && s.keys_sheet.is_none() {
         let letter =
             |c: char| matches!(&ev.key, rune::Key::Command(k) if k.eq_ignore_ascii_case(&c));
@@ -483,6 +493,12 @@ pub fn dispatch(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
             return true;
         }
         if ev.mods.ctrl && letter('d') {
+            s.term.sink.focused = true;
+            return s.terminal_key(ev, tx);
+        }
+        if (ev.key == rune::Key::Tab && ev.mods.ctrl)
+            || (ev.mods.ctrl && (ev.key == rune::Key::PageDown || ev.key == rune::Key::PageUp))
+        {
             s.term.sink.focused = true;
             return s.terminal_key(ev, tx);
         }
@@ -678,6 +694,8 @@ pub enum EscStep {
     Popup,
     /// Dictation, the file viewer, a zoomed picture, a subagent's sheet.
     Dialog,
+    /// Working tree changes diff view: return to chat.
+    Diff,
     /// The timeline row's detail pane.
     Pane,
     /// In-session timeline search.
@@ -703,6 +721,9 @@ pub fn esc_step(s: &UiState) -> Option<EscStep> {
     }
     if s.voice.is_some() || s.viewer.is_some() || s.zoom.is_some() || s.detail.is_some() {
         return Some(EscStep::Dialog);
+    }
+    if s.show_diff {
+        return Some(EscStep::Diff);
     }
     if s.inspect.is_some() {
         return Some(EscStep::Pane);
@@ -759,6 +780,7 @@ pub fn escape(s: &mut UiState) -> bool {
                 s.close_detail();
             }
         }
+        EscStep::Diff => s.show_diff = false,
         EscStep::Pane => s.close_inspect(),
         EscStep::TimelineSearch => s.close_timeline_search(),
         EscStep::Search => s.close_search(),
@@ -916,6 +938,13 @@ mod tests {
         assert_eq!(esc_step(&s), Some(EscStep::Alert));
         assert!(escape(&mut s));
         assert!(s.error.is_none());
+        assert_eq!(esc_step(&s), None);
+
+        // Diff view dismiss via Esc
+        s.show_diff = true;
+        assert_eq!(esc_step(&s), Some(EscStep::Diff));
+        assert!(escape(&mut s));
+        assert!(!s.show_diff);
         assert_eq!(esc_step(&s), None);
     }
 }

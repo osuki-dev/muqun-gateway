@@ -55,7 +55,9 @@ pub fn family(role: FontRole) -> &'static str {
         // the sans slot is left alone (naming a CJK family here would put
         // its Latin in front of Inter's wherever Inter is not installed).
         FontRole::Ui => "Inter",
-        FontRole::Mono => "JetBrainsMono Nerd Font, JetBrainsMono NF, ui-monospace",
+        FontRole::Mono => {
+            "JetBrainsMono Nerd Font, JetBrainsMono NF, JetBrains Mono, Noto Sans Mono CJK SC, Noto Sans Mono CJK TC, Noto Sans Mono CJK JP, monospace, ui-monospace"
+        }
         FontRole::Display => "Noto Serif CJK SC, Inter",
     }
 }
@@ -68,4 +70,24 @@ pub fn family(role: FontRole) -> &'static str {
 /// not installed.
 pub fn families() -> (&'static str, &'static str) {
     (family(FontRole::Ui), family(FontRole::Mono))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mono_family_resolves_monospace_advance() {
+        let (ui, mono) = families();
+        let _guard = rune::text::with_families(ui, mono);
+        let w_digits = rune::text::advance("0123456789", rune::TextStyle::new(13.0, 400.0).mono());
+        let cw = w_digits / 10.0;
+        assert!(cw > 6.0 && cw < 9.0, "unexpected cell width: {cw}");
+        let w_c = rune::text::advance("c", rune::TextStyle::new(13.0, 400.0).mono());
+        let w_l = rune::text::advance("l", rune::TextStyle::new(13.0, 400.0).mono());
+        assert!(
+            (w_c - w_l).abs() < 0.1,
+            "monospace glyph advances should match"
+        );
+    }
 }

@@ -253,7 +253,7 @@ impl UiState {
     /// The search field's keys: ↑ / ↓ move through both groups, Enter opens,
     /// Esc closes the search (with nothing typed it only blurs the field).
     pub fn search_key(&mut self, ev: &rune::KeyEvent, tx: &mut Tx) -> bool {
-        if ev.mods.alt || ev.mods.primary() {
+        if (ev.mods.alt || ev.mods.primary()) && ev.key != rune::Key::Enter {
             return false;
         }
         if ev.key == rune::Key::Escape {
@@ -290,9 +290,22 @@ impl UiState {
                     return false;
                 };
                 self.content.cursor = Some(row.clone());
+                let in_tile = ev.mods.ctrl || ev.mods.cmd || ev.mods.alt || ev.mods.shift;
                 match row {
-                    Cursor::Session(asid) => self.open_session(&asid),
-                    Cursor::Hit(i) => self.open_hit(i),
+                    Cursor::Session(asid) => {
+                        if in_tile {
+                            self.open_in_tile(&asid);
+                        } else {
+                            self.open_session(&asid);
+                        }
+                    }
+                    Cursor::Hit(i) => {
+                        if in_tile {
+                            self.open_hit_in_tile(i);
+                        } else {
+                            self.open_hit(i);
+                        }
+                    }
                 }
                 true
             }
@@ -302,6 +315,15 @@ impl UiState {
 
     /// Open hit `i`'s session and reveal its row once it is loaded.
     pub fn open_hit(&mut self, i: usize) {
+        self.open_hit_inner(i, false);
+    }
+
+    /// Open hit `i`'s session in a split tile and reveal its row once it is loaded.
+    pub fn open_hit_in_tile(&mut self, i: usize) {
+        self.open_hit_inner(i, true);
+    }
+
+    fn open_hit_inner(&mut self, i: usize, in_tile: bool) {
         let Some(hit) = self.content.hits.get(i).cloned() else {
             return;
         };
@@ -316,7 +338,11 @@ impl UiState {
             since: Instant::now(),
             seen: false,
         });
-        self.open_session(&hit.asid);
+        if in_tile {
+            self.open_in_tile(&hit.asid);
+        } else {
+            self.open_session(&hit.asid);
+        }
     }
 
     /// Before each frame: reveal a hit's row, put out a lit row, and ask
@@ -676,7 +702,14 @@ fn session_block(s: &UiState, k: &Kit, start: usize, end: usize, now: u64) -> El
         block = block.child(
             k.interactive(line)
                 .cursor(rune::Cursor::Pointer)
-                .on_press(move |s: &mut UiState| s.open_hit(i)),
+                .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
+                    let mods = tx.mods();
+                    if mods.ctrl || mods.cmd || mods.alt || mods.shift {
+                        s.open_hit_in_tile(i);
+                    } else {
+                        s.open_hit(i);
+                    }
+                }),
         );
     }
     block

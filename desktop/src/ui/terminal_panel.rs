@@ -74,7 +74,7 @@ impl TermTab {
 
 /// The grid's type: the mono slot (JetBrains Mono where installed).
 const FONT_SIZE: f32 = 13.0;
-const LINE: f32 = 17.0;
+const LINE: f32 = 18.0;
 /// Inside the panel, beside and below the cells.
 const INSET: f32 = 10.0;
 /// The title strip's height: the main card's toolbar row, so the two line up.
@@ -485,6 +485,26 @@ impl UiState {
         self.term.sink.focused = true;
     }
 
+    pub fn term_next_tab(&mut self) {
+        if self.term.tabs.len() <= 1 {
+            return;
+        }
+        let next = (self.term.active_tab + 1) % self.term.tabs.len();
+        self.term_switch_tab(next);
+    }
+
+    pub fn term_prev_tab(&mut self) {
+        if self.term.tabs.len() <= 1 {
+            return;
+        }
+        let prev = if self.term.active_tab == 0 {
+            self.term.tabs.len() - 1
+        } else {
+            self.term.active_tab - 1
+        };
+        self.term_switch_tab(prev);
+    }
+
     pub fn term_close_tab(&mut self, index: usize) {
         if index >= self.term.tabs.len() {
             if self.term.tabs.is_empty() {
@@ -777,6 +797,66 @@ impl UiState {
                 self.term_close_tab(self.term.active_tab);
                 return true;
             }
+            if matches!(&ev.key, rune::Key::Command(']'))
+                || matches!(&ev.key, rune::Key::Text(t) if t == "]" || t == "}")
+                || tx.physical_key() == Some(rune::PhysicalKeyCode::BracketRight)
+            {
+                self.term_next_tab();
+                return true;
+            }
+            if matches!(&ev.key, rune::Key::Command('['))
+                || matches!(&ev.key, rune::Key::Text(t) if t == "[" || t == "{")
+                || tx.physical_key() == Some(rune::PhysicalKeyCode::BracketLeft)
+            {
+                self.term_prev_tab();
+                return true;
+            }
+        }
+        // Tab switching: Ctrl+Tab (next), Ctrl+Shift+Tab (prev)
+        if ev.key == rune::Key::Tab && ev.mods.ctrl && !ev.mods.alt {
+            if ev.mods.shift {
+                self.term_prev_tab();
+            } else {
+                self.term_next_tab();
+            }
+            return true;
+        }
+        // PageDown / PageUp with Ctrl: Next / Prev tab
+        if ev.mods.ctrl && !ev.mods.alt && !ev.mods.shift {
+            if ev.key == rune::Key::PageDown {
+                self.term_next_tab();
+                return true;
+            }
+            if ev.key == rune::Key::PageUp {
+                self.term_prev_tab();
+                return true;
+            }
+        }
+        // Direct jump: Alt+1..Alt+9 (or Cmd+1..Cmd+9 on macOS)
+        let is_jump_mod = (ev.mods.alt && !ev.mods.ctrl && !ev.mods.shift && !ev.mods.cmd)
+            || (mac && ev.mods.logo && !ev.mods.ctrl && !ev.mods.shift);
+        if is_jump_mod {
+            let digit = match &ev.key {
+                rune::Key::Command(c) if c.is_ascii_digit() => c.to_digit(10),
+                rune::Key::Text(t)
+                    if t.len() == 1 && t.chars().next().unwrap().is_ascii_digit() =>
+                {
+                    t.chars().next().unwrap().to_digit(10)
+                }
+                _ => None,
+            };
+            if let Some(d) = digit {
+                if (1..=8).contains(&d) {
+                    let target = (d - 1) as usize;
+                    if target < self.term.tabs.len() {
+                        self.term_switch_tab(target);
+                        return true;
+                    }
+                } else if d == 9 && !self.term.tabs.is_empty() {
+                    self.term_switch_tab(self.term.tabs.len() - 1);
+                    return true;
+                }
+            }
         }
         match input::route(ev, tx.physical_key(), mac) {
             Route::Toggle => self.toggle_terminal(),
@@ -890,7 +970,11 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         };
 
         let (bg_color, fg_color, border_color) = if is_active {
-            (k.c.layer_01, k.c.text_base, k.c.border_base)
+            (
+                k.c.surface_raised,
+                k.c.text_base,
+                k.alpha(k.c.border_weak, 0.45),
+            )
         } else {
             (
                 k.c.bg_base.alpha(0.0),
@@ -899,23 +983,29 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
             )
         };
 
-        let close_tab = IconButton::new(k.glyph.close)
-            .variant(IconButtonVariant::GhostMuted)
-            .control_size(ControlSize::Small)
-            .label(tr_ref(language, "Close tab"))
-            .on_press(move |s: &mut UiState| {
-                s.term_close_tab(i);
-                s.term.sink.focused = true;
-            })
-            .build(k)
-            .key(format!("terminal-tab-close-{i}"));
+        let close_tab = if tab_count > 1 {
+            Some(
+                IconButton::new(k.glyph.close)
+                    .variant(IconButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
+                    .label(tr_ref(language, "Close tab"))
+                    .on_press(move |s: &mut UiState| {
+                        s.term_close_tab(i);
+                        s.term.sink.focused = true;
+                    })
+                    .build(k)
+                    .key(format!("terminal-tab-close-{i}")),
+            )
+        } else {
+            None
+        };
 
-        let tab_pill = row()
+        let mut tab_pill = row()
             .key(format!("terminal-tab-{i}"))
-            .h(26.0)
-            .pl(8.0)
-            .pr(2.0)
-            .gap(5.0)
+            .h(28.0)
+            .pl(10.0)
+            .pr(if close_tab.is_some() { 4.0 } else { 10.0 })
+            .gap(6.0)
             .center_y()
             .fill(bg_color)
             .border(1.0, border_color)
@@ -936,13 +1026,20 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
             )
             .child(
                 text(tab_title)
-                    .font(k.ty.caption())
+                    .font(if is_active {
+                        k.ty.small_medium
+                    } else {
+                        k.ty.small
+                    })
                     .color(fg_color)
                     .truncate()
                     .shrink()
-                    .max_w(130.0),
-            )
-            .child(close_tab);
+                    .max_w(140.0),
+            );
+
+        if let Some(btn) = close_tab {
+            tab_pill = tab_pill.child(btn);
+        }
 
         tabs_strip = tabs_strip.child(tab_pill);
     }
@@ -959,7 +1056,7 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
     let sync_cwd_btn = IconButton::new(&rune_kit::glyphs::FOLDER)
         .variant(IconButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
-        .label(super::copy::t_ref(language, "Sync CWD"))
+        .label(super::copy::t_ref(language, "Sync directory with session"))
         .on_press(|s: &mut UiState| s.term_sync_cwd())
         .build(k)
         .key("terminal-sync-cwd");
@@ -969,10 +1066,11 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         .key("terminal-head")
         .w_full()
         .h(HEAD)
-        .pl(INSET)
-        .pr(INSET)
+        .pl(8.0)
+        .pr(8.0)
         .gap(6.0)
         .center_y()
+        .fill(k.alpha(k.c.layer_01, 0.65))
         .child(tabs_strip)
         .child(
             IconButton::new(&RESTART)
@@ -999,6 +1097,7 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         .w_full()
         .grow(1.0)
         .min_h(0.0)
+        .pt(6.0)
         .px(INSET)
         .pb(INSET)
         .gap(8.0)
@@ -1020,6 +1119,7 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         .h_full()
         .min_h(0.0)
         .child(header)
+        .child(el().w_full().h(1.0).fill(k.alpha(k.c.border_weak, 0.35)))
         .child(body)
 }
 
@@ -1289,17 +1389,6 @@ fn draw_row(key: &str, row: &Row, y: usize, m: Metrics) -> El {
             font = font.italic();
         }
         out = out.child(text(run.text.clone()).font(font).color(fg).absolute(x, 0.0));
-        if run.attrs.bold {
-            // Rune resolves the mono slot's family to its regular face only
-            // (the Nerd Font's Bold is installed but not picked), so bold is
-            // drawn twice, a fraction of a point apart.
-            out = out.child(
-                text(run.text.clone())
-                    .font(font)
-                    .color(fg)
-                    .absolute(x + 0.6, 0.0),
-            );
-        }
         let w = f32::from(run.cells) * m.cw;
         if run.attrs.underline {
             out = out.child(el().absolute(x, m.ch - 2.0).size(w, 1.0).fill(fg));
@@ -1692,5 +1781,142 @@ mod tests {
             state.toasts.last().unwrap().title,
             "Terminal switched to session folder"
         );
+    }
+
+    #[test]
+    fn terminal_tab_switch_shortcuts() {
+        let (tx, _rx) = commands::channel();
+        let mut s = UiState::new(tx);
+        s.term.tabs.push(TermTab {
+            id: 1,
+            session: None,
+            frame: None,
+            cwd: PathBuf::from("/tmp/1"),
+            title: Some("tab1".into()),
+            pending_command: None,
+        });
+        s.term.tabs.push(TermTab {
+            id: 2,
+            session: None,
+            frame: None,
+            cwd: PathBuf::from("/tmp/2"),
+            title: Some("tab2".into()),
+            pending_command: None,
+        });
+        s.term.tabs.push(TermTab {
+            id: 3,
+            session: None,
+            frame: None,
+            cwd: PathBuf::from("/tmp/3"),
+            title: Some("tab3".into()),
+            pending_command: None,
+        });
+        s.term.active_tab = 0;
+
+        // Next tab
+        s.term_next_tab();
+        assert_eq!(s.term.active_tab, 1);
+        s.term_next_tab();
+        assert_eq!(s.term.active_tab, 2);
+        // Wraps around
+        s.term_next_tab();
+        assert_eq!(s.term.active_tab, 0);
+
+        // Prev tab
+        s.term_prev_tab();
+        assert_eq!(s.term.active_tab, 2);
+        s.term_prev_tab();
+        assert_eq!(s.term.active_tab, 1);
+
+        // Test keyboard switching via runtime
+        s.open_terminal();
+        s.term.sink.focused = true;
+        let mut rt = Runtime::new(s, super::super::view, (1440.0, 900.0), Env::new(true, 1.0));
+        rt.on_key = Some(super::super::on_key);
+        rt.frame(0.0);
+
+        // Alt+1 jumps to tab 0
+        rt.key(KeyEvent {
+            key: Key::Text("1".into()),
+            mods: Mods {
+                shift: false,
+                cmd: false,
+                alt: true,
+                ctrl: false,
+                logo: false,
+            },
+        });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.term.active_tab, 0);
+
+        // Alt+3 jumps to tab 2
+        rt.key(KeyEvent {
+            key: Key::Text("3".into()),
+            mods: Mods {
+                shift: false,
+                cmd: false,
+                alt: true,
+                ctrl: false,
+                logo: false,
+            },
+        });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.term.active_tab, 2);
+
+        // Ctrl+Tab cycles next (wraps to 0)
+        rt.key(KeyEvent {
+            key: Key::Tab,
+            mods: Mods {
+                shift: false,
+                cmd: true,
+                alt: false,
+                ctrl: true,
+                logo: false,
+            },
+        });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.term.active_tab, 0);
+
+        // Ctrl+Shift+Tab cycles prev (wraps to 2)
+        rt.key(KeyEvent {
+            key: Key::Tab,
+            mods: Mods {
+                shift: true,
+                cmd: true,
+                alt: false,
+                ctrl: true,
+                logo: false,
+            },
+        });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.term.active_tab, 2);
+
+        // Ctrl+PageUp cycles prev (to 1)
+        rt.key(KeyEvent {
+            key: Key::PageUp,
+            mods: Mods {
+                shift: false,
+                cmd: true,
+                alt: false,
+                ctrl: true,
+                logo: false,
+            },
+        });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.term.active_tab, 1);
+
+        // Ctrl+PageDown cycles next (to 2)
+        rt.key(KeyEvent {
+            key: Key::PageDown,
+            mods: Mods {
+                shift: false,
+                cmd: true,
+                alt: false,
+                ctrl: true,
+                logo: false,
+            },
+        });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.term.active_tab, 2);
     }
 }

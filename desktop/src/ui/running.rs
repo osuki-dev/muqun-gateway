@@ -112,9 +112,15 @@ pub fn elapsed(ms: u64, language: Language) -> String {
     localize(language, text)
 }
 
-fn open_entry(s: &mut UiState, asid: Option<String>) {
+fn open_entry(s: &mut UiState, asid: Option<String>, in_tile: bool) {
     match asid {
-        Some(asid) => s.open_session(&asid),
+        Some(asid) => {
+            if in_tile {
+                s.open_in_tile(&asid);
+            } else {
+                s.open_session(&asid);
+            }
+        }
         None => s.go(Mode::Tasks),
     }
 }
@@ -203,9 +209,13 @@ fn entry_row(s: &UiState, k: &Kit, e: &Entry<'_>, now: u64) -> El {
     if waiting {
         r = r.subtitle_color(k.c.warning.fg);
     }
-    r.on_select(move |s: &mut UiState, _: &mut Tx| open_entry(s, asid.clone()))
-        .build(k)
-        .key(format!("running-{key}"))
+    r.on_select(move |s: &mut UiState, tx: &mut Tx| {
+        let mods = tx.mods();
+        let in_tile = mods.ctrl || mods.cmd || mods.alt || mods.shift;
+        open_entry(s, asid.clone(), in_tile);
+    })
+    .build(k)
+    .key(format!("running-{key}"))
 }
 
 /// The Running row and, when open, its list. Nothing while nothing runs.

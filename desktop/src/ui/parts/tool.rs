@@ -795,8 +795,15 @@ fn subagent(
             Button::new(cx.t("Open session"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
-                .on_press(move |s: &mut UiState| s.open_session(&child_id))
-                .build(k),
+                .build(k)
+                .on_press_tx(move |s: &mut UiState, tx: &mut rune::Tx| {
+                    let mods = tx.mods();
+                    if mods.ctrl || mods.cmd || mods.alt || mods.shift {
+                        s.open_in_tile(&child_id);
+                    } else {
+                        s.open_session(&child_id);
+                    }
+                }),
         );
     }
 }
