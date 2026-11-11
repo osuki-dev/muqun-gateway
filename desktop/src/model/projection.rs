@@ -322,6 +322,8 @@ impl Core {
                         self.inbox.push(Update::ComputerPairingOutcome {
                             server_id,
                             token: None,
+                            device_id: None,
+                            transport_key: None,
                             error: Some(err.to_string()),
                         });
                     }
@@ -355,6 +357,8 @@ impl Core {
                         self.inbox.push(Update::ComputerPairingOutcome {
                             server_id: server_id.clone(),
                             token: Some(claimed.token),
+                            device_id: Some(claimed.device_id),
+                            transport_key: claimed.transport_key,
                             error: None,
                         });
                         self.switch_computer(server_id).await;
@@ -363,6 +367,8 @@ impl Core {
                         self.inbox.push(Update::ComputerPairingOutcome {
                             server_id,
                             token: None,
+                            device_id: None,
+                            transport_key: None,
                             error: Some(err.to_string()),
                         });
                     }
@@ -386,6 +392,8 @@ impl Core {
                     self.inbox.push(Update::ComputerPairingOutcome {
                         server_id: server_id.clone(),
                         token: Some(token),
+                        device_id: None,
+                        transport_key: None,
                         error: None,
                     });
                     self.switch_computer(server_id).await;
@@ -394,6 +402,8 @@ impl Core {
                     self.inbox.push(Update::ComputerPairingOutcome {
                         server_id,
                         token: None,
+                        device_id: None,
+                        transport_key: None,
                         error: Some("Token is invalid or refused by remote gateway".into()),
                     });
                 }
@@ -401,6 +411,8 @@ impl Core {
                     self.inbox.push(Update::ComputerPairingOutcome {
                         server_id,
                         token: None,
+                        device_id: None,
+                        transport_key: None,
                         error: Some(format!("Connection error: {err}")),
                     });
                 }
@@ -1213,9 +1225,17 @@ impl Core {
                 );
                 let hub = Arc::clone(&self.hub);
                 let wake = asid.clone();
+                let core = Arc::clone(self);
                 tokio::spawn(async move {
                     if let Err(err) = hub.wake(&wake).await {
                         tracing::debug!(asid = %wake.0, %err, "background wake after peek failed");
+                    }
+                    if core.is_open(&wake) {
+                        if let Ok(fresh) = hub.snapshot(&wake).await {
+                            if core.is_open(&wake) {
+                                core.push_snapshot(fresh);
+                            }
+                        }
                     }
                 });
                 tokio::spawn(self.clone().diff(asid.clone()));
@@ -1304,8 +1324,10 @@ impl Core {
                             items: found.items,
                             seq: found.latest_seq,
                         }));
+                    true
+                } else {
+                    found.latest_seq <= after
                 }
-                true
             }
             Ok(_) => false,
             Err(err) => {
@@ -1453,6 +1475,17 @@ impl Core {
                         {
                             tokio::spawn(self.clone().diff(asid.clone()));
                             tokio::spawn(self.clone().descendants(asid.clone()));
+                            let core = self.clone();
+                            let s_asid = asid.clone();
+                            tokio::spawn(async move {
+                                if !core.catch_up(&s_asid).await {
+                                    if let Ok(snapshot) = core.hub.snapshot(&s_asid).await {
+                                        if core.is_open(&s_asid) {
+                                            core.push_snapshot(snapshot);
+                                        }
+                                    }
+                                }
+                            });
                         }
                         _ => {}
                     }

@@ -192,6 +192,14 @@ impl SessionHub for LocalHub {
         })
     }
 
+    fn wake<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let manager = self.manager_for_session(asid).await?;
+            manager.sessions().prepare_session(asid).await?;
+            Ok(())
+        })
+    }
+
     fn peek<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Option<AgentSessionSnapshot>> {
         Box::pin(async move {
             let manager = self.manager_for_session(asid).await?;

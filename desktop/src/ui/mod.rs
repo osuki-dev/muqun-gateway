@@ -1851,6 +1851,8 @@ impl UiState {
                 Update::ComputerPairingOutcome {
                     server_id,
                     token,
+                    device_id,
+                    transport_key,
                     error,
                 } => {
                     self.pairing_busy = false;
@@ -1858,6 +1860,12 @@ impl UiState {
                         self.close_pairing();
                         let comp = self.cfg.computers.entry(server_id.clone()).or_default();
                         comp.token = Some(tok);
+                        if device_id.is_some() {
+                            comp.device_id = device_id;
+                        }
+                        if transport_key.is_some() {
+                            comp.transport_key = transport_key;
+                        }
                         let name = self.computer_name(&server_id);
                         self.toast(
                             format!(

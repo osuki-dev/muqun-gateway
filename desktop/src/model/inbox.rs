@@ -140,6 +140,8 @@ pub enum Update {
     ComputerPairingOutcome {
         server_id: String,
         token: Option<String>,
+        device_id: Option<String>,
+        transport_key: Option<String>,
         error: Option<String>,
     },
     /// A read-only snapshot for a detail sheet (`Command::ReadDetail`), or
