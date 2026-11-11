@@ -61,6 +61,10 @@ pub struct ComputerProfile {
     pub accent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agents: Option<AgentConfigs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_key: Option<String>,
 }
 
 impl Default for DesktopConfig {
@@ -740,6 +744,8 @@ pub enum ConfigEdit {
         computer: String,
         url: String,
         token: String,
+        device_id: Option<String>,
+        transport_key: Option<String>,
     },
 }
 
@@ -840,10 +846,18 @@ impl DesktopConfig {
                 computer,
                 url,
                 token,
+                device_id,
+                transport_key,
             } => {
                 let p = self.computers.entry(computer).or_default();
                 p.url = Some(url);
                 p.token = Some(token);
+                if device_id.is_some() {
+                    p.device_id = device_id;
+                }
+                if transport_key.is_some() {
+                    p.transport_key = transport_key;
+                }
             }
             ConfigEdit::AgentEnabled { agent, on } => {
                 let target = self.current_computer.clone();

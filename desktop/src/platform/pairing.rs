@@ -44,6 +44,7 @@ pub struct ClaimedToken {
     pub server_label: String,
     #[allow(dead_code)]
     pub device_id: String,
+    pub transport_key: Option<String>,
 }
 
 /// Request pairing from a remote gateway (`POST /api/pair/request`).
@@ -231,12 +232,17 @@ pub async fn claim_app_pairing(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let transport_key = final_body
+        .get("transport_key")
+        .and_then(Value::as_str)
+        .map(String::from);
 
     Ok(ClaimedToken {
         token,
         server_id,
         server_label,
         device_id,
+        transport_key,
     })
 }
 

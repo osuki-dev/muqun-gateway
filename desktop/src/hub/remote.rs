@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
 use futures::{SinkExt as _, StreamExt as _};
 use muqun_gateway::agents::directories::{Completion, DirectoryEntry};
 use muqun_gateway::agents::ports::{AgentError, AgentSessionSnapshot, FileDiffItem};
@@ -40,11 +41,42 @@ const CAPABILITIES_FRESH: Duration = Duration::from_secs(60);
 /// The capability `GET /api/search` comes with.
 const SEARCH_CAPABILITY: &str = "session_search_v1";
 
+fn now_unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EncryptedRequestPayload {
+    token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_type: Option<String>,
+    body: String,
+}
+
+#[derive(serde::Deserialize)]
+struct EncryptedResponsePayload {
+    status: u16,
+    #[serde(default)]
+    #[allow(dead_code)]
+    headers: HashMap<String, String>,
+    body: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    content_encoding: Option<String>,
+}
+
 /// What `local-client.json` holds.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct LocalGateway {
     pub url: String,
     pub token: String,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub transport_key: Option<String>,
 }
 
 /// The local gateway's credential, when its file names one that answers
@@ -96,6 +128,9 @@ pub struct RemoteHub {
     http: reqwest::Client,
     base: reqwest::Url,
     token: String,
+    device_id: Option<String>,
+    material: Option<Vec<u8>>,
+    transport_version: u8,
     events: broadcast::Sender<AgentDomainEvent>,
     /// `task.*` frames, which are not the session plane's events.
     task_events: broadcast::Sender<TaskHubEvent>,
@@ -105,26 +140,42 @@ pub struct RemoteHub {
     capabilities: tokio::sync::Mutex<Option<(std::time::Instant, Vec<String>)>>,
     /// Why the event socket is down (`None` while it is connected).
     link: tokio::sync::watch::Sender<Option<String>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+}
+
+impl Drop for RemoteHub {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+    }
 }
 
 impl RemoteHub {
     /// Connect to `gateway` and start the event socket (which reconnects).
     pub fn start(gateway: LocalGateway) -> anyhow::Result<Arc<Self>> {
+        let material = gateway
+            .transport_key
+            .as_deref()
+            .and_then(|k| muqun_gateway::connectivity::transport::decode_key(k).ok());
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(120))
             .build()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let hub = Arc::new(Self {
             http,
             base: reqwest::Url::parse(gateway.url.trim_end_matches('/'))?,
             token: gateway.token,
+            device_id: gateway.device_id,
+            material,
+            transport_version: muqun_gateway::connectivity::transport::VERSION_V2,
             events: broadcast::channel(EVENT_CAPACITY).0,
             task_events: broadcast::channel(EVENT_CAPACITY).0,
             cursors: Mutex::new(HashMap::new()),
             capabilities: tokio::sync::Mutex::new(None),
             link: tokio::sync::watch::channel(None).0,
+            shutdown: shutdown_tx,
         });
-        tokio::spawn(event_socket(hub.clone()));
+        tokio::spawn(event_socket(Arc::downgrade(&hub), shutdown_rx));
         Ok(hub)
     }
 
@@ -139,6 +190,121 @@ impl RemoteHub {
         url
     }
 
+    async fn call_bytes(
+        &self,
+        method: Method,
+        segments: &[&str],
+        query: &[(&str, &str)],
+        content_type: Option<&str>,
+        body: Option<Vec<u8>>,
+    ) -> Result<(u16, Vec<u8>), HubError> {
+        let url = self.url(segments, query);
+        if let (Some(material), Some(device_id)) = (&self.material, &self.device_id) {
+            let path_and_query = match url.query() {
+                Some(q) if !q.is_empty() => format!("{}?{}", url.path(), q),
+                _ => url.path().to_string(),
+            };
+            let aad = format!("{method} {path_and_query}");
+            let payload = EncryptedRequestPayload {
+                token: self.token.clone(),
+                content_type: content_type.map(str::to_owned),
+                body: body
+                    .as_deref()
+                    .map(|b| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b))
+                    .unwrap_or_default(),
+            };
+            let envelope = muqun_gateway::connectivity::transport::seal_version(
+                self.transport_version,
+                material,
+                muqun_gateway::connectivity::transport::Direction::Request,
+                aad.as_bytes(),
+                &serde_json::to_vec(&payload).map_err(|e| {
+                    HubError::Agent(AgentError::Network(format!("serialization failed: {e}")))
+                })?,
+                now_unix_ms(),
+            )
+            .map_err(|e| HubError::Agent(AgentError::Network(format!("encryption failed: {e}"))))?;
+
+            let mut request = self
+                .http
+                .request(method.clone(), url)
+                .header("x-muqun-transport", "1")
+                .header("x-muqun-device", device_id);
+
+            if method == Method::GET {
+                let envelope_json = serde_json::to_vec(&envelope).map_err(|e| {
+                    HubError::Agent(AgentError::Network(format!(
+                        "envelope serialization failed: {e}"
+                    )))
+                })?;
+                request = request.header(
+                    "x-muqun-envelope",
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(envelope_json),
+                );
+            } else {
+                request = request.json(&envelope);
+            }
+
+            let answer = request.send().await.map_err(|err| {
+                HubError::Agent(AgentError::Network(format!(
+                    "the remote gateway did not answer: {err}"
+                )))
+            })?;
+            let outer_status = answer.status().as_u16();
+            let outer_bytes = answer.bytes().await.unwrap_or_default().to_vec();
+
+            if let Ok(sealed) = serde_json::from_slice::<
+                muqun_gateway::connectivity::transport::Envelope,
+            >(&outer_bytes)
+            {
+                let response_aad = format!("{aad}\n{}", envelope.nonce);
+                let plaintext = muqun_gateway::connectivity::transport::open(
+                    material,
+                    muqun_gateway::connectivity::transport::Direction::Response,
+                    response_aad.as_bytes(),
+                    &sealed,
+                    now_unix_ms(),
+                )
+                .map_err(|e| {
+                    HubError::Agent(AgentError::Network(format!(
+                        "failed to decrypt remote response: {e:?}"
+                    )))
+                })?;
+                let resp_payload: EncryptedResponsePayload = serde_json::from_slice(&plaintext)
+                    .map_err(|e| {
+                        HubError::Agent(AgentError::Network(format!(
+                            "invalid decrypted response payload: {e}"
+                        )))
+                    })?;
+                let inner_body = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(&resp_payload.body)
+                    .or_else(|_| {
+                        base64::engine::general_purpose::STANDARD.decode(&resp_payload.body)
+                    })
+                    .unwrap_or_default();
+                Ok((resp_payload.status, inner_body))
+            } else {
+                Ok((outer_status, outer_bytes))
+            }
+        } else {
+            let mut request = self.http.request(method, url).bearer_auth(&self.token);
+            if let Some(ct) = content_type {
+                request = request.header("content-type", ct);
+            }
+            if let Some(body) = body {
+                request = request.body(body);
+            }
+            let answer = request.send().await.map_err(|err| {
+                HubError::Agent(AgentError::Network(format!(
+                    "the local gateway did not answer: {err}"
+                )))
+            })?;
+            let status = answer.status().as_u16();
+            let bytes = answer.bytes().await.unwrap_or_default().to_vec();
+            Ok((status, bytes))
+        }
+    }
+
     /// The whole JSON answer of one call.
     async fn call(
         &self,
@@ -147,30 +313,27 @@ impl RemoteHub {
         query: &[(&str, &str)],
         body: Option<Value>,
     ) -> Result<Value, HubError> {
-        let mut request = self
-            .http
-            .request(method, self.url(segments, query))
-            .bearer_auth(&self.token);
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        let answer = request.send().await.map_err(|err| {
-            HubError::Agent(AgentError::Network(format!(
-                "the local gateway did not answer: {err}"
-            )))
-        })?;
-        let status = answer.status();
-        let text = answer.text().await.unwrap_or_default();
+        let (body_bytes, ct) = if let Some(body) = body {
+            (
+                Some(serde_json::to_vec(&body).unwrap_or_default()),
+                Some("application/json"),
+            )
+        } else {
+            (None, None)
+        };
+        let (status, bytes) = self
+            .call_bytes(method, segments, query, ct, body_bytes)
+            .await?;
+        let text = String::from_utf8(bytes).unwrap_or_default();
         let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        if status.is_success() {
-            drop(text);
+        if (200..300).contains(&status) {
             return Ok(json);
         }
         let asid = match segments {
             ["api", "agent-sessions", asid, ..] => asid.to_string(),
             _ => String::new(),
         };
-        Err(map_error(status.as_u16(), &json, &asid, &text))
+        Err(map_error(status, &json, &asid, &text))
     }
 
     /// `data` of the envelope, as `T`.
@@ -904,24 +1067,16 @@ impl SessionHub for RemoteHub {
             if !matches!(segments.as_slice(), ["api", "agent-images" | "assets", ..]) {
                 return Err(HubError::Agent(AgentError::Unsupported("media".into())));
             }
-            let answer = self
-                .http
-                .get(self.url(&segments, &[]))
-                .bearer_auth(&self.token)
-                .send()
-                .await
-                .map_err(|err| HubError::Agent(AgentError::Network(err.to_string())))?;
-            if !answer.status().is_success() {
-                return Err(HubError::Agent(AgentError::Network(format!(
-                    "media answered {}",
-                    answer.status()
-                ))));
+            let (status, bytes) = self
+                .call_bytes(Method::GET, &segments, &[], None, None)
+                .await?;
+            if (200..300).contains(&status) {
+                Ok(bytes)
+            } else {
+                Err(HubError::Agent(AgentError::Network(format!(
+                    "media answered {status}"
+                ))))
             }
-            answer
-                .bytes()
-                .await
-                .map(|b| b.to_vec())
-                .map_err(|err| HubError::Agent(AgentError::Network(err.to_string())))
         })
     }
 
@@ -942,23 +1097,20 @@ impl SessionHub for RemoteHub {
             .into_bytes();
             body.extend_from_slice(&bytes);
             body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-            let answer = self
-                .http
-                .post(self.url(&["api", "uploads"], &[]))
-                .bearer_auth(&self.token)
-                .header(
-                    "content-type",
-                    format!("multipart/form-data; boundary={boundary}"),
+            let content_type = format!("multipart/form-data; boundary={boundary}");
+            let (status, resp_bytes) = self
+                .call_bytes(
+                    Method::POST,
+                    &["api", "uploads"],
+                    &[],
+                    Some(&content_type),
+                    Some(body),
                 )
-                .body(body)
-                .send()
-                .await
-                .map_err(|err| HubError::Agent(AgentError::Network(err.to_string())))?;
-            let status = answer.status();
-            let text = answer.text().await.unwrap_or_default();
+                .await?;
+            let text = String::from_utf8(resp_bytes).unwrap_or_default();
             let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-            if !status.is_success() {
-                return Err(map_error(status.as_u16(), &json, "", &text));
+            if !(200..300).contains(&status) {
+                return Err(map_error(status, &json, "", &text));
             }
             let field = |key: &str| json.get(key).and_then(Value::as_str).unwrap_or_default();
             let stored_name = field("url")
@@ -1401,6 +1553,83 @@ fn intern(mime: &str) -> &'static str {
     leaked
 }
 
+struct ClientCodec {
+    server_key: [u8; 32],
+    client_key: [u8; 32],
+    connection_id: String,
+    recv_seq: u64,
+    send_seq: u64,
+}
+
+impl ClientCodec {
+    fn open_first(
+        first: &Value,
+        material: &[u8],
+        request_nonce: &str,
+    ) -> anyhow::Result<(Self, String)> {
+        let connection_id = first["cid"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no connection id"))?
+            .to_owned();
+        let mut codec = Self {
+            server_key: muqun_gateway::connectivity::transport::derive_ws_server_key(
+                material,
+                &connection_id,
+                request_nonce,
+            )?,
+            client_key: muqun_gateway::connectivity::transport::derive_ws_client_key(
+                material,
+                &connection_id,
+                request_nonce,
+            )?,
+            connection_id,
+            recv_seq: 0,
+            send_seq: 0,
+        };
+        let hello = codec.open(first)?;
+        Ok((codec, hello))
+    }
+
+    fn aad(&self, seq: u64) -> String {
+        format!("GET /api/ws\n{}\n{seq}", self.connection_id)
+    }
+
+    fn open(&mut self, frame: &Value) -> anyhow::Result<String> {
+        let seq = frame["seq"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("no seq in frame"))?;
+        anyhow::ensure!(
+            seq == self.recv_seq,
+            "frame out of order: expected {}, got {}",
+            self.recv_seq,
+            seq
+        );
+        let ciphertext = frame["c"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no ciphertext in frame"))?;
+        let plaintext = muqun_gateway::connectivity::transport::open_stream_event(
+            &self.server_key,
+            seq,
+            self.aad(seq).as_bytes(),
+            ciphertext,
+        )?;
+        self.recv_seq += 1;
+        Ok(String::from_utf8(plaintext)?)
+    }
+
+    fn seal(&mut self, plaintext: &str) -> anyhow::Result<String> {
+        let seq = self.send_seq;
+        let c = muqun_gateway::connectivity::transport::seal_stream_event(
+            &self.client_key,
+            seq,
+            self.aad(seq).as_bytes(),
+            plaintext.as_bytes(),
+        )?;
+        self.send_seq += 1;
+        Ok(format!(r#"{{"seq":{seq},"c":"{c}"}}"#))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Event socket
 // ---------------------------------------------------------------------------
@@ -1409,12 +1638,21 @@ fn intern(mime: &str) -> &'static str {
 /// every reconnect the projection is told to read again (an unnamed
 /// `agent.resync`): the open session's snapshot and every list, which covers
 /// whatever the socket missed.
-async fn event_socket(hub: Arc<RemoteHub>) {
+async fn event_socket(
+    weak: std::sync::Weak<RemoteHub>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
     let mut backoff = BACKOFF_START;
     let mut first = true;
     loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        let Some(hub) = weak.upgrade() else {
+            return;
+        };
         let started = tokio::time::Instant::now();
-        let why = match run_socket(&hub, &mut first).await {
+        let why = match run_socket(&hub, &mut first, &mut shutdown).await {
             Ok(()) => {
                 tracing::info!("event socket closed");
                 "the gateway closed the connection".to_string()
@@ -1424,17 +1662,28 @@ async fn event_socket(hub: Arc<RemoteHub>) {
                 why
             }
         };
+        if *shutdown.borrow() {
+            return;
+        }
         hub.link.send_replace(Some(why));
-        // A connection that lived a while starts the backoff over.
+        drop(hub);
+
         if started.elapsed() > Duration::from_secs(30) {
             backoff = BACKOFF_START;
         }
-        tokio::time::sleep(backoff).await;
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }
 }
 
-async fn run_socket(hub: &RemoteHub, first: &mut bool) -> Result<(), String> {
+async fn run_socket(
+    hub: &RemoteHub,
+    first: &mut bool,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
     use tokio_tungstenite::tungstenite::Message;
 
@@ -1450,19 +1699,88 @@ async fn run_socket(hub: &RemoteHub, first: &mut bool) -> Result<(), String> {
         .as_str()
         .into_client_request()
         .map_err(|e| e.to_string())?;
-    request.headers_mut().insert(
-        "authorization",
-        format!("Bearer {}", hub.token)
-            .parse()
-            .map_err(|_| "bad token".to_string())?,
-    );
+
+    let mut nonce = None;
+    if let (Some(material), Some(device_id)) = (&hub.material, &hub.device_id) {
+        let payload = EncryptedRequestPayload {
+            token: hub.token.clone(),
+            content_type: None,
+            body: String::new(),
+        };
+        let envelope = muqun_gateway::connectivity::transport::seal_version(
+            hub.transport_version,
+            material,
+            muqun_gateway::connectivity::transport::Direction::Request,
+            b"GET /api/ws",
+            &serde_json::to_vec(&payload).map_err(|e| e.to_string())?,
+            now_unix_ms(),
+        )
+        .map_err(|e| format!("seal ws: {e}"))?;
+        let sealed = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&envelope).map_err(|e| e.to_string())?);
+
+        let headers = request.headers_mut();
+        headers.insert(
+            "x-muqun-transport",
+            "1".parse()
+                .map_err(|e: reqwest::header::InvalidHeaderValue| e.to_string())?,
+        );
+        headers.insert(
+            "x-muqun-device",
+            device_id
+                .parse()
+                .map_err(|e: reqwest::header::InvalidHeaderValue| e.to_string())?,
+        );
+        headers.insert(
+            "x-muqun-envelope",
+            sealed
+                .parse()
+                .map_err(|e: reqwest::header::InvalidHeaderValue| e.to_string())?,
+        );
+        nonce = Some(envelope.nonce);
+    } else {
+        request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {}", hub.token)
+                .parse()
+                .map_err(|_| "bad token".to_string())?,
+        );
+    }
+
     let (mut socket, _) = tokio_tungstenite::connect_async(request)
         .await
         .map_err(|e| e.to_string())?;
-    socket
-        .send(Message::text(r#"{"t":"subscribe_all"}"#))
-        .await
-        .map_err(|e| e.to_string())?;
+
+    let mut codec: Option<ClientCodec> = None;
+    if let (Some(material), Some(request_nonce)) = (&hub.material, nonce) {
+        let first_msg = tokio::select! {
+            _ = shutdown.changed() => return Ok(()),
+            res = socket.next() => res.ok_or_else(|| "socket closed before hello".to_string())?.map_err(|e| e.to_string())?,
+        };
+        let first_text = match first_msg {
+            Message::Text(t) => t.to_string(),
+            _ => return Err("unexpected non-text frame before hello".into()),
+        };
+        let first_val: Value =
+            serde_json::from_str(&first_text).map_err(|e| format!("invalid hello json: {e}"))?;
+        let (mut client_codec, _hello) =
+            ClientCodec::open_first(&first_val, material, &request_nonce)
+                .map_err(|e| format!("hello open failed: {e}"))?;
+        let sub = client_codec
+            .seal(r#"{"t":"subscribe_all"}"#)
+            .map_err(|e| format!("seal subscribe: {e}"))?;
+        socket
+            .send(Message::text(sub))
+            .await
+            .map_err(|e| e.to_string())?;
+        codec = Some(client_codec);
+    } else {
+        socket
+            .send(Message::text(r#"{"t":"subscribe_all"}"#))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
     tracing::info!("event socket connected");
     hub.link.send_replace(None);
     if !std::mem::take(first) {
@@ -1472,22 +1790,47 @@ async fn run_socket(hub: &RemoteHub, first: &mut bool) -> Result<(), String> {
         });
         let _ = hub.task_events.send(TaskHubEvent::Resync);
     }
-    while let Some(message) = socket.next().await {
-        match message.map_err(|e| e.to_string())? {
-            Message::Text(text) => match parse_frame(text.as_str()) {
-                Some(Frame::Agent(event)) => {
-                    let _ = hub.events.send(*event);
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                let _ = socket.close(None).await;
+                return Ok(());
+            }
+            item = socket.next() => {
+                let Some(message) = item else {
+                    return Ok(());
+                };
+                let msg = message.map_err(|e| e.to_string())?;
+                let text = match msg {
+                    Message::Text(text) => {
+                        if let Some(c) = codec.as_mut() {
+                            let frame_val: Value =
+                                serde_json::from_str(&text).map_err(|e| e.to_string())?;
+                            c.open(&frame_val).map_err(|e| e.to_string())?
+                        } else {
+                            text.to_string()
+                        }
+                    }
+                    Message::Close(_) => return Ok(()),
+                    Message::Ping(payload) => {
+                        let _ = socket.send(Message::Pong(payload)).await;
+                        continue;
+                    }
+                    _ => continue,
+                };
+                match parse_frame(text.as_str()) {
+                    Some(Frame::Agent(event)) => {
+                        let _ = hub.events.send(*event);
+                    }
+                    Some(Frame::Task(event)) => {
+                        let _ = hub.task_events.send(event);
+                    }
+                    None => {}
                 }
-                Some(Frame::Task(event)) => {
-                    let _ = hub.task_events.send(event);
-                }
-                None => {}
-            },
-            Message::Close(_) => return Ok(()),
-            _ => {}
+            }
         }
     }
-    Ok(())
 }
 
 /// What one server frame carries: a session event, or a task change.
@@ -1698,5 +2041,81 @@ mod tests {
             map_error(503, &json!({"error": {"code": "agent_unavailable", "message": "Agent 'opencode' is not available"}}), "", ""),
             HubError::AgentUnavailable { agent, .. } if agent == "opencode"
         ));
+    }
+
+    #[test]
+    fn client_codec_round_trip() {
+        let material = b"test-material-32-bytes-long!!!!!";
+        let request_nonce = "test-request-nonce";
+        let connection_id = "test-connection-id";
+
+        // Server derives server key
+        let server_key = muqun_gateway::connectivity::transport::derive_ws_server_key(
+            material,
+            connection_id,
+            request_nonce,
+        )
+        .unwrap();
+
+        // Server seals hello at seq 0
+        let hello_aad = format!("GET /api/ws\n{connection_id}\n0");
+        let hello_c = muqun_gateway::connectivity::transport::seal_stream_event(
+            &server_key,
+            0,
+            hello_aad.as_bytes(),
+            br#"{"t":"hello"}"#,
+        )
+        .unwrap();
+        let first_frame = json!({
+            "seq": 0,
+            "cid": connection_id,
+            "c": hello_c,
+        });
+
+        // Client opens first frame
+        let (mut client_codec, hello_plain) =
+            ClientCodec::open_first(&first_frame, material, request_nonce).unwrap();
+        assert_eq!(hello_plain, r#"{"t":"hello"}"#);
+
+        // Client seals subscribe frame at send_seq 0
+        let sub_frame_wire = client_codec.seal(r#"{"t":"subscribe_all"}"#).unwrap();
+        let sub_val: Value = serde_json::from_str(&sub_frame_wire).unwrap();
+        assert_eq!(sub_val["seq"], 0);
+
+        // Server decrypts client frame using client key
+        let client_key = muqun_gateway::connectivity::transport::derive_ws_client_key(
+            material,
+            connection_id,
+            request_nonce,
+        )
+        .unwrap();
+        let client_aad = format!("GET /api/ws\n{connection_id}\n0");
+        let client_plain = muqun_gateway::connectivity::transport::open_stream_event(
+            &client_key,
+            0,
+            client_aad.as_bytes(),
+            sub_val["c"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(client_plain).unwrap(),
+            r#"{"t":"subscribe_all"}"#
+        );
+
+        // Server seals event at seq 1
+        let event_aad = format!("GET /api/ws\n{connection_id}\n1");
+        let event_c = muqun_gateway::connectivity::transport::seal_stream_event(
+            &server_key,
+            1,
+            event_aad.as_bytes(),
+            br#"{"t":"event"}"#,
+        )
+        .unwrap();
+        let event_frame = json!({
+            "seq": 1,
+            "c": event_c,
+        });
+        let event_plain = client_codec.open(&event_frame).unwrap();
+        assert_eq!(event_plain, r#"{"t":"event"}"#);
     }
 }

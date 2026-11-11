@@ -348,6 +348,8 @@ impl Core {
                                 computer: server_id.clone(),
                                 url,
                                 token: claimed.token.clone(),
+                                device_id: Some(claimed.device_id.clone()),
+                                transport_key: claimed.transport_key.clone(),
                             })
                         });
                         self.inbox.push(Update::ComputerPairingOutcome {
@@ -377,6 +379,8 @@ impl Core {
                             computer: server_id.clone(),
                             url,
                             token: token.clone(),
+                            device_id: None,
+                            transport_key: None,
                         })
                     });
                     self.inbox.push(Update::ComputerPairingOutcome {
@@ -899,6 +903,8 @@ impl Core {
                     crate::hub::RemoteHub::start(crate::hub::LocalGateway {
                         url: url.clone(),
                         token: token.clone(),
+                        device_id: profile.device_id.clone(),
+                        transport_key: profile.transport_key.clone(),
                     })
                     .ok()
                     .map(|h| h as Arc<dyn SessionHub>)
