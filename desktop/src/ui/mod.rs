@@ -107,6 +107,7 @@ pub struct ToastItem {
     pub id: u64,
     pub title: String,
     pub detail: Option<String>,
+    pub created_at: std::time::Instant,
 }
 
 const MAX_TOASTS: usize = 3;
@@ -118,6 +119,7 @@ pub(crate) const GALLERY_PAGE: usize = 36;
 /// [`UiState::persist_layout`] should look (set from the pane access
 /// functions, read by the inbox pump).
 static LAYOUT_DIRTY: AtomicBool = AtomicBool::new(false);
+static HAS_TOASTS: AtomicBool = AtomicBool::new(false);
 
 fn sidebar_pane(s: &mut UiState) -> &mut PaneState {
     LAYOUT_DIRTY.store(true, Ordering::Release);
@@ -951,15 +953,6 @@ impl UiState {
             self.send(Command::SwitchComputer(id.clone()));
             self.send(Command::Refresh);
         }
-
-        let name = self.computer_name(&id);
-        self.toast(
-            format!(
-                "{} {name}",
-                copy::t(self.cfg.general.language, "Switched to")
-            ),
-            None,
-        );
     }
 
     pub fn toast(&mut self, title: impl Into<String>, detail: Option<String>) {
@@ -968,10 +961,27 @@ impl UiState {
             id: self.toast_seq,
             title: title.into(),
             detail,
+            created_at: std::time::Instant::now(),
         });
         while self.toasts.len() > MAX_TOASTS {
             self.toasts.remove(0);
         }
+        HAS_TOASTS.store(true, Ordering::Release);
+    }
+
+    pub fn expire_toasts(&mut self) -> bool {
+        if self.toasts.is_empty() {
+            HAS_TOASTS.store(false, Ordering::Release);
+            return false;
+        }
+        let before = self.toasts.len();
+        self.toasts
+            .retain(|t| t.created_at.elapsed() < std::time::Duration::from_millis(3500));
+        let changed = self.toasts.len() != before;
+        if self.toasts.is_empty() {
+            HAS_TOASTS.store(false, Ordering::Release);
+        }
+        changed
     }
 
     pub fn token(&mut self, slot: Slot) -> u64 {
@@ -2768,7 +2778,11 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     pair_computer::mount(s, &k, &mut layer);
     if !s.toasts.is_empty() {
         let mut region = ToastRegion::new();
-        for t in &s.toasts {
+        for t in s
+            .toasts
+            .iter()
+            .filter(|t| t.created_at.elapsed() < std::time::Duration::from_millis(3500))
+        {
             let id = t.id;
             let mut toast = rune_kit::Toast::new(format!("toast-{id}"), t.title.clone())
                 .on_close(move |s: &mut UiState| s.toasts.retain(|t| t.id != id));
@@ -2792,6 +2806,11 @@ pub fn spawn_inbox_pump(inbox: Arc<Inbox>, handle: rune::AppHandle<UiState>) {
         .name("muqun-ui-inbox".into())
         .spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(16));
+            if HAS_TOASTS.load(Ordering::Acquire) {
+                handle.update(|s, _| {
+                    s.expire_toasts();
+                });
+            }
             let batch = inbox.take();
             if batch.is_empty() {
                 // A pane grip was touched: look at the widths once the
@@ -2804,4 +2823,28 @@ pub fn spawn_inbox_pump(inbox: Arc<Inbox>, handle: rune::AppHandle<UiState>) {
             handle.update(move |s, _| s.apply_updates(batch));
         })
         .expect("inbox pump");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toasts_expire_after_ttl() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut s = UiState::new(tx);
+        s.toast("Notice", None);
+        assert_eq!(s.toasts.len(), 1);
+        assert!(HAS_TOASTS.load(Ordering::Acquire));
+
+        // Not yet expired
+        assert!(!s.expire_toasts());
+        assert_eq!(s.toasts.len(), 1);
+
+        // Move created_at into the past
+        s.toasts[0].created_at = std::time::Instant::now() - std::time::Duration::from_millis(3600);
+        assert!(s.expire_toasts());
+        assert!(s.toasts.is_empty());
+        assert!(!HAS_TOASTS.load(Ordering::Acquire));
+    }
 }

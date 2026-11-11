@@ -882,6 +882,7 @@ impl Core {
         self.watched.lock().unwrap().clear();
         self.resolved.lock().unwrap().clear();
         self.last_seq.lock().unwrap().clear();
+        *self.refreshed_at.lock().unwrap() = None;
 
         let cfg = self.config.get();
         let maybe_new_hub: Option<Arc<dyn SessionHub>> = if target == "local" || target == "self" {
@@ -915,6 +916,12 @@ impl Core {
             self.hub.switch(new_hub);
             self.inbox.push(Update::HubMode(self.hub.mode()));
             self.refresh().await;
+        } else if target != "all" {
+            self.inbox.push(Update::Error(UiError {
+                message: format!("Computer '{target}' is not configured or unpaired"),
+                detail: Some("Check computer connection in Settings".into()),
+                unreachable: true,
+            }));
         }
     }
 
@@ -932,8 +939,16 @@ impl Core {
         }
         tokio::spawn(self.clone().refresh_tasks());
         tokio::spawn(self.clone().refresh_peers());
-        if let Ok(agents) = self.hub.agents().await {
-            self.inbox.push(Update::Agents(agents));
+        match self.hub.agents().await {
+            Ok(agents) => self.inbox.push(Update::Agents(agents)),
+            Err(err) => {
+                tracing::warn!(%err, "agents list failed during refresh");
+                self.inbox.push(Update::Error(UiError {
+                    message: format!("Could not reach computer: {err}"),
+                    detail: Some("Connection failed or authorization was refused".into()),
+                    unreachable: true,
+                }));
+            }
         }
         let attached = self.hub.attached().await.unwrap_or_default();
         self.spawn_lists(attached).await;
