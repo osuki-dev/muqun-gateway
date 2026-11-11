@@ -40,6 +40,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             s,
             k,
             tiles::toggle_clearance(s, crate::platform::titlebar_inset(cx.titlebar_inset())),
+            cx.env().scale,
             layer,
         ),
         Mode::Session => session(s, k, &look, layer),
@@ -103,7 +104,10 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     } else {
         0.0
     };
-    if s.term.mounted() && (s.term.open || (details.is_none() && !inspector_here)) {
+    let term_in_drawer = s.term.mounted()
+        && (s.term.open || (details.is_none() && !inspector_here))
+        && !s.has_terminal_tile();
+    if term_in_drawer {
         right_w = s.term.pane.shown_width();
         let scheme = if k.dark {
             crate::theme::color_scheme::ColorScheme::Dark
@@ -735,9 +739,10 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
         }
     }
     if s.mode != Mode::Home {
+        let has_term_tile = s.has_terminal_tile();
         bar = bar.trailing(
             IconButton::new(&super::terminal_panel::TERMINAL_WINDOW)
-                .variant(if s.term.open {
+                .variant(if s.term.open || has_term_tile {
                     IconButtonVariant::Contrast
                 } else {
                     IconButtonVariant::Ghost
@@ -747,8 +752,15 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
                     tr_ref(language, "Terminal"),
                     super::keymap::Action::ToggleTerminal,
                 ))
-                .on_press(|s: &mut UiState| {
-                    if s.term.open {
+                .on_press_tx(|s: &mut UiState, tx: &mut rune::Tx| {
+                    let mods = tx.mods();
+                    if mods.ctrl || mods.cmd || mods.alt {
+                        s.open_terminal_tile();
+                    } else if s.has_terminal_tile() {
+                        if let Some(i) = s.tile_of_terminal() {
+                            s.focus_tile(i);
+                        }
+                    } else if s.term.open {
                         s.close_terminal();
                     } else {
                         s.open_terminal();

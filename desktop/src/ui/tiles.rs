@@ -65,14 +65,14 @@ const PICK_ROWS: usize = 6;
 
 /// Put session `asid` into empty tile `i`.
 fn fill_tile(s: &mut UiState, i: usize, asid: &str) {
-    if s.tiles.get(i).is_none_or(|t| t.asid.is_some()) {
+    if s.tiles.get(i).is_none_or(|t| !t.is_empty()) {
         return;
     }
     if let Some(open) = s.tile_of(asid) {
         s.focus_tile(open);
         return;
     }
-    s.tiles[i].asid = Some(asid.to_string());
+    s.tiles[i].set_session(asid);
     s.tiles[i].slot = super::SessionSlot {
         draft: rune::TextEdit::new(s.cfg.general.drafts.get(asid).cloned().unwrap_or_default()),
         ..Default::default()
@@ -82,6 +82,24 @@ fn fill_tile(s: &mut UiState, i: usize, asid: &str) {
     )));
     s.focus_tile(i);
     s.sync_watch();
+    s.persist_tiles();
+}
+
+/// Put the interactive terminal into empty tile `i`.
+fn fill_terminal_tile(s: &mut UiState, i: usize) {
+    if s.tiles.get(i).is_none_or(|t| !t.is_empty()) {
+        return;
+    }
+    if let Some(open) = s.tile_of_terminal() {
+        s.focus_tile(open);
+        return;
+    }
+    s.close_terminal();
+    s.tiles[i].set_terminal();
+    if s.term.session.is_none() {
+        s.start_terminal();
+    }
+    s.focus_tile(i);
     s.persist_tiles();
 }
 
@@ -100,8 +118,7 @@ fn reach(language: crate::config::Language, i: usize) -> String {
 fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut Vec<El>) -> El {
     let language = s.cfg.general.language;
     let focused = i == s.focus;
-    let asid = s.tiles[i].asid.clone();
-    let info = asid.as_deref().and_then(|a| s.session_by_id(a));
+    let content = &s.tiles[i].content;
     let mut head = row()
         .key("tile-head")
         .w_full()
@@ -116,44 +133,136 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
     // One weight either way, so focus moving never reflows a title; only
     // its ink changes, cross-fading with the pane's scrim.
     let title_font = k.ty.ui_medium;
-    if let Some(info) = info {
-        let activity = s.activity(info);
-        head = head
-            .child(super::agents::mark(&info.agent_id, 14.0, s.dark).a11y_hidden())
-            .child(
-                text(title_of(info))
-                    .key("tile-title")
-                    .font(title_font)
-                    .color(if focused {
+    match content {
+        super::TileContent::Session(asid) => {
+            let info = s.session_by_id(asid);
+            if let Some(info) = info {
+                let activity = s.activity(info);
+                head = head
+                    .child(super::agents::mark(&info.agent_id, 14.0, s.dark).a11y_hidden())
+                    .child(
+                        text(title_of(info))
+                            .key("tile-title")
+                            .font(title_font)
+                            .color(if focused {
+                                k.c.text_base
+                            } else {
+                                k.c.text_muted
+                            })
+                            .motion(look.focus_fade())
+                            .truncate()
+                            .shrink()
+                            // The agent's name gives way first in a narrow pane.
+                            .min_w(48.0),
+                    )
+                    .child(
+                        text(s.agent_name(&info.agent_id))
+                            .key("tile-agent")
+                            .font(k.ty.small)
+                            .color(k.c.text_faint)
+                            .truncate()
+                            .shrink()
+                            .min_w(0.0),
+                    );
+                if let Some(mark) = status_mark(k, look, activity, language) {
+                    head = head.child(mark);
+                }
+            } else {
+                head = head.child(text(asid.clone()).key("tile-title").font(title_font).color(
+                    if focused {
                         k.c.text_base
                     } else {
                         k.c.text_muted
-                    })
-                    .motion(look.focus_fade())
-                    .truncate()
-                    .shrink()
-                    // The agent's name gives way first in a narrow pane.
-                    .min_w(48.0),
-            )
-            .child(
-                text(s.agent_name(&info.agent_id))
-                    .key("tile-agent")
-                    .font(k.ty.small)
-                    .color(k.c.text_faint)
-                    .truncate()
-                    .shrink()
-                    .min_w(0.0),
-            );
-        if let Some(mark) = status_mark(k, look, activity, language) {
-            head = head.child(mark);
+                    },
+                ));
+            }
         }
-    } else {
-        head = head.child(
-            text(tr(language, "Pick a session"))
-                .key("tile-title")
-                .font(title_font)
-                .color(k.c.text_muted),
-        );
+        super::TileContent::Terminal => {
+            let title = s.term_active_title();
+            head = head
+                .child(
+                    rune::icon(&super::terminal_panel::TERMINAL_WINDOW, 14.0)
+                        .color(if focused {
+                            k.c.text_accent
+                        } else {
+                            k.c.icon_muted
+                        })
+                        .a11y_hidden(),
+                )
+                .child(
+                    text(title)
+                        .key("tile-title")
+                        .font(title_font)
+                        .color(if focused {
+                            k.c.text_base
+                        } else {
+                            k.c.text_muted
+                        })
+                        .motion(look.focus_fade())
+                        .truncate()
+                        .shrink()
+                        .min_w(48.0),
+                )
+                .child(
+                    text(tr(language, "Terminal"))
+                        .key("tile-agent")
+                        .font(k.ty.small)
+                        .color(k.c.text_faint)
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0),
+                );
+        }
+        super::TileContent::Diff(path) => {
+            head = head
+                .child(
+                    rune::icon(&super::icons::BRANCH, 14.0)
+                        .color(k.c.text_accent)
+                        .a11y_hidden(),
+                )
+                .child(
+                    text(format!("Diff: {path}"))
+                        .key("tile-title")
+                        .font(title_font)
+                        .color(if focused {
+                            k.c.text_base
+                        } else {
+                            k.c.text_muted
+                        }),
+                );
+        }
+        super::TileContent::Custom { title, kind, .. } => {
+            head = head
+                .child(
+                    rune::icon(&super::icons::GRID, 14.0)
+                        .color(k.c.text_accent)
+                        .a11y_hidden(),
+                )
+                .child(
+                    text(title.clone())
+                        .key("tile-title")
+                        .font(title_font)
+                        .color(if focused {
+                            k.c.text_base
+                        } else {
+                            k.c.text_muted
+                        }),
+                )
+                .child(
+                    text(kind.clone())
+                        .key("tile-agent")
+                        .font(k.ty.small)
+                        .color(k.c.text_faint),
+                );
+        }
+        super::TileContent::Empty => {
+            head = head.child(
+                text(tr(language, "Pick a session"))
+                    .key("tile-title")
+                    .font(title_font)
+                    .color(k.c.text_muted),
+            );
+        }
     }
     // The header row stands where a title bar would: its empty middle
     // moves the window.
@@ -205,25 +314,44 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
             );
         }
     }
-    if let Some(a) = asid.clone() {
-        menu = menu.item(MenuItem::new(tr(language, "Show only this one")).on_select(
-            move |s: &mut UiState| {
-                // Keep this session, drop the other panes.
-                if let Some(at) = s.tile_of(&a) {
-                    s.focus_tile(at);
-                }
-                let mut j = s.tiles.len();
-                while j > 0 {
-                    j -= 1;
-                    if s.tiles
-                        .get(j)
-                        .is_some_and(|t| t.asid.as_deref() != Some(a.as_str()))
-                    {
-                        s.close_tile(j);
+    match content {
+        super::TileContent::Session(a) => {
+            let a = a.clone();
+            menu = menu.item(MenuItem::new(tr(language, "Show only this one")).on_select(
+                move |s: &mut UiState| {
+                    if let Some(at) = s.tile_of(&a) {
+                        s.focus_tile(at);
                     }
-                }
-            },
-        ));
+                    let mut j = s.tiles.len();
+                    while j > 0 {
+                        j -= 1;
+                        if s.tiles
+                            .get(j)
+                            .is_some_and(|t| t.asid.as_deref() != Some(a.as_str()))
+                        {
+                            s.close_tile(j);
+                        }
+                    }
+                },
+            ));
+        }
+        super::TileContent::Terminal => {
+            menu = menu.item(MenuItem::new(tr(language, "Show only this one")).on_select(
+                move |s: &mut UiState| {
+                    if let Some(at) = s.tile_of_terminal() {
+                        s.focus_tile(at);
+                    }
+                    let mut j = s.tiles.len();
+                    while j > 0 {
+                        j -= 1;
+                        if s.tiles.get(j).is_some_and(|t| !t.is_terminal()) {
+                            s.close_tile(j);
+                        }
+                    }
+                },
+            ));
+        }
+        _ => {}
     }
     menu = menu
         .separator()
@@ -299,9 +427,10 @@ fn window_actions(s: &UiState, k: &Kit) -> El {
                 .key("split-add"),
         );
     }
+    let has_term_tile = s.has_terminal_tile();
     out.child(
         IconButton::new(&super::terminal_panel::TERMINAL_WINDOW)
-            .variant(if s.term.open {
+            .variant(if s.term.open || has_term_tile {
                 IconButtonVariant::Contrast
             } else {
                 IconButtonVariant::GhostMuted
@@ -309,8 +438,15 @@ fn window_actions(s: &UiState, k: &Kit) -> El {
             .control_size(ControlSize::Small)
             .label(tr_ref(language, "Terminal"))
             .help(tip(tr_ref(language, "Terminal"), Action::ToggleTerminal))
-            .on_press(|s: &mut UiState| {
-                if s.term.open {
+            .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
+                let mods = tx.mods();
+                if mods.ctrl || mods.cmd || mods.alt {
+                    s.open_terminal_tile();
+                } else if s.has_terminal_tile() {
+                    if let Some(i) = s.tile_of_terminal() {
+                        s.focus_tile(i);
+                    }
+                } else if s.term.open {
                     s.close_terminal();
                 } else {
                     s.open_terminal();
@@ -497,6 +633,31 @@ fn picker(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         }
         list = list.child(look.pressable(k, look.row_card(k, line, 10.0)));
     }
+    let mut actions = row().gap(8.0).center_y();
+    actions = actions.child(
+        Button::new(tr_ref(language, "New session…"))
+            .variant(ButtonVariant::Outline)
+            .control_size(ControlSize::Regular)
+            .on_press(move |s: &mut UiState| {
+                s.pending_tile = Some(i);
+                s.go(Mode::Home);
+            })
+            .build(k)
+            .key(format!("tile-new-{i}")),
+    );
+    if !s.has_terminal_tile() {
+        actions = actions.child(
+            Button::new(tr_ref(language, "Terminal"))
+                .icon(&super::terminal_panel::TERMINAL_WINDOW)
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Regular)
+                .on_press(move |s: &mut UiState| {
+                    fill_terminal_tile(s, i);
+                })
+                .build(k)
+                .key(format!("tile-term-{i}")),
+        );
+    }
     col()
         .key("tile-empty")
         .grow(1.0)
@@ -511,17 +672,7 @@ fn picker(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
                 .color(k.c.text_base),
         )
         .child(list)
-        .child(
-            Button::new(tr_ref(language, "New session…"))
-                .variant(ButtonVariant::Outline)
-                .control_size(ControlSize::Regular)
-                .on_press(move |s: &mut UiState| {
-                    s.pending_tile = Some(i);
-                    s.go(Mode::Home);
-                })
-                .build(k)
-                .key(format!("tile-new-{i}")),
-        )
+        .child(actions)
 }
 
 /// Where pane `i` sits among the others, for what its header carries.
@@ -536,13 +687,24 @@ struct Place {
 
 /// Pane `i` as its own card: a rounded floor like the sidebar's, a header
 /// line, its timeline and composer.
-fn tile(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut Vec<El>) -> El {
+fn tile(
+    s: &UiState,
+    k: &Kit,
+    look: &Look,
+    i: usize,
+    place: Place,
+    scale: f32,
+    layer: &mut Vec<El>,
+) -> El {
     let focused = i == s.focus;
     let t = &s.tiles[i];
-    let id = t
-        .asid
-        .clone()
-        .map_or_else(|| format!("tile-empty-{i}"), |a| format!("tile-{a}"));
+    let id = match &t.content {
+        super::TileContent::Session(asid) => format!("tile-{asid}"),
+        super::TileContent::Terminal => "tile-terminal".to_string(),
+        super::TileContent::Diff(p) => format!("tile-diff-{p}"),
+        super::TileContent::Custom { id, .. } => format!("tile-custom-{id}"),
+        super::TileContent::Empty => format!("tile-empty-{i}"),
+    };
     let radius = k.radius.lg;
     let (under, over) = super::shell::card_floor_colors(k, look);
     let mut body = col()
@@ -574,9 +736,17 @@ fn tile(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut V
             .fill(k.c.border_muted)
             .a11y_hidden(),
     );
-    match (&t.asid, focused) {
-        (None, _) => body = body.child(picker(s, k, look, i)),
-        (Some(_), true) => {
+    match (&t.content, focused) {
+        (super::TileContent::Empty, _) => body = body.child(picker(s, k, look, i)),
+        (super::TileContent::Terminal, _) => {
+            let scheme = if k.dark {
+                crate::theme::color_scheme::ColorScheme::Dark
+            } else {
+                crate::theme::color_scheme::ColorScheme::Light
+            };
+            body = body.child(super::terminal_panel::tile_body(s, k, scheme, scale, layer));
+        }
+        (super::TileContent::Session(_), true) => {
             let feed = if s.show_diff {
                 timeline::changes(s, k)
             } else {
@@ -587,11 +757,12 @@ fn tile(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut V
                 .on_drop_hover(|s: &mut UiState, over, _| s.drop_hover = over);
             body = body.child(feed).child(composer::view(s, k, layer));
         }
-        (Some(asid), false) => {
+        (super::TileContent::Session(asid), false) => {
             body = body
                 .child(timeline::session_view(s, k, asid))
                 .child(parked_composer(s, k, look, i));
         }
+        _ => {}
     }
     // Focus is contrast: the other panes' content sits a step back under a
     // scrim of the card's own colour (one quad, no layer, no blur) that
@@ -710,7 +881,7 @@ pub fn toggle_clearance(s: &UiState, inset: f32) -> f32 {
 /// The panes, each its own card on the window with gaps between (the
 /// main card steps aside for them); `clear` keeps the top-left header
 /// clear of the window's corner ([`toggle_clearance`]).
-pub fn view(s: &UiState, k: &Kit, clear: f32, layer: &mut Vec<El>) -> El {
+pub fn view(s: &UiState, k: &Kit, clear: f32, scale: f32, layer: &mut Vec<El>) -> El {
     let look = s.look();
     let tree = s.tile_layout();
     let [w, h] = s.tile_grid;
@@ -731,7 +902,7 @@ pub fn view(s: &UiState, k: &Kit, clear: f32, layer: &mut Vec<El>) -> El {
                 clear: if Some(i) == top_left { clear } else { 0.0 },
                 corner: Some(i) == top_right,
             };
-            Some(tile(s, k, &look, i, place, layer))
+            Some(tile(s, k, &look, i, place, scale, layer))
         })
         .collect();
     let body = arrange(
@@ -765,7 +936,7 @@ pub fn view(s: &UiState, k: &Kit, clear: f32, layer: &mut Vec<El>) -> El {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::{SessionSlot, Tile};
+    use crate::ui::Tile;
     use muqun_gateway::agents::AgentSessionInfo;
     use rune::TextEdit;
 
@@ -782,10 +953,7 @@ mod tests {
         }))
         .unwrap();
         s.sessions = vec![session];
-        s.tiles = vec![Tile {
-            asid: Some("s1".into()),
-            slot: SessionSlot::default(),
-        }];
+        s.tiles = vec![Tile::session("s1")];
 
         let k = Kit::neutral(s.dark);
         let look = s.look();
@@ -802,5 +970,54 @@ mod tests {
         // Test with busy status
         s.sessions[0].status = muqun_gateway::agents::AgentSessionStatus::Busy;
         let _el_busy = parked_composer(&s, &k, &look, 0);
+    }
+
+    #[test]
+    fn terminal_tile_lifecycle_and_split_operations() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.open_session("s1");
+        assert_eq!(s.selected.as_deref(), Some("s1"));
+        assert!(!s.in_split());
+
+        // Open terminal beside the current session
+        s.open_terminal_tile();
+        assert!(s.in_split());
+        assert_eq!(s.tiles.len(), 2);
+        assert!(s.tiles[0].is_session());
+        assert_eq!(s.tiles[0].asid.as_deref(), Some("s1"));
+        assert!(s.tiles[1].is_terminal());
+        assert!(s.has_terminal_tile());
+        assert_eq!(s.focus, 1);
+        assert!(s.term.sink.focused);
+
+        // Focus session tile
+        s.focus_tile(0);
+        assert_eq!(s.focus, 0);
+        assert!(s.draft.focused);
+        assert!(!s.term.sink.focused);
+
+        // Focus back to terminal tile
+        s.focus_tile(1);
+        assert_eq!(s.focus, 1);
+        assert!(!s.draft.focused);
+        assert!(s.term.sink.focused);
+
+        // Swap tiles
+        s.swap_tiles(0, 1);
+        assert!(s.tiles[0].is_terminal());
+        assert!(s.tiles[1].is_session());
+        assert_eq!(s.focus, 0);
+
+        // Persist and restore
+        s.persist_tiles();
+        assert_eq!(s.cfg.ui.tiles, vec!["terminal", "s1"]);
+
+        // Close terminal tile
+        s.close_tile(0);
+        assert_eq!(s.tiles.len(), 0);
+        assert_eq!(s.selected.as_deref(), Some("s1"));
+        assert!(!s.in_split());
+        assert!(!s.has_terminal_tile());
     }
 }

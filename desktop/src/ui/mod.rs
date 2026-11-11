@@ -201,12 +201,139 @@ pub struct SessionSlot {
     pub saved_permissions: Vec<SavedPermission>,
 }
 
-/// One pane of the split session view. `asid` is `None` while the tile
-/// waits for a session to be picked into it.
+/// What kind of window or view is hosted in a split tile.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TileContent {
+    /// Waiting for content to be picked into it.
+    #[default]
+    Empty,
+    /// An AI agent chat session.
+    Session(String),
+    /// An embedded interactive terminal.
+    Terminal,
+    /// A git diff / working tree comparison view.
+    #[allow(dead_code)]
+    Diff(String),
+    /// A generic custom or extension window.
+    #[allow(dead_code)]
+    Custom {
+        id: String,
+        kind: String,
+        title: String,
+    },
+}
+
+impl TileContent {
+    pub fn is_empty(&self) -> bool {
+        matches!(self, TileContent::Empty)
+    }
+
+    #[allow(dead_code)]
+    pub fn is_session(&self) -> bool {
+        matches!(self, TileContent::Session(_))
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, TileContent::Terminal)
+    }
+
+    #[allow(dead_code)]
+    pub fn asid(&self) -> Option<&str> {
+        match self {
+            TileContent::Session(ref id) => Some(id),
+            _ => None,
+        }
+    }
+
+    pub fn to_persist_key(&self) -> Option<String> {
+        match self {
+            TileContent::Empty => None,
+            TileContent::Session(id) => Some(id.clone()),
+            TileContent::Terminal => Some("terminal".to_string()),
+            TileContent::Diff(path) => Some(format!("diff:{path}")),
+            TileContent::Custom { id, kind, .. } => Some(format!("custom:{kind}:{id}")),
+        }
+    }
+
+    pub fn from_persist_key(key: &str) -> Self {
+        if key == "terminal" {
+            TileContent::Terminal
+        } else if let Some(path) = key.strip_prefix("diff:") {
+            TileContent::Diff(path.to_string())
+        } else if let Some(rest) = key.strip_prefix("session:") {
+            TileContent::Session(rest.to_string())
+        } else if let Some(rest) = key.strip_prefix("custom:") {
+            let mut parts = rest.splitn(2, ':');
+            let kind = parts.next().unwrap_or("").to_string();
+            let id = parts.next().unwrap_or("").to_string();
+            TileContent::Custom {
+                id,
+                kind,
+                title: "Window".to_string(),
+            }
+        } else {
+            TileContent::Session(key.to_string())
+        }
+    }
+}
+
+/// One pane of the split session view.
 #[derive(Default)]
 pub struct Tile {
+    pub content: TileContent,
     pub asid: Option<String>,
     pub slot: SessionSlot,
+}
+
+impl Tile {
+    pub fn empty() -> Self {
+        Self {
+            content: TileContent::Empty,
+            asid: None,
+            slot: SessionSlot::default(),
+        }
+    }
+
+    pub fn session(asid: impl Into<String>) -> Self {
+        let asid = asid.into();
+        Self {
+            content: TileContent::Session(asid.clone()),
+            asid: Some(asid),
+            slot: SessionSlot::default(),
+        }
+    }
+
+    pub fn terminal() -> Self {
+        Self {
+            content: TileContent::Terminal,
+            asid: None,
+            slot: SessionSlot::default(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.content.is_empty()
+    }
+
+    #[allow(dead_code)]
+    pub fn is_session(&self) -> bool {
+        self.content.is_session()
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.content.is_terminal()
+    }
+
+    pub fn set_session(&mut self, asid: impl Into<String>) {
+        let asid = asid.into();
+        self.asid = Some(asid.clone());
+        self.content = TileContent::Session(asid);
+    }
+
+    pub fn set_terminal(&mut self) {
+        self.asid = None;
+        self.content = TileContent::Terminal;
+    }
 }
 
 /// How many sessions may be open side by side.
@@ -1469,6 +1596,14 @@ impl UiState {
             .position(|t| t.asid.as_deref() == Some(asid))
     }
 
+    pub fn tile_of_terminal(&self) -> Option<usize> {
+        self.tiles.iter().position(|t| t.is_terminal())
+    }
+
+    pub fn has_terminal_tile(&self) -> bool {
+        self.tiles.iter().any(|t| t.is_terminal())
+    }
+
     /// Move the focused session's view state out of the top-level fields.
     fn take_slot(&mut self) -> SessionSlot {
         SessionSlot {
@@ -1501,8 +1636,8 @@ impl UiState {
         self.saved_permissions = slot.saved_permissions;
     }
 
-    /// Give tile `i` the keyboard: its session becomes the one the top-level
-    /// fields describe, the old focused tile keeps its state in its slot.
+    /// Give tile `i` the keyboard: its session or window becomes active,
+    /// and the old focused tile keeps its state in its slot.
     pub fn focus_tile(&mut self, i: usize) {
         if i >= self.tiles.len() {
             self.mode = Mode::Session;
@@ -1510,14 +1645,25 @@ impl UiState {
         }
         if i == self.focus {
             self.mode = Mode::Session;
-            if self.selected != self.tiles[i].asid {
-                self.selected = self.tiles[i].asid.clone();
-                self.sync_watch();
-                if self.catalog.is_none() {
-                    if let Some(info) = self.current().cloned() {
-                        self.session_opened(&info);
+            match &self.tiles[i].content {
+                TileContent::Session(asid) => {
+                    if self.selected.as_ref() != Some(asid) {
+                        self.selected = Some(asid.clone());
+                        self.sync_watch();
+                        if self.catalog.is_none() {
+                            if let Some(info) = self.current().cloned() {
+                                self.session_opened(&info);
+                            }
+                        }
                     }
+                    self.draft.focused = true;
+                    self.term.sink.focused = false;
                 }
+                TileContent::Terminal => {
+                    self.term.sink.focused = true;
+                    self.draft.focused = false;
+                }
+                _ => {}
             }
             return;
         }
@@ -1529,11 +1675,30 @@ impl UiState {
         self.selected = self.tiles[i].asid.clone();
         self.menu = None;
         self.mode = Mode::Session;
-        self.sync_watch();
-        if self.catalog.is_none() {
-            if let Some(info) = self.current().cloned() {
-                self.session_opened(&info);
+
+        match &self.tiles[i].content {
+            TileContent::Session(_) => {
+                self.draft.focused = true;
+                self.term.sink.focused = false;
+                self.sync_watch();
+                if self.catalog.is_none() {
+                    if let Some(info) = self.current().cloned() {
+                        self.session_opened(&info);
+                    }
+                }
             }
+            TileContent::Terminal => {
+                self.term.sink.focused = true;
+                self.draft.focused = false;
+                if self.term.session.is_none() {
+                    self.start_terminal();
+                }
+            }
+            TileContent::Empty => {
+                self.draft.focused = false;
+                self.term.sink.focused = false;
+            }
+            _ => {}
         }
     }
 
@@ -1566,14 +1731,11 @@ impl UiState {
                 self.open_here(asid);
                 return;
             };
-            self.tiles.push(Tile {
-                asid: Some(current),
-                slot: SessionSlot::default(),
-            });
+            self.tiles.push(Tile::session(current));
             self.focus = 0;
             self.tile_tree = crate::config::TileNode::Leaf(0);
         }
-        let at = match self.tiles.iter().position(|t| t.asid.is_none()) {
+        let at = match self.tiles.iter().position(|t| t.is_empty()) {
             Some(empty) => empty,
             None if self.tiles.len() < MAX_TILES => self.add_tile(),
             None => {
@@ -1581,7 +1743,7 @@ impl UiState {
                 return;
             }
         };
-        self.tiles[at].asid = Some(asid.to_string());
+        self.tiles[at].set_session(asid);
         self.tiles[at].slot = SessionSlot {
             draft: TextEdit::new(
                 self.cfg
@@ -1600,16 +1762,52 @@ impl UiState {
         self.persist_tiles();
     }
 
+    /// Open the terminal in a split tile beside the current view.
+    pub fn open_terminal_tile(&mut self) {
+        if let Some(i) = self.tile_of_terminal() {
+            self.focus_tile(i);
+            return;
+        }
+        self.close_terminal();
+        self.right_open = false;
+        self.right.set_open(false);
+
+        if self.tiles.is_empty() {
+            let current = self.selected.clone();
+            self.tiles.push(Tile {
+                content: match &current {
+                    Some(asid) => TileContent::Session(asid.clone()),
+                    None => TileContent::Empty,
+                },
+                asid: current,
+                slot: SessionSlot::default(),
+            });
+            self.focus = 0;
+            self.tile_tree = crate::config::TileNode::Leaf(0);
+        }
+
+        let at = match self.tiles.iter().position(|t| t.is_empty()) {
+            Some(empty) => empty,
+            None if self.tiles.len() < MAX_TILES => self.add_tile(),
+            None => self.focus,
+        };
+
+        self.tiles[at].set_terminal();
+        self.mode = Mode::Session;
+        if self.term.session.is_none() {
+            self.start_terminal();
+        }
+        self.focus_tile(at);
+        self.persist_tiles();
+    }
+
     /// An empty tile splitting the focused one; its index.
     fn add_tile(&mut self) -> usize {
         let mut tree = self.tile_layout();
         let new = self.tiles.len();
         dwindle::insert(&mut tree, self.focus, new, self.tile_grid);
         self.tile_tree = tree;
-        self.tiles.push(Tile {
-            asid: None,
-            slot: SessionSlot::default(),
-        });
+        self.tiles.push(Tile::empty());
         new
     }
 
@@ -1646,10 +1844,7 @@ impl UiState {
             let Some(current) = self.selected.clone() else {
                 return;
             };
-            self.tiles.push(Tile {
-                asid: Some(current),
-                slot: SessionSlot::default(),
-            });
+            self.tiles.push(Tile::session(current));
             self.focus = 0;
             self.tile_tree = crate::config::TileNode::Leaf(0);
         }
@@ -1709,10 +1904,17 @@ impl UiState {
             }
         }
         if self.tiles.len() <= 1 {
+            let last_tile = self.tiles.pop();
             self.tiles.clear();
             self.tile_tree = crate::config::TileNode::Leaf(0);
             self.focus = 0;
-            if self.selected.is_none() {
+            if let Some(tile) = last_tile {
+                if let Some(asid) = tile.asid {
+                    self.open_session(&asid);
+                } else if tile.is_terminal() {
+                    self.open_terminal();
+                }
+            } else if self.selected.is_none() {
                 self.mode = Mode::Home;
             }
         }
@@ -1750,10 +1952,14 @@ impl UiState {
     /// Remember the split for the next launch: its sessions and their
     /// tiling, empty panes left out.
     pub fn persist_tiles(&mut self) {
-        let asids: Vec<String> = self.tiles.iter().filter_map(|t| t.asid.clone()).collect();
+        let asids: Vec<String> = self
+            .tiles
+            .iter()
+            .filter_map(|t| t.content.to_persist_key())
+            .collect();
         let mut layout = (self.tiles.len() >= 2).then(|| self.tile_layout());
         for (i, t) in self.tiles.iter().enumerate().rev() {
-            if t.asid.is_none() {
+            if t.is_empty() {
                 layout = layout.and_then(|l| dwindle::remove(l, i));
             }
         }
@@ -1777,7 +1983,15 @@ impl UiState {
             .ui
             .tiles
             .iter()
-            .filter(|a| self.session_by_id(a).is_some())
+            .filter(|key| {
+                if key.as_str() == "terminal" {
+                    true
+                } else if let Some(asid) = key.strip_prefix("session:") {
+                    self.session_by_id(asid).is_some()
+                } else {
+                    self.session_by_id(key).is_some()
+                }
+            })
             .cloned()
             .collect();
         // Lists arrive agent by agent: wait for every saved tile, or for
@@ -1797,9 +2011,26 @@ impl UiState {
             return;
         }
         self.tiles_restored = true;
-        self.open_session(&saved[0]);
-        for asid in &saved[1..] {
-            self.open_in_tile(asid);
+        self.tiles.clear();
+        for key in &saved {
+            match TileContent::from_persist_key(key) {
+                TileContent::Terminal => self.tiles.push(Tile::terminal()),
+                TileContent::Session(asid) => self.tiles.push(Tile::session(asid)),
+                TileContent::Diff(path) => self.tiles.push(Tile {
+                    content: TileContent::Diff(path),
+                    asid: None,
+                    slot: SessionSlot::default(),
+                }),
+                TileContent::Custom { id, kind, title } => self.tiles.push(Tile {
+                    content: TileContent::Custom { id, kind, title },
+                    asid: None,
+                    slot: SessionSlot::default(),
+                }),
+                TileContent::Empty => self.tiles.push(Tile::empty()),
+            }
+        }
+        if let Some(first_asid) = self.tiles.iter().find_map(|t| t.asid.clone()) {
+            self.open_session(&first_asid);
         }
         // The saved tiling, when every saved pane came back.
         if let Some(layout) = self.cfg.ui.tile_layout.clone() {

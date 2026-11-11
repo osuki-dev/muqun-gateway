@@ -468,16 +468,13 @@ fn split2(s: &mut UiState) {
     timeline(s);
     diff_stat(s);
     s.tiles = vec![
+        Tile::session("s1"),
         Tile {
-            asid: Some("s1".into()),
-            slot: SessionSlot::default(),
-        },
-        Tile {
-            asid: Some("s2".into()),
             slot: SessionSlot {
                 draft: TextEdit::new("Also check the Chinese copy"),
                 ..SessionSlot::default()
             },
+            ..Tile::session("s2")
         },
     ];
     s.timelines.insert(
@@ -511,26 +508,10 @@ fn split4(s: &mut UiState) {
     ));
     timeline(s);
     s.tiles = vec![
-        Tile {
-            asid: Some("s1".into()),
-            slot: SessionSlot::default(),
-        },
-        Tile {
-            asid: Some("s2".into()),
-            slot: SessionSlot {
-                ..SessionSlot::default()
-            },
-        },
-        Tile {
-            asid: Some("s4".into()),
-            slot: SessionSlot {
-                ..SessionSlot::default()
-            },
-        },
-        Tile {
-            asid: None,
-            slot: SessionSlot::default(),
-        },
+        Tile::session("s1"),
+        Tile::session("s2"),
+        Tile::session("s4"),
+        Tile::empty(),
     ];
     s.timelines.insert("s2".into(), {
         let mut tl = super::timeline::SessionTimeline::default();

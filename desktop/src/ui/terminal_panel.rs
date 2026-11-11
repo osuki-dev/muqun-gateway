@@ -352,6 +352,21 @@ impl UiState {
     /// Ctrl+`: open and focus; focused, close and hand the keyboard back;
     /// open but elsewhere, take the keyboard.
     pub fn toggle_terminal(&mut self) {
+        if let Some(i) = self.tile_of_terminal() {
+            if self.focus == i && self.term.sink.focused {
+                let next = if i > 0 {
+                    i - 1
+                } else if self.tiles.len() > 1 {
+                    1
+                } else {
+                    0
+                };
+                self.focus_tile(next);
+            } else {
+                self.focus_tile(i);
+            }
+            return;
+        }
         if !self.term.open {
             self.open_terminal();
         } else if self.term.sink.focused {
@@ -609,7 +624,22 @@ impl UiState {
             .unwrap_or_else(|| PathBuf::from("/"))
     }
 
-    fn start_terminal(&mut self) {
+    pub fn term_active_title(&self) -> String {
+        let frame = self.term.frame.as_ref();
+        if let Some(t) = frame.map(|f| f.title.clone()).filter(|t| !t.is_empty()) {
+            t
+        } else {
+            let cwd = self
+                .term
+                .session
+                .as_ref()
+                .map(|x| x.cwd.clone())
+                .unwrap_or_else(|| self.terminal_cwd());
+            short_path(&cwd)
+        }
+    }
+
+    pub(crate) fn start_terminal(&mut self) {
         let cwd = self.terminal_cwd();
         self.start_terminal_in(cwd);
     }
@@ -667,10 +697,20 @@ impl UiState {
     /// The grid was laid out at `[x, y, w, h]`: the shell's size follows.
     /// Hidden, the shell keeps the size it had.
     fn terminal_layout(&mut self, rect: [f32; 4], scale: f32) {
-        if !self.term.open || rect[2] < 40.0 || rect[3] < 20.0 {
+        if (!self.term.open && !self.has_terminal_tile()) || rect[2] < 40.0 || rect[3] < 20.0 {
             return;
         }
-        let size = grid_size(self.term.pane.width(), rect[3], metrics(), scale);
+        let m = metrics();
+        let size = if self.has_terminal_tile() {
+            Size {
+                cols: (((rect[2] - 2.0 * INSET) / m.cw).floor() as u16).max(2),
+                rows: ((rect[3] / m.ch).floor() as u16).max(1),
+                cell_w: (m.cw * scale).round().max(1.0) as u32,
+                cell_h: (m.ch * scale).round().max(1.0) as u32,
+            }
+        } else {
+            grid_size(self.term.pane.width(), rect[3], m, scale)
+        };
         if self.term.size == Some(size)
             && (self.term.session.is_some() || self.term.frame.is_some())
         {
@@ -783,6 +823,11 @@ impl UiState {
 
     /// A key while the terminal has the keyboard (the sink's key handler).
     pub(crate) fn terminal_key(&mut self, ev: &KeyEvent, tx: &mut Tx) -> bool {
+        // Split view pane navigation from terminal:
+        if self.in_split() && super::tiles::arrow_key(self, ev) {
+            return true;
+        }
+
         let mac = crate::platform::keys::Style::current() == crate::platform::keys::Style::Symbols;
         let letter =
             |c: char| matches!(&ev.key, rune::Key::Command(k) if k.eq_ignore_ascii_case(&c));
@@ -1082,6 +1127,15 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
                 .key("terminal-restart"),
         )
         .child(
+            IconButton::new(&super::icons::PLUS)
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .label(tr_ref(language, "Add to split view"))
+                .on_press(|s: &mut UiState| s.open_terminal_tile())
+                .build(k)
+                .key("terminal-dock-split"),
+        )
+        .child(
             IconButton::new(k.glyph.close)
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
@@ -1120,6 +1174,202 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         .min_h(0.0)
         .child(header)
         .child(el().w_full().h(1.0).fill(k.alpha(k.c.border_weak, 0.35)))
+        .child(body)
+}
+
+/// The embedded terminal content inside a split tile.
+pub fn tile_body(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut Vec<El>) -> El {
+    let language = s.cfg.general.language;
+    let colors = colors(k, scheme);
+    s.term.want.set(Some(colors));
+    let m = metrics();
+    let frame = s.term.frame.as_ref();
+    let bg = color(frame.map_or(colors.bg, |f| f.bg));
+    let ended = s
+        .term
+        .session
+        .as_ref()
+        .and_then(Session::ended)
+        .or(s.term.fixture_ended);
+
+    let tab_count = s.term.tabs.len().max(1);
+    let mut tabs_strip = row()
+        .key("tile-terminal-tabs-strip")
+        .gap(4.0)
+        .center_y()
+        .shrink()
+        .min_w(0.0)
+        .grow(1.0);
+
+    for i in 0..tab_count {
+        let is_active = i == s.term.active_tab;
+        let tab_title = if is_active {
+            frame
+                .map(|f| f.title.clone())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| {
+                    let cwd = s
+                        .term
+                        .session
+                        .as_ref()
+                        .map(|x| x.cwd.clone())
+                        .unwrap_or_else(|| s.terminal_cwd());
+                    short_path(&cwd)
+                })
+        } else if let Some(tab) = s.term.tabs.get(i) {
+            tab.frame
+                .as_ref()
+                .map(|f| f.title.clone())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| short_path(&tab.cwd))
+        } else {
+            format!("Tab {}", i + 1)
+        };
+
+        let (bg_color, fg_color, border_color) = if is_active {
+            (
+                k.c.surface_raised,
+                k.c.text_base,
+                k.alpha(k.c.border_weak, 0.45),
+            )
+        } else {
+            (
+                k.c.bg_base.alpha(0.0),
+                k.c.text_muted,
+                k.c.border_base.alpha(0.0),
+            )
+        };
+
+        let close_tab = if tab_count > 1 {
+            Some(
+                IconButton::new(k.glyph.close)
+                    .variant(IconButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
+                    .label(tr_ref(language, "Close tab"))
+                    .on_press(move |s: &mut UiState| {
+                        s.term_close_tab(i);
+                        s.term.sink.focused = true;
+                    })
+                    .build(k)
+                    .key(format!("tile-terminal-tab-close-{i}")),
+            )
+        } else {
+            None
+        };
+
+        let mut tab_pill = row()
+            .key(format!("tile-terminal-tab-{i}"))
+            .h(26.0)
+            .pl(8.0)
+            .pr(if close_tab.is_some() { 4.0 } else { 8.0 })
+            .gap(5.0)
+            .center_y()
+            .fill(bg_color)
+            .border(1.0, border_color)
+            .clip_rounded(6.0)
+            .cursor(rune::Cursor::Pointer)
+            .on_press(move |s: &mut UiState| {
+                s.term_switch_tab(i);
+                s.term.sink.focused = true;
+            })
+            .child(
+                rune::icon(&TERMINAL_WINDOW, 11.0)
+                    .color(if is_active {
+                        k.c.text_accent
+                    } else {
+                        k.c.icon_muted
+                    })
+                    .a11y_hidden(),
+            )
+            .child(
+                text(tab_title)
+                    .font(if is_active {
+                        k.ty.small_medium
+                    } else {
+                        k.ty.small
+                    })
+                    .color(fg_color)
+                    .truncate()
+                    .shrink()
+                    .max_w(130.0),
+            );
+
+        if let Some(btn) = close_tab {
+            tab_pill = tab_pill.child(btn);
+        }
+
+        tabs_strip = tabs_strip.child(tab_pill);
+    }
+
+    let add_tab_btn = IconButton::new(&PLUS)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .label(tr_ref(language, "New tab (Ctrl+Shift+T)"))
+        .on_press(|s: &mut UiState| s.term_new_tab())
+        .build(k)
+        .key("tile-terminal-new-tab");
+    tabs_strip = tabs_strip.child(add_tab_btn);
+
+    let sync_cwd_btn = IconButton::new(&rune_kit::glyphs::FOLDER)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .label(super::copy::t_ref(language, "Sync directory with session"))
+        .on_press(|s: &mut UiState| s.term_sync_cwd())
+        .build(k)
+        .key("tile-terminal-sync-cwd");
+    tabs_strip = tabs_strip.child(sync_cwd_btn);
+
+    let subheader = row()
+        .key("tile-terminal-subhead")
+        .w_full()
+        .h(30.0)
+        .pl(8.0)
+        .pr(8.0)
+        .gap(6.0)
+        .center_y()
+        .fill(k.alpha(k.c.layer_01, 0.45))
+        .child(tabs_strip)
+        .child(
+            IconButton::new(&RESTART)
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .label(tr_ref(language, "Restart shell"))
+                .on_press(|s: &mut UiState| s.restart_terminal())
+                .build(k)
+                .key("tile-terminal-restart"),
+        );
+
+    let grid = context_menu(s, k, grid(s, k, frame, m, bg, scale), layer);
+    let mut body = col()
+        .key("tile-terminal-body")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .pt(6.0)
+        .px(INSET)
+        .pb(INSET)
+        .gap(8.0)
+        .child(grid);
+
+    if let Some(err) = &s.term.error {
+        body = body.child(
+            text(err.clone())
+                .key("tile-terminal-error")
+                .font(k.ty.body)
+                .color(k.c.danger.fg)
+                .wrap(),
+        );
+    } else if let Some(ended) = ended {
+        body = body.child(ended_notice(k, language, ended));
+    }
+
+    col()
+        .key("tile-terminal-content")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(subheader)
+        .child(el().w_full().h(1.0).fill(k.alpha(k.c.border_weak, 0.25)))
         .child(body)
 }
 
