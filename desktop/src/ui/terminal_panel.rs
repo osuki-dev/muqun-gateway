@@ -1607,9 +1607,16 @@ fn grid(s: &UiState, k: &Kit, frame: Option<&Frame>, m: Metrics, bg: Color, scal
     for (y, row) in frame.grid.iter().enumerate() {
         let row = row.clone();
         let key = format!("terminal-row-{y}");
-        let version = (row.hash, m.cw.to_bits(), y);
+        let version = (
+            row.hash,
+            m.cw.to_bits(),
+            y,
+            bg.r.to_bits(),
+            bg.g.to_bits(),
+            bg.b.to_bits(),
+        );
         grid = grid.child(memo(key.clone(), version, move || {
-            draw_row(&key, &row, y, m)
+            draw_row(&key, &row, y, m, bg)
         }));
     }
     // A shell that ended takes no more keys: no cursor.
@@ -1748,7 +1755,7 @@ pub(crate) fn cursor_glyph(frame: &Frame, col: u16, row: u16, bg: Color) -> El {
     text(ch).font(style()).color(bg)
 }
 
-fn draw_row(key: &str, row: &Row, y: usize, m: Metrics) -> El {
+fn draw_row(key: &str, row: &Row, y: usize, m: Metrics, default_bg: Color) -> El {
     let mut out = el()
         .key(key.to_string())
         .absolute(0.0, y as f32 * m.ch)
@@ -1764,9 +1771,16 @@ fn draw_row(key: &str, row: &Row, y: usize, m: Metrics) -> El {
     }
     for run in &row.runs {
         let x = f32::from(run.col) * m.cw;
+        let cell_bg = row
+            .bgs
+            .iter()
+            .find(|b| run.col >= b.col && run.col < b.col + b.len)
+            .map_or(default_bg, |b| color(b.color));
         let mut fg = color(run.fg);
         if run.attrs.faint {
-            fg = fg.alpha(0.6);
+            fg = ensure_contrast(fg.mix(cell_bg, 0.35), cell_bg, 3.2);
+        } else {
+            fg = ensure_contrast(fg, cell_bg, 4.65);
         }
         let mut font = style();
         if run.attrs.bold {
