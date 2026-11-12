@@ -103,6 +103,30 @@ fn fill_terminal_tile(s: &mut UiState, i: usize) {
     s.persist_tiles();
 }
 
+/// Put a registered plugin into empty tile `i`.
+pub fn fill_plugin_tile(s: &mut UiState, i: usize, plugin_id: &str) {
+    if plugin_id == "terminal" {
+        fill_terminal_tile(s, i);
+        return;
+    }
+    if s.tiles.get(i).is_none_or(|t| !t.is_empty()) {
+        return;
+    }
+    if let Some(plugin) = s.plugins.get(plugin_id) {
+        let lang = s.cfg.general.language;
+        let title = plugin.title(lang);
+        let token = s.next_token;
+        s.next_token += 1;
+        s.tiles[i].content = super::TileContent::Custom {
+            id: format!("{plugin_id}-{token}"),
+            kind: plugin_id.to_string(),
+            title,
+        };
+        s.focus_tile(i);
+        s.persist_tiles();
+    }
+}
+
 /// How to reach pane `i` from the keyboard, for its header's tooltip.
 fn reach(language: crate::config::Language, i: usize) -> String {
     format!(
@@ -232,12 +256,13 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
                 );
         }
         super::TileContent::Custom { title, kind, .. } => {
+            let icon = s
+                .plugins
+                .get(kind)
+                .map(|p| p.icon())
+                .unwrap_or(&super::icons::GRID);
             head = head
-                .child(
-                    rune::icon(&super::icons::GRID, 14.0)
-                        .color(k.c.text_accent)
-                        .a11y_hidden(),
-                )
+                .child(rune::icon(icon, 14.0).color(k.c.text_accent).a11y_hidden())
                 .child(
                     text(title.clone())
                         .key("tile-title")
@@ -350,6 +375,21 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
                     }
                 },
             ));
+        }
+        super::TileContent::Custom { kind, .. } => {
+            if let Some(plugin) = s.plugins.get(kind) {
+                for cmd in plugin.commands() {
+                    let cmd_id = cmd.id;
+                    let p = plugin.clone();
+                    menu = menu.item(
+                        MenuItem::new(cmd.title)
+                            .shortcut(cmd.shortcut.unwrap_or_default())
+                            .on_select(move |s: &mut UiState| {
+                                p.on_command(s, cmd_id);
+                            }),
+                    );
+                }
+            }
         }
         _ => {}
     }
@@ -633,7 +673,7 @@ fn picker(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         }
         list = list.child(look.pressable(k, look.row_card(k, line, 10.0)));
     }
-    let mut actions = row().gap(8.0).center_y();
+    let mut actions = row().gap(8.0).wrap().center_y();
     actions = actions.child(
         Button::new(tr_ref(language, "New session…"))
             .variant(ButtonVariant::Outline)
@@ -645,17 +685,24 @@ fn picker(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
             .build(k)
             .key(format!("tile-new-{i}")),
     );
-    if !s.has_terminal_tile() {
+    for plugin in s.plugins.tile_plugins() {
+        let plugin_id = plugin.id();
+        if plugin_id == "terminal" && s.has_terminal_tile() {
+            continue;
+        }
+        let plugin_title = plugin.title(language);
+        let plugin_icon = plugin.icon();
+        let pid = plugin_id.to_string();
         actions = actions.child(
-            Button::new(tr_ref(language, "Terminal"))
-                .icon(&super::terminal_panel::TERMINAL_WINDOW)
+            Button::new(plugin_title)
+                .icon(plugin_icon)
                 .variant(ButtonVariant::Outline)
                 .control_size(ControlSize::Regular)
                 .on_press(move |s: &mut UiState| {
-                    fill_terminal_tile(s, i);
+                    fill_plugin_tile(s, i, &pid);
                 })
                 .build(k)
-                .key(format!("tile-term-{i}")),
+                .key(format!("tile-plugin-{plugin_id}-{i}")),
         );
     }
     col()
@@ -746,6 +793,34 @@ fn tile(
             };
             body = body.child(super::terminal_panel::tile_body(s, k, scheme, scale, layer));
         }
+        (super::TileContent::Custom { id, kind, .. }, _) => {
+            let ctx = crate::plugin::PluginViewContext {
+                s,
+                k,
+                look,
+                tile_id: id,
+                scale,
+            };
+            if let Some(plugin) = s.plugins.get(kind) {
+                if let Some(view) = plugin.render_tile(&ctx, layer) {
+                    body = body.child(view);
+                }
+            }
+        }
+        (super::TileContent::Diff(_), _) => {
+            let ctx = crate::plugin::PluginViewContext {
+                s,
+                k,
+                look,
+                tile_id: "diff",
+                scale,
+            };
+            if let Some(plugin) = s.plugins.get("diff") {
+                if let Some(view) = plugin.render_tile(&ctx, layer) {
+                    body = body.child(view);
+                }
+            }
+        }
         (super::TileContent::Session(_), true) => {
             let feed = if s.show_diff {
                 timeline::changes(s, k)
@@ -762,7 +837,6 @@ fn tile(
                 .child(timeline::session_view(s, k, asid))
                 .child(parked_composer(s, k, look, i));
         }
-        _ => {}
     }
     // Focus is contrast: the other panes' content sits a step back under a
     // scrim of the card's own colour (one quad, no layer, no blur) that
@@ -1019,5 +1093,40 @@ mod tests {
         assert_eq!(s.selected.as_deref(), Some("s1"));
         assert!(!s.in_split());
         assert!(!s.has_terminal_tile());
+    }
+
+    #[test]
+    fn custom_plugin_tile_lifecycle_and_rendering() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.open_session("s1");
+        s.split();
+        assert_eq!(s.tiles.len(), 2);
+        assert!(s.tiles[1].is_empty());
+
+        // Fill empty tile with sysinfo plugin
+        fill_plugin_tile(&mut s, 1, "sysinfo");
+        assert!(matches!(
+            &s.tiles[1].content,
+            crate::ui::TileContent::Custom { kind, .. } if kind == "sysinfo"
+        ));
+
+        let k = Kit::neutral(s.dark);
+        let look = s.look();
+        let place = Place::default();
+        let mut layer = Vec::new();
+
+        // Render sysinfo tile
+        let _el = tile(&s, &k, &look, 1, place, 1.0, &mut layer);
+
+        // Fill with quicknotes plugin
+        s.tiles[1].content = crate::ui::TileContent::Empty;
+        fill_plugin_tile(&mut s, 1, "quicknotes");
+        assert!(matches!(
+            &s.tiles[1].content,
+            crate::ui::TileContent::Custom { kind, .. } if kind == "quicknotes"
+        ));
+
+        let _el_notes = tile(&s, &k, &look, 1, place, 1.0, &mut layer);
     }
 }

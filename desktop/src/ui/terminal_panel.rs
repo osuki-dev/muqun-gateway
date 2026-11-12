@@ -279,6 +279,44 @@ fn ended_well(ended: Ended, lived: std::time::Duration) -> bool {
     }
 }
 
+/// Relative luminance for linear light [`Color`] (WCAG 2.1).
+pub fn relative_luminance(c: Color) -> f32 {
+    0.2126 * c.r.clamp(0.0, 1.0) + 0.7152 * c.g.clamp(0.0, 1.0) + 0.0722 * c.b.clamp(0.0, 1.0)
+}
+
+/// Contrast ratio between two colors in linear light (1.0 to 21.0).
+pub fn contrast_ratio(c1: Color, c2: Color) -> f32 {
+    let (l1, l2) = (relative_luminance(c1), relative_luminance(c2));
+    let (lighter, darker) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+/// Ensure color `c` has at least `min_ratio` contrast against `bg`.
+/// Darkens towards black on light backgrounds, or lightens towards white on dark backgrounds,
+/// preserving the color's original hue.
+pub fn ensure_contrast(c: Color, bg: Color, min_ratio: f32) -> Color {
+    if contrast_ratio(c, bg) >= min_ratio {
+        return c;
+    }
+    let target = if relative_luminance(bg) >= 0.45 {
+        Color::BLACK
+    } else {
+        Color::WHITE
+    };
+    let mut lo = 0.0f32;
+    let mut hi = 1.0f32;
+    for _ in 0..10 {
+        let mid = (lo + hi) * 0.5;
+        let test = c.mix(target, mid);
+        if contrast_ratio(test, bg) >= min_ratio {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    c.mix(target, hi)
+}
+
 /// The terminal's colours for this theme and scheme: the pack's own terminal
 /// palette, or one derived from the kit's tokens when no pack is active.
 pub fn colors(k: &Kit, scheme: ColorScheme) -> Colors {
@@ -299,27 +337,36 @@ pub fn colors(k: &Kit, scheme: ColorScheme) -> Colors {
             hex(&t.cursor),
             hex(&t.selection),
         ) {
+            let mut adjusted_ansi = ansi;
+            for slot in &mut adjusted_ansi {
+                *slot = to_rgb(ensure_contrast(color(*slot), bg, 4.65));
+            }
             return Colors {
-                fg: to_rgb(fg),
+                fg: to_rgb(ensure_contrast(fg, bg, 4.65)),
                 bg: to_rgb(bg),
                 cursor: to_rgb(cursor),
                 selection: to_rgb(bg.mix(sel.alpha(1.0), sel.a.max(0.25))),
-                ansi,
+                ansi: adjusted_ansi,
             };
         }
     }
     let c = &k.c;
     let (bg, fg) = (c.bg_base, c.text_base);
-    let tone = |col: Color, t: f32| to_rgb(bg.mix(col, t));
+    let is_light = relative_luminance(bg) >= 0.45;
     let (red, green, yellow, blue) = (c.danger.fg, c.success.fg, c.warning.fg, c.info.fg);
     let magenta = red.mix(blue, 0.5);
     let cyan = green.mix(blue, 0.5);
-    // Black stays the dark end and white the light end in either scheme,
-    // as programs assume.
-    let (black, white, grey, bright_white) = if k.dark {
+
+    let (black, white, grey, bright_white) = if !is_light {
+        let tone = |col: Color, t: f32| to_rgb(bg.mix(col, t));
         (tone(fg, 0.25), tone(fg, 0.75), tone(fg, 0.45), to_rgb(fg))
     } else {
-        (to_rgb(fg), tone(fg, 0.3), tone(fg, 0.55), tone(fg, 0.12))
+        (
+            to_rgb(fg),
+            to_rgb(fg.mix(bg, 0.35)),
+            to_rgb(fg.mix(bg, 0.50)),
+            to_rgb(fg),
+        )
     };
     let base = [
         black,
@@ -334,13 +381,22 @@ pub fn colors(k: &Kit, scheme: ColorScheme) -> Colors {
     let mut ansi = [Rgb::default(); 16];
     for i in 0..8 {
         ansi[i] = base[i];
-        let lift = if k.dark { Color::WHITE } else { Color::BLACK };
+        let lift = if !is_light {
+            Color::WHITE
+        } else {
+            Color::BLACK
+        };
         ansi[i + 8] = to_rgb(color(base[i]).mix(lift, 0.2));
     }
     ansi[8] = grey;
     ansi[15] = bright_white;
+
+    for slot in &mut ansi {
+        *slot = to_rgb(ensure_contrast(color(*slot), bg, 4.65));
+    }
+
     Colors {
-        fg: to_rgb(fg),
+        fg: to_rgb(ensure_contrast(fg, bg, 4.65)),
         bg: to_rgb(bg),
         cursor: to_rgb(c.text_accent),
         selection: to_rgb(bg.mix(c.bg_accent, 0.3)),
@@ -494,6 +550,9 @@ impl UiState {
         self.term.active_tab = index;
         self.term.session = self.term.tabs[index].session.clone();
         self.term.frame = self.term.tabs[index].frame.clone();
+        if let Some(want) = self.term.want.get() {
+            self.term.send(Msg::Colors(want));
+        }
         if let Some(size) = self.term.size {
             self.term.send(Msg::Resize(size));
         }
@@ -756,14 +815,21 @@ impl UiState {
             tx.wake_after(std::time::Duration::from_secs_f64(left));
         }
         if let Some(want) = self.term.want.get() {
-            if self.term.sent.is_some_and(|sent| sent != want) {
+            if self.term.sent.is_none_or(|sent| sent != want) {
                 self.term.sent = Some(want);
                 if let (Some(fixture), Some(size)) = (self.term.fixture, self.term.size) {
                     let bytes = fixture(size.cols, size.rows);
                     self.term.frame = crate::term::engine::render_fixture(&bytes, size, want);
                     changed = true;
                 } else {
-                    self.term.send(Msg::Colors(want));
+                    for tab in &self.term.tabs {
+                        if let Some(sess) = &tab.session {
+                            sess.send(Msg::Colors(want));
+                        }
+                    }
+                    if let Some(session) = &self.term.session {
+                        session.send(Msg::Colors(want));
+                    }
                 }
             }
         }
@@ -2168,5 +2234,36 @@ mod tests {
         });
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.term.active_tab, 2);
+    }
+
+    #[test]
+    fn terminal_colors_maintain_high_contrast_in_light_and_dark_modes() {
+        for dark in [false, true] {
+            let scheme = if dark {
+                ColorScheme::Dark
+            } else {
+                ColorScheme::Light
+            };
+            let kit = Kit::neutral(dark);
+            let c = colors(&kit, scheme);
+            let bg = color(c.bg);
+            let fg = color(c.fg);
+
+            let fg_ratio = contrast_ratio(fg, bg);
+            assert!(
+                fg_ratio >= 4.5,
+                "fg contrast ratio too low in dark={dark}: {fg_ratio}"
+            );
+
+            for (i, ansi_rgb) in c.ansi.iter().enumerate() {
+                let ansi_col = color(*ansi_rgb);
+                let ratio = contrast_ratio(ansi_col, bg);
+                assert!(
+                    ratio >= 4.5,
+                    "ansi[{i}] contrast ratio too low in dark={dark}: {ratio} (ansi: {ansi_rgb:?}, bg: {:?})",
+                    c.bg
+                );
+            }
+        }
     }
 }

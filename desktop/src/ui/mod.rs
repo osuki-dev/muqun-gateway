@@ -15,7 +15,7 @@ mod echo;
 pub mod fx;
 mod home;
 pub mod i18n;
-mod icons;
+pub(crate) mod icons;
 mod inbox;
 mod inspector;
 pub mod keymap;
@@ -33,7 +33,7 @@ mod shell;
 mod shortcuts;
 mod splash;
 mod tasks;
-mod terminal_panel;
+pub(crate) mod terminal_panel;
 mod tiles;
 mod timeline;
 mod tray;
@@ -579,6 +579,10 @@ pub struct UiState {
     pub tile_grid: [f32; 2],
     /// The saved split was put back once sessions were listed.
     tiles_restored: bool,
+    /// Registered desktop plugins.
+    pub plugins: crate::plugin::PluginRegistry,
+    /// Persistent or active notes per quick notes tile.
+    pub quick_notes: HashMap<String, String>,
     /// Agents whose session list has arrived (split restore waits for them).
     listed_agents: HashSet<String>,
 }
@@ -739,6 +743,8 @@ impl UiState {
             tile_grid: [0.0; 2],
             listed_agents: HashSet::new(),
             tiles_restored: false,
+            plugins: crate::plugin::PluginRegistry::default_registry(),
+            quick_notes: HashMap::new(),
             cfg,
         };
         s.arm_splash(splash::SplashKind::Boot);
