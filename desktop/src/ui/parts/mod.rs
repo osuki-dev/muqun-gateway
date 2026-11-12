@@ -531,11 +531,16 @@ impl<'a> ToolCard<'a> {
         });
         let asid = cx.asid.to_string();
         let menu_id = id.clone();
-        let line = line.on_secondary_press(move |s: &mut UiState, press, _tx: &mut rune::Tx| {
+        let line = line.on_secondary_press(move |s: &mut UiState, press, tx: &mut rune::Tx| {
+            let selection = tx
+                .text_selection()
+                .map(|ts| ts.text().to_string())
+                .filter(|s| !s.is_empty());
             s.row_menu = Some(crate::ui::RowMenu {
                 asid: asid.clone(),
                 id: menu_id.clone(),
                 point: press,
+                selection,
             });
         });
         let mut block = col()

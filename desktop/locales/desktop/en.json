@@ -464,6 +464,8 @@
   "Restart shell": "Restart shell",
   "Roll back to here": "Roll back to here",
   "Fork from here": "Fork from here",
+  "Quote to composer": "Quote to composer",
+  "Copy entire message": "Copy entire message",
   "Peer": "Peer",
   "Fleet gateway": "Fleet gateway",
   "Gateway URL:": "Gateway URL:",

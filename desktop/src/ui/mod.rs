@@ -1285,6 +1285,29 @@ impl UiState {
         self.prompt_history_cursor = None;
     }
 
+    /// Quote a block of text into the active composer draft.
+    pub fn quote_to_composer(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let quoted: Vec<String> = trimmed.lines().map(|l| format!("> {l}")).collect();
+        let block = format!("{}\n\n", quoted.join("\n"));
+        let mut cur = self.draft.text.clone();
+        if !cur.is_empty() && !cur.ends_with("\n\n") {
+            if cur.ends_with('\n') {
+                cur.push('\n');
+            } else {
+                cur.push_str("\n\n");
+            }
+        }
+        cur.push_str(&block);
+        let len = cur.len();
+        self.draft = composer::fresh(cur);
+        self.draft.set_caret(len);
+        self.draft.focused = true;
+    }
+
     /// Toggle floating in-session timeline search (Ctrl+F).
     pub fn toggle_timeline_search(&mut self) {
         self.timeline_search.active = !self.timeline_search.active;

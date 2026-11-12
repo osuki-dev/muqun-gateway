@@ -469,6 +469,7 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
             true
         });
     let bottom_asid = asid.to_string();
+    let feed_asid = asid.to_string();
     let feed = col()
         .key(key)
         .w_full()
@@ -479,6 +480,22 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
         .on_at_bottom(move |s: &mut UiState, at| {
             if let Some(tl) = s.timelines.get_mut(&bottom_asid) {
                 tl.at_bottom(at);
+            }
+        })
+        .on_secondary_press(move |s: &mut UiState, press, tx: &mut rune::Tx| {
+            if s.row_menu.is_none() {
+                if let Some(selection) = tx
+                    .text_selection()
+                    .map(|ts| ts.text().to_string())
+                    .filter(|s| !s.is_empty())
+                {
+                    s.row_menu = Some(crate::ui::RowMenu {
+                        asid: feed_asid.clone(),
+                        id: String::new(),
+                        point: press,
+                        selection: Some(selection),
+                    });
+                }
             }
         })
         .scroll_bar(k);
@@ -837,7 +854,20 @@ fn item_row(cx: &Tcx, it: &TimelineItem) -> El {
         let actions = message_actions(cx, it).pin(None, Some(0.0), Some(0.0), None);
         wrap = wrap.hover_group().child(actions);
     }
-    wrap
+    let asid = cx.asid.to_string();
+    let item_id = it.id.clone();
+    wrap.on_secondary_press(move |s: &mut UiState, press, tx: &mut rune::Tx| {
+        let selection = tx
+            .text_selection()
+            .map(|ts| ts.text().to_string())
+            .filter(|s| !s.is_empty());
+        s.row_menu = Some(crate::ui::RowMenu {
+            asid: asid.clone(),
+            id: item_id.clone(),
+            point: press,
+            selection,
+        });
+    })
 }
 
 /// What the timeline draws over the window: an opened picture, else a

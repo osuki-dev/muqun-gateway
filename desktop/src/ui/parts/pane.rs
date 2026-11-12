@@ -29,6 +29,7 @@ pub struct RowMenu {
     pub asid: String,
     pub id: String,
     pub point: PointerPress,
+    pub selection: Option<String>,
 }
 
 /// Rows the keyboard walks: activity rows and group lines, and the calls of
@@ -315,6 +316,14 @@ impl UiState {
 /// What a row's Copy takes and the file its Open shows.
 fn row_targets(item: &TimelineItem) -> (Option<String>, Option<String>) {
     match &item.part {
+        AgentPart::Text { text } => {
+            let body = if item.role == TimelineRole::User {
+                muqun_gateway::agents::ports::agent::prompt_display_body(text).to_string()
+            } else {
+                text.clone()
+            };
+            ((!body.trim().is_empty()).then_some(body), None)
+        }
         AgentPart::Tool(call) => {
             let kind = activity::tool_kind(call);
             let target = tv::target(kind, tv::input_record(call).as_ref());
@@ -339,20 +348,109 @@ pub fn row_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
     let Some(menu) = s.row_menu.as_ref() else {
         return;
     };
-    let Some(found) = s.timelines.get(&menu.asid).and_then(|t| item(t, &menu.id)) else {
-        return;
-    };
+    let found = s.timelines.get(&menu.asid).and_then(|t| item(t, &menu.id));
     let t = |en| crate::ui::copy::tr_ref(s.cfg.general.language, en);
-    let (copy, open) = row_targets(found);
     let close = |s: &mut UiState| s.row_menu = None;
     let (asid, id) = (menu.asid.clone(), menu.id.clone());
-    let detail = has_detail(found);
+    let detail = found.is_some_and(has_detail);
+    let (copy, open) = found.map_or((None, None), row_targets);
+    let selection = menu.selection.clone().filter(|s| !s.trim().is_empty());
+
+    let is_text = found.is_some_and(|f| matches!(f.part, AgentPart::Text { .. }));
+    let is_user_text = found
+        .is_some_and(|f| f.role == TimelineRole::User && matches!(f.part, AgentPart::Text { .. }));
+    let has_items =
+        selection.is_some() || copy.is_some() || detail || open.is_some() || is_user_text;
+    if !has_items {
+        return;
+    }
+
     let mut m = context_menu(
         "row-menu",
         col().key("row-menu-anchor").size(0.0, 0.0),
         Some(menu.point),
     )
+    .min_width(180.0)
     .on_close(close);
+
+    let copy_shortcut = crate::platform::keys::label("Primary+C");
+
+    // Selected text operations take precedence if user highlighted a section.
+    if let Some(selected) = selection.clone() {
+        let sel_copy = selected.clone();
+        m = m.item(
+            MenuItem::new(t("Copy"))
+                .shortcut(&copy_shortcut)
+                .on_select_tx(move |s: &mut UiState, tx: &mut Tx| {
+                    s.row_menu = None;
+                    tx.copy(sel_copy.clone());
+                }),
+        );
+        let sel_quote = selected;
+        m = m.item(
+            MenuItem::new(t("Quote to composer")).on_select(move |s: &mut UiState| {
+                s.row_menu = None;
+                s.quote_to_composer(&sel_quote);
+            }),
+        );
+        m = m.separator();
+    }
+
+    if let Some(copy_text) = copy.filter(|c| !c.is_empty()) {
+        let label = if selection.is_some() {
+            t("Copy entire message")
+        } else {
+            t("Copy")
+        };
+        let mut mi = MenuItem::new(label);
+        if selection.is_none() {
+            mi = mi.shortcut(&copy_shortcut);
+        }
+        let copy_all = copy_text.clone();
+        m = m.item(mi.on_select_tx(move |s: &mut UiState, tx: &mut Tx| {
+            s.row_menu = None;
+            tx.copy(copy_all.clone());
+        }));
+
+        if selection.is_none() && is_text {
+            let quote_all = copy_text;
+            m = m.item(
+                MenuItem::new(t("Quote to composer")).on_select(move |s: &mut UiState| {
+                    s.row_menu = None;
+                    s.quote_to_composer(&quote_all);
+                }),
+            );
+        }
+    }
+
+    if is_user_text {
+        if let Some(f) = found {
+            let rollback_asid = muqun_gateway::agents::AgentSessionId(asid.clone());
+            let rollback_id = f.message_id.clone();
+            m = m.separator();
+            m = m.item(
+                MenuItem::new(t("Roll back to here")).on_select(move |s: &mut UiState| {
+                    s.row_menu = None;
+                    s.send(crate::model::commands::Command::StageRevert {
+                        asid: rollback_asid.clone(),
+                        message_id: rollback_id.clone(),
+                    });
+                }),
+            );
+            let fork_asid = muqun_gateway::agents::AgentSessionId(asid.clone());
+            let fork_id = f.message_id.clone();
+            m = m.item(
+                MenuItem::new(t("Fork from here")).on_select(move |s: &mut UiState| {
+                    s.row_menu = None;
+                    s.send(crate::model::commands::Command::ForkSession {
+                        asid: fork_asid.clone(),
+                        message_id: Some(fork_id.clone()),
+                    });
+                }),
+            );
+        }
+    }
+
     if detail {
         m = m.item(
             MenuItem::new(t("Show details"))
@@ -365,14 +463,6 @@ pub fn row_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                     });
                     s.inspect_pane.set_open(true);
                 }),
-        );
-    }
-    if let Some(copy) = copy.filter(|c| !c.is_empty()) {
-        m = m.item(
-            MenuItem::new(t("Copy")).on_select_tx(move |s: &mut UiState, tx: &mut Tx| {
-                s.row_menu = None;
-                tx.copy(copy.clone());
-            }),
         );
     }
     if let Some(path) = open {
@@ -555,5 +645,87 @@ mod tests {
         let handled = s.open_selected(&mut rune_tx);
         assert!(handled);
         assert_eq!(s.inspect, None);
+    }
+
+    #[test]
+    fn row_menu_text_selection_and_quote() {
+        use muqun_gateway::agents::{AgentPart, TimelineItem, TimelineRole};
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let asid = "s1";
+        s.selected = Some(asid.to_string());
+
+        let item = TimelineItem {
+            id: "msg-1".into(),
+            message_id: "m-1".into(),
+            role: TimelineRole::Assistant,
+            part: AgentPart::Text {
+                text: "Here is the full solution for your problem.".into(),
+            },
+            seq: 0,
+            updated_ms: 0,
+            ordinal: 0,
+            attachments: None,
+            image_assets: None,
+            generation: None,
+            origin: None,
+        };
+
+        let mut tl = SessionTimeline::default();
+        tl.items.push(item);
+        s.timelines.insert(asid.to_string(), tl);
+
+        // 1. Right click with highlighted selection
+        s.row_menu = Some(RowMenu {
+            asid: asid.to_string(),
+            id: "msg-1".to_string(),
+            point: rune::PointerPress { x: 100.0, y: 100.0 },
+            selection: Some("full solution".into()),
+        });
+
+        let k = Kit::neutral(false);
+        let mut layer = Vec::new();
+        row_menu(&s, &k, &mut layer);
+        assert!(!layer.is_empty());
+
+        // 2. Quote to composer works
+        s.quote_to_composer("full solution");
+        assert_eq!(s.draft.text, "> full solution\n\n");
+        assert!(s.draft.focused);
+
+        // Appending another quote
+        s.quote_to_composer("second line\nthird line");
+        assert_eq!(
+            s.draft.text,
+            "> full solution\n\n> second line\n> third line\n\n"
+        );
+
+        // 3. Right click with no selection on user message
+        s.timelines.get_mut(asid).unwrap().items.push(TimelineItem {
+            id: "user-msg".into(),
+            message_id: "m-user".into(),
+            role: TimelineRole::User,
+            part: AgentPart::Text {
+                text: "Please fix this now".into(),
+            },
+            seq: 1,
+            updated_ms: 0,
+            ordinal: 1,
+            attachments: None,
+            image_assets: None,
+            generation: None,
+            origin: None,
+        });
+
+        s.row_menu = Some(RowMenu {
+            asid: asid.to_string(),
+            id: "user-msg".to_string(),
+            point: rune::PointerPress { x: 100.0, y: 100.0 },
+            selection: None,
+        });
+
+        let mut layer_user = Vec::new();
+        row_menu(&s, &k, &mut layer_user);
+        assert!(!layer_user.is_empty());
     }
 }
