@@ -1,7 +1,7 @@
 From f0a20081518359954366703bdb81aa3bfc2fa644 Mon Sep 17 00:00:00 2001
 From: ryu <213640356+ryuhzk@users.noreply.github.com>
 Date: Sat, 7 Nov 2026 13:50:06 +0800
-Subject: [PATCH 1/2] Expose on_input_paste on TextInput and TextArea.
+Subject: [PATCH 1/3] Expose on_input_paste on TextInput and TextArea.
 
 Lets apps stage clipboard files and images from the focused field
 without dropping through to plain-text paste.

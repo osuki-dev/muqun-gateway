@@ -4377,7 +4377,7 @@ dependencies = [
 [[package]]
 name = "rune"
 version = "0.0.1"
-source = "git+https://github.com/ryuhzk/rune?rev=647784f321f210acd2d2a60db8f80ba389cff1e5#647784f321f210acd2d2a60db8f80ba389cff1e5"
+source = "git+https://github.com/ryuhzk/rune?rev=5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3#5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -4459,7 +4459,7 @@ dependencies = [
 [[package]]
 name = "rune-fx"
 version = "0.0.1"
-source = "git+https://github.com/ryuhzk/rune?rev=647784f321f210acd2d2a60db8f80ba389cff1e5#647784f321f210acd2d2a60db8f80ba389cff1e5"
+source = "git+https://github.com/ryuhzk/rune?rev=5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3#5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3"
 dependencies = [
  "bytemuck",
  "rune-motion",
@@ -4470,7 +4470,7 @@ dependencies = [
 [[package]]
 name = "rune-highlights"
 version = "0.0.1"
-source = "git+https://github.com/ryuhzk/rune?rev=647784f321f210acd2d2a60db8f80ba389cff1e5#647784f321f210acd2d2a60db8f80ba389cff1e5"
+source = "git+https://github.com/ryuhzk/rune?rev=5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3#5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3"
 dependencies = [
  "unicode-ident",
  "wasmparser",
@@ -4479,7 +4479,7 @@ dependencies = [
 [[package]]
 name = "rune-i18n"
 version = "0.1.0"
-source = "git+https://github.com/ryuhzk/rune?rev=647784f321f210acd2d2a60db8f80ba389cff1e5#647784f321f210acd2d2a60db8f80ba389cff1e5"
+source = "git+https://github.com/ryuhzk/rune?rev=5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3#5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3"
 dependencies = [
  "fixed_decimal",
  "icu_decimal",
@@ -4498,7 +4498,7 @@ dependencies = [
 [[package]]
 name = "rune-kit"
 version = "0.0.1"
-source = "git+https://github.com/ryuhzk/rune?rev=647784f321f210acd2d2a60db8f80ba389cff1e5#647784f321f210acd2d2a60db8f80ba389cff1e5"
+source = "git+https://github.com/ryuhzk/rune?rev=5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3#5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3"
 dependencies = [
  "icu_normalizer",
  "pulldown-cmark",
@@ -4511,12 +4511,12 @@ dependencies = [
 [[package]]
 name = "rune-motion"
 version = "0.1.0"
-source = "git+https://github.com/ryuhzk/rune?rev=647784f321f210acd2d2a60db8f80ba389cff1e5#647784f321f210acd2d2a60db8f80ba389cff1e5"
+source = "git+https://github.com/ryuhzk/rune?rev=5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3#5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3"
 
 [[package]]
 name = "rune-staging"
 version = "0.0.1"
-source = "git+https://github.com/ryuhzk/rune?rev=647784f321f210acd2d2a60db8f80ba389cff1e5#647784f321f210acd2d2a60db8f80ba389cff1e5"
+source = "git+https://github.com/ryuhzk/rune?rev=5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3#5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3"
 dependencies = [
  "wgpu",
 ]
@@ -4524,7 +4524,7 @@ dependencies = [
 [[package]]
 name = "rune-taffy"
 version = "0.0.1"
-source = "git+https://github.com/ryuhzk/rune?rev=647784f321f210acd2d2a60db8f80ba389cff1e5#647784f321f210acd2d2a60db8f80ba389cff1e5"
+source = "git+https://github.com/ryuhzk/rune?rev=5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3#5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3"
 dependencies = [
  "taffy",
 ]

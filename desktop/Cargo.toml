@@ -16,11 +16,11 @@ path = "src/main.rs"
 # land upstream; patches live in desktop/patches/rune/ for review.
 [dependencies]
 muqun-gateway = { path = ".." }
-rune = { git = "https://github.com/ryuhzk/rune", rev = "647784f321f210acd2d2a60db8f80ba389cff1e5" }
-rune-kit = { git = "https://github.com/ryuhzk/rune", rev = "647784f321f210acd2d2a60db8f80ba389cff1e5", features = ["markdown"] }
+rune = { git = "https://github.com/ryuhzk/rune", rev = "5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3" }
+rune-kit = { git = "https://github.com/ryuhzk/rune", rev = "5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3", features = ["markdown"] }
 # GPU effect layers (`ui/fx.rs`): glow and liquid metal at effect slots.
-rune-fx = { git = "https://github.com/ryuhzk/rune", rev = "647784f321f210acd2d2a60db8f80ba389cff1e5" }
-rune-i18n = { git = "https://github.com/ryuhzk/rune", rev = "647784f321f210acd2d2a60db8f80ba389cff1e5" }
+rune-fx = { git = "https://github.com/ryuhzk/rune", rev = "5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3" }
+rune-i18n = { git = "https://github.com/ryuhzk/rune", rev = "5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3" }
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl"] }
 anyhow = "1.0.103"
 uuid = { version = "1.29.0", features = ["v4"] }
@@ -58,7 +58,7 @@ unicode-width = "0.2"
 zbus = { version = "6.2.1", default-features = false, features = ["tokio", "proxy"] }
 
 [build-dependencies]
-rune-i18n = { git = "https://github.com/ryuhzk/rune", rev = "647784f321f210acd2d2a60db8f80ba389cff1e5", features = ["codegen"] }
+rune-i18n = { git = "https://github.com/ryuhzk/rune", rev = "5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3", features = ["codegen"] }
 
 
 [dev-dependencies]
