@@ -1,8 +1,8 @@
 # Rune patches for Muqun Desktop
 
 `desktop/Cargo.toml` pins
-[`ryuhzk/rune@030e916`](https://github.com/ryuhzk/rune/tree/muqun-desktop-apis)
-(`muqun-desktop-apis`), which is `anomalyco/rune@a6a59e6` plus:
+[`ryuhzk/rune@647784f`](https://github.com/ryuhzk/rune/tree/muqun-desktop-apis)
+(`muqun-desktop-apis`), which is `anomalyco/rune@50d5c6d` plus:
 
 1. `TextArea` / `TextInput` `on_input_paste` (Ctrl/Cmd+V files and images)
 2. `SplitView::sidebar_leading` (brand mark in the title-bar band)

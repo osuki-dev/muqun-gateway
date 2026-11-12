@@ -744,7 +744,7 @@ impl DaemonSession {
         let mut guard = self
             .pty
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "pty lock poisoned"))?;
+            .map_err(|_| io::Error::other("pty lock poisoned"))?;
         if let Some(pty) = guard.as_mut() {
             pty.write_all(data)
         } else {
@@ -1493,8 +1493,7 @@ impl DaemonClient {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         if !resp.ok {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
+            Err(io::Error::other(
                 resp.error.unwrap_or_else(|| "daemon error".into()),
             ))
         } else {
@@ -1611,8 +1610,7 @@ impl DaemonClient {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         if !resp.ok {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 resp.error.unwrap_or_else(|| "attach failed".into()),
             ));
         }
@@ -1688,8 +1686,7 @@ impl DaemonClient {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         if !resp.ok {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 resp.error.unwrap_or_else(|| "attach raw failed".into()),
             ));
         }
@@ -1802,8 +1799,7 @@ impl SyncDaemonClient {
         if resp.ok {
             Ok(resp.sessions.unwrap_or_default())
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
+            Err(io::Error::other(
                 resp.error.unwrap_or_else(|| "list sessions failed".into()),
             ))
         }
@@ -1842,12 +1838,10 @@ impl SyncDaemonClient {
         };
         let resp = self.send_request(&req)?;
         if resp.ok {
-            resp.id.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "missing session id in response")
-            })
+            resp.id
+                .ok_or_else(|| io::Error::other("missing session id in response"))
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
+            Err(io::Error::other(
                 resp.error.unwrap_or_else(|| "create session failed".into()),
             ))
         }
@@ -1863,8 +1857,7 @@ impl SyncDaemonClient {
         if resp.ok {
             Ok(resp.scrollback.unwrap_or_default())
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
+            Err(io::Error::other(
                 resp.error.unwrap_or_else(|| "read session failed".into()),
             ))
         }
@@ -1907,8 +1900,7 @@ impl SyncDaemonClient {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         if !resp.ok {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 resp.error.unwrap_or_else(|| "attach raw failed".into()),
             ));
         }
@@ -1927,8 +1919,7 @@ impl SyncDaemonClient {
         if resp.ok {
             Ok(())
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
+            Err(io::Error::other(
                 resp.error.unwrap_or_else(|| "close session failed".into()),
             ))
         }
@@ -1947,8 +1938,7 @@ impl SyncDaemonClient {
         if resp.ok {
             Ok(())
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
+            Err(io::Error::other(
                 resp.error.unwrap_or_else(|| "resize session failed".into()),
             ))
         }

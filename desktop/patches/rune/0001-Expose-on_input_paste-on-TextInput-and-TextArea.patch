@@ -1,4 +1,4 @@
-From 47106b64c30936422539798b631c3c2b855a5455 Mon Sep 17 00:00:00 2001
+From f0a20081518359954366703bdb81aa3bfc2fa644 Mon Sep 17 00:00:00 2001
 From: ryu <213640356+ryuhzk@users.noreply.github.com>
 Date: Sat, 7 Nov 2026 13:50:06 +0800
 Subject: [PATCH 1/2] Expose on_input_paste on TextInput and TextArea.
@@ -12,7 +12,7 @@ Co-authored-by: Cursor <cursoragent@cursor.com>
  1 file changed, 24 insertions(+)
 
 diff --git a/crates/rune-kit/src/text_input.rs b/crates/rune-kit/src/text_input.rs
-index a607d8e..0ef2d44 100644
+index eeb2821..46f29b3 100644
 --- a/crates/rune-kit/src/text_input.rs
 +++ b/crates/rune-kit/src/text_input.rs
 @@ -96,6 +96,13 @@ impl EditActs {
@@ -29,7 +29,7 @@ index a607d8e..0ef2d44 100644
      fn visual(&mut self, f: impl FnOnce(El) -> El + 'static) {
          self.visual.push(Box::new(f));
      }
-@@ -290,6 +297,14 @@ impl TextInput {
+@@ -302,6 +309,14 @@ impl TextInput {
          self.copy_acts.press_tx(f);
          self
      }
@@ -44,7 +44,7 @@ index a607d8e..0ef2d44 100644
      rich_forwarders!();
  
      pub fn build(self, k: &Kit) -> El {
-@@ -478,6 +493,15 @@ impl TextArea {
+@@ -498,6 +513,15 @@ impl TextArea {
          self.edits.change(f);
          self
      }

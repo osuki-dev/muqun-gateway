@@ -730,6 +730,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::type_complexity)]
     fn key_encoding_across_terminal_modes() {
         let size = Size {
             cols: 80,

@@ -1,4 +1,4 @@
-From a1fe7354ed53396558e4ab40385bfccb9bb617d3 Mon Sep 17 00:00:00 2001
+From 647784f321f210acd2d2a60db8f80ba389cff1e5 Mon Sep 17 00:00:00 2001
 From: ryu <213640356+ryuhzk@users.noreply.github.com>
 Date: Sat, 7 Nov 2026 14:06:13 +0800
 Subject: [PATCH 2/2] Add SplitView::sidebar_leading for brand in the title-bar
@@ -10,7 +10,7 @@ Co-authored-by: Cursor <cursoragent@cursor.com>
  1 file changed, 12 insertions(+)
 
 diff --git a/crates/rune-kit/src/shell/split.rs b/crates/rune-kit/src/shell/split.rs
-index 53cdf44..d224f10 100644
+index 5210465..abaf81d 100644
 --- a/crates/rune-kit/src/shell/split.rs
 +++ b/crates/rune-kit/src/shell/split.rs
 @@ -136,6 +136,8 @@ pub struct SplitView {

@@ -1318,7 +1318,7 @@ mod tests {
             .term
             .tabs
             .iter()
-            .any(|t| t.cwd == std::path::PathBuf::from("/tmp/muqun-worktree-1")));
+            .any(|t| t.cwd == std::path::Path::new("/tmp/muqun-worktree-1")));
 
         // Verify detail and actions render without panicking
         let k = Kit::neutral(true);

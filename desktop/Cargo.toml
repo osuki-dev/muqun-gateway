@@ -12,15 +12,15 @@ name = "muqun-desktop"
 path = "src/main.rs"
 
 # UI: Rune. `muqun-desktop-apis` carries TextArea::on_input_paste and
-# SplitView::sidebar_leading on top of anomalyco/rune@a6a59e6 until those
+# SplitView::sidebar_leading on top of anomalyco/rune@50d5c6d until those
 # land upstream; patches live in desktop/patches/rune/ for review.
 [dependencies]
 muqun-gateway = { path = ".." }
-rune = { git = "https://github.com/ryuhzk/rune", rev = "030e916c5531a0defe6255fd2b29bfc2ae076827" }
-rune-kit = { git = "https://github.com/ryuhzk/rune", rev = "030e916c5531a0defe6255fd2b29bfc2ae076827", features = ["markdown"] }
+rune = { git = "https://github.com/ryuhzk/rune", rev = "647784f321f210acd2d2a60db8f80ba389cff1e5" }
+rune-kit = { git = "https://github.com/ryuhzk/rune", rev = "647784f321f210acd2d2a60db8f80ba389cff1e5", features = ["markdown"] }
 # GPU effect layers (`ui/fx.rs`): glow and liquid metal at effect slots.
-rune-fx = { git = "https://github.com/ryuhzk/rune", rev = "030e916c5531a0defe6255fd2b29bfc2ae076827" }
-rune-i18n = { git = "https://github.com/ryuhzk/rune", rev = "030e916c5531a0defe6255fd2b29bfc2ae076827" }
+rune-fx = { git = "https://github.com/ryuhzk/rune", rev = "647784f321f210acd2d2a60db8f80ba389cff1e5" }
+rune-i18n = { git = "https://github.com/ryuhzk/rune", rev = "647784f321f210acd2d2a60db8f80ba389cff1e5" }
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl"] }
 anyhow = "1.0.103"
 uuid = { version = "1.29.0", features = ["v4"] }
@@ -58,7 +58,7 @@ unicode-width = "0.2"
 zbus = { version = "6.2.1", default-features = false, features = ["tokio", "proxy"] }
 
 [build-dependencies]
-rune-i18n = { git = "https://github.com/ryuhzk/rune", rev = "030e916c5531a0defe6255fd2b29bfc2ae076827", features = ["codegen"] }
+rune-i18n = { git = "https://github.com/ryuhzk/rune", rev = "647784f321f210acd2d2a60db8f80ba389cff1e5", features = ["codegen"] }
 
 
 [dev-dependencies]
