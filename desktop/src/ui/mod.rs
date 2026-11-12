@@ -283,6 +283,7 @@ impl TileContent {
 pub struct Tile {
     pub content: TileContent,
     pub asid: Option<String>,
+    pub term_tab: Option<usize>,
     pub slot: SessionSlot,
 }
 
@@ -291,6 +292,7 @@ impl Tile {
         Self {
             content: TileContent::Empty,
             asid: None,
+            term_tab: None,
             slot: SessionSlot::default(),
         }
     }
@@ -300,6 +302,7 @@ impl Tile {
         Self {
             content: TileContent::Session(asid.clone()),
             asid: Some(asid),
+            term_tab: None,
             slot: SessionSlot::default(),
         }
     }
@@ -308,6 +311,7 @@ impl Tile {
         Self {
             content: TileContent::Terminal,
             asid: None,
+            term_tab: None,
             slot: SessionSlot::default(),
         }
     }
@@ -328,11 +332,18 @@ impl Tile {
     pub fn set_session(&mut self, asid: impl Into<String>) {
         let asid = asid.into();
         self.asid = Some(asid.clone());
+        self.term_tab = None;
         self.content = TileContent::Session(asid);
     }
 
     pub fn set_terminal(&mut self) {
         self.asid = None;
+        self.content = TileContent::Terminal;
+    }
+
+    pub fn set_terminal_tab(&mut self, tab: usize) {
+        self.asid = None;
+        self.term_tab = Some(tab);
         self.content = TileContent::Terminal;
     }
 }
@@ -1605,8 +1616,27 @@ impl UiState {
             .position(|t| t.asid.as_deref() == Some(asid))
     }
 
+    /// The terminal tile showing the live (active) shell: the focused terminal
+    /// tile, else the one bound to the active tab, else the first terminal tile.
+    /// Exactly one terminal tile is live, so only it carries the keyboard sink.
     pub fn tile_of_terminal(&self) -> Option<usize> {
-        self.tiles.iter().position(|t| t.is_terminal())
+        if self.tiles.get(self.focus).is_some_and(Tile::is_terminal) {
+            return Some(self.focus);
+        }
+        let active = self.term.active_tab;
+        self.tiles
+            .iter()
+            .position(|t| t.is_terminal() && t.term_tab.is_none_or(|tab| tab == active))
+            .or_else(|| self.tiles.iter().position(Tile::is_terminal))
+    }
+
+    /// The terminal tab a non-live terminal tile shows, when it is bound to one.
+    pub fn tile_terminal_tab(&self, i: usize) -> Option<usize> {
+        let tile = self.tiles.get(i).filter(|t| t.is_terminal())?;
+        if self.tile_of_terminal() == Some(i) {
+            return Some(self.term.active_tab);
+        }
+        tile.term_tab.filter(|tab| *tab < self.term.tabs.len())
     }
 
     pub fn has_terminal_tile(&self) -> bool {
@@ -1670,6 +1700,7 @@ impl UiState {
                 TileContent::Terminal => {
                     self.term.sink.focused = true;
                     self.draft.focused = false;
+                    self.sync_tile_terminal_tab(i);
                 }
                 _ => {}
             }
@@ -1698,9 +1729,10 @@ impl UiState {
             TileContent::Terminal => {
                 self.term.sink.focused = true;
                 self.draft.focused = false;
-                if self.term.session.is_none() {
+                if self.term.session.is_none() && self.term.tabs.is_empty() {
                     self.start_terminal();
                 }
+                self.sync_tile_terminal_tab(i);
             }
             TileContent::Empty => {
                 self.draft.focused = false;
@@ -1708,6 +1740,31 @@ impl UiState {
             }
             _ => {}
         }
+    }
+
+    /// Ensure `s.term.active_tab` matches the terminal tab bound to tile `i`.
+    pub(crate) fn sync_tile_terminal_tab(&mut self, i: usize) {
+        let Some(tile) = self.tiles.get(i) else {
+            return;
+        };
+        if !tile.is_terminal() {
+            return;
+        }
+        if let Some(tab_idx) = tile.term_tab {
+            if tab_idx < self.term.tabs.len() {
+                if self.term.active_tab != tab_idx {
+                    if let Some(cur) = self.term.tabs.get_mut(self.term.active_tab) {
+                        cur.session = self.term.session.clone();
+                        cur.frame = self.term.frame.clone();
+                    }
+                    self.term.active_tab = tab_idx;
+                    self.term.session = self.term.tabs[tab_idx].session.clone();
+                    self.term.frame = self.term.tabs[tab_idx].frame.clone();
+                }
+                return;
+            }
+        }
+        self.tiles[i].term_tab = Some(self.term.active_tab);
     }
 
     /// Tell the core which sessions are on screen in split tiles, and who is focused.
@@ -1771,9 +1828,14 @@ impl UiState {
     }
 
     /// Open the terminal in a split tile beside the current view.
+    /// If a terminal tile is already focused, splits a new independent terminal tile beside it.
     pub fn open_terminal_tile(&mut self) {
         if let Some(i) = self.tile_of_terminal() {
-            self.focus_tile(i);
+            if self.in_split() && self.focus == i {
+                self.split_terminal_tile();
+            } else {
+                self.focus_tile(i);
+            }
             return;
         }
         self.close_terminal();
@@ -1788,6 +1850,7 @@ impl UiState {
                     None => TileContent::Empty,
                 },
                 asid: current,
+                term_tab: None,
                 slot: SessionSlot::default(),
             });
             self.focus = 0;
@@ -1800,13 +1863,32 @@ impl UiState {
             None => self.focus,
         };
 
-        self.tiles[at].set_terminal();
-        self.mode = Mode::Session;
-        if self.term.session.is_none() {
+        if self.term.session.is_none() && self.term.tabs.is_empty() {
             self.start_terminal();
         }
+        self.tiles[at].set_terminal_tab(self.term.active_tab);
+        self.mode = Mode::Session;
         self.focus_tile(at);
         self.persist_tiles();
+    }
+
+    /// Split a new independent terminal tile beside the currently focused tile,
+    /// assigning it an unused terminal tab or spawning a new terminal tab for it.
+    pub fn split_terminal_tile(&mut self) {
+        if !self.has_terminal_tile() {
+            self.open_terminal_tile();
+            return;
+        }
+        self.close_terminal();
+        self.right_open = false;
+        self.right.set_open(false);
+
+        let at = match self.tiles.iter().position(|t| t.is_empty()) {
+            Some(empty) => empty,
+            None if self.tiles.len() < MAX_TILES => self.add_tile(),
+            None => return,
+        };
+        tiles::fill_terminal_tile(self, at);
     }
 
     /// An empty tile splitting the focused one; its index.
@@ -2020,18 +2102,26 @@ impl UiState {
         }
         self.tiles_restored = true;
         self.tiles.clear();
+        let mut term_idx = 0usize;
         for key in &saved {
             match TileContent::from_persist_key(key) {
-                TileContent::Terminal => self.tiles.push(Tile::terminal()),
+                TileContent::Terminal => {
+                    let mut tile = Tile::terminal();
+                    tile.term_tab = Some(term_idx);
+                    term_idx += 1;
+                    self.tiles.push(tile);
+                }
                 TileContent::Session(asid) => self.tiles.push(Tile::session(asid)),
                 TileContent::Diff(path) => self.tiles.push(Tile {
                     content: TileContent::Diff(path),
                     asid: None,
+                    term_tab: None,
                     slot: SessionSlot::default(),
                 }),
                 TileContent::Custom { id, kind, title } => self.tiles.push(Tile {
                     content: TileContent::Custom { id, kind, title },
                     asid: None,
+                    term_tab: None,
                     slot: SessionSlot::default(),
                 }),
                 TileContent::Empty => self.tiles.push(Tile::empty()),

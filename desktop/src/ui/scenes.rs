@@ -1082,6 +1082,55 @@ fn base_scenes() -> &'static [Scene] {
             s.term.open = true;
             s.term.pane.set_open(true);
         }),
+        // Two independent terminal tiles side by side, each with its own tab.
+        ("split-terminals", |s| {
+            base(s);
+            s.term.fixture = Some(shell_fixture);
+            let is_light = std::env::args().any(|a| a == "light");
+            let scheme = if is_light {
+                crate::theme::color_scheme::ColorScheme::Light
+            } else {
+                crate::theme::color_scheme::ColorScheme::Dark
+            };
+            let colors =
+                crate::ui::terminal_panel::colors(&rune_kit::Kit::neutral(!is_light), scheme);
+            s.term.want.set(Some(colors));
+            let size = crate::term::engine::Size {
+                cols: 80,
+                rows: 24,
+                cell_w: 8,
+                cell_h: 17,
+            };
+            let frame_0 = crate::term::engine::render_fixture(&shell_fixture(80, 24), size, colors);
+            let frame_1 = crate::term::engine::render_fixture(&vim_fixture(80, 24), size, colors);
+            s.term.frame = frame_0.clone();
+            s.term.tabs.push(super::terminal_panel::TermTab {
+                id: 0,
+                session: None,
+                frame: frame_0,
+                cwd: std::path::PathBuf::from("/home/demo/app"),
+                title: Some("shell".into()),
+                pending_command: None,
+            });
+            s.term.tabs.push(super::terminal_panel::TermTab {
+                id: 1,
+                session: None,
+                frame: frame_1,
+                cwd: std::path::PathBuf::from("/home/demo/api"),
+                title: Some("editor".into()),
+                pending_command: None,
+            });
+            s.term.next_tab_id = 2;
+            s.term.active_tab = 0;
+            let mut a = super::Tile::terminal();
+            a.term_tab = Some(0);
+            let mut b = super::Tile::terminal();
+            b.term_tab = Some(1);
+            s.tiles = vec![a, b];
+            s.focus = 0;
+            s.mode = super::Mode::Session;
+            s.term.sink.focused = true;
+        }),
         ("settings", settings),
         ("tasks", tasks),
         ("inbox", inbox),

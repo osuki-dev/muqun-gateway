@@ -128,6 +128,8 @@ pub struct TermPanel {
     pub pending_command: Option<String>,
     /// The grid's size the shell and emulator have, in cells.
     size: Option<Size>,
+    /// Per-tab grid sizes when multiple terminal tiles sit side by side.
+    pub tab_sizes: std::collections::HashMap<u64, Size>,
     /// New sizes on their way to the shell (paced while the divider drags).
     resize: Resizer,
     /// The frame clock's seconds, as the last poll saw them.
@@ -164,6 +166,7 @@ impl TermPanel {
             error: None,
             pending_command: None,
             size: None,
+            tab_sizes: std::collections::HashMap::new(),
             resize: Resizer::default(),
             now: 0.0,
             want: Cell::new(None),
@@ -246,6 +249,16 @@ fn grid_size(pane_width: f32, height: f32, m: Metrics, scale: f32) -> Size {
     Size {
         cols: ((across / m.cw).floor() as u16).max(2),
         rows: ((height / m.ch).floor() as u16).max(1),
+        cell_w: (m.cw * scale).round().max(1.0) as u32,
+        cell_h: (m.ch * scale).round().max(1.0) as u32,
+    }
+}
+
+/// The grid's size in cells inside a split tile laid out at `rect`.
+fn tile_grid_size(rect: [f32; 4], m: Metrics, scale: f32) -> Size {
+    Size {
+        cols: (((rect[2] - 2.0 * INSET) / m.cw).floor() as u16).max(2),
+        rows: ((rect[3] / m.ch).floor() as u16).max(1),
         cell_w: (m.cw * scale).round().max(1.0) as u32,
         cell_h: (m.ch * scale).round().max(1.0) as u32,
     }
@@ -520,27 +533,38 @@ impl UiState {
         self.term_new_tab_in(cwd, None);
     }
 
+    /// Record the lone shell as tab 0 before a second tab joins it. `force`
+    /// seeds even before that shell has started (a second terminal tile).
+    pub(crate) fn ensure_term_tabs_seeded(&mut self, force: bool) {
+        if self.term.tabs.is_empty()
+            && (force || self.term.session.is_some() || self.term.frame.is_some())
+        {
+            let id = self.term.next_tab_id;
+            self.term.next_tab_id += 1;
+            let cur_cwd = self
+                .term
+                .session
+                .as_ref()
+                .map(|s| s.cwd.clone())
+                .unwrap_or_else(|| self.terminal_cwd());
+            self.term.tabs.push(TermTab {
+                id,
+                session: self.term.session.clone(),
+                frame: self.term.frame.clone(),
+                cwd: cur_cwd,
+                title: None,
+                pending_command: None,
+            });
+            self.term.active_tab = 0;
+        }
+    }
+
     pub fn term_new_tab_in(&mut self, cwd: PathBuf, command: Option<String>) {
-        self.open_terminal();
+        if !self.has_terminal_tile() {
+            self.open_terminal();
+        }
         if self.term.tabs.is_empty() {
-            if self.term.session.is_some() || self.term.frame.is_some() {
-                let id = self.term.next_tab_id;
-                self.term.next_tab_id += 1;
-                let cur_cwd = self
-                    .term
-                    .session
-                    .as_ref()
-                    .map(|s| s.cwd.clone())
-                    .unwrap_or_else(|| self.terminal_cwd());
-                self.term.tabs.push(TermTab {
-                    id,
-                    session: self.term.session.clone(),
-                    frame: self.term.frame.clone(),
-                    cwd: cur_cwd,
-                    title: None,
-                    pending_command: None,
-                });
-            }
+            self.ensure_term_tabs_seeded(false);
         } else if let Some(cur) = self.term.tabs.get_mut(self.term.active_tab) {
             cur.session = self.term.session.clone();
             cur.frame = self.term.frame.clone();
@@ -557,6 +581,9 @@ impl UiState {
             pending_command: command.clone(),
         });
         self.term.active_tab = self.term.tabs.len() - 1;
+        if self.in_split() && self.tiles.get(self.focus).is_some_and(|t| t.is_terminal()) {
+            self.tiles[self.focus].term_tab = Some(self.term.active_tab);
+        }
         self.term.session = None;
         self.term.frame = None;
         self.term.pending_command = command;
@@ -565,7 +592,23 @@ impl UiState {
     }
 
     pub fn term_switch_tab(&mut self, index: usize) {
-        if index >= self.term.tabs.len() || index == self.term.active_tab {
+        if index >= self.term.tabs.len() {
+            self.focus_terminal();
+            return;
+        }
+        if self.in_split() && self.tiles.get(self.focus).is_some_and(|t| t.is_terminal()) {
+            // A tab already shown by another tile trades places with ours, so
+            // two tiles never drive the same shell.
+            let old = self.term.active_tab;
+            let focus = self.focus;
+            for (j, t) in self.tiles.iter_mut().enumerate() {
+                if j != focus && t.is_terminal() && t.term_tab == Some(index) {
+                    t.term_tab = Some(old);
+                }
+            }
+            self.tiles[focus].term_tab = Some(index);
+        }
+        if index == self.term.active_tab {
             self.focus_terminal();
             return;
         }
@@ -583,6 +626,15 @@ impl UiState {
             self.term.send(Msg::Resize(size));
         }
         self.focus_terminal();
+    }
+
+    pub fn term_switch_tab_for_tile(&mut self, tile_idx: Option<usize>, index: usize) {
+        if let Some(ti) = tile_idx {
+            if ti < self.tiles.len() && self.focus != ti {
+                self.focus_tile(ti);
+            }
+        }
+        self.term_switch_tab(index);
     }
 
     pub fn term_next_tab(&mut self) {
@@ -654,7 +706,61 @@ impl UiState {
                 self.term.active_tab -= 1;
             }
         }
+        self.rebind_tiles_after_close(index);
         self.focus_terminal();
+    }
+
+    /// Tab `index` is gone: shift the tabs tiles show, and give a tile that
+    /// showed it another unshown tab, or close that tile when none is left.
+    fn rebind_tiles_after_close(&mut self, index: usize) {
+        let mut orphans = Vec::new();
+        for (i, t) in self.tiles.iter_mut().enumerate() {
+            if !t.is_terminal() {
+                continue;
+            }
+            match t.term_tab {
+                Some(tab) if tab == index => {
+                    t.term_tab = None;
+                    orphans.push(i);
+                }
+                Some(tab) if tab > index => t.term_tab = Some(tab - 1),
+                _ => {}
+            }
+        }
+        if orphans.is_empty() {
+            return;
+        }
+        // The focused tile first: it takes the newly active tab when free.
+        orphans.sort_by_key(|i| *i != self.focus);
+        let mut doomed = Vec::new();
+        for i in orphans {
+            let used: Vec<usize> = self
+                .tiles
+                .iter()
+                .enumerate()
+                .filter(|(j, t)| *j != i && t.is_terminal())
+                .filter_map(|(_, t)| t.term_tab)
+                .collect();
+            let free = if used.contains(&self.term.active_tab) {
+                (0..self.term.tabs.len()).find(|tab| !used.contains(tab))
+            } else {
+                Some(self.term.active_tab)
+            };
+            match free {
+                Some(tab) => self.tiles[i].term_tab = Some(tab),
+                None => doomed.push(i),
+            }
+        }
+        doomed.sort_unstable();
+        for i in doomed.into_iter().rev() {
+            if self.tiles.iter().filter(|t| t.is_terminal()).count() > 1 {
+                self.close_tile(i);
+            }
+        }
+        if self.tiles.get(self.focus).is_some_and(|t| t.is_terminal()) {
+            self.sync_tile_terminal_tab(self.focus);
+        }
+        self.persist_tiles();
     }
 
     /// Switch the active terminal to the focused session's workspace directory,
@@ -737,6 +843,25 @@ impl UiState {
                 .map(|x| x.cwd.clone())
                 .unwrap_or_else(|| self.terminal_cwd());
             short_path(&cwd)
+        }
+    }
+
+    /// The title a terminal tile's header shows: its own shell's.
+    pub fn term_tile_title(&self, tile_idx: usize) -> String {
+        if self.tile_of_terminal() == Some(tile_idx) {
+            return self.term_active_title();
+        }
+        match self
+            .tile_terminal_tab(tile_idx)
+            .and_then(|tab| self.term.tabs.get(tab))
+        {
+            Some(tab) => tab
+                .frame
+                .as_ref()
+                .map(|f| f.title.clone())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| short_path(&tab.cwd)),
+            None => short_path(&self.terminal_cwd()),
         }
     }
 
@@ -857,14 +982,17 @@ impl UiState {
         if (!self.term.open && !self.has_terminal_tile()) || rect[2] < 40.0 || rect[3] < 20.0 {
             return;
         }
+        // Each tab keeps the size it was last given: after a switch, the grid
+        // compares against the new tab's, not the old one's.
+        if let Some(id) = self.term.tabs.get(self.term.active_tab).map(|t| t.id) {
+            let had = self.term.tab_sizes.get(&id).copied();
+            if had.is_some() && had != self.term.size {
+                self.term.size = had;
+            }
+        }
         let m = metrics();
         let size = if self.has_terminal_tile() {
-            Size {
-                cols: (((rect[2] - 2.0 * INSET) / m.cw).floor() as u16).max(2),
-                rows: ((rect[3] / m.ch).floor() as u16).max(1),
-                cell_w: (m.cw * scale).round().max(1.0) as u32,
-                cell_h: (m.ch * scale).round().max(1.0) as u32,
-            }
+            tile_grid_size(rect, m, scale)
         } else {
             grid_size(self.term.pane.width(), rect[3], m, scale)
         };
@@ -881,14 +1009,96 @@ impl UiState {
         }
     }
 
+    /// A terminal tile's grid was laid out. The live tile drives the active
+    /// shell; any other tile sizes the background tab it shows, starting a
+    /// shell for it first when it has none yet (a restored layout).
+    fn terminal_tile_layout(&mut self, tile_idx: Option<usize>, rect: [f32; 4], scale: f32) {
+        let Some(ti) = tile_idx.filter(|ti| self.tile_of_terminal() != Some(*ti)) else {
+            self.terminal_layout(rect, scale);
+            return;
+        };
+        if rect[2] < 40.0 || rect[3] < 20.0 {
+            return;
+        }
+        let size = tile_grid_size(rect, metrics(), scale);
+        // A scene's fixture paints every tile's shell (no real processes).
+        if let Some(fixture) = self.term.fixture {
+            let (Some(tab), Some(colors)) = (self.tile_terminal_tab(ti), self.term.want.get())
+            else {
+                return;
+            };
+            if let Some(t) = self.term.tabs.get_mut(tab) {
+                if t.frame
+                    .as_ref()
+                    .is_none_or(|f| f.cols != size.cols || f.rows != size.rows)
+                {
+                    let bytes = fixture(size.cols, size.rows);
+                    t.frame = crate::term::engine::render_fixture(&bytes, size, colors);
+                }
+            }
+            return;
+        }
+        let tab = match self.tile_terminal_tab(ti) {
+            Some(tab) => tab,
+            None => match self.spawn_background_tab(size) {
+                Some(tab) => {
+                    self.tiles[ti].term_tab = Some(tab);
+                    return;
+                }
+                None => return,
+            },
+        };
+        if tab == self.term.active_tab {
+            return;
+        }
+        let Some(t) = self.term.tabs.get(tab) else {
+            return;
+        };
+        if self.term.tab_sizes.get(&t.id) == Some(&size) {
+            return;
+        }
+        if let Some(session) = &t.session {
+            session.send(Msg::Resize(size));
+        }
+        self.term.tab_sizes.insert(t.id, size);
+    }
+
+    /// Start a shell in a new tab without making it the active one.
+    fn spawn_background_tab(&mut self, size: Size) -> Option<usize> {
+        let waker = self.term.waker.clone()?;
+        let colors = self.term.want.get()?;
+        let cwd = self.terminal_cwd();
+        let session = Session::start(cwd.clone(), size, colors, waker).ok()?;
+        self.ensure_term_tabs_seeded(true);
+        let id = self.term.next_tab_id;
+        self.term.next_tab_id += 1;
+        self.term.tabs.push(TermTab {
+            id,
+            session: Some(session),
+            frame: None,
+            cwd,
+            title: None,
+            pending_command: None,
+        });
+        self.term.tab_sizes.insert(id, size);
+        Some(self.term.tabs.len() - 1)
+    }
+
     /// Give the shell and emulator (or a scene's fixture) a new grid size.
     fn resize_terminal(&mut self, size: Size) {
         self.term.size = Some(size);
+        if let Some(id) = self.term.tabs.get(self.term.active_tab).map(|t| t.id) {
+            self.term.tab_sizes.insert(id, size);
+        }
         tracing::debug!(target: "muqun_desktop::term_resize", cols = size.cols, rows = size.rows, "grid resize");
         if let Some(fixture) = self.term.fixture {
             if let Some(colors) = self.term.want.get() {
                 let bytes = fixture(size.cols, size.rows);
-                self.term.frame = crate::term::engine::render_fixture(&bytes, size, colors);
+                let f = crate::term::engine::render_fixture(&bytes, size, colors);
+                self.term.frame = f.clone();
+                if let Some(t) = self.term.tabs.get_mut(self.term.active_tab) {
+                    t.frame = f;
+                }
                 self.term.sent = Some(colors);
             }
         } else if self.term.session.is_some() {
@@ -917,7 +1127,17 @@ impl UiState {
                 self.term.sent = Some(want);
                 if let (Some(fixture), Some(size)) = (self.term.fixture, self.term.size) {
                     let bytes = fixture(size.cols, size.rows);
-                    self.term.frame = crate::term::engine::render_fixture(&bytes, size, want);
+                    let f = crate::term::engine::render_fixture(&bytes, size, want);
+                    self.term.frame = f.clone();
+                    if let Some(t) = self.term.tabs.get_mut(self.term.active_tab) {
+                        t.frame = f;
+                    }
+                    for (tab_idx, tab) in self.term.tabs.iter_mut().enumerate() {
+                        if tab_idx != self.term.active_tab {
+                            let f_tab = crate::term::engine::render_fixture(&bytes, size, want);
+                            tab.frame = f_tab;
+                        }
+                    }
                     changed = true;
                 } else {
                     for tab in &self.term.tabs {
@@ -944,6 +1164,9 @@ impl UiState {
             }
             changed = true;
         }
+        let shown: Vec<usize> = (0..self.tiles.len())
+            .filter_map(|i| self.tile_terminal_tab(i))
+            .collect();
         for (i, tab) in self.term.tabs.iter_mut().enumerate() {
             if i != self.term.active_tab {
                 if let Some(frame) = tab.session.as_ref().and_then(Session::take_frame) {
@@ -953,6 +1176,8 @@ impl UiState {
                         }
                     }
                     tab.frame = Some(frame);
+                    // Another tile shows this tab: redraw it.
+                    changed |= shown.contains(&i);
                 }
             }
         }
@@ -1021,7 +1246,7 @@ impl UiState {
                 || tx.physical_key() == Some(rune::PhysicalKeyCode::Backslash)
             {
                 if self.in_split() {
-                    self.split();
+                    self.split_terminal_tile();
                 } else {
                     self.open_terminal_tile();
                 }
@@ -1365,7 +1590,10 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
                 .key("terminal-close"),
         );
 
-    let grid = context_menu(s, k, grid(s, k, frame, m, bg, scale), layer);
+    let ended_now = s.term.fixture_ended.is_some()
+        || s.term.session.as_ref().is_some_and(|x| x.ended().is_some());
+    let view = GridView::panel(ended_now);
+    let grid = context_menu(s, k, grid(s, k, frame, m, bg, scale, view), layer);
     let mut body = col()
         .key("terminal-body")
         .w_full()
@@ -1386,7 +1614,7 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
                 .wrap(),
         );
     } else if let Some(ended) = ended {
-        body = body.child(ended_notice(k, language, ended));
+        body = body.child(ended_notice(k, language, ended, "", None));
     }
     col()
         .key("terminal-panel")
@@ -1401,22 +1629,95 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
 
 /// The embedded terminal content inside a split tile.
 pub fn tile_body(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut Vec<El>) -> El {
+    tile_body_for(s, k, scheme, scale, layer, None)
+}
+
+/// How one grid is shown: in which tile, whether it is the live shell (the
+/// one with the keyboard sink), and the suffix that keeps its keys unique.
+#[derive(Clone, Copy)]
+struct GridView<'a> {
+    tile_idx: Option<usize>,
+    live: bool,
+    sfx: &'a str,
+    ended: bool,
+}
+
+impl GridView<'static> {
+    /// The bottom panel's single grid (or a lone terminal tile): live.
+    fn panel(ended: bool) -> Self {
+        Self {
+            tile_idx: None,
+            live: true,
+            sfx: "",
+            ended,
+        }
+    }
+}
+
+impl UiState {
+    /// Take the keyboard into terminal tile `tile_idx` (its shell becomes active).
+    fn focus_terminal_tile_tx(&mut self, tile_idx: Option<usize>, tx: &mut Tx) {
+        if let Some(i) = tile_idx {
+            if i < self.tiles.len() && self.focus != i {
+                self.focus_tile(i);
+            }
+        }
+        self.focus_terminal_tx(tx);
+    }
+}
+
+/// The terminal inside split tile `tile_idx`: each terminal tile shows its
+/// own tab, so several shells sit side by side.
+pub fn tile_body_for(
+    s: &UiState,
+    k: &Kit,
+    scheme: ColorScheme,
+    scale: f32,
+    layer: &mut Vec<El>,
+    tile_idx: Option<usize>,
+) -> El {
     let language = s.cfg.general.language;
     let colors = colors(k, scheme);
     s.term.want.set(Some(colors));
     let m = metrics();
-    let frame = s.term.frame.as_ref();
+    let live = tile_idx.is_none_or(|i| s.tile_of_terminal() == Some(i));
+    // The first terminal tile keeps the plain keys; others get a suffix.
+    let first = tile_idx.is_none_or(|i| !s.tiles.iter().take(i).any(|t| t.is_terminal()));
+    let sfx = match tile_idx {
+        Some(i) if !first => format!("-{i}"),
+        _ => String::new(),
+    };
+    let shown_tab = if live {
+        Some(s.term.active_tab)
+    } else {
+        tile_idx.and_then(|i| s.tile_terminal_tab(i))
+    };
+    let bg_tab = if live {
+        None
+    } else {
+        shown_tab.and_then(|t| s.term.tabs.get(t))
+    };
+    let frame = if live {
+        s.term.frame.as_ref()
+    } else {
+        bg_tab.and_then(|t| t.frame.as_ref())
+    };
     let bg = color(frame.map_or(colors.bg, |f| f.bg));
-    let ended = s
-        .term
-        .session
-        .as_ref()
-        .and_then(Session::ended)
-        .or(s.term.fixture_ended);
+    let ended = if live {
+        s.term
+            .session
+            .as_ref()
+            .and_then(Session::ended)
+            .or(s.term.fixture_ended)
+    } else {
+        bg_tab
+            .and_then(|t| t.session.as_ref())
+            .and_then(Session::ended)
+    };
 
     let tab_count = s.term.tabs.len().max(1);
     let mut tabs_strip = row()
-        .key("tile-terminal-tabs-strip")
+        .key(format!("tile-terminal-tabs-strip{sfx}"))
         .gap(4.0)
         .center_y()
         .shrink()
@@ -1424,9 +1725,11 @@ pub fn tile_body(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &
         .grow(1.0);
 
     for i in 0..tab_count {
-        let is_active = i == s.term.active_tab;
-        let tab_title = if is_active {
-            frame
+        let is_active = Some(i) == shown_tab;
+        let tab_title = if i == s.term.active_tab {
+            s.term
+                .frame
+                .as_ref()
                 .map(|f| f.title.clone())
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| {
@@ -1469,20 +1772,21 @@ pub fn tile_body(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &
                     .control_size(ControlSize::Small)
                     .label(tr_ref(language, "Close tab"))
                     .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
+                        s.focus_terminal_tile_tx(tile_idx, tx);
                         s.term_close_tab(i);
                         if s.term.open || s.has_terminal_tile() {
                             s.focus_terminal_tx(tx);
                         }
                     })
                     .build(k)
-                    .key(format!("tile-terminal-tab-close-{i}")),
+                    .key(format!("tile-terminal-tab-close{sfx}-{i}")),
             )
         } else {
             None
         };
 
         let mut tab_pill = row()
-            .key(format!("tile-terminal-tab-{i}"))
+            .key(format!("tile-terminal-tab{sfx}-{i}"))
             .h(26.0)
             .pl(8.0)
             .pr(if close_tab.is_some() { 4.0 } else { 8.0 })
@@ -1494,8 +1798,8 @@ pub fn tile_body(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &
             .cursor(rune::Cursor::Pointer)
             .preserve_focus_on_press(true)
             .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
-                s.term_switch_tab(i);
-                s.focus_terminal_tx(tx);
+                s.term_switch_tab_for_tile(tile_idx, i);
+                s.focus_terminal_tile_tx(tile_idx, tx);
             })
             .child(
                 rune::icon(&TERMINAL_WINDOW, 11.0)
@@ -1530,28 +1834,30 @@ pub fn tile_body(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &
         .variant(IconButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
         .label(tr_ref(language, "New tab (Ctrl+Shift+T)"))
-        .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
+        .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
+            s.focus_terminal_tile_tx(tile_idx, tx);
             s.term_new_tab();
             s.focus_terminal_tx(tx);
         })
         .build(k)
-        .key("tile-terminal-new-tab");
+        .key(format!("tile-terminal-new-tab{sfx}"));
     tabs_strip = tabs_strip.child(add_tab_btn);
 
     let sync_cwd_btn = IconButton::new(&rune_kit::glyphs::FOLDER)
         .variant(IconButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
         .label(super::copy::t_ref(language, "Sync directory with session"))
-        .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
+        .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
+            s.focus_terminal_tile_tx(tile_idx, tx);
             s.term_sync_cwd();
             s.focus_terminal_tx(tx);
         })
         .build(k)
-        .key("tile-terminal-sync-cwd");
+        .key(format!("tile-terminal-sync-cwd{sfx}"));
     tabs_strip = tabs_strip.child(sync_cwd_btn);
 
     let subheader = row()
-        .key("tile-terminal-subhead")
+        .key(format!("tile-terminal-subhead{sfx}"))
         .w_full()
         .h(30.0)
         .pl(8.0)
@@ -1566,17 +1872,31 @@ pub fn tile_body(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
                 .label(tr_ref(language, "Restart shell"))
-                .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
+                .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
+                    s.focus_terminal_tile_tx(tile_idx, tx);
                     s.restart_terminal();
                     s.focus_terminal_tx(tx);
                 })
                 .build(k)
-                .key("tile-terminal-restart"),
+                .key(format!("tile-terminal-restart{sfx}")),
         );
 
-    let grid = context_menu(s, k, grid(s, k, frame, m, bg, scale), layer);
+    let view = GridView {
+        tile_idx,
+        live,
+        sfx: &sfx,
+        ended: ended.is_some(),
+    };
+    let g = grid(s, k, frame, m, bg, scale, view);
+    let grid = if live {
+        context_menu(s, k, g, layer)
+    } else {
+        g.on_secondary_press(move |s: &mut UiState, _at, tx: &mut Tx| {
+            s.focus_terminal_tile_tx(tile_idx, tx);
+        })
+    };
     let mut body = col()
-        .key("tile-terminal-body")
+        .key(format!("tile-terminal-body{sfx}"))
         .w_full()
         .grow(1.0)
         .min_h(0.0)
@@ -1587,20 +1907,24 @@ pub fn tile_body(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &
         .preserve_focus_on_press(true)
         .child(grid);
 
-    if let Some(err) = &s.term.error {
-        body = body.child(
-            text(err.clone())
-                .key("tile-terminal-error")
-                .font(k.ty.body)
-                .color(k.c.danger.fg)
-                .wrap(),
-        );
-    } else if let Some(ended) = ended {
-        body = body.child(ended_notice(k, language, ended));
+    match (&s.term.error, ended) {
+        (Some(err), _) if live => {
+            body = body.child(
+                text(err.clone())
+                    .key("tile-terminal-error")
+                    .font(k.ty.body)
+                    .color(k.c.danger.fg)
+                    .wrap(),
+            );
+        }
+        (_, Some(ended)) => {
+            body = body.child(ended_notice(k, language, ended, &sfx, tile_idx));
+        }
+        _ => {}
     }
 
     col()
-        .key("tile-terminal-content")
+        .key(format!("tile-terminal-content{sfx}"))
         .w_full()
         .grow(1.0)
         .min_h(0.0)
@@ -1612,7 +1936,13 @@ pub fn tile_body(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &
 
 /// What a shell that ended badly says under its last screen: how it ended,
 /// and a new one a press (or Return) away.
-fn ended_notice(k: &Kit, language: crate::config::Language, ended: Ended) -> El {
+fn ended_notice(
+    k: &Kit,
+    language: crate::config::Language,
+    ended: Ended,
+    sfx: &str,
+    tile_idx: Option<usize>,
+) -> El {
     use super::copy::tr;
     let what = match ended {
         Ended::Shell(Exit::Code(n)) => tr(language, &format!("Shell exited (code {n})")),
@@ -1620,13 +1950,13 @@ fn ended_notice(k: &Kit, language: crate::config::Language, ended: Ended) -> El 
         Ended::Broken => tr(language, "The terminal stopped"),
     };
     row()
-        .key("terminal-ended")
+        .key(format!("terminal-ended{sfx}"))
         .w_full()
         .gap(10.0)
         .center_y()
         .child(
             text(what)
-                .key("terminal-ended-text")
+                .key(format!("terminal-ended-text{sfx}"))
                 .font(k.ty.caption())
                 .color(k.c.text_muted)
                 .truncate()
@@ -1638,9 +1968,12 @@ fn ended_notice(k: &Kit, language: crate::config::Language, ended: Ended) -> El 
             Button::new(tr_ref(language, "Restart"))
                 .variant(ButtonVariant::Outline)
                 .control_size(ControlSize::Small)
-                .on_press(|s: &mut UiState| s.restart_terminal())
+                .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
+                    s.focus_terminal_tile_tx(tile_idx, tx);
+                    s.restart_terminal();
+                })
                 .build(k)
-                .key("terminal-ended-restart"),
+                .key(format!("terminal-ended-restart{sfx}")),
         )
 }
 
@@ -1718,10 +2051,24 @@ fn short_path(path: &std::path::Path) -> String {
     path.display().to_string()
 }
 
-fn grid(s: &UiState, k: &Kit, frame: Option<&Frame>, m: Metrics, bg: Color, scale: f32) -> El {
-    let focused = s.term.sink.focused;
+fn grid(
+    s: &UiState,
+    k: &Kit,
+    frame: Option<&Frame>,
+    m: Metrics,
+    bg: Color,
+    scale: f32,
+    view: GridView<'_>,
+) -> El {
+    let GridView {
+        tile_idx,
+        live,
+        sfx,
+        ended,
+    } = view;
+    let focused = live && s.term.sink.focused;
     let mut grid = el()
-        .key("terminal-grid")
+        .key(format!("terminal-grid{sfx}"))
         .w_full()
         .grow(1.0)
         .min_h(0.0)
@@ -1731,15 +2078,15 @@ fn grid(s: &UiState, k: &Kit, frame: Option<&Frame>, m: Metrics, bg: Color, scal
         } else {
             rune::Cursor::Text
         })
-        .on_layout(move |s: &mut UiState, r| s.terminal_layout(r, scale))
-        .on_drop_files(|s: &mut UiState, files, tx: &mut Tx| {
-            s.focus_terminal_tx(tx);
+        .on_layout(move |s: &mut UiState, r| s.terminal_tile_layout(tile_idx, r, scale))
+        .on_drop_files(move |s: &mut UiState, files, tx: &mut Tx| {
+            s.focus_terminal_tile_tx(tile_idx, tx);
             paste_terminal_files(s, files);
         })
-        .on_drag(|s: &mut UiState, d: &mut rune::Drag, tx: &mut Tx| {
+        .on_drag(move |s: &mut UiState, d: &mut rune::Drag, tx: &mut Tx| {
             let phase = match d.phase {
                 rune::Phase::Down => {
-                    s.focus_terminal_tx(tx);
+                    s.focus_terminal_tile_tx(tile_idx, tx);
                     MousePhase::Down
                 }
                 rune::Phase::Move => MousePhase::Move,
@@ -1747,20 +2094,28 @@ fn grid(s: &UiState, k: &Kit, frame: Option<&Frame>, m: Metrics, bg: Color, scal
             };
             s.terminal_mouse(phase, d.x, d.y, tx.mods());
         })
-        .on_wheel(|s: &mut UiState, e: rune::WheelEvent, _: &mut Tx| {
+        .on_wheel(move |s: &mut UiState, e: rune::WheelEvent, _: &mut Tx| {
             let ch = metrics().ch;
             s.term.wheel += e.dy;
             let lines = -(s.term.wheel / ch).trunc() as i32;
             if lines != 0 {
                 s.term.wheel += lines as f32 * ch;
-                let size = s.term.size;
+                // A tile beside the live one scrolls its own shell.
+                let other = tile_idx
+                    .filter(|i| s.tile_of_terminal() != Some(*i))
+                    .and_then(|i| s.tile_terminal_tab(i))
+                    .and_then(|t| s.term.tabs.get(t));
+                let size = match other {
+                    Some(tab) => s.term.tab_sizes.get(&tab.id).copied(),
+                    None => s.term.size,
+                };
                 let (x, y) = size.map_or((0.0, 0.0), |sz| {
                     (
                         e.x / metrics().cw * sz.cell_w as f32,
                         e.y / ch * sz.cell_h as f32,
                     )
                 });
-                s.term.send(Msg::Wheel {
+                let msg = Msg::Wheel {
                     lines,
                     x,
                     y,
@@ -1770,16 +2125,25 @@ fn grid(s: &UiState, k: &Kit, frame: Option<&Frame>, m: Metrics, bg: Color, scal
                         alt: e.mods.alt,
                         logo: e.mods.logo,
                     },
-                });
+                };
+                match other.and_then(|tab| tab.session.as_ref()) {
+                    Some(session) => session.send(msg),
+                    None if other.is_none() => s.term.send(msg),
+                    None => {}
+                }
             }
             true
         });
     let Some(frame) = frame else {
-        return grid.child(sink(s, k, m, 0, 0, bg));
+        return if live {
+            grid.child(sink(s, k, m, 0, 0, bg))
+        } else {
+            grid
+        };
     };
     for (y, row) in frame.grid.iter().enumerate() {
         let row = row.clone();
-        let key = format!("terminal-row-{y}");
+        let key = format!("terminal-row{sfx}-{y}");
         let version = (
             row.hash,
             m.cw.to_bits(),
@@ -1793,8 +2157,6 @@ fn grid(s: &UiState, k: &Kit, frame: Option<&Frame>, m: Metrics, bg: Color, scal
         }));
     }
     // A shell that ended takes no more keys: no cursor.
-    let ended = s.term.fixture_ended.is_some()
-        || s.term.session.as_ref().is_some_and(|x| x.ended().is_some());
     if let Some(cursor) = frame.cursor.filter(|_| !ended) {
         let (_ch, is_wide, head_col) = cursor_char_at(frame, cursor.col, cursor.row);
         let wide = cursor.wide || is_wide;
@@ -1818,7 +2180,7 @@ fn grid(s: &UiState, k: &Kit, frame: Option<&Frame>, m: Metrics, bg: Color, scal
                 .fill(c),
         };
         grid = grid.child(
-            mark.key("terminal-cursor")
+            mark.key(format!("terminal-cursor{sfx}"))
                 .instant_changes()
                 .motion(rune::Spring::NONE)
                 .transition(rune::Transition::none())
@@ -1833,13 +2195,16 @@ fn grid(s: &UiState, k: &Kit, frame: Option<&Frame>, m: Metrics, bg: Color, scal
         let range = (frame.scroll.total - frame.scroll.len).max(1) as f32;
         let top = frame.scroll.offset as f32 / range * (h - thumb);
         grid = grid.child(
-            el().key("terminal-scroll")
+            el().key(format!("terminal-scroll{sfx}"))
                 .absolute(f32::from(frame.cols) * m.cw - 3.0, top.min(h - thumb))
                 .size(3.0, thumb)
                 .radius(1.5)
                 .fill(k.c.text_faint.alpha(0.6))
                 .a11y_hidden(),
         );
+    }
+    if !live {
+        return grid;
     }
     let (cx, cy) = frame.cursor.map_or((0, 0), |c| (c.col, c.row));
     grid.child(sink(s, k, m, cx, cy, bg))
@@ -2875,7 +3240,7 @@ mod tests {
             wide: false,
         });
 
-        let grid_el = grid(&s, &k, Some(&frame), m, bg, 1.0);
+        let grid_el = grid(&s, &k, Some(&frame), m, bg, 1.0, GridView::panel(false));
         // Verify grid builds cleanly
         let _ = grid_el;
 
@@ -2886,7 +3251,7 @@ mod tests {
             shape: CursorShape::Block,
             wide: true,
         });
-        let grid_el_tail = grid(&s, &k, Some(&frame), m, bg, 1.0);
+        let grid_el_tail = grid(&s, &k, Some(&frame), m, bg, 1.0, GridView::panel(false));
         let _ = grid_el_tail;
     }
 

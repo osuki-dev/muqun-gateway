@@ -86,19 +86,46 @@ fn fill_tile(s: &mut UiState, i: usize, asid: &str) {
 }
 
 /// Put the interactive terminal into empty tile `i`.
-fn fill_terminal_tile(s: &mut UiState, i: usize) {
+/// When another tile already hosts a terminal, assigns an unused terminal tab
+/// or opens a new terminal tab so both tiles display independent shells.
+pub(crate) fn fill_terminal_tile(s: &mut UiState, i: usize) {
     if s.tiles.get(i).is_none_or(|t| !t.is_empty()) {
         return;
     }
-    if let Some(open) = s.tile_of_terminal() {
-        s.focus_tile(open);
-        return;
-    }
+    let used_tabs: Vec<usize> = s
+        .tiles
+        .iter()
+        .enumerate()
+        .filter(|(idx, t)| *idx != i && t.is_terminal())
+        .map(|(_, t)| t.term_tab.unwrap_or(s.term.active_tab))
+        .collect();
     s.close_terminal();
-    s.tiles[i].set_terminal();
-    if s.term.session.is_none() {
+    if s.term.session.is_none() && s.term.tabs.is_empty() {
         s.start_terminal();
     }
+    if !used_tabs.is_empty() {
+        // Switching or opening a tab rebinds the focused tile; it keeps its own.
+        let keep = (
+            s.focus,
+            s.tiles
+                .get(s.focus)
+                .and_then(|t| t.term_tab)
+                .or(Some(s.term.active_tab)),
+        );
+        s.ensure_term_tabs_seeded(true);
+        if let Some(free_idx) = (0..s.term.tabs.len()).find(|idx| !used_tabs.contains(idx)) {
+            s.term_switch_tab(free_idx);
+        } else {
+            let cwd = s.terminal_cwd();
+            s.term_new_tab_in(cwd, None);
+        }
+        if keep.0 != i {
+            if let Some(t) = s.tiles.get_mut(keep.0).filter(|t| t.is_terminal()) {
+                t.term_tab = keep.1;
+            }
+        }
+    }
+    s.tiles[i].set_terminal_tab(s.term.active_tab);
     s.focus_tile(i);
     s.persist_tiles();
 }
@@ -202,7 +229,7 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
             }
         }
         super::TileContent::Terminal => {
-            let title = s.term_active_title();
+            let title = s.term_tile_title(i);
             head = head
                 .child(
                     rune::icon(&super::terminal_panel::TERMINAL_WINDOW, 14.0)
@@ -363,13 +390,13 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
         super::TileContent::Terminal => {
             menu = menu.item(MenuItem::new(tr(language, "Show only this one")).on_select(
                 move |s: &mut UiState| {
-                    if let Some(at) = s.tile_of_terminal() {
-                        s.focus_tile(at);
+                    if i < s.tiles.len() {
+                        s.focus_tile(i);
                     }
                     let mut j = s.tiles.len();
                     while j > 0 {
                         j -= 1;
-                        if s.tiles.get(j).is_some_and(|t| !t.is_terminal()) {
+                        if j != s.focus && s.tiles.len() > 1 {
                             s.close_tile(j);
                         }
                     }
@@ -687,9 +714,6 @@ fn picker(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
     );
     for plugin in s.plugins.tile_plugins() {
         let plugin_id = plugin.id();
-        if plugin_id == "terminal" && s.has_terminal_tile() {
-            continue;
-        }
         let plugin_title = plugin.title(language);
         let plugin_icon = plugin.icon();
         let pid = plugin_id.to_string();
@@ -747,7 +771,13 @@ fn tile(
     let t = &s.tiles[i];
     let id = match &t.content {
         super::TileContent::Session(asid) => format!("tile-{asid}"),
-        super::TileContent::Terminal => "tile-terminal".to_string(),
+        super::TileContent::Terminal => {
+            if s.tiles.iter().take(i).any(|x| x.is_terminal()) {
+                format!("tile-terminal-{i}")
+            } else {
+                "tile-terminal".to_string()
+            }
+        }
         super::TileContent::Diff(p) => format!("tile-diff-{p}"),
         super::TileContent::Custom { id, .. } => format!("tile-custom-{id}"),
         super::TileContent::Empty => format!("tile-empty-{i}"),
@@ -791,7 +821,14 @@ fn tile(
             } else {
                 crate::theme::color_scheme::ColorScheme::Light
             };
-            body = body.child(super::terminal_panel::tile_body(s, k, scheme, scale, layer));
+            body = body.child(super::terminal_panel::tile_body_for(
+                s,
+                k,
+                scheme,
+                scale,
+                layer,
+                Some(i),
+            ));
         }
         (super::TileContent::Custom { id, kind, .. }, _) => {
             let ctx = crate::plugin::PluginViewContext {
@@ -1128,5 +1165,58 @@ mod tests {
         ));
 
         let _el_notes = tile(&s, &k, &look, 1, place, 1.0, &mut layer);
+    }
+
+    #[test]
+    fn multiple_independent_terminal_tiles_side_by_side() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.open_session("s1");
+        s.open_terminal_tile();
+        assert_eq!(s.focus, 1);
+        // Split again from the focused terminal: a second, separate shell.
+        s.open_terminal_tile();
+        let terms: Vec<usize> = (0..s.tiles.len())
+            .filter(|i| s.tiles[*i].is_terminal())
+            .collect();
+        assert_eq!(terms.len(), 2);
+        let (a, b) = (terms[0], terms[1]);
+        assert_eq!(s.focus, b);
+        assert_eq!(s.term.tabs.len(), 2);
+        let tab_a = s.tiles[a].term_tab.unwrap();
+        let tab_b = s.tiles[b].term_tab.unwrap();
+        assert_ne!(tab_a, tab_b);
+        assert_eq!(s.term.active_tab, tab_b);
+        assert_eq!(s.tile_of_terminal(), Some(b));
+        assert_eq!(s.tile_terminal_tab(a), Some(tab_a));
+
+        // Focus follows: the active shell is the focused tile's own.
+        s.focus_tile(a);
+        assert_eq!(s.term.active_tab, tab_a);
+        assert_eq!(s.tile_of_terminal(), Some(a));
+        assert_eq!(s.tiles[b].term_tab, Some(tab_b));
+
+        // Switching tile a to b's tab trades the two tiles' shells.
+        s.term_switch_tab_for_tile(Some(a), tab_b);
+        assert_eq!(s.tiles[a].term_tab, Some(tab_b));
+        assert_eq!(s.tiles[b].term_tab, Some(tab_a));
+        assert_eq!(s.term.active_tab, tab_b);
+
+        // Both tiles render without colliding (only the live one has the sink).
+        let k = Kit::neutral(s.dark);
+        let look = s.look();
+        let mut layer = Vec::new();
+        let _ea = tile(&s, &k, &look, a, Place::default(), 1.0, &mut layer);
+        let _eb = tile(&s, &k, &look, b, Place::default(), 1.0, &mut layer);
+        assert_ne!(s.term_tile_title(a), String::new());
+
+        // Closing the only spare tab a tile shows closes that tile.
+        let shown_by_b = s.tiles[b].term_tab.unwrap();
+        s.term_close_tab(shown_by_b);
+        assert_eq!(s.tiles.iter().filter(|t| t.is_terminal()).count(), 1);
+        assert_eq!(s.term.tabs.len(), 1);
+        let only = s.tile_of_terminal().unwrap();
+        assert_eq!(s.tiles[only].term_tab, Some(0));
+        assert_eq!(s.term.active_tab, 0);
     }
 }
