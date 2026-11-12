@@ -53,6 +53,23 @@ pub struct Row {
     pub hash: u64,
 }
 
+impl Row {
+    /// Reconstruct the visible text across columns for this row.
+    pub fn plain_text(&self) -> String {
+        let mut out = String::new();
+        let mut cur_col = 0;
+        for run in &self.runs {
+            while cur_col < run.col {
+                out.push(' ');
+                cur_col += 1;
+            }
+            out.push_str(&run.text);
+            cur_col += run.cells;
+        }
+        out
+    }
+}
+
 /// One cell as the emulator hands it to [`build_row`], colours resolved
 /// (inverse and selection already applied).
 #[derive(Debug, Clone, Copy, PartialEq)]

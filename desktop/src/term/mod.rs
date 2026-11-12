@@ -6,4 +6,5 @@ pub mod daemon;
 pub mod engine;
 pub mod grid;
 pub mod input;
+pub mod link;
 pub mod session;

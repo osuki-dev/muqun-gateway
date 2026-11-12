@@ -18,7 +18,9 @@ use std::path::PathBuf;
 
 use rune::{col, el, memo, row, text, text_input, Color, El, KeyEvent, TextEdit, TextStyle, Tx};
 use rune_kit::shell::PaneState;
-use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, MenuItem};
+use rune_kit::{
+    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, MenuItem, TextInput,
+};
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -106,6 +108,32 @@ pub fn metrics() -> Metrics {
     }
 }
 
+/// One search match in terminal scrollback/grid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermSearchMatch {
+    pub row: usize,
+    pub col: u16,
+    pub len: u16,
+}
+
+/// State for the in-terminal scrollback search bar.
+#[derive(Debug, Clone, Default)]
+pub struct TermSearchState {
+    pub open: bool,
+    pub query: TextEdit,
+    pub matches: Vec<TermSearchMatch>,
+    pub active_idx: usize,
+}
+
+/// A hovered clickable link (URL or file path) in the terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermHoverLink {
+    pub link: crate::term::link::TerminalLink,
+    pub row: usize,
+    pub col_start: u16,
+    pub col_end: u16,
+}
+
 /// What the panel keeps between frames.
 pub struct TermPanel {
     pub open: bool,
@@ -118,6 +146,10 @@ pub struct TermPanel {
     /// The keyboard sink on the cursor cell (see the module docs).
     pub sink: TextEdit,
     pub waker: Option<rune::Waker>,
+    /// Search state for scrollback and grid.
+    pub search: TermSearchState,
+    /// Hovered link under pointer when Ctrl/Cmd is held.
+    pub hover_link: Option<TermHoverLink>,
     /// Screenshot scenes: what a program would print at a size, replayed
     /// into a fresh emulator instead of a live shell.
     pub fixture: Option<fn(u16, u16) -> Vec<u8>>,
@@ -161,6 +193,8 @@ impl TermPanel {
             frame: None,
             sink: TextEdit::new(""),
             waker: None,
+            search: TermSearchState::default(),
+            hover_link: None,
             fixture: None,
             fixture_ended: None,
             error: None,
@@ -434,6 +468,7 @@ impl UiState {
         self.draft.focused = false;
         self.start_draft.focused = false;
         self.timeline_search.query.focused = false;
+        self.term.search.query.focused = false;
         self.search.focused = false;
     }
 
@@ -483,6 +518,8 @@ impl UiState {
         self.term.open = false;
         self.term.pane.set_open(false);
         self.term.sink.focused = false;
+        self.term.search.open = false;
+        self.term.hover_link = None;
         if self.term.tabs.is_empty() {
             self.term.session = None;
             self.term.frame = None;
@@ -1228,10 +1265,20 @@ impl UiState {
         let mac = crate::platform::keys::Style::current() == crate::platform::keys::Style::Symbols;
         let letter =
             |c: char| matches!(&ev.key, rune::Key::Command(k) if k.eq_ignore_ascii_case(&c));
-        // Tab & split shortcuts: Ctrl+Shift+T (new tab), Ctrl+Shift+W (close tab),
-        // Ctrl+Shift+D / Ctrl+Shift+\ (dock/split terminal pane)
+
+        if self.term.search.open && ev.key == rune::Key::Escape {
+            self.close_terminal_search(tx);
+            return true;
+        }
+
+        // Tab, search & split shortcuts: Ctrl+Shift+T (new tab), Ctrl+Shift+W (close tab),
+        // Ctrl+Shift+F (find in terminal), Ctrl+Shift+D / Ctrl+Shift+\ (dock/split terminal pane)
         if (ev.mods.ctrl && ev.mods.shift && !ev.mods.alt) || (mac && ev.mods.logo && ev.mods.shift)
         {
+            if letter('f') {
+                self.open_terminal_search();
+                return true;
+            }
             if letter('t') {
                 self.term_new_tab();
                 return true;
@@ -1284,6 +1331,11 @@ impl UiState {
             } else {
                 self.open_terminal_tile();
             }
+            return true;
+        }
+        // Terminal search shortcut on macOS: Cmd+F
+        if mac && ev.mods.logo && !ev.mods.shift && !ev.mods.alt && letter('f') {
+            self.open_terminal_search();
             return true;
         }
         // Tab switching: Ctrl+Tab (next), Ctrl+Shift+Tab (prev)
@@ -1391,6 +1443,140 @@ impl UiState {
                 logo: mods.logo,
             },
         }));
+    }
+
+    pub fn open_terminal_search(&mut self) {
+        self.term.search.open = true;
+        self.term.search.query.focused = true;
+        if !self.term.search.query.text.trim().is_empty() {
+            self.update_term_search_matches();
+            self.term_search_jump_to_current();
+        }
+    }
+
+    pub fn close_terminal_search(&mut self, tx: &mut Tx) {
+        self.close_terminal_search_no_tx();
+        self.focus_terminal_tx(tx);
+    }
+
+    pub fn close_terminal_search_no_tx(&mut self) {
+        self.term.search.open = false;
+        self.term.search.matches.clear();
+        self.term.search.active_idx = 0;
+        self.term.send(Msg::ScrollToBottom);
+    }
+
+    pub fn toggle_terminal_search(&mut self) {
+        if self.term.search.open {
+            self.close_terminal_search_no_tx();
+        } else {
+            self.open_terminal_search();
+        }
+    }
+
+    pub fn update_term_search_matches(&mut self) {
+        let q = self.term.search.query.text.trim().to_lowercase();
+        self.term.search.matches.clear();
+        self.term.search.active_idx = 0;
+        if q.is_empty() {
+            return;
+        }
+
+        let text = self
+            .term
+            .active_mut()
+            .and_then(|t| t.session.as_ref())
+            .and_then(|s| s.dump_plain_text())
+            .or_else(|| self.term.session.as_ref().and_then(|s| s.dump_plain_text()))
+            .unwrap_or_else(|| {
+                self.term
+                    .frame
+                    .as_ref()
+                    .map(|f| {
+                        f.grid
+                            .iter()
+                            .map(|r| r.plain_text())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default()
+            });
+
+        for (row_idx, line) in text.lines().enumerate() {
+            let lower = line.to_lowercase();
+            let mut start = 0;
+            while let Some(pos) = lower[start..].find(&q) {
+                let byte_pos = start + pos;
+                let col = line[..byte_pos].chars().count() as u16;
+                let len = q.chars().count() as u16;
+                self.term.search.matches.push(TermSearchMatch {
+                    row: row_idx,
+                    col,
+                    len,
+                });
+                start = byte_pos + q.len().max(1);
+            }
+        }
+    }
+
+    pub fn term_search_jump_to_current(&mut self) {
+        if self.term.search.matches.is_empty() {
+            return;
+        }
+        let idx = self.term.search.active_idx % self.term.search.matches.len();
+        let target_row = self.term.search.matches[idx].row;
+        let msg = Msg::ScrollToRow(target_row);
+        if let Some(session) = self.term.active_mut().and_then(|t| t.session.as_ref()) {
+            session.send(msg);
+        } else {
+            self.term.send(msg);
+        }
+    }
+
+    pub fn term_search_next(&mut self) {
+        if self.term.search.matches.is_empty() {
+            return;
+        }
+        self.term.search.active_idx =
+            (self.term.search.active_idx + 1) % self.term.search.matches.len();
+        self.term_search_jump_to_current();
+    }
+
+    pub fn term_search_prev(&mut self) {
+        if self.term.search.matches.is_empty() {
+            return;
+        }
+        if self.term.search.active_idx == 0 {
+            self.term.search.active_idx = self.term.search.matches.len() - 1;
+        } else {
+            self.term.search.active_idx -= 1;
+        }
+        self.term_search_jump_to_current();
+    }
+
+    pub fn open_terminal_link(&mut self, link: crate::term::link::TerminalLink) {
+        match link {
+            crate::term::link::TerminalLink::Url(url) => {
+                crate::platform::shell::open_url(&url);
+            }
+            crate::term::link::TerminalLink::FilePath {
+                path,
+                line: _,
+                col: _,
+            } => {
+                let custom = self.cfg.general.editor_command.clone();
+                let choice = Some(self.cfg.general.editor);
+                if let Some(editor) =
+                    crate::platform::editors::resolve_terminal_editor(custom.as_deref(), choice)
+                {
+                    self.open_file_in_terminal(&path, &editor);
+                } else if let Some(cmd) = custom.as_deref().filter(|c| !c.trim().is_empty()) {
+                    let _ = crate::platform::editors::try_custom_command(cmd, &path);
+                } else {
+                    self.open_file(path);
+                }
+            }
+        }
     }
 }
 
@@ -1605,6 +1791,9 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         .gap(8.0)
         .preserve_focus_on_press(true)
         .child(grid);
+    if s.term.search.open {
+        body = body.child(terminal_search_bar(s, k));
+    }
     if let Some(err) = &s.term.error {
         body = body.child(
             text(err.clone())
@@ -1906,6 +2095,9 @@ pub fn tile_body_for(
         .gap(8.0)
         .preserve_focus_on_press(true)
         .child(grid);
+    if live && s.term.search.open {
+        body = body.child(terminal_search_bar(s, k));
+    }
 
     match (&s.term.error, ended) {
         (Some(err), _) if live => {
@@ -1932,6 +2124,97 @@ pub fn tile_body_for(
         .child(subheader)
         .child(el().w_full().h(1.0).fill(k.alpha(k.c.border_weak, 0.25)))
         .child(body)
+}
+
+fn terminal_search_bar(s: &UiState, k: &Kit) -> El {
+    let language = s.cfg.general.language;
+    let match_count = format!(
+        "{}/{}",
+        if s.term.search.matches.is_empty() {
+            0
+        } else {
+            s.term.search.active_idx + 1
+        },
+        s.term.search.matches.len(),
+    );
+    let field = TextInput::new(&s.term.search.query)
+        .placeholder(tr_ref(language, "Find in terminal…"))
+        .leading_icon(&rune_kit::glyphs::SEARCH)
+        .leading_icon_size(14.0)
+        .width(Some(160.0))
+        .plain()
+        .on_edit(|s: &mut UiState| &mut s.term.search.query)
+        .on_change(|s: &mut UiState, _: &mut rune::Tx| {
+            s.update_term_search_matches();
+            s.term_search_jump_to_current();
+        })
+        .on_key(|s: &mut UiState, ev: &rune::KeyEvent, tx: &mut rune::Tx| {
+            if ev.key == rune::Key::Enter {
+                if ev.mods.shift {
+                    s.term_search_prev();
+                } else {
+                    s.term_search_next();
+                }
+                return true;
+            }
+            if ev.key == rune::Key::Escape {
+                s.close_terminal_search(tx);
+                return true;
+            }
+            false
+        })
+        .build(k)
+        .key("term-search-input");
+
+    let counter = text(match_count).font(k.ty.small).color(k.c.text_faint);
+
+    let prev_btn = IconButton::new(&rune_kit::glyphs::CHEVRON_UP)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .label(tr_ref(language, "Previous match"))
+        .on_press(|s: &mut UiState| s.term_search_prev())
+        .build(k)
+        .key("term-search-prev");
+
+    let next_btn = IconButton::new(&rune_kit::glyphs::CHEVRON_DOWN)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .label(tr_ref(language, "Next match"))
+        .on_press(|s: &mut UiState| s.term_search_next())
+        .build(k)
+        .key("term-search-next");
+
+    let close_btn = IconButton::new(&rune_kit::glyphs::CLOSE)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .label(tr_ref(language, "Close search"))
+        .on_press_tx(|s: &mut UiState, tx: &mut rune::Tx| s.close_terminal_search(tx))
+        .build(k)
+        .key("term-search-close");
+
+    let mut bar = row()
+        .key("terminal-search-bar")
+        .gap(6.0)
+        .center_y()
+        .px(10.0)
+        .py(4.0)
+        .radius(crate::theme::look::CARD_RADIUS)
+        .fill(k.c.layer_01)
+        .border(1.0, k.c.border_muted)
+        .child(field)
+        .child(counter)
+        .child(prev_btn)
+        .child(next_btn)
+        .child(close_btn);
+
+    for shadow in k.shadow_layers(&k.elevation.overlay) {
+        bar = bar.box_shadow(shadow);
+    }
+
+    row()
+        .key("term-search-band")
+        .pin(None, Some(8.0), Some(16.0), None)
+        .child(bar)
 }
 
 /// What a shell that ended badly says under its last screen: how it ended,
@@ -2009,6 +2292,14 @@ fn context_menu(s: &UiState, k: &Kit, grid: El, layer: &mut Vec<El>) -> El {
                 }),
         )
         .item(
+            MenuItem::new(tr_ref(language, "Find in terminal…"))
+                .shortcut(label(Action::SearchMessages))
+                .on_select(|s: &mut UiState| {
+                    s.term.menu_at = None;
+                    s.open_terminal_search();
+                }),
+        )
+        .item(
             MenuItem::new(tr_ref(language, "Clear")).on_select(|s: &mut UiState| {
                 s.term.menu_at = None;
                 s.term.send(Msg::Clear);
@@ -2073,7 +2364,9 @@ fn grid(
         .grow(1.0)
         .min_h(0.0)
         .preserve_focus_on_press(true)
-        .cursor(if frame.is_some_and(|f| f.mouse_tracking) {
+        .cursor(if s.term.hover_link.is_some() {
+            rune::Cursor::Pointer
+        } else if frame.is_some_and(|f| f.mouse_tracking) {
             rune::Cursor::Default
         } else {
             rune::Cursor::Text
@@ -2083,7 +2376,71 @@ fn grid(
             s.focus_terminal_tile_tx(tile_idx, tx);
             paste_terminal_files(s, files);
         })
+        .on_pointer_move_local(move |s: &mut UiState, ev, tx: &mut Tx| {
+            let mac =
+                crate::platform::keys::Style::current() == crate::platform::keys::Style::Symbols;
+            let ctrl = tx.mods().ctrl || (mac && tx.mods().logo);
+            if !ctrl {
+                if s.term.hover_link.is_some() {
+                    s.term.hover_link = None;
+                }
+                return;
+            }
+            let ch = metrics().ch;
+            let cw = metrics().cw;
+            let col = (ev.x / cw).floor() as u16;
+            let row = (ev.y / ch).floor() as usize;
+            let frame = if live {
+                s.term.frame.as_ref()
+            } else {
+                tile_idx
+                    .and_then(|i| s.tile_terminal_tab(i))
+                    .and_then(|t| s.term.tabs.get(t))
+                    .and_then(|t| t.frame.as_ref())
+            };
+            if let Some(row_data) = frame.and_then(|f| f.grid.get(row)) {
+                let text = row_data.plain_text();
+                let cwd = s.terminal_cwd();
+                if let Some(detected) = crate::term::link::find_link_at(&text, col as usize, &cwd) {
+                    s.term.hover_link = Some(TermHoverLink {
+                        link: detected.link,
+                        row,
+                        col_start: detected.col_start,
+                        col_end: detected.col_end,
+                    });
+                    return;
+                }
+            }
+            s.term.hover_link = None;
+        })
         .on_drag(move |s: &mut UiState, d: &mut rune::Drag, tx: &mut Tx| {
+            let mac =
+                crate::platform::keys::Style::current() == crate::platform::keys::Style::Symbols;
+            let ctrl = tx.mods().ctrl || (mac && tx.mods().logo);
+            if ctrl && d.phase == rune::Phase::Down {
+                let ch = metrics().ch;
+                let cw = metrics().cw;
+                let col = (d.x / cw).floor() as u16;
+                let row = (d.y / ch).floor() as usize;
+                let frame = if live {
+                    s.term.frame.as_ref()
+                } else {
+                    tile_idx
+                        .and_then(|i| s.tile_terminal_tab(i))
+                        .and_then(|t| s.term.tabs.get(t))
+                        .and_then(|t| t.frame.as_ref())
+                };
+                if let Some(row_data) = frame.and_then(|f| f.grid.get(row)) {
+                    let text = row_data.plain_text();
+                    let cwd = s.terminal_cwd();
+                    if let Some(detected) =
+                        crate::term::link::find_link_at(&text, col as usize, &cwd)
+                    {
+                        s.open_terminal_link(detected.link);
+                        return;
+                    }
+                }
+            }
             let phase = match d.phase {
                 rune::Phase::Down => {
                     s.focus_terminal_tile_tx(tile_idx, tx);
@@ -2156,6 +2513,52 @@ fn grid(
             draw_row(&key, &row, y, m, bg)
         }));
     }
+
+    // Search match highlights (when search overlay is active)
+    if s.term.search.open && !s.term.search.matches.is_empty() {
+        let offset = frame.scroll.offset as usize;
+        let len = frame.scroll.len as usize;
+        for (idx, m_item) in s.term.search.matches.iter().enumerate() {
+            if m_item.row >= offset && m_item.row < offset + len {
+                let visible_y = (m_item.row - offset) as f32;
+                let is_active = idx == s.term.search.active_idx;
+                let x = m_item.col as f32 * m.cw;
+                let y = visible_y * m.ch;
+                let w = m_item.len as f32 * m.cw;
+                let h = m.ch;
+                let highlight_fill = if is_active {
+                    k.c.bg_accent.alpha(0.65)
+                } else {
+                    color(Rgb(250, 204, 21)).alpha(0.35)
+                };
+                grid = grid.child(
+                    el().key(format!("term-match{sfx}-{idx}"))
+                        .absolute(x, y)
+                        .size(w.max(2.0), h)
+                        .radius(2.0)
+                        .fill(highlight_fill)
+                        .a11y_hidden(),
+                );
+            }
+        }
+    }
+
+    // Hovered link underline (Ctrl/Cmd + hover)
+    if let Some(hover) = &s.term.hover_link {
+        if hover.row < frame.grid.len() {
+            let x = hover.col_start as f32 * m.cw;
+            let y = hover.row as f32 * m.ch;
+            let w = (hover.col_end.saturating_sub(hover.col_start)) as f32 * m.cw;
+            grid = grid.child(
+                el().key(format!("terminal-hover-link{sfx}"))
+                    .absolute(x, y + m.ch - 1.5)
+                    .size(w.max(2.0), 1.5)
+                    .fill(k.c.text_accent)
+                    .a11y_hidden(),
+            );
+        }
+    }
+
     // A shell that ended takes no more keys: no cursor.
     if let Some(cursor) = frame.cursor.filter(|_| !ended) {
         let (_ch, is_wide, head_col) = cursor_char_at(frame, cursor.col, cursor.row);
@@ -2428,6 +2831,7 @@ mod tests {
     use super::*;
     use crate::model::commands;
     use rune::{Env, Ime, Key, Mods, Runtime};
+    use std::sync::Arc;
 
     #[test]
     fn the_grid_takes_the_settled_pane_width_and_a_drag_paces_its_resizes() {
@@ -3301,5 +3705,87 @@ mod tests {
         assert_eq!(rt.state.draft.focus, 2);
         assert!(rt.state.term.sink.focused);
         assert!(!rt.state.draft.focused);
+    }
+
+    #[test]
+    fn terminal_search_finds_matches_and_navigates() {
+        let (tx, _rx) = commands::channel();
+        let mut state = UiState::new(tx);
+        let frame = Frame {
+            rows: 4,
+            cols: 40,
+            grid: vec![
+                Arc::new(Row {
+                    runs: vec![crate::term::grid::TextRun {
+                        col: 0,
+                        cells: 14,
+                        text: "Error in main.rs".into(),
+                        fg: Rgb(200, 200, 200),
+                        attrs: Default::default(),
+                    }],
+                    ..Default::default()
+                }),
+                Arc::new(Row {
+                    runs: vec![crate::term::grid::TextRun {
+                        col: 0,
+                        cells: 18,
+                        text: "Checking main.rs line".into(),
+                        fg: Rgb(200, 200, 200),
+                        attrs: Default::default(),
+                    }],
+                    ..Default::default()
+                }),
+            ],
+            ..Default::default()
+        };
+        state.term.frame = Some(frame);
+
+        // Open terminal search
+        state.open_terminal_search();
+        assert!(state.term.search.open);
+
+        // Search for "main.rs"
+        state.term.search.query = TextEdit::new("main.rs");
+        state.update_term_search_matches();
+        assert_eq!(state.term.search.matches.len(), 2);
+        assert_eq!(state.term.search.matches[0].row, 0);
+        assert_eq!(state.term.search.matches[0].col, 9);
+        assert_eq!(state.term.search.matches[1].row, 1);
+        assert_eq!(state.term.search.matches[1].col, 9);
+
+        // Next / Prev navigation
+        state.term_search_next();
+        assert_eq!(state.term.search.active_idx, 1);
+        state.term_search_next();
+        assert_eq!(state.term.search.active_idx, 0);
+        state.term_search_prev();
+        assert_eq!(state.term.search.active_idx, 1);
+
+        // Close search
+        state.close_terminal_search_no_tx();
+        assert!(!state.term.search.open);
+        assert!(state.term.search.matches.is_empty());
+    }
+
+    #[test]
+    fn terminal_link_detection_and_open() {
+        let cwd = std::env::current_dir().unwrap();
+        let line =
+            "error: file not found at desktop/src/main.rs:10:5 (see https://github.com/rust-lang)";
+        let url_link = crate::term::link::find_link_at(line, 60, &cwd).unwrap();
+        assert_eq!(
+            url_link.link,
+            crate::term::link::TerminalLink::Url("https://github.com/rust-lang".into())
+        );
+
+        let file_link = crate::term::link::find_link_at(line, 30, &cwd).unwrap();
+        match file_link.link {
+            crate::term::link::TerminalLink::FilePath { path, line, col } => {
+                assert!(path.ends_with("desktop/src/main.rs"));
+                assert_eq!(line, Some(10));
+                assert_eq!(col, Some(5));
+            }
+            _ => panic!("expected FilePath"),
+        }
     }
 }

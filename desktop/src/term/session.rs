@@ -51,6 +51,12 @@ pub enum Msg {
     Bytes(Vec<u8>),
     /// Drop the history and have the shell redraw its prompt (Ctrl+L).
     Clear,
+    /// Scroll the viewport to row `row` in the full buffer.
+    ScrollToRow(usize),
+    /// Scroll the viewport back to the bottom.
+    ScrollToBottom,
+    /// Request full plain text dump of terminal buffer (including scrollback).
+    DumpText(std::sync::mpsc::Sender<String>),
     Eof,
     /// The shell ended.
     Exited(Exit),
@@ -332,6 +338,15 @@ impl Session {
                                 }
                                 Msg::Colors(c) => log(engine.set_colors(c)),
                                 Msg::Clear => log(engine.clear()),
+                                Msg::ScrollToRow(row) => {
+                                    engine.scroll_to_row(row);
+                                }
+                                Msg::ScrollToBottom => {
+                                    engine.scroll_to_bottom();
+                                }
+                                Msg::DumpText(resp) => {
+                                    let _ = resp.send(engine.dump_plain_text().unwrap_or_default());
+                                }
                                 Msg::Eof => {
                                     how = Some(Ended::Shell(Exit::Code(0)));
                                     until = Instant::now() + LAST_WORDS;
@@ -527,6 +542,15 @@ impl Session {
                                 }
                                 Msg::Colors(c) => log(engine.set_colors(c)),
                                 Msg::Clear => log(engine.clear()),
+                                Msg::ScrollToRow(row) => {
+                                    engine.scroll_to_row(row);
+                                }
+                                Msg::ScrollToBottom => {
+                                    engine.scroll_to_bottom();
+                                }
+                                Msg::DumpText(resp) => {
+                                    let _ = resp.send(engine.dump_plain_text().unwrap_or_default());
+                                }
                                 Msg::Eof => eof = true,
                                 Msg::Exited(exit) => {
                                     how = Some(Ended::Shell(exit));
@@ -567,6 +591,23 @@ impl Session {
 
     pub fn send(&self, msg: Msg) {
         let _ = self.inner.tx.send(msg);
+    }
+
+    /// Scroll the emulator viewport to row `row`.
+    pub fn scroll_to_row(&self, row: usize) {
+        self.send(Msg::ScrollToRow(row));
+    }
+
+    /// Scroll the emulator viewport to the bottom.
+    pub fn scroll_to_bottom(&self) {
+        self.send(Msg::ScrollToBottom);
+    }
+
+    /// Request a dump of the plain text buffer across scrollback and screen.
+    pub fn dump_plain_text(&self) -> Option<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.send(Msg::DumpText(tx));
+        rx.recv_timeout(Duration::from_millis(200)).ok()
     }
 
     /// Explicitly closes the remote daemon session if backed by one.

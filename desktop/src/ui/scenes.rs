@@ -1223,6 +1223,51 @@ fn base_scenes() -> &'static [Scene] {
                 y: 300.0,
             });
         }),
+        ("terminal-search", |s| {
+            terminal_scene(s, shell_fixture);
+            let is_light = std::env::args().any(|a| a == "light");
+            let scheme = if is_light {
+                crate::theme::color_scheme::ColorScheme::Light
+            } else {
+                crate::theme::color_scheme::ColorScheme::Dark
+            };
+            let colors =
+                crate::ui::terminal_panel::colors(&rune_kit::Kit::neutral(!is_light), scheme);
+            s.term.want.set(Some(colors));
+            let size = crate::term::engine::Size {
+                cols: 80,
+                rows: 24,
+                cell_w: 8,
+                cell_h: 17,
+            };
+            let frame_0 = crate::term::engine::render_fixture(&shell_fixture(80, 24), size, colors);
+            s.term.frame = frame_0;
+            s.term.search.open = true;
+            s.term.search.query = rune::TextEdit::new("Cargo");
+            s.term.search.matches = vec![
+                super::terminal_panel::TermSearchMatch {
+                    row: 1,
+                    col: 0,
+                    len: 5,
+                },
+                super::terminal_panel::TermSearchMatch {
+                    row: 1,
+                    col: 14,
+                    len: 5,
+                },
+            ];
+            s.term.search.active_idx = 0;
+            s.term.hover_link = Some(super::terminal_panel::TermHoverLink {
+                link: crate::term::link::TerminalLink::FilePath {
+                    path: std::path::PathBuf::from("Cargo.toml"),
+                    line: None,
+                    col: None,
+                },
+                row: 1,
+                col_start: 14,
+                col_end: 24,
+            });
+        }),
         ("terminal-ime", |s| {
             terminal_scene(s, shell_fixture);
             s.term

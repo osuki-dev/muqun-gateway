@@ -328,6 +328,30 @@ impl Engine {
         }
     }
 
+    /// Format all terminal content (including scrollback) as plain text.
+    pub fn dump_plain_text(&self) -> Result<String> {
+        use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
+        let opts = FormatterOptions::new()
+            .with_format(Format::Plain)
+            .with_unwrap(false)
+            .with_trim(true);
+        let mut formatter = Formatter::new(&self.term, opts)?;
+        let bytes = formatter.format_alloc(None)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Scroll the viewport to row `row` in the full buffer.
+    pub fn scroll_to_row(&mut self, row: usize) {
+        self.term.scroll_viewport(ScrollViewport::Row(row));
+        self.force = true;
+    }
+
+    /// Scroll the viewport back to the bottom (following live output).
+    pub fn scroll_to_bottom(&mut self) {
+        self.term.scroll_viewport(ScrollViewport::Bottom);
+        self.force = true;
+    }
+
     fn scroll(&self) -> Scroll {
         self.term
             .scrollbar()
@@ -785,5 +809,48 @@ mod tests {
                 .unwrap();
             assert_eq!(engine.take_output(), exp_ctrl_e);
         }
+    }
+
+    #[test]
+    fn scrollback_formatting_and_search() {
+        let size = Size {
+            cols: 20,
+            rows: 4,
+            cell_w: 8,
+            cell_h: 16,
+        };
+        let mut engine = Engine::new(size, colors()).unwrap();
+        // Feed 10 lines so 6 lines go into scrollback
+        engine.feed(b"line 0\r\nline 1\r\nline 2\r\nline 3\r\nline 4\r\nline 5\r\nline 6\r\nline 7\r\nline 8\r\nline 9");
+        assert_eq!(engine.term.total_rows().unwrap(), 10);
+        assert_eq!(engine.term.scrollback_rows().unwrap(), 6);
+
+        let text = engine.dump_plain_text().unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 10);
+        assert_eq!(lines[0], "line 0");
+        assert_eq!(lines[9], "line 9");
+
+        engine.scroll_to_row(2);
+        let s = engine.scroll();
+        assert_eq!(s.offset, 2);
+        let frame = engine.frame().unwrap().unwrap();
+        assert_eq!(frame.scroll.offset, 2);
+        let visible_texts: Vec<String> = frame
+            .grid
+            .iter()
+            .map(|r| {
+                r.runs
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+        assert_eq!(visible_texts[0], "line 2");
+
+        engine.scroll_to_bottom();
+        let s = engine.scroll();
+        assert_eq!(s.offset, 6);
     }
 }

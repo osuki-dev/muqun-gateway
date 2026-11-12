@@ -493,5 +493,7 @@
   "Attached files": "已新增檔案",
   "Drop files or images here to attach": "拖拽檔案或圖片到此處新增",
   "Quote to composer": "引用到輸入框",
-  "Copy entire message": "複製整條訊息"
+  "Copy entire message": "複製整條訊息",
+  "Find in terminal…": "在終端中查詢…",
+  "Find in terminal": "在終端中查詢"
 }

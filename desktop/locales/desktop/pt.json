@@ -493,5 +493,7 @@
   "Show or hide Git inspector": "Show or hide Git inspector",
   "Initialize Git in Terminal": "Initialize Git in Terminal",
   "Quote to composer": "Quote to composer",
-  "Copy entire message": "Copy entire message"
+  "Copy entire message": "Copy entire message",
+  "Find in terminal…": "Find in terminal…",
+  "Find in terminal": "Find in terminal"
 }

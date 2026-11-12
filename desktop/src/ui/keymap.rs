@@ -732,6 +732,8 @@ pub enum EscStep {
     Pane,
     /// In-session timeline search.
     TimelineSearch,
+    /// In-terminal scrollback search.
+    TermSearch,
     /// The sidebar's search: cleared, back to the session list.
     Search,
     /// An error alert banner.
@@ -759,6 +761,9 @@ pub fn esc_step(s: &UiState) -> Option<EscStep> {
     }
     if s.inspect.is_some() {
         return Some(EscStep::Pane);
+    }
+    if s.term.search.open {
+        return Some(EscStep::TermSearch);
     }
     if s.timeline_search.active {
         return Some(EscStep::TimelineSearch);
@@ -815,6 +820,7 @@ pub fn escape(s: &mut UiState) -> bool {
         EscStep::Diff => s.show_diff = false,
         EscStep::Pane => s.close_inspect(),
         EscStep::TimelineSearch => s.close_timeline_search(),
+        EscStep::TermSearch => s.close_terminal_search_no_tx(),
         EscStep::Search => s.close_search(),
         EscStep::Alert => s.error = None,
         EscStep::Page => match last_session(s) {
