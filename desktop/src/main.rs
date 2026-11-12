@@ -49,6 +49,14 @@ fn tune_allocator() {}
 
 fn main() -> anyhow::Result<()> {
     tune_allocator();
+    if let Some(pos) = std::env::args().position(|a| a == "--term-daemon") {
+        let socket_path = std::env::args()
+            .nth(pos + 1)
+            .filter(|s| !s.starts_with("--"))
+            .map(PathBuf::from);
+        term::daemon::run_daemon(socket_path)?;
+        return Ok(());
+    }
     let started = Instant::now();
     let (config_dir, state_dir) = platform::directories()?;
     muqun_gateway::set_directories(config_dir.clone(), state_dir.clone())?;

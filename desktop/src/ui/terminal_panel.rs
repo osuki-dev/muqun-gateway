@@ -586,6 +586,7 @@ impl UiState {
         if index >= self.term.tabs.len() {
             if self.term.tabs.is_empty() {
                 if let Some(session) = self.term.session.take() {
+                    session.close_remote();
                     session.send(Msg::Shutdown);
                 }
                 self.term.frame = None;
@@ -595,10 +596,12 @@ impl UiState {
         }
         if self.term.tabs.len() <= 1 {
             if let Some(session) = self.term.session.take() {
+                session.close_remote();
                 session.send(Msg::Shutdown);
             }
             for tab in self.term.tabs.drain(..) {
                 if let Some(s) = tab.session {
+                    s.close_remote();
                     s.send(Msg::Shutdown);
                 }
             }
@@ -608,6 +611,7 @@ impl UiState {
         }
         if index == self.term.active_tab {
             if let Some(session) = &self.term.session {
+                session.close_remote();
                 session.send(Msg::Shutdown);
             }
             self.term.tabs.remove(index);
@@ -620,6 +624,7 @@ impl UiState {
         } else {
             let tab = self.term.tabs.remove(index);
             if let Some(s) = tab.session {
+                s.close_remote();
                 s.send(Msg::Shutdown);
             }
             if index < self.term.active_tab {
@@ -702,6 +707,62 @@ impl UiState {
     }
 
     pub(crate) fn start_terminal(&mut self) {
+        #[cfg(unix)]
+        if self.term.fixture.is_none()
+            && self.term.session.is_none()
+            && self.term.tabs.is_empty()
+            && self.term.waker.is_some()
+        {
+            if let Ok(sessions) = crate::term::daemon::SyncDaemonClient::new(None).list_sessions() {
+                let alive: Vec<_> = sessions.into_iter().filter(|s| s.alive).collect();
+                if !alive.is_empty() {
+                    let waker = self.term.waker.clone().unwrap();
+                    let size = self.term.size.unwrap_or(Size {
+                        cols: 80,
+                        rows: 24,
+                        cell_w: 8,
+                        cell_h: 17,
+                    });
+                    let colors = self.term.want.get().unwrap_or_else(|| {
+                        colors(
+                            &Kit::neutral(self.dark),
+                            if self.dark {
+                                ColorScheme::Dark
+                            } else {
+                                ColorScheme::Light
+                            },
+                        )
+                    });
+                    for s_info in alive {
+                        if let Ok(session) = Session::start_with_id(
+                            Some(s_info.id),
+                            s_info.cwd.clone(),
+                            size,
+                            colors,
+                            waker.clone(),
+                        ) {
+                            let id = self.term.next_tab_id;
+                            self.term.next_tab_id += 1;
+                            self.term.tabs.push(TermTab {
+                                id,
+                                session: Some(session),
+                                frame: None,
+                                cwd: s_info.cwd,
+                                title: None,
+                                pending_command: None,
+                            });
+                        }
+                    }
+                    if !self.term.tabs.is_empty() {
+                        self.term.active_tab = 0;
+                        self.term.session = self.term.tabs[0].session.clone();
+                        self.term.sent = Some(colors);
+                        self.term.error = None;
+                        return;
+                    }
+                }
+            }
+        }
         let cwd = self.terminal_cwd();
         self.start_terminal_in(cwd);
     }
