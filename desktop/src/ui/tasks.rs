@@ -208,8 +208,44 @@ fn create(s: &mut UiState) {
     });
 }
 
+fn open_task_terminal(s: &mut UiState, pane_id: Option<&str>, cwd: Option<&str>) {
+    let pane_id = pane_id.filter(|p| !p.is_empty());
+    let cwd = cwd.filter(|c| !c.is_empty());
+
+    if s.term.tabs.is_empty() && s.term.session.is_none() {
+        s.start_terminal();
+    }
+
+    if let Some(pid) = pane_id {
+        if let Some(idx) = s.term.tabs.iter().position(|tab| {
+            tab.session
+                .as_ref()
+                .and_then(|sess| sess.session_id.as_deref())
+                == Some(pid)
+        }) {
+            s.open_terminal();
+            s.term_switch_tab(idx);
+            return;
+        }
+    }
+
+    if let Some(dir) = cwd {
+        let target = std::path::PathBuf::from(dir);
+        if let Some(idx) = s.term.tabs.iter().position(|tab| tab.cwd == target) {
+            s.open_terminal();
+            s.term_switch_tab(idx);
+            return;
+        }
+        s.term_new_tab_in(target, None);
+        return;
+    }
+
+    s.open_terminal();
+}
+
 /// The Tasks keys (`keymap::run`): j/k and the arrows move, Enter opens
-/// the session, M confirms a paused task done, X twice cancels.
+/// the session (or terminal when no session is bound), M confirms a paused
+/// task done, X twice cancels.
 pub fn key(s: &mut UiState, action: Action) -> bool {
     let list = shown(s);
     let Some(at) = current(&list, &s.tasks_view) else {
@@ -227,10 +263,15 @@ pub fn key(s: &mut UiState, action: Action) -> bool {
             select(s, id);
         }
         Action::OpenRow => {
-            let Some(asid) = t.asid.clone() else {
+            if let Some(asid) = t.asid.clone() {
+                s.open_session(&asid);
+            } else if t.cwd.is_some() || t.pane_id.is_some() {
+                let pane_id = t.pane_id.clone();
+                let cwd = t.cwd.clone();
+                open_task_terminal(s, pane_id.as_deref(), cwd.as_deref());
+            } else {
                 return false;
-            };
-            s.open_session(&asid);
+            }
         }
         Action::MarkDone if t.completable => {
             let id = t.id.clone();
@@ -900,6 +941,12 @@ fn detail(s: &UiState, k: &Kit, t: &TaskRow, w: f32) -> El {
     if !where_.is_empty() {
         facts = facts.child(fact(k, tr_ref(language, "Runs on"), where_));
     }
+    if let Some(cwd) = t.cwd.as_ref().filter(|c| !c.is_empty()) {
+        facts = facts.child(fact(k, tr_ref(language, "Folder"), cwd.clone()));
+    }
+    if let Some(branch) = t.worktree_branch.as_ref().filter(|b| !b.is_empty()) {
+        facts = facts.child(fact(k, tr_ref(language, "Worktree"), branch.clone()));
+    }
     if t.started_ms > 0 {
         facts = facts.child(fact(
             k,
@@ -1117,6 +1164,22 @@ fn actions(s: &UiState, k: &Kit, t: &TaskRow) -> El {
                 }),
         );
     }
+    if t.cwd.is_some() || t.pane_id.is_some() {
+        let pane_id = t.pane_id.clone();
+        let cwd = t.cwd.clone();
+        let label = tr(language, "Open terminal");
+        let mut btn = Button::new(label.clone()).variant(ButtonVariant::Outline);
+        if t.asid.is_none() {
+            btn = btn.label_with(keyed(label, &["↵"]));
+        }
+        line = line.child(
+            btn.on_press(move |s: &mut UiState| {
+                open_task_terminal(s, pane_id.as_deref(), cwd.as_deref());
+            })
+            .build(k)
+            .key("task-open-terminal"),
+        );
+    }
     if t.completable {
         let id = t.id.clone();
         let label = tr(language, "Mark done");
@@ -1229,5 +1292,37 @@ mod tests {
         assert_eq!(cancels(&mut rx), 0);
         assert!(key(&mut s, Action::CancelTask));
         assert_eq!(cancels(&mut rx), 1);
+    }
+
+    #[test]
+    fn open_row_opens_terminal_in_task_worktree_when_no_session_bound() {
+        let (tx, _rx) = commands::channel();
+        let mut s = UiState::new(tx);
+        s.mode = super::super::Mode::Tasks;
+        s.tasks.push(TaskRow {
+            id: "task-1".into(),
+            state: "working".into(),
+            kind: "command".into(),
+            title: "cargo test".into(),
+            goal: "!cargo test".into(),
+            pane_id: Some("task-1".into()),
+            worktree_branch: Some("muqun/task-1".into()),
+            cwd: Some("/tmp/muqun-worktree-1".into()),
+            ..TaskRow::default()
+        });
+
+        assert!(!s.term.open);
+        assert!(key(&mut s, Action::OpenRow));
+        assert!(s.term.open);
+        assert!(s
+            .term
+            .tabs
+            .iter()
+            .any(|t| t.cwd == std::path::PathBuf::from("/tmp/muqun-worktree-1")));
+
+        // Verify detail and actions render without panicking
+        let k = Kit::neutral(true);
+        let mut layer = Vec::new();
+        let _el = view(&s, &k, &mut layer);
     }
 }

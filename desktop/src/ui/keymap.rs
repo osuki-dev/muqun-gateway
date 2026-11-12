@@ -483,7 +483,16 @@ pub fn dispatch(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         s.show_diff = false;
         return true;
     }
-    if s.term.open && !s.draft.focused && s.palette.is_none() && s.keys_sheet.is_none() {
+    let term_active =
+        s.term.open || (s.in_split() && s.tiles.get(s.focus).is_some_and(|t| t.is_terminal()));
+    if term_active
+        && !s.draft.focused
+        && !s.start_draft.focused
+        && !s.timeline_search.active
+        && !s.search.focused
+        && s.palette.is_none()
+        && s.keys_sheet.is_none()
+    {
         let letter =
             |c: char| matches!(&ev.key, rune::Key::Command(k) if k.eq_ignore_ascii_case(&c));
         if ((ev.mods.ctrl && (letter('d') || letter('w'))) || ev.key == rune::Key::Escape)
@@ -492,14 +501,16 @@ pub fn dispatch(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
             s.term_close_tab(s.term.active_tab);
             return true;
         }
-        if ev.mods.ctrl && letter('d') {
-            s.term.sink.focused = true;
-            return s.terminal_key(ev, tx);
-        }
-        if (ev.key == rune::Key::Tab && ev.mods.ctrl)
-            || (ev.mods.ctrl && (ev.key == rune::Key::PageDown || ev.key == rune::Key::PageUp))
+        let mac = crate::platform::keys::Style::current() == crate::platform::keys::Style::Symbols;
+        let is_window_shortcut = ENTRIES
+            .iter()
+            .filter(|e| e.owner == Owner::Window)
+            .any(|e| e.keybind().matches_tx(ev, tx));
+        if !is_window_shortcut
+            && crate::term::input::route(ev, tx.physical_key(), mac)
+                != crate::term::input::Route::App
         {
-            s.term.sink.focused = true;
+            s.focus_terminal_tx(tx);
             return s.terminal_key(ev, tx);
         }
     }
@@ -538,6 +549,27 @@ pub fn field_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx, at_end: bool) -> b
         if entry(action).keybind().matches_tx(ev, tx) {
             return run(s, action, ev, tx);
         }
+    }
+    if !cfg!(target_os = "macos")
+        && ev.mods.ctrl
+        && !ev.mods.shift
+        && !ev.mods.alt
+        && !ev.mods.logo
+        && matches!(&ev.key, rune::Key::Command(c) if c.eq_ignore_ascii_case(&'e'))
+    {
+        let edit = if s.mode == Mode::Home {
+            &mut s.start_draft
+        } else {
+            &mut s.draft
+        };
+        edit.key(
+            &rune::KeyEvent {
+                key: rune::Key::End,
+                mods: rune::Mods::default(),
+            },
+            None,
+        );
+        return true;
     }
     let ctrl_end = ev.key == rune::Key::End && ev.mods.primary() && !ev.mods.shift;
     at_end && ctrl_end && run(s, A::JumpLatest, ev, tx)

@@ -728,4 +728,61 @@ mod tests {
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("<65;"), "wheel down reports button 5/65: {s}");
     }
+
+    #[test]
+    fn key_encoding_across_terminal_modes() {
+        let size = Size {
+            cols: 80,
+            rows: 24,
+            cell_w: 8,
+            cell_h: 16,
+        };
+        let cases: &[(&[u8], &[u8], &[u8], &[u8])] = &[
+            (b"", b"\x1b[D", b"\x1b[C", b"\x05"),
+            (b"\x1b[?1h", b"\x1bOD", b"\x1bOC", b"\x05"),
+            (b"\x1b[>4;2m", b"\x1b[D", b"\x1b[C", b"\x05"),
+            (b"\x1b[>5u", b"\x1b[D", b"\x1b[C", b"\x1b[101;5u"),
+        ];
+        for &(init, exp_left, exp_right, exp_ctrl_e) in cases {
+            let mut engine = Engine::new(size, colors()).unwrap();
+            engine.feed(init);
+            let _ = engine.take_output();
+
+            engine
+                .key(&KeyInput {
+                    key: key::Key::ArrowLeft,
+                    mods: Mods::default(),
+                    text: None,
+                    unshifted: '\0',
+                    repeat: false,
+                })
+                .unwrap();
+            assert_eq!(engine.take_output(), exp_left);
+
+            engine
+                .key(&KeyInput {
+                    key: key::Key::ArrowRight,
+                    mods: Mods::default(),
+                    text: None,
+                    unshifted: '\0',
+                    repeat: false,
+                })
+                .unwrap();
+            assert_eq!(engine.take_output(), exp_right);
+
+            engine
+                .key(&KeyInput {
+                    key: key::Key::E,
+                    mods: Mods {
+                        ctrl: true,
+                        ..Mods::default()
+                    },
+                    text: None,
+                    unshifted: 'e',
+                    repeat: false,
+                })
+                .unwrap();
+            assert_eq!(engine.take_output(), exp_ctrl_e);
+        }
+    }
 }

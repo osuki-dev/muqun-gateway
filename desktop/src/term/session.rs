@@ -167,11 +167,32 @@ impl Session {
 
         let socket_path = ensure_daemon_running()?;
         let client = SyncDaemonClient::new(Some(socket_path));
+        let is_reattach = session_id.is_some();
         let id = match session_id {
             Some(existing) => existing,
             None => client.create_session(None, Some(cwd.clone()), size.cols, size.rows)?,
         };
-        let stream = client.attach_raw(&id)?;
+        let mut stream = client.attach_raw(&id)?;
+        let mut initial_scrollback = Vec::new();
+        if is_reattach {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(25)));
+            let mut sb_buf = [0u8; 64 * 1024];
+            loop {
+                match stream.read(&mut sb_buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        initial_scrollback.extend_from_slice(&sb_buf[..n]);
+                        if initial_scrollback.len() >= 1024 * 1024 {
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            let _ = stream.set_read_timeout(None);
+            let _ = client.resize_session(&id, size.cols, size.rows);
+        }
         let mut reader_stream = stream.try_clone()?;
         let mut writer_stream = stream;
 
@@ -231,6 +252,16 @@ impl Session {
                             return;
                         }
                     };
+                    if !initial_scrollback.is_empty() {
+                        engine.feed(&initial_scrollback);
+                        // Discard historical terminal query replies (DECRQM, DA1, DSR, Kitty)
+                        // so reattaching never injects escape sequences into the live PTY stdin.
+                        let _ = engine.take_output();
+                        if let Ok(Some(frame)) = engine.frame() {
+                            *latest.lock().unwrap() = Some(frame);
+                            wake();
+                        }
+                    }
                     let mut last = Instant::now() - FRAME_GAP;
                     let mut pending = false;
                     let mut how: Option<Ended> = None;

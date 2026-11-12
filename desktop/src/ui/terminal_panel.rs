@@ -408,6 +408,27 @@ pub fn colors(k: &Kit, scheme: ColorScheme) -> Colors {
 }
 
 impl UiState {
+    /// Give the terminal sink exclusive keyboard focus and sync split-tile focus.
+    pub fn focus_terminal(&mut self) {
+        if self.in_split() {
+            if let Some(i) = self.tile_of_terminal() {
+                if self.focus != i {
+                    self.focus_tile(i);
+                }
+            }
+        }
+        self.term.sink.focused = true;
+        self.draft.focused = false;
+        self.start_draft.focused = false;
+        self.timeline_search.query.focused = false;
+        self.search.focused = false;
+    }
+
+    pub fn focus_terminal_tx(&mut self, tx: &mut Tx) {
+        self.focus_terminal();
+        tx.focus("terminal-keys", false);
+    }
+
     /// Ctrl+`: open and focus; focused, close and hand the keyboard back;
     /// open but elsewhere, take the keyboard.
     pub fn toggle_terminal(&mut self) {
@@ -423,6 +444,7 @@ impl UiState {
                 self.focus_tile(next);
             } else {
                 self.focus_tile(i);
+                self.focus_terminal();
             }
             return;
         }
@@ -431,14 +453,14 @@ impl UiState {
         } else if self.term.sink.focused {
             self.close_terminal();
         } else {
-            self.term.sink.focused = true;
+            self.focus_terminal();
         }
     }
 
     pub fn open_terminal(&mut self) {
         self.term.open = true;
         self.term.pane.set_open(true);
-        self.term.sink.focused = true;
+        self.focus_terminal();
         self.right_open = false;
         self.right.set_open(false);
     }
@@ -539,11 +561,12 @@ impl UiState {
         self.term.frame = None;
         self.term.pending_command = command;
         self.start_terminal_in(cwd);
-        self.term.sink.focused = true;
+        self.focus_terminal();
     }
 
     pub fn term_switch_tab(&mut self, index: usize) {
         if index >= self.term.tabs.len() || index == self.term.active_tab {
+            self.focus_terminal();
             return;
         }
         if let Some(cur) = self.term.tabs.get_mut(self.term.active_tab) {
@@ -559,7 +582,7 @@ impl UiState {
         if let Some(size) = self.term.size {
             self.term.send(Msg::Resize(size));
         }
-        self.term.sink.focused = true;
+        self.focus_terminal();
     }
 
     pub fn term_next_tab(&mut self) {
@@ -631,7 +654,7 @@ impl UiState {
                 self.term.active_tab -= 1;
             }
         }
-        self.term.sink.focused = true;
+        self.focus_terminal();
     }
 
     /// Switch the active terminal to the focused session's workspace directory,
@@ -669,7 +692,17 @@ impl UiState {
 
     /// End the shell and start a new one in the focused session's folder.
     pub fn restart_terminal(&mut self) {
-        self.term.session = None;
+        if let Some(session) = self.term.session.take() {
+            session.close_remote();
+            session.send(Msg::Shutdown);
+        }
+        if let Some(active) = self.term.tabs.get_mut(self.term.active_tab) {
+            if let Some(s) = active.session.take() {
+                s.close_remote();
+                s.send(Msg::Shutdown);
+            }
+            active.frame = None;
+        }
         self.term.frame = None;
         self.term.error = None;
         let cwd = self
@@ -679,6 +712,7 @@ impl UiState {
             .map(|t| t.cwd.clone())
             .unwrap_or_else(|| self.terminal_cwd());
         self.start_terminal_in(cwd);
+        self.focus_terminal();
     }
 
     /// Where a new shell starts: the focused session's folder, else home.
@@ -934,13 +968,21 @@ impl UiState {
         };
         match session.ended() {
             Some(ended) if ended_well(ended, session.started.elapsed()) => {
-                self.term.session = None;
-                self.term.frame = None;
                 if self.term.tabs.len() > 1 {
                     self.term_close_tab(self.term.active_tab);
                     true
                 } else {
-                    self.term.tabs.clear();
+                    if let Some(s) = self.term.session.take() {
+                        s.close_remote();
+                        s.send(Msg::Shutdown);
+                    }
+                    for tab in self.term.tabs.drain(..) {
+                        if let Some(s) = tab.session {
+                            s.close_remote();
+                            s.send(Msg::Shutdown);
+                        }
+                    }
+                    self.term.frame = None;
                     if self.term.open {
                         self.close_terminal();
                     }
@@ -961,7 +1003,8 @@ impl UiState {
         let mac = crate::platform::keys::Style::current() == crate::platform::keys::Style::Symbols;
         let letter =
             |c: char| matches!(&ev.key, rune::Key::Command(k) if k.eq_ignore_ascii_case(&c));
-        // Tab shortcuts: Ctrl+Shift+T (new tab) and Ctrl+Shift+W (close tab)
+        // Tab & split shortcuts: Ctrl+Shift+T (new tab), Ctrl+Shift+W (close tab),
+        // Ctrl+Shift+D / Ctrl+Shift+\ (dock/split terminal pane)
         if (ev.mods.ctrl && ev.mods.shift && !ev.mods.alt) || (mac && ev.mods.logo && ev.mods.shift)
         {
             if letter('t') {
@@ -970,6 +1013,18 @@ impl UiState {
             }
             if letter('w') {
                 self.term_close_tab(self.term.active_tab);
+                return true;
+            }
+            if letter('d')
+                || matches!(&ev.key, rune::Key::Command('\\'))
+                || matches!(&ev.key, rune::Key::Text(t) if t == "\\" || t == "|")
+                || tx.physical_key() == Some(rune::PhysicalKeyCode::Backslash)
+            {
+                if self.in_split() {
+                    self.split();
+                } else {
+                    self.open_terminal_tile();
+                }
                 return true;
             }
             if matches!(&ev.key, rune::Key::Command(']'))
@@ -986,6 +1041,25 @@ impl UiState {
                 self.term_prev_tab();
                 return true;
             }
+        }
+        // Herdr / global split shortcut inside terminal: Ctrl+\ (or Cmd+D / Cmd+\ on macOS)
+        if (ev.mods.ctrl
+            && !ev.mods.shift
+            && !ev.mods.alt
+            && (matches!(&ev.key, rune::Key::Command('\\'))
+                || tx.physical_key() == Some(rune::PhysicalKeyCode::Backslash)))
+            || (mac
+                && ev.mods.logo
+                && !ev.mods.shift
+                && !ev.mods.alt
+                && (letter('d') || matches!(&ev.key, rune::Key::Command('\\'))))
+        {
+            if self.in_split() {
+                self.split();
+            } else {
+                self.open_terminal_tile();
+            }
+            return true;
         }
         // Tab switching: Ctrl+Tab (next), Ctrl+Shift+Tab (prev)
         if ev.key == rune::Key::Tab && ev.mods.ctrl && !ev.mods.alt {
@@ -1164,9 +1238,11 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
                     .variant(IconButtonVariant::GhostMuted)
                     .control_size(ControlSize::Small)
                     .label(tr_ref(language, "Close tab"))
-                    .on_press(move |s: &mut UiState| {
+                    .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
                         s.term_close_tab(i);
-                        s.term.sink.focused = true;
+                        if s.term.open || s.has_terminal_tile() {
+                            s.focus_terminal_tx(tx);
+                        }
                     })
                     .build(k)
                     .key(format!("terminal-tab-close-{i}")),
@@ -1186,9 +1262,10 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
             .border(1.0, border_color)
             .clip_rounded(6.0)
             .cursor(rune::Cursor::Pointer)
-            .on_press(move |s: &mut UiState| {
+            .preserve_focus_on_press(true)
+            .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
                 s.term_switch_tab(i);
-                s.term.sink.focused = true;
+                s.focus_terminal_tx(tx);
             })
             .child(
                 rune::icon(&TERMINAL_WINDOW, 12.0)
@@ -1223,7 +1300,10 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         .variant(IconButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
         .label(tr_ref(language, "New tab (Ctrl+Shift+T)"))
-        .on_press(|s: &mut UiState| s.term_new_tab())
+        .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
+            s.term_new_tab();
+            s.focus_terminal_tx(tx);
+        })
         .build(k)
         .key("terminal-new-tab");
     tabs_strip = tabs_strip.child(add_tab_btn);
@@ -1232,7 +1312,10 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         .variant(IconButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
         .label(super::copy::t_ref(language, "Sync directory with session"))
-        .on_press(|s: &mut UiState| s.term_sync_cwd())
+        .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
+            s.term_sync_cwd();
+            s.focus_terminal_tx(tx);
+        })
         .build(k)
         .key("terminal-sync-cwd");
     tabs_strip = tabs_strip.child(sync_cwd_btn);
@@ -1246,13 +1329,17 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         .gap(6.0)
         .center_y()
         .fill(k.alpha(k.c.layer_01, 0.65))
+        .preserve_focus_on_press(true)
         .child(tabs_strip)
         .child(
             IconButton::new(&RESTART)
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
                 .label(tr_ref(language, "Restart shell"))
-                .on_press(|s: &mut UiState| s.restart_terminal())
+                .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
+                    s.restart_terminal();
+                    s.focus_terminal_tx(tx);
+                })
                 .build(k)
                 .key("terminal-restart"),
         )
@@ -1261,7 +1348,10 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
                 .label(tr_ref(language, "Add to split view"))
-                .on_press(|s: &mut UiState| s.open_terminal_tile())
+                .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
+                    s.open_terminal_tile();
+                    s.focus_terminal_tx(tx);
+                })
                 .build(k)
                 .key("terminal-dock-split"),
         )
@@ -1285,6 +1375,7 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         .px(INSET)
         .pb(INSET)
         .gap(8.0)
+        .preserve_focus_on_press(true)
         .child(grid);
     if let Some(err) = &s.term.error {
         body = body.child(
@@ -1302,6 +1393,7 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         .w_full()
         .h_full()
         .min_h(0.0)
+        .preserve_focus_on_press(true)
         .child(header)
         .child(el().w_full().h(1.0).fill(k.alpha(k.c.border_weak, 0.35)))
         .child(body)
@@ -1376,9 +1468,11 @@ pub fn tile_body(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &
                     .variant(IconButtonVariant::GhostMuted)
                     .control_size(ControlSize::Small)
                     .label(tr_ref(language, "Close tab"))
-                    .on_press(move |s: &mut UiState| {
+                    .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
                         s.term_close_tab(i);
-                        s.term.sink.focused = true;
+                        if s.term.open || s.has_terminal_tile() {
+                            s.focus_terminal_tx(tx);
+                        }
                     })
                     .build(k)
                     .key(format!("tile-terminal-tab-close-{i}")),
@@ -1398,9 +1492,10 @@ pub fn tile_body(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &
             .border(1.0, border_color)
             .clip_rounded(6.0)
             .cursor(rune::Cursor::Pointer)
-            .on_press(move |s: &mut UiState| {
+            .preserve_focus_on_press(true)
+            .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
                 s.term_switch_tab(i);
-                s.term.sink.focused = true;
+                s.focus_terminal_tx(tx);
             })
             .child(
                 rune::icon(&TERMINAL_WINDOW, 11.0)
@@ -1435,7 +1530,10 @@ pub fn tile_body(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &
         .variant(IconButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
         .label(tr_ref(language, "New tab (Ctrl+Shift+T)"))
-        .on_press(|s: &mut UiState| s.term_new_tab())
+        .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
+            s.term_new_tab();
+            s.focus_terminal_tx(tx);
+        })
         .build(k)
         .key("tile-terminal-new-tab");
     tabs_strip = tabs_strip.child(add_tab_btn);
@@ -1444,7 +1542,10 @@ pub fn tile_body(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &
         .variant(IconButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
         .label(super::copy::t_ref(language, "Sync directory with session"))
-        .on_press(|s: &mut UiState| s.term_sync_cwd())
+        .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
+            s.term_sync_cwd();
+            s.focus_terminal_tx(tx);
+        })
         .build(k)
         .key("tile-terminal-sync-cwd");
     tabs_strip = tabs_strip.child(sync_cwd_btn);
@@ -1458,13 +1559,17 @@ pub fn tile_body(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &
         .gap(6.0)
         .center_y()
         .fill(k.alpha(k.c.layer_01, 0.45))
+        .preserve_focus_on_press(true)
         .child(tabs_strip)
         .child(
             IconButton::new(&RESTART)
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
                 .label(tr_ref(language, "Restart shell"))
-                .on_press(|s: &mut UiState| s.restart_terminal())
+                .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
+                    s.restart_terminal();
+                    s.focus_terminal_tx(tx);
+                })
                 .build(k)
                 .key("tile-terminal-restart"),
         );
@@ -1479,6 +1584,7 @@ pub fn tile_body(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &
         .px(INSET)
         .pb(INSET)
         .gap(8.0)
+        .preserve_focus_on_press(true)
         .child(grid);
 
     if let Some(err) = &s.term.error {
@@ -1498,6 +1604,7 @@ pub fn tile_body(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &
         .w_full()
         .grow(1.0)
         .min_h(0.0)
+        .preserve_focus_on_press(true)
         .child(subheader)
         .child(el().w_full().h(1.0).fill(k.alpha(k.c.border_weak, 0.25)))
         .child(body)
@@ -1542,9 +1649,9 @@ fn context_menu(s: &UiState, k: &Kit, grid: El, layer: &mut Vec<El>) -> El {
     let language = s.cfg.general.language;
     let has_selection = s.term.frame.as_ref().is_some_and(|f| f.selection.is_some());
     use super::keymap::{label, Action};
-    let grid = grid.on_secondary_press(|s: &mut UiState, at, _: &mut Tx| {
+    let grid = grid.on_secondary_press(|s: &mut UiState, at, tx: &mut Tx| {
         s.term.menu_at = Some(at);
-        s.term.sink.focused = true;
+        s.focus_terminal_tx(tx);
     });
     rune_kit::context_menu("terminal-menu", grid, s.term.menu_at)
         .min_width(220.0)
@@ -1618,16 +1725,21 @@ fn grid(s: &UiState, k: &Kit, frame: Option<&Frame>, m: Metrics, bg: Color, scal
         .w_full()
         .grow(1.0)
         .min_h(0.0)
+        .preserve_focus_on_press(true)
         .cursor(if frame.is_some_and(|f| f.mouse_tracking) {
             rune::Cursor::Default
         } else {
             rune::Cursor::Text
         })
         .on_layout(move |s: &mut UiState, r| s.terminal_layout(r, scale))
+        .on_drop_files(|s: &mut UiState, files, tx: &mut Tx| {
+            s.focus_terminal_tx(tx);
+            paste_terminal_files(s, files);
+        })
         .on_drag(|s: &mut UiState, d: &mut rune::Drag, tx: &mut Tx| {
             let phase = match d.phase {
                 rune::Phase::Down => {
-                    s.term.sink.focused = true;
+                    s.focus_terminal_tx(tx);
                     MousePhase::Down
                 }
                 rune::Phase::Move => MousePhase::Move,
@@ -1886,13 +1998,64 @@ fn sink(s: &UiState, k: &Kit, m: Metrics, col: u16, row: u16, bg: Color) -> El {
             }
         })
         .on_input_paste(|s: &mut UiState, content: &rune::ClipboardContent, _| {
-            s.term.send(Msg::Paste(content.text().to_string()));
+            paste_terminal_clipboard(s, content);
             true
         });
     if composing {
         field = field.fill(bg);
     }
     field
+}
+
+fn shell_quote_path(path: &std::path::Path) -> String {
+    let raw = path.to_string_lossy();
+    if raw
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':' | '~'))
+    {
+        raw.into_owned()
+    } else {
+        format!("'{}'", raw.replace('\'', "'\\''"))
+    }
+}
+
+fn paste_terminal_files(s: &mut UiState, files: &[PathBuf]) {
+    if files.is_empty() {
+        return;
+    }
+    let joined: Vec<String> = files.iter().map(|p| shell_quote_path(p)).collect();
+    s.term.send(Msg::Paste(format!("{} ", joined.join(" "))));
+}
+
+fn paste_terminal_clipboard(s: &mut UiState, content: &rune::ClipboardContent) {
+    let files = content.files();
+    if !files.is_empty() {
+        paste_terminal_files(s, files);
+        return;
+    }
+    if let Some(image) = content.image() {
+        let dir = std::env::temp_dir().join("muqun-clipboard");
+        let _ = std::fs::create_dir_all(&dir);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = dir.join(format!("paste-{stamp}.png"));
+        if std::fs::write(&path, image.png()).is_ok() {
+            let quoted = shell_quote_path(&path);
+            s.term.send(Msg::Paste(format!("{quoted} ")));
+            return;
+        }
+    }
+    let text = content.text();
+    if !text.is_empty() {
+        s.term.send(Msg::Paste(text.to_string()));
+    } else {
+        // If ClipboardContent held neither files, image, nor text when Ctrl+V
+        // triggered a paste, forward raw Ctrl+V (\x16) to the PTY so TUI agents
+        // or editors listening for literal ^V still receive it.
+        s.term.send(Msg::Text("\x16".into()));
+    }
 }
 
 #[cfg(test)]
@@ -2725,5 +2888,53 @@ mod tests {
         });
         let grid_el_tail = grid(&s, &k, Some(&frame), m, bg, 1.0);
         let _ = grid_el_tail;
+    }
+
+    #[test]
+    fn clicking_terminal_in_session_mode_keeps_keyboard_on_terminal_not_composer() {
+        let (tx, _rx) = commands::channel();
+        let mut state = UiState::new(tx);
+        state.mode = super::super::Mode::Session;
+        state.draft = TextEdit::new("hello world");
+        state.draft.set_caret(2);
+        state.draft.focused = true;
+
+        state.open_terminal();
+        assert!(state.term.sink.focused);
+        assert!(!state.draft.focused);
+
+        let mut rt = Runtime::new(
+            state,
+            super::super::view,
+            (1440.0, 900.0),
+            Env::new(true, 1.0),
+        );
+        rt.on_key = Some(super::super::on_key);
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+
+        // Click inside the terminal grid on the right side of the window.
+        rt.pointer_down(1200.0, 300.0);
+        rt.pointer_up(1200.0, 300.0);
+        rt.frame(2.0 / 60.0);
+
+        assert!(rt.state.term.sink.focused);
+        assert!(!rt.state.draft.focused);
+
+        // Pressing Left, Right, Ctrl+E, and typing characters must go to the terminal,
+        // never moving the composer caret or inserting into `state.draft`.
+        for ev in [
+            key(Key::Left, false, false),
+            key(Key::Right, false, false),
+            key(Key::Command('e'), true, false),
+            key(Key::Text("x".into()), false, false),
+        ] {
+            rt.key(ev);
+            rt.frame(3.0 / 60.0);
+        }
+        assert_eq!(rt.state.draft.text, "hello world");
+        assert_eq!(rt.state.draft.focus, 2);
+        assert!(rt.state.term.sink.focused);
+        assert!(!rt.state.draft.focused);
     }
 }

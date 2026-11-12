@@ -57,7 +57,7 @@ pub struct PeerMention {
 
 /// One delegated task, as `GET /api/tasks` lists it (the gateway's `TaskView`,
 /// the fields the desktop shows).
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TaskRow {
     #[serde(rename = "task_id", alias = "id", default)]
     pub id: String,
@@ -85,11 +85,17 @@ pub struct TaskRow {
     #[serde(default)]
     pub updated_ms: u64,
     /// The agent the task runs on, from its binding.
-    #[serde(skip)]
+    #[serde(default)]
     pub agent_id: Option<String>,
     /// The agent session the task is bound to, when it is one.
-    #[serde(skip)]
+    #[serde(default)]
     pub asid: Option<String>,
+    /// Persistent terminal session / pane ID bound to this task (e.g. `task-1`).
+    #[serde(default)]
+    pub pane_id: Option<String>,
+    /// Isolated git worktree branch created for this task, if any.
+    #[serde(default)]
+    pub worktree_branch: Option<String>,
     /// The folder, when the gateway names one (a task view does not today).
     #[serde(default)]
     pub cwd: Option<String>,
@@ -99,14 +105,14 @@ pub struct TaskRow {
     #[serde(default)]
     pub exit_code: Option<i32>,
     /// When it started working: its last reopening, else its creation.
-    #[serde(skip)]
+    #[serde(default)]
     pub started_ms: u64,
     /// The computer a mirrored delegation runs on (`binding.peer_name`).
-    #[serde(skip)]
+    #[serde(default)]
     pub machine: Option<String>,
     /// Whether the user may confirm it is finished (`POST …/complete`):
     /// a device-opened task that is paused.
-    #[serde(skip)]
+    #[serde(default)]
     pub completable: bool,
 }
 
@@ -121,15 +127,24 @@ impl TaskRow {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         };
-        row.agent_id = text("agent_id");
+        row.agent_id = text("agent_id").or(row.agent_id);
         row.asid = text("asid").or_else(|| {
             value
                 .get("asid")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         });
+        row.pane_id = text("pane_id").or_else(|| {
+            value
+                .get("pane_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+        row.cwd = row.cwd.or_else(|| text("cwd"));
         let ms = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
-        row.started_ms = ms("reopened_ms").or_else(|| ms("created_ms")).unwrap_or(0);
+        row.started_ms = ms("reopened_ms")
+            .or_else(|| ms("created_ms"))
+            .unwrap_or(row.started_ms);
         if binding
             .and_then(|b| b.get("kind"))
             .and_then(serde_json::Value::as_str)
@@ -192,7 +207,7 @@ impl WorktreeRow {
 }
 
 /// A task's direct children by state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TaskChildren {
     #[serde(default)]
     pub total: u32,
@@ -205,7 +220,7 @@ pub struct TaskChildren {
 }
 
 /// One state change in a task's history.
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TaskStep {
     #[serde(default)]
     pub at_ms: u64,

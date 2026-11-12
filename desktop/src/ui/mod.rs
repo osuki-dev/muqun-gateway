@@ -1468,7 +1468,9 @@ impl UiState {
             .cloned()
             .unwrap_or_default();
         self.draft = TextEdit::new(text);
-        self.draft.focused = true;
+        if !self.term.sink.focused {
+            self.draft.focused = true;
+        }
     }
 
     /// Keep the right-hand panes within the window beside the sidebar
@@ -1630,7 +1632,6 @@ impl UiState {
 
     fn put_slot(&mut self, slot: SessionSlot) {
         self.draft = slot.draft;
-        self.draft.focused = true;
         self.queue = slot.queue;
         self.staged = slot.staged;
         self.diff_stat = slot.diff_stat;
@@ -2417,8 +2418,11 @@ impl UiState {
         let fresh = self.selected.as_deref() != Some(asid.as_str());
         self.selected = Some(asid.clone());
         if let Some(tile) = self.tiles.get_mut(self.focus) {
-            if tile.asid.as_deref() != Some(asid.as_str()) {
+            if matches!(tile.content, TileContent::Session(_) | TileContent::Empty)
+                && tile.asid.as_deref() != Some(asid.as_str())
+            {
                 tile.asid = Some(asid.clone());
+                tile.content = TileContent::Session(asid.clone());
                 self.sync_watch();
                 self.persist_tiles();
             }

@@ -5,12 +5,12 @@
 //! array remains backward compatible.
 
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context as _;
 
-use super::{BackendKind, HerdrBackend, TerminalBackend, TmuxBackend};
+use super::{BackendKind, HerdrBackend, MuqunTermBackend, TerminalBackend, TmuxBackend};
 
 pub struct BackendRegistry {
     herdr_default_socket: String,
@@ -25,11 +25,39 @@ impl BackendRegistry {
 
     pub fn connect(&self, kind: BackendKind, socket_path: &str) -> Box<dyn TerminalBackend> {
         match kind {
-            BackendKind::Herdr => Box::new(HerdrBackend::new(socket_path)),
+            BackendKind::Herdr => {
+                let muqun_socket = super::muqun_term::default_socket_path();
+                if let Some(target) =
+                    self.resolve_muqun_term_socket(socket_path, &muqun_socket, !cfg!(test))
+                {
+                    Box::new(MuqunTermBackend::new(target))
+                } else {
+                    Box::new(HerdrBackend::new(socket_path))
+                }
+            }
             BackendKind::Tmux => Box::new(TmuxBackend::new(
                 (!socket_path.is_empty()).then(|| PathBuf::from(socket_path)),
             )),
         }
+    }
+
+    fn resolve_muqun_term_socket(
+        &self,
+        socket_path: &str,
+        muqun_socket: &Path,
+        allow_auto_fallback: bool,
+    ) -> Option<PathBuf> {
+        if socket_path.ends_with("term.sock") {
+            return Some(PathBuf::from(socket_path));
+        }
+        if allow_auto_fallback
+            && socket_path == self.herdr_default_socket
+            && !Path::new(socket_path).exists()
+            && muqun_socket.exists()
+        {
+            return Some(muqun_socket.to_path_buf());
+        }
+        None
     }
 
     pub fn default_socket(&self, kind: BackendKind) -> String {
@@ -99,5 +127,60 @@ mod tests {
             registry.endpoint(BackendKind::Tmux, ""),
             "default tmux server"
         );
+    }
+
+    #[test]
+    fn resolves_muqun_term_when_explicit_or_when_default_herdr_absent() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("muqun-registry-fallback-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let existing_muqun_sock = temp_dir.join("term.sock");
+        std::fs::write(&existing_muqun_sock, b"").unwrap();
+        let missing_herdr_sock = temp_dir.join("herdr.sock");
+
+        let registry = BackendRegistry::new(missing_herdr_sock.to_string_lossy());
+
+        // Explicit term.sock always routes to MuqunTermBackend
+        assert_eq!(
+            registry.resolve_muqun_term_socket(
+                "/custom/muqun-desktop/term.sock",
+                &existing_muqun_sock,
+                false,
+            ),
+            Some(PathBuf::from("/custom/muqun-desktop/term.sock"))
+        );
+
+        // Automatic fallback activates when Herdr default socket is absent and term.sock exists
+        assert_eq!(
+            registry.resolve_muqun_term_socket(
+                &missing_herdr_sock.to_string_lossy(),
+                &existing_muqun_sock,
+                true,
+            ),
+            Some(existing_muqun_sock.clone())
+        );
+
+        // Non-default Herdr socket paths do not fall back automatically
+        assert_eq!(
+            registry.resolve_muqun_term_socket(
+                "/some/other/herdr.sock",
+                &existing_muqun_sock,
+                true,
+            ),
+            None
+        );
+
+        // When Herdr socket exists on disk, Herdr takes precedence
+        std::fs::write(&missing_herdr_sock, b"").unwrap();
+        assert_eq!(
+            registry.resolve_muqun_term_socket(
+                &missing_herdr_sock.to_string_lossy(),
+                &existing_muqun_sock,
+                true,
+            ),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

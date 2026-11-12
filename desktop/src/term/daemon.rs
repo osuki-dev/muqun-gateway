@@ -151,6 +151,10 @@ pub enum Request {
         cell_w: Option<u16>,
         #[serde(default)]
         cell_h: Option<u16>,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        command: Option<String>,
     },
     /// Attach to an existing session to stream scrollback and live output.
     Attach {
@@ -170,6 +174,12 @@ pub enum Request {
         #[serde(default)]
         cell_h: Option<u16>,
     },
+    /// Read recent scrollback text from a session without attaching a stream.
+    Read {
+        id: String,
+        #[serde(default)]
+        lines: Option<u32>,
+    },
     /// Terminate and close a persistent session.
     Close { id: String },
     /// List all active and recent sessions.
@@ -185,6 +195,16 @@ pub struct SessionInfo {
     pub alive: bool,
     pub cols: u16,
     pub rows: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_summary: Option<String>,
 }
 
 /// Server response frame returned for control requests.
@@ -260,6 +280,16 @@ pub enum DaemonEvent {
     Output {
         data: String,
     },
+    Status {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_summary: Option<String>,
+    },
     Exit {
         #[serde(skip_serializing_if = "Option::is_none")]
         code: Option<i32>,
@@ -272,7 +302,228 @@ pub enum DaemonEvent {
 #[derive(Debug, Clone)]
 pub enum OutputMsg {
     Data(Vec<u8>),
+    Status {
+        cwd: Option<PathBuf>,
+        agent_status: Option<String>,
+        exit_code: Option<i32>,
+        task_summary: Option<String>,
+    },
     Exit(Exit),
+}
+
+// ============================================================================
+// ANSI Stripping & Output Inspection Helpers
+// ============================================================================
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Strips ANSI escape sequences (CSI `\x1b[...`, OSC `\x1b]...(\x07|\x1b\\)`,
+/// and 2-byte/3-byte ESC sequences) and normalizes `\r\n` to `\n`.
+pub fn strip_ansi_codes(bytes: &[u8]) -> String {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            match bytes.get(i + 1).copied() {
+                Some(b'[') => {
+                    i += 2;
+                    while i < bytes.len() {
+                        let b = bytes[i];
+                        i += 1;
+                        if (0x40..=0x7e).contains(&b) {
+                            break;
+                        }
+                    }
+                }
+                Some(b']') | Some(b'P') | Some(b'X') | Some(b'^') | Some(b'_') => {
+                    i += 2;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                Some(b'(') | Some(b')') | Some(b'*') | Some(b'+') | Some(b'-') | Some(b'.')
+                | Some(b'/') => {
+                    i = (i + 3).min(bytes.len());
+                }
+                Some(_) => {
+                    i += 2;
+                }
+                None => {
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).replace("\r\n", "\n")
+}
+
+/// Inspects a raw PTY output chunk for OSC 7 (CWD), OSC 133 (shell integration),
+/// and task completion markers (`MUQUN_TASK_DONE:` / `MUQUN_TASK_BLOCKED:`).
+///
+/// Updates the session state locks in place and returns a `DaemonEvent::Status`
+/// if any field was updated.
+pub fn inspect_output_chunk(
+    chunk: &[u8],
+    live_cwd: &Mutex<PathBuf>,
+    agent_status: &Mutex<Option<String>>,
+    exit_code: &Mutex<Option<i32>>,
+    task_summary: &Mutex<Option<String>>,
+) -> Option<DaemonEvent> {
+    let mut changed_cwd: Option<PathBuf> = None;
+    let mut changed_status: Option<String> = None;
+    let mut changed_exit_code: Option<i32> = None;
+    let mut changed_summary: Option<String> = None;
+
+    // 1. Scan for OSC sequences (\x1b] ... (\x07 | \x1b\\))
+    let mut i = 0;
+    while i + 1 < chunk.len() {
+        if chunk[i] == 0x1b && chunk[i + 1] == b']' {
+            let start = i + 2;
+            let mut end = None;
+            let mut next_i = start;
+            let mut j = start;
+            while j < chunk.len() {
+                if chunk[j] == 0x07 {
+                    end = Some(j);
+                    next_i = j + 1;
+                    break;
+                }
+                if chunk[j] == 0x1b && chunk.get(j + 1) == Some(&b'\\') {
+                    end = Some(j);
+                    next_i = j + 2;
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(end_idx) = end {
+                let osc_str = String::from_utf8_lossy(&chunk[start..end_idx]);
+                if let Some(rest) = osc_str.strip_prefix("7;file://") {
+                    if let Some(slash_idx) = rest.find('/') {
+                        let decoded = percent_decode(&rest[slash_idx..]);
+                        if decoded.starts_with('/') {
+                            let new_path = PathBuf::from(decoded);
+                            if let Ok(mut guard) = live_cwd.lock() {
+                                *guard = new_path.clone();
+                            }
+                            changed_cwd = Some(new_path);
+                        }
+                    }
+                } else if let Some(rest) = osc_str.strip_prefix("133;") {
+                    if rest == "A" || rest.starts_with("A;") {
+                        if let Ok(mut guard) = agent_status.lock() {
+                            let keep = matches!(guard.as_deref(), Some("done") | Some("blocked"));
+                            if !keep {
+                                *guard = Some("idle".to_string());
+                                changed_status = Some("idle".to_string());
+                            }
+                        }
+                    } else if rest == "C" || rest.starts_with("C;") {
+                        if let Ok(mut guard) = agent_status.lock() {
+                            *guard = Some("working".to_string());
+                            changed_status = Some("working".to_string());
+                        }
+                    } else if rest == "D" || rest.starts_with("D;") {
+                        if let Some(after_d) = rest.strip_prefix("D;") {
+                            let code_part = after_d.split(';').next().unwrap_or("");
+                            if let Ok(code) = code_part.trim().parse::<i32>() {
+                                if let Ok(mut guard) = exit_code.lock() {
+                                    *guard = Some(code);
+                                }
+                                changed_exit_code = Some(code);
+                            }
+                        }
+                        if let Ok(mut guard) = agent_status.lock() {
+                            let keep = matches!(guard.as_deref(), Some("done") | Some("blocked"));
+                            if !keep {
+                                *guard = Some("idle".to_string());
+                                changed_status = Some("idle".to_string());
+                            }
+                        }
+                    }
+                }
+                i = next_i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    // 2. Scan lines for task completion markers
+    let text = String::from_utf8_lossy(chunk);
+    for line in text.lines() {
+        if let Some(idx) = line.find("MUQUN_TASK_DONE:") {
+            let after = &line[idx + "MUQUN_TASK_DONE:".len()..];
+            let summary = strip_ansi_codes(after.as_bytes()).trim().to_string();
+            if !summary.is_empty() && !summary.contains("<one-line summary>") {
+                if let Ok(mut guard) = agent_status.lock() {
+                    *guard = Some("done".to_string());
+                }
+                if let Ok(mut guard) = task_summary.lock() {
+                    *guard = Some(summary.clone());
+                }
+                changed_status = Some("done".to_string());
+                changed_summary = Some(summary);
+            }
+        } else if let Some(idx) = line.find("MUQUN_TASK_BLOCKED:") {
+            let after = &line[idx + "MUQUN_TASK_BLOCKED:".len()..];
+            let reason = strip_ansi_codes(after.as_bytes()).trim().to_string();
+            if !reason.is_empty() && !reason.contains("<one-line reason>") {
+                if let Ok(mut guard) = agent_status.lock() {
+                    *guard = Some("blocked".to_string());
+                }
+                if let Ok(mut guard) = task_summary.lock() {
+                    *guard = Some(reason.clone());
+                }
+                changed_status = Some("blocked".to_string());
+                changed_summary = Some(reason);
+            }
+        }
+    }
+
+    if changed_cwd.is_some()
+        || changed_status.is_some()
+        || changed_exit_code.is_some()
+        || changed_summary.is_some()
+    {
+        Some(DaemonEvent::Status {
+            cwd: changed_cwd,
+            agent_status: changed_status,
+            exit_code: changed_exit_code,
+            task_summary: changed_summary,
+        })
+    } else {
+        None
+    }
 }
 
 // ============================================================================
@@ -284,6 +535,12 @@ pub struct DaemonSession {
     pub id: String,
     pub cwd: PathBuf,
     pub created_at: Instant,
+    live_cwd: Arc<Mutex<PathBuf>>,
+    label: Mutex<Option<String>>,
+    shell_pid: Option<u32>,
+    exit_code: Arc<Mutex<Option<i32>>>,
+    agent_status: Arc<Mutex<Option<String>>>,
+    task_summary: Arc<Mutex<Option<String>>>,
     size: Mutex<WinSize>,
     pty: Mutex<Option<Pty>>,
     child: Mutex<Option<Child>>,
@@ -303,16 +560,26 @@ impl DaemonSession {
     ) -> io::Result<Arc<Self>> {
         let alive = Arc::new(AtomicBool::new(true));
         let exit_status = Arc::new(Mutex::new(None));
+        let exit_code = Arc::new(Mutex::new(None));
+        let live_cwd = Arc::new(Mutex::new(cwd.clone()));
+        let agent_status = Arc::new(Mutex::new(Some("idle".to_string())));
+        let task_summary = Arc::new(Mutex::new(None));
         let (broadcast_tx, _rx) = broadcast::channel(1024);
 
         let alive_flag = alive.clone();
         let exit_slot = exit_status.clone();
+        let exit_code_slot = exit_code.clone();
         let exit_broadcast = broadcast_tx.clone();
 
         let on_exit: pty::OnExit = Box::new(move |exit| {
             alive_flag.store(false, Ordering::SeqCst);
             if let Ok(mut slot) = exit_slot.lock() {
                 *slot = Some(exit);
+            }
+            if let Exit::Code(c) = exit {
+                if let Ok(mut code_guard) = exit_code_slot.lock() {
+                    *code_guard = Some(c);
+                }
             }
             let _ = exit_broadcast.send(OutputMsg::Exit(exit));
         });
@@ -324,6 +591,10 @@ impl DaemonSession {
         let scrollback_writer = scrollback.clone();
         let stream_tx = broadcast_tx.clone();
         let alive_for_reader = alive.clone();
+        let reader_cwd = live_cwd.clone();
+        let reader_status = agent_status.clone();
+        let reader_exit_code = exit_code.clone();
+        let reader_summary = task_summary.clone();
 
         let reader_thread_name = format!("term-reader-{}", id);
         std::thread::Builder::new()
@@ -340,6 +611,25 @@ impl DaemonSession {
                                 sb.push(chunk);
                             }
                             let _ = stream_tx.send(OutputMsg::Data(chunk.to_vec()));
+                            if let Some(DaemonEvent::Status {
+                                cwd,
+                                agent_status,
+                                exit_code,
+                                task_summary,
+                            }) = inspect_output_chunk(
+                                chunk,
+                                &reader_cwd,
+                                &reader_status,
+                                &reader_exit_code,
+                                &reader_summary,
+                            ) {
+                                let _ = stream_tx.send(OutputMsg::Status {
+                                    cwd,
+                                    agent_status,
+                                    exit_code,
+                                    task_summary,
+                                });
+                            }
                         }
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
@@ -352,6 +642,12 @@ impl DaemonSession {
             id,
             cwd,
             created_at: Instant::now(),
+            live_cwd,
+            label: Mutex::new(None),
+            shell_pid: None,
+            exit_code,
+            agent_status,
+            task_summary,
             size: Mutex::new(size),
             pty: Mutex::new(Some(pty)),
             child: Mutex::new(Some(child)),
@@ -370,6 +666,45 @@ impl DaemonSession {
 
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    pub fn live_cwd(&self) -> PathBuf {
+        self.live_cwd
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| self.cwd.clone())
+    }
+
+    pub fn label(&self) -> Option<String> {
+        self.label.lock().ok().and_then(|g| g.clone())
+    }
+
+    pub fn set_label(&self, label: Option<String>) {
+        if let Ok(mut g) = self.label.lock() {
+            *g = label;
+        }
+    }
+
+    pub fn shell_pid(&self) -> Option<u32> {
+        self.shell_pid
+    }
+
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code.lock().ok().and_then(|g| *g)
+    }
+
+    pub fn agent_status(&self) -> Option<String> {
+        self.agent_status.lock().ok().and_then(|g| g.clone())
+    }
+
+    pub fn set_agent_status(&self, status: Option<String>) {
+        if let Ok(mut g) = self.agent_status.lock() {
+            *g = status;
+        }
+    }
+
+    pub fn task_summary(&self) -> Option<String> {
+        self.task_summary.lock().ok().and_then(|g| g.clone())
     }
 
     pub fn is_alive(&self) -> bool {
@@ -484,7 +819,9 @@ impl DaemonServer {
                 rows,
                 cell_w,
                 cell_h,
-            } => self.handle_create(id, cwd, cols, rows, cell_w, cell_h),
+                label,
+                command,
+            } => self.handle_create(id, cwd, cols, rows, cell_w, cell_h, label, command),
             Request::List => self.handle_list(),
             Request::Input { id, data } => self.handle_input(&id, &data),
             Request::Resize {
@@ -494,6 +831,7 @@ impl DaemonServer {
                 cell_w,
                 cell_h,
             } => self.handle_resize(&id, cols, rows, cell_w, cell_h),
+            Request::Read { id, lines } => self.handle_read(&id, lines),
             Request::Close { id } => self.handle_close(&id),
             Request::Attach { .. } => {
                 Response::error("attach command cannot be dispatched synchronously")
@@ -501,6 +839,7 @@ impl DaemonServer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_create(
         &self,
         id: Option<String>,
@@ -509,6 +848,8 @@ impl DaemonServer {
         rows: u16,
         cell_w: Option<u16>,
         cell_h: Option<u16>,
+        label: Option<String>,
+        command: Option<String>,
     ) -> Response {
         let cols = if cols == 0 { DEFAULT_COLS } else { cols };
         let rows = if rows == 0 { DEFAULT_ROWS } else { rows };
@@ -553,6 +894,16 @@ impl DaemonServer {
                 DEFAULT_SCROLLBACK_CAPACITY,
             ) {
                 Ok(session) => {
+                    if label.is_some() {
+                        session.set_label(label);
+                    }
+                    if let Some(ref cmd) = command {
+                        if !cmd.is_empty() {
+                            session.set_agent_status(Some("working".to_string()));
+                            let line = format!("{}\n", cmd.trim_end_matches('\n'));
+                            let _ = session.write_all(line.as_bytes());
+                        }
+                    }
                     sessions.insert(session_id.clone(), session);
                     Response::id(session_id)
                 }
@@ -562,25 +913,62 @@ impl DaemonServer {
     }
 
     fn handle_list(&self) -> Response {
-        let sessions = match self.sessions.lock() {
+        let mut sessions = match self.sessions.lock() {
             Ok(s) => s,
             Err(_) => return Response::error("daemon sessions lock poisoned"),
         };
+
+        sessions.retain(|_, s| s.is_alive());
 
         let mut list = Vec::new();
         for (id, s) in sessions.iter() {
             let size = s.size();
             list.push(SessionInfo {
                 id: id.clone(),
-                cwd: s.cwd.clone(),
+                cwd: s.live_cwd(),
                 uptime_secs: s.uptime().as_secs(),
                 alive: s.is_alive(),
                 cols: size.cols,
                 rows: size.rows,
+                label: s.label(),
+                shell_pid: s.shell_pid(),
+                exit_code: s.exit_code(),
+                agent_status: s.agent_status(),
+                task_summary: s.task_summary(),
             });
         }
         list.sort_by(|a, b| a.id.cmp(&b.id));
         Response::sessions(list)
+    }
+
+    fn handle_read(&self, id: &str, lines: Option<u32>) -> Response {
+        let session = {
+            let sessions = match self.sessions.lock() {
+                Ok(s) => s,
+                Err(_) => return Response::error("daemon sessions lock poisoned"),
+            };
+            sessions.get(id).cloned()
+        };
+
+        let session = match session {
+            Some(s) => s,
+            None => return Response::error(format!("session '{id}' not found")),
+        };
+
+        let raw_bytes = session.scrollback();
+        let stripped = strip_ansi_codes(&raw_bytes);
+        let max_lines = lines.unwrap_or(200) as usize;
+        let all_lines: Vec<&str> = stripped.lines().collect();
+        let start = all_lines.len().saturating_sub(max_lines);
+        let text = all_lines[start..].join("\n");
+
+        Response {
+            ok: true,
+            id: Some(id.to_string()),
+            sessions: None,
+            scrollback: Some(text),
+            error: None,
+        }
     }
 
     fn handle_input(&self, id: &str, data: &str) -> Response {
@@ -774,6 +1162,7 @@ impl DaemonServer {
                                 }
                                 let _ = writer.flush().await;
                             }
+                            Ok(OutputMsg::Status { .. }) => continue,
                             Ok(OutputMsg::Exit(_)) => break,
                             Err(broadcast::error::RecvError::Lagged(_)) => continue,
                             Err(broadcast::error::RecvError::Closed) => break,
@@ -820,6 +1209,25 @@ impl DaemonServer {
                             Ok(OutputMsg::Data(bytes)) => {
                                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                                 let event = DaemonEvent::Output { data: b64 };
+                                let mut out = serde_json::to_vec(&event)?;
+                                out.push(b'\n');
+                                if writer.write_all(&out).await.is_err() {
+                                    break;
+                                }
+                                let _ = writer.flush().await;
+                            }
+                            Ok(OutputMsg::Status {
+                                cwd,
+                                agent_status,
+                                exit_code,
+                                task_summary,
+                            }) => {
+                                let event = DaemonEvent::Status {
+                                    cwd,
+                                    agent_status,
+                                    exit_code,
+                                    task_summary,
+                                };
                                 let mut out = serde_json::to_vec(&event)?;
                                 out.push(b'\n');
                                 if writer.write_all(&out).await.is_err() {
@@ -1102,6 +1510,20 @@ impl DaemonClient {
         cols: u16,
         rows: u16,
     ) -> io::Result<String> {
+        self.create_session_with_options(id, cwd, cols, rows, None, None)
+            .await
+    }
+
+    /// Creates a persistent session on the daemon with optional label and initial command.
+    pub async fn create_session_with_options(
+        &self,
+        id: Option<String>,
+        cwd: Option<PathBuf>,
+        cols: u16,
+        rows: u16,
+        label: Option<String>,
+        command: Option<String>,
+    ) -> io::Result<String> {
         let req = Request::Create {
             id,
             cwd,
@@ -1109,11 +1531,23 @@ impl DaemonClient {
             rows,
             cell_w: None,
             cell_h: None,
+            label,
+            command,
         };
         let resp = self.send_request(&req).await?;
         resp.id.ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "missing session id in response")
         })
+    }
+
+    /// Reads recent plain-text scrollback lines from a session without attaching a stream.
+    pub async fn read_session_text(&self, id: &str, lines: Option<u32>) -> io::Result<String> {
+        let req = Request::Read {
+            id: id.to_string(),
+            lines,
+        };
+        let resp = self.send_request(&req).await?;
+        Ok(resp.scrollback.unwrap_or_default())
     }
 
     /// Lists active and recent sessions on the daemon.
@@ -1206,6 +1640,7 @@ impl DaemonClient {
                                 }
                             }
                         }
+                        DaemonEvent::Status { .. } => {}
                         DaemonEvent::Exit { .. } => break,
                     }
                 }
@@ -1382,6 +1817,19 @@ impl SyncDaemonClient {
         cols: u16,
         rows: u16,
     ) -> io::Result<String> {
+        self.create_session_with_options(id, cwd, cols, rows, None, None)
+    }
+
+    /// Creates a persistent session on the daemon with optional label and initial command.
+    pub fn create_session_with_options(
+        &self,
+        id: Option<String>,
+        cwd: Option<PathBuf>,
+        cols: u16,
+        rows: u16,
+        label: Option<String>,
+        command: Option<String>,
+    ) -> io::Result<String> {
         let req = Request::Create {
             id,
             cwd,
@@ -1389,6 +1837,8 @@ impl SyncDaemonClient {
             rows,
             cell_w: None,
             cell_h: None,
+            label,
+            command,
         };
         let resp = self.send_request(&req)?;
         if resp.ok {
@@ -1399,6 +1849,23 @@ impl SyncDaemonClient {
             Err(io::Error::new(
                 io::ErrorKind::Other,
                 resp.error.unwrap_or_else(|| "create session failed".into()),
+            ))
+        }
+    }
+
+    /// Reads recent plain-text scrollback lines from a session without attaching a stream.
+    pub fn read_session_text(&self, id: &str, lines: Option<u32>) -> io::Result<String> {
+        let req = Request::Read {
+            id: id.to_string(),
+            lines,
+        };
+        let resp = self.send_request(&req)?;
+        if resp.ok {
+            Ok(resp.scrollback.unwrap_or_default())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                resp.error.unwrap_or_else(|| "read session failed".into()),
             ))
         }
     }
@@ -1532,11 +1999,39 @@ mod tests {
             rows: 40,
             cell_w: Some(8),
             cell_h: Some(16),
+            label: Some("worker-1".into()),
+            command: Some("cargo test".into()),
         };
         let json_create = serde_json::to_string(&req_create).unwrap();
         assert!(json_create.contains(r#""cmd":"create""#));
         let decoded_create: Request = serde_json::from_str(&json_create).unwrap();
         assert_eq!(req_create, decoded_create);
+
+        // Verify backward compatibility with legacy JSON without label/command
+        let legacy_create = r#"{"cmd":"create","id":"term-legacy","cols":80,"rows":24}"#;
+        let decoded_legacy: Request = serde_json::from_str(legacy_create).unwrap();
+        assert_eq!(
+            decoded_legacy,
+            Request::Create {
+                id: Some("term-legacy".into()),
+                cwd: None,
+                cols: 80,
+                rows: 24,
+                cell_w: None,
+                cell_h: None,
+                label: None,
+                command: None,
+            }
+        );
+
+        let req_read = Request::Read {
+            id: "term-1".into(),
+            lines: Some(50),
+        };
+        let json_read = serde_json::to_string(&req_read).unwrap();
+        assert!(json_read.contains(r#""cmd":"read""#));
+        let decoded_read: Request = serde_json::from_str(&json_read).unwrap();
+        assert_eq!(req_read, decoded_read);
 
         let req_attach = Request::Attach {
             id: "term-1".into(),
@@ -1834,6 +2329,209 @@ mod tests {
         let sessions_after = sync_client.list_sessions().unwrap();
         assert!(sessions_after.is_empty());
 
+        let _ = shutdown_tx.send(true);
+        let _ = rt.block_on(server_task);
+        let _ = std::fs::remove_dir_all(&socket_dir);
+    }
+
+    #[test]
+    fn test_strip_ansi_codes_and_inspect_output_chunk() {
+        // 1. Test strip_ansi_codes with CSI, OSC (BEL and ST), 2-byte ESC, and \r\n
+        let raw = b"\x1b]7;file://localhost/tmp/work%20dir\x07\x1b[32mhello\x1b[0m \x1b]133;A\x1b\\world\r\nline2\x1bM\r\n";
+        let stripped = strip_ansi_codes(raw);
+        assert_eq!(stripped, "hello world\nline2\n");
+
+        // 2. Test inspect_output_chunk with OSC 7 and OSC 133 (A, C, D;0, D;1)
+        let cwd = Mutex::new(PathBuf::from("/initial"));
+        let status = Mutex::new(Some("idle".to_string()));
+        let exit_code = Mutex::new(None);
+        let summary = Mutex::new(None);
+
+        let evt_osc7 = inspect_output_chunk(
+            b"\x1b]7;file://myhost/var/log/my%20app\x07",
+            &cwd,
+            &status,
+            &exit_code,
+            &summary,
+        );
+        assert_eq!(
+            evt_osc7,
+            Some(DaemonEvent::Status {
+                cwd: Some(PathBuf::from("/var/log/my app")),
+                agent_status: None,
+                exit_code: None,
+                task_summary: None,
+            })
+        );
+        assert_eq!(*cwd.lock().unwrap(), PathBuf::from("/var/log/my app"));
+
+        let evt_c = inspect_output_chunk(b"\x1b]133;C\x07", &cwd, &status, &exit_code, &summary);
+        assert_eq!(
+            evt_c,
+            Some(DaemonEvent::Status {
+                cwd: None,
+                agent_status: Some("working".to_string()),
+                exit_code: None,
+                task_summary: None,
+            })
+        );
+        assert_eq!(status.lock().unwrap().as_deref(), Some("working"));
+
+        let evt_d0 =
+            inspect_output_chunk(b"\x1b]133;D;0\x1b\\", &cwd, &status, &exit_code, &summary);
+        assert_eq!(
+            evt_d0,
+            Some(DaemonEvent::Status {
+                cwd: None,
+                agent_status: Some("idle".to_string()),
+                exit_code: Some(0),
+                task_summary: None,
+            })
+        );
+        assert_eq!(status.lock().unwrap().as_deref(), Some("idle"));
+        assert_eq!(*exit_code.lock().unwrap(), Some(0));
+
+        let evt_d1 = inspect_output_chunk(b"\x1b]133;D;1\x07", &cwd, &status, &exit_code, &summary);
+        assert_eq!(
+            evt_d1,
+            Some(DaemonEvent::Status {
+                cwd: None,
+                agent_status: Some("idle".to_string()),
+                exit_code: Some(1),
+                task_summary: None,
+            })
+        );
+        assert_eq!(*exit_code.lock().unwrap(), Some(1));
+
+        // 3. Test placeholder ignored
+        let evt_placeholder = inspect_output_chunk(
+            b"MUQUN_TASK_DONE: <one-line summary>\nMUQUN_TASK_BLOCKED: <one-line reason>\n",
+            &cwd,
+            &status,
+            &exit_code,
+            &summary,
+        );
+        assert_eq!(evt_placeholder, None);
+
+        // 4. Test MUQUN_TASK_DONE and verify OSC 133;A / 133;D do not overwrite "done"
+        let evt_done = inspect_output_chunk(
+            b"output line\r\nMUQUN_TASK_DONE: all tests pass\r\n\x1b]133;D;0\x07\x1b]133;A\x07",
+            &cwd,
+            &status,
+            &exit_code,
+            &summary,
+        );
+        assert_eq!(
+            evt_done,
+            Some(DaemonEvent::Status {
+                cwd: None,
+                agent_status: Some("done".to_string()),
+                exit_code: Some(0),
+                task_summary: Some("all tests pass".to_string()),
+            })
+        );
+        assert_eq!(status.lock().unwrap().as_deref(), Some("done"));
+        assert_eq!(summary.lock().unwrap().as_deref(), Some("all tests pass"));
+
+        // Prompt redraw (\x1b]133;A) must not overwrite "done"
+        let evt_a_after_done =
+            inspect_output_chunk(b"\x1b]133;A\x07", &cwd, &status, &exit_code, &summary);
+        assert_eq!(evt_a_after_done, None);
+        assert_eq!(status.lock().unwrap().as_deref(), Some("done"));
+
+        // 5. Test MUQUN_TASK_BLOCKED
+        let evt_blocked = inspect_output_chunk(
+            b"MUQUN_TASK_BLOCKED: need API key\n",
+            &cwd,
+            &status,
+            &exit_code,
+            &summary,
+        );
+        assert_eq!(
+            evt_blocked,
+            Some(DaemonEvent::Status {
+                cwd: None,
+                agent_status: Some("blocked".to_string()),
+                exit_code: None,
+                task_summary: Some("need API key".to_string()),
+            })
+        );
+        assert_eq!(status.lock().unwrap().as_deref(), Some("blocked"));
+        assert_eq!(summary.lock().unwrap().as_deref(), Some("need API key"));
+    }
+
+    #[test]
+    fn test_create_session_with_options_and_read_session_text() {
+        let socket_dir = std::env::temp_dir().join(format!("muqun-opt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let socket_path = socket_dir.join("test-options.sock");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sp = socket_path.clone();
+
+        let server_task = rt.spawn(async move {
+            let listener = tokio::net::UnixListener::bind(&sp).unwrap();
+            let server = Arc::new(DaemonServer::new());
+            run_server_with_shutdown(server, listener, shutdown_rx)
+                .await
+                .unwrap();
+        });
+
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            if is_socket_alive(&socket_path) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let sync_client = SyncDaemonClient::new(Some(socket_path));
+        let session_id = sync_client
+            .create_session_with_options(
+                Some("worker-opt-1".into()),
+                Some(socket_dir.clone()),
+                80,
+                24,
+                Some("test-worker".into()),
+                Some(
+                    "printf '\\033[32m%s\\033[0m\\n%s: finished task\\n' READ_PLAIN_OK MUQUN_TASK_DONE"
+                        .into(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(session_id, "worker-opt-1");
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut text = String::new();
+        while Instant::now() < deadline {
+            text = sync_client
+                .read_session_text(&session_id, Some(50))
+                .unwrap();
+            let sessions = sync_client.list_sessions().unwrap();
+            let done = sessions.first().and_then(|s| s.agent_status.as_deref()) == Some("done");
+            if text.contains("READ_PLAIN_OK") && done {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+
+        assert!(
+            text.contains("READ_PLAIN_OK"),
+            "expected plain text output in scrollback read, got: {text}"
+        );
+        assert!(
+            !text.contains("\x1b[32m"),
+            "ANSI escape sequences should be stripped from read_session_text: {text}"
+        );
+
+        let sessions = sync_client.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].label.as_deref(), Some("test-worker"));
+        assert_eq!(sessions[0].agent_status.as_deref(), Some("done"));
+        assert_eq!(sessions[0].task_summary.as_deref(), Some("finished task"));
+
+        sync_client.close_session(&session_id).unwrap();
         let _ = shutdown_tx.send(true);
         let _ = rt.block_on(server_task);
         let _ = std::fs::remove_dir_all(&socket_dir);

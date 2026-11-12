@@ -83,8 +83,9 @@ fn fits_cell(text: &str) -> bool {
 pub fn build_row<'a>(cells: impl IntoIterator<Item = CellIn<'a>>) -> Row {
     let mut bgs: Vec<BgRun> = Vec::new();
     let mut runs: Vec<TextRun> = Vec::new();
-    // The run being extended: it only takes cells that fit one column.
+    // The run being extended: it only takes cells that fit one column and share background.
     let mut open = false;
+    let mut open_bg: Option<Rgb> = None;
     let mut col: u16 = 0;
     for cell in cells {
         let width = u16::from(cell.width);
@@ -112,11 +113,12 @@ pub fn build_row<'a>(cells: impl IntoIterator<Item = CellIn<'a>>) -> Row {
         let blank = text == " ";
         let decorated = cell.attrs.underline || cell.attrs.strike;
         if blank && !decorated {
-            // Spaces only join a run already open in the same style (so
-            // `a b` stays one run); they never start one.
+            // Spaces only join a run already open in the same style and background
+            // (so `a b` stays one run, while an inverse/colored cursor block splits).
             match runs.last_mut() {
                 Some(last)
                     if open
+                        && open_bg == cell.bg
                         && last.col + last.cells == col
                         && last.fg == cell.fg
                         && last.attrs == cell.attrs =>
@@ -124,7 +126,10 @@ pub fn build_row<'a>(cells: impl IntoIterator<Item = CellIn<'a>>) -> Row {
                     last.text.push(' ');
                     last.cells += 1;
                 }
-                _ => open = false,
+                _ => {
+                    open = false;
+                    open_bg = None;
+                }
             }
             col += width;
             continue;
@@ -134,6 +139,7 @@ pub fn build_row<'a>(cells: impl IntoIterator<Item = CellIn<'a>>) -> Row {
             Some(last)
                 if simple
                     && open
+                    && open_bg == cell.bg
                     && last.col + last.cells == col
                     && last.fg == cell.fg
                     && last.attrs == cell.attrs =>
@@ -150,6 +156,7 @@ pub fn build_row<'a>(cells: impl IntoIterator<Item = CellIn<'a>>) -> Row {
                     attrs: cell.attrs,
                 });
                 open = simple;
+                open_bg = cell.bg;
             }
         }
         col += width;
