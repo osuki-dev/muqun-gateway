@@ -20,6 +20,9 @@ use rune::{col, el, memo, row, text, text_input, Color, El, KeyEvent, TextEdit, 
 use rune_kit::shell::PaneState;
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, MenuItem};
 
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
 use super::copy::tr_ref;
 use super::UiState;
 use crate::platform::pty::Exit;
@@ -1613,8 +1616,11 @@ fn grid(s: &UiState, k: &Kit, frame: Option<&Frame>, m: Metrics, bg: Color, scal
     let ended = s.term.fixture_ended.is_some()
         || s.term.session.as_ref().is_some_and(|x| x.ended().is_some());
     if let Some(cursor) = frame.cursor.filter(|_| !ended) {
-        let cells = if cursor.wide { 2.0 } else { 1.0 };
-        let (x, y) = (f32::from(cursor.col) * m.cw, f32::from(cursor.row) * m.ch);
+        let (_ch, is_wide, head_col) = cursor_char_at(frame, cursor.col, cursor.row);
+        let wide = cursor.wide || is_wide;
+        let cells = if wide { 2.0 } else { 1.0 };
+        let col = if wide { head_col } else { cursor.col };
+        let (x, y) = (f32::from(col) * m.cw, f32::from(cursor.row) * m.ch);
         let c = color(frame.cursor_color);
         let mark = match (cursor.shape, focused) {
             (CursorShape::Block, true) => el()
@@ -1631,7 +1637,13 @@ fn grid(s: &UiState, k: &Kit, frame: Option<&Frame>, m: Metrics, bg: Color, scal
                 .size(m.cw * cells, 2.0)
                 .fill(c),
         };
-        grid = grid.child(mark.key("terminal-cursor").a11y_hidden());
+        grid = grid.child(
+            mark.key("terminal-cursor")
+                .instant_changes()
+                .motion(rune::Spring::NONE)
+                .transition(rune::Transition::none())
+                .a11y_hidden(),
+        );
     }
     if frame.scroll.in_history() && frame.scroll.total > 0 {
         // Where the viewport is in the history, along the right edge.
@@ -1653,27 +1665,86 @@ fn grid(s: &UiState, k: &Kit, frame: Option<&Frame>, m: Metrics, bg: Color, scal
     grid.child(sink(s, k, m, cx, cy, bg))
 }
 
-/// The character under a block cursor, drawn in the background colour.
-fn cursor_glyph(frame: &Frame, col: u16, row: u16, bg: Color) -> El {
-    let ch = frame
-        .grid
-        .get(usize::from(row))
-        .and_then(|r| {
-            r.runs.iter().find_map(|run| {
-                (col >= run.col && col < run.col + run.cells).then(|| {
-                    if run.text.chars().count() == usize::from(run.cells) {
-                        run.text
-                            .chars()
-                            .nth(usize::from(col - run.col))
-                            .map(String::from)
-                            .unwrap_or_default()
-                    } else {
-                        run.text.clone()
+/// Extract the character, wide status, and start column for the cell at (col, row).
+pub(crate) fn cursor_char_at(frame: &Frame, col: u16, row: u16) -> (String, bool, u16) {
+    let Some(row_data) = frame.grid.get(usize::from(row)) else {
+        return (String::new(), false, col);
+    };
+
+    for run in &row_data.runs {
+        if col >= run.col && col < run.col + run.cells {
+            let offset = usize::from(col - run.col);
+            let total_cells = usize::from(run.cells);
+
+            if run.text.is_empty() || total_cells == 0 {
+                return (String::new(), false, col);
+            }
+
+            // Tab stops or whitespace runs draw a space and never span wide cells.
+            if run.text == "\t" || (run.text.trim().is_empty() && !run.text.is_empty()) {
+                return (" ".to_string(), false, col);
+            }
+
+            // Single grapheme cluster (e.g. CJK wide character, Nerd font icon,
+            // or emoji with variation selector).
+            let grapheme_count = run.text.graphemes(true).count();
+            if grapheme_count <= 1 {
+                let is_wide = total_cells >= 2;
+                return (run.text.clone(), is_wide, run.col);
+            }
+
+            // Fast path: simple 1-cell run where every grapheme is 1 char and 1 cell.
+            if run.text.chars().count() == total_cells && grapheme_count == total_cells {
+                let ch = run
+                    .text
+                    .chars()
+                    .nth(offset)
+                    .map(String::from)
+                    .unwrap_or_default();
+                return (ch, false, col);
+            }
+
+            // Multiple graphemes where char count != cell count (e.g. mixed CJK/ASCII,
+            // multi-byte sequences, combining marks, or tab stops).
+            let mut current_cell = 0usize;
+            for g in run.text.graphemes(true) {
+                let w = if g == "\t" {
+                    (8 - (current_cell % 8))
+                        .min(total_cells.saturating_sub(current_cell))
+                        .max(1)
+                } else {
+                    UnicodeWidthStr::width(g).max(1)
+                };
+
+                if w > 0 {
+                    let next_cell = current_cell + w;
+                    if offset >= current_cell && offset < next_cell {
+                        let is_wide = w >= 2;
+                        let head_col = run.col + current_cell as u16;
+                        let text = if g == "\t" {
+                            " ".to_string()
+                        } else {
+                            g.to_string()
+                        };
+                        return (text, is_wide, head_col);
                     }
-                })
-            })
-        })
-        .unwrap_or_default();
+                    current_cell = next_cell;
+                    if current_cell > offset {
+                        break;
+                    }
+                }
+            }
+
+            return (String::new(), false, col);
+        }
+    }
+
+    (String::new(), false, col)
+}
+
+/// The character under a block cursor, drawn in the background colour.
+pub(crate) fn cursor_glyph(frame: &Frame, col: u16, row: u16, bg: Color) -> El {
+    let (ch, _wide, _head) = cursor_char_at(frame, col, row);
     text(ch).font(style()).color(bg)
 }
 
@@ -2265,5 +2336,319 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn cursor_glyph_handles_ascii_cjk_and_icons() {
+        use crate::term::grid::{Attrs, TextRun};
+        use std::sync::Arc;
+
+        let mut frame = Frame {
+            cols: 80,
+            rows: 24,
+            ..Default::default()
+        };
+
+        let row0 = Row {
+            runs: vec![
+                TextRun {
+                    col: 0,
+                    cells: 5,
+                    text: "hello".to_string(),
+                    fg: Rgb::default(),
+                    attrs: Attrs::default(),
+                },
+                // CJK wide character (U+4E16)
+                TextRun {
+                    col: 5,
+                    cells: 2,
+                    text: "\u{4e16}".to_string(),
+                    fg: Rgb::default(),
+                    attrs: Attrs::default(),
+                },
+                // CJK wide character (U+754C)
+                TextRun {
+                    col: 7,
+                    cells: 2,
+                    text: "\u{754c}".to_string(),
+                    fg: Rgb::default(),
+                    attrs: Attrs::default(),
+                },
+                // Nerd Font icon
+                TextRun {
+                    col: 9,
+                    cells: 1,
+                    text: "\u{e0a0}".to_string(),
+                    fg: Rgb::default(),
+                    attrs: Attrs::default(),
+                },
+                // Mixed run with CJK and ASCII
+                TextRun {
+                    col: 10,
+                    cells: 4,
+                    text: "a\u{4e16}b".to_string(),
+                    fg: Rgb::default(),
+                    attrs: Attrs::default(),
+                },
+            ],
+            ..Row::default()
+        };
+
+        let row1 = Row {
+            runs: vec![
+                // Combining mark (e + acute)
+                TextRun {
+                    col: 0,
+                    cells: 1,
+                    text: "e\u{0301}".to_string(),
+                    fg: Rgb::default(),
+                    attrs: Attrs::default(),
+                },
+                // Tab stop
+                TextRun {
+                    col: 1,
+                    cells: 4,
+                    text: "\t".to_string(),
+                    fg: Rgb::default(),
+                    attrs: Attrs::default(),
+                },
+                // Emoji with variation selector
+                TextRun {
+                    col: 5,
+                    cells: 2,
+                    text: "\u{2764}\u{fe0f}".to_string(),
+                    fg: Rgb::default(),
+                    attrs: Attrs::default(),
+                },
+            ],
+            ..Row::default()
+        };
+
+        frame.grid = vec![Arc::new(row0), Arc::new(row1)];
+
+        // 1. ASCII tests
+        assert_eq!(cursor_char_at(&frame, 0, 0), ("h".to_string(), false, 0));
+        assert_eq!(cursor_char_at(&frame, 1, 0), ("e".to_string(), false, 1));
+        assert_eq!(cursor_char_at(&frame, 4, 0), ("o".to_string(), false, 4));
+
+        // 2. CJK wide character at col 5 (2 cells wide)
+        // Head of wide character
+        assert_eq!(
+            cursor_char_at(&frame, 5, 0),
+            ("\u{4e16}".to_string(), true, 5)
+        );
+        // Tail of wide character (should return the same glyph and point to head_col 5)
+        assert_eq!(
+            cursor_char_at(&frame, 6, 0),
+            ("\u{4e16}".to_string(), true, 5)
+        );
+
+        // Next CJK wide character at col 7
+        assert_eq!(
+            cursor_char_at(&frame, 7, 0),
+            ("\u{754c}".to_string(), true, 7)
+        );
+        assert_eq!(
+            cursor_char_at(&frame, 8, 0),
+            ("\u{754c}".to_string(), true, 7)
+        );
+
+        // 3. Nerd font icon at col 9
+        assert_eq!(
+            cursor_char_at(&frame, 9, 0),
+            ("\u{e0a0}".to_string(), false, 9)
+        );
+
+        // 4. Mixed run "a\u{4e16}b" at col 10..14
+        assert_eq!(cursor_char_at(&frame, 10, 0), ("a".to_string(), false, 10));
+        assert_eq!(
+            cursor_char_at(&frame, 11, 0),
+            ("\u{4e16}".to_string(), true, 11)
+        );
+        assert_eq!(
+            cursor_char_at(&frame, 12, 0),
+            ("\u{4e16}".to_string(), true, 11)
+        );
+        assert_eq!(cursor_char_at(&frame, 13, 0), ("b".to_string(), false, 13));
+
+        // 5. Combining mark on row 1
+        assert_eq!(
+            cursor_char_at(&frame, 0, 1),
+            ("e\u{0301}".to_string(), false, 0)
+        );
+
+        // 6. Tab stop on row 1 (renders spaces, not raw tab character)
+        assert_eq!(cursor_char_at(&frame, 1, 1), (" ".to_string(), false, 1));
+        assert_eq!(cursor_char_at(&frame, 4, 1), (" ".to_string(), false, 4));
+
+        // 7. Emoji on row 1
+        assert_eq!(
+            cursor_char_at(&frame, 5, 1),
+            ("\u{2764}\u{fe0f}".to_string(), true, 5)
+        );
+        assert_eq!(
+            cursor_char_at(&frame, 6, 1),
+            ("\u{2764}\u{fe0f}".to_string(), true, 5)
+        );
+
+        // Verify cursor_glyph builds elements for all these positions without panic
+        let bg = Color::WHITE;
+        let _ = cursor_glyph(&frame, 0, 0, bg);
+        let _ = cursor_glyph(&frame, 5, 0, bg);
+        let _ = cursor_glyph(&frame, 6, 0, bg);
+        let _ = cursor_glyph(&frame, 9, 0, bg);
+        let _ = cursor_glyph(&frame, 11, 0, bg);
+        let _ = cursor_glyph(&frame, 0, 1, bg);
+        let _ = cursor_glyph(&frame, 1, 1, bg);
+    }
+
+    #[test]
+    fn cursor_glyph_bounds_checking() {
+        use crate::term::grid::{Attrs, TextRun};
+        use std::sync::Arc;
+
+        let mut frame = Frame {
+            cols: 80,
+            rows: 24,
+            ..Default::default()
+        };
+
+        // Gap between runs: run 0 at 0..5, run 1 at 10..15
+        let row0 = Row {
+            runs: vec![
+                TextRun {
+                    col: 0,
+                    cells: 5,
+                    text: "start".to_string(),
+                    fg: Rgb::default(),
+                    attrs: Attrs::default(),
+                },
+                TextRun {
+                    col: 10,
+                    cells: 5,
+                    text: "after".to_string(),
+                    fg: Rgb::default(),
+                    attrs: Attrs::default(),
+                },
+            ],
+            ..Row::default()
+        };
+
+        // Row with an empty text run
+        let row1 = Row {
+            runs: vec![TextRun {
+                col: 0,
+                cells: 0,
+                text: String::new(),
+                fg: Rgb::default(),
+                attrs: Attrs::default(),
+            }],
+            ..Row::default()
+        };
+
+        frame.grid = vec![Arc::new(row0), Arc::new(row1)];
+
+        // Cell in the gap (cols 5..9)
+        assert_eq!(cursor_char_at(&frame, 5, 0), (String::new(), false, 5));
+        assert_eq!(cursor_char_at(&frame, 7, 0), (String::new(), false, 7));
+        assert_eq!(cursor_char_at(&frame, 9, 0), (String::new(), false, 9));
+
+        // Column beyond all runs on row 0
+        assert_eq!(cursor_char_at(&frame, 15, 0), (String::new(), false, 15));
+        assert_eq!(cursor_char_at(&frame, 79, 0), (String::new(), false, 79));
+        assert_eq!(cursor_char_at(&frame, 100, 0), (String::new(), false, 100));
+        assert_eq!(
+            cursor_char_at(&frame, u16::MAX, 0),
+            (String::new(), false, u16::MAX)
+        );
+
+        // Empty run on row 1
+        assert_eq!(cursor_char_at(&frame, 0, 1), (String::new(), false, 0));
+
+        // Row out of bounds
+        assert_eq!(cursor_char_at(&frame, 0, 2), (String::new(), false, 0));
+        assert_eq!(cursor_char_at(&frame, 0, 99), (String::new(), false, 0));
+        assert_eq!(
+            cursor_char_at(&frame, 0, u16::MAX),
+            (String::new(), false, 0)
+        );
+
+        // Completely empty frame
+        let empty_frame = Frame::default();
+        assert_eq!(
+            cursor_char_at(&empty_frame, 0, 0),
+            (String::new(), false, 0)
+        );
+
+        // Ensure cursor_glyph handles all boundary cases without panic
+        let bg = Color::WHITE;
+        let _ = cursor_glyph(&frame, 7, 0, bg);
+        let _ = cursor_glyph(&frame, 100, 0, bg);
+        let _ = cursor_glyph(&frame, 0, 99, bg);
+        let _ = cursor_glyph(&empty_frame, 0, 0, bg);
+    }
+
+    #[test]
+    fn cursor_element_in_grid_handles_wide_character_and_instant_layout() {
+        use crate::term::grid::{Cursor, CursorShape, TextRun};
+        use std::sync::Arc;
+
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.term.sink.focused = true;
+        let k = Kit::neutral(false);
+        let m = Metrics { cw: 8.0, ch: 16.0 };
+        let bg = Color::BLACK;
+
+        let mut frame = Frame {
+            cols: 80,
+            rows: 24,
+            cursor_color: Rgb(255, 255, 255),
+            ..Default::default()
+        };
+
+        // Put a CJK wide character at col 4..6
+        let row0 = Row {
+            runs: vec![
+                TextRun {
+                    col: 0,
+                    cells: 4,
+                    text: "test".to_string(),
+                    fg: Rgb::default(),
+                    attrs: Default::default(),
+                },
+                TextRun {
+                    col: 4,
+                    cells: 2,
+                    text: "\u{4e16}".to_string(),
+                    fg: Rgb::default(),
+                    attrs: Default::default(),
+                },
+            ],
+            ..Row::default()
+        };
+        frame.grid = vec![Arc::new(row0)];
+
+        // Cursor positioned at head of wide character (col 4)
+        frame.cursor = Some(Cursor {
+            col: 4,
+            row: 0,
+            shape: CursorShape::Block,
+            wide: false,
+        });
+
+        let grid_el = grid(&s, &k, Some(&frame), m, bg, 1.0);
+        // Verify grid builds cleanly
+        let _ = grid_el;
+
+        // Cursor positioned at tail of wide character (col 5)
+        frame.cursor = Some(Cursor {
+            col: 5,
+            row: 0,
+            shape: CursorShape::Block,
+            wide: true,
+        });
+        let grid_el_tail = grid(&s, &k, Some(&frame), m, bg, 1.0);
+        let _ = grid_el_tail;
     }
 }

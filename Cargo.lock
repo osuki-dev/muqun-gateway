@@ -2854,6 +2854,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-segmentation",
+ "unicode-width",
  "uuid",
  "wgpu",
  "zbus 6.2.1",

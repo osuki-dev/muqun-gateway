@@ -50,6 +50,7 @@ unicode-segmentation = "1.13"
 libghostty-vt = "0.2.2"
 # Dictation's microphone (`platform/mic.rs`): ALSA, Core Audio, WASAPI.
 cpal = "0.17.3"
+unicode-width = "0.2"
 
 # System notifications (`platform/notify.rs`): the freedesktop notification
 # server over the session bus. Same zbus as Rune's own D-Bus services.

@@ -19,25 +19,11 @@ use crate::ui::icons;
 use crate::ui::terminal_panel;
 use crate::ui::UiState;
 
-/// Category of the plugin for filtering and presentation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PluginCategory {
-    Core,
-    Tools,
-    Diagnostics,
-    Extensions,
-}
+pub mod loader;
+pub mod manifest;
 
-impl PluginCategory {
-    pub fn label(self, lang: Language) -> &'static str {
-        match self {
-            Self::Core => tr_ref(lang, "Core"),
-            Self::Tools => tr_ref(lang, "Tools"),
-            Self::Diagnostics => tr_ref(lang, "Diagnostics"),
-            Self::Extensions => tr_ref(lang, "Extensions"),
-        }
-    }
-}
+pub use loader::{discover_plugins, ExternalPlugin};
+pub use manifest::{PluginCategory, PluginCommandManifest, PluginManifest, PluginTileManifest};
 
 /// A command contributed by a plugin.
 #[derive(Clone, Debug)]
@@ -110,13 +96,20 @@ impl PluginRegistry {
         Self::default()
     }
 
-    /// Construct a registry populated with the default set of built-in plugins.
+    /// Construct a registry populated with the default set of built-in plugins
+    /// and any discovered external plugins.
     pub fn default_registry() -> Self {
         let mut r = Self::new();
         r.register(Arc::new(TerminalPlugin));
         r.register(Arc::new(SysInfoPlugin));
         r.register(Arc::new(QuickNotesPlugin));
         r.register(Arc::new(DiffPlugin));
+
+        let dirs = loader::default_plugin_dirs();
+        for plugin in loader::discover_plugins(&dirs) {
+            r.register(Arc::new(plugin));
+        }
+
         r
     }
 

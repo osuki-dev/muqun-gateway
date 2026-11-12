@@ -374,7 +374,7 @@ impl Engine {
         if alt && self.term.mode(Mode::ALT_SCROLL).unwrap_or(true) {
             let seq: &[u8] = if lines < 0 { b"\x1b[A" } else { b"\x1b[B" };
             let app = self.term.mode(Mode::DECCKM).unwrap_or(false);
-            for _ in 0..lines.unsigned_abs() {
+            for _ in 0..lines.unsigned_abs().min(10) {
                 if app {
                     self.out.borrow_mut().extend_from_slice(if lines < 0 {
                         b"\x1bOA"
@@ -674,5 +674,58 @@ mod tests {
         assert_eq!(frame.grid[0].runs[0].text, "red");
         assert!(!frame.alternate_screen);
         assert_eq!(frame.cursor.map(|c| (c.col, c.row)), Some((2, 1)));
+    }
+
+    #[test]
+    fn wheel_scrolling_in_alternate_screen_and_mouse_tracking() {
+        let size = Size {
+            cols: 20,
+            rows: 4,
+            cell_w: 8,
+            cell_h: 16,
+        };
+        let mut engine = Engine::new(size, colors()).unwrap();
+
+        // 1. Alternate screen sends Up/Down arrow sequences
+        engine.feed(b"\x1b[?1049h");
+        let _ = engine.frame();
+        let _ = engine.take_output();
+
+        // Wheel up (lines < 0) sends Up arrow \x1b[A
+        engine.wheel(-1, 0.0, 0.0, Mods::default()).unwrap();
+        assert_eq!(engine.take_output(), b"\x1b[A");
+
+        // Wheel down (lines > 0) sends Down arrow \x1b[B
+        engine.wheel(1, 0.0, 0.0, Mods::default()).unwrap();
+        assert_eq!(engine.take_output(), b"\x1b[B");
+
+        // Large delta is capped to 10 events to avoid jumping
+        engine.wheel(-50, 0.0, 0.0, Mods::default()).unwrap();
+        let out = engine.take_output();
+        assert_eq!(out.len(), 10 * 3); // 10 * "\x1b[A" (3 bytes each)
+
+        // Application cursor keys (DECCKM mode)
+        engine.feed(b"\x1b[?1h");
+        let _ = engine.take_output();
+        engine.wheel(-1, 0.0, 0.0, Mods::default()).unwrap();
+        assert_eq!(engine.take_output(), b"\x1bOA");
+        engine.wheel(1, 0.0, 0.0, Mods::default()).unwrap();
+        assert_eq!(engine.take_output(), b"\x1bOB");
+
+        // 2. Mouse tracking reports Button 4 (Up) and Button 5 (Down)
+        engine.feed(b"\x1b[?1000h\x1b[?1006h");
+        let _ = engine.take_output();
+
+        // Wheel up sends SGR press for button 64 (button 4)
+        engine.wheel(-1, 16.0, 32.0, Mods::default()).unwrap();
+        let out = engine.take_output();
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("<64;"), "wheel up reports button 4/64: {s}");
+
+        // Wheel down sends SGR press for button 65 (button 5)
+        engine.wheel(1, 16.0, 32.0, Mods::default()).unwrap();
+        let out = engine.take_output();
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("<65;"), "wheel down reports button 5/65: {s}");
     }
 }

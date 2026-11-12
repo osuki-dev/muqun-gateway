@@ -130,6 +130,7 @@ fn inspect_pane(s: &mut UiState) -> &mut PaneState {
     &mut s.inspect_pane
 }
 
+pub use parts::open_markdown_link;
 pub use parts::pane::{Inspect, RowMenu};
 
 fn right_pane(s: &mut UiState) -> &mut PaneState {
