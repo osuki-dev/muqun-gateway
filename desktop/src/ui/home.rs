@@ -738,6 +738,9 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
             })
             .on_edit(|s: &mut UiState| &mut s.start_draft)
             .on_key(|s: &mut UiState, ev: &rune::KeyEvent, tx: &mut Tx| {
+                if super::keymap::intercept_global_key(s, ev, tx) {
+                    return true;
+                }
                 if ev.key == rune::Key::Escape && s.error.is_some() {
                     s.error = None;
                     return true;

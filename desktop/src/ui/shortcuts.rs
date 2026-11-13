@@ -88,8 +88,13 @@ pub(super) fn keycaps<S: AsRef<str>>(k: &Kit, keys: &[S]) -> El {
 /// The keys of one row: each chord as keycaps, alternatives side by side.
 /// A run of chords that differ only in the key (Ctrl+1 … Ctrl+4, the four
 /// arrows) reads as one: the modifiers, then the keys.
-fn keys(k: &Kit, language: Language, entry: &Entry) -> El {
-    let mut chords = entry.keycaps_on(KeyPlatform::current());
+pub(super) fn entry_keys(
+    k: &Kit,
+    language: Language,
+    entry: &Entry,
+    cfg: Option<&crate::config::KeymapConfig>,
+) -> El {
+    let mut chords = keymap::keycaps_for(entry, KeyPlatform::current(), cfg);
     if chords.len() > 2 {
         let mods = chords[0][..chords[0].len() - 1].to_vec();
         if chords.iter().all(|c| c[..c.len() - 1] == mods[..]) {
@@ -119,6 +124,10 @@ fn keys(k: &Kit, language: Language, entry: &Entry) -> El {
         line = line.child(keycaps(k, caps));
     }
     line
+}
+
+fn keys(k: &Kit, language: Language, entry: &Entry) -> El {
+    entry_keys(k, language, entry, None)
 }
 
 fn entry_row(k: &Kit, language: Language, entry: &Entry, key: String) -> El {
@@ -246,8 +255,11 @@ pub fn field_notes(language: Language) -> Vec<String> {
     ]
 }
 
-/// Mount the sheet above the window when it is open.
+/// Mount the sheet and/or the Which-Key overlay above the window when open.
 pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
+    if s.is_leader_armed() {
+        mount_which_key(s, k, layer);
+    }
     let Some(sheet) = s.keys_sheet.as_ref() else {
         return;
     };
@@ -261,7 +273,16 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .leading_icon_size(14.0)
         .width(None)
         .plain()
-        .on_edit(|s: &mut UiState| &mut s.keys_sheet.as_mut().expect("sheet open").query)
+        .on_edit(|s: &mut UiState| match s.keys_sheet.as_mut() {
+            Some(sheet) => &mut sheet.query,
+            None => &mut s.closed_edit,
+        })
+        .on_key(|s: &mut UiState, ev: &rune::KeyEvent, tx: &mut rune::Tx| {
+            if s.keys_sheet.is_none() {
+                return super::keymap::dispatch(s, ev, tx);
+            }
+            super::keymap::intercept_global_key(s, ev, tx)
+        })
         .build(k)
         .key("keys-search")
         .w_full();
@@ -417,4 +438,213 @@ fn hint(k: &Kit, key: &str, what: String) -> El {
         .center_y()
         .child(keycaps(k, &[key]))
         .child(text(what).font(k.ty.small).color(k.c.text_faint))
+}
+
+fn which_key_item(k: &Kit, id: &str, keys_list: &[&str], label: &str) -> El {
+    row()
+        .key(format!("wk-{id}"))
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .py(2.0)
+        .child(keycaps(k, keys_list))
+        .child(
+            text(label.to_string())
+                .font(k.ty.small)
+                .color(k.c.text_base)
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .truncate(),
+        )
+}
+
+fn mount_which_key(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
+    let language = s.cfg.general.language;
+    let look = s.look();
+    let leader_caps = keymap::leader_keycaps(KeyPlatform::current(), Some(&s.cfg.keymap));
+
+    let badge = row()
+        .key("which-key-badge")
+        .h(22.0)
+        .px(8.0)
+        .center()
+        .radius(k.radius.sm)
+        .fill(k.c.bg_accent.alpha(0.18))
+        .border(1.0, k.c.bg_accent.alpha(0.45))
+        .child(
+            text("LEADER")
+                .font(k.ty.small_medium)
+                .color(k.c.text_accent),
+        );
+
+    let head = row()
+        .key("which-key-head")
+        .w_full()
+        .gap(10.0)
+        .center_y()
+        .px(16.0)
+        .pt(12.0)
+        .pb(10.0)
+        .child(badge)
+        .child(keycaps(k, &leader_caps))
+        .child(
+            text(tr_ref(
+                language,
+                "Press a key · Leader again to send to terminal · Esc to cancel",
+            ))
+            .font(k.ty.small)
+            .color(k.c.text_muted)
+            .grow(1.0)
+            .shrink()
+            .min_w(0.0)
+            .truncate(),
+        );
+
+    let col_nav = col()
+        .key("wk-col-nav")
+        .w_full()
+        .min_w(0.0)
+        .gap(4.0)
+        .child(
+            text(tr_ref(language, "Focus & Navigate"))
+                .font(k.ty.small_medium)
+                .color(k.c.text_faint)
+                .pb(2.0),
+        )
+        .child(which_key_item(
+            k,
+            "focus",
+            &["Space", ";"],
+            tr_ref(language, "Focus"),
+        ))
+        .child(which_key_item(
+            k,
+            "palette",
+            &["k"],
+            tr_ref(language, "Palette"),
+        ))
+        .child(which_key_item(
+            k,
+            "sessions",
+            &["p"],
+            tr_ref(language, "Sessions"),
+        ))
+        .child(which_key_item(
+            k,
+            "new-session",
+            &["n"],
+            tr_ref(language, "New session"),
+        ))
+        .child(which_key_item(
+            k,
+            "pages",
+            &["H/I/T/S"],
+            tr_ref(language, "Pages"),
+        ));
+
+    let col_panels = col()
+        .key("wk-col-panels")
+        .w_full()
+        .min_w(0.0)
+        .gap(4.0)
+        .child(
+            text(tr_ref(language, "Panels & Search"))
+                .font(k.ty.small_medium)
+                .color(k.c.text_faint)
+                .pb(2.0),
+        )
+        .child(which_key_item(
+            k,
+            "sidebar",
+            &["b"],
+            tr_ref(language, "Sidebar"),
+        ))
+        .child(which_key_item(k, "git", &["g"], tr_ref(language, "Git")))
+        .child(which_key_item(
+            k,
+            "inspector",
+            &["i"],
+            tr_ref(language, "Inspector"),
+        ))
+        .child(which_key_item(
+            k,
+            "terminal",
+            &["t"],
+            tr_ref(language, "Terminal"),
+        ))
+        .child(which_key_item(
+            k,
+            "search",
+            &["/"],
+            tr_ref(language, "Search"),
+        ));
+
+    let col_term = col()
+        .key("wk-col-term")
+        .w_full()
+        .min_w(0.0)
+        .gap(4.0)
+        .child(
+            text(tr_ref(language, "Terminal & Split"))
+                .font(k.ty.small_medium)
+                .color(k.c.text_faint)
+                .pb(2.0),
+        )
+        .child(which_key_item(
+            k,
+            "new-tab",
+            &["c"],
+            tr_ref(language, "New Tab"),
+        ))
+        .child(which_key_item(
+            k,
+            "split",
+            &["s", "v"],
+            tr_ref(language, "Split"),
+        ))
+        .child(which_key_item(
+            k,
+            "pane-tab",
+            &["1–4"],
+            tr_ref(language, "Pane/Tab"),
+        ))
+        .child(which_key_item(k, "zoom", &["z"], tr_ref(language, "Zoom")))
+        .child(which_key_item(k, "help", &["?"], tr_ref(language, "Help")));
+
+    let grid = row()
+        .key("which-key-grid")
+        .w_full()
+        .equal_columns(3)
+        .gap(20.0)
+        .px(16.0)
+        .py(12.0)
+        .child(col_nav)
+        .child(col_panels)
+        .child(col_term);
+
+    let card = col()
+        .key("which-key-card")
+        .role("region")
+        .label("Leader shortcuts")
+        .w_full()
+        .max_w(720.0)
+        .child(head)
+        .child(el().w_full().h(1.0).fill(k.c.border_muted))
+        .child(grid);
+
+    let mut card = look
+        .panel(k, card, crate::theme::look::PANEL_RADIUS)
+        .fill(k.c.surface_raised_base.alpha(0.97));
+    for shadow in k.shadow_layers(&k.elevation.overlay) {
+        card = card.box_shadow(shadow);
+    }
+
+    layer.push(
+        col()
+            .key("which-key-overlay")
+            .pin(Some(24.0), None, Some(24.0), Some(20.0))
+            .items_center()
+            .child(card),
+    );
 }

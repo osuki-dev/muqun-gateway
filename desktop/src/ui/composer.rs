@@ -2169,6 +2169,9 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             .on_edit(|s: &mut UiState| &mut s.draft)
             .on_change(|s: &mut UiState, _: &mut Tx| on_draft_change(s, Slot::Session))
             .on_key(|s: &mut UiState, ev: &rune::KeyEvent, tx: &mut Tx| {
+                if super::keymap::intercept_global_key(s, ev, tx) {
+                    return true;
+                }
                 if popup_key(s, Slot::Session, ev) {
                     return true;
                 }

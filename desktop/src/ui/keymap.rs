@@ -19,7 +19,57 @@ use std::sync::OnceLock;
 use rune::{KeyEvent, KeyPlatform, Keybind, Tx};
 
 use super::{Mode, OpenMenu, UiState};
-use crate::config::Language;
+use crate::config::{KeymapConfig, Language};
+
+/// Which shortcut is currently being recorded in `Settings → Shortcuts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordingTarget {
+    Leader,
+    Action(Action),
+}
+
+thread_local! {
+    static ACTIVE_KEYMAP: std::cell::RefCell<KeymapConfig> =
+        std::cell::RefCell::new(KeymapConfig::default());
+}
+
+/// Sync the active keymap snapshot with `cfg` so `label`, `keycaps_on`,
+/// `clashes`, and `terminal_shadows` reflect user customizations everywhere.
+pub fn sync_active_keymap(cfg: &KeymapConfig) {
+    ACTIVE_KEYMAP.with(|cell| {
+        if *cell.borrow() != *cfg {
+            *cell.borrow_mut() = cfg.clone();
+        }
+    });
+}
+
+/// Return a snapshot of the active `KeymapConfig`.
+#[allow(dead_code)]
+pub fn active_keymap() -> KeymapConfig {
+    ACTIVE_KEYMAP.with(|cell| cell.borrow().clone())
+}
+
+/// Safely parse a Rune keybind spec (normalizing `+,` to `+comma`), returning
+/// `None` if empty or malformed instead of panicking.
+pub fn try_parse_keybind(spec: &str) -> Option<Keybind> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = if trimmed == "," {
+        "comma".to_string()
+    } else {
+        trimmed.replace("+,", "+comma")
+    };
+    let bind = std::panic::catch_unwind(|| Keybind::new(&normalized)).ok()?;
+    if bind.chords_on(KeyPlatform::current()).is_empty()
+        && bind.chords_on(KeyPlatform::Linux).is_empty()
+        && bind.chords_on(KeyPlatform::Mac).is_empty()
+    {
+        return None;
+    }
+    Some(bind)
+}
 
 /// What a shortcut does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -78,6 +128,76 @@ pub enum Action {
     Deny,
     MarkDone,
     CancelTask,
+}
+
+impl Action {
+    /// Stable identifier used as the key in `KeymapConfig::bindings`.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Shortcuts => "shortcuts",
+            Self::Palette => "palette",
+            Self::QuickOpen => "quick_open",
+            Self::NewSession => "new_session",
+            Self::Home => "home",
+            Self::Inbox => "inbox",
+            Self::Tasks => "tasks",
+            Self::Settings => "settings",
+            Self::Back => "back",
+            Self::ToggleSidebar => "toggle_sidebar",
+            Self::ToggleTerminal => "toggle_terminal",
+            Self::ToggleFocus => "toggle_focus",
+            Self::NewShell => "new_shell",
+            Self::ToggleInspector => "toggle_inspector",
+            Self::ToggleGit => "toggle_git",
+            Self::FocusSearch => "focus_search",
+            Self::SearchMessages => "search_messages",
+            Self::ToggleRecentSession => "toggle_recent_session",
+            Self::PrevSession => "prev_session",
+            Self::NextSession => "next_session",
+            Self::AddSplit => "add_split",
+            Self::RemoveSplit => "remove_split",
+            Self::FocusPane => "focus_pane",
+            Self::FocusPaneToward => "focus_pane_toward",
+            Self::SwapPaneToward => "swap_pane_toward",
+            Self::FocusComposer => "focus_composer",
+            Self::ExpandComposer => "expand_composer",
+            Self::PromptHistory => "prompt_history",
+            Self::Send => "send",
+            Self::Queue => "queue",
+            Self::Stop => "stop",
+            Self::ModelPicker => "model_picker",
+            Self::Dictation => "dictation",
+            Self::JumpLatest => "jump_latest",
+            Self::NextRow => "next_row",
+            Self::PrevRow => "prev_row",
+            Self::ToggleRow => "toggle_row",
+            Self::OpenRow => "open_row",
+            Self::NextMessage => "next_message",
+            Self::PrevMessage => "prev_message",
+            Self::TermPrefix => "term_prefix",
+            Self::TermNewTab => "term_new_tab",
+            Self::TermCloseTab => "term_close_tab",
+            Self::TermSwitchTab => "term_switch_tab",
+            Self::TermCycleTab => "term_cycle_tab",
+            Self::TermSplit => "term_split",
+            Self::TermSearch => "term_search",
+            Self::TermCopy => "term_copy",
+            Self::TermPaste => "term_paste",
+            Self::Allow => "allow",
+            Self::AllowAlways => "allow_always",
+            Self::Deny => "deny",
+            Self::MarkDone => "mark_done",
+            Self::CancelTask => "cancel_task",
+        }
+    }
+
+    /// Resolve an `Action` from its stable identifier.
+    pub fn from_id(id: &str) -> Option<Self> {
+        ENTRIES
+            .iter()
+            .find(|e| e.action.id() == id)
+            .map(|e| e.action)
+    }
 }
 
 /// Where a shortcut is listed.
@@ -437,7 +557,13 @@ pub static ENTRIES: &[Entry] = &[
 ];
 
 impl Entry {
-    pub fn keybind(&self) -> &'static Keybind {
+    /// The built-in default keybind spec string.
+    pub fn default_spec(&self) -> &'static str {
+        self.spec
+    }
+
+    /// The built-in default `Keybind`.
+    pub fn default_keybind(&self) -> &'static Keybind {
         static BINDS: OnceLock<Vec<Keybind>> = OnceLock::new();
         let binds = BINDS.get_or_init(|| {
             ENTRIES
@@ -458,6 +584,63 @@ impl Entry {
         &binds[at]
     }
 
+    /// The effective spec string for this entry, respecting user overrides in `cfg`.
+    #[allow(dead_code)]
+    pub fn effective_spec<'a>(&'a self, cfg: Option<&'a KeymapConfig>) -> &'a str {
+        if let Some(cfg) = cfg {
+            if let Some(custom) = cfg.bindings.get(self.action.id()) {
+                if try_parse_keybind(custom).is_some() {
+                    return custom.as_str();
+                }
+            }
+            if self.action == Action::TermPrefix && try_parse_keybind(&cfg.leader).is_some() {
+                return cfg.leader.as_str();
+            }
+        }
+        self.spec
+    }
+
+    /// Whether this entry has a valid custom override in `cfg`.
+    pub fn is_overridden(&self, cfg: &KeymapConfig) -> bool {
+        if let Some(custom) = cfg.bindings.get(self.action.id()) {
+            if try_parse_keybind(custom).is_some() && custom.trim() != self.spec {
+                return true;
+            }
+        }
+        if self.action == Action::TermPrefix
+            && try_parse_keybind(&cfg.leader).is_some()
+            && cfg.leader.trim() != self.spec
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Resolve the `Keybind` for this entry, respecting user overrides in `cfg`
+    /// (or the active keymap snapshot when `cfg` is `None`).
+    pub fn keybind_for(&self, cfg: Option<&KeymapConfig>) -> Keybind {
+        if let Some(cfg) = cfg {
+            if let Some(custom) = cfg.bindings.get(self.action.id()) {
+                if let Some(bind) = try_parse_keybind(custom) {
+                    return bind;
+                }
+            }
+            if self.action == Action::TermPrefix {
+                if let Some(bind) = try_parse_keybind(&cfg.leader) {
+                    return bind;
+                }
+            }
+            self.default_keybind().clone()
+        } else {
+            ACTIVE_KEYMAP.with(|cell| self.keybind_for(Some(&cell.borrow())))
+        }
+    }
+
+    /// The active `Keybind` for this entry.
+    pub fn keybind(&self) -> Keybind {
+        self.keybind_for(None)
+    }
+
     /// What it does, in the owner's language.
     pub fn what(&self, language: Language) -> String {
         crate::ui::copy::t(language, self.en)
@@ -465,11 +648,7 @@ impl Entry {
 
     /// Each chord's keycaps on `platform`.
     pub fn keycaps_on(&self, platform: KeyPlatform) -> Vec<Vec<String>> {
-        self.keybind()
-            .chords_on(platform)
-            .iter()
-            .map(|c| c.keycaps_on(platform))
-            .collect()
+        keycaps_for(self, platform, None)
     }
 }
 
@@ -480,25 +659,85 @@ pub fn entry(action: Action) -> &'static Entry {
         .expect("every action has a row")
 }
 
-/// The chord hints show for `action` ("Ctrl+B", "⌘B").
-pub fn label(action: Action) -> String {
+/// Each chord's keycaps for `entry` on `platform`, respecting `cfg`.
+pub fn keycaps_for(
+    entry: &Entry,
+    platform: KeyPlatform,
+    cfg: Option<&KeymapConfig>,
+) -> Vec<Vec<String>> {
+    entry
+        .keybind_for(cfg)
+        .chords_on(platform)
+        .iter()
+        .map(|c| c.keycaps_on(platform))
+        .collect()
+}
+
+/// The chord hints show for `action` ("Ctrl+B", "⌘B") with explicit `cfg`.
+pub fn label_with(action: Action, cfg: Option<&KeymapConfig>) -> String {
     entry(action)
-        .keybind()
+        .keybind_for(cfg)
         .chords()
         .first()
         .map(|c| c.label())
         .unwrap_or_default()
 }
 
-/// Every chord of `action`, in the keymap's order (the pane arrows: left,
-/// right, up, down).
-pub fn labels(action: Action) -> Vec<String> {
+/// The chord hints show for `action` ("Ctrl+B", "⌘B").
+pub fn label(action: Action) -> String {
+    label_with(action, None)
+}
+
+/// Every chord of `action`, in the keymap's order, with explicit `cfg`.
+pub fn labels_with(action: Action, cfg: Option<&KeymapConfig>) -> Vec<String> {
     entry(action)
-        .keybind()
+        .keybind_for(cfg)
         .chords()
         .iter()
         .map(|c| c.label())
         .collect()
+}
+
+/// Every chord of `action`, in the keymap's order (the pane arrows: left,
+/// right, up, down).
+pub fn labels(action: Action) -> Vec<String> {
+    labels_with(action, None)
+}
+
+/// Resolve the active Leader `Keybind` from `cfg` (or the active keymap),
+/// falling back to `ctrl+space` if malformed.
+pub fn leader_keybind(cfg: Option<&KeymapConfig>) -> Keybind {
+    let resolve = |c: &KeymapConfig| {
+        try_parse_keybind(&c.leader)
+            .or_else(|| {
+                c.bindings
+                    .get(Action::TermPrefix.id())
+                    .and_then(|s| try_parse_keybind(s))
+            })
+            .unwrap_or_else(|| Keybind::new(KeymapConfig::DEFAULT_LEADER))
+    };
+    match cfg {
+        Some(c) => resolve(c),
+        None => ACTIVE_KEYMAP.with(|cell| resolve(&cell.borrow())),
+    }
+}
+
+/// Keycaps for the active Leader key on `platform`.
+pub fn leader_keycaps(platform: KeyPlatform, cfg: Option<&KeymapConfig>) -> Vec<String> {
+    leader_keybind(cfg)
+        .chords_on(platform)
+        .first()
+        .map(|c| c.keycaps_on(platform))
+        .unwrap_or_else(|| vec!["Ctrl".into(), "Space".into()])
+}
+
+/// Display label for the active Leader key (e.g. `"Ctrl+Space"`).
+pub fn leader_label(cfg: Option<&KeymapConfig>) -> String {
+    leader_keybind(cfg)
+        .chords()
+        .first()
+        .map(|c| c.label())
+        .unwrap_or_else(|| "Ctrl+Space".to_string())
 }
 
 /// A button's tooltip: "Toggle sidebar (Ctrl+B)".
@@ -508,21 +747,31 @@ pub fn tip(text: &str, action: Action) -> String {
 
 /// The sidebar toggle's chord as a `&'static str`, as the kit's button takes it.
 pub fn sidebar_label() -> &'static str {
-    static LABEL: OnceLock<String> = OnceLock::new();
-    LABEL.get_or_init(|| label(Action::ToggleSidebar))
+    static INTERNED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let cur = label(Action::ToggleSidebar);
+    let mut list = INTERNED.lock().unwrap();
+    if let Some(&s) = list.iter().find(|&&s| s == cur) {
+        return s;
+    }
+    let leaked: &'static str = Box::leak(cur.into_boxed_str());
+    list.push(leaked);
+    leaked
 }
 
-/// Two rows sharing a chord on `platform`, among rows `pick` keeps.
-pub fn clashes(
+/// Two rows sharing a chord on `platform` with explicit `cfg`, among rows `pick` keeps.
+pub fn clashes_for(
     platform: KeyPlatform,
+    cfg: Option<&KeymapConfig>,
     pick: impl Fn(&Entry) -> bool,
 ) -> Vec<(Action, Action, String)> {
     let rows: Vec<&Entry> = ENTRIES.iter().filter(|e| pick(e)).collect();
     let mut out = Vec::new();
     for (i, a) in rows.iter().enumerate() {
+        let bind_a = a.keybind_for(cfg);
         for b in &rows[i + 1..] {
-            for ca in a.keybind().chords_on(platform) {
-                if b.keybind()
+            let bind_b = b.keybind_for(cfg);
+            for ca in bind_a.chords_on(platform) {
+                if bind_b
                     .chords_on(platform)
                     .iter()
                     .any(|cb| ca.same_keys(cb, platform))
@@ -535,11 +784,22 @@ pub fn clashes(
     out
 }
 
+/// Two rows sharing a chord on `platform`, among rows `pick` keeps.
+pub fn clashes(
+    platform: KeyPlatform,
+    pick: impl Fn(&Entry) -> bool,
+) -> Vec<(Action, Action, String)> {
+    clashes_for(platform, None, pick)
+}
+
 /// Inside the terminal on Windows and Linux, a window chord with Ctrl
 /// arrives with Shift added; one that already has Shift arrives as it is.
 /// The window chords that land on the same keys there, the first one wins
 /// (`(winner, shadowed, keys)`). macOS sends ⌘ chords unchanged.
-pub fn terminal_shadows(platform: KeyPlatform) -> Vec<(Action, Action, String)> {
+pub fn terminal_shadows_for(
+    platform: KeyPlatform,
+    cfg: Option<&KeymapConfig>,
+) -> Vec<(Action, Action, String)> {
     if platform == KeyPlatform::Mac {
         return Vec::new();
     }
@@ -550,7 +810,8 @@ pub fn terminal_shadows(platform: KeyPlatform) -> Vec<(Action, Action, String)> 
         .iter()
         .filter(|e| e.owner == Owner::Window && e.action != Action::ToggleTerminal);
     for e in lent {
-        for chord in e.keybind().chords_on(platform) {
+        let bind = e.keybind_for(cfg);
+        for chord in bind.chords_on(platform) {
             if !chord.has(rune::ChordMod::Primary) && !chord.has(rune::ChordMod::Ctrl) {
                 continue;
             }
@@ -573,9 +834,325 @@ pub fn terminal_shadows(platform: KeyPlatform) -> Vec<(Action, Action, String)> 
     out
 }
 
+pub fn terminal_shadows(platform: KeyPlatform) -> Vec<(Action, Action, String)> {
+    terminal_shadows_for(platform, None)
+}
+
+/// Convert a pressed `KeyEvent` into a normalized Rune keybind spec string
+/// (e.g. `"ctrl+shift+k"`, `"alt+p"`, `"mod+/"`, `"ctrl+space"`).
+pub fn event_to_spec(ev: &KeyEvent, physical: Option<rune::PhysicalKeyCode>) -> Option<String> {
+    let mut parts: Vec<&'static str> = Vec::new();
+    let mac = crate::platform::is_macos();
+    if ev.mods.ctrl {
+        parts.push("ctrl");
+        if mac && ev.mods.logo {
+            parts.push("mod");
+        }
+    } else if ev.mods.logo || ev.mods.cmd {
+        parts.push("mod");
+    }
+    if ev.mods.alt {
+        parts.push("alt");
+    }
+    if ev.mods.shift {
+        parts.push("shift");
+    }
+
+    let key_part: String = if physical == Some(rune::PhysicalKeyCode::Space)
+        || matches!(&ev.key, rune::Key::Command(' ' | '\0'))
+        || matches!(&ev.key, rune::Key::Text(t) if t == " " || t == "\0")
+    {
+        "space".to_string()
+    } else if physical == Some(rune::PhysicalKeyCode::Backquote)
+        || matches!(&ev.key, rune::Key::Command('`' | '~'))
+        || matches!(&ev.key, rune::Key::Text(t) if t == "`" || t == "~")
+    {
+        "`".to_string()
+    } else {
+        match &ev.key {
+            rune::Key::Command(',') => "comma".to_string(),
+            rune::Key::Command('.') => "period".to_string(),
+            rune::Key::Command(c) if c.is_ascii_alphabetic() => c.to_ascii_lowercase().to_string(),
+            rune::Key::Command(c) if !c.is_control() => c.to_string(),
+            rune::Key::Text(t) => {
+                let mut chars = t.chars();
+                let (Some(c), None) = (chars.next(), chars.next()) else {
+                    return None;
+                };
+                if c == ',' {
+                    "comma".to_string()
+                } else if c == '.' {
+                    "period".to_string()
+                } else if c.is_ascii_alphabetic() {
+                    c.to_ascii_lowercase().to_string()
+                } else if !c.is_control() {
+                    c.to_string()
+                } else {
+                    return None;
+                }
+            }
+            rune::Key::Enter => "enter".to_string(),
+            rune::Key::Tab => "tab".to_string(),
+            rune::Key::Backspace => "backspace".to_string(),
+            rune::Key::Delete => "delete".to_string(),
+            rune::Key::Insert => "insert".to_string(),
+            rune::Key::Home => "home".to_string(),
+            rune::Key::End => "end".to_string(),
+            rune::Key::PageUp => "pageup".to_string(),
+            rune::Key::PageDown => "pagedown".to_string(),
+            rune::Key::Left => "left".to_string(),
+            rune::Key::Right => "right".to_string(),
+            rune::Key::Up => "up".to_string(),
+            rune::Key::Down => "down".to_string(),
+            rune::Key::Escape => "escape".to_string(),
+            rune::Key::Function(n) => format!("f{n}"),
+            _ => return None,
+        }
+    };
+
+    let spec = if parts.is_empty() {
+        key_part
+    } else {
+        format!("{}+{key_part}", parts.join("+"))
+    };
+    try_parse_keybind(&spec)?;
+    Some(spec)
+}
+
+/// If `s.recording_key` is active, handle `ev` (Esc cancels, any valid key records).
+pub fn handle_recording_key(s: &mut UiState, ev: &KeyEvent, tx: &Tx) -> bool {
+    let Some(target) = s.recording_key else {
+        return false;
+    };
+    if ev.key == rune::Key::Escape
+        && !(ev.mods.ctrl || ev.mods.alt || ev.mods.shift || ev.mods.logo)
+    {
+        s.recording_key = None;
+        return true;
+    }
+    if let Some(spec) = event_to_spec(ev, tx.physical_key()) {
+        s.recording_key = None;
+        match target {
+            RecordingTarget::Leader => {
+                s.edit(crate::config::ConfigEdit::SetLeader(spec));
+            }
+            RecordingTarget::Action(action) => {
+                if action == Action::TermPrefix {
+                    s.edit(crate::config::ConfigEdit::SetLeader(spec.clone()));
+                }
+                let default_spec = entry(action).default_spec();
+                let override_spec = if spec == default_spec {
+                    None
+                } else {
+                    Some(spec)
+                };
+                s.edit(crate::config::ConfigEdit::SetKeybind {
+                    action: action.id().to_string(),
+                    spec: override_spec,
+                });
+            }
+        }
+    }
+    true
+}
+
+/// Whether `ev` matches the configured global Leader key.
+pub fn is_leader_event(s: &UiState, ev: &KeyEvent, tx: &Tx) -> bool {
+    let leader_str = s.cfg.keymap.leader.trim();
+    if (leader_str.is_empty() || leader_str.eq_ignore_ascii_case("ctrl+space"))
+        && crate::term::input::is_ctrl_space(ev, tx.physical_key())
+    {
+        return true;
+    }
+    let bind = leader_keybind(Some(&s.cfg.keymap));
+    keybind_matches(&bind, ev, tx)
+}
+
+/// Execute a follow-up chord when `leader_armed` is active.
+pub fn handle_leader_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    let was_term_focused = s.is_terminal_focused();
+    s.disarm_leader();
+
+    // Double-tap Leader key: disarm and forward literal key to terminal if focused.
+    if is_leader_event(s, ev, tx) {
+        if was_term_focused {
+            let leader_str = s.cfg.keymap.leader.trim();
+            if crate::term::input::is_ctrl_space(ev, tx.physical_key())
+                || leader_str.is_empty()
+                || leader_str.eq_ignore_ascii_case("ctrl+space")
+            {
+                s.term.send(crate::term::session::Msg::Text("\x00".into()));
+            } else if let Some(key) =
+                crate::term::input::key_input(ev, tx.physical_key(), tx.key_base(), tx.key_repeat())
+            {
+                s.term.send(crate::term::session::Msg::Key(key));
+            }
+        }
+        return true;
+    }
+
+    if ev.key == rune::Key::Escape {
+        return true;
+    }
+
+    if matches!(
+        ev.key,
+        rune::Key::Left | rune::Key::Right | rune::Key::Up | rune::Key::Down
+    ) {
+        if s.in_split() {
+            if let Some(j) =
+                super::dwindle::neighbour(&s.tile_layout(), s.tile_grid, s.focus, &ev.key)
+            {
+                s.focus_tile(j);
+                if s.tiles.get(s.focus).is_some_and(|t| t.is_terminal()) {
+                    s.focus_terminal_tx(tx);
+                }
+            }
+        } else {
+            match ev.key {
+                rune::Key::Left => s.term_prev_tab(),
+                rune::Key::Right => s.term_next_tab(),
+                rune::Key::Up => {
+                    let _ = step_session(s, false);
+                }
+                rune::Key::Down => {
+                    let _ = step_session(s, true);
+                }
+                _ => {}
+            }
+        }
+        return true;
+    }
+
+    let raw_ch = match &ev.key {
+        rune::Key::Text(t) => t.chars().next(),
+        rune::Key::Command(c) => Some(*c),
+        _ => None,
+    };
+    let ch = match (raw_ch, ev.mods.shift) {
+        (Some('/'), true) => Some('?'),
+        (Some('\\'), true) => Some('|'),
+        (Some(';'), true) => Some(':'),
+        (Some(c), true) if c.is_ascii_alphabetic() => Some(c.to_ascii_uppercase()),
+        (c, _) => c,
+    };
+
+    match ch {
+        Some(' ' | ';') => s.toggle_focus_tx(tx),
+        Some('k' | ':') => s.toggle_palette(false),
+        Some('p' | 'o') => s.toggle_palette(true),
+        Some('n') => {
+            let _ = run(s, Action::NewSession, ev, tx);
+        }
+        Some('b') => s.sidebar.toggle(),
+        Some('g') => {
+            if !run(s, Action::ToggleGit, ev, tx) {
+                s.open_git_inspector();
+            }
+        }
+        Some('i') => {
+            if !run(s, Action::ToggleInspector, ev, tx) {
+                s.toggle_inspector();
+            }
+        }
+        Some('t') => s.toggle_terminal_tx(tx),
+        Some('c' | 'C') => {
+            s.term_new_tab();
+            s.focus_terminal_tx(tx);
+        }
+        Some('x' | 'X') => {
+            if s.in_split() && s.tiles.get(s.focus).is_some_and(|t| t.is_terminal()) {
+                s.close_tile(s.focus);
+            } else if s.term.open || s.has_terminal_tile() {
+                s.term_close_tab(s.term.active_tab);
+            } else if s.in_split() {
+                s.close_tile(s.focus);
+            }
+        }
+        Some('[' | ',') => {
+            if ch == Some('[') && (was_term_focused || s.term.open) {
+                s.open_terminal_search();
+            } else {
+                let _ = step_session(s, false);
+            }
+        }
+        Some(']') => {
+            let _ = step_session(s, true);
+        }
+        Some('h' | 's' | '-') => {
+            s.split_terminal_with_axis(false);
+            s.focus_terminal_tx(tx);
+        }
+        Some('v' | 'V' | '\\' | '|') => {
+            s.split_terminal_with_axis(true);
+            s.focus_terminal_tx(tx);
+        }
+        Some('z' | 'Z') => s.toggle_terminal_zoom(),
+        Some('w' | 'W') => {
+            if s.in_split() {
+                s.close_tile(s.focus);
+            }
+        }
+        Some(d @ '1'..='4') => {
+            let idx = (d as u8 - b'1') as usize;
+            if s.in_split() {
+                if idx < s.tiles.len() {
+                    s.focus_tile(idx);
+                    if s.tiles.get(idx).is_some_and(|t| t.is_terminal()) {
+                        s.focus_terminal_tx(tx);
+                    }
+                }
+            } else {
+                s.term_switch_tab(idx);
+            }
+        }
+        Some(d @ '5'..='9') => {
+            let idx = (d as u8 - b'1') as usize;
+            s.term_switch_tab(idx);
+        }
+        Some('/' | 'f' | 'F') => {
+            if was_term_focused || s.term.open {
+                s.open_terminal_search();
+            } else {
+                let _ = run(s, Action::FocusSearch, ev, tx);
+            }
+        }
+        Some('H') => s.go(Mode::Home),
+        Some('I') => s.go(Mode::Inbox),
+        Some('T') => s.go(Mode::Tasks),
+        Some('S') => s.go(Mode::Settings),
+        Some('?') => s.toggle_keys_sheet(),
+        Some('d' | 'D') => s.close_terminal(),
+        _ => {}
+    }
+    true
+}
+
+/// Intercept shortcut recording and global Leader / Which-Key mode before
+/// any field, terminal, or window key handler.
+pub fn intercept_global_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    sync_active_keymap(&s.cfg.keymap);
+    if handle_recording_key(s, ev, tx) {
+        return true;
+    }
+    if s.is_leader_armed() {
+        return handle_leader_key(s, ev, tx);
+    }
+    if is_leader_event(s, ev, tx) {
+        s.arm_leader(tx);
+        return true;
+    }
+    false
+}
+
 /// The window's keys (`on_key`): run the first row whose chord this is.
 pub fn dispatch(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
-    if crate::term::input::is_toggle(ev, tx.physical_key()) {
+    if intercept_global_key(s, ev, tx) {
+        return true;
+    }
+    if crate::term::input::is_toggle(ev, tx.physical_key())
+        || bind_matches_cfg(entry(A::ToggleTerminal), &s.cfg.keymap, ev, tx)
+    {
         s.toggle_terminal_tx(tx);
         return true;
     }
@@ -599,11 +1176,7 @@ pub fn dispatch(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
             return true;
         }
     }
-    let term_active = if s.in_split() {
-        s.tiles.get(s.focus).is_some_and(|t| t.is_terminal()) && s.term.sink.focused
-    } else {
-        s.term.open && s.term.sink.focused
-    };
+    let term_active = s.is_terminal_focused();
     if term_active
         && !s.draft.focused
         && !s.start_draft.focused
@@ -618,27 +1191,48 @@ pub fn dispatch(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
     dispatch_window(s, ev, tx)
 }
 
-fn keybind_matches(bind: &Keybind, ev: &KeyEvent, tx: &Tx) -> bool {
+pub(crate) fn keybind_matches(bind: &Keybind, ev: &KeyEvent, tx: &Tx) -> bool {
     if bind.matches_tx(ev, tx) {
         return true;
+    }
+    if matches!(&ev.key, rune::Key::Command('\0')) && ev.mods.ctrl {
+        let norm = KeyEvent {
+            key: rune::Key::Command(' '),
+            mods: ev.mods,
+        };
+        if bind.matches_tx(&norm, tx) {
+            return true;
+        }
     }
     if let rune::Key::Text(t) = &ev.key {
         let mut chars = t.chars();
         if let (Some(c), None) = (chars.next(), chars.next()) {
-            if ev.mods.ctrl || ev.mods.alt || ev.mods.cmd || ev.mods.logo {
+            let mapped = if c == '\0' {
+                ' '
+            } else {
+                c.to_ascii_lowercase()
+            };
+            if ev.mods.ctrl
+                || ev.mods.alt
+                || ev.mods.cmd
+                || ev.mods.logo
+                || !c.is_ascii_alphabetic()
+            {
                 let norm = KeyEvent {
-                    key: rune::Key::Command(c.to_ascii_lowercase()),
+                    key: rune::Key::Command(mapped),
                     mods: ev.mods,
                 };
-                return bind.matches_tx(&norm, tx);
+                if bind.matches_tx(&norm, tx) {
+                    return true;
+                }
             }
         }
     }
     false
 }
 
-fn bind_matches(entry: &Entry, ev: &KeyEvent, tx: &Tx) -> bool {
-    keybind_matches(entry.keybind(), ev, tx)
+pub(crate) fn bind_matches_cfg(entry: &Entry, cfg: &KeymapConfig, ev: &KeyEvent, tx: &Tx) -> bool {
+    keybind_matches(&entry.keybind_for(Some(cfg)), ev, tx)
 }
 
 /// Check registered plugin commands for a matching `shortcut` chord and execute it.
@@ -649,8 +1243,7 @@ pub fn dispatch_plugin_shortcut(s: &mut UiState, ev: &KeyEvent, tx: &Tx) -> bool
             let Some(sc) = cmd.shortcut.map(str::trim).filter(|s| !s.is_empty()) else {
                 continue;
             };
-            let normalized = sc.replace("+,", "+comma");
-            let Ok(bind) = std::panic::catch_unwind(|| Keybind::new(&normalized)) else {
+            let Some(bind) = try_parse_keybind(sc) else {
                 continue;
             };
             if keybind_matches(&bind, ev, tx) {
@@ -666,6 +1259,7 @@ pub fn dispatch_plugin_shortcut(s: &mut UiState, ev: &KeyEvent, tx: &Tx) -> bool
 /// Run a window shortcut (used by [`dispatch`] and by the terminal's
 /// `Route::App` handoff so it does not loop back into `terminal_key`).
 pub fn dispatch_window(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    sync_active_keymap(&s.cfg.keymap);
     // The arrows step the Inbox's and Tasks' lists as j and k do.
     if matches!(s.mode, Mode::Inbox | Mode::Tasks)
         && matches!(ev.key, rune::Key::Up | rune::Key::Down)
@@ -683,7 +1277,7 @@ pub fn dispatch_window(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         .filter(|e| {
             e.owner == Owner::Window || matches!(e.action, A::ExpandComposer | A::PromptHistory)
         })
-        .find(|e| bind_matches(e, ev, tx))
+        .find(|e| bind_matches_cfg(e, &s.cfg.keymap, ev, tx))
     {
         return run(s, found.action, ev, tx);
     }
@@ -697,11 +1291,10 @@ pub fn dispatch_window(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
 /// caret moves: Alt+↑/↓, the split's pane arrows, composer shortcuts,
 /// focus toggles, and Ctrl+End once the caret is already at the end.
 pub fn field_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx, at_end: bool) -> bool {
-    let term_active = if s.in_split() {
-        s.tiles.get(s.focus).is_some_and(|t| t.is_terminal()) && s.term.sink.focused
-    } else {
-        s.term.open && s.term.sink.focused
-    };
+    if intercept_global_key(s, ev, tx) {
+        return true;
+    }
+    let term_active = s.is_terminal_focused();
     if term_active && !s.draft.focused && !s.start_draft.focused {
         s.focus_terminal_tx(tx);
         return s.terminal_key(ev, tx);
@@ -716,7 +1309,7 @@ pub fn field_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx, at_end: bool) -> b
         A::ExpandComposer,
         A::PromptHistory,
     ] {
-        if bind_matches(entry(action), ev, tx) {
+        if bind_matches_cfg(entry(action), &s.cfg.keymap, ev, tx) {
             return run(s, action, ev, tx);
         }
     }
@@ -1285,5 +1878,211 @@ mod tests {
             rt.frame(1.0 / 60.0);
             assert!(rt.state.palette.is_some());
         }
+    }
+
+    #[test]
+    fn action_ids_round_trip_and_malformed_specs_fallback_safely() {
+        for e in ENTRIES {
+            let id = e.action.id();
+            assert!(!id.is_empty());
+            assert_eq!(Action::from_id(id), Some(e.action));
+        }
+        assert_eq!(Action::from_id("nonexistent_action"), None);
+
+        let mut cfg = KeymapConfig {
+            leader: "not+a+valid+keybind+at+all!!!".into(),
+            ..Default::default()
+        };
+        cfg.bindings
+            .insert("palette".into(), "bogus+unknown_key".into());
+        assert_eq!(
+            entry(A::Palette).effective_spec(Some(&cfg)),
+            "mod+k, mod+shift+p"
+        );
+        let bind = entry(A::Palette).keybind_for(Some(&cfg));
+        assert!(!bind.chords().is_empty());
+        let leader = leader_keybind(Some(&cfg));
+        assert!(!leader.chords().is_empty());
+
+        // `+,` is normalized to `+comma`
+        assert!(try_parse_keybind("ctrl+,").is_some());
+    }
+
+    #[test]
+    fn recording_custom_keybind_and_dispatching_custom_action_and_conflicts() {
+        use crate::config::ConfigEdit;
+        use rune::{Env, Key, Mods, Runtime};
+
+        let mut s = state();
+        s.mode = Mode::Settings;
+        s.settings_tab = crate::ui::SettingsTab::Shortcuts;
+
+        // Start recording for Palette
+        s.recording_key = Some(RecordingTarget::Action(A::Palette));
+
+        let mut rt = Runtime::new(s, super::super::view, (1440.0, 900.0), Env::new(true, 1.0));
+        rt.on_key = Some(super::super::on_key);
+        rt.frame(0.0);
+
+        // Pressing Esc cancels recording without modifying bindings
+        rt.key(KeyEvent {
+            key: Key::Escape,
+            mods: Mods::default(),
+        });
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.recording_key.is_none());
+        assert!(rt.state.cfg.keymap.bindings.is_empty());
+
+        // Arm recording for Palette again and press Alt+P
+        rt.state.recording_key = Some(RecordingTarget::Action(A::Palette));
+        let alt_p = KeyEvent {
+            key: Key::Command('p'),
+            mods: Mods {
+                alt: true,
+                ..Default::default()
+            },
+        };
+        rt.key(alt_p.clone());
+        rt.frame(1.0 / 60.0);
+
+        assert!(rt.state.recording_key.is_none());
+        assert_eq!(
+            rt.state
+                .cfg
+                .keymap
+                .bindings
+                .get("palette")
+                .map(String::as_str),
+            Some("alt+p")
+        );
+        assert!(entry(A::Palette).is_overridden(&rt.state.cfg.keymap));
+
+        // Now pressing Alt+P opens the Command Palette!
+        assert!(rt.state.palette.is_none());
+        rt.key(alt_p);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.palette.is_some());
+        rt.state.palette = None;
+
+        // Setting QuickOpen to "alt+p" as well triggers a conflict in clashes()
+        rt.state.edit(ConfigEdit::SetKeybind {
+            action: A::QuickOpen.id().into(),
+            spec: Some("alt+p".into()),
+        });
+        let found_clashes = clashes(KeyPlatform::current(), |e| e.owner == Owner::Window);
+        assert!(
+            found_clashes
+                .iter()
+                .any(|(a, b, _)| (*a == A::Palette && *b == A::QuickOpen)
+                    || (*a == A::QuickOpen && *b == A::Palette)),
+            "expected clash between Palette and QuickOpen: {found_clashes:?}"
+        );
+
+        // Resetting restores conflict-free state
+        rt.state.edit(ConfigEdit::ResetKeymap);
+        let after_reset = clashes(KeyPlatform::current(), |e| e.owner == Owner::Window);
+        assert!(after_reset.is_empty());
+    }
+
+    #[test]
+    fn global_leader_arms_in_session_and_terminal_executes_which_key_and_double_taps() {
+        use rune::{Env, Key, Mods, Runtime};
+
+        let mut s = state();
+        s.mode = Mode::Session;
+        s.draft.focused = true;
+        s.term.open = false;
+
+        let mut rt = Runtime::new(s, super::super::view, (1440.0, 900.0), Env::new(true, 1.0));
+        rt.on_key = Some(super::super::on_key);
+        rt.frame(0.0);
+
+        let ctrl_space = KeyEvent {
+            key: Key::Text(" ".into()),
+            mods: Mods {
+                ctrl: true,
+                cmd: true,
+                ..Default::default()
+            },
+        };
+        let plain = |c: char| KeyEvent {
+            key: Key::Text(c.to_string()),
+            mods: Mods::default(),
+        };
+
+        // 1. In Session mode with Composer focused, pressing Leader (Ctrl+Space) arms leader_armed
+        rt.key(ctrl_space.clone());
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.is_leader_armed());
+
+        // Pressing 'k' opens the Command Palette instead of typing 'k' into the composer draft!
+        rt.key(plain('k'));
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.is_leader_armed());
+        assert!(rt.state.palette.is_some());
+        assert!(rt.state.draft.text.is_empty());
+        rt.state.palette = None;
+        rt.frame(1.0 / 60.0);
+
+        // 2. Pressing Leader then 'b' toggles the sidebar
+        let sidebar_before = rt.state.sidebar.is_open();
+        rt.key(ctrl_space.clone());
+        rt.key(plain('b'));
+        rt.frame(1.0 / 60.0);
+        assert_ne!(rt.state.sidebar.is_open(), sidebar_before);
+
+        // 3. Pressing Leader then ' ' (Space) toggles focus to Terminal (opening it)
+        assert!(!rt.state.term.open);
+        rt.key(ctrl_space.clone());
+        rt.key(plain(' '));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.term.open && rt.state.term.sink.focused);
+
+        // 4. Inside focused Terminal, double-tapping Leader forwards literal \x00 to PTY
+        rt.state.term.sent_log.borrow_mut().clear();
+        rt.key(ctrl_space.clone());
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.is_leader_armed());
+        rt.key(ctrl_space);
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.is_leader_armed());
+        assert_eq!(*rt.state.term.sent_log.borrow(), ["text \0"]);
+
+        // 5. Custom Leader key (Record Leader -> Ctrl+G) works globally and double-taps in Terminal
+        rt.state.recording_key = Some(RecordingTarget::Leader);
+        let ctrl_g = KeyEvent {
+            key: Key::Command('g'),
+            mods: Mods {
+                ctrl: true,
+                cmd: true,
+                ..Default::default()
+            },
+        };
+        rt.key(ctrl_g.clone());
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.recording_key.is_none());
+        assert_eq!(rt.state.cfg.keymap.leader, "ctrl+g");
+
+        // Double-tap custom leader (Ctrl+G) in focused terminal sends key G ctrl=true
+        rt.state.term.sent_log.borrow_mut().clear();
+        rt.key(ctrl_g.clone());
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.is_leader_armed());
+        rt.key(ctrl_g.clone());
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.is_leader_armed());
+        assert_eq!(*rt.state.term.sent_log.borrow(), ["key G ctrl=true"]);
+
+        // Custom leader (Ctrl+G) followed by Shift+S navigates to Settings
+        rt.key(ctrl_g);
+        rt.key(KeyEvent {
+            key: Key::Text("S".into()),
+            mods: Mods {
+                shift: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.mode, Mode::Settings);
     }
 }

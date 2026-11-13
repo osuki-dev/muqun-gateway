@@ -605,14 +605,23 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .label(tr_ref(language, "Command palette"))
         .plain()
         .large()
-        .on_edit(|s: &mut UiState| &mut s.palette.as_mut().expect("palette open").query)
+        .on_edit(|s: &mut UiState| match s.palette.as_mut() {
+            Some(p) => &mut p.query,
+            None => &mut s.closed_edit,
+        })
         .on_change(|s: &mut UiState, _: &mut Tx| {
             if let Some(p) = s.palette.as_mut() {
                 p.selected = 0;
             }
         })
-        .on_key(
-            |s: &mut UiState, ev: &rune::KeyEvent, tx: &mut Tx| match ev.key {
+        .on_key(|s: &mut UiState, ev: &rune::KeyEvent, tx: &mut Tx| {
+            if s.palette.is_none() {
+                return super::keymap::dispatch(s, ev, tx);
+            }
+            if super::keymap::intercept_global_key(s, ev, tx) {
+                return true;
+            }
+            match ev.key {
                 rune::Key::Down => {
                     s.palette_move(1);
                     true
@@ -626,8 +635,8 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                     true
                 }
                 _ => false,
-            },
-        )
+            }
+        })
         .build(k)
         .key("palette-input")
         .w_full();

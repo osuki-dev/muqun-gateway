@@ -33,12 +33,42 @@ pub struct DesktopConfig {
     pub notifications: Notifications,
     /// Dictation's speech service (the API key lives in the keyring).
     pub voice: VoiceConfig,
+    /// User-configurable shortcuts and global leader key.
+    pub keymap: KeymapConfig,
     /// Per-computer profiles (theme, accent, agent configs) by computer id / server_id.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub computers: HashMap<String, ComputerProfile>,
     /// Currently active computer id ("local" or peer server_id / name).
     #[serde(default = "default_computer")]
     pub current_computer: String,
+}
+
+/// User-customized keyboard shortcuts and global leader key (`Settings → Shortcuts`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeymapConfig {
+    /// Global leader chord (e.g. `"ctrl+space"`, `"ctrl+;"`, `"alt+space"`, `"ctrl+a"`, `"ctrl+g"`).
+    pub leader: String,
+    /// Per-action shortcut overrides keyed by `Action::id()` (e.g. `"palette" -> "mod+k"`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bindings: BTreeMap<String, String>,
+}
+
+impl KeymapConfig {
+    pub const DEFAULT_LEADER: &'static str = "ctrl+space";
+
+    pub fn is_default(&self) -> bool {
+        self.leader == Self::DEFAULT_LEADER && self.bindings.is_empty()
+    }
+}
+
+impl Default for KeymapConfig {
+    fn default() -> Self {
+        Self {
+            leader: Self::DEFAULT_LEADER.to_string(),
+            bindings: BTreeMap::new(),
+        }
+    }
 }
 
 fn default_computer() -> String {
@@ -77,6 +107,7 @@ impl Default for DesktopConfig {
             window: WindowGeometry::default(),
             notifications: Notifications::default(),
             voice: VoiceConfig::default(),
+            keymap: KeymapConfig::default(),
             computers: HashMap::new(),
             current_computer: default_computer(),
         }
@@ -747,6 +778,15 @@ pub enum ConfigEdit {
         device_id: Option<String>,
         transport_key: Option<String>,
     },
+    /// Set the global leader key chord (falls back to `"ctrl+space"` if empty).
+    SetLeader(String),
+    /// Set or clear a custom shortcut override for an action (`Action::id()`).
+    SetKeybind {
+        action: String,
+        spec: Option<String>,
+    },
+    /// Reset all custom keybindings and the leader key to defaults.
+    ResetKeymap,
 }
 
 impl DesktopConfig {
@@ -875,6 +915,28 @@ impl DesktopConfig {
                 {
                     tracing::debug!(agent, ?field, %err, "an invalid value was not applied");
                 }
+            }
+            ConfigEdit::SetLeader(leader) => {
+                let trimmed = leader.trim();
+                self.keymap.leader = if trimmed.is_empty() {
+                    KeymapConfig::DEFAULT_LEADER.to_string()
+                } else {
+                    trimmed.to_string()
+                };
+            }
+            ConfigEdit::SetKeybind { action, spec } => {
+                match spec.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                    Some(s) => {
+                        self.keymap.bindings.insert(action, s);
+                    }
+                    None => {
+                        self.keymap.bindings.remove(&action);
+                    }
+                }
+            }
+            ConfigEdit::ResetKeymap => {
+                self.keymap.bindings.clear();
+                self.keymap.leader = KeymapConfig::DEFAULT_LEADER.to_string();
             }
         }
     }
@@ -1279,5 +1341,57 @@ mod tests {
         config.apply(ConfigEdit::CurrentComputer("local".into()));
         assert_eq!(config.current_computer, "local");
         assert!(config.agents_for(&config.current_computer).claude.enabled);
+    }
+
+    #[test]
+    fn keymap_config_serializes_and_applies_edits() {
+        let mut config = DesktopConfig::default();
+        assert!(config.keymap.is_default());
+        assert_eq!(config.keymap.leader, "ctrl+space");
+        assert!(config.keymap.bindings.is_empty());
+
+        config.apply(ConfigEdit::SetLeader("ctrl+a".into()));
+        assert_eq!(config.keymap.leader, "ctrl+a");
+        assert!(!config.keymap.is_default());
+
+        // Empty leader falls back to ctrl+space
+        config.apply(ConfigEdit::SetLeader("   ".into()));
+        assert_eq!(config.keymap.leader, "ctrl+space");
+
+        config.apply(ConfigEdit::SetLeader("alt+space".into()));
+        config.apply(ConfigEdit::SetKeybind {
+            action: "palette".into(),
+            spec: Some("ctrl+shift+k".into()),
+        });
+        assert_eq!(
+            config.keymap.bindings.get("palette").map(String::as_str),
+            Some("ctrl+shift+k")
+        );
+
+        // Round-trip through JSON
+        let json = serde_json::to_string(&config).unwrap();
+        let loaded: DesktopConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.keymap.leader, "alt+space");
+        assert_eq!(
+            loaded.keymap.bindings.get("palette").map(String::as_str),
+            Some("ctrl+shift+k")
+        );
+
+        // Clear single keybind
+        config.apply(ConfigEdit::SetKeybind {
+            action: "palette".into(),
+            spec: None,
+        });
+        assert!(!config.keymap.bindings.contains_key("palette"));
+
+        // Reset all keymap settings
+        config.apply(ConfigEdit::SetKeybind {
+            action: "toggle_sidebar".into(),
+            spec: Some("alt+b".into()),
+        });
+        config.apply(ConfigEdit::ResetKeymap);
+        assert!(config.keymap.is_default());
+        assert_eq!(config.keymap.leader, "ctrl+space");
+        assert!(config.keymap.bindings.is_empty());
     }
 }

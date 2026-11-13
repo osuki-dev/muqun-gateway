@@ -366,6 +366,7 @@ static INITIAL_CONFIG: OnceLock<DesktopConfig> = OnceLock::new();
 
 /// Hand the loaded config to the UI before the window opens.
 pub fn seed_config(config: DesktopConfig) {
+    keymap::sync_active_keymap(&config.keymap);
     let _ = INITIAL_CONFIG.set(config);
 }
 
@@ -590,6 +591,12 @@ pub struct UiState {
     pub palette: Option<palette::Palette>,
     /// The keyboard shortcuts sheet (`ui/shortcuts.rs`), when open.
     pub keys_sheet: Option<shortcuts::Sheet>,
+    /// Global leader key timestamp when armed (`Which-Key` mode).
+    pub leader_armed: Option<std::time::Instant>,
+    /// Active shortcut recording target in `Settings → Shortcuts`.
+    pub recording_key: Option<keymap::RecordingTarget>,
+    /// Sink for any overlay `TextInput` during its exit transition after close.
+    pub closed_edit: TextEdit,
     /// Dictation in progress (`ui/voice.rs`).
     pub voice: Option<voice::Dictation>,
     /// In-app self-update status.
@@ -789,6 +796,9 @@ impl UiState {
             update_state: crate::model::inbox::UpdateState::Idle,
             palette: None,
             keys_sheet: None,
+            leader_armed: None,
+            recording_key: None,
+            closed_edit: TextEdit::new(""),
             tray_shown: None,
             voice_form: voice::VoiceForm::new(&cfg.voice),
             term: terminal_panel::TermPanel::new(cfg.ui.terminal()),
@@ -820,6 +830,7 @@ impl UiState {
             runtime_installing: HashSet::new(),
             cfg,
         };
+        keymap::sync_active_keymap(&s.cfg.keymap);
         s.arm_splash(splash::SplashKind::Boot);
         s.check_voice_key();
         s
@@ -900,7 +911,38 @@ impl UiState {
     /// Fold a config edit into the mirror and tell the core.
     pub fn edit(&mut self, edit: ConfigEdit) {
         self.cfg.apply(edit.clone());
+        keymap::sync_active_keymap(&self.cfg.keymap);
         self.send(Command::Edit(edit));
+    }
+
+    /// Whether the global Leader key (`Which-Key` mode) is currently armed and within timeout.
+    pub fn is_leader_armed(&self) -> bool {
+        self.leader_armed
+            .is_some_and(|at| at.elapsed() < terminal_panel::PREFIX_TIMEOUT)
+            || self.term.is_prefix_armed()
+    }
+
+    /// Arm the global Leader key (`Which-Key` mode).
+    pub fn arm_leader(&mut self, tx: &mut Tx) {
+        let now = std::time::Instant::now();
+        self.leader_armed = Some(now);
+        self.term.prefix_armed = Some(now);
+        tx.wake_after(terminal_panel::PREFIX_TIMEOUT);
+    }
+
+    /// Disarm the global Leader key (`Which-Key` mode).
+    pub fn disarm_leader(&mut self) {
+        self.leader_armed = None;
+        self.term.prefix_armed = None;
+    }
+
+    /// Whether a terminal pane or tile currently holds keyboard focus.
+    pub fn is_terminal_focused(&self) -> bool {
+        if self.in_split() {
+            self.tiles.get(self.focus).is_some_and(|t| t.is_terminal()) && self.term.sink.focused
+        } else {
+            self.term.open && self.term.sink.focused
+        }
     }
 
     pub fn session_by_id(&self, asid: &str) -> Option<&AgentSessionInfo> {
@@ -3584,6 +3626,7 @@ pub fn on_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
 }
 
 pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
+    keymap::sync_active_keymap(&s.cfg.keymap);
     // Desktop CI smoke greps this once the first frame builds (xvfb / lavapipe).
     static FIRST_FRAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
     if FIRST_FRAME.swap(false, std::sync::atomic::Ordering::Relaxed) {

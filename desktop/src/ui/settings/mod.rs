@@ -621,7 +621,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         ),
         SettingsTab::Agents => (agents::actions(s, k), None, agents::page(s, k, layer)),
         SettingsTab::Voice => (Vec::new(), None, super::voice::settings(s, k, layer)),
-        SettingsTab::Shortcuts => (Vec::new(), None, keys::page(s, k)),
+        SettingsTab::Shortcuts => (keys::actions(s, k), None, keys::page(s, k)),
         SettingsTab::Storage => (Vec::new(), None, storage::page(s, k)),
         SettingsTab::About => (Vec::new(), None, about::page(s, k)),
     };

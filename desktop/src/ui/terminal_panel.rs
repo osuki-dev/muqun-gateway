@@ -234,7 +234,7 @@ impl TermPanel {
         self.tabs.get_mut(self.active_tab)
     }
 
-    fn send(&self, msg: Msg) {
+    pub(crate) fn send(&self, msg: Msg) {
         #[cfg(test)]
         self.sent_log.borrow_mut().push(match &msg {
             Msg::Key(k) => format!("key {:?} ctrl={}", k.key, k.mods.ctrl),
@@ -1267,10 +1267,10 @@ impl UiState {
     pub fn poll_terminal(&mut self, now: f64, tx: &mut Tx) -> bool {
         self.term.now = now;
         let mut changed = false;
-        if let Some(armed_at) = self.term.prefix_armed {
+        if let Some(armed_at) = self.leader_armed.or(self.term.prefix_armed) {
             let elapsed = armed_at.elapsed();
             if elapsed >= PREFIX_TIMEOUT {
-                self.term.prefix_armed = None;
+                self.disarm_leader();
                 changed = true;
             } else {
                 tx.wake_after(PREFIX_TIMEOUT.saturating_sub(elapsed));
@@ -1387,19 +1387,64 @@ impl UiState {
         let letter =
             |c: char| matches!(&ev.key, rune::Key::Command(k) if k.eq_ignore_ascii_case(&c));
 
-        // 1. Herdr prefix (`Ctrl+Space`) state machine when armed:
-        if self.term.is_prefix_armed() {
-            return self.handle_prefix_key(ev, tx);
-        }
-        if input::is_ctrl_space(ev, tx.physical_key()) {
-            self.term.prefix_armed = Some(std::time::Instant::now());
-            tx.wake_after(PREFIX_TIMEOUT);
+        // 1. Global Leader key / Which-Key & shortcut recording interception:
+        if super::keymap::intercept_global_key(self, ev, tx) {
             return true;
         }
 
-        // 2. Global focus toggle between terminal and session composer (`Ctrl+;` / `Cmd+;`):
-        if input::is_focus_toggle(ev, tx.physical_key(), mac) {
+        // 2. Global focus toggle between terminal and session composer (`Ctrl+;` / `Cmd+;` or custom):
+        if input::is_focus_toggle(ev, tx.physical_key(), mac)
+            || super::keymap::bind_matches_cfg(
+                super::keymap::entry(super::keymap::Action::ToggleFocus),
+                &self.cfg.keymap,
+                ev,
+                tx,
+            )
+        {
             self.toggle_focus_tx(tx);
+            return true;
+        }
+
+        // 2b. Configurable terminal actions (if customized or matching entry):
+        if super::keymap::bind_matches_cfg(
+            super::keymap::entry(super::keymap::Action::TermNewTab),
+            &self.cfg.keymap,
+            ev,
+            tx,
+        ) {
+            self.term_new_tab();
+            return true;
+        }
+        if super::keymap::bind_matches_cfg(
+            super::keymap::entry(super::keymap::Action::TermCloseTab),
+            &self.cfg.keymap,
+            ev,
+            tx,
+        ) {
+            self.term_close_tab(self.term.active_tab);
+            return true;
+        }
+        if super::keymap::bind_matches_cfg(
+            super::keymap::entry(super::keymap::Action::TermSearch),
+            &self.cfg.keymap,
+            ev,
+            tx,
+        ) {
+            self.open_terminal_search();
+            return true;
+        }
+        if super::keymap::bind_matches_cfg(
+            super::keymap::entry(super::keymap::Action::TermSplit),
+            &self.cfg.keymap,
+            ev,
+            tx,
+        ) {
+            if self.in_split() {
+                self.split_terminal_tile();
+            } else {
+                self.open_terminal_tile();
+            }
+            self.focus_terminal_tx(tx);
             return true;
         }
 
@@ -1631,69 +1676,6 @@ impl UiState {
                     self.term.send(Msg::Key(key));
                 }
             }
-        }
-        true
-    }
-
-    /// Execute a Herdr command after `Ctrl+Space` prefix was armed.
-    fn handle_prefix_key(&mut self, ev: &KeyEvent, tx: &mut Tx) -> bool {
-        self.term.prefix_armed = None;
-
-        // Pressing `Ctrl+Space` a second time sends literal Ctrl+Space (`\x00`) to the PTY shell.
-        if input::is_ctrl_space(ev, tx.physical_key()) {
-            self.term.send(Msg::Text("\x00".into()));
-            return true;
-        }
-        // If `terminal-keys` is a `TextInput`, pressing `Space` while `Ctrl` is held
-        // may also fire `on_input_change` or remain armed; ignore pure modifier releases.
-        if ev.key == rune::Key::Escape {
-            return true;
-        }
-        let raw_ch = match &ev.key {
-            rune::Key::Text(t) => t.chars().next(),
-            rune::Key::Command(c) => Some(*c),
-            _ => None,
-        };
-        let ch = match (raw_ch, ev.mods.shift) {
-            (Some('/'), true) => Some('?'),
-            (Some('\\'), true) => Some('|'),
-            (c, _) => c,
-        };
-        match ch {
-            Some('c' | 'C') => {
-                self.term_new_tab();
-                self.focus_terminal_tx(tx);
-            }
-            Some('k' | 'K') => {
-                self.term_close_tab(self.term.active_tab);
-            }
-            Some('x' | 'X') => {
-                if self.in_split() && self.tiles.get(self.focus).is_some_and(|t| t.is_terminal()) {
-                    self.close_tile(self.focus);
-                } else {
-                    self.term_close_tab(self.term.active_tab);
-                }
-            }
-            Some('n' | 'N') => self.term_next_tab(),
-            Some('p' | 'P') => self.term_prev_tab(),
-            Some(d @ '1'..='9') => {
-                let idx = (d as u8 - b'1') as usize;
-                self.term_switch_tab(idx);
-            }
-            Some('h' | 'H' | '-') => {
-                self.split_terminal_with_axis(false);
-                self.focus_terminal_tx(tx);
-            }
-            Some('v' | 'V' | '|' | '\\') => {
-                self.split_terminal_with_axis(true);
-                self.focus_terminal_tx(tx);
-            }
-            Some('z' | 'Z') => self.toggle_terminal_zoom(),
-            Some('[' | '/') => self.open_terminal_search(),
-            Some(';') => self.toggle_focus_tx(tx),
-            Some('?') => self.toggle_keys_sheet(),
-            Some('d' | 'D') => self.close_terminal(),
-            _ => {}
         }
         true
     }
@@ -2646,6 +2628,7 @@ fn short_path(path: &std::path::Path) -> String {
 }
 
 fn prefix_badge(k: &Kit, sfx: &str) -> El {
+    let leader = super::keymap::leader_label(None);
     row()
         .key(format!("terminal-prefix-badge{sfx}"))
         .h(20.0)
@@ -2655,7 +2638,7 @@ fn prefix_badge(k: &Kit, sfx: &str) -> El {
         .fill(k.c.bg_accent.alpha(0.18))
         .border(1.0, k.c.bg_accent.alpha(0.45))
         .child(
-            text("PREFIX (Ctrl+Space)")
+            text(format!("LEADER ({leader})"))
                 .font(k.ty.small_medium)
                 .color(k.c.text_accent),
         )
