@@ -483,8 +483,21 @@ pub fn dispatch(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         s.show_diff = false;
         return true;
     }
-    let term_active =
-        s.term.open || (s.in_split() && s.tiles.get(s.focus).is_some_and(|t| t.is_terminal()));
+    if let Some(sel) = tx.text_selection() {
+        let letter =
+            |c: char| matches!(&ev.key, rune::Key::Command(k) if k.eq_ignore_ascii_case(&c));
+        let is_copy =
+            (ev.mods.ctrl || ev.mods.cmd) && !ev.mods.alt && !ev.mods.shift && letter('c');
+        if is_copy {
+            tx.copy(sel.text().to_string());
+            return true;
+        }
+    }
+    let term_active = if s.in_split() {
+        s.tiles.get(s.focus).is_some_and(|t| t.is_terminal()) && s.term.sink.focused
+    } else {
+        s.term.open && s.term.sink.focused
+    };
     if term_active
         && !s.draft.focused
         && !s.start_draft.focused

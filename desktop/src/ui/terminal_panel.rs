@@ -3741,6 +3741,42 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_in_session_mode_does_not_interrupt_terminal() {
+        let (tx, _rx) = commands::channel();
+        let mut state = UiState::new(tx);
+        state.mode = super::super::Mode::Session;
+        state.open_terminal();
+        assert!(state.term.open);
+        // User moves focus to session / timeline (blurring the terminal sink).
+        state.term.sink.focused = false;
+
+        let mut rt = Runtime::new(
+            state,
+            super::super::view,
+            (1440.0, 900.0),
+            Env::new(true, 1.0),
+        );
+        rt.on_key = Some(super::super::on_key);
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+
+        // Press Ctrl+C in session
+        rt.key(key(Key::Command('c'), true, false));
+        rt.frame(2.0 / 60.0);
+
+        // Terminal must NOT have received Ctrl+C
+        assert!(
+            !rt.state
+                .term
+                .sent_log
+                .borrow()
+                .iter()
+                .any(|k| k.contains("ctrl=true")),
+            "terminal must not receive Ctrl+C when session is active"
+        );
+    }
+
+    #[test]
     fn terminal_search_finds_matches_and_navigates() {
         let (tx, _rx) = commands::channel();
         let mut state = UiState::new(tx);
