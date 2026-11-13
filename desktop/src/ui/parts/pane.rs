@@ -359,21 +359,18 @@ pub fn row_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
     let is_text = found.is_some_and(|f| matches!(f.part, AgentPart::Text { .. }));
     let is_user_text = found
         .is_some_and(|f| f.role == TimelineRole::User && matches!(f.part, AgentPart::Text { .. }));
-    let has_items =
-        selection.is_some() || copy.is_some() || detail || open.is_some() || is_user_text;
-    if !has_items {
-        return;
-    }
 
     let mut m = context_menu(
         "row-menu",
         col().key("row-menu-anchor").size(0.0, 0.0),
         Some(menu.point),
     )
-    .min_width(180.0)
+    .min_width(200.0)
     .on_close(close);
 
     let copy_shortcut = crate::platform::keys::label("Primary+C");
+    let search_shortcut = crate::platform::keys::label("Primary+F");
+    let select_all_shortcut = crate::platform::keys::label("Primary+A");
 
     // Selected text operations take precedence if user highlighted a section.
     if let Some(selected) = selection.clone() {
@@ -386,12 +383,26 @@ pub fn row_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                     tx.copy(sel_copy.clone());
                 }),
         );
-        let sel_quote = selected;
+        let sel_quote = selected.clone();
         m = m.item(
             MenuItem::new(t("Quote to composer")).on_select(move |s: &mut UiState| {
                 s.row_menu = None;
                 s.quote_to_composer(&sel_quote);
             }),
+        );
+        let sel_search = selected;
+        let search_asid = asid.clone();
+        m = m.item(
+            MenuItem::new(t("Find in timeline…"))
+                .shortcut(&search_shortcut)
+                .on_select_tx(move |s: &mut UiState, tx: &mut Tx| {
+                    s.row_menu = None;
+                    s.timeline_search.query.text = sel_search.clone();
+                    s.timeline_search.active = true;
+                    s.timeline_search.query.focused = true;
+                    s.update_timeline_search_matches(&search_asid);
+                    s.timeline_search_jump_to_current(tx);
+                }),
         );
         m = m.separator();
     }
@@ -421,6 +432,12 @@ pub fn row_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                 }),
             );
         }
+    } else if selection.is_none() {
+        m = m.item(
+            MenuItem::new(t("Copy"))
+                .shortcut(&copy_shortcut)
+                .disabled(true),
+        );
     }
 
     if is_user_text {
@@ -452,13 +469,14 @@ pub fn row_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
     }
 
     if detail {
+        let detail_asid = asid.clone();
         m = m.item(
             MenuItem::new(t("Show details"))
                 .shortcut("Enter")
                 .on_select(move |s: &mut UiState| {
                     s.row_menu = None;
                     s.inspect = Some(Inspect {
-                        asid: asid.clone(),
+                        asid: detail_asid.clone(),
                         id: id.clone(),
                     });
                     s.inspect_pane.set_open(true);
@@ -473,6 +491,39 @@ pub fn row_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
             }),
         );
     }
+
+    m = m.separator();
+    if selection.is_none() {
+        let search_asid = asid.clone();
+        m = m.item(
+            MenuItem::new(t("Find in timeline…"))
+                .shortcut(&search_shortcut)
+                .on_select(move |s: &mut UiState| {
+                    s.row_menu = None;
+                    s.timeline_search.active = true;
+                    s.timeline_search.query.focused = true;
+                    s.update_timeline_search_matches(&search_asid);
+                }),
+        );
+    }
+
+    let select_asid = asid.clone();
+    m = m.item(
+        MenuItem::new(t("Select all"))
+            .shortcut(&select_all_shortcut)
+            .on_select_tx(move |s: &mut UiState, tx: &mut Tx| {
+                s.row_menu = None;
+                tx.select_all_text(format!("feed-{select_asid}"));
+            }),
+    );
+
+    let scroll_asid = asid.clone();
+    m = m.item(MenuItem::new(t("Scroll to bottom")).on_select_tx(
+        move |s: &mut UiState, tx: &mut Tx| {
+            s.row_menu = None;
+            tx.scroll_to_bottom(format!("feed-{scroll_asid}"));
+        },
+    ));
     let anchor = m.build(k, layer);
     layer.push(anchor);
 }

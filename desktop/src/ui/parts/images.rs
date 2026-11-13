@@ -152,6 +152,10 @@ pub fn carries_images(item: &TimelineItem) -> bool {
             .iter()
             .flatten()
             .any(|a| a.unavailable_reason.is_none() && a.mime.starts_with("image/"))
+        || match &item.part {
+            muqun_gateway::agents::AgentPart::Text { text } => text.contains("[Image #"),
+            _ => false,
+        }
 }
 
 /// The images a tool returned (`content[]` file / image items, ACP's nested

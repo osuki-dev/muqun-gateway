@@ -468,6 +468,8 @@
   "Fork from here": "从这里分叉",
   "Quote to composer": "引用到输入框",
   "Copy entire message": "复制整条消息",
+  "Select all": "全选",
+  "Scroll to bottom": "滚动到底部",
   "Peer": "对等节点",
   "Fleet gateway": "网关舰队",
   "Gateway URL:": "网关地址（URL）：",

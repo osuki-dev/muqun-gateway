@@ -109,23 +109,27 @@ impl Echo {
 
 /// Drop each echo a new user row in `rows` stands for, one row per echo.
 /// Returns whether any went.
-pub fn reconcile(echoes: &mut Vec<Echo>, rows: &[TimelineItem]) -> bool {
+pub fn reconcile(echoes: &mut Vec<Echo>, rows: &mut [TimelineItem]) -> bool {
     let before = echoes.len();
-    // The latest rows are where a new one lands.
-    let recent = &rows[rows.len().saturating_sub(200)..];
+    let len = rows.len();
+    let start = len.saturating_sub(200);
+    let recent = &mut rows[start..];
     for row in recent {
-        let Some(said) = user_words(row) else {
+        let Some(said) = user_words(row).map(|s| s.to_string()) else {
             continue;
         };
         let Some(at) = echoes.iter().position(|e| {
-            e.state != EchoState::Failed && e.says(said) && !e.known.contains(&row.id)
+            e.state != EchoState::Failed && e.says(&said) && !e.known.contains(&row.id)
         }) else {
             continue;
         };
-        echoes.remove(at);
+        let echo = echoes.remove(at);
+        if row.attachments.as_ref().is_none_or(|a| a.is_empty()) && !echo.images.is_empty() {
+            row.attachments = Some(echo.images.clone());
+        }
         // The row is spoken for: a second echo of the same words waits for
         // a row of its own.
-        for e in echoes.iter_mut().filter(|e| e.says(said)) {
+        for e in echoes.iter_mut().filter(|e| e.says(&said)) {
             e.known.insert(row.id.clone());
         }
     }
@@ -214,10 +218,11 @@ impl UiState {
 
     /// `asid`'s timeline changed: drop the echoes its new rows stand for.
     pub fn echo_rows(&mut self, asid: &str) {
-        let (Some(echoes), Some(tl)) = (self.echoes.get_mut(asid), self.timelines.get(asid)) else {
+        let (Some(echoes), Some(tl)) = (self.echoes.get_mut(asid), self.timelines.get_mut(asid))
+        else {
             return;
         };
-        if reconcile(echoes, &tl.items) {
+        if reconcile(echoes, &mut tl.items) {
             self.echo_rev += 1;
         }
     }
@@ -498,18 +503,18 @@ mod tests {
             echo(2, "run the tests", &rows),
         ];
         // Re-reading what was already there (a snapshot) claims nothing.
-        assert!(!reconcile(&mut echoes, &rows));
+        assert!(!reconcile(&mut echoes, &mut rows));
         // The first send's row arrives, its file list appended by the gateway.
         rows.push(user(
             "u1",
             "run the tests\n\nAttached files (on this host):\n- /up/a.png",
         ));
-        assert!(reconcile(&mut echoes, &rows));
+        assert!(reconcile(&mut echoes, &mut rows));
         assert_eq!(echoes.iter().map(|e| e.token).collect::<Vec<_>>(), [2]);
         // The same rows again (a later snapshot) leave the second echo be.
-        assert!(!reconcile(&mut echoes, &rows));
+        assert!(!reconcile(&mut echoes, &mut rows));
         rows.push(user("u2", "run the tests"));
-        assert!(reconcile(&mut echoes, &rows));
+        assert!(reconcile(&mut echoes, &mut rows));
         assert!(echoes.is_empty());
     }
 
@@ -551,12 +556,15 @@ mod tests {
         assert_eq!(echoes[0].inbox.as_deref(), Some("q1"));
         // A failed send is no inbox item, and no row takes it away.
         assert_eq!(echoes[1].inbox, None);
-        assert!(!reconcile(&mut echoes, &[user("u9", "also lint")]));
+        assert!(!reconcile(&mut echoes, &mut [user("u9", "also lint")]));
         assert_eq!(echoes.len(), 2);
         // The agent took it: the item leaves the inbox, the echo waits for its row.
         assert!(claim_inbox(&mut echoes, &[]));
         assert_eq!(echoes[0].inbox, None);
-        assert!(reconcile(&mut echoes, &[user("u3", "stop and explain")]));
+        assert!(reconcile(
+            &mut echoes,
+            &mut [user("u3", "stop and explain")]
+        ));
         assert_eq!(echoes.len(), 1);
         assert_eq!(echoes[0].state, EchoState::Failed);
     }

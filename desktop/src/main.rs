@@ -71,15 +71,19 @@ fn main() -> anyhow::Result<()> {
         Ok(t) if !t.is_empty() => Box::leak(t.into_boxed_str()) as &'static str,
         _ => branding::APP_NAME,
     };
-    // `muqun-desktop <file>` opens the file in the viewer.
-    let open = rune::extra_args()
-        .iter()
-        .find(|a| !a.starts_with('-'))
-        .map(|a| std::path::absolute(a).unwrap_or_else(|_| PathBuf::from(a)));
     // A second launch focuses the first (and hands it the file), before
     // this one starts any agent. Rune's tooling flags (--scene, --snap, …)
     // always run on their own.
     let tooling = std::env::args().skip(1).any(|a| a.starts_with("--"));
+    // `muqun-desktop <file>` opens the file in the viewer.
+    let open = if tooling {
+        None
+    } else {
+        rune::extra_args()
+            .iter()
+            .find(|a| !a.starts_with('-'))
+            .map(|a| std::path::absolute(a).unwrap_or_else(|_| PathBuf::from(a)))
+    };
     let instance = if tooling {
         None
     } else {
@@ -103,9 +107,11 @@ fn main() -> anyhow::Result<()> {
     COMMANDS
         .set(tx.clone())
         .map_err(|_| anyhow::anyhow!("commands already installed"))?;
-    // A screenshot scene (`--scene`) shows demo data and ignores the core:
+    // A screenshot scene (`--scene`, `--snap`) shows demo data and ignores the core:
     // starting it would launch agents (and their daemons) for nothing.
-    if std::env::args().any(|a| a == "--scene" || a.starts_with("--scene=")) {
+    if std::env::args().any(|a| {
+        a == "--scene" || a.starts_with("--scene=") || a == "--snap" || a.starts_with("--snap=")
+    }) {
         std::thread::spawn(move || {
             let mut rx = rx;
             while rx.blocking_recv().is_some() {}

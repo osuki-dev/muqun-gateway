@@ -594,6 +594,8 @@ pub struct UiState {
     pub tile_tree: crate::config::TileNode,
     /// An empty tile waiting for the next opened session.
     pub pending_tile: Option<usize>,
+    /// Pending optimistic session being created from home composer: (placeholder_asid, token).
+    pub pending_start: Option<(String, u64)>,
     /// The split's size on screen, for splitting and the gaps' drags.
     pub tile_grid: [f32; 2],
     /// Active tile split gap path being dragged.
@@ -628,6 +630,12 @@ impl UiState {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
         );
+        let start_agent = cfg.general.last_agent.clone().unwrap_or_default();
+        let start_cwd_text = if !start_agent.is_empty() {
+            cfg.general.initial_cwd(&start_agent).display().to_string()
+        } else {
+            String::new()
+        };
         let mut s = Self {
             commands,
             dark,
@@ -662,8 +670,8 @@ impl UiState {
             error: None,
             draft,
             start_draft,
-            start_agent: cfg.general.last_agent.clone().unwrap_or_default(),
-            start_cwd: TextEdit::new(""),
+            start_agent,
+            start_cwd: TextEdit::new(start_cwd_text),
             start_worktree: false,
             start_model: None,
             start_mode: None,
@@ -765,6 +773,7 @@ impl UiState {
             focus: 0,
             tile_tree: crate::config::TileNode::Leaf(0),
             pending_tile: None,
+            pending_start: None,
             tile_grid: [0.0; 2],
             tile_drag: None,
             listed_agents: HashSet::new(),
@@ -2484,18 +2493,18 @@ impl UiState {
         let first = !self.agents_seen;
         self.agents_seen = true;
         self.agents = agents;
-        if first && self.start_cwd.text.is_empty() {
-            let cwd = self.cfg.general.initial_cwd(&self.start_agent);
-            self.start_cwd = TextEdit::new(cwd.display().to_string());
+        if first {
+            if self.start_cwd.text.is_empty() {
+                let cwd = self.cfg.general.initial_cwd(&self.start_agent);
+                self.start_cwd = TextEdit::new(cwd.display().to_string());
+            }
             if !self.start_agent.is_empty() {
                 self.send(Command::LoadProjects {
                     agent: self.start_agent.clone(),
                 });
+                self.refresh_start_catalog();
             }
-        } else if first && !self.start_agent.is_empty() {
-            self.send(Command::LoadProjects {
-                agent: self.start_agent.clone(),
-            });
+        } else if !self.start_agent.is_empty() && self.start_catalog.is_none() {
             self.refresh_start_catalog();
         }
     }
@@ -2514,6 +2523,27 @@ impl UiState {
 
     fn on_snapshot(&mut self, snapshot: muqun_gateway::agents::ports::AgentSessionSnapshot) {
         let asid = snapshot.info.asid.0.clone();
+        // Migrate optimistic pending session created from home composer if present.
+        if let Some((pending_asid, _)) = self.pending_start.take() {
+            self.sessions.retain(|s| s.asid.0 != pending_asid);
+            if let Some(pending_echoes) = self.echoes.remove(&pending_asid) {
+                let list = self.echoes.entry(asid.clone()).or_default();
+                for echo in pending_echoes {
+                    if !list.iter().any(|e| e.token == echo.token) {
+                        list.push(echo);
+                    }
+                }
+            }
+            if self.selected.as_deref() == Some(pending_asid.as_str()) {
+                self.selected = Some(asid.clone());
+            }
+            for tile in &mut self.tiles {
+                if tile.asid.as_deref() == Some(pending_asid.as_str()) {
+                    tile.asid = Some(asid.clone());
+                    tile.content = TileContent::Session(asid.clone());
+                }
+            }
+        }
         // A session opened into a tile that is not focused fills that tile.
         if let Some(i) = self.tile_of(&asid) {
             if i != self.focus {
@@ -2769,8 +2799,11 @@ impl UiState {
                     .current()
                     .is_some_and(|i| i.agent_id == agent && i.directory == directory);
                 let typed = self.start_cwd.text.trim();
-                let start =
-                    agent == self.start_agent && directory.as_deref().unwrap_or("") == typed;
+                let start = agent == self.start_agent
+                    && (directory.as_deref().unwrap_or("").trim_end_matches('/')
+                        == typed.trim_end_matches('/')
+                        || directory.is_none()
+                        || typed.is_empty());
                 if start {
                     self.start_catalog = Some(view.clone());
                 }
@@ -3228,5 +3261,76 @@ mod tests {
         assert!(s.expire_toasts());
         assert!(s.toasts.is_empty());
         assert!(!HAS_TOASTS.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn on_agents_triggers_start_catalog_refresh_on_first_launch() {
+        use crate::model::commands::Command;
+        use crate::model::compose::ComposeCommand;
+        use muqun_gateway::platform::discovery::{
+            AgentAvailability, AgentDiscoveryInfo, AgentFeatures,
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut s = UiState::new(tx);
+        s.start_cwd = TextEdit::new(""); // simulate empty cwd on cold start
+        s.start_agent = "claude".into();
+
+        let agent = AgentDiscoveryInfo {
+            id: "claude".into(),
+            name: "Claude Code".into(),
+            kind: "claude".into(),
+            status: AgentAvailability::Connected,
+            enabled: true,
+            endpoint: None,
+            version: None,
+            reason: None,
+            models: Vec::new(),
+            modes: Vec::new(),
+            features: AgentFeatures {
+                streaming: true,
+                reasoning_effort: false,
+                model_selection: true,
+                tool_approvals: false,
+                worktrees: false,
+                revert: false,
+                staged_revert: false,
+                inbox: false,
+                modes: true,
+                skills: false,
+                slash_commands: false,
+                compaction: false,
+                background_shells: false,
+                attachments: false,
+                attachments_by_path: false,
+                extra: Default::default(),
+            },
+        };
+
+        s.on_agents(vec![agent]);
+
+        // Verify that commands were emitted:
+        // 1. LoadProjects
+        // 2. ComposeCommand::Catalog
+        let mut saw_load_projects = false;
+        let mut saw_catalog = false;
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                Command::LoadProjects { agent } => {
+                    assert_eq!(agent, "claude");
+                    saw_load_projects = true;
+                }
+                Command::Compose(ComposeCommand::Catalog { agent, .. }) => {
+                    assert_eq!(agent, "claude");
+                    saw_catalog = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_load_projects, "expected LoadProjects on first launch");
+        assert!(
+            saw_catalog,
+            "expected Catalog refresh on first launch even when start_cwd was empty"
+        );
     }
 }

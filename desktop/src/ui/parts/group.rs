@@ -182,5 +182,18 @@ pub fn view(cx: &Tcx, items: &[TimelineItem]) -> El {
         }
         block = block.child(rail);
     }
-    block
+    let asid_sec = cx.asid.to_string();
+    let key_sec = key.clone();
+    block.on_secondary_press(move |s: &mut UiState, press, tx: &mut rune::Tx| {
+        let selection = tx
+            .text_selection()
+            .map(|ts| ts.text().to_string())
+            .filter(|s| !s.is_empty());
+        s.row_menu = Some(crate::ui::RowMenu {
+            asid: asid_sec.clone(),
+            id: key_sec.clone(),
+            point: press,
+            selection,
+        });
+    })
 }

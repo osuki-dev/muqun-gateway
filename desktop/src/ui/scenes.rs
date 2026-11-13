@@ -277,6 +277,7 @@ fn home(s: &mut UiState) {
     s.selected = None;
     s.mode = Mode::Home;
     s.start_draft = TextEdit::new("Add a settings page that edits the agent list.");
+    s.start_catalog = Some(composer_catalog());
     s.demo = true;
 }
 
@@ -1317,6 +1318,15 @@ fn base_scenes() -> &'static [Scene] {
             s.term.menu_at = Some(rune::PointerPress {
                 x: 1180.0,
                 y: 300.0,
+            });
+        }),
+        ("row-menu", |s| {
+            timeline_expanded(s);
+            s.row_menu = Some(crate::ui::RowMenu {
+                asid: "s1".into(),
+                id: "sh2".into(),
+                point: rune::PointerPress { x: 500.0, y: 300.0 },
+                selection: Some("git status".into()),
             });
         }),
         ("terminal-search", |s| {

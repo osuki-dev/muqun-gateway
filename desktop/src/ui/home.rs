@@ -51,7 +51,20 @@ pub fn submit_start(s: &mut UiState) {
         PathBuf::from(typed)
     };
     let (agent, worktree) = (s.start_agent.clone(), s.start_worktree);
-    let (model, mode) = (s.start_model.clone(), s.start_mode.clone());
+    let defaults = s.start_catalog.as_deref().map(|v| &v.catalog.defaults);
+    let model = s
+        .start_model
+        .clone()
+        .or_else(|| defaults.and_then(|d| d.model.clone()));
+    let mode = s
+        .start_mode
+        .clone()
+        .or_else(|| defaults.and_then(|d| d.mode.clone()))
+        .or_else(|| {
+            s.start_catalog
+                .as_deref()
+                .and_then(|v| v.catalog.modes.first().map(|m| m.id.clone()))
+        });
     if model.is_some() || mode.is_some() {
         s.edit(ConfigEdit::Remember {
             agent: agent.clone(),
@@ -68,6 +81,39 @@ pub fn submit_start(s: &mut UiState) {
     composer::note_skill_args(s, &deliver);
     let token = s.token(Slot::Start);
     s.status = "Starting…".into();
+
+    let pending_asid = format!("new-{token}");
+    let pending_title = if prompt.trim().is_empty() {
+        agent.clone()
+    } else {
+        prompt.chars().take(40).collect()
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if let Ok(pending_info) = serde_json::from_value(serde_json::json!({
+        "asid": pending_asid,
+        "agent_id": agent,
+        "title": pending_title,
+        "status": "idle",
+        "updated_ms": now_ms,
+    })) {
+        s.sessions.insert(0, pending_info);
+    }
+
+    let staged_files = s.staged.clone();
+    if !prompt.trim().is_empty() || !staged_files.is_empty() {
+        s.echo_sent(&pending_asid, token, prompt.clone(), &staged_files, false);
+    }
+    s.pending_start = Some((pending_asid.clone(), token));
+    s.open_session(&pending_asid);
+
+    s.start_draft.text.clear();
+    s.start_draft.anchor = 0;
+    s.start_draft.focus = 0;
+    s.staged.clear();
+
     s.send(Command::Compose(ComposeCommand::Submit {
         token,
         target: Target::New {
@@ -604,10 +650,13 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
         let current = s
             .start_mode
             .clone()
-            .or_else(|| defaults.and_then(|d| d.mode.clone()));
-        let at = current
-            .as_ref()
-            .and_then(|m| modes.iter().position(|(id, _)| id == m));
+            .or_else(|| defaults.and_then(|d| d.mode.clone()))
+            .or_else(|| modes.first().map(|(id, _)| id.clone()));
+        let at = current.as_ref().and_then(|m| {
+            modes
+                .iter()
+                .position(|(id, _)| id == m || id.eq_ignore_ascii_case(m))
+        });
         let ids: Vec<String> = modes.iter().map(|(id, _)| id.clone()).collect();
         if modes.len() <= 4 {
             let labels: Vec<&str> = modes.iter().map(|(_, n)| n.as_str()).collect();

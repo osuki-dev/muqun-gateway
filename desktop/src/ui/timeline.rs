@@ -484,18 +484,16 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
         })
         .on_secondary_press(move |s: &mut UiState, press, tx: &mut rune::Tx| {
             if s.row_menu.is_none() {
-                if let Some(selection) = tx
+                let selection = tx
                     .text_selection()
                     .map(|ts| ts.text().to_string())
-                    .filter(|s| !s.is_empty())
-                {
-                    s.row_menu = Some(crate::ui::RowMenu {
-                        asid: feed_asid.clone(),
-                        id: String::new(),
-                        point: press,
-                        selection: Some(selection),
-                    });
-                }
+                    .filter(|s| !s.is_empty());
+                s.row_menu = Some(crate::ui::RowMenu {
+                    asid: feed_asid.clone(),
+                    id: String::new(),
+                    point: press,
+                    selection,
+                });
             }
         })
         .scroll_bar(k);
@@ -1510,5 +1508,95 @@ mod tests {
         assert_eq!(s.selected.as_deref(), Some("b"));
         s.apply_updates(vec![upsert("a", "a-3", 3)]);
         assert_eq!(ids(&s, "a"), ["a-1", "a-2", "a-3"]);
+    }
+
+    #[test]
+    fn right_click_on_timeline_opens_row_menu() {
+        use rune::{Env, Runtime};
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.splash = None;
+        s.mode = crate::ui::Mode::Session;
+        let info: muqun_gateway::agents::AgentSessionInfo =
+            serde_json::from_value(serde_json::json!({
+                "asid": "s1", "agent_id": "codex", "title": "Test", "status": "idle",
+                "updated_ms": 1u64,
+            }))
+            .unwrap();
+        let item = text_item("msg-1");
+        s.open_session("s1");
+        s.apply_updates(vec![crate::model::inbox::Update::Snapshot(Box::new(
+            muqun_gateway::agents::ports::AgentSessionSnapshot {
+                info,
+                timeline: vec![item],
+                permissions: vec![],
+                forms: vec![],
+                inbox: vec![],
+                seq: 1,
+            },
+        ))]);
+
+        let mut rt = Runtime::new(s, crate::ui::view, (1000.0, 800.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        let elements = rt.elements();
+        let msg = elements
+            .iter()
+            .find(|e| e.key.as_deref() == Some("item-msg-1"));
+        assert!(msg.is_some(), "item-msg-1 must be present in elements");
+        let rect = msg.unwrap().rect;
+        let glyphs: Vec<(f32, f32)> = rt
+            .instances
+            .iter()
+            .filter(|i| i.params[1] == rune::render::KIND_GLYPH)
+            .map(|i| {
+                (
+                    (i.rect[0] + i.rect[2] / 2.0) / 1.0,
+                    (i.rect[1] + i.rect[3] / 2.0) / 1.0,
+                )
+            })
+            .collect();
+        println!("glyphs count: {}", glyphs.len());
+        println!("first 5 glyphs: {:?}", &glyphs[..5.min(glyphs.len())]);
+        println!("msg rect: {:?}", rect);
+        let msg_glyphs: Vec<(f32, f32)> = glyphs
+            .into_iter()
+            .filter(|&(x, y)| {
+                x >= rect[0] && x <= rect[0] + rect[2] && y >= rect[1] && y <= rect[1] + rect[3]
+            })
+            .collect();
+        println!("msg_glyphs count: {}", msg_glyphs.len());
+        if msg_glyphs.len() >= 2 {
+            let (g0, g1) = (msg_glyphs[0], msg_glyphs[msg_glyphs.len() - 1]);
+            println!("dragging from {:?} to {:?}", g0, g1);
+            rt.pointer_move(g0.0 - 5.0, g0.1);
+            rt.pointer_down(g0.0 - 5.0, g0.1);
+            rt.frame(1.0 / 60.0);
+            for k in 1..=6 {
+                let f = k as f32 / 6.0;
+                rt.pointer_move(g0.0 + (g1.0 - g0.0) * f, g0.1 + (g1.1 - g0.1) * f);
+                rt.frame(1.0 / 60.0);
+            }
+            rt.pointer_up(g1.0 + 5.0, g1.1);
+            rt.frame(1.0 / 60.0);
+        }
+
+        println!(
+            "runtime selection: {:?}",
+            rt.selection().map(|s| s.text().to_string())
+        );
+        let at = (rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0);
+        rt.secondary_down(at.0, at.1);
+        rt.secondary_up(at.0, at.1);
+        rt.frame(1.0 / 60.0);
+        assert!(
+            rt.state.row_menu.is_some(),
+            "row_menu must be set after right-click with selection"
+        );
+        let menu = rt.state.row_menu.as_ref().unwrap();
+        println!("menu selection: {:?}", menu.selection);
+        assert!(
+            menu.selection.is_some(),
+            "menu.selection must contain selected text"
+        );
     }
 }
