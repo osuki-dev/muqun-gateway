@@ -16,23 +16,23 @@ pub mod fx;
 mod home;
 pub mod i18n;
 pub(crate) mod icons;
-mod inbox;
-mod inspector;
+pub(crate) mod inbox;
+pub(crate) mod inspector;
 pub mod keymap;
 mod labels;
 pub mod pair_computer;
-mod palette;
+pub(crate) mod palette;
 mod panes;
 mod parts;
 mod running;
 pub mod scenes;
 mod search;
 mod sessions;
-mod settings;
+pub(crate) mod settings;
 mod shell;
 mod shortcuts;
 mod splash;
-mod tasks;
+pub(crate) mod tasks;
 pub(crate) mod terminal_panel;
 mod tiles;
 mod timeline;
@@ -101,16 +101,27 @@ pub enum Slot {
     Start,
 }
 
-/// A transient notice (theme service answers, failed sends).
+/// Severity level for bottom-right notifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToastLevel {
+    #[default]
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+/// A transient notice (theme service answers, failed sends, errors).
 #[derive(Debug, Clone)]
 pub struct ToastItem {
     pub id: u64,
+    pub level: ToastLevel,
     pub title: String,
     pub detail: Option<String>,
     pub created_at: std::time::Instant,
 }
 
-const MAX_TOASTS: usize = 3;
+const MAX_TOASTS: usize = 5;
 
 /// How many gallery themes the Themes tab lists before "Show more".
 pub(crate) const GALLERY_PAGE: usize = 36;
@@ -431,6 +442,7 @@ pub struct UiState {
     pub status: String,
     pub hub_label: String,
     pub error: Option<UiError>,
+    pub error_at: Option<std::time::Instant>,
 
     pub draft: TextEdit,
     pub start_draft: TextEdit,
@@ -604,8 +616,18 @@ pub struct UiState {
     tiles_restored: bool,
     /// Registered desktop plugins.
     pub plugins: crate::plugin::PluginRegistry,
+    /// Active plugin opened in the full-screen Page slot (`PluginSlot::Page`).
+    pub active_plugin_page: Option<String>,
+    /// Active plugin opened in the right-hand Drawer slot (`PluginSlot::Drawer`).
+    pub active_plugin_drawer: Option<String>,
+    /// Interactive text buffer for the Quick Notes (`"quicknotes"`) scratchpad plugin.
+    pub quick_notes_edit: TextEdit,
     /// Persistent or active notes per quick notes tile.
     pub quick_notes: HashMap<String, String>,
+    /// Probed status of external runtimes (`bun`, `herdr`) for System & Diagnostics.
+    pub runtime_statuses: Vec<muqun_gateway::platform::runtimes::RuntimeStatus>,
+    /// Runtimes currently being installed or updated in the background.
+    pub runtime_installing: HashSet<muqun_gateway::platform::runtimes::RuntimeKind>,
     /// Agents whose session list has arrived (split restore waits for them).
     listed_agents: HashSet<String>,
 }
@@ -668,6 +690,7 @@ impl UiState {
             status: "Starting…".into(),
             hub_label: String::new(),
             error: None,
+            error_at: None,
             draft,
             start_draft,
             start_agent,
@@ -779,7 +802,22 @@ impl UiState {
             listed_agents: HashSet::new(),
             tiles_restored: false,
             plugins: crate::plugin::PluginRegistry::default_registry(),
+            active_plugin_page: None,
+            active_plugin_drawer: None,
+            quick_notes_edit: TextEdit::new(""),
             quick_notes: HashMap::new(),
+            runtime_statuses: muqun_gateway::platform::runtimes::RuntimeKind::ALL
+                .into_iter()
+                .map(|kind| muqun_gateway::platform::runtimes::RuntimeStatus {
+                    kind,
+                    available: false,
+                    source: None,
+                    binary_path: None,
+                    version: None,
+                    managed_dir: std::env::temp_dir().join("muqun-runtimes").join(kind.id()),
+                })
+                .collect(),
+            runtime_installing: HashSet::new(),
             cfg,
         };
         s.arm_splash(splash::SplashKind::Boot);
@@ -804,6 +842,7 @@ impl UiState {
         self.send(Command::Refresh);
         self.send(Command::ThemeRefresh);
         self.send(Command::RefreshTasks);
+        self.send(Command::ProbeRuntimes);
     }
 
     /// Install the image cache once the window can wake it.
@@ -1124,12 +1163,33 @@ impl UiState {
     }
 
     pub fn toast(&mut self, title: impl Into<String>, detail: Option<String>) {
+        self.notify(ToastLevel::Info, title, detail);
+    }
+
+    pub fn toast_error(&mut self, title: impl Into<String>, detail: Option<String>) {
+        self.notify(ToastLevel::Error, title, detail);
+    }
+
+    pub fn notify(&mut self, level: ToastLevel, title: impl Into<String>, detail: Option<String>) {
+        let title = title.into();
+        let now = std::time::Instant::now();
+        if let Some(existing) = self
+            .toasts
+            .iter_mut()
+            .find(|t| t.title == title && t.detail == detail)
+        {
+            existing.level = level;
+            existing.created_at = now;
+            HAS_TOASTS.store(true, Ordering::Release);
+            return;
+        }
         self.toast_seq += 1;
         self.toasts.push(ToastItem {
             id: self.toast_seq,
-            title: title.into(),
+            level,
+            title,
             detail,
-            created_at: std::time::Instant::now(),
+            created_at: now,
         });
         while self.toasts.len() > MAX_TOASTS {
             self.toasts.remove(0);
@@ -1138,18 +1198,70 @@ impl UiState {
     }
 
     pub fn expire_toasts(&mut self) -> bool {
-        if self.toasts.is_empty() {
-            HAS_TOASTS.store(false, Ordering::Release);
-            return false;
+        let mut changed = false;
+        if let Some(ref err) = self.error {
+            if !err.unreachable
+                && self
+                    .error_at
+                    .is_some_and(|at| at.elapsed() >= std::time::Duration::from_millis(6000))
+            {
+                self.error = None;
+                self.error_at = None;
+                changed = true;
+            }
         }
-        let before = self.toasts.len();
-        self.toasts
-            .retain(|t| t.created_at.elapsed() < std::time::Duration::from_millis(3500));
-        let changed = self.toasts.len() != before;
-        if self.toasts.is_empty() {
+        if !self.toasts.is_empty() {
+            let before = self.toasts.len();
+            self.toasts.retain(|t| {
+                let ttl = if t.level == ToastLevel::Error {
+                    5000
+                } else {
+                    3500
+                };
+                t.created_at.elapsed() < std::time::Duration::from_millis(ttl)
+            });
+            if self.toasts.len() != before {
+                changed = true;
+            }
+        }
+        let has_expiring_error = self.error.as_ref().is_some_and(|e| !e.unreachable);
+        if self.toasts.is_empty() && !has_expiring_error {
             HAS_TOASTS.store(false, Ordering::Release);
         }
         changed
+    }
+
+    /// Clean up an optimistic `new-{token}` session placeholder when creation fails.
+    pub fn cleanup_pending_start(&mut self) {
+        let Some((pending_asid, _)) = self.pending_start.take() else {
+            return;
+        };
+        self.sessions.retain(|s| s.asid.0 != pending_asid);
+        if let Some(mut echoes) = self.echoes.remove(&pending_asid) {
+            if self.start_draft.text.trim().is_empty() {
+                if let Some(first) = echoes.drain(..).next() {
+                    self.start_draft = TextEdit::new(first.text);
+                }
+            }
+        }
+        self.timelines.remove(&pending_asid);
+        if let Some(i) = self.tile_of(&pending_asid) {
+            if self.in_split() {
+                self.close_tile(i);
+            } else {
+                self.tiles[i].asid = None;
+                self.tiles[i].content = TileContent::Empty;
+            }
+        }
+        if self.selected.as_deref() == Some(pending_asid.as_str()) {
+            self.selected = self
+                .last_selected
+                .take()
+                .filter(|id| self.sessions.iter().any(|s| s.asid.0 == *id));
+            if self.selected.is_none() {
+                self.mode = Mode::Home;
+            }
+        }
     }
 
     pub fn token(&mut self, slot: Slot) -> u64 {
@@ -1183,6 +1295,7 @@ impl UiState {
     /// Show session `asid`. In split view it joins as a new pane (or takes
     /// focus where it already is); otherwise it fills the main card.
     pub fn open_session(&mut self, asid: &str) {
+        self.active_plugin_page = None;
         if self.in_split() && self.tile_of(asid).is_none() {
             crate::platform::notify::withdraw(asid);
             self.open_in_tile(asid);
@@ -1227,7 +1340,14 @@ impl UiState {
             self.show_diff = false;
         }
         self.status = format!("Opening {asid}");
-        self.send(Command::OpenSession(AgentSessionId(asid.to_string())));
+        let is_optimistic = asid.starts_with("new-")
+            || self
+                .pending_start
+                .as_ref()
+                .is_some_and(|(pending, _)| pending == asid);
+        if !is_optimistic {
+            self.send(Command::OpenSession(AgentSessionId(asid.to_string())));
+        }
         self.send(Command::Compose(
             crate::model::compose::ComposeCommand::ListPeers,
         ));
@@ -1329,6 +1449,263 @@ impl UiState {
         self.draft = composer::fresh(cur);
         self.draft.set_caret(len);
         self.draft.focused = true;
+    }
+
+    /// Append or insert text into the active composer (`draft` or `start_draft`) and focus it.
+    pub fn insert_into_composer(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.mode == Mode::Home && self.selected.is_none() {
+            let mut cur = self.start_draft.text.clone();
+            if !cur.is_empty() && !cur.ends_with('\n') && !cur.ends_with(' ') {
+                cur.push('\n');
+            }
+            cur.push_str(trimmed);
+            let len = cur.len();
+            self.start_draft = composer::fresh(cur);
+            self.start_draft.set_caret(len);
+            self.start_draft.focused = true;
+            self.quick_notes_edit.focused = false;
+            self.term.sink.focused = false;
+            self.persist_draft(Slot::Start);
+        } else {
+            let mut cur = self.draft.text.clone();
+            if !cur.is_empty() && !cur.ends_with('\n') && !cur.ends_with(' ') {
+                cur.push('\n');
+            }
+            cur.push_str(trimmed);
+            let len = cur.len();
+            self.draft = composer::fresh(cur);
+            self.draft.set_caret(len);
+            self.draft.focused = true;
+            self.quick_notes_edit.focused = false;
+            self.term.sink.focused = false;
+            self.persist_draft(Slot::Session);
+        }
+    }
+
+    /// Insert the current Quick Notes scratchpad content into the composer and focus the composer.
+    pub fn insert_quick_notes_into_composer(&mut self) {
+        let notes = if !self.quick_notes_edit.text.trim().is_empty() {
+            self.quick_notes_edit.text.clone()
+        } else {
+            self.quick_notes
+                .values()
+                .find(|v| !v.trim().is_empty())
+                .cloned()
+                .unwrap_or_default()
+        };
+        if notes.trim().is_empty() {
+            return;
+        }
+        self.insert_into_composer(&notes);
+        if self.active_plugin_page.as_deref() == Some("quicknotes") {
+            self.active_plugin_page = None;
+        }
+        self.notify(
+            ToastLevel::Success,
+            copy::tr_ref(self.cfg.general.language, "Inserted notes into composer"),
+            None,
+        );
+    }
+
+    /// Clear the Quick Notes scratchpad editor and stored tile buffers.
+    pub fn clear_quick_notes(&mut self) {
+        self.quick_notes_edit = TextEdit::new("");
+        self.quick_notes.clear();
+    }
+
+    /// Probe external runtimes (`bun`, `herdr`) and refresh `runtime_statuses`.
+    pub fn refresh_runtimes(&mut self) {
+        self.runtime_statuses = muqun_gateway::platform::runtimes::probe_all();
+        self.send(Command::ProbeRuntimes);
+    }
+
+    /// Trigger background installation or update of a managed runtime (`bun` or `herdr`).
+    pub fn install_managed_runtime(
+        &mut self,
+        kind: muqun_gateway::platform::runtimes::RuntimeKind,
+    ) {
+        self.runtime_installing.insert(kind);
+        self.notify(
+            ToastLevel::Info,
+            format!("Installing managed {} runtime…", kind.display_name()),
+            None,
+        );
+        self.send(Command::InstallManagedRuntime(kind));
+    }
+
+    /// Open a plugin in the full-screen Page slot (`PluginSlot::Page`).
+    pub fn open_plugin_page(&mut self, plugin_id: &str) {
+        if self.plugins.get(plugin_id).is_none() {
+            return;
+        }
+        self.active_plugin_page = Some(plugin_id.to_string());
+        if plugin_id == "sysinfo" {
+            self.refresh_runtimes();
+        } else if plugin_id == "terminal" {
+            if self.term.session.is_none() && self.term.tabs.is_empty() {
+                self.start_terminal();
+            }
+            self.focus_terminal();
+        } else if plugin_id == "quicknotes" {
+            self.quick_notes_edit.focused = true;
+            self.draft.focused = false;
+            self.term.sink.focused = false;
+        }
+    }
+
+    /// Close the active full-screen plugin page, returning to the underlying workspace view.
+    pub fn close_plugin_page(&mut self) {
+        self.active_plugin_page = None;
+    }
+
+    /// Open a plugin in the right-hand Drawer slot (`PluginSlot::Drawer`).
+    pub fn open_plugin_drawer(&mut self, plugin_id: &str) {
+        if plugin_id == "terminal" {
+            self.active_plugin_drawer = None;
+            self.open_terminal();
+            return;
+        }
+        if self.plugins.get(plugin_id).is_none() {
+            return;
+        }
+        if self.in_split() {
+            self.unsplit();
+        }
+        if self.mode != Mode::Session {
+            self.mode = Mode::Session;
+        }
+        if self.term.open {
+            self.close_terminal();
+        }
+        self.active_plugin_drawer = Some(plugin_id.to_string());
+        self.right_open = true;
+        self.right.set_open(true);
+        if plugin_id == "sysinfo" {
+            self.refresh_runtimes();
+        } else if plugin_id == "quicknotes" {
+            self.quick_notes_edit.focused = true;
+            self.draft.focused = false;
+        }
+    }
+
+    /// Close the active right-hand plugin drawer.
+    pub fn close_plugin_drawer(&mut self) {
+        if self.active_plugin_drawer.take().is_some() {
+            self.right_open = false;
+            self.right.set_open(false);
+        }
+    }
+
+    /// Find the tile index currently hosting `plugin_id`, if any.
+    pub fn tile_of_plugin(&self, plugin_id: &str) -> Option<usize> {
+        if plugin_id == "terminal" {
+            return self.tile_of_terminal();
+        }
+        self.tiles.iter().position(|t| match &t.content {
+            TileContent::Custom { kind, .. } => kind == plugin_id,
+            TileContent::Diff(_) => plugin_id == "diff",
+            _ => false,
+        })
+    }
+
+    /// Open a plugin in a split-view Tile (`PluginSlot::Tile`).
+    pub fn open_plugin_tile(&mut self, plugin_id: &str) {
+        if plugin_id == "terminal" {
+            self.active_plugin_page = None;
+            self.open_terminal_tile();
+            return;
+        }
+        if self.plugins.get(plugin_id).is_none() {
+            return;
+        }
+        self.active_plugin_page = None;
+        if self.active_plugin_drawer.as_deref() == Some(plugin_id) {
+            self.close_plugin_drawer();
+        }
+        if let Some(i) = self.tile_of_plugin(plugin_id) {
+            self.mode = Mode::Session;
+            self.focus_tile(i);
+            return;
+        }
+        self.close_terminal();
+        self.right_open = false;
+        self.right.set_open(false);
+
+        if self.tiles.is_empty() {
+            let current = self.selected.clone();
+            self.tiles.push(Tile {
+                content: match &current {
+                    Some(asid) => TileContent::Session(asid.clone()),
+                    None => TileContent::Empty,
+                },
+                asid: current,
+                term_tab: None,
+                slot: SessionSlot::default(),
+            });
+            self.focus = 0;
+            self.tile_tree = crate::config::TileNode::Leaf(0);
+        }
+
+        let at = match self.tiles.iter().position(|t| t.is_empty()) {
+            Some(empty) => empty,
+            None if self.tiles.len() < MAX_TILES => self.add_tile(),
+            None => {
+                let f = self.focus;
+                self.tiles[f].content = TileContent::Empty;
+                f
+            }
+        };
+        self.mode = Mode::Session;
+        tiles::fill_plugin_tile(self, at, plugin_id);
+    }
+
+    /// Seamlessly switch `plugin_id` between `Tile` ⇄ `Page` ⇄ `Drawer`.
+    pub fn switch_plugin_surface(&mut self, plugin_id: &str, target: crate::plugin::PluginSlot) {
+        match target {
+            crate::plugin::PluginSlot::Page => {
+                if self.active_plugin_drawer.as_deref() == Some(plugin_id) {
+                    self.close_plugin_drawer();
+                }
+                if plugin_id == "terminal" && self.term.open {
+                    self.close_terminal();
+                }
+                if let Some(i) = self.tile_of_plugin(plugin_id) {
+                    if self.in_split() {
+                        self.close_tile(i);
+                    } else {
+                        self.tiles.clear();
+                    }
+                }
+                self.open_plugin_page(plugin_id);
+            }
+            crate::plugin::PluginSlot::Drawer => {
+                if self.active_plugin_page.as_deref() == Some(plugin_id) {
+                    self.close_plugin_page();
+                }
+                if let Some(i) = self.tile_of_plugin(plugin_id) {
+                    if self.in_split() {
+                        self.close_tile(i);
+                    } else {
+                        self.tiles.clear();
+                    }
+                }
+                self.open_plugin_drawer(plugin_id);
+            }
+            crate::plugin::PluginSlot::Tile => {
+                if self.active_plugin_page.as_deref() == Some(plugin_id) {
+                    self.close_plugin_page();
+                }
+                if self.active_plugin_drawer.as_deref() == Some(plugin_id) {
+                    self.close_plugin_drawer();
+                }
+                self.open_plugin_tile(plugin_id);
+            }
+            _ => {}
+        }
     }
 
     /// Toggle floating in-session timeline search (Ctrl+F).
@@ -1451,6 +1828,7 @@ impl UiState {
     }
 
     pub fn go(&mut self, mode: Mode) {
+        self.active_plugin_page = None;
         self.mode = mode;
         match mode {
             Mode::Tasks => self.send(Command::RefreshTasks),
@@ -1596,6 +1974,7 @@ impl UiState {
     }
 
     pub fn toggle_inspector(&mut self) {
+        self.active_plugin_drawer = None;
         if self.term.open {
             // One panel on the right at a time: the inspector takes it back.
             self.close_terminal();
@@ -1609,6 +1988,7 @@ impl UiState {
     }
 
     pub fn open_git_inspector(&mut self) {
+        self.active_plugin_drawer = None;
         if self.mode != Mode::Session && self.selected.is_some() {
             self.go(Mode::Session);
         }
@@ -1822,11 +2202,15 @@ impl UiState {
         let watched: Vec<AgentSessionId> = self
             .tiles
             .iter()
-            .filter_map(|t| t.asid.clone().map(AgentSessionId))
+            .filter_map(|t| t.asid.clone())
+            .filter(|asid| !asid.starts_with("new-"))
+            .map(AgentSessionId)
             .collect();
         self.send(Command::WatchSessions(watched));
         if let Some(ref asid) = self.selected {
-            self.send(Command::FocusSession(AgentSessionId(asid.clone())));
+            if !asid.starts_with("new-") {
+                self.send(Command::FocusSession(AgentSessionId(asid.clone())));
+            }
         }
     }
 
@@ -1871,7 +2255,14 @@ impl UiState {
             ..SessionSlot::default()
         };
         self.mode = Mode::Session;
-        self.send(Command::OpenTile(AgentSessionId(asid.to_string())));
+        let is_optimistic = asid.starts_with("new-")
+            || self
+                .pending_start
+                .as_ref()
+                .is_some_and(|(pending, _)| pending == asid);
+        if !is_optimistic {
+            self.send(Command::OpenTile(AgentSessionId(asid.to_string())));
+        }
         self.focus_tile(at);
         self.sync_watch();
         self.persist_tiles();
@@ -2314,9 +2705,15 @@ impl UiState {
                 }
                 Update::Snapshot(snapshot) => self.on_snapshot(*snapshot),
                 Update::Event(event) => self.apply_event(*event),
-                Update::Error(err) => {
+                Update::Error(mut err) => {
+                    err.message = crate::model::inbox::clean_error_message(&err.message);
+                    if self.pending_start.is_some() {
+                        self.cleanup_pending_start();
+                    }
                     self.status = err.message.clone();
+                    self.error_at = Some(std::time::Instant::now());
                     self.error = Some(err);
+                    HAS_TOASTS.store(true, Ordering::Release);
                 }
                 Update::Projects { agent, projects } => {
                     self.agent_projects.insert(agent, projects);
@@ -2404,6 +2801,38 @@ impl UiState {
                 Update::Attention(attention) => self.on_attention(&attention),
                 Update::Voice(event) => self.on_voice(event),
                 Update::UpdateState(state) => self.update_state = state,
+                Update::Runtimes(statuses) => {
+                    self.runtime_statuses = statuses;
+                }
+                Update::RuntimeInstalled { kind, result } => {
+                    self.runtime_installing.remove(&kind);
+                    match result {
+                        Ok(status) => {
+                            let ver = status.version.clone().map(|v| {
+                                format!("v{v} installed in {}", status.managed_dir.display())
+                            });
+                            if let Some(slot) =
+                                self.runtime_statuses.iter_mut().find(|s| s.kind == kind)
+                            {
+                                *slot = status;
+                            } else {
+                                self.runtime_statuses.push(status);
+                            }
+                            self.notify(
+                                ToastLevel::Success,
+                                format!("Managed {} runtime ready", kind.display_name()),
+                                ver,
+                            );
+                        }
+                        Err(err) => {
+                            self.notify(
+                                ToastLevel::Error,
+                                format!("Failed to install {}", kind.display_name()),
+                                Some(err),
+                            );
+                        }
+                    }
+                }
             }
         }
         if LAYOUT_DIRTY.swap(false, Ordering::AcqRel) {
@@ -2659,11 +3088,14 @@ impl UiState {
                     slot.status = status;
                 }
                 if let Some(err) = error {
+                    let message = crate::model::inbox::clean_error_message(&err.message);
+                    self.error_at = Some(std::time::Instant::now());
                     self.error = Some(UiError {
-                        message: err.message,
+                        message,
                         detail: Some(err.name),
                         unreachable: false,
                     });
+                    HAS_TOASTS.store(true, Ordering::Release);
                 }
             }
             AgentDomainEvent::PermissionPending { asid, request, .. } => {
@@ -2813,9 +3245,17 @@ impl UiState {
             }
             ComposerUpdate::Staged { result, .. } => match result {
                 Ok(file) => self.staged.push(file),
-                Err(err) => self.toast("Attachment failed", Some(err)),
+                Err(err) => self.toast_error("Attachment failed", Some(err)),
             },
             ComposerUpdate::Submitted { token, ok } => {
+                if !ok
+                    && self
+                        .pending_start
+                        .as_ref()
+                        .is_some_and(|(_, pending_tok)| *pending_tok == token)
+                {
+                    self.cleanup_pending_start();
+                }
                 // An echoed prompt left the draft when it was sent; its
                 // bubble says how the send went.
                 if self.echo_submitted(token, ok) {
@@ -2969,6 +3409,7 @@ impl UiState {
             &self.cwd_input,
             &self.rename_edit,
             &self.project_edit,
+            &self.quick_notes_edit,
         ]
         .into_iter()
         .chain(self.form_inputs.values())
@@ -3191,15 +3632,53 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     palette::mount(s, &k, &mut layer);
     shortcuts::mount(s, &k, &mut layer);
     pair_computer::mount(s, &k, &mut layer);
-    if !s.toasts.is_empty() {
+    if s.error.is_some() || !s.toasts.is_empty() {
         let mut region = ToastRegion::new();
-        for t in s
-            .toasts
-            .iter()
-            .filter(|t| t.created_at.elapsed() < std::time::Duration::from_millis(3500))
-        {
+        if let Some(err) = &s.error {
+            let dot = rune::el()
+                .size(8.0, 8.0)
+                .radius(4.0)
+                .fill(k.c.danger.icon)
+                .a11y_hidden();
+            let mut toast = rune_kit::Toast::new("alert-bar", err.message.clone())
+                .lead(dot)
+                .on_close(|s: &mut UiState| {
+                    s.error = None;
+                    s.error_at = None;
+                });
+            if let Some(d) = &err.detail {
+                toast = toast.description(d.clone());
+            }
+            if err.unreachable {
+                let retry_label = copy::tr(s.cfg.general.language, "Retry");
+                toast = toast.action(&k, &retry_label, true, |s: &mut UiState, _| {
+                    s.send(Command::Refresh);
+                });
+            }
+            region = region.toast(toast.build(&k));
+        }
+        for t in s.toasts.iter().filter(|t| {
+            let ttl = if t.level == ToastLevel::Error {
+                5000
+            } else {
+                3500
+            };
+            t.created_at.elapsed() < std::time::Duration::from_millis(ttl)
+        }) {
             let id = t.id;
+            let dot_color = match t.level {
+                ToastLevel::Info => k.c.info.icon,
+                ToastLevel::Success => k.c.success.icon,
+                ToastLevel::Warning => k.c.warning.icon,
+                ToastLevel::Error => k.c.danger.icon,
+            };
+            let dot = rune::el()
+                .size(8.0, 8.0)
+                .radius(4.0)
+                .fill(dot_color)
+                .a11y_hidden();
             let mut toast = rune_kit::Toast::new(format!("toast-{id}"), t.title.clone())
+                .lead(dot)
                 .on_close(move |s: &mut UiState| s.toasts.retain(|t| t.id != id));
             if let Some(d) = &t.detail {
                 toast = toast.description(d.clone());
@@ -3332,5 +3811,103 @@ mod tests {
             saw_catalog,
             "expected Catalog refresh on first launch even when start_cwd was empty"
         );
+    }
+
+    #[test]
+    fn clean_error_message_strips_nested_agent_request_failed_prefixes() {
+        use crate::model::inbox::clean_error_message;
+        assert_eq!(
+            clean_error_message(
+                "Agent request failed: Agent request failed: Cursor ACP request rejected (code -32602): Invalid params"
+            ),
+            "Cursor ACP request rejected (code -32602): Invalid params"
+        );
+        assert_eq!(
+            clean_error_message("Agent request failed: timeout"),
+            "timeout"
+        );
+        assert_eq!(clean_error_message("Plain error"), "Plain error");
+    }
+
+    #[test]
+    fn submit_start_does_not_open_optimistic_placeholder_on_backend_and_cleans_up_on_failure() {
+        use crate::model::commands::Command;
+        use crate::model::compose::{ComposeCommand, ComposerUpdate, Target};
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut s = UiState::new(tx);
+        s.start_agent = "cursor".into();
+        s.start_cwd = TextEdit::new("/tmp");
+        s.start_draft = TextEdit::new("Hello Cursor");
+
+        home::submit_start(&mut s);
+
+        assert_eq!(s.selected.as_deref(), Some("new-1"));
+        assert_eq!(s.sessions.len(), 1);
+        assert_eq!(s.sessions[0].asid.0, "new-1");
+
+        let mut saw_submit = false;
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                Command::OpenSession(asid) => {
+                    panic!("should not send OpenSession for optimistic placeholder {asid:?}");
+                }
+                Command::OpenTile(asid) => {
+                    panic!("should not send OpenTile for optimistic placeholder {asid:?}");
+                }
+                Command::FocusSession(asid) => {
+                    panic!("should not send FocusSession for optimistic placeholder {asid:?}");
+                }
+                Command::Compose(ComposeCommand::Submit {
+                    token,
+                    target:
+                        Target::New {
+                            model, mode, agent, ..
+                        },
+                    ..
+                }) => {
+                    assert_eq!(token, 1);
+                    assert_eq!(agent, "cursor");
+                    assert!(model.is_none());
+                    assert!(mode.is_none());
+                    saw_submit = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_submit, "expected Submit command");
+
+        // Simulate failed submission: optimistic session should be cleaned up and draft restored.
+        s.apply_updates(vec![Update::Composer(Box::new(
+            ComposerUpdate::Submitted {
+                token: 1,
+                ok: false,
+            },
+        ))]);
+        assert!(s.sessions.is_empty());
+        assert!(s.pending_start.is_none());
+        assert_eq!(s.mode, Mode::Home);
+        assert_eq!(s.start_draft.text, "Hello Cursor");
+    }
+
+    #[test]
+    fn toasts_deduplicate_and_errors_auto_expire() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut s = UiState::new(tx);
+        s.toast("Saved", Some("/tmp/a.rs".into()));
+        s.toast("Saved", Some("/tmp/a.rs".into()));
+        assert_eq!(s.toasts.len(), 1);
+
+        s.apply_updates(vec![Update::Error(UiError {
+            message: "Agent request failed: Agent request failed: Boom".into(),
+            detail: None,
+            unreachable: false,
+        })]);
+        assert_eq!(s.error.as_ref().unwrap().message, "Boom");
+        assert!(!s.expire_toasts());
+
+        s.error_at = Some(std::time::Instant::now() - std::time::Duration::from_millis(6100));
+        assert!(s.expire_toasts());
+        assert!(s.error.is_none());
     }
 }

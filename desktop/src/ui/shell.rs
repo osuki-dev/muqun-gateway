@@ -26,34 +26,92 @@ use crate::theme::look::Look;
 pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> El {
     let look = s.look();
 
-    let page = match s.mode {
-        // Composed for the card's size: the first frame guesses, the
-        // layout read re-runs the view once the card is laid out.
-        Mode::Home => home::view(
+    let scale = cx.env().scale;
+    let page = if let Some(pid) = s.active_plugin_page.as_deref() {
+        let ctx = crate::plugin::PluginViewContext {
             s,
             k,
-            cx.layout_size("main-pane").unwrap_or([1080.0, 860.0]),
-            cx.layout_size("home-dock"),
-            layer,
-        ),
-        Mode::Session if s.in_split() => tiles::view(
-            s,
-            k,
-            tiles::toggle_clearance(s, crate::platform::titlebar_inset(cx.titlebar_inset())),
-            cx.env().scale,
-            layer,
-        ),
-        Mode::Session => session(s, k, &look, layer),
-        Mode::Inbox => inbox::view(s, k),
-        Mode::Tasks => tasks::view(s, k, layer),
-        Mode::Settings => settings::view(s, k, layer),
+            look: &look,
+            tile_id: "page",
+            scale,
+            surface: crate::plugin::PluginSlot::Page,
+        };
+        let content = s
+            .plugins
+            .get(pid)
+            .and_then(|p| p.render_surface(&ctx, layer))
+            .unwrap_or_else(|| el().key("empty-plugin-page"));
+        super::card_stage("plugin-page", content)
+    } else {
+        match s.mode {
+            // Composed for the card's size: the first frame guesses, the
+            // layout read re-runs the view once the card is laid out.
+            Mode::Home => home::view(
+                s,
+                k,
+                cx.layout_size("main-pane").unwrap_or([1080.0, 860.0]),
+                cx.layout_size("home-dock"),
+                layer,
+            ),
+            Mode::Session if s.in_split() => tiles::view(
+                s,
+                k,
+                tiles::toggle_clearance(s, crate::platform::titlebar_inset(cx.titlebar_inset())),
+                scale,
+                layer,
+            ),
+            Mode::Session => session(s, k, &look, layer),
+            Mode::Inbox => {
+                let ctx = crate::plugin::PluginViewContext {
+                    s,
+                    k,
+                    look: &look,
+                    tile_id: "inbox",
+                    scale,
+                    surface: crate::plugin::PluginSlot::Page,
+                };
+                s.plugins
+                    .get("inbox")
+                    .and_then(|p| p.render_surface(&ctx, layer))
+                    .unwrap_or_else(|| inbox::view(s, k))
+            }
+            Mode::Tasks => {
+                let ctx = crate::plugin::PluginViewContext {
+                    s,
+                    k,
+                    look: &look,
+                    tile_id: "tasks",
+                    scale,
+                    surface: crate::plugin::PluginSlot::Page,
+                };
+                s.plugins
+                    .get("tasks")
+                    .and_then(|p| p.render_surface(&ctx, layer))
+                    .unwrap_or_else(|| tasks::view(s, k, layer))
+            }
+            Mode::Settings => {
+                let ctx = crate::plugin::PluginViewContext {
+                    s,
+                    k,
+                    look: &look,
+                    tile_id: "settings",
+                    scale,
+                    surface: crate::plugin::PluginSlot::Page,
+                };
+                s.plugins
+                    .get("settings")
+                    .and_then(|p| p.render_surface(&ctx, layer))
+                    .unwrap_or_else(|| settings::view(s, k, layer))
+            }
+        }
     };
-    let mut main = col().key("main").w_full().h_full().min_h(0.0);
-    if let Some(alert) = alert(s, k) {
-        main = main.child(alert);
-    }
+    let main = col().key("main").w_full().h_full().min_h(0.0);
     // Pages cross-fade and lift a little as the mode changes.
-    let page = look.arrive(page.key(format!("page-{:?}", s.mode)), 0);
+    let page_key = match s.active_plugin_page.as_deref() {
+        Some(pid) => format!("page-plugin-{pid}"),
+        None => format!("page-{:?}", s.mode),
+    };
+    let page = look.arrive(page.key(page_key), 0);
     let main = main.child(page.grow(1.0).min_h(0.0));
     // Home is full-bleed artwork; a toolbar strip would sit as a band over
     // the hero. Settings / hub live in the sidebar footer there.
@@ -83,16 +141,19 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             s.mode,
             Mode::Home | Mode::Settings | Mode::Inbox | Mode::Tasks
         ) || (s.mode == Mode::Session && s.in_split())
+            || s.active_plugin_page.is_some()
         {
             Toolbar::new()
         } else {
             toolbar(s, k, &look, layer)
         },
     );
-    let inspector_here = s.right_open && s.mode == Mode::Session && !s.in_split();
+    let plugin_drawer = s.right_open && s.active_plugin_drawer.is_some() && !s.in_split();
+    let inspector_here =
+        (s.right_open && s.mode == Mode::Session && !s.in_split()) || plugin_drawer;
     // A row's details take the right-hand slot while they are open; an open
     // terminal takes it over both, and the inspector comes last.
-    let details = (s.mode == Mode::Session)
+    let details = (s.mode == Mode::Session && s.active_plugin_page.is_none() && !plugin_drawer)
         .then(|| timeline::detail_pane(s, k))
         .flatten();
     // The right-hand pane's width, for the main card's floor on a
@@ -106,7 +167,8 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     };
     let term_in_drawer = s.term.mounted()
         && (s.term.open || (details.is_none() && !inspector_here))
-        && !s.has_terminal_tile();
+        && !s.has_terminal_tile()
+        && s.active_plugin_page.as_deref() != Some("terminal");
     if term_in_drawer {
         right_w = s.term.pane.shown_width();
         let scheme = if k.dark {
@@ -122,7 +184,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             1.0
         };
         let surface = super::terminal_panel::surface(s, k, scheme).alpha(alpha);
-        let view = super::terminal_panel::view(s, k, scheme, cx.env().scale, layer);
+        let view = super::terminal_panel::view(s, k, scheme, scale, layer);
         split = split.inspector(
             &s.term.pane,
             super::terminal_pane,
@@ -137,10 +199,24 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         );
     } else if inspector_here {
         right_w = s.right.shown_width();
+        let pid = s.active_plugin_drawer.as_deref().unwrap_or("inspector");
+        let ctx = crate::plugin::PluginViewContext {
+            s,
+            k,
+            look: &look,
+            tile_id: "drawer",
+            scale,
+            surface: crate::plugin::PluginSlot::Drawer,
+        };
+        let drawer_content = s
+            .plugins
+            .get(pid)
+            .and_then(|p| p.render_surface(&ctx, layer))
+            .unwrap_or_else(|| inspector::view(s, k));
         split = split.inspector(
             &s.right,
             super::right_pane,
-            right_panel(k, wash, look.dark, None, inspector::view(s, k)),
+            right_panel(k, wash, look.dark, None, drawer_content),
         );
     }
     let mut split = split
@@ -806,80 +882,6 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
         );
     }
     bar
-}
-
-/// An error from the core: the message, what to check, and a way to dismiss it.
-fn alert(s: &UiState, k: &Kit) -> Option<El> {
-    let language = s.cfg.general.language;
-    let err = s.error.as_ref()?;
-    let danger = k.c.danger.icon;
-    let dark = s.dark;
-
-    let mut content = row()
-        .gap(8.0)
-        .center_y()
-        .grow(1.0)
-        .min_w(0.0)
-        .child(el().size(6.0, 6.0).radius(3.0).fill(danger).a11y_hidden())
-        .child(
-            text(err.message.clone())
-                .font(k.ty.small_medium)
-                .color(k.c.text_base),
-        );
-
-    if let Some(detail) = &err.detail {
-        content = content.child(
-            Badge::new(detail.clone())
-                .variant(BadgeVariant::Neutral)
-                .build(k),
-        );
-    }
-
-    let mut actions = row().gap(6.0).center_y();
-    if err.unreachable {
-        actions = actions.child(
-            Button::new(tr_ref(language, "Retry"))
-                .variant(ButtonVariant::Outline)
-                .control_size(ControlSize::Small)
-                .on_press(|s: &mut UiState| s.send(Command::Refresh))
-                .build(k)
-                .key("retry-error"),
-        );
-    }
-
-    let dismiss_label = format!("{} (Esc)", tr_ref(language, "Dismiss"));
-    actions = actions.child(
-        IconButton::new(k.glyph.close)
-            .variant(IconButtonVariant::GhostMuted)
-            .control_size(ControlSize::Small)
-            .label(dismiss_label)
-            .on_press(|s: &mut UiState| s.error = None)
-            .build(k)
-            .key("dismiss-error"),
-    );
-
-    let bar = row()
-        .key("alert-bar")
-        .w_full()
-        .min_h(32.0)
-        .px(12.0)
-        .py(4.0)
-        .center_y()
-        .radius(k.radius.md)
-        .fill(danger.alpha(if dark { 0.14 } else { 0.08 }))
-        .border(1.0, danger.alpha(if dark { 0.35 } else { 0.22 }))
-        .child(content)
-        .child(actions);
-
-    Some(
-        col()
-            .key("alert")
-            .w_full()
-            .px(16.0)
-            .pt(6.0)
-            .pb(2.0)
-            .child(bar),
-    )
 }
 
 /// A hairline of light under the title band, in the session agent's colour.

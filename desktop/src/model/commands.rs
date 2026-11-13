@@ -269,6 +269,10 @@ pub enum Command {
         worktree_dir: Option<String>,
         branch: Option<String>,
     },
+    /// Probe managed & system runtimes (Bun & Herdr) on the background worker.
+    ProbeRuntimes,
+    /// Download and install a managed runtime (Bun or Herdr) on the background worker.
+    InstallManagedRuntime(muqun_gateway::platform::runtimes::RuntimeKind),
 }
 
 pub type CommandSender = mpsc::UnboundedSender<Command>;

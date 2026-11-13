@@ -1938,9 +1938,15 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         tr_ref(language, "Expand")
     };
     let expand_help = if s.composer_expanded || s.composer_rows.is_some() {
-        tr_ref(language, "Collapse composer (Ctrl+Shift+E)")
+        super::keymap::tip(
+            tr_ref(language, "Collapse composer"),
+            super::keymap::Action::ExpandComposer,
+        )
     } else {
-        tr_ref(language, "Expand composer (Ctrl+Shift+E)")
+        super::keymap::tip(
+            tr_ref(language, "Expand composer"),
+            super::keymap::Action::ExpandComposer,
+        )
     };
     let expand_btn = rune_kit::IconButton::new(expand_icon)
         .variant(rune_kit::IconButtonVariant::GhostMuted)
@@ -1965,7 +1971,10 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             rune_kit::IconButtonVariant::GhostMuted
         })
         .label(tr_ref(language, "History"))
-        .help(tr_ref(language, "Prompt history (Alt+H)"))
+        .help(super::keymap::tip(
+            tr_ref(language, "Prompt history"),
+            super::keymap::Action::PromptHistory,
+        ))
         .on_press(|s: &mut UiState| {
             s.composer_history_open = !s.composer_history_open;
         })
@@ -2167,36 +2176,6 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                     s.composer_history_open = false;
                     return true;
                 }
-                let is_e = match &ev.key {
-                    rune::Key::Command(c) => c.eq_ignore_ascii_case(&'e'),
-                    rune::Key::Text(s) => s.eq_ignore_ascii_case("e"),
-                    _ => false,
-                };
-                let is_h = match &ev.key {
-                    rune::Key::Command(c) => c.eq_ignore_ascii_case(&'h'),
-                    rune::Key::Text(s) => s.eq_ignore_ascii_case("h"),
-                    _ => false,
-                };
-                let is_r = match &ev.key {
-                    rune::Key::Command(c) => c.eq_ignore_ascii_case(&'r'),
-                    rune::Key::Text(s) => s.eq_ignore_ascii_case("r"),
-                    _ => false,
-                };
-                let primary = ev.mods.primary();
-                if primary && ev.mods.shift && is_e {
-                    if s.composer_expanded || s.composer_rows.is_some() {
-                        s.composer_expanded = false;
-                        s.composer_rows = None;
-                    } else {
-                        s.composer_expanded = true;
-                        s.composer_rows = Some(14);
-                    }
-                    return true;
-                }
-                if (ev.mods.alt && (is_h || ev.key == rune::Key::Up)) || (primary && is_r) {
-                    s.composer_history_open = !s.composer_history_open;
-                    return true;
-                }
                 if ev.key == rune::Key::Up
                     && !ev.mods.cmd
                     && !ev.mods.alt
@@ -2226,12 +2205,15 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                     return true;
                 }
                 // Alt+Enter while the agent works: queue after this turn.
-                let alt_enter = ev.key == rune::Key::Enter && ev.mods.alt && !ev.mods.cmd;
-                if alt_enter && s.busy() {
+                if super::keymap::entry(super::keymap::Action::Queue)
+                    .keybind()
+                    .matches_tx(ev, tx)
+                    && s.busy()
+                {
                     queue_session(s);
                     return true;
                 }
-                // Sidebar and pane keys, ahead of the field's caret moves.
+                // Sidebar, pane, and composer keys, ahead of the field's caret moves.
                 let at_end = caret_at_end(&s.draft);
                 super::keymap::field_key(s, ev, tx, at_end)
             })

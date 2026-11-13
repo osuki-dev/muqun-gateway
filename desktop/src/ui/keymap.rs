@@ -35,6 +35,7 @@ pub enum Action {
     Back,
     ToggleSidebar,
     ToggleTerminal,
+    ToggleFocus,
     NewShell,
     ToggleInspector,
     ToggleGit,
@@ -49,6 +50,8 @@ pub enum Action {
     FocusPaneToward,
     SwapPaneToward,
     FocusComposer,
+    ExpandComposer,
+    PromptHistory,
     Send,
     Queue,
     Stop,
@@ -61,6 +64,13 @@ pub enum Action {
     OpenRow,
     NextMessage,
     PrevMessage,
+    TermPrefix,
+    TermNewTab,
+    TermCloseTab,
+    TermSwitchTab,
+    TermCycleTab,
+    TermSplit,
+    TermSearch,
     TermCopy,
     TermPaste,
     Allow,
@@ -185,6 +195,12 @@ pub static ENTRIES: &[Entry] = &[
         "ctrl+`",
         "Show or hide the terminal",
     ),
+    e(
+        A::ToggleFocus,
+        G::Panels,
+        "mod+;",
+        "Switch focus between session and terminal",
+    ),
     e(A::NewShell, G::Panels, "ctrl+shift+`", "New shell"),
     e(
         A::ToggleInspector,
@@ -228,6 +244,24 @@ pub static ENTRIES: &[Entry] = &[
         G::Session,
         "mod+l",
         "Focus the message field",
+    ),
+    owned(
+        e(
+            A::ExpandComposer,
+            G::Session,
+            "mod+shift+e",
+            "Expand or collapse the composer",
+        ),
+        Owner::Composer,
+    ),
+    owned(
+        e(
+            A::PromptHistory,
+            G::Session,
+            "alt+h, ctrl+r",
+            "Prompt history",
+        ),
+        Owner::Composer,
     ),
     owned(
         e(
@@ -311,6 +345,78 @@ pub static ENTRIES: &[Entry] = &[
         G::Split,
         "mod+alt+shift+left, mod+alt+shift+right, mod+alt+shift+up, mod+alt+shift+down",
         "Swap the pane with the one that way",
+    ),
+    owned(
+        e(
+            A::TermPrefix,
+            G::Terminal,
+            "ctrl+space",
+            "Herdr prefix (c new, k close, n/p tab, h/v split, [ find, ; focus)",
+        ),
+        Owner::Terminal,
+    ),
+    owned(
+        on_mac(
+            e(
+                A::TermNewTab,
+                G::Terminal,
+                "ctrl+shift+t",
+                "New terminal tab",
+            ),
+            "mod+t, ctrl+shift+t",
+        ),
+        Owner::Terminal,
+    ),
+    owned(
+        e(
+            A::TermCloseTab,
+            G::Terminal,
+            "ctrl+shift+w, alt+escape",
+            "Close terminal tab or pane",
+        ),
+        Owner::Terminal,
+    ),
+    owned(
+        e(
+            A::TermSwitchTab,
+            G::Terminal,
+            "alt+1, alt+2, alt+3, alt+4, alt+5, alt+6, alt+7, alt+8, alt+9",
+            "Switch to terminal tab 1–9",
+        ),
+        Owner::Terminal,
+    ),
+    owned(
+        e(
+            A::TermCycleTab,
+            G::Terminal,
+            "alt+left, alt+right, ctrl+tab, ctrl+shift+tab",
+            "Previous or next terminal tab",
+        ),
+        Owner::Terminal,
+    ),
+    owned(
+        on_mac(
+            e(
+                A::TermSplit,
+                G::Terminal,
+                "ctrl+shift+d, alt+enter",
+                "Split terminal pane",
+            ),
+            "mod+d, alt+enter",
+        ),
+        Owner::Terminal,
+    ),
+    owned(
+        on_mac(
+            e(
+                A::TermSearch,
+                G::Terminal,
+                "ctrl+shift+f",
+                "Find in terminal scrollback",
+            ),
+            "mod+f, ctrl+shift+f",
+        ),
+        Owner::Terminal,
     ),
     owned(
         on_mac(e(A::TermCopy, G::Terminal, "ctrl+shift+c", "Copy"), "mod+c"),
@@ -470,7 +576,7 @@ pub fn terminal_shadows(platform: KeyPlatform) -> Vec<(Action, Action, String)> 
 /// The window's keys (`on_key`): run the first row whose chord this is.
 pub fn dispatch(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if crate::term::input::is_toggle(ev, tx.physical_key()) {
-        s.toggle_terminal();
+        s.toggle_terminal_tx(tx);
         return true;
     }
     if s.show_diff
@@ -502,31 +608,64 @@ pub fn dispatch(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         && !s.draft.focused
         && !s.start_draft.focused
         && !s.timeline_search.active
+        && !s.term.search.open
         && !s.search.focused
         && s.palette.is_none()
         && s.keys_sheet.is_none()
     {
-        let letter =
-            |c: char| matches!(&ev.key, rune::Key::Command(k) if k.eq_ignore_ascii_case(&c));
-        if ((ev.mods.ctrl && (letter('d') || letter('w'))) || ev.key == rune::Key::Escape)
-            && s.term.session.as_ref().is_some_and(|x| x.ended().is_some())
-        {
-            s.term_close_tab(s.term.active_tab);
-            return true;
-        }
-        let mac = crate::platform::keys::Style::current() == crate::platform::keys::Style::Symbols;
-        let is_window_shortcut = ENTRIES
-            .iter()
-            .filter(|e| e.owner == Owner::Window)
-            .any(|e| e.keybind().matches_tx(ev, tx));
-        if !is_window_shortcut
-            && crate::term::input::route(ev, tx.physical_key(), mac)
-                != crate::term::input::Route::App
-        {
-            s.focus_terminal_tx(tx);
-            return s.terminal_key(ev, tx);
+        return s.terminal_key(ev, tx);
+    }
+    dispatch_window(s, ev, tx)
+}
+
+fn keybind_matches(bind: &Keybind, ev: &KeyEvent, tx: &Tx) -> bool {
+    if bind.matches_tx(ev, tx) {
+        return true;
+    }
+    if let rune::Key::Text(t) = &ev.key {
+        let mut chars = t.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            if ev.mods.ctrl || ev.mods.alt || ev.mods.cmd || ev.mods.logo {
+                let norm = KeyEvent {
+                    key: rune::Key::Command(c.to_ascii_lowercase()),
+                    mods: ev.mods,
+                };
+                return bind.matches_tx(&norm, tx);
+            }
         }
     }
+    false
+}
+
+fn bind_matches(entry: &Entry, ev: &KeyEvent, tx: &Tx) -> bool {
+    keybind_matches(entry.keybind(), ev, tx)
+}
+
+/// Check registered plugin commands for a matching `shortcut` chord and execute it.
+pub fn dispatch_plugin_shortcut(s: &mut UiState, ev: &KeyEvent, tx: &Tx) -> bool {
+    let plugins = s.plugins.all();
+    for plugin in plugins {
+        for cmd in plugin.commands() {
+            let Some(sc) = cmd.shortcut.map(str::trim).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let normalized = sc.replace("+,", "+comma");
+            let Ok(bind) = std::panic::catch_unwind(|| Keybind::new(&normalized)) else {
+                continue;
+            };
+            if keybind_matches(&bind, ev, tx) {
+                s.keys_sheet = None;
+                s.palette = None;
+                return plugin.on_command(s, cmd.id);
+            }
+        }
+    }
+    false
+}
+
+/// Run a window shortcut (used by [`dispatch`] and by the terminal's
+/// `Route::App` handoff so it does not loop back into `terminal_key`).
+pub fn dispatch_window(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
     // The arrows step the Inbox's and Tasks' lists as j and k do.
     if matches!(s.mode, Mode::Inbox | Mode::Tasks)
         && matches!(ev.key, rune::Key::Up | rune::Key::Down)
@@ -539,27 +678,45 @@ pub fn dispatch(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         };
         return run(s, action, ev, tx);
     }
-    let Some(found) = ENTRIES
+    if let Some(found) = ENTRIES
         .iter()
-        .filter(|e| e.owner == Owner::Window)
-        .find(|e| e.keybind().matches_tx(ev, tx))
-    else {
-        return false;
-    };
-    run(s, found.action, ev, tx)
+        .filter(|e| {
+            e.owner == Owner::Window || matches!(e.action, A::ExpandComposer | A::PromptHistory)
+        })
+        .find(|e| bind_matches(e, ev, tx))
+    {
+        return run(s, found.action, ev, tx);
+    }
+    if dispatch_plugin_shortcut(s, ev, tx) {
+        return true;
+    }
+    false
 }
 
 /// Keys a composer hears before its editor, which would take them as
-/// caret moves: Alt+↑/↓, the split's pane arrows, and Ctrl+End once the
-/// caret is already at the end.
+/// caret moves: Alt+↑/↓, the split's pane arrows, composer shortcuts,
+/// focus toggles, and Ctrl+End once the caret is already at the end.
 pub fn field_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx, at_end: bool) -> bool {
+    let term_active = if s.in_split() {
+        s.tiles.get(s.focus).is_some_and(|t| t.is_terminal()) && s.term.sink.focused
+    } else {
+        s.term.open && s.term.sink.focused
+    };
+    if term_active && !s.draft.focused && !s.start_draft.focused {
+        s.focus_terminal_tx(tx);
+        return s.terminal_key(ev, tx);
+    }
     for action in [
         A::PrevSession,
         A::NextSession,
+        A::ToggleFocus,
+        A::FocusPane,
         A::FocusPaneToward,
         A::SwapPaneToward,
+        A::ExpandComposer,
+        A::PromptHistory,
     ] {
-        if entry(action).keybind().matches_tx(ev, tx) {
+        if bind_matches(entry(action), ev, tx) {
             return run(s, action, ev, tx);
         }
     }
@@ -610,7 +767,8 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
         A::Settings => s.go(Mode::Settings),
         A::Back => return escape(s),
         A::ToggleSidebar => s.sidebar.toggle(),
-        A::ToggleTerminal => s.toggle_terminal(),
+        A::ToggleTerminal => s.toggle_terminal_tx(tx),
+        A::ToggleFocus => s.toggle_focus_tx(tx),
         A::NewShell => {
             s.open_terminal();
             s.restart_terminal();
@@ -650,19 +808,55 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
         A::FocusPane => {
             let n = ['1', '2', '3', '4']
                 .iter()
-                .position(|c| ev.is_command(*c))
+                .position(|&c| {
+                    ev.is_command(c)
+                        || matches!(&ev.key, rune::Key::Text(t) if t.len() == 1 && t.starts_with(c))
+                })
                 .unwrap_or(usize::MAX);
             if !(s.in_split() && n < s.tiles.len()) {
                 return false;
             }
             s.focus_tile(n);
+            if s.tiles.get(n).is_some_and(|t| t.is_terminal()) {
+                s.focus_terminal_tx(tx);
+            }
         }
-        A::FocusPaneToward | A::SwapPaneToward => return super::tiles::arrow_key(s, ev),
+        A::FocusPaneToward | A::SwapPaneToward => {
+            let was_term = s.term.sink.focused;
+            if was_term {
+                s.term.sink.focused = false;
+            }
+            let handled = super::tiles::arrow_key(s, ev);
+            if s.in_split() && s.tiles.get(s.focus).is_some_and(|t| t.is_terminal()) {
+                s.focus_terminal_tx(tx);
+            } else if was_term && !handled {
+                s.term.sink.focused = true;
+            }
+            return handled;
+        }
         A::FocusComposer => match s.mode {
-            Mode::Session => s.draft.focused = true,
-            Mode::Home => s.start_draft.focused = true,
+            Mode::Session => {
+                s.draft.focused = true;
+                s.term.sink.focused = false;
+            }
+            Mode::Home => {
+                s.start_draft.focused = true;
+                s.term.sink.focused = false;
+            }
             _ => return false,
         },
+        A::ExpandComposer if session => {
+            if s.composer_expanded || s.composer_rows.is_some() {
+                s.composer_expanded = false;
+                s.composer_rows = None;
+            } else {
+                s.composer_expanded = true;
+                s.composer_rows = Some(14);
+            }
+        }
+        A::PromptHistory if session => {
+            s.composer_history_open = !s.composer_history_open;
+        }
         A::Stop if session && s.busy() => {
             let Some(asid) = s.selected.clone() else {
                 return false;
@@ -772,7 +966,7 @@ pub fn esc_step(s: &UiState) -> Option<EscStep> {
     if s.show_diff {
         return Some(EscStep::Diff);
     }
-    if s.inspect.is_some() {
+    if s.inspect.is_some() || (s.right_open && s.active_plugin_drawer.is_some()) {
         return Some(EscStep::Pane);
     }
     if s.term.search.open {
@@ -786,6 +980,9 @@ pub fn esc_step(s: &UiState) -> Option<EscStep> {
     }
     if s.error.is_some() {
         return Some(EscStep::Alert);
+    }
+    if s.active_plugin_page.is_some() {
+        return Some(EscStep::Page);
     }
     let session = last_session(s).is_some();
     match s.mode {
@@ -831,16 +1028,30 @@ pub fn escape(s: &mut UiState) -> bool {
             }
         }
         EscStep::Diff => s.show_diff = false,
-        EscStep::Pane => s.close_inspect(),
+        EscStep::Pane => {
+            if s.inspect.is_some() {
+                s.close_inspect();
+            } else {
+                s.close_plugin_drawer();
+            }
+        }
         EscStep::TimelineSearch => s.close_timeline_search(),
         EscStep::TermSearch => s.close_terminal_search_no_tx(),
         EscStep::Search => s.close_search(),
         EscStep::Alert => s.error = None,
-        EscStep::Page => match last_session(s) {
-            Some(_) if s.in_split() => s.mode = Mode::Session,
-            Some(asid) => s.open_session(&asid),
-            None => s.go(Mode::Home),
-        },
+        EscStep::Page => {
+            if s.active_plugin_page.take().is_some()
+                && s.mode == Mode::Session
+                && s.selected.is_some()
+            {
+                return true;
+            }
+            match last_session(s) {
+                Some(_) if s.in_split() => s.mode = Mode::Session,
+                Some(asid) => s.open_session(&asid),
+                None => s.go(Mode::Home),
+            }
+        }
     }
     true
 }
@@ -857,9 +1068,16 @@ mod tests {
     fn no_two_commands_share_a_chord_in_any_context() {
         for platform in PLATFORMS {
             for owner in [Owner::Window, Owner::Composer, Owner::Terminal] {
-                // The composer's and the terminal's keys are heard where the
-                // window's are too, so each is checked against them.
-                let clashes = clashes(platform, |e| e.owner == owner || e.owner == Owner::Window);
+                // The composer's keys are heard where the window's are too;
+                // the terminal captures all keys and only forwards unbound
+                // `Route::App` chords to the window.
+                let clashes = clashes(platform, |e| {
+                    if owner == Owner::Terminal {
+                        e.owner == Owner::Terminal
+                    } else {
+                        e.owner == owner || e.owner == Owner::Window
+                    }
+                });
                 assert!(clashes.is_empty(), "{platform:?} {owner:?}: {clashes:?}");
             }
         }
@@ -997,5 +1215,75 @@ mod tests {
         assert!(escape(&mut s));
         assert!(!s.show_diff);
         assert_eq!(esc_step(&s), None);
+    }
+
+    #[test]
+    fn focused_terminal_keeps_ctrl_b_p_w_for_shell_and_lends_ctrl_shift_and_split_arrows() {
+        use rune::{Env, Key, Mods, Runtime};
+        let mut s = state();
+        s.open_terminal();
+        assert!(s.term.open && s.term.sink.focused);
+        let sidebar_was = s.sidebar.is_open();
+
+        let mut rt = Runtime::new(s, super::super::view, (1440.0, 900.0), Env::new(true, 1.0));
+        rt.on_key = Some(super::super::on_key);
+        rt.frame(0.0);
+
+        let key = |k: Key, ctrl: bool, shift: bool, alt: bool| KeyEvent {
+            key: k,
+            mods: Mods {
+                shift,
+                cmd: ctrl,
+                alt,
+                ctrl,
+                logo: false,
+            },
+        };
+
+        // Direct dispatch and runtime key with Ctrl+B, Ctrl+P, Ctrl+W when terminal is focused:
+        // Must go to the terminal shell, NOT stolen by ToggleSidebar / QuickOpen / RemoveSplit.
+        for c in ['b', 'p', 'w'] {
+            rt.key(key(Key::Command(c), true, false, false));
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.sidebar.is_open(), sidebar_was);
+        assert!(rt.state.palette.is_none());
+        assert_eq!(
+            *rt.state.term.sent_log.borrow(),
+            ["key B ctrl=true", "key P ctrl=true", "key W ctrl=true",]
+        );
+
+        // Ctrl+Shift+B toggles sidebar; Ctrl+Shift+K opens palette.
+        if !crate::platform::is_macos() {
+            rt.key(key(Key::Command('b'), true, true, false));
+            rt.frame(1.0 / 60.0);
+            assert_ne!(rt.state.sidebar.is_open(), sidebar_was);
+        }
+
+        // Split view navigation (`Ctrl+Alt+Arrow`) works from inside a terminal tile.
+        rt.state.open_terminal_tile();
+        assert!(rt.state.in_split());
+        assert_eq!(rt.state.focus, 1);
+        assert!(rt.state.term.sink.focused);
+        rt.frame(1.0 / 60.0);
+
+        rt.key(key(Key::Left, true, false, true));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.focus, 0);
+        assert!(rt.state.draft.focused);
+        assert!(!rt.state.term.sink.focused);
+
+        // And from the session composer, `Ctrl+Alt+Right` moves focus back to the terminal tile!
+        rt.key(key(Key::Right, true, false, true));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.focus, 1);
+        assert!(rt.state.term.sink.focused);
+
+        // Ctrl+Shift+K from inside the terminal tile opens the command palette.
+        if !crate::platform::is_macos() {
+            rt.key(key(Key::Command('k'), true, true, false));
+            rt.frame(1.0 / 60.0);
+            assert!(rt.state.palette.is_some());
+        }
     }
 }

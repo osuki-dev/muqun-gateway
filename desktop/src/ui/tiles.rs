@@ -149,6 +149,9 @@ pub fn fill_plugin_tile(s: &mut UiState, i: usize, plugin_id: &str) {
             kind: plugin_id.to_string(),
             title,
         };
+        if plugin_id == "sysinfo" {
+            s.refresh_runtimes();
+        }
         s.focus_tile(i);
         s.persist_tiles();
     }
@@ -404,6 +407,26 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
             ));
         }
         super::TileContent::Custom { kind, .. } => {
+            let kind_page = kind.clone();
+            let kind_drawer = kind.clone();
+            menu = menu
+                .item(
+                    MenuItem::new(tr(language, "Open as Full-Screen Page")).on_select(
+                        move |s: &mut UiState| {
+                            s.switch_plugin_surface(&kind_page, crate::plugin::PluginSlot::Page);
+                        },
+                    ),
+                )
+                .item(
+                    MenuItem::new(tr(language, "Move to Right Drawer")).on_select(
+                        move |s: &mut UiState| {
+                            s.switch_plugin_surface(
+                                &kind_drawer,
+                                crate::plugin::PluginSlot::Drawer,
+                            );
+                        },
+                    ),
+                );
             if let Some(plugin) = s.plugins.get(kind) {
                 for cmd in plugin.commands() {
                     let cmd_id = cmd.id;
@@ -837,9 +860,10 @@ fn tile(
                 look,
                 tile_id: id,
                 scale,
+                surface: crate::plugin::PluginSlot::Tile,
             };
             if let Some(plugin) = s.plugins.get(kind) {
-                if let Some(view) = plugin.render_tile(&ctx, layer) {
+                if let Some(view) = plugin.render_surface(&ctx, layer) {
                     body = body.child(view);
                 }
             }
@@ -851,9 +875,10 @@ fn tile(
                 look,
                 tile_id: "diff",
                 scale,
+                surface: crate::plugin::PluginSlot::Tile,
             };
             if let Some(plugin) = s.plugins.get("diff") {
-                if let Some(view) = plugin.render_tile(&ctx, layer) {
+                if let Some(view) = plugin.render_surface(&ctx, layer) {
                     body = body.child(view);
                 }
             }
@@ -897,9 +922,22 @@ fn tile(
 /// The gap between the two halves of the split at `path`: the window shows
 /// through it, and dragging it moves the split. `room` is the length the
 /// halves share along the split.
-fn gap(s: &UiState, _k: &Kit, path: &[bool], across: bool, ratio: f32, room: f32) -> El {
+fn gap(s: &UiState, k: &Kit, path: &[bool], across: bool, ratio: f32, room: f32) -> El {
     let key = path_key("tile-gap", path);
     let path_clone = path.to_vec();
+    let is_dragging = s.tile_drag.as_ref() == Some(&path_clone);
+
+    let line_color = if is_dragging {
+        k.c.bg_accent
+    } else {
+        k.c.border_muted.alpha(0.6)
+    };
+    let grip_color = if is_dragging {
+        k.c.bg_accent
+    } else {
+        k.c.text_muted.alpha(0.7)
+    };
+
     let path_drag = path_clone.clone();
     let mut handle = el()
         .key(key)
@@ -929,11 +967,37 @@ fn gap(s: &UiState, _k: &Kit, path: &[bool], across: bool, ratio: f32, room: f32
             },
         );
 
-    handle = if across {
-        handle.w(GAP).h_full()
+    if across {
+        let center_offset = (room * 0.5 - 16.0).max(0.0);
+        handle = handle
+            .w(GAP)
+            .h_full()
+            .center()
+            .child(el().w(1.0).h_full().fill(line_color))
+            .child(
+                el().absolute(2.0, center_offset)
+                    .w(4.0)
+                    .h(32.0)
+                    .radius(2.0)
+                    .fill(grip_color)
+                    .hover(k.c.bg_accent),
+            );
     } else {
-        handle.h(GAP).w_full()
-    };
+        let center_offset = (room * 0.5 - 16.0).max(0.0);
+        handle = handle
+            .h(GAP)
+            .w_full()
+            .center()
+            .child(el().h(1.0).w_full().fill(line_color))
+            .child(
+                el().absolute(center_offset, 2.0)
+                    .w(32.0)
+                    .h(4.0)
+                    .radius(2.0)
+                    .fill(grip_color)
+                    .hover(k.c.bg_accent),
+            );
+    }
     handle
 }
 
@@ -1040,12 +1104,7 @@ pub fn view(s: &UiState, k: &Kit, clear: f32, scale: f32, layer: &mut Vec<El>) -
             .key("tiles")
             .pin(
                 Some(0.0),
-                // An error card above them keeps the row's place.
-                Some(if s.error.is_some() {
-                    0.0
-                } else {
-                    -rune_kit::shell::TOOLBAR_HEIGHT
-                }),
+                Some(-rune_kit::shell::TOOLBAR_HEIGHT),
                 Some(0.0),
                 Some(0.0),
             )

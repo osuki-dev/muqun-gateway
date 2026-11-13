@@ -776,14 +776,6 @@ impl DaemonSession {
         if let Ok(mut child_guard) = self.child.lock() {
             child_guard.take();
         }
-        #[cfg(unix)]
-        if let Some(pid) = self.shell_pid {
-            unsafe {
-                let p = pid as libc::pid_t;
-                libc::kill(-p, libc::SIGHUP);
-                libc::kill(p, libc::SIGHUP);
-            }
-        }
     }
 }
 

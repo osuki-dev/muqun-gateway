@@ -757,7 +757,7 @@ impl Core {
             } => {
                 let inbox = self.inbox.clone();
                 let cwd_clone = cwd.clone();
-                tokio::task::spawn_blocking(move || {
+                let _ = tokio::task::spawn_blocking(move || {
                     let path = PathBuf::from(&cwd_clone);
                     match crate::model::git_ops::git_commit(&path, &message) {
                         Ok(summary) => {
@@ -790,7 +790,8 @@ impl Core {
                             }));
                         }
                     }
-                });
+                })
+                .await;
                 if let Some(asid) = asid {
                     tokio::spawn(self.clone().diff(asid));
                 }
@@ -806,7 +807,7 @@ impl Core {
             Command::GitPush { cwd, asid } => {
                 let inbox = self.inbox.clone();
                 let cwd_clone = cwd.clone();
-                tokio::task::spawn_blocking(move || {
+                let _ = tokio::task::spawn_blocking(move || {
                     let path = PathBuf::from(&cwd_clone);
                     match crate::model::git_ops::git_push(&path) {
                         Ok(msg) => {
@@ -822,7 +823,8 @@ impl Core {
                             }));
                         }
                     }
-                });
+                })
+                .await;
                 if let Some(asid) = asid {
                     tokio::spawn(self.clone().diff(asid));
                 }
@@ -921,6 +923,25 @@ impl Core {
                             inbox.push(Update::UpdateState(UpdateState::Failed(err.to_string())));
                         }
                     }
+                });
+            }
+            Command::ProbeRuntimes => {
+                let inbox = self.inbox.clone();
+                tokio::task::spawn_blocking(move || {
+                    let statuses = muqun_gateway::platform::runtimes::probe_all();
+                    inbox.push(Update::Runtimes(statuses));
+                });
+            }
+            Command::InstallManagedRuntime(kind) => {
+                let inbox = self.inbox.clone();
+                tokio::spawn(async move {
+                    let result =
+                        muqun_gateway::platform::runtimes::install_managed(kind, None, None)
+                            .await
+                            .map_err(|e| format!("{e:#}"));
+                    inbox.push(Update::RuntimeInstalled { kind, result });
+                    let statuses = muqun_gateway::platform::runtimes::probe_all();
+                    inbox.push(Update::Runtimes(statuses));
                 });
             }
             Command::CompleteDirectory { .. } | Command::Edit(_) => {

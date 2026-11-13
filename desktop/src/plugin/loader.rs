@@ -4,18 +4,51 @@
 //! parses their manifests, and instantiates [`ExternalPlugin`] which implements
 //! [`DesktopPlugin`].
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
+use muqun_gateway::platform::runtimes::{self, RuntimeKind};
 use rune::{col, el, icon, row, text, El, Icon};
-use rune_kit::{Button, ButtonVariant, ControlSize, Markdown};
+use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Markdown};
 
 use crate::config::Language;
-use crate::plugin::manifest::{PluginCategory, PluginManifest};
-use crate::plugin::{DesktopPlugin, PluginCommand, PluginViewContext};
+use crate::plugin::manifest::{
+    PluginCategory, PluginCommandManifest, PluginManifest, PluginRenderKind, PluginSlot,
+};
+use crate::plugin::{surface_switcher, DesktopPlugin, PluginCommand, PluginViewContext};
 use crate::ui::copy::tr_ref;
 use crate::ui::icons;
 use crate::ui::terminal_panel;
-use crate::ui::UiState;
+use crate::ui::{ToastLevel, UiState};
+
+/// Maximum execution time for a synchronous Bun plugin command script.
+const BUN_SCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Structured toast notification returned by a Bun plugin script on stdout.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BunToastResponse {
+    pub title: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub level: Option<String>,
+}
+
+/// Structured JSON response returned by a Bun plugin script on stdout.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BunScriptResponse {
+    #[serde(default)]
+    pub toast: Option<BunToastResponse>,
+    #[serde(default)]
+    pub open_url: Option<String>,
+    #[serde(default)]
+    pub markdown: Option<String>,
+    #[serde(default)]
+    pub composer_text: Option<String>,
+}
 
 /// An external file-based plugin loaded from a `plugin.json` manifest.
 pub struct ExternalPlugin {
@@ -23,6 +56,12 @@ pub struct ExternalPlugin {
     manifest: PluginManifest,
     dir: PathBuf,
     commands: Vec<PluginCommand>,
+    dynamic_markdown: Mutex<Option<String>>,
+    /// Optional override for the Bun binary resolution:
+    /// - `None`: resolve via `muqun_gateway::platform::runtimes::resolve_binary(RuntimeKind::Bun, None)`
+    /// - `Some(Some(path))`: resolve with `configured = Some(path)`
+    /// - `Some(None)`: force Bun unavailable (used for testing missing-runtime fallback)
+    bun_binary_override: Mutex<Option<Option<PathBuf>>>,
 }
 
 impl ExternalPlugin {
@@ -51,7 +90,19 @@ impl ExternalPlugin {
             manifest,
             dir,
             commands,
+            dynamic_markdown: Mutex::new(None),
+            bun_binary_override: Mutex::new(None),
         }
+    }
+
+    /// Configure an explicit Bun binary path (or `None` to simulate missing Bun in tests).
+    pub fn set_bun_binary_override(&self, override_bin: Option<Option<PathBuf>>) {
+        *self.bun_binary_override.lock().unwrap() = override_bin;
+    }
+
+    /// Return the latest dynamic markdown produced by a Bun script execution, if any.
+    pub fn dynamic_markdown(&self) -> Option<String> {
+        self.dynamic_markdown.lock().unwrap().clone()
     }
 
     /// Load an external plugin from a directory containing `plugin.json`.
@@ -74,8 +125,252 @@ impl ExternalPlugin {
         &self.dir
     }
 
-    /// Attempt to load markdown content from configured tile entry or README.md.
+    fn resolve_script_path(&self, raw: &str) -> PathBuf {
+        let trimmed = raw.strip_prefix("bun:").unwrap_or(raw).trim();
+        let p = Path::new(trimmed);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.dir.join(p)
+        }
+    }
+
+    fn is_script_reference(s: &str) -> bool {
+        let lower = s.trim().to_ascii_lowercase();
+        lower.starts_with("bun:")
+            || lower.ends_with(".ts")
+            || lower.ends_with(".js")
+            || lower.ends_with(".mjs")
+            || lower.ends_with(".tsx")
+            || lower.ends_with(".jsx")
+    }
+
+    /// Determine whether a command should execute a Bun script, returning its script path.
+    fn script_for_command(&self, cmd: &PluginCommandManifest) -> Option<PathBuf> {
+        if let Some(script) = &cmd.script {
+            if !script.trim().is_empty() {
+                return Some(self.resolve_script_path(script));
+            }
+        }
+        if let Some(action) = &cmd.action {
+            if Self::is_script_reference(action) {
+                return Some(self.resolve_script_path(action));
+            }
+        }
+        if let PluginRenderKind::BunScript { entry } = self.manifest.render_kind() {
+            return Some(self.resolve_script_path(&entry));
+        }
+        None
+    }
+
+    fn resolve_bun_binary(&self) -> Option<PathBuf> {
+        let guard = self.bun_binary_override.lock().unwrap().clone();
+        match guard {
+            Some(None) => None,
+            Some(Some(cfg)) => runtimes::resolve_binary(RuntimeKind::Bun, Some(&cfg)),
+            None => {
+                let env_override = std::env::var("MUQUN_BUN_BINARY")
+                    .ok()
+                    .map(PathBuf::from)
+                    .filter(|p| !p.as_os_str().is_empty());
+                runtimes::resolve_binary(RuntimeKind::Bun, env_override.as_deref())
+            }
+        }
+    }
+
+    /// Execute a Bun `.ts` / `.js` script and apply its output to `UiState`.
+    fn execute_bun_script(
+        &self,
+        s: &mut UiState,
+        command_id: &str,
+        command_title: &str,
+        script_path: &Path,
+    ) -> bool {
+        let Some(bun_bin) = self.resolve_bun_binary() else {
+            s.notify(
+                ToastLevel::Warning,
+                format!("{}: Bun runtime required", self.manifest.name),
+                Some(
+                    "Bun is not installed. Open System & Diagnostics to install the managed Bun runtime."
+                        .to_string(),
+                ),
+            );
+            return true;
+        };
+
+        if !script_path.is_file() {
+            s.notify(
+                ToastLevel::Error,
+                format!("{}: Script not found", self.manifest.name),
+                Some(format!("Missing script file `{}`", script_path.display())),
+            );
+            return true;
+        }
+
+        let workspace_cwd = s
+            .current()
+            .and_then(|i| i.directory.clone())
+            .unwrap_or_else(|| s.terminal_cwd().display().to_string());
+        let session_id = s.selected.clone().unwrap_or_default();
+
+        let mut command = ProcessCommand::new(&bun_bin);
+        command
+            .arg("run")
+            .arg(script_path)
+            .current_dir(&self.dir)
+            .env("MUQUN_PLUGIN_ID", self.id)
+            .env("MUQUN_PLUGIN_DIR", self.dir.as_os_str())
+            .env("MUQUN_WORKSPACE_CWD", &workspace_cwd)
+            .env("MUQUN_SESSION_ID", &session_id)
+            .env("MUQUN_COMMAND_ID", command_id)
+            .env("MUQUN_SCRIPT_PATH", script_path.as_os_str())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = match command.spawn() {
+            Ok(c) => c,
+            Err(err) => {
+                s.notify(
+                    ToastLevel::Error,
+                    format!("{}: Failed to start Bun", self.manifest.name),
+                    Some(err.to_string()),
+                );
+                return true;
+            }
+        };
+
+        let deadline = Instant::now() + BUN_SCRIPT_TIMEOUT;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break st,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    s.notify(
+                        ToastLevel::Error,
+                        format!("{}: Script timed out", self.manifest.name),
+                        Some(format!(
+                            "`{}` exceeded {:?}",
+                            script_path.display(),
+                            BUN_SCRIPT_TIMEOUT
+                        )),
+                    );
+                    return true;
+                }
+                Err(err) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    s.notify(
+                        ToastLevel::Error,
+                        format!("{}: Execution error", self.manifest.name),
+                        Some(err.to_string()),
+                    );
+                    return true;
+                }
+            }
+        };
+
+        let mut stdout_bytes = Vec::new();
+        if let Some(out) = child.stdout.take() {
+            let _ = out.take(64 * 1024).read_to_end(&mut stdout_bytes);
+        }
+        let mut stderr_bytes = Vec::new();
+        if let Some(err) = child.stderr.take() {
+            let _ = err.take(16 * 1024).read_to_end(&mut stderr_bytes);
+        }
+
+        let stdout_str = String::from_utf8_lossy(&stdout_bytes).trim().to_string();
+        let stderr_str = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+
+        if !status.success() {
+            let detail = if !stderr_str.is_empty() {
+                stderr_str
+            } else if !stdout_str.is_empty() {
+                stdout_str
+            } else {
+                format!("Exited with status {status}")
+            };
+            s.notify(
+                ToastLevel::Error,
+                format!("{}: {} failed", self.manifest.name, command_title),
+                Some(detail),
+            );
+            return true;
+        }
+
+        // Parse structured JSON response from full stdout or the last JSON line.
+        let parsed_json = serde_json::from_str::<BunScriptResponse>(&stdout_str).or_else(|_| {
+            stdout_str
+                .lines()
+                .rev()
+                .find(|line| line.trim_start().starts_with('{'))
+                .ok_or_else(|| serde::de::Error::custom("no json line"))
+                .and_then(serde_json::from_str::<BunScriptResponse>)
+        });
+
+        if let Ok(resp) = parsed_json {
+            if let Some(md) = resp.markdown {
+                *self.dynamic_markdown.lock().unwrap() = Some(md);
+            }
+            if let Some(url) = resp.open_url {
+                if !url.trim().is_empty() {
+                    crate::platform::shell::open_url(&url);
+                }
+            }
+            if let Some(composer_text) = resp.composer_text {
+                if !composer_text.trim().is_empty() {
+                    s.insert_into_composer(&composer_text);
+                }
+            }
+            if let Some(toast) = resp.toast {
+                let level = match toast
+                    .level
+                    .as_deref()
+                    .unwrap_or("info")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "success" | "ok" => ToastLevel::Success,
+                    "warning" | "warn" => ToastLevel::Warning,
+                    "error" | "err" | "danger" => ToastLevel::Error,
+                    _ => ToastLevel::Info,
+                };
+                s.notify(level, toast.title, toast.detail);
+            } else {
+                s.notify(
+                    ToastLevel::Success,
+                    format!("{}: {}", self.manifest.name, command_title),
+                    None,
+                );
+            }
+        } else if !stdout_str.is_empty() {
+            *self.dynamic_markdown.lock().unwrap() = Some(stdout_str.clone());
+            s.notify(
+                ToastLevel::Success,
+                format!("{}: {}", self.manifest.name, command_title),
+                Some(stdout_str),
+            );
+        } else {
+            s.notify(
+                ToastLevel::Success,
+                format!("{}: {}", self.manifest.name, command_title),
+                None,
+            );
+        }
+
+        true
+    }
+
+    /// Attempt to load markdown content from dynamic output, configured tile entry, or README.md.
     fn load_markdown_content(&self) -> Option<String> {
+        if let Some(dynamic) = self.dynamic_markdown() {
+            return Some(dynamic);
+        }
+
         if let Some(tile) = &self.manifest.tile {
             if tile.kind == "markdown"
                 || tile
@@ -136,17 +431,26 @@ impl DesktopPlugin for ExternalPlugin {
         self.manifest.category()
     }
 
-    fn supports_tile(&self) -> bool {
-        true
+    fn surfaces(&self) -> Vec<PluginSlot> {
+        self.manifest.supported_surfaces()
     }
 
-    fn render_tile(&self, ctx: &PluginViewContext<'_>, _layer: &mut Vec<El>) -> Option<El> {
+    fn render_kind(&self) -> PluginRenderKind {
+        self.manifest.render_kind()
+    }
+
+    fn supports_tile(&self) -> bool {
+        self.supports_surface(PluginSlot::Tile)
+    }
+
+    fn render_tile(&self, ctx: &PluginViewContext<'_>, layer: &mut Vec<El>) -> Option<El> {
         let k = ctx.k;
         let s = ctx.s;
         let look = ctx.look;
         let lang = s.cfg.general.language;
         let tile_id = ctx.tile_id;
         let pid = self.id.to_string();
+        let render_kind = self.manifest.render_kind();
 
         let header_icon = icon(self.icon(), 14.0).color(k.c.text_accent);
         let title_text = text(&self.manifest.name)
@@ -169,8 +473,25 @@ impl DesktopPlugin for ExternalPlugin {
             .child(header_icon)
             .child(title_text)
             .child(category_badge)
-            .child(version_badge)
-            .child(el().grow(1.0));
+            .child(version_badge);
+
+        if matches!(render_kind, PluginRenderKind::BunScript { .. }) {
+            header = header.child(
+                Badge::new("Bun")
+                    .variant(BadgeVariant::Accent)
+                    .build(k)
+                    .key(format!("bun-badge-{tile_id}")),
+            );
+        } else if matches!(render_kind, PluginRenderKind::TerminalTui { .. }) {
+            header = header.child(
+                Badge::new("TUI")
+                    .variant(BadgeVariant::Subtle)
+                    .build(k)
+                    .key(format!("tui-badge-{tile_id}")),
+            );
+        }
+
+        header = header.child(el().grow(1.0));
 
         if let Some(author) = &self.manifest.author {
             header = header.child(
@@ -180,14 +501,84 @@ impl DesktopPlugin for ExternalPlugin {
             );
         }
 
+        header = header.child(surface_switcher(k, lang, self.id, ctx.surface));
+
         let divider = el().w_full().h(1.0).fill(k.alpha(k.c.border_weak, 0.35));
+
+        if let PluginRenderKind::TerminalTui { command, cwd } = &render_kind {
+            let cmd_str = command.join(" ");
+            let cwd_opt = cwd.clone();
+            let pid_launch = pid.clone();
+            let tui_bar = row()
+                .w_full()
+                .h(36.0)
+                .px(12.0)
+                .gap(8.0)
+                .center_y()
+                .fill(k.alpha(k.c.layer_01, 0.3))
+                .child(icon(&terminal_panel::TERMINAL_WINDOW, 13.0).color(k.c.text_accent))
+                .child(
+                    text(if cmd_str.is_empty() {
+                        tr_ref(lang, "Interactive Terminal TUI").to_string()
+                    } else {
+                        format!("$ {cmd_str}")
+                    })
+                    .font(k.ty.mono)
+                    .color(k.c.text_base)
+                    .truncate(),
+                )
+                .child(el().grow(1.0))
+                .child(
+                    Button::new(tr_ref(lang, "Launch in Terminal"))
+                        .variant(ButtonVariant::Outline)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut UiState| {
+                            if let Some(p) = s.plugins.get(&pid_launch) {
+                                p.on_command(s, "__run_entry__");
+                            } else {
+                                let dir = cwd_opt
+                                    .as_ref()
+                                    .map(PathBuf::from)
+                                    .unwrap_or_else(|| s.terminal_cwd());
+                                let run_cmd = if cmd_str.is_empty() {
+                                    None
+                                } else {
+                                    Some(format!("{cmd_str}\n"))
+                                };
+                                s.term_new_tab_in(dir, run_cmd);
+                            }
+                        })
+                        .build(k)
+                        .key(format!("tui-launch-{tile_id}")),
+                );
+
+            let scheme = if k.dark {
+                crate::theme::color_scheme::ColorScheme::Dark
+            } else {
+                crate::theme::color_scheme::ColorScheme::Light
+            };
+            let term_view = terminal_panel::tile_body(s, k, scheme, ctx.scale, layer);
+            return Some(
+                col()
+                    .key(format!("ext-plugin-tui-{}-{}", self.id, tile_id))
+                    .grow(1.0)
+                    .w_full()
+                    .min_h(0.0)
+                    .child(header)
+                    .child(divider)
+                    .child(tui_bar)
+                    .child(term_view),
+            );
+        }
 
         let md_content = self.load_markdown_content();
 
         let body = if let Some(content) = md_content {
             let mut col_inner = col().w_full().max_w(760.0).px(24.0).py(16.0).gap(12.0);
 
-            if !self.manifest.commands.is_empty() {
+            if !self.manifest.commands.is_empty()
+                || matches!(render_kind, PluginRenderKind::BunScript { .. })
+            {
                 let mut cmd_bar = row()
                     .w_full()
                     .wrap()
@@ -198,6 +589,22 @@ impl DesktopPlugin for ExternalPlugin {
                     .fill(k.alpha(k.c.layer_01, 0.3))
                     .radius(k.radius.sm)
                     .border(1.0, k.alpha(k.c.border_weak, 0.3));
+
+                if let PluginRenderKind::BunScript { entry } = &render_kind {
+                    let pid_run = pid.clone();
+                    cmd_bar = cmd_bar.child(
+                        Button::new(format!("{} ({entry})", tr_ref(lang, "Run Script")))
+                            .variant(ButtonVariant::Outline)
+                            .control_size(ControlSize::Small)
+                            .on_press(move |s: &mut UiState| {
+                                if let Some(p) = s.plugins.get(&pid_run) {
+                                    p.on_command(s, "__run_entry__");
+                                }
+                            })
+                            .build(k)
+                            .key(format!("bun-run-entry-{tile_id}")),
+                    );
+                }
 
                 for cmd in &self.manifest.commands {
                     let cmd_id = cmd.id.clone();
@@ -257,6 +664,49 @@ impl DesktopPlugin for ExternalPlugin {
                 k.radius.md,
             );
             content_col = content_col.child(desc_card);
+
+            if let PluginRenderKind::BunScript { entry } = &render_kind {
+                let pid_run = pid.clone();
+                let bun_card = look.row_card(
+                    k,
+                    row()
+                        .w_full()
+                        .px(14.0)
+                        .py(12.0)
+                        .gap(10.0)
+                        .center_y()
+                        .child(icon(&icons::RUNNING, 13.0).color(k.c.text_accent))
+                        .child(
+                            col()
+                                .grow(1.0)
+                                .gap(2.0)
+                                .child(
+                                    text(tr_ref(lang, "Bun Script Host"))
+                                        .font(k.ty.ui_medium)
+                                        .color(k.c.text_base),
+                                )
+                                .child(
+                                    text(format!("Entry: {entry}"))
+                                        .font(k.ty.mono)
+                                        .color(k.c.text_muted),
+                                ),
+                        )
+                        .child(
+                            Button::new(tr_ref(lang, "Run"))
+                                .variant(ButtonVariant::Outline)
+                                .control_size(ControlSize::Small)
+                                .on_press(move |s: &mut UiState| {
+                                    if let Some(p) = s.plugins.get(&pid_run) {
+                                        p.on_command(s, "__run_entry__");
+                                    }
+                                })
+                                .build(k)
+                                .key(format!("bun-card-run-{tile_id}")),
+                        ),
+                    k.radius.md,
+                );
+                content_col = content_col.child(bun_card);
+            }
 
             if let Some(tile) = &self.manifest.tile {
                 if tile.kind == "webview" {
@@ -375,7 +825,42 @@ impl DesktopPlugin for ExternalPlugin {
     }
 
     fn on_command(&self, s: &mut UiState, command_id: &str) -> bool {
+        if command_id == "__run_entry__" {
+            match self.manifest.render_kind() {
+                PluginRenderKind::BunScript { entry } => {
+                    let script_path = self.resolve_script_path(&entry);
+                    return self.execute_bun_script(
+                        s,
+                        command_id,
+                        &self.manifest.name,
+                        &script_path,
+                    );
+                }
+                PluginRenderKind::TerminalTui { command, cwd } => {
+                    let dir = cwd
+                        .as_ref()
+                        .map(|c| {
+                            let p = Path::new(c);
+                            if p.is_absolute() {
+                                p.to_path_buf()
+                            } else {
+                                self.dir.join(p)
+                            }
+                        })
+                        .unwrap_or_else(|| s.terminal_cwd());
+                    let cmd_str = command.join(" ");
+                    let run_cmd = (!cmd_str.is_empty()).then(|| format!("{cmd_str}\n"));
+                    s.term_new_tab_in(dir, run_cmd);
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+
         if let Some(cmd) = self.manifest.commands.iter().find(|c| c.id == command_id) {
+            if let Some(script_path) = self.script_for_command(cmd) {
+                return self.execute_bun_script(s, command_id, &cmd.title, &script_path);
+            }
             if let Some(action) = &cmd.action {
                 if action.starts_with("http://") || action.starts_with("https://") {
                     crate::platform::shell::open_url(action);
@@ -636,16 +1121,22 @@ mod tests {
             author: Some("Tester".to_string()),
             category: Some(PluginCategory::Tools),
             icon: Some("terminal".to_string()),
+            runtime: None,
+            entry: None,
+            surfaces: vec![],
             commands: vec![PluginCommandManifest {
                 id: "ext.run".to_string(),
                 title: "Run Command".to_string(),
                 shortcut: Some("Ctrl+R".to_string()),
                 action: Some("Executed test".to_string()),
+                script: None,
             }],
             tile: Some(PluginTileManifest {
                 kind: "command".to_string(),
                 title: "Command Tile".to_string(),
                 entry: None,
+                command: None,
+                cwd: None,
             }),
         };
 
@@ -669,5 +1160,94 @@ mod tests {
         assert!(plugin.on_command(&mut s, "ext.run"));
         assert!(!s.toasts.is_empty());
         assert!(!plugin.on_command(&mut s, "unknown.command"));
+    }
+
+    #[test]
+    fn external_plugin_bun_script_execution_and_missing_runtime_toast() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("muqun_test_bun_plugin_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let script_file = temp_dir.join("index.ts");
+        std::fs::write(&script_file, "// mock ts script\n").unwrap();
+
+        // Create a mock `bun` binary in the temp directory that verifies env vars and outputs JSON.
+        let mock_bun = temp_dir.join("mock-bun");
+        std::fs::write(
+            &mock_bun,
+            r##"#!/bin/sh
+printf '{"toast":{"title":"Bun Executed %s","detail":"session=%s cmd=%s","level":"success"},"markdown":"# Dynamic Output from %s","composer_text":"generated prompt from bun"}\n' "$MUQUN_PLUGIN_ID" "$MUQUN_SESSION_ID" "$MUQUN_COMMAND_ID" "$MUQUN_PLUGIN_ID"
+"##,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&mock_bun, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let manifest_json = r#"{
+            "id": "bun-demo",
+            "name": "Bun Demo Plugin",
+            "version": "1.0.0",
+            "description": "Demonstrates Bun script execution",
+            "runtime": "bun",
+            "entry": "index.ts",
+            "surfaces": ["page", "tile", "drawer"],
+            "commands": [
+                {
+                    "id": "bun.analyze",
+                    "title": "Analyze Workspace",
+                    "shortcut": "Ctrl+Shift+Y",
+                    "script": "index.ts"
+                }
+            ]
+        }"#;
+        std::fs::write(temp_dir.join("plugin.json"), manifest_json).unwrap();
+
+        let plugin = ExternalPlugin::from_dir(&temp_dir).expect("bun plugin loads");
+        assert_eq!(
+            plugin.render_kind(),
+            PluginRenderKind::BunScript {
+                entry: "index.ts".to_string()
+            }
+        );
+
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.selected = Some("sess-42".to_string());
+
+        // 1. Simulate missing Bun runtime -> shows informative warning toast
+        plugin.set_bun_binary_override(Some(None));
+        s.toasts.clear();
+        assert!(plugin.on_command(&mut s, "bun.analyze"));
+        assert_eq!(s.toasts.len(), 1);
+        assert_eq!(s.toasts[0].level, ToastLevel::Warning);
+        assert!(s.toasts[0].title.contains("Bun runtime required"));
+        assert!(s.toasts[0]
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("System & Diagnostics"));
+
+        // 2. Configure mock Bun binary -> executes script, parses JSON stdout, updates markdown & composer & toast
+        plugin.set_bun_binary_override(Some(Some(mock_bun)));
+        s.toasts.clear();
+        s.draft.text.clear();
+        assert!(plugin.on_command(&mut s, "bun.analyze"));
+        assert_eq!(s.toasts.len(), 1);
+        assert_eq!(s.toasts[0].level, ToastLevel::Success);
+        assert_eq!(s.toasts[0].title, "Bun Executed bun-demo");
+        assert_eq!(
+            s.toasts[0].detail.as_deref(),
+            Some("session=sess-42 cmd=bun.analyze")
+        );
+        assert_eq!(
+            plugin.dynamic_markdown().as_deref(),
+            Some("# Dynamic Output from bun-demo")
+        );
+        assert!(s.draft.text.contains("generated prompt from bun"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

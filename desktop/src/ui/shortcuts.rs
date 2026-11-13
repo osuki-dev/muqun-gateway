@@ -193,7 +193,11 @@ pub fn conflicts(language: Language) -> (Vec<String>, Vec<String>) {
         .into_iter()
         .flat_map(|owner| {
             keymap::clashes(platform, move |e| {
-                e.owner == owner || e.owner == Owner::Window
+                if owner == Owner::Terminal {
+                    e.owner == Owner::Terminal
+                } else {
+                    e.owner == owner || e.owner == Owner::Window
+                }
             })
         })
         .map(|(a, b, keys)| {

@@ -134,6 +134,9 @@ pub struct TermHoverLink {
     pub col_end: u16,
 }
 
+/// How long the Herdr `Ctrl+Space` prefix remains armed waiting for the next key.
+pub const PREFIX_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// What the panel keeps between frames.
 pub struct TermPanel {
     pub open: bool,
@@ -150,6 +153,8 @@ pub struct TermPanel {
     pub search: TermSearchState,
     /// Hovered link under pointer when Ctrl/Cmd is held.
     pub hover_link: Option<TermHoverLink>,
+    /// When the Herdr `Ctrl+Space` prefix was armed.
+    pub prefix_armed: Option<std::time::Instant>,
     /// Screenshot scenes: what a program would print at a size, replayed
     /// into a fresh emulator instead of a live shell.
     pub fixture: Option<fn(u16, u16) -> Vec<u8>>,
@@ -195,6 +200,7 @@ impl TermPanel {
             waker: None,
             search: TermSearchState::default(),
             hover_link: None,
+            prefix_armed: None,
             fixture: None,
             fixture_ended: None,
             error: None,
@@ -210,6 +216,12 @@ impl TermPanel {
             #[cfg(test)]
             sent_log: Default::default(),
         }
+    }
+
+    /// Whether the Herdr `Ctrl+Space` prefix is currently armed and within timeout.
+    pub fn is_prefix_armed(&self) -> bool {
+        self.prefix_armed
+            .is_some_and(|at| at.elapsed() < PREFIX_TIMEOUT)
     }
 
     /// Whether the panel is in the window (open, or sliding shut over a
@@ -482,14 +494,21 @@ impl UiState {
     pub fn toggle_terminal(&mut self) {
         if let Some(i) = self.tile_of_terminal() {
             if self.focus == i && self.term.sink.focused {
-                let next = if i > 0 {
-                    i - 1
-                } else if self.tiles.len() > 1 {
-                    1
+                let next = (0..self.tiles.len())
+                    .find(|&j| j != i && !self.tiles[j].is_terminal())
+                    .unwrap_or(if i > 0 {
+                        i - 1
+                    } else if self.tiles.len() > 1 {
+                        1
+                    } else {
+                        0
+                    });
+                if next != i {
+                    self.focus_tile(next);
                 } else {
-                    0
-                };
-                self.focus_tile(next);
+                    self.term.sink.focused = false;
+                    self.draft.focused = true;
+                }
             } else {
                 self.focus_tile(i);
                 self.focus_terminal();
@@ -502,6 +521,91 @@ impl UiState {
             self.close_terminal();
         } else {
             self.focus_terminal();
+        }
+    }
+
+    pub fn toggle_terminal_tx(&mut self, tx: &mut Tx) {
+        self.toggle_terminal();
+        if self.term.sink.focused {
+            tx.focus("terminal-keys", false);
+        } else if self.draft.focused {
+            tx.focus("draft", false);
+        }
+    }
+
+    /// Switch keyboard focus between the session composer and the terminal
+    /// without closing the terminal panel. Opens the terminal if closed.
+    pub fn toggle_focus(&mut self) {
+        if self.in_split() {
+            if self.tiles.get(self.focus).is_some_and(|t| t.is_terminal()) && self.term.sink.focused
+            {
+                if let Some(j) = (0..self.tiles.len()).find(|&j| !self.tiles[j].is_terminal()) {
+                    self.focus_tile(j);
+                } else {
+                    self.term.sink.focused = false;
+                    self.draft.focused = true;
+                }
+            } else if let Some(i) = self.tile_of_terminal() {
+                self.focus_tile(i);
+                self.focus_terminal();
+            } else if self.term.open {
+                self.focus_terminal();
+            } else {
+                self.open_terminal();
+            }
+            return;
+        }
+        if self.term.open && self.term.sink.focused {
+            self.term.sink.focused = false;
+            if self.mode == super::Mode::Home {
+                self.start_draft.focused = true;
+            } else {
+                self.draft.focused = true;
+            }
+        } else if self.term.open {
+            self.focus_terminal();
+        } else {
+            self.open_terminal();
+        }
+    }
+
+    pub fn toggle_focus_tx(&mut self, tx: &mut Tx) {
+        self.toggle_focus();
+        if self.term.sink.focused {
+            tx.focus("terminal-keys", false);
+        } else if self.draft.focused {
+            tx.focus("draft", false);
+        }
+    }
+
+    /// Split a terminal pane with explicit orientation (`across`: true for
+    /// vertical side-by-side split, false for horizontal top/bottom split).
+    pub fn split_terminal_with_axis(&mut self, across: bool) {
+        if self.in_split() {
+            self.split_terminal_tile();
+        } else {
+            self.open_terminal_tile();
+        }
+        let target = self.focus;
+        let mut tree = self.tile_layout();
+        set_leaf_parent_across(&mut tree, target, across);
+        self.tile_tree = tree;
+        self.persist_tiles();
+    }
+
+    /// Toggle terminal zoom/maximize (expands panel width or split ratio).
+    pub fn toggle_terminal_zoom(&mut self) {
+        if self.in_split() {
+            let target = self.focus;
+            let mut tree = self.tile_layout();
+            toggle_leaf_parent_zoom(&mut tree, target);
+            self.tile_tree = tree;
+            self.persist_tiles();
+        } else if self.term.open {
+            let cur = self.term.pane.width();
+            let next = if cur < 800.0 { 960.0 } else { 560.0 };
+            self.term.pane = self.term.pane.with_width(next);
+            self.term.pane.set_open(true);
         }
     }
 
@@ -1163,6 +1267,15 @@ impl UiState {
     pub fn poll_terminal(&mut self, now: f64, tx: &mut Tx) -> bool {
         self.term.now = now;
         let mut changed = false;
+        if let Some(armed_at) = self.term.prefix_armed {
+            let elapsed = armed_at.elapsed();
+            if elapsed >= PREFIX_TIMEOUT {
+                self.term.prefix_armed = None;
+                changed = true;
+            } else {
+                tx.wake_after(PREFIX_TIMEOUT.saturating_sub(elapsed));
+            }
+        }
         let dragging = self.term.pane.is_resizing() || self.tile_drag.is_some();
         if let Some(size) = self.term.resize.due(now, dragging) {
             if self.term.size != Some(size) {
@@ -1270,17 +1383,92 @@ impl UiState {
 
     /// A key while the terminal has the keyboard (the sink's key handler).
     pub(crate) fn terminal_key(&mut self, ev: &KeyEvent, tx: &mut Tx) -> bool {
-        // Split view pane navigation from terminal:
-        if self.in_split() && super::tiles::arrow_key(self, ev) {
-            return true;
-        }
-
         let mac = crate::platform::keys::Style::current() == crate::platform::keys::Style::Symbols;
         let letter =
             |c: char| matches!(&ev.key, rune::Key::Command(k) if k.eq_ignore_ascii_case(&c));
 
+        // 1. Herdr prefix (`Ctrl+Space`) state machine when armed:
+        if self.term.is_prefix_armed() {
+            return self.handle_prefix_key(ev, tx);
+        }
+        if input::is_ctrl_space(ev, tx.physical_key()) {
+            self.term.prefix_armed = Some(std::time::Instant::now());
+            tx.wake_after(PREFIX_TIMEOUT);
+            return true;
+        }
+
+        // 2. Global focus toggle between terminal and session composer (`Ctrl+;` / `Cmd+;`):
+        if input::is_focus_toggle(ev, tx.physical_key(), mac) {
+            self.toggle_focus_tx(tx);
+            return true;
+        }
+
+        // 3. Split view pane navigation (`Ctrl+Alt+Arrows`, `Ctrl+Alt+Shift+Arrows`, `Mod+1..4`):
+        if self.in_split() {
+            if super::keymap::entry(super::keymap::Action::FocusPaneToward)
+                .keybind()
+                .matches_tx(ev, tx)
+                || super::keymap::entry(super::keymap::Action::SwapPaneToward)
+                    .keybind()
+                    .matches_tx(ev, tx)
+                || (ev.mods.primary()
+                    && ev.mods.alt
+                    && matches!(
+                        ev.key,
+                        rune::Key::Left | rune::Key::Right | rune::Key::Up | rune::Key::Down
+                    ))
+            {
+                self.term.sink.focused = false;
+                let handled = super::tiles::arrow_key(self, ev);
+                if self.tiles.get(self.focus).is_some_and(|t| t.is_terminal()) {
+                    self.focus_terminal_tx(tx);
+                }
+                if handled {
+                    return true;
+                }
+            }
+            if super::keymap::entry(super::keymap::Action::FocusPane)
+                .keybind()
+                .matches_tx(ev, tx)
+                && super::keymap::run(self, super::keymap::Action::FocusPane, ev, tx)
+            {
+                return true;
+            }
+        }
+
         if self.term.search.open && ev.key == rune::Key::Escape {
             self.close_terminal_search(tx);
+            return true;
+        }
+
+        // 4. Herdr direct navigation chords (when terminal is focused):
+        // Alt+Left / Alt+Right: Previous / Next terminal tab
+        if ev.mods.alt && !ev.mods.ctrl && !ev.mods.shift && !ev.mods.logo {
+            if ev.key == rune::Key::Left {
+                self.term_prev_tab();
+                return true;
+            }
+            if ev.key == rune::Key::Right {
+                self.term_next_tab();
+                return true;
+            }
+            if ev.key == rune::Key::Escape {
+                if self.in_split() && self.tiles.get(self.focus).is_some_and(|t| t.is_terminal()) {
+                    self.close_tile(self.focus);
+                } else {
+                    self.close_terminal();
+                }
+                return true;
+            }
+        }
+        // Alt+Enter / Alt+Shift+Enter: Split terminal tile
+        if ev.key == rune::Key::Enter && ev.mods.alt && !ev.mods.ctrl && !ev.mods.logo {
+            if self.in_split() {
+                self.split_terminal_tile();
+            } else {
+                self.open_terminal_tile();
+            }
+            self.focus_terminal_tx(tx);
             return true;
         }
 
@@ -1346,10 +1534,16 @@ impl UiState {
             }
             return true;
         }
-        // Terminal search shortcut on macOS: Cmd+F
-        if mac && ev.mods.logo && !ev.mods.shift && !ev.mods.alt && letter('f') {
-            self.open_terminal_search();
-            return true;
+        // Terminal shortcuts on macOS: Cmd+F (search), Cmd+T (new tab)
+        if mac && ev.mods.logo && !ev.mods.shift && !ev.mods.alt {
+            if letter('f') {
+                self.open_terminal_search();
+                return true;
+            }
+            if letter('t') {
+                self.term_new_tab();
+                return true;
+            }
         }
         // Tab switching: Ctrl+Tab (next), Ctrl+Shift+Tab (prev)
         if ev.key == rune::Key::Tab && ev.mods.ctrl && !ev.mods.alt {
@@ -1371,9 +1565,9 @@ impl UiState {
                 return true;
             }
         }
-        // Direct jump: Alt+1..Alt+9 (or Cmd+1..Cmd+9 on macOS)
+        // Direct jump: Alt+1..Alt+9 (or Cmd+1..Cmd+9 on macOS when not in split view)
         let is_jump_mod = (ev.mods.alt && !ev.mods.ctrl && !ev.mods.shift && !ev.mods.cmd)
-            || (mac && ev.mods.logo && !ev.mods.ctrl && !ev.mods.shift);
+            || (mac && ev.mods.logo && !ev.mods.ctrl && !ev.mods.shift && !self.in_split());
         if is_jump_mod {
             let digit = match &ev.key {
                 rune::Key::Command(c) if c.is_ascii_digit() => c.to_digit(10),
@@ -1398,7 +1592,7 @@ impl UiState {
             }
         }
         match input::route(ev, tx.physical_key(), mac) {
-            Route::Toggle => self.toggle_terminal(),
+            Route::Toggle => self.toggle_terminal_tx(tx),
             Route::Copy => {
                 if let Some(text) = self.term.frame.as_ref().and_then(|f| f.selection.clone()) {
                     tx.copy(text);
@@ -1408,10 +1602,10 @@ impl UiState {
             Route::App => {
                 // Ctrl+Shift+K reaches Ctrl+K's shortcut when the app has
                 // no Ctrl+Shift+K of its own.
-                if !super::on_key(self, ev, tx) {
+                if !super::keymap::dispatch_window(self, ev, tx) {
                     let mut plain = ev.clone();
                     plain.mods.shift = false;
-                    super::on_key(self, &plain, tx);
+                    super::keymap::dispatch_window(self, &plain, tx);
                 }
             }
             Route::Terminal => {
@@ -1441,6 +1635,69 @@ impl UiState {
         true
     }
 
+    /// Execute a Herdr command after `Ctrl+Space` prefix was armed.
+    fn handle_prefix_key(&mut self, ev: &KeyEvent, tx: &mut Tx) -> bool {
+        self.term.prefix_armed = None;
+
+        // Pressing `Ctrl+Space` a second time sends literal Ctrl+Space (`\x00`) to the PTY shell.
+        if input::is_ctrl_space(ev, tx.physical_key()) {
+            self.term.send(Msg::Text("\x00".into()));
+            return true;
+        }
+        // If `terminal-keys` is a `TextInput`, pressing `Space` while `Ctrl` is held
+        // may also fire `on_input_change` or remain armed; ignore pure modifier releases.
+        if ev.key == rune::Key::Escape {
+            return true;
+        }
+        let raw_ch = match &ev.key {
+            rune::Key::Text(t) => t.chars().next(),
+            rune::Key::Command(c) => Some(*c),
+            _ => None,
+        };
+        let ch = match (raw_ch, ev.mods.shift) {
+            (Some('/'), true) => Some('?'),
+            (Some('\\'), true) => Some('|'),
+            (c, _) => c,
+        };
+        match ch {
+            Some('c' | 'C') => {
+                self.term_new_tab();
+                self.focus_terminal_tx(tx);
+            }
+            Some('k' | 'K') => {
+                self.term_close_tab(self.term.active_tab);
+            }
+            Some('x' | 'X') => {
+                if self.in_split() && self.tiles.get(self.focus).is_some_and(|t| t.is_terminal()) {
+                    self.close_tile(self.focus);
+                } else {
+                    self.term_close_tab(self.term.active_tab);
+                }
+            }
+            Some('n' | 'N') => self.term_next_tab(),
+            Some('p' | 'P') => self.term_prev_tab(),
+            Some(d @ '1'..='9') => {
+                let idx = (d as u8 - b'1') as usize;
+                self.term_switch_tab(idx);
+            }
+            Some('h' | 'H' | '-') => {
+                self.split_terminal_with_axis(false);
+                self.focus_terminal_tx(tx);
+            }
+            Some('v' | 'V' | '|' | '\\') => {
+                self.split_terminal_with_axis(true);
+                self.focus_terminal_tx(tx);
+            }
+            Some('z' | 'Z') => self.toggle_terminal_zoom(),
+            Some('[' | '/') => self.open_terminal_search(),
+            Some(';') => self.toggle_focus_tx(tx),
+            Some('?') => self.toggle_keys_sheet(),
+            Some('d' | 'D') => self.close_terminal(),
+            _ => {}
+        }
+        true
+    }
+
     fn terminal_mouse(&mut self, phase: MousePhase, x: f32, y: f32, mods: rune::Mods) {
         let (Some(size), m) = (self.term.size, metrics()) else {
             return;
@@ -1461,6 +1718,7 @@ impl UiState {
     pub fn open_terminal_search(&mut self) {
         self.term.search.open = true;
         self.term.search.query.focused = true;
+        self.term.sink.focused = false;
         if !self.term.search.query.text.trim().is_empty() {
             self.update_term_search_matches();
             self.term_search_jump_to_current();
@@ -1474,9 +1732,12 @@ impl UiState {
 
     pub fn close_terminal_search_no_tx(&mut self) {
         self.term.search.open = false;
+        self.term.search.query.focused = false;
         self.term.search.matches.clear();
         self.term.search.active_idx = 0;
-        self.term.send(Msg::ScrollToBottom);
+        if self.term.open || self.has_terminal_tile() {
+            self.focus_terminal();
+        }
     }
 
     pub fn toggle_terminal_search(&mut self) {
@@ -1744,7 +2005,7 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         .key("terminal-sync-cwd");
     tabs_strip = tabs_strip.child(sync_cwd_btn);
 
-    let header = row()
+    let mut header = row()
         .key("terminal-head")
         .w_full()
         .h(HEAD)
@@ -1754,7 +2015,11 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         .center_y()
         .fill(k.alpha(k.c.layer_01, 0.65))
         .preserve_focus_on_press(true)
-        .child(tabs_strip)
+        .child(tabs_strip);
+    if s.term.is_prefix_armed() {
+        header = header.child(prefix_badge(k, ""));
+    }
+    let header = header
         .child(
             IconButton::new(&RESTART)
                 .variant(IconButtonVariant::GhostMuted)
@@ -2072,7 +2337,7 @@ pub fn tile_body_for(
         .key(format!("tile-terminal-sync-cwd{sfx}"));
     tabs_strip = tabs_strip.child(sync_cwd_btn);
 
-    let subheader = row()
+    let mut subheader = row()
         .key(format!("tile-terminal-subhead{sfx}"))
         .w_full()
         .h(30.0)
@@ -2082,20 +2347,23 @@ pub fn tile_body_for(
         .center_y()
         .fill(k.alpha(k.c.layer_01, 0.45))
         .preserve_focus_on_press(true)
-        .child(tabs_strip)
-        .child(
-            IconButton::new(&RESTART)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Restart shell"))
-                .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
-                    s.focus_terminal_tile_tx(tile_idx, tx);
-                    s.restart_terminal();
-                    s.focus_terminal_tx(tx);
-                })
-                .build(k)
-                .key(format!("tile-terminal-restart{sfx}")),
-        );
+        .child(tabs_strip);
+    if live && s.term.is_prefix_armed() {
+        subheader = subheader.child(prefix_badge(k, &sfx));
+    }
+    let subheader = subheader.child(
+        IconButton::new(&RESTART)
+            .variant(IconButtonVariant::GhostMuted)
+            .control_size(ControlSize::Small)
+            .label(tr_ref(language, "Restart shell"))
+            .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
+                s.focus_terminal_tile_tx(tile_idx, tx);
+                s.restart_terminal();
+                s.focus_terminal_tx(tx);
+            })
+            .build(k)
+            .key(format!("tile-terminal-restart{sfx}")),
+    );
 
     let view = GridView {
         tile_idx,
@@ -2320,7 +2588,7 @@ fn context_menu(s: &UiState, k: &Kit, grid: El, layer: &mut Vec<El>) -> El {
         )
         .item(
             MenuItem::new(tr_ref(language, "Find in terminal…"))
-                .shortcut(label(Action::SearchMessages))
+                .shortcut(label(Action::TermSearch))
                 .on_select(|s: &mut UiState| {
                     s.term.menu_at = None;
                     s.open_terminal_search();
@@ -2342,10 +2610,12 @@ fn context_menu(s: &UiState, k: &Kit, grid: El, layer: &mut Vec<El>) -> El {
                 }),
         )
         .item(
-            MenuItem::new(tr_ref(language, "Close tab")).on_select(|s: &mut UiState| {
-                s.term.menu_at = None;
-                s.term_close_tab(s.term.active_tab);
-            }),
+            MenuItem::new(tr_ref(language, "Close tab"))
+                .shortcut(label(Action::TermCloseTab))
+                .on_select(|s: &mut UiState| {
+                    s.term.menu_at = None;
+                    s.term_close_tab(s.term.active_tab);
+                }),
         )
         .item(
             MenuItem::new(tr_ref(language, "Hide terminal"))
@@ -2373,6 +2643,59 @@ fn short_path(path: &std::path::Path) -> String {
         }
     }
     path.display().to_string()
+}
+
+fn prefix_badge(k: &Kit, sfx: &str) -> El {
+    row()
+        .key(format!("terminal-prefix-badge{sfx}"))
+        .h(20.0)
+        .px(7.0)
+        .center()
+        .radius(4.0)
+        .fill(k.c.bg_accent.alpha(0.18))
+        .border(1.0, k.c.bg_accent.alpha(0.45))
+        .child(
+            text("PREFIX (Ctrl+Space)")
+                .font(k.ty.small_medium)
+                .color(k.c.text_accent),
+        )
+}
+
+fn set_leaf_parent_across(node: &mut crate::config::TileNode, target: usize, across: bool) {
+    if let crate::config::TileNode::Split {
+        across: a_dir,
+        a,
+        b,
+        ..
+    } = node
+    {
+        let is_direct_child = matches!(**a, crate::config::TileNode::Leaf(i) if i == target)
+            || matches!(**b, crate::config::TileNode::Leaf(i) if i == target);
+        if is_direct_child {
+            *a_dir = across;
+            return;
+        }
+        set_leaf_parent_across(a, target, across);
+        set_leaf_parent_across(b, target, across);
+    }
+}
+
+fn toggle_leaf_parent_zoom(node: &mut crate::config::TileNode, target: usize) {
+    if let crate::config::TileNode::Split { ratio, a, b, .. } = node {
+        let in_a = matches!(**a, crate::config::TileNode::Leaf(i) if i == target);
+        let in_b = matches!(**b, crate::config::TileNode::Leaf(i) if i == target);
+        if in_a || in_b {
+            let zoomed = if in_a { 0.82 } else { 0.18 };
+            *ratio = if (*ratio - 0.5).abs() > 0.05 {
+                0.5
+            } else {
+                zoomed
+            };
+            return;
+        }
+        toggle_leaf_parent_zoom(a, target);
+        toggle_leaf_parent_zoom(b, target);
+    }
 }
 
 fn grid(
@@ -3856,5 +4179,110 @@ mod tests {
             }
             _ => panic!("expected FilePath"),
         }
+    }
+
+    #[test]
+    fn herdr_ctrl_space_prefix_state_machine_and_focus_toggle() {
+        let (tx, _rx) = commands::channel();
+        let mut s = UiState::new(tx);
+        s.mode = super::super::Mode::Session;
+        s.open_terminal();
+
+        let mut rt = Runtime::new(s, super::super::view, (1440.0, 900.0), Env::new(true, 1.0));
+        rt.on_key = Some(super::super::on_key);
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+
+        // Click inside the terminal grid so `terminal-keys` holds Runtime focus.
+        rt.pointer_down(1200.0, 300.0);
+        rt.pointer_up(1200.0, 300.0);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.term.sink.focused);
+        assert!(!rt.state.draft.focused);
+
+        rt.state.term_new_tab_in(PathBuf::from("/tmp/tab1"), None);
+        assert_eq!(rt.state.term.tabs.len(), 1);
+        assert_eq!(rt.state.term.active_tab, 0);
+
+        let ctrl_space = KeyEvent {
+            key: Key::Text(" ".into()),
+            mods: Mods {
+                shift: false,
+                cmd: true,
+                alt: false,
+                ctrl: true,
+                logo: false,
+            },
+        };
+        let plain = |c: char| KeyEvent {
+            key: Key::Text(c.to_string()),
+            mods: Mods::default(),
+        };
+
+        // 1. `Ctrl+Space` then `c` creates a new terminal tab.
+        rt.key(ctrl_space.clone());
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.term.is_prefix_armed());
+        rt.key(plain('c'));
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.term.is_prefix_armed());
+        assert_eq!(rt.state.term.tabs.len(), 2);
+        assert_eq!(rt.state.term.active_tab, 1);
+
+        // 2. `Ctrl+Space` then `1` / `2` switches tabs.
+        rt.key(ctrl_space.clone());
+        rt.key(plain('1'));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.term.active_tab, 0);
+
+        rt.key(ctrl_space.clone());
+        rt.key(plain('2'));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.term.active_tab, 1);
+
+        // 3. `Ctrl+Space` then `[` opens terminal scrollback search.
+        assert!(!rt.state.term.search.open);
+        rt.key(ctrl_space.clone());
+        rt.key(plain('['));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.term.search.open);
+        rt.state.close_terminal_search_no_tx();
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.term.search.open);
+
+        // 4. `Ctrl+Space` twice sends literal `Ctrl+Space` (`\x00`) to the PTY shell.
+        rt.state.term.sent_log.borrow_mut().clear();
+        rt.key(ctrl_space.clone());
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.term.is_prefix_armed());
+        rt.key(ctrl_space);
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.term.is_prefix_armed());
+        assert_eq!(*rt.state.term.sent_log.borrow(), ["text \0"]);
+
+        // 5. `Ctrl+;` toggles focus between terminal and session composer without closing terminal.
+        rt.state.mode = super::super::Mode::Session;
+        let ctrl_semi = KeyEvent {
+            key: Key::Command(';'),
+            mods: Mods {
+                shift: false,
+                cmd: true,
+                alt: false,
+                ctrl: true,
+                logo: false,
+            },
+        };
+        assert!(rt.state.term.open && rt.state.term.sink.focused);
+        rt.key(ctrl_semi.clone());
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.term.open);
+        assert!(!rt.state.term.sink.focused);
+        assert!(rt.state.draft.focused);
+
+        rt.key(ctrl_semi);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.term.open);
+        assert!(rt.state.term.sink.focused);
+        assert!(!rt.state.draft.focused);
     }
 }

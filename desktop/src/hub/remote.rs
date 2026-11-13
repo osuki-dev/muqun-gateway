@@ -507,7 +507,9 @@ fn map_error(status: u16, body: &Value, asid: &str, raw: &str) -> HubError {
         (_, Some("session_open_required")) => HubError::Agent(AgentError::OpenRequired(message)),
         (501, _) => HubError::Agent(AgentError::Unsupported(message)),
         (400, _) => HubError::Agent(AgentError::InvalidRequest(message)),
-        _ => HubError::Agent(AgentError::RequestFailed(message)),
+        _ => HubError::Agent(AgentError::RequestFailed(
+            crate::model::inbox::clean_error_message(&message),
+        )),
     }
 }
 

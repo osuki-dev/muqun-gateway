@@ -61,6 +61,16 @@ pub enum Act {
     Dictation,
     /// A keymap command (`ui/keymap.rs`).
     Key(Action),
+    /// Open a plugin in a specific surface (`Page`, `Tile`, `Drawer`).
+    PluginSurface {
+        plugin_id: String,
+        surface: crate::plugin::PluginSlot,
+    },
+    /// Execute a command contributed by a registered plugin.
+    PluginCommand {
+        plugin_id: String,
+        command_id: String,
+    },
 }
 
 impl Act {
@@ -104,6 +114,13 @@ impl Act {
             Self::ToggleScheme => "scheme".into(),
             Self::Dictation => "dictation".into(),
             Self::Key(action) => format!("key:{action:?}"),
+            Self::PluginSurface { plugin_id, surface } => {
+                format!("plugin-surface:{plugin_id}:{surface:?}")
+            }
+            Self::PluginCommand {
+                plugin_id,
+                command_id,
+            } => format!("plugin-cmd:{plugin_id}:{command_id}"),
         }
     }
 }
@@ -353,6 +370,64 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
             agent: None,
         });
     }
+    for plugin in s.plugins.all() {
+        let pid = plugin.id().to_string();
+        let ptitle = plugin.title(language);
+        let pdesc = plugin.description(language).unwrap_or_default();
+        let pcat = plugin.category().label(language).to_string();
+
+        if plugin.supports_surface(crate::plugin::PluginSlot::Page) {
+            out.push(Entry {
+                label: format!("Open {ptitle} (Full Screen)"),
+                detail: pdesc.clone(),
+                hint: pcat.clone(),
+                act: Act::PluginSurface {
+                    plugin_id: pid.clone(),
+                    surface: crate::plugin::PluginSlot::Page,
+                },
+                agent: None,
+            });
+        }
+        if plugin.supports_surface(crate::plugin::PluginSlot::Tile) {
+            out.push(Entry {
+                label: format!("Open {ptitle} (Split Tile)"),
+                detail: pdesc.clone(),
+                hint: pcat.clone(),
+                act: Act::PluginSurface {
+                    plugin_id: pid.clone(),
+                    surface: crate::plugin::PluginSlot::Tile,
+                },
+                agent: None,
+            });
+        }
+        if plugin.supports_surface(crate::plugin::PluginSlot::Drawer) {
+            out.push(Entry {
+                label: format!("Open {ptitle} (Right Drawer)"),
+                detail: pdesc.clone(),
+                hint: pcat.clone(),
+                act: Act::PluginSurface {
+                    plugin_id: pid.clone(),
+                    surface: crate::plugin::PluginSlot::Drawer,
+                },
+                agent: None,
+            });
+        }
+        for cmd in plugin.commands() {
+            out.push(Entry {
+                label: format!("{ptitle}: {}", cmd.title),
+                detail: cmd.id.to_string(),
+                hint: cmd
+                    .shortcut
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| pcat.clone()),
+                act: Act::PluginCommand {
+                    plugin_id: pid.clone(),
+                    command_id: cmd.id.to_string(),
+                },
+                agent: None,
+            });
+        }
+    }
     out
 }
 
@@ -481,6 +556,17 @@ impl UiState {
             Act::Dictation => self.toggle_voice(),
             Act::Key(action) => {
                 keymap::run(self, action, &rune::Key::Escape.into(), tx);
+            }
+            Act::PluginSurface { plugin_id, surface } => {
+                self.switch_plugin_surface(&plugin_id, surface);
+            }
+            Act::PluginCommand {
+                plugin_id,
+                command_id,
+            } => {
+                if let Some(plugin) = self.plugins.get(&plugin_id) {
+                    plugin.on_command(self, &command_id);
+                }
             }
         }
     }
@@ -713,6 +799,7 @@ fn glyph(act: &Act) -> &'static rune::Icon {
         | Act::Unsplit
         | Act::Key(Action::Settings) => &super::icons::SETTINGS,
         Act::Theme(_) | Act::ToggleScheme => &rune_kit::glyphs::SPARKLE,
+        Act::PluginSurface { .. } | Act::PluginCommand { .. } => &super::icons::GRID,
         _ => &rune_kit::glyphs::ARROW_RIGHT,
     }
 }

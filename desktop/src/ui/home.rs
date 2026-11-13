@@ -51,20 +51,7 @@ pub fn submit_start(s: &mut UiState) {
         PathBuf::from(typed)
     };
     let (agent, worktree) = (s.start_agent.clone(), s.start_worktree);
-    let defaults = s.start_catalog.as_deref().map(|v| &v.catalog.defaults);
-    let model = s
-        .start_model
-        .clone()
-        .or_else(|| defaults.and_then(|d| d.model.clone()));
-    let mode = s
-        .start_mode
-        .clone()
-        .or_else(|| defaults.and_then(|d| d.mode.clone()))
-        .or_else(|| {
-            s.start_catalog
-                .as_deref()
-                .and_then(|v| v.catalog.modes.first().map(|m| m.id.clone()))
-        });
+    let (model, mode) = (s.start_model.clone(), s.start_mode.clone());
     if model.is_some() || mode.is_some() {
         s.edit(ConfigEdit::Remember {
             agent: agent.clone(),

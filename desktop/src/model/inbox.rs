@@ -21,7 +21,7 @@ use muqun_gateway::agents::ports::AgentSessionSnapshot;
 use muqun_gateway::agents::{AgentDomainEvent, AgentProject, AgentSessionInfo};
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 
-/// An error the UI shows in its alert strip.
+/// An error the UI shows in its notification stack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiError {
     pub message: String,
@@ -30,6 +30,20 @@ pub struct UiError {
     pub detail: Option<String>,
     /// The agent could not be reached; a later successful read clears it.
     pub unreachable: bool,
+}
+
+/// Strip redundant nested `"Agent request failed: "` prefixes so UI error
+/// messages remain concise and readable.
+pub fn clean_error_message(msg: &str) -> String {
+    let mut s = msg.trim();
+    while let Some(rest) = s.strip_prefix("Agent request failed:") {
+        s = rest.trim_start();
+    }
+    if s.is_empty() {
+        msg.trim().to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 /// Work that originates on the UI thread but must run after the current
@@ -228,6 +242,13 @@ pub enum Update {
     Attention(super::notify::Attention),
     /// Dictation's progress (`model/voice.rs`).
     Voice(super::voice::VoiceEvent),
+    /// Probed status of external runtimes (`bun`, `herdr`).
+    Runtimes(Vec<muqun_gateway::platform::runtimes::RuntimeStatus>),
+    /// Outcome of installing or updating a managed runtime.
+    RuntimeInstalled {
+        kind: muqun_gateway::platform::runtimes::RuntimeKind,
+        result: Result<muqun_gateway::platform::runtimes::RuntimeStatus, String>,
+    },
 }
 
 impl Update {
