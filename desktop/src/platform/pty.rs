@@ -166,6 +166,7 @@ mod unix {
                 // SAFETY: kill(2) on our own child, not yet reaped (the
                 // lock keeps the waiter from reaping it meanwhile).
                 unsafe {
+                    libc::kill(-self.pid, libc::SIGHUP);
                     libc::kill(self.pid, libc::SIGHUP);
                 }
             }
@@ -173,6 +174,11 @@ mod unix {
     }
 
     impl Child {
+        /// The process ID of this child.
+        pub fn pid(&self) -> libc::pid_t {
+            self.pid
+        }
+
         /// Wait for `pid` on a thread; `on_exit` hears how it ended.
         fn watch(pid: libc::pid_t, on_exit: super::OnExit) -> io::Result<Self> {
             let reaped = Arc::new(Mutex::new(false));
@@ -393,6 +399,12 @@ mod other {
 
     pub struct Pty;
     pub struct Child;
+
+    impl Child {
+        pub fn pid(&self) -> u32 {
+            0
+        }
+    }
 
     impl Pty {
         pub fn reader(&self) -> io::Result<io::Empty> {

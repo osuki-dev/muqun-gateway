@@ -722,16 +722,29 @@ impl UiState {
             return;
         }
         if index == self.term.active_tab {
+            let tab = self.term.tabs.remove(index);
+            if let Some(s) = tab.session {
+                s.close_remote();
+                s.send(Msg::Shutdown);
+            }
             if let Some(session) = &self.term.session {
                 session.close_remote();
                 session.send(Msg::Shutdown);
             }
-            self.term.tabs.remove(index);
-            self.term.active_tab = self.term.active_tab.min(self.term.tabs.len() - 1);
-            self.term.session = self.term.tabs[self.term.active_tab].session.clone();
-            self.term.frame = self.term.tabs[self.term.active_tab].frame.clone();
-            if let Some(size) = self.term.size {
-                self.term.send(Msg::Resize(size));
+            self.term.active_tab = self
+                .term
+                .active_tab
+                .min(self.term.tabs.len().saturating_sub(1));
+            if !self.term.tabs.is_empty() {
+                self.term.session = self.term.tabs[self.term.active_tab].session.clone();
+                self.term.frame = self.term.tabs[self.term.active_tab].frame.clone();
+                if let Some(size) = self.term.size {
+                    self.term.send(Msg::Resize(size));
+                }
+            } else {
+                self.term.session = None;
+                self.term.frame = None;
+                self.close_terminal();
             }
         } else {
             let tab = self.term.tabs.remove(index);
@@ -1767,11 +1780,25 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
                 .key("terminal-dock-split"),
         )
         .child(
-            IconButton::new(k.glyph.close)
+            IconButton::new(k.glyph.chevron_down)
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
                 .label(tr_ref(language, "Hide terminal"))
                 .on_press(|s: &mut UiState| s.close_terminal())
+                .build(k)
+                .key("terminal-hide"),
+        )
+        .child(
+            IconButton::new(k.glyph.close)
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .label(tr_ref(language, "Close tab"))
+                .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
+                    s.term_close_tab(s.term.active_tab);
+                    if s.term.open || s.has_terminal_tile() {
+                        s.focus_terminal_tx(tx);
+                    }
+                })
                 .build(k)
                 .key("terminal-close"),
         );
@@ -2313,6 +2340,12 @@ fn context_menu(s: &UiState, k: &Kit, grid: El, layer: &mut Vec<El>) -> El {
                     s.term.menu_at = None;
                     s.restart_terminal();
                 }),
+        )
+        .item(
+            MenuItem::new(tr_ref(language, "Close tab")).on_select(|s: &mut UiState| {
+                s.term.menu_at = None;
+                s.term_close_tab(s.term.active_tab);
+            }),
         )
         .item(
             MenuItem::new(tr_ref(language, "Hide terminal"))

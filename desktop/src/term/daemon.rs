@@ -644,7 +644,7 @@ impl DaemonSession {
             created_at: Instant::now(),
             live_cwd,
             label: Mutex::new(None),
-            shell_pid: None,
+            shell_pid: Some(child.pid() as u32),
             exit_code,
             agent_status,
             task_summary,
@@ -775,6 +775,14 @@ impl DaemonSession {
         }
         if let Ok(mut child_guard) = self.child.lock() {
             child_guard.take();
+        }
+        #[cfg(unix)]
+        if let Some(pid) = self.shell_pid {
+            unsafe {
+                let p = pid as libc::pid_t;
+                libc::kill(-p, libc::SIGHUP);
+                libc::kill(p, libc::SIGHUP);
+            }
         }
     }
 }
