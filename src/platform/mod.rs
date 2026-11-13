@@ -17,6 +17,7 @@ pub(crate) mod metadata;
 pub(crate) mod openapi;
 pub(crate) mod parts;
 pub(crate) mod routes;
+pub mod runtimes;
 pub(crate) mod server;
 pub(crate) mod service;
 pub(crate) mod setup;

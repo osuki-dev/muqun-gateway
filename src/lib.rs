@@ -29,6 +29,7 @@ pub(crate) use platform::config::*;
 pub(crate) use platform::http::*;
 pub(crate) use platform::manage::*;
 pub(crate) use platform::metadata::*;
+pub use platform::runtimes;
 pub(crate) use platform::server::*;
 pub use platform::set_directories;
 // Small pure helpers an embedding host shows the same way the gateway does:
