@@ -922,23 +922,9 @@ fn tile(
 /// The gap between the two halves of the split at `path`: the window shows
 /// through it, and dragging it moves the split. `room` is the length the
 /// halves share along the split.
-fn gap(s: &UiState, k: &Kit, path: &[bool], across: bool, ratio: f32, room: f32) -> El {
+fn gap(s: &UiState, _k: &Kit, path: &[bool], across: bool, ratio: f32, room: f32) -> El {
     let key = path_key("tile-gap", path);
-    let path_clone = path.to_vec();
-    let is_dragging = s.tile_drag.as_ref() == Some(&path_clone);
-
-    let line_color = if is_dragging {
-        k.c.bg_accent
-    } else {
-        k.c.border_muted.alpha(0.6)
-    };
-    let grip_color = if is_dragging {
-        k.c.bg_accent
-    } else {
-        k.c.text_muted.alpha(0.7)
-    };
-
-    let path_drag = path_clone.clone();
+    let path_drag = path.to_vec();
     let mut handle = el()
         .key(key)
         .cursor(if across {
@@ -967,37 +953,11 @@ fn gap(s: &UiState, k: &Kit, path: &[bool], across: bool, ratio: f32, room: f32)
             },
         );
 
-    if across {
-        let center_offset = (room * 0.5 - 16.0).max(0.0);
-        handle = handle
-            .w(GAP)
-            .h_full()
-            .center()
-            .child(el().w(1.0).h_full().fill(line_color))
-            .child(
-                el().absolute(2.0, center_offset)
-                    .w(4.0)
-                    .h(32.0)
-                    .radius(2.0)
-                    .fill(grip_color)
-                    .hover(k.c.bg_accent),
-            );
+    handle = if across {
+        handle.w(GAP).h_full()
     } else {
-        let center_offset = (room * 0.5 - 16.0).max(0.0);
-        handle = handle
-            .h(GAP)
-            .w_full()
-            .center()
-            .child(el().h(1.0).w_full().fill(line_color))
-            .child(
-                el().absolute(center_offset, 2.0)
-                    .w(32.0)
-                    .h(4.0)
-                    .radius(2.0)
-                    .fill(grip_color)
-                    .hover(k.c.bg_accent),
-            );
-    }
+        handle.h(GAP).w_full()
+    };
     handle
 }
 
