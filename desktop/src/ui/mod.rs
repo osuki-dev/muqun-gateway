@@ -556,6 +556,12 @@ pub struct UiState {
     pub prompt_history: Vec<String>,
     pub prompt_history_cursor: Option<usize>,
     pub prompt_history_draft_stash: Option<String>,
+    /// Whether the composer prompt history picker popup is open.
+    pub composer_history_open: bool,
+    /// Manual height override for the composer textarea (number of rows).
+    pub composer_rows: Option<usize>,
+    /// Whether the composer textarea is toggled into expanded multiline mode.
+    pub composer_expanded: bool,
     /// Timeline in-session search state (Ctrl+F in session mode).
     pub timeline_search: TimelineSearch,
     /// First agents discovery finished (empty list still counts).
@@ -590,6 +596,8 @@ pub struct UiState {
     pub pending_tile: Option<usize>,
     /// The split's size on screen, for splitting and the gaps' drags.
     pub tile_grid: [f32; 2],
+    /// Active tile split gap path being dragged.
+    pub tile_drag: Option<Vec<bool>>,
     /// The saved split was put back once sessions were listed.
     tiles_restored: bool,
     /// Registered desktop plugins.
@@ -738,6 +746,9 @@ impl UiState {
             prompt_history: Vec::new(),
             prompt_history_cursor: None,
             prompt_history_draft_stash: None,
+            composer_history_open: false,
+            composer_rows: None,
+            composer_expanded: false,
             timeline_search: TimelineSearch::default(),
             agents_seen: false,
             demo: false,
@@ -755,6 +766,7 @@ impl UiState {
             tile_tree: crate::config::TileNode::Leaf(0),
             pending_tile: None,
             tile_grid: [0.0; 2],
+            tile_drag: None,
             listed_agents: HashSet::new(),
             tiles_restored: false,
             plugins: crate::plugin::PluginRegistry::default_registry(),

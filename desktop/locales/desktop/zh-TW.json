@@ -504,5 +504,17 @@
   "Push commits": "推送提交",
   "Merge worktree": "合併工作區",
   "Clean worktree": "清理工作區",
-  "Confirm clean": "確認清理"
+  "Confirm clean": "確認清理",
+  "Resize composer": "調整輸入框高度",
+  "Expand composer": "展開輸入框",
+  "Collapse composer": "收起輸入框",
+  "Expand composer (Ctrl+Shift+E)": "展開輸入框 (Ctrl+Shift+E)",
+  "Collapse composer (Ctrl+Shift+E)": "收起輸入框 (Ctrl+Shift+E)",
+  "Prompt history": "歷史記錄",
+  "Prompt history (Alt+H)": "歷史記錄 (Alt+H)",
+  "No prompt history yet": "暫無歷史記錄",
+  "Click prompt to recall · Esc to close": "點選快速回溯 · Esc 關閉",
+  "Resize split view": "調整分屏大小",
+  "item": "條",
+  "items": "條"
 }

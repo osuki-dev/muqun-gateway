@@ -504,5 +504,17 @@
   "Push commits": "Push commits",
   "Merge worktree": "Merge worktree",
   "Clean worktree": "Clean worktree",
-  "Confirm clean": "Confirm clean"
+  "Confirm clean": "Confirm clean",
+  "Resize composer": "Resize composer",
+  "Expand composer": "Expand composer",
+  "Collapse composer": "Collapse composer",
+  "Expand composer (Ctrl+Shift+E)": "Expand composer (Ctrl+Shift+E)",
+  "Collapse composer (Ctrl+Shift+E)": "Collapse composer (Ctrl+Shift+E)",
+  "Prompt history": "Prompt history",
+  "Prompt history (Alt+H)": "Prompt history (Alt+H)",
+  "No prompt history yet": "No prompt history yet",
+  "Click prompt to recall · Esc to close": "Click prompt to recall · Esc to close",
+  "Resize split view": "Resize split view",
+  "item": "item",
+  "items": "items"
 }

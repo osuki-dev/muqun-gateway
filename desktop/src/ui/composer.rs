@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use muqun_gateway::agents::{AgentSessionId, ModelRef};
-use rune::{col, el, row, text, El, ImageCache, PillStyle, SurfaceFit, TextEdit, Tx};
+use rune::{
+    col, el, row, text, Cursor, El, ImageCache, Phase, PillStyle, SurfaceFit, TextEdit, Tx,
+};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, Menu, MenuItem, ScrollBar,
     TextArea,
@@ -1420,6 +1422,200 @@ pub(super) fn popup(s: &UiState, k: &Kit, layer: &mut Vec<El>, slot: Slot) {
     }
 }
 
+/// Prompt history picker popup anchored above the composer draft.
+pub(super) fn history_popup(s: &UiState, k: &Kit, layer: &mut Vec<El>, slot: Slot) {
+    if !s.composer_history_open {
+        return;
+    }
+    let language = s.cfg.general.language;
+    let look = s.look();
+    let anchor = match slot {
+        Slot::Session => "draft",
+        Slot::Start => "start-draft",
+    };
+
+    // Scrim overlay to catch outside clicks
+    layer.push(
+        el().key("prompt-history-scrim")
+            .absolute(0.0, 0.0)
+            .w_full()
+            .h_full()
+            .on_press(|s: &mut UiState| {
+                s.composer_history_open = false;
+            }),
+    );
+
+    let count = s.prompt_history.len();
+    let count_text = if count == 1 {
+        format!("{count} {}", tr_ref(language, "item"))
+    } else {
+        format!("{count} {}", tr_ref(language, "items"))
+    };
+
+    let header = row()
+        .key("prompt-history-header")
+        .w_full()
+        .px(10.0)
+        .py(6.0)
+        .center_y()
+        .child(
+            row()
+                .gap(6.0)
+                .center_y()
+                .child(rune::icon(&super::parts::glyphs::TIME, 14.0).color(k.c.text_accent))
+                .child(
+                    text(tr_ref(language, "Prompt history"))
+                        .font(k.ty.ui_medium)
+                        .color(k.c.text_base),
+                ),
+        )
+        .child(el().grow(1.0))
+        .child(
+            text(count_text)
+                .font(k.ty.small)
+                .color(k.c.text_faint)
+                .mr(8.0),
+        )
+        .child(
+            rune_kit::IconButton::new(&super::parts::glyphs::CLOSE)
+                .variant(rune_kit::IconButtonVariant::GhostMuted)
+                .label(tr_ref(language, "Close"))
+                .on_press(|s: &mut UiState| {
+                    s.composer_history_open = false;
+                })
+                .build(k)
+                .key("prompt-history-close"),
+        );
+
+    let mut row_els = col()
+        .key("prompt-history-rows")
+        .w_full()
+        .gap(2.0)
+        .px(4.0)
+        .py(4.0);
+
+    if s.prompt_history.is_empty() {
+        row_els = row_els.child(
+            col().w_full().center().py(18.0).child(
+                text(tr_ref(language, "No prompt history yet"))
+                    .font(k.ty.ui)
+                    .color(k.c.text_faint),
+            ),
+        );
+    } else {
+        for (i, prompt) in s.prompt_history.iter().rev().enumerate() {
+            let p_click = prompt.clone();
+            let first_line = prompt.lines().next().unwrap_or(prompt);
+            let display_text = if first_line.chars().count() > 70 {
+                let s: String = first_line.chars().take(67).collect();
+                format!("{s}…")
+            } else if prompt.lines().count() > 1 {
+                format!("{first_line}…")
+            } else {
+                first_line.to_string()
+            };
+
+            let item = row()
+                .key(format!("prompt-history-item-{i}"))
+                .w_full()
+                .px(8.0)
+                .py(6.0)
+                .radius(k.radius.sm)
+                .gap(8.0)
+                .center_y()
+                .cursor(Cursor::Pointer)
+                .hover(k.c.hover)
+                .on_press(move |s: &mut UiState| {
+                    match slot {
+                        Slot::Session => {
+                            s.draft.text = p_click.clone();
+                            let len = s.draft.text.len();
+                            s.draft.set_caret(len);
+                            s.draft.focused = true;
+                        }
+                        Slot::Start => {
+                            s.start_draft.text = p_click.clone();
+                            let len = s.start_draft.text.len();
+                            s.start_draft.set_caret(len);
+                            s.start_draft.focused = true;
+                        }
+                    }
+                    s.composer_history_open = false;
+                    s.prompt_history_cursor = None;
+                    s.prompt_history_draft_stash = None;
+                })
+                .child(
+                    rune::icon(&super::parts::glyphs::TIME, 12.0)
+                        .color(k.c.text_faint)
+                        .a11y_hidden(),
+                )
+                .child(
+                    text(display_text)
+                        .font(k.ty.ui)
+                        .color(k.c.text_base)
+                        .shrink()
+                        .grow(1.0),
+                );
+            row_els = row_els.child(item);
+        }
+    }
+
+    let item_count = s.prompt_history.len().max(1);
+    let viewport = col()
+        .key("prompt-history-viewport")
+        .role("listbox")
+        .label(tr_ref(language, "Prompt history"))
+        .w_full()
+        .h((item_count as f32 * 34.0).clamp(60.0, 320.0))
+        .scroll(rune::ScrollSpec {
+            stick_bottom: false,
+        })
+        .clip_soft(0.0)
+        .child(row_els)
+        .scroll_bar(k)
+        .shrink()
+        .min_h(0.0);
+
+    let footer = row()
+        .key("prompt-history-footer")
+        .w_full()
+        .px(10.0)
+        .py(4.0)
+        .center_y()
+        .child(
+            text(tr_ref(language, "Click prompt to recall · Esc to close"))
+                .font(k.ty.small)
+                .color(k.c.text_faint),
+        );
+
+    let mut panel = col()
+        .key("prompt-history-panel")
+        .preserve_focus_on_press(true)
+        .w(440.0)
+        .padding(4.0)
+        .radius(k.radius.md)
+        .fill(look.panel_fill(k))
+        .border(1.0, k.c.border_strong)
+        .on_press(|_: &mut UiState| {})
+        .child(header)
+        .child(el().w_full().h(1.0).fill(k.c.border_weak).mb(2.0))
+        .child(viewport)
+        .child(el().w_full().h(1.0).fill(k.c.border_weak).mt(2.0))
+        .child(footer);
+
+    panel = look.accent_rim(k, panel, k.c.bg_accent);
+    for shadow in k.shadow_layers(&k.elevation.overlay) {
+        panel = panel.box_shadow(shadow);
+    }
+
+    let anchored_panel = panel
+        .anchored_fit(anchor, rune::Side::Top, rune::Align::Start, 6.0)
+        .transition(rune::Transition::opacity().combined(rune::Transition::scale(0.97)))
+        .token_motion(k.motion.overlay);
+
+    layer.push(anchored_panel);
+}
+
 // ---- pills --------------------------------------------------------------------------
 
 /// Remember what the pills show for the open session's agent and folder, so a
@@ -1723,22 +1919,69 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let inner = rune::memo::layout_with("composer-card", |r| r[2].round())
         .map_or(f32::INFINITY, |w| w - CARD_PAD);
     let button_w = |label: &str| rune::text::measure(label, &[], k.ty.ui_medium, None).0 + 24.0;
-    // Mic and Attach (24 pt each), Send, Stop while working, the gaps.
-    let mut buttons = 24.0 + 24.0 + button_w(send_label) + 3.0 * ACTION_GAP;
+    // Mic, Attach, History, Expand (24 pt each), Send, Stop while working, the gaps.
+    let mut buttons = 4.0 * 24.0 + button_w(send_label) + 5.0 * ACTION_GAP;
     if busy {
         buttons += button_w(stop_label) + ACTION_GAP;
     }
-    // Narrower still, Mic and Attach join the controls' line so Stop and
-    // Send keep their words.
+    // Narrower still, Mic, Attach, History and Expand join the controls' line
+    // so Stop and Send keep their words.
     let squeezed = inner < buttons;
+    let expand_icon = if s.composer_expanded || s.composer_rows.is_some() {
+        &super::icons::COLLAPSE
+    } else {
+        &super::icons::EXPAND
+    };
+    let expand_label = if s.composer_expanded || s.composer_rows.is_some() {
+        tr_ref(language, "Collapse")
+    } else {
+        tr_ref(language, "Expand")
+    };
+    let expand_help = if s.composer_expanded || s.composer_rows.is_some() {
+        tr_ref(language, "Collapse composer (Ctrl+Shift+E)")
+    } else {
+        tr_ref(language, "Expand composer (Ctrl+Shift+E)")
+    };
+    let expand_btn = rune_kit::IconButton::new(expand_icon)
+        .variant(rune_kit::IconButtonVariant::GhostMuted)
+        .label(expand_label)
+        .help(expand_help)
+        .on_press(|s: &mut UiState| {
+            if s.composer_expanded || s.composer_rows.is_some() {
+                s.composer_expanded = false;
+                s.composer_rows = None;
+            } else {
+                s.composer_expanded = true;
+                s.composer_rows = Some(14);
+            }
+        })
+        .build(k)
+        .key("composer-expand");
+
+    let history_btn = rune_kit::IconButton::new(&super::parts::glyphs::TIME)
+        .variant(if s.composer_history_open {
+            rune_kit::IconButtonVariant::Contrast
+        } else {
+            rune_kit::IconButtonVariant::GhostMuted
+        })
+        .label(tr_ref(language, "History"))
+        .help(tr_ref(language, "Prompt history (Alt+H)"))
+        .on_press(|s: &mut UiState| {
+            s.composer_history_open = !s.composer_history_open;
+        })
+        .build(k)
+        .key("composer-history");
+
     let mut tools = Some(
         row()
             .gap(ACTION_GAP)
             .center_y()
             .child(super::voice::mic_button(s, k))
-            .child(attach),
+            .child(attach)
+            .child(history_btn)
+            .child(expand_btn),
     );
-    let tools_w = 48.0 + 2.0 * ACTION_GAP;
+    let tools_w = 4.0 * 24.0 + 4.0 * ACTION_GAP;
     let controls = controls_row::Controls::read(s);
     let beside = controls
         .as_ref()
@@ -1815,13 +2058,56 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     ));
 
     popup(s, k, layer, Slot::Session);
+    history_popup(s, k, layer, Slot::Session);
     let mut card = col()
         .key("composer-card")
         .w_full()
         .gap(8.0)
         .px(12.0)
-        .pt(10.0)
+        .pt(6.0)
         .pb(10.0);
+
+    let resizer = row()
+        .key("composer-resizer")
+        .w_full()
+        .h(6.0)
+        .center()
+        .cursor(Cursor::ResizeRow)
+        .role("separator")
+        .label(tr_ref(language, "Resize composer"))
+        .on_double_press(|s: &mut UiState| {
+            s.composer_rows = None;
+            s.composer_expanded = false;
+        })
+        .on_drag(
+            |s: &mut UiState, d: &mut rune::Drag, _: &mut Tx| match d.phase {
+                Phase::Down => {
+                    let cur = s
+                        .composer_rows
+                        .unwrap_or(if s.composer_expanded { 12 } else { 3 });
+                    d.data = cur as f32;
+                }
+                Phase::Move => {
+                    let delta = (-d.dy / 18.0).round() as i32;
+                    let target = (d.data as i32 + delta).clamp(2, 24) as usize;
+                    s.composer_rows = Some(target);
+                }
+                _ => {}
+            },
+        )
+        .child(
+            el().key("composer-resizer-pill")
+                .w(32.0)
+                .h(3.0)
+                .radius(1.5)
+                .fill(if s.composer_rows.is_some() {
+                    k.c.bg_accent.alpha(0.7)
+                } else {
+                    k.c.border_muted
+                })
+                .hover(k.c.bg_accent),
+        );
+    card = card.child(resizer);
     if let Some(chips) = chips(s, k, layer) {
         card = card.child(chips);
     }
@@ -1841,6 +2127,13 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     };
     let accent = k.c.bg_accent;
     let info = k.c.info.icon;
+    let (min_rows, max_rows) = if let Some(r) = s.composer_rows {
+        (r, r.max(8))
+    } else if s.composer_expanded {
+        (10, 24)
+    } else {
+        (2, 8)
+    };
     if let Some(dictation) = super::voice::strip(s, k) {
         card = card.child(dictation);
     }
@@ -1849,7 +2142,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             .placeholder(placeholder)
             .label(tr_ref(language, "Draft"))
             .width(None)
-            .auto_grow(2, 8)
+            .auto_grow(min_rows, max_rows)
             .pill_style(move |id| {
                 if id.starts_with("computer:") {
                     PillStyle::default().bg(accent.alpha(0.22)).fg(accent)
@@ -1868,6 +2161,40 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             .on_change(|s: &mut UiState, _: &mut Tx| on_draft_change(s, Slot::Session))
             .on_key(|s: &mut UiState, ev: &rune::KeyEvent, tx: &mut Tx| {
                 if popup_key(s, Slot::Session, ev) {
+                    return true;
+                }
+                if ev.key == rune::Key::Escape && s.composer_history_open {
+                    s.composer_history_open = false;
+                    return true;
+                }
+                let is_e = match &ev.key {
+                    rune::Key::Command(c) => c.eq_ignore_ascii_case(&'e'),
+                    rune::Key::Text(s) => s.eq_ignore_ascii_case("e"),
+                    _ => false,
+                };
+                let is_h = match &ev.key {
+                    rune::Key::Command(c) => c.eq_ignore_ascii_case(&'h'),
+                    rune::Key::Text(s) => s.eq_ignore_ascii_case("h"),
+                    _ => false,
+                };
+                let is_r = match &ev.key {
+                    rune::Key::Command(c) => c.eq_ignore_ascii_case(&'r'),
+                    rune::Key::Text(s) => s.eq_ignore_ascii_case("r"),
+                    _ => false,
+                };
+                let primary = ev.mods.primary();
+                if primary && ev.mods.shift && is_e {
+                    if s.composer_expanded || s.composer_rows.is_some() {
+                        s.composer_expanded = false;
+                        s.composer_rows = None;
+                    } else {
+                        s.composer_expanded = true;
+                        s.composer_rows = Some(14);
+                    }
+                    return true;
+                }
+                if (ev.mods.alt && (is_h || ev.key == rune::Key::Up)) || (primary && is_r) {
+                    s.composer_history_open = !s.composer_history_open;
                     return true;
                 }
                 if ev.key == rune::Key::Up
@@ -2018,5 +2345,40 @@ mod tests {
             }
         }
         assert_eq!(staged_names, vec!["test-screenshot.png", "app.log"]);
+    }
+
+    #[test]
+    fn composer_resize_expand_and_history_popup() {
+        let (tx, _rx) = crate::ui::commands::channel();
+        let mut s = UiState::new(tx);
+        assert_eq!(s.composer_rows, None);
+        assert!(!s.composer_expanded);
+        assert!(!s.composer_history_open);
+
+        // Record prompts into history
+        s.record_prompt_history("cargo check");
+        s.record_prompt_history("git diff --staged");
+        assert_eq!(s.prompt_history.len(), 2);
+
+        // Toggle history popup
+        s.composer_history_open = true;
+        assert!(s.composer_history_open);
+
+        let k = Kit::neutral(s.dark);
+        let mut layer = Vec::new();
+        history_popup(&s, &k, &mut layer, Slot::Session);
+        assert!(!layer.is_empty());
+
+        // Test expanding composer
+        s.composer_expanded = true;
+        assert!(s.composer_expanded);
+
+        // Test manual row resize override
+        s.composer_rows = Some(16);
+        assert_eq!(s.composer_rows, Some(16));
+
+        // Test view generation
+        let look = s.look();
+        let _card = composer_card(&k, &look, col(), false, false, false);
     }
 }

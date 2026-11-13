@@ -1040,7 +1040,7 @@ impl UiState {
             return;
         }
         // A size held back waits for `poll_terminal`, which wakes for it.
-        let dragging = self.term.pane.is_resizing();
+        let dragging = self.term.pane.is_resizing() || self.tile_drag.is_some();
         if let Some(size) = self.term.resize.want(size, self.term.now, dragging) {
             self.resize_terminal(size);
         }
@@ -1150,7 +1150,7 @@ impl UiState {
     pub fn poll_terminal(&mut self, now: f64, tx: &mut Tx) -> bool {
         self.term.now = now;
         let mut changed = false;
-        let dragging = self.term.pane.is_resizing();
+        let dragging = self.term.pane.is_resizing() || self.tile_drag.is_some();
         if let Some(size) = self.term.resize.due(now, dragging) {
             if self.term.size != Some(size) {
                 self.resize_terminal(size);

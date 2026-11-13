@@ -199,3 +199,17 @@ pub static PLUS: Icon = Icon {
     view: 16.0,
     body: r#"<path d="M8 3.75V12.25M3.75 8H12.25" stroke="currentColor"/>"#,
 };
+
+/// Expand composer height or maximize pane.
+pub static EXPAND: Icon = Icon {
+    name: "expand",
+    view: 24.0,
+    body: r#"<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
+/// Collapse composer height or restore pane.
+pub static COLLAPSE: Icon = Icon {
+    name: "collapse",
+    view: 24.0,
+    body: r#"<path d="M4 14h6v6M20 10h-6V4M10 14l-7 7M14 10l7-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};

@@ -155,5 +155,17 @@ fn composer_scenes() -> Vec<Scene> {
             composer_split(s, true);
             s.menu = Some(super::OpenMenu::Mode);
         }),
+        ("composer-history", |s| {
+            composer_session(s, false);
+            s.record_prompt_history("git status -s");
+            s.record_prompt_history("Review the documentation and fix typo");
+            s.record_prompt_history("Run cargo clippy and cargo test --locked");
+            s.composer_history_open = true;
+        }),
+        ("composer-expanded", |s| {
+            composer_session(s, false);
+            s.composer_expanded = true;
+            s.draft = rune::TextEdit::new("Here is an expanded multi-line prompt.\nIt provides extra vertical space for editing long instructions and code blocks comfortably.");
+        }),
     ]
 }

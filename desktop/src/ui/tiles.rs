@@ -897,9 +897,23 @@ fn tile(
 /// The gap between the two halves of the split at `path`: the window shows
 /// through it, and dragging it moves the split. `room` is the length the
 /// halves share along the split.
-fn gap(s: &UiState, path: &[bool], across: bool, ratio: f32, room: f32) -> El {
+fn gap(s: &UiState, k: &Kit, path: &[bool], across: bool, ratio: f32, room: f32) -> El {
     let key = path_key("tile-gap", path);
-    let path = path.to_vec();
+    let path_clone = path.to_vec();
+    let is_dragging = s.tile_drag.as_ref() == Some(&path_clone);
+
+    let line_color = if is_dragging {
+        k.c.bg_accent
+    } else {
+        k.c.border_muted.alpha(0.6)
+    };
+    let grip_color = if is_dragging {
+        k.c.bg_accent
+    } else {
+        k.c.text_muted.alpha(0.7)
+    };
+
+    let path_drag = path_clone.clone();
     let mut handle = el()
         .key(key)
         .cursor(if across {
@@ -912,20 +926,53 @@ fn gap(s: &UiState, path: &[bool], across: bool, ratio: f32, room: f32) -> El {
         .a11y_value(format!("{:.0}%", ratio * 100.0))
         .on_drag(
             move |s: &mut UiState, d: &mut rune::Drag, _: &mut Tx| match d.phase {
-                Phase::Down => d.data = ratio,
+                Phase::Down => {
+                    d.data = ratio;
+                    s.tile_drag = Some(path_drag.clone());
+                }
                 Phase::Move if room > 0.0 => {
                     let moved = if across { d.dx } else { d.dy };
-                    s.set_tile_ratio(&path, d.data + moved / room);
+                    s.set_tile_ratio(&path_drag, d.data + moved / room);
                 }
-                Phase::Up => s.persist_tiles(),
+                Phase::Up => {
+                    s.tile_drag = None;
+                    s.persist_tiles();
+                }
                 _ => {}
             },
         );
-    handle = if across {
-        handle.w(GAP).h_full()
+
+    if across {
+        let center_offset = (room * 0.5 - 16.0).max(0.0);
+        handle = handle
+            .w(GAP)
+            .h_full()
+            .center()
+            .child(el().w(1.0).h_full().fill(line_color))
+            .child(
+                el().absolute(2.0, center_offset)
+                    .w(4.0)
+                    .h(32.0)
+                    .radius(2.0)
+                    .fill(grip_color)
+                    .hover(k.c.bg_accent),
+            );
     } else {
-        handle.h(GAP).w_full()
-    };
+        let center_offset = (room * 0.5 - 16.0).max(0.0);
+        handle = handle
+            .h(GAP)
+            .w_full()
+            .center()
+            .child(el().h(1.0).w_full().fill(line_color))
+            .child(
+                el().absolute(center_offset, 2.0)
+                    .w(32.0)
+                    .h(4.0)
+                    .radius(2.0)
+                    .fill(grip_color)
+                    .hover(k.c.bg_accent),
+            );
+    }
     handle
 }
 
@@ -937,6 +984,7 @@ fn path_key(prefix: &str, path: &[bool]) -> String {
 /// The tree at `path` as nested rows and columns of cards and gaps.
 fn arrange(
     s: &UiState,
+    k: &Kit,
     node: &TileNode,
     path: &mut Vec<bool>,
     rect: dwindle::Rect,
@@ -955,12 +1003,12 @@ fn arrange(
         } => {
             let (ra, rb) = dwindle::cut(rect, *across, *ratio);
             let room = if *across { rect[2] } else { rect[3] } - GAP;
-            let gap = gap(s, path, *across, *ratio, room);
+            let gap = gap(s, k, path, *across, *ratio, room);
             path.push(false);
-            let first = arrange(s, a, path, ra, cards);
+            let first = arrange(s, k, a, path, ra, cards);
             path.pop();
             path.push(true);
-            let second = arrange(s, b, path, rb, cards);
+            let second = arrange(s, k, b, path, rb, cards);
             path.pop();
             let line = if *across { row() } else { col() };
             line.key(path_key("tile-split", path))
@@ -1018,6 +1066,7 @@ pub fn view(s: &UiState, k: &Kit, clear: f32, scale: f32, layer: &mut Vec<El>) -
         .collect();
     let body = arrange(
         s,
+        k,
         &tree,
         &mut Vec::new(),
         [0.0, 0.0, size[0], size[1]],
@@ -1218,5 +1267,32 @@ mod tests {
         let only = s.tile_of_terminal().unwrap();
         assert_eq!(s.tiles[only].term_tab, Some(0));
         assert_eq!(s.term.active_tab, 0);
+    }
+
+    #[test]
+    fn split_resizer_gap_and_tile_drag() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.open_session("s1");
+        s.open_terminal_tile();
+        assert!(s.in_split());
+
+        let path = vec![];
+        s.set_tile_ratio(&path, 0.4);
+        let tree = s.tile_layout();
+        match tree {
+            crate::config::TileNode::Split { ratio, .. } => {
+                assert!((ratio - 0.4).abs() < 0.001);
+            }
+            _ => panic!("expected split node"),
+        }
+
+        let k = Kit::neutral(s.dark);
+        let g = gap(&s, &k, &path, true, 0.4, 800.0);
+        let _ = g;
+
+        // Test vertical split gap as well
+        let g_vert = gap(&s, &k, &path, false, 0.4, 600.0);
+        let _ = g_vert;
     }
 }
