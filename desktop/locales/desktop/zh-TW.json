@@ -495,5 +495,14 @@
   "Quote to composer": "引用到輸入框",
   "Copy entire message": "複製整條訊息",
   "Find in terminal…": "在終端中查詢…",
-  "Find in terminal": "在終端中查詢"
+  "Find in terminal": "在終端中查詢",
+  "Commit": "提交",
+  "Commit & Push": "提交併推送",
+  "Commit message": "提交說明",
+  "Commit message cannot be empty": "提交說明不能為空",
+  "Commit message…": "提交說明…",
+  "Push commits": "推送提交",
+  "Merge worktree": "合併工作區",
+  "Clean worktree": "清理工作區",
+  "Confirm clean": "確認清理"
 }

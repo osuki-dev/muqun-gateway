@@ -441,6 +441,7 @@ fn diff(s: &mut UiState) {
     s.show_diff = true;
     s.right_open = true;
     s.inspector_tab = InspectorTab::Git;
+    s.git_commit_msg = rune::TextEdit::new("feat: update greeting copy");
     s.demo = true;
 }
 
@@ -618,6 +619,8 @@ fn tasks(s: &mut UiState) {
             progress: Some("3 of 5 steps".into()),
             agent_id: Some("codex".into()),
             asid: Some("s1".into()),
+            cwd: Some("/home/demo/gateway/.git/muqun-worktrees/k1".into()),
+            worktree_branch: Some("muqun/k1".into()),
             ..TaskRow::default()
         },
         TaskRow {

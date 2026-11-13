@@ -749,6 +749,149 @@ impl Core {
                     Err(_) => tracing::debug!(task = %id, "task history timed out"),
                 }
             }
+            Command::GitCommit {
+                cwd,
+                message,
+                push,
+                asid,
+            } => {
+                let inbox = self.inbox.clone();
+                let cwd_clone = cwd.clone();
+                tokio::task::spawn_blocking(move || {
+                    let path = PathBuf::from(&cwd_clone);
+                    match crate::model::git_ops::git_commit(&path, &message) {
+                        Ok(summary) => {
+                            if push {
+                                match crate::model::git_ops::git_push(&path) {
+                                    Ok(_) => {
+                                        inbox.push(Update::Ui(super::inbox::UiAction::Toast {
+                                            title: "Committed and pushed".into(),
+                                            detail: Some(summary),
+                                        }));
+                                    }
+                                    Err(why) => {
+                                        inbox.push(Update::Ui(super::inbox::UiAction::Toast {
+                                            title: "Committed, but push failed".into(),
+                                            detail: Some(why),
+                                        }));
+                                    }
+                                }
+                            } else {
+                                inbox.push(Update::Ui(super::inbox::UiAction::Toast {
+                                    title: "Committed changes".into(),
+                                    detail: Some(summary),
+                                }));
+                            }
+                        }
+                        Err(why) => {
+                            inbox.push(Update::Ui(super::inbox::UiAction::Toast {
+                                title: "Git commit failed".into(),
+                                detail: Some(why),
+                            }));
+                        }
+                    }
+                });
+                if let Some(asid) = asid {
+                    tokio::spawn(self.clone().diff(asid));
+                }
+                let path = PathBuf::from(&cwd);
+                let info =
+                    tokio::task::spawn_blocking(move || crate::model::compose::branch_info(&path))
+                        .await
+                        .unwrap_or_default();
+                self.inbox.push(Update::Composer(Box::new(
+                    super::compose::ComposerUpdate::Branch { cwd, info },
+                )));
+            }
+            Command::GitPush { cwd, asid } => {
+                let inbox = self.inbox.clone();
+                let cwd_clone = cwd.clone();
+                tokio::task::spawn_blocking(move || {
+                    let path = PathBuf::from(&cwd_clone);
+                    match crate::model::git_ops::git_push(&path) {
+                        Ok(msg) => {
+                            inbox.push(Update::Ui(super::inbox::UiAction::Toast {
+                                title: "Pushed to remote".into(),
+                                detail: (!msg.trim().is_empty()).then_some(msg),
+                            }));
+                        }
+                        Err(why) => {
+                            inbox.push(Update::Ui(super::inbox::UiAction::Toast {
+                                title: "Git push failed".into(),
+                                detail: Some(why),
+                            }));
+                        }
+                    }
+                });
+                if let Some(asid) = asid {
+                    tokio::spawn(self.clone().diff(asid));
+                }
+                let path = PathBuf::from(&cwd);
+                let info =
+                    tokio::task::spawn_blocking(move || crate::model::compose::branch_info(&path))
+                        .await
+                        .unwrap_or_default();
+                self.inbox.push(Update::Composer(Box::new(
+                    super::compose::ComposerUpdate::Branch { cwd, info },
+                )));
+            }
+            Command::MergeTaskWorktree {
+                task_id,
+                base_dir,
+                branch,
+                worktree_dir,
+            } => {
+                match self
+                    .hub
+                    .merge_task_worktree(&task_id, &base_dir, &branch, worktree_dir.as_deref())
+                    .await
+                {
+                    Ok(msg) => {
+                        self.inbox.push(Update::Ui(super::inbox::UiAction::Toast {
+                            title: format!("Merged branch {branch}"),
+                            detail: (!msg.trim().is_empty()).then_some(msg),
+                        }));
+                        self.refresh_tasks().await;
+                    }
+                    Err(err) => {
+                        self.inbox.push(Update::Ui(super::inbox::UiAction::Toast {
+                            title: format!("Merge failed: {branch}"),
+                            detail: Some(err.to_string()),
+                        }));
+                    }
+                }
+            }
+            Command::CleanTaskWorktree {
+                task_id,
+                base_dir,
+                worktree_dir,
+                branch,
+            } => {
+                match self
+                    .hub
+                    .clean_task_worktree(
+                        &task_id,
+                        &base_dir,
+                        worktree_dir.as_deref(),
+                        branch.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        self.inbox.push(Update::Ui(super::inbox::UiAction::Toast {
+                            title: "Worktree cleaned".into(),
+                            detail: Some(format!("Removed task {task_id} worktree")),
+                        }));
+                        self.refresh_tasks().await;
+                    }
+                    Err(err) => {
+                        self.inbox.push(Update::Ui(super::inbox::UiAction::Toast {
+                            title: "Failed to clean worktree".into(),
+                            detail: Some(err.to_string()),
+                        }));
+                    }
+                }
+            }
             Command::CheckUpdate { include_preview } => {
                 let inbox = self.inbox.clone();
                 inbox.push(Update::UpdateState(UpdateState::Checking));

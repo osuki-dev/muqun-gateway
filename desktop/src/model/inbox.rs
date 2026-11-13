@@ -81,6 +81,11 @@ pub enum UiAction {
         asid: String,
         path: String,
     },
+    /// Show a brief notification toast.
+    Toast {
+        title: String,
+        detail: Option<String>,
+    },
 }
 
 /// What a content search came back with.

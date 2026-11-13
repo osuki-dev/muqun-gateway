@@ -243,6 +243,32 @@ pub enum Command {
     TaskHistory {
         id: String,
     },
+    /// Git commit staged changes or all changes in `cwd`.
+    GitCommit {
+        cwd: String,
+        message: String,
+        push: bool,
+        asid: Option<AgentSessionId>,
+    },
+    /// Git push current branch in `cwd`.
+    GitPush {
+        cwd: String,
+        asid: Option<AgentSessionId>,
+    },
+    /// Merge a task's worktree branch into current base checkout.
+    MergeTaskWorktree {
+        task_id: String,
+        base_dir: String,
+        branch: String,
+        worktree_dir: Option<String>,
+    },
+    /// Clean up a task's worktree folder and prune worktrees.
+    CleanTaskWorktree {
+        task_id: String,
+        base_dir: String,
+        worktree_dir: Option<String>,
+        branch: Option<String>,
+    },
 }
 
 pub type CommandSender = mpsc::UnboundedSender<Command>;

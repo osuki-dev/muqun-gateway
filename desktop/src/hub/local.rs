@@ -1009,6 +1009,74 @@ impl SessionHub for LocalHub {
         })
     }
 
+    fn merge_task_worktree<'a>(
+        &'a self,
+        task_id: &'a str,
+        base_dir: &'a str,
+        branch: &'a str,
+        worktree_dir: Option<&'a str>,
+    ) -> HubFuture<'a, String> {
+        let task_id = task_id.to_string();
+        let base_dir = base_dir.to_string();
+        let branch = branch.to_string();
+        let worktree_dir = worktree_dir.map(String::from);
+        let tasks = Arc::clone(&self.tasks);
+        Box::pin(async move {
+            let branch_for_merge = branch.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                let base = PathBuf::from(&base_dir);
+                let wt = worktree_dir.as_deref().map(std::path::Path::new);
+                crate::model::git_ops::git_merge_branch(&base, wt, &branch_for_merge)
+            })
+            .await
+            .map_err(|e| HubError::Agent(AgentError::RequestFailed(e.to_string())))?;
+
+            match res {
+                Ok(summary) => {
+                    tasks.record_task_step(
+                        &task_id,
+                        "merged",
+                        Some(format!("Merged branch {branch}")),
+                    );
+                    Ok(summary)
+                }
+                Err(why) => Err(HubError::Agent(AgentError::RequestFailed(why))),
+            }
+        })
+    }
+
+    fn clean_task_worktree<'a>(
+        &'a self,
+        task_id: &'a str,
+        base_dir: &'a str,
+        worktree_dir: Option<&'a str>,
+        branch: Option<&'a str>,
+    ) -> HubFuture<'a, ()> {
+        let task_id = task_id.to_string();
+        let base_dir = base_dir.to_string();
+        let worktree_dir = worktree_dir.map(String::from);
+        let branch = branch.map(String::from);
+        let tasks = Arc::clone(&self.tasks);
+        Box::pin(async move {
+            let res = tokio::task::spawn_blocking(move || {
+                let base = PathBuf::from(&base_dir);
+                let wt = worktree_dir.as_deref().map(std::path::Path::new);
+                crate::model::git_ops::git_clean_worktree(&base, wt, branch.as_deref())
+            })
+            .await
+            .map_err(|e| HubError::Agent(AgentError::RequestFailed(e.to_string())))?;
+
+            match res {
+                Ok(()) => {
+                    tasks.clear_task_worktree(&task_id);
+                    tasks.record_task_step(&task_id, "cleaned", Some("Worktree cleaned up".into()));
+                    Ok(())
+                }
+                Err(why) => Err(HubError::Agent(AgentError::RequestFailed(why))),
+            }
+        })
+    }
+
     fn task_defaults(&self) -> HubFuture<'_, TaskDefaults> {
         Box::pin(async {
             let default_cwd = std::env::current_dir()
@@ -1334,6 +1402,41 @@ impl LocalTaskManager {
         }
         rec.row.progress = progress;
         rec.row.updated_ms = now_ms();
+        let updated = rec.row.clone();
+        self.save_locked(&guard);
+        drop(guard);
+        let _ = self
+            .events_tx
+            .send(TaskHubEvent::Updated(Box::new(updated)));
+    }
+
+    pub fn clear_task_worktree(&self, id: &str) {
+        let mut guard = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(rec) = guard.tasks.iter_mut().find(|r| r.row.id == id) else {
+            return;
+        };
+        rec.row.worktree_branch = None;
+        rec.row.updated_ms = now_ms();
+        let updated = rec.row.clone();
+        self.save_locked(&guard);
+        drop(guard);
+        let _ = self
+            .events_tx
+            .send(TaskHubEvent::Updated(Box::new(updated)));
+    }
+
+    pub fn record_task_step(&self, id: &str, to_state: &str, note: Option<String>) {
+        let now = now_ms();
+        let mut guard = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(rec) = guard.tasks.iter_mut().find(|r| r.row.id == id) else {
+            return;
+        };
+        rec.steps.push(TaskStep {
+            at_ms: now,
+            to: to_state.to_string(),
+            note,
+        });
+        rec.row.updated_ms = now;
         let updated = rec.row.clone();
         self.save_locked(&guard);
         drop(guard);

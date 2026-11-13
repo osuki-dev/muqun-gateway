@@ -582,6 +582,26 @@ pub trait SessionHub: Send + Sync {
     /// The user confirms a paused delegation is finished
     /// (`POST /api/tasks/{id}/complete`).
     fn complete_task<'a>(&'a self, id: &'a str) -> HubFuture<'a, ()>;
+    /// Merge a task's worktree branch into current base checkout.
+    fn merge_task_worktree<'a>(
+        &'a self,
+        _task_id: &'a str,
+        _base_dir: &'a str,
+        _branch: &'a str,
+        _worktree_dir: Option<&'a str>,
+    ) -> HubFuture<'a, String> {
+        Box::pin(async { Ok("Merged".into()) })
+    }
+    /// Clean up a task's worktree.
+    fn clean_task_worktree<'a>(
+        &'a self,
+        _task_id: &'a str,
+        _base_dir: &'a str,
+        _worktree_dir: Option<&'a str>,
+        _branch: Option<&'a str>,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
     /// What a task opened without a folder would run in.
     fn task_defaults(&self) -> HubFuture<'_, TaskDefaults>;
     /// A task's state changes, oldest first (`GET /api/tasks/{id}`

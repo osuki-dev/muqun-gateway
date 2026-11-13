@@ -3,8 +3,10 @@
 use std::path::PathBuf;
 
 use muqun_gateway::agents::AgentSessionId;
-use rune::{col, el, row, text, El, ScrollSpec};
-use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, ScrollBar};
+use rune::{col, el, row, text, El, ScrollSpec, Tx};
+use rune_kit::{
+    Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, ScrollBar, TextInput,
+};
 
 use super::copy::{tr, tr_ref};
 use super::{muted, timeline, title_of, InspectorTab, Mode, UiState};
@@ -399,6 +401,15 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
             t("Working tree is clean"),
             t("Edits the agent makes show up here."),
         ));
+        if cwd.is_some() {
+            out.push(small(
+                k,
+                t("Push commits"),
+                ButtonVariant::Outline,
+                "git-push-btn".into(),
+                push_changes,
+            ));
+        }
     } else {
         out.push(muted(
             k,
@@ -463,6 +474,47 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
                 Some(actions),
             ));
         }
+
+        // Commit message input & action buttons
+        let commit_input = TextInput::new(&s.git_commit_msg)
+            .placeholder(t("Commit message…"))
+            .label(t("Commit message"))
+            .on_edit(|s: &mut UiState| &mut s.git_commit_msg)
+            .on_submit(|s: &mut UiState, _: &mut Tx| commit_changes(s, false))
+            .build(k)
+            .key("git-commit-msg-field")
+            .w_full();
+
+        let has_msg = !s.git_commit_msg.text.trim().is_empty();
+        let commit_btn = Button::new(t("Commit"))
+            .variant(ButtonVariant::Submit)
+            .disabled(!has_msg)
+            .on_press(|s: &mut UiState| commit_changes(s, false))
+            .build(k)
+            .key("git-commit-btn");
+
+        let commit_push_btn = Button::new(t("Commit & Push"))
+            .variant(ButtonVariant::Outline)
+            .disabled(!has_msg)
+            .on_press(|s: &mut UiState| commit_changes(s, true))
+            .build(k)
+            .key("git-commit-push-btn");
+
+        let commit_box = col()
+            .key("git-commit-box")
+            .w_full()
+            .gap(8.0)
+            .pt(6.0)
+            .child(commit_input)
+            .child(
+                row()
+                    .gap(8.0)
+                    .center_y()
+                    .child(commit_btn)
+                    .child(commit_push_btn),
+            );
+        out.push(commit_box);
+
         out.push(small(
             k,
             t("View changes"),
@@ -801,6 +853,42 @@ pub fn view(s: &UiState, k: &Kit) -> El {
         )
 }
 
+fn commit_changes(s: &mut UiState, push: bool) {
+    let msg = s.git_commit_msg.text.trim().to_string();
+    if msg.is_empty() {
+        let lang = s.cfg.general.language;
+        s.toast(tr_ref(lang, "Commit message cannot be empty"), None);
+        return;
+    }
+    let cwd = s
+        .current()
+        .and_then(|info| info.directory.clone())
+        .unwrap_or_else(|| s.terminal_cwd().display().to_string());
+    if cwd.is_empty() {
+        return;
+    }
+    s.git_commit_msg = rune::TextEdit::new("");
+    let asid = s.selected.clone().map(AgentSessionId);
+    s.send(Command::GitCommit {
+        cwd,
+        message: msg,
+        push,
+        asid,
+    });
+}
+
+fn push_changes(s: &mut UiState) {
+    let cwd = s
+        .current()
+        .and_then(|info| info.directory.clone())
+        .unwrap_or_else(|| s.terminal_cwd().display().to_string());
+    if cwd.is_empty() {
+        return;
+    }
+    let asid = s.selected.clone().map(AgentSessionId);
+    s.send(Command::GitPush { cwd, asid });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -830,5 +918,46 @@ mod tests {
         let k = Kit::neutral(s.dark);
         let els = subagents(&s, &k);
         assert_eq!(els.len(), 3); // 1 header banner with "Tile all" + 2 subagent rows
+    }
+
+    #[test]
+    fn git_inspector_renders_commit_box_when_changes_present() {
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let info: AgentSessionInfo = serde_json::from_value(serde_json::json!({
+            "asid": "test-session",
+            "agent_id": "opencode",
+            "title": "Test",
+            "status": "idle",
+            "directory": "/tmp",
+            "updated_ms": 1000u64,
+        }))
+        .unwrap();
+        s.sessions = vec![info];
+        s.selected = Some("test-session".into());
+        s.diff_stat.files = 2;
+        s.diff_stat.paths = vec![crate::model::types::DiffFile {
+            path: "src/main.rs".into(),
+            added: 5,
+            removed: 1,
+            patch: "".into(),
+        }];
+        s.git_commit_msg = rune::TextEdit::new("feat: cool feature");
+        let k = Kit::neutral(s.dark);
+        let els = git(&s, &k);
+        assert!(!els.is_empty());
+
+        while rx.try_recv().is_ok() {}
+
+        commit_changes(&mut s, false);
+        assert!(s.git_commit_msg.text.is_empty());
+        let cmd = rx.try_recv().unwrap();
+        match cmd {
+            Command::GitCommit { message, push, .. } => {
+                assert_eq!(message, "feat: cool feature");
+                assert!(!push);
+            }
+            other => panic!("expected GitCommit command, got {:?}", other),
+        }
     }
 }

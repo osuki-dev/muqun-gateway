@@ -495,5 +495,14 @@
   "Updates": "软件更新",
   "Git": "Git",
   "Show or hide Git inspector": "显示或隐藏 Git 审查面板",
-  "Initialize Git in Terminal": "在终端中初始化 Git"
+  "Initialize Git in Terminal": "在终端中初始化 Git",
+  "Commit": "提交",
+  "Commit & Push": "提交并推送",
+  "Commit message": "提交说明",
+  "Commit message cannot be empty": "提交说明不能为空",
+  "Commit message…": "提交说明…",
+  "Push commits": "推送提交",
+  "Merge worktree": "合并工作区",
+  "Clean worktree": "清理工作区",
+  "Confirm clean": "确认清理"
 }

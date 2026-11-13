@@ -29,6 +29,8 @@ pub struct TasksView {
     pub machine: Option<Option<String>>,
     /// The task Cancel was pressed once for: the next press cancels it.
     pub arm_cancel: Option<String>,
+    /// The task Clean worktree was pressed once for: the next press confirms.
+    pub arm_clean_wt: Option<String>,
     pub history: HashMap<String, Vec<TaskStep>>,
     /// Why the list could not be read, until it next is.
     pub error: Option<String>,
@@ -170,6 +172,9 @@ fn select(s: &mut UiState, id: String) {
     if s.tasks_view.arm_cancel.as_ref() != Some(&id) {
         s.tasks_view.arm_cancel = None;
     }
+    if s.tasks_view.arm_clean_wt.as_ref() != Some(&id) {
+        s.tasks_view.arm_clean_wt = None;
+    }
     s.send(Command::TaskHistory { id: id.clone() });
     s.tasks_view.pick = Some(id);
 }
@@ -187,6 +192,7 @@ pub fn listed(s: &mut UiState) {
 }
 
 fn cancel(s: &mut UiState, id: &str) {
+    s.tasks_view.arm_clean_wt = None;
     if s.tasks_view.arm_cancel.as_deref() == Some(id) {
         s.tasks_view.arm_cancel = None;
         s.send(Command::CancelTask { id: id.to_string() });
@@ -475,6 +481,7 @@ fn filters(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .on_pick(|s: &mut UiState, i, _: &mut Tx| {
                     s.tasks_view.filter = Filter::ALL[i];
                     s.tasks_view.arm_cancel = None;
+                    s.tasks_view.arm_clean_wt = None;
                 })
                 .build(k)
                 .key("tasks-state"),
@@ -1192,6 +1199,60 @@ fn actions(s: &UiState, k: &Kit, t: &TaskRow) -> El {
                 .key("task-done"),
         );
     }
+    if let Some(branch) = t.worktree_branch.as_ref().filter(|b| !b.is_empty()) {
+        let task_id = t.id.clone();
+        let cwd = t.cwd.clone().unwrap_or_default();
+        let branch_for_merge = branch.clone();
+        let branch_for_clean = branch.clone();
+
+        let merge_label = tr(language, "Merge worktree");
+        line = line.child(
+            Button::new(merge_label)
+                .variant(ButtonVariant::Outline)
+                .on_press(move |s: &mut UiState| {
+                    s.send(Command::MergeTaskWorktree {
+                        task_id: task_id.clone(),
+                        base_dir: cwd.clone(),
+                        branch: branch_for_merge.clone(),
+                        worktree_dir: Some(cwd.clone()),
+                    });
+                })
+                .build(k)
+                .key("task-merge-worktree"),
+        );
+
+        let task_id_clean = t.id.clone();
+        let cwd_clean = t.cwd.clone().unwrap_or_default();
+        let armed = s.tasks_view.arm_clean_wt.as_deref() == Some(t.id.as_str());
+        let clean_label = if armed {
+            tr(language, "Confirm clean")
+        } else {
+            tr(language, "Clean worktree")
+        };
+        line = line.child(
+            Button::new(clean_label)
+                .variant(if armed {
+                    ButtonVariant::Danger
+                } else {
+                    ButtonVariant::Ghost
+                })
+                .on_press(move |s: &mut UiState| {
+                    if armed {
+                        s.tasks_view.arm_clean_wt = None;
+                        s.send(Command::CleanTaskWorktree {
+                            task_id: task_id_clean.clone(),
+                            base_dir: cwd_clean.clone(),
+                            worktree_dir: Some(cwd_clean.clone()),
+                            branch: Some(branch_for_clean.clone()),
+                        });
+                    } else {
+                        s.tasks_view.arm_clean_wt = Some(task_id_clean.clone());
+                    }
+                })
+                .build(k)
+                .key("task-clean-worktree"),
+        );
+    }
     if !t.is_ended() {
         let armed = s.tasks_view.arm_cancel.as_deref() == Some(t.id.as_str());
         let id = t.id.clone();
@@ -1324,5 +1385,30 @@ mod tests {
         let k = Kit::neutral(true);
         let mut layer = Vec::new();
         let _el = view(&s, &k, &mut layer);
+    }
+
+    #[test]
+    fn task_worktree_merge_and_clean_actions() {
+        let (tx, _rx) = commands::channel();
+        let mut s = UiState::new(tx);
+        s.mode = super::super::Mode::Tasks;
+        let task = TaskRow {
+            id: "task-wt".into(),
+            state: "working".into(),
+            title: "Task with worktree".into(),
+            worktree_branch: Some("muqun/task-wt".into()),
+            cwd: Some("/tmp/muqun-wt".into()),
+            ..TaskRow::default()
+        };
+        s.tasks.push(task.clone());
+        let k = Kit::neutral(true);
+        let _act = actions(&s, &k, &task);
+
+        // Arm clean worktree
+        assert_eq!(s.tasks_view.arm_clean_wt, None);
+        s.tasks_view.arm_clean_wt = Some("task-wt".into());
+        // Selecting another task disarms it
+        select(&mut s, "other-task".into());
+        assert_eq!(s.tasks_view.arm_clean_wt, None);
     }
 }

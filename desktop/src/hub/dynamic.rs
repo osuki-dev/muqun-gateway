@@ -462,6 +462,36 @@ impl SessionHub for DynamicHub {
         Box::pin(async move { active.complete_task(id).await })
     }
 
+    fn merge_task_worktree<'a>(
+        &'a self,
+        task_id: &'a str,
+        base_dir: &'a str,
+        branch: &'a str,
+        worktree_dir: Option<&'a str>,
+    ) -> HubFuture<'a, String> {
+        let active = self.active();
+        Box::pin(async move {
+            active
+                .merge_task_worktree(task_id, base_dir, branch, worktree_dir)
+                .await
+        })
+    }
+
+    fn clean_task_worktree<'a>(
+        &'a self,
+        task_id: &'a str,
+        base_dir: &'a str,
+        worktree_dir: Option<&'a str>,
+        branch: Option<&'a str>,
+    ) -> HubFuture<'a, ()> {
+        let active = self.active();
+        Box::pin(async move {
+            active
+                .clean_task_worktree(task_id, base_dir, worktree_dir, branch)
+                .await
+        })
+    }
+
     fn task_defaults(&self) -> HubFuture<'_, TaskDefaults> {
         let active = self.active();
         Box::pin(async move { active.task_defaults().await })

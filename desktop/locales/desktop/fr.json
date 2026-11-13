@@ -495,5 +495,14 @@
   "Quote to composer": "Quote to composer",
   "Copy entire message": "Copy entire message",
   "Find in terminal…": "Find in terminal…",
-  "Find in terminal": "Find in terminal"
+  "Find in terminal": "Find in terminal",
+  "Commit": "Commit",
+  "Commit & Push": "Commit & Push",
+  "Commit message": "Commit message",
+  "Commit message cannot be empty": "Commit message cannot be empty",
+  "Commit message…": "Commit message…",
+  "Push commits": "Push commits",
+  "Merge worktree": "Merge worktree",
+  "Clean worktree": "Clean worktree",
+  "Confirm clean": "Confirm clean"
 }

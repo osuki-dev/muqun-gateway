@@ -481,6 +481,7 @@ pub struct UiState {
     pub show_diff: bool,
     pub diff_active_file: usize,
     pub revert_staged: bool,
+    pub git_commit_msg: TextEdit,
 
     pub tasks: Vec<TaskRow>,
     pub task_cwd: Option<String>,
@@ -684,6 +685,7 @@ impl UiState {
             show_diff: false,
             diff_active_file: 0,
             revert_staged: false,
+            git_commit_msg: TextEdit::new(""),
             tasks: Vec::new(),
             task_cwd: None,
             task_goal: TextEdit::new(""),
@@ -1555,9 +1557,13 @@ impl UiState {
                 if let Some(directory) = info.directory.clone() {
                     self.send(Command::LoadWorktrees {
                         agent: info.agent_id.clone(),
-                        directory,
+                        directory: directory.clone(),
                     });
+                    self.send(Command::Compose(
+                        crate::model::compose::ComposeCommand::Branch { cwd: directory },
+                    ));
                 }
+                self.send(Command::RefreshDiff(asid));
             }
             InspectorTab::Subagents => self.send(Command::LoadDescendants { asid }),
             InspectorTab::Saved => self.send(Command::LoadSavedPermissions { asid }),
@@ -2682,6 +2688,7 @@ impl UiState {
     fn on_action(&mut self, action: UiAction) {
         match action {
             UiAction::Open(asid) => self.open_session(&asid),
+            UiAction::Toast { title, detail } => self.toast(title, detail),
             UiAction::ToggleDiffPanel => self.show_diff = !self.show_diff,
             UiAction::OpenDiffFile { asid, path } => {
                 if self.selected.as_deref() == Some(asid.as_str()) {

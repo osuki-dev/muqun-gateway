@@ -495,5 +495,14 @@
   "Updates": "Updates",
   "Git": "Git",
   "Show or hide Git inspector": "Show or hide Git inspector",
-  "Initialize Git in Terminal": "Initialize Git in Terminal"
+  "Initialize Git in Terminal": "Initialize Git in Terminal",
+  "Commit": "Commit",
+  "Commit & Push": "Commit & Push",
+  "Commit message": "Commit message",
+  "Commit message cannot be empty": "Commit message cannot be empty",
+  "Commit message…": "Commit message…",
+  "Push commits": "Push commits",
+  "Merge worktree": "Merge worktree",
+  "Clean worktree": "Clean worktree",
+  "Confirm clean": "Confirm clean"
 }
