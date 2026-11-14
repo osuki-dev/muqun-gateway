@@ -12,7 +12,7 @@ use muqun_gateway::agents::{
 };
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 use muqun_gateway::platform::StoredUpload;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use super::{
     CatalogView, HubFuture, HubMode, PeerMention, SavedPermission, SearchPage, SearchQuery,
@@ -28,6 +28,8 @@ pub struct DynamicHub {
     task_events: broadcast::Sender<TaskHubEvent>,
     forward_abort: Mutex<Option<tokio::task::AbortHandle>>,
     task_forward_abort: Mutex<Option<tokio::task::AbortHandle>>,
+    link: watch::Sender<Option<String>>,
+    link_forward_abort: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 impl DynamicHub {
@@ -40,6 +42,8 @@ impl DynamicHub {
             task_events: task_events_tx,
             forward_abort: Mutex::new(None),
             task_forward_abort: Mutex::new(None),
+            link: watch::channel(None).0,
+            link_forward_abort: Mutex::new(None),
         });
         hub.bind_forwarders(&initial);
         hub
@@ -61,29 +65,78 @@ impl DynamicHub {
         if let Some(handle) = self.task_forward_abort.lock().unwrap().take() {
             handle.abort();
         }
+        if let Some(handle) = self.link_forward_abort.lock().unwrap().take() {
+            handle.abort();
+        }
 
-        let mut rx = hub.events();
-        let tx = self.events.clone();
-        let task = tokio::spawn(async move {
-            while let Ok(event) = rx.recv().await {
-                let _ = tx.send(event);
-            }
-        });
+        let task = tokio::spawn(forward_events(hub.events(), self.events.clone()));
         *self.forward_abort.lock().unwrap() = Some(task.abort_handle());
 
-        if let Some(mut task_rx) = hub.task_events() {
-            let task_tx = self.task_events.clone();
-            let task2 = tokio::spawn(async move {
-                while let Ok(event) = task_rx.recv().await {
-                    let _ = task_tx.send(event);
+        if let Some(task_rx) = hub.task_events() {
+            let task2 = tokio::spawn(forward_tasks(task_rx, self.task_events.clone()));
+            *self.task_forward_abort.lock().unwrap() = Some(task2.abort_handle());
+        }
+        if let Some(mut link) = hub.link() {
+            self.link.send_replace(link.borrow_and_update().clone());
+            let tx = self.link.clone();
+            let task = tokio::spawn(async move {
+                while link.changed().await.is_ok() {
+                    tx.send_replace(link.borrow_and_update().clone());
                 }
             });
-            *self.task_forward_abort.lock().unwrap() = Some(task2.abort_handle());
+            *self.link_forward_abort.lock().unwrap() = Some(task.abort_handle());
+        } else {
+            self.link.send_replace(None);
         }
     }
 
     fn active(&self) -> Arc<dyn SessionHub> {
         self.current.read().unwrap().clone()
+    }
+}
+
+impl Drop for DynamicHub {
+    fn drop(&mut self) {
+        for slot in [
+            &self.forward_abort,
+            &self.task_forward_abort,
+            &self.link_forward_abort,
+        ] {
+            if let Some(handle) = slot.lock().unwrap().take() {
+                handle.abort();
+            }
+        }
+    }
+}
+
+async fn forward_events(
+    mut rx: broadcast::Receiver<AgentDomainEvent>,
+    tx: broadcast::Sender<AgentDomainEvent>,
+) {
+    loop {
+        let event = match rx.recv().await {
+            Ok(event) => event,
+            Err(broadcast::error::RecvError::Lagged(_)) => AgentDomainEvent::Resync {
+                asid: AgentSessionId(String::new()),
+                reason: "event forwarding lagged".into(),
+            },
+            Err(broadcast::error::RecvError::Closed) => return,
+        };
+        let _ = tx.send(event);
+    }
+}
+
+async fn forward_tasks(
+    mut rx: broadcast::Receiver<TaskHubEvent>,
+    tx: broadcast::Sender<TaskHubEvent>,
+) {
+    loop {
+        let event = match rx.recv().await {
+            Ok(event) => event,
+            Err(broadcast::error::RecvError::Lagged(_)) => TaskHubEvent::Resync,
+            Err(broadcast::error::RecvError::Closed) => return,
+        };
+        let _ = tx.send(event);
     }
 }
 
@@ -517,10 +570,78 @@ impl SessionHub for DynamicHub {
     }
 
     fn link(&self) -> Option<tokio::sync::watch::Receiver<Option<String>>> {
-        self.active().link()
+        Some(self.link.subscribe())
     }
 
     fn task_events(&self) -> Option<broadcast::Receiver<TaskHubEvent>> {
         Some(self.task_events.subscribe())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lagged_agent_forwarder_resyncs_and_keeps_delivering() {
+        let (source, input) = broadcast::channel(2);
+        let (output, mut received) = broadcast::channel(8);
+        for n in 0..4 {
+            source
+                .send(AgentDomainEvent::Resync {
+                    asid: AgentSessionId(format!("session-{n}")),
+                    reason: "fixture".into(),
+                })
+                .unwrap();
+        }
+        let forwarder = tokio::spawn(forward_events(input, output));
+        async fn next(rx: &mut broadcast::Receiver<AgentDomainEvent>) -> AgentDomainEvent {
+            // A bounded wait turns the original silent exit into a failure.
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        assert!(matches!(next(&mut received).await,
+            AgentDomainEvent::Resync { asid, .. } if asid.0.is_empty()));
+        for n in 2..4 {
+            assert!(matches!(next(&mut received).await,
+                AgentDomainEvent::Resync { asid, .. } if asid.0 == format!("session-{n}")));
+        }
+        drop(source);
+        forwarder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lagged_task_forwarder_resyncs_and_keeps_delivering() {
+        let (source, input) = broadcast::channel(2);
+        let (output, mut received) = broadcast::channel(8);
+        for n in 0..4 {
+            source
+                .send(TaskHubEvent::Deleted {
+                    task_id: format!("task-{n}"),
+                })
+                .unwrap();
+        }
+        let forwarder = tokio::spawn(forward_tasks(input, output));
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event, TaskHubEvent::Resync);
+        for n in 2..4 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), received.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                event,
+                TaskHubEvent::Deleted {
+                    task_id: format!("task-{n}")
+                }
+            );
+        }
+        drop(source);
+        forwarder.await.unwrap();
     }
 }

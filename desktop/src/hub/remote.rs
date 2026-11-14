@@ -1645,7 +1645,6 @@ async fn event_socket(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut backoff = BACKOFF_START;
-    let mut first = true;
     loop {
         if *shutdown.borrow() {
             return;
@@ -1654,7 +1653,7 @@ async fn event_socket(
             return;
         };
         let started = tokio::time::Instant::now();
-        let why = match run_socket(&hub, &mut first, &mut shutdown).await {
+        let why = match run_socket(hub, &mut shutdown).await {
             Ok(()) => {
                 tracing::info!("event socket closed");
                 "the gateway closed the connection".to_string()
@@ -1667,8 +1666,11 @@ async fn event_socket(
         if *shutdown.borrow() {
             return;
         }
-        hub.link.send_replace(Some(why));
-        drop(hub);
+        if let Some(hub) = weak.upgrade() {
+            hub.link.send_replace(Some(why));
+        } else {
+            return;
+        }
 
         if started.elapsed() > Duration::from_secs(30) {
             backoff = BACKOFF_START;
@@ -1682,8 +1684,7 @@ async fn event_socket(
 }
 
 async fn run_socket(
-    hub: &RemoteHub,
-    first: &mut bool,
+    hub: Arc<RemoteHub>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -1749,15 +1750,22 @@ async fn run_socket(
         );
     }
 
-    let (mut socket, _) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|e| e.to_string())?;
+    let (mut socket, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    .map_err(|_| "event socket handshake timed out".to_string())?
+    .map_err(|e| e.to_string())?;
 
     let mut codec: Option<ClientCodec> = None;
     if let (Some(material), Some(request_nonce)) = (&hub.material, nonce) {
         let first_msg = tokio::select! {
             _ = shutdown.changed() => return Ok(()),
-            res = socket.next() => res.ok_or_else(|| "socket closed before hello".to_string())?.map_err(|e| e.to_string())?,
+            res = tokio::time::timeout(Duration::from_secs(10), socket.next()) => res
+                .map_err(|_| "event socket hello timed out".to_string())?
+                .ok_or_else(|| "socket closed before hello".to_string())?
+                .map_err(|e| e.to_string())?,
         };
         let first_text = match first_msg {
             Message::Text(t) => t.to_string(),
@@ -1785,13 +1793,17 @@ async fn run_socket(
 
     tracing::info!("event socket connected");
     hub.link.send_replace(None);
-    if !std::mem::take(first) {
-        let _ = hub.events.send(AgentDomainEvent::Resync {
-            asid: AgentSessionId(String::new()),
-            reason: "reconnected".into(),
-        });
-        let _ = hub.task_events.send(TaskHubEvent::Resync);
-    }
+    // Also catch up the first connection: initial HTTP reads may have finished
+    // before the event subscription, or failed while the gateway was offline.
+    let _ = hub.events.send(AgentDomainEvent::Resync {
+        asid: AgentSessionId(String::new()),
+        reason: "connected".into(),
+    });
+    let _ = hub.task_events.send(TaskHubEvent::Resync);
+    // A connected socket must not keep an abandoned computer alive forever.
+    // Dropping the last owner closes shutdown and releases this socket.
+    let weak = Arc::downgrade(&hub);
+    drop(hub);
 
     loop {
         tokio::select! {
@@ -1823,10 +1835,14 @@ async fn run_socket(
                 };
                 match parse_frame(text.as_str()) {
                     Some(Frame::Agent(event)) => {
-                        let _ = hub.events.send(*event);
+                        if let Some(hub) = weak.upgrade() {
+                            let _ = hub.events.send(*event);
+                        }
                     }
                     Some(Frame::Task(event)) => {
-                        let _ = hub.task_events.send(event);
+                        if let Some(hub) = weak.upgrade() {
+                            let _ = hub.task_events.send(event);
+                        }
                     }
                     None => {}
                 }
@@ -1894,6 +1910,124 @@ fn parse_task_frame(frame: &Value) -> Option<TaskHubEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn accept_subscription(
+        listener: &tokio::net::TcpListener,
+    ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let sub = socket.next().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(sub.to_text().unwrap()).unwrap(),
+            json!({"t":"subscribe_all"})
+        );
+        socket
+    }
+
+    fn connect_fixture(listener: &tokio::net::TcpListener) -> Arc<RemoteHub> {
+        RemoteHub::start(LocalGateway {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token: "isolated-test".into(),
+            device_id: None,
+            transport_key: None,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn saved_remote_computer_reopens_its_connection_before_reading_sessions() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = crate::config::DesktopConfig {
+                current_computer: "qa-remote".into(),
+                ..Default::default()
+            };
+            config.computers.insert("qa-remote".into(), crate::config::ComputerProfile {
+                url: Some(format!("http://{}", listener.local_addr().unwrap())),
+                token: Some("isolated-test".into()),
+                ..Default::default()
+            });
+            let hub = crate::configured_remote_hub(&config).expect("saved remote selected");
+            let mut events = hub.events();
+            let mut socket = accept_subscription(&listener).await;
+            assert!(matches!(events.recv().await.unwrap(), AgentDomainEvent::Resync { .. }));
+            socket.send(tokio_tungstenite::tungstenite::Message::text(
+                json!({"t":"event","event":"agent.permission.resolved","data":{
+                    "type":"agent.permission.resolved","asid":"remote-session","request_id":"remote-request","seq":1
+                }}).to_string()
+            )).await.unwrap();
+            assert!(matches!(events.recv().await.unwrap(), AgentDomainEvent::PermissionResolved { asid, .. } if asid.0 == "remote-session"));
+        }).await.expect("saved remote delivers events without a local gateway");
+    }
+
+    #[tokio::test]
+    async fn socket_reconnect_resyncs_then_delivers_and_releases_abandoned_hub() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let hub = connect_fixture(&listener);
+            let mut events = hub.events();
+            let mut tasks = hub.task_events().unwrap();
+            let mut link = hub.link().unwrap();
+            let socket = accept_subscription(&listener).await;
+            assert!(matches!(events.recv().await.unwrap(), AgentDomainEvent::Resync { asid, .. } if asid.0.is_empty()));
+            assert_eq!(tasks.recv().await.unwrap(), TaskHubEvent::Resync);
+            link.borrow_and_update();
+            drop(socket);
+            loop {
+                link.changed().await.unwrap();
+                if link.borrow_and_update().is_some() { break; }
+            }
+            let mut socket = accept_subscription(&listener).await;
+            assert!(matches!(events.recv().await.unwrap(), AgentDomainEvent::Resync { .. }));
+            assert_eq!(tasks.recv().await.unwrap(), TaskHubEvent::Resync);
+            assert!(link.borrow().is_none());
+            socket.send(tokio_tungstenite::tungstenite::Message::text(
+                json!({"t":"event","event":"agent.permission.resolved","data":{
+                    "type":"agent.permission.resolved","asid":"isolated-session","request_id":"r1","seq":2
+                }}).to_string()
+            )).await.unwrap();
+            assert!(matches!(events.recv().await.unwrap(), AgentDomainEvent::PermissionResolved { asid, .. } if asid.0 == "isolated-session"));
+            let weak = Arc::downgrade(&hub);
+            drop(hub);
+            assert!(weak.upgrade().is_none(), "an idle socket must not own its hub");
+            // The peer observes a close rather than a leaked connection.
+            assert!(matches!(socket.next().await, Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None));
+        }).await.expect("reconnect and cleanup complete within the budget");
+    }
+
+    #[tokio::test]
+    async fn switching_computers_moves_existing_link_subscription() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let first = connect_fixture(&a);
+            let first_weak = Arc::downgrade(&first);
+            let hub = super::super::DynamicHub::new(first);
+            let mut link = hub.link().unwrap();
+            let _socket_a = accept_subscription(&a).await;
+            let second = connect_fixture(&b);
+            let socket_b = accept_subscription(&b).await;
+            hub.switch(second);
+            link.borrow_and_update();
+            drop(socket_b);
+            loop {
+                link.changed().await.unwrap();
+                if link.borrow_and_update().is_some() {
+                    break;
+                }
+            }
+            assert!(first_weak.upgrade().is_none());
+            let _socket_b = accept_subscription(&b).await;
+            loop {
+                link.changed().await.unwrap();
+                if link.borrow_and_update().is_none() {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the original subscription follows the new computer");
+    }
 
     #[test]
     fn auto_approve_answers_read_as_on_or_off() {
