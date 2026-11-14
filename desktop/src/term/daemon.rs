@@ -1132,43 +1132,40 @@ impl DaemonServer {
             writer.write_all(&out).await?;
             writer.flush().await?;
 
-            if !scrollback_bytes.is_empty() {
-                writer.write_all(&scrollback_bytes).await?;
-                writer.flush().await?;
-            }
-
-            let session_in = session.clone();
             let mut raw_reader = lines.into_inner();
-            let mut in_buf = [0u8; 4096];
-
-            loop {
-                tokio::select! {
-                    read_res = raw_reader.read(&mut in_buf) => {
-                        match read_res {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                if session_in.write_all(&in_buf[..n]).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
+            // Keep polling input while output is awaiting socket capacity. A
+            // single select loop with write_all inside its output arm stalls
+            // every key (including Ctrl+C) behind a slow renderer.
+            let input = async {
+                let mut bytes = [0u8; 4096];
+                loop {
+                    let count = raw_reader.read(&mut bytes).await?;
+                    if count == 0 {
+                        return Ok::<(), io::Error>(());
                     }
-                    msg_res = broadcast_rx.recv() => {
-                        match msg_res {
-                            Ok(OutputMsg::Data(bytes)) => {
-                                if writer.write_all(&bytes).await.is_err() {
-                                    break;
-                                }
-                                let _ = writer.flush().await;
-                            }
-                            Ok(OutputMsg::Status { .. }) => continue,
-                            Ok(OutputMsg::Exit(_)) => break,
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(broadcast::error::RecvError::Closed) => break,
+                    session.write_all(&bytes[..count])?;
+                }
+            };
+            let output = async {
+                if !scrollback_bytes.is_empty() {
+                    writer.write_all(&scrollback_bytes).await?;
+                }
+                loop {
+                    match broadcast_rx.recv().await {
+                        Ok(OutputMsg::Data(bytes)) => writer.write_all(&bytes).await?,
+                        Ok(OutputMsg::Status { .. }) => continue,
+                        Ok(OutputMsg::Exit(_)) | Err(broadcast::error::RecvError::Closed) => {
+                            return Ok::<(), io::Error>(());
                         }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     }
                 }
+            };
+            // Both futures belong to the connection; ending either cancels
+            // the other without leaving a detached reader or writer behind.
+            tokio::select! {
+                result = input => result?,
+                result = output => result?,
             }
         } else {
             let scrollback_b64 =
@@ -2072,6 +2069,51 @@ mod tests {
         };
         let json_evt = serde_json::to_string(&evt_output).unwrap();
         assert!(json_evt.contains(r#""event":"output""#));
+    }
+
+    #[tokio::test]
+    async fn raw_input_reaches_the_shell_while_output_is_backpressured() {
+        let dir = std::env::temp_dir().join(format!("muqun-input-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("term.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = Arc::new(DaemonServer::new());
+        let (shutdown, rx) = watch::channel(false);
+        let worker = tokio::spawn(run_server_with_shutdown(server.clone(), listener, rx));
+        let client = DaemonClient::new(Some(socket));
+        let id = client
+            .create_session(None, Some(dir.clone()), 80, 24)
+            .await
+            .unwrap();
+        let mut stream = client.attach_raw(&id).await.unwrap();
+        let session = server.sessions.lock().unwrap().get(&id).unwrap().clone();
+        // Much larger than a Unix socket's send buffer. Never drain this client:
+        // input must remain usable even while its output cannot make progress.
+        session
+            .broadcast_tx
+            .send(OutputMsg::Data(vec![b'x'; 8 << 20]))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stream
+            .write_all(b"printf INPUT_OK > input-received\n")
+            .await
+            .unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(2), async {
+            while std::fs::read(dir.join("input-received")).ok().as_deref() != Some(b"INPUT_OK") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        drop(stream);
+        client.close_session(&id).await.unwrap();
+        let _ = shutdown.send(true);
+        worker.await.unwrap().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            received,
+            "blocked output prevented the shell from receiving input"
+        );
     }
 
     #[tokio::test]
