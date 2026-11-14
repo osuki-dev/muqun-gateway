@@ -459,10 +459,46 @@ fn which_key_item(k: &Kit, id: &str, keys_list: &[&str], label: &str) -> El {
         )
 }
 
+fn which_key_column(k: &Kit, id: &str, title: &str, items: Vec<El>) -> El {
+    let mut column = col()
+        .key(format!("wk-col-{id}"))
+        .w_full()
+        .min_w(0.0)
+        .gap(4.0)
+        .child(
+            text(title.to_string())
+                .font(k.ty.small_medium)
+                .color(k.c.text_faint)
+                .pb(2.0),
+        );
+    for item in items {
+        column = column.child(item);
+    }
+    column
+}
+
 fn mount_which_key(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
     let language = s.cfg.general.language;
     let look = s.look();
     let leader_caps = keymap::leader_keycaps(KeyPlatform::current(), Some(&s.cfg.keymap));
+    let group = s.leader_group;
+
+    let badge_label = match group {
+        Some(g) => format!("LEADER → {}", g.key().to_ascii_uppercase()),
+        None => "LEADER".to_string(),
+    };
+    let hint = match group {
+        Some(g) => format!(
+            "{} · {}",
+            tr_ref(language, g.label()),
+            tr_ref(language, "Esc to close")
+        ),
+        None => tr_ref(
+            language,
+            "Group key or chord · Leader again to send to terminal · Esc to close",
+        )
+        .to_string(),
+    };
 
     let badge = row()
         .key("which-key-badge")
@@ -473,7 +509,7 @@ fn mount_which_key(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .fill(k.c.bg_accent.alpha(0.18))
         .border(1.0, k.c.bg_accent.alpha(0.45))
         .child(
-            text("LEADER")
+            text(badge_label)
                 .font(k.ty.small_medium)
                 .color(k.c.text_accent),
         );
@@ -489,139 +525,139 @@ fn mount_which_key(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .child(badge)
         .child(keycaps(k, &leader_caps))
         .child(
-            text(tr_ref(
-                language,
-                "Press a key · Leader again to send to terminal · Esc to cancel",
-            ))
-            .font(k.ty.small)
-            .color(k.c.text_muted)
-            .grow(1.0)
-            .shrink()
-            .min_w(0.0)
-            .truncate(),
+            text(hint)
+                .font(k.ty.small)
+                .color(k.c.text_muted)
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .truncate(),
         );
 
-    let col_nav = col()
-        .key("wk-col-nav")
-        .w_full()
-        .min_w(0.0)
-        .gap(4.0)
-        .child(
-            text(tr_ref(language, "Focus & Navigate"))
-                .font(k.ty.small_medium)
-                .color(k.c.text_faint)
-                .pb(2.0),
+    let grid = match group {
+        None => {
+            let groups = which_key_column(
+                k,
+                "groups",
+                tr_ref(language, "Groups"),
+                vec![
+                    which_key_item(k, "g-s", &["s"], tr_ref(language, "Session")),
+                    which_key_item(k, "g-w", &["w"], tr_ref(language, "Window")),
+                    which_key_item(k, "g-t", &["t"], tr_ref(language, "Terminal")),
+                    which_key_item(k, "g-g", &["g"], tr_ref(language, "Git")),
+                    which_key_item(k, "g-p", &["p"], tr_ref(language, "Plugins")),
+                    which_key_item(k, "g-o", &["o"], tr_ref(language, "Open")),
+                ],
+            );
+            let direct = which_key_column(
+                k,
+                "direct",
+                tr_ref(language, "Direct"),
+                vec![
+                    which_key_item(k, "focus", &["Space", ";"], tr_ref(language, "Focus")),
+                    which_key_item(k, "palette", &["k"], tr_ref(language, "Palette")),
+                    which_key_item(k, "new-session", &["n"], tr_ref(language, "New session")),
+                    which_key_item(k, "sidebar", &["b"], tr_ref(language, "Sidebar")),
+                    which_key_item(k, "inspector", &["i"], tr_ref(language, "Inspector")),
+                    which_key_item(k, "pages", &["H/I/T/S"], tr_ref(language, "Pages")),
+                    which_key_item(k, "help", &["?"], tr_ref(language, "Help")),
+                ],
+            );
+            row()
+                .key("which-key-grid")
+                .w_full()
+                .equal_columns(2)
+                .gap(20.0)
+                .px(16.0)
+                .py(12.0)
+                .child(groups)
+                .child(direct)
+        }
+        Some(keymap::LeaderGroup::Session) => which_key_column(
+            k,
+            "session",
+            tr_ref(language, "Session"),
+            vec![
+                which_key_item(k, "s-n", &["n"], tr_ref(language, "New session")),
+                which_key_item(k, "s-p", &["p", "["], tr_ref(language, "Previous session")),
+                which_key_item(k, "s-]", &["]"], tr_ref(language, "Next session")),
+                which_key_item(k, "s-r", &["r"], tr_ref(language, "Recent session")),
+                which_key_item(k, "s-c", &["c"], tr_ref(language, "Focus composer")),
+                which_key_item(k, "s-f", &["/", "f"], tr_ref(language, "Search messages")),
+            ],
         )
-        .child(which_key_item(
+        .px(16.0)
+        .py(12.0),
+        Some(keymap::LeaderGroup::Window) => which_key_column(
             k,
-            "focus",
-            &["Space", ";"],
-            tr_ref(language, "Focus"),
-        ))
-        .child(which_key_item(
-            k,
-            "palette",
-            &["k"],
-            tr_ref(language, "Palette"),
-        ))
-        .child(which_key_item(
-            k,
-            "sessions",
-            &["p"],
-            tr_ref(language, "Sessions"),
-        ))
-        .child(which_key_item(
-            k,
-            "new-session",
-            &["n"],
-            tr_ref(language, "New session"),
-        ))
-        .child(which_key_item(
-            k,
-            "pages",
-            &["H/I/T/S"],
-            tr_ref(language, "Pages"),
-        ));
-
-    let col_panels = col()
-        .key("wk-col-panels")
-        .w_full()
-        .min_w(0.0)
-        .gap(4.0)
-        .child(
-            text(tr_ref(language, "Panels & Search"))
-                .font(k.ty.small_medium)
-                .color(k.c.text_faint)
-                .pb(2.0),
+            "window",
+            tr_ref(language, "Window"),
+            vec![
+                which_key_item(k, "w-s", &["s"], tr_ref(language, "Split")),
+                which_key_item(k, "w-h", &["h"], tr_ref(language, "Split stacked")),
+                which_key_item(k, "w-v", &["v"], tr_ref(language, "Split side by side")),
+                which_key_item(k, "w-j", &["j"], tr_ref(language, "Toggle split axis")),
+                which_key_item(k, "w-z", &["z"], tr_ref(language, "Maximize")),
+                which_key_item(k, "w-o", &["o"], tr_ref(language, "Pop out")),
+                which_key_item(k, "w-e", &["e"], tr_ref(language, "Equalize")),
+                which_key_item(k, "w-l", &["l"], tr_ref(language, "Cycle layout")),
+                which_key_item(k, "w-x", &["x", "w"], tr_ref(language, "Close pane")),
+            ],
         )
-        .child(which_key_item(
-            k,
-            "sidebar",
-            &["b"],
-            tr_ref(language, "Sidebar"),
-        ))
-        .child(which_key_item(k, "git", &["g"], tr_ref(language, "Git")))
-        .child(which_key_item(
-            k,
-            "inspector",
-            &["i"],
-            tr_ref(language, "Inspector"),
-        ))
-        .child(which_key_item(
+        .px(16.0)
+        .py(12.0),
+        Some(keymap::LeaderGroup::Terminal) => which_key_column(
             k,
             "terminal",
-            &["t"],
             tr_ref(language, "Terminal"),
-        ))
-        .child(which_key_item(
-            k,
-            "search",
-            &["/"],
-            tr_ref(language, "Search"),
-        ));
-
-    let col_term = col()
-        .key("wk-col-term")
-        .w_full()
-        .min_w(0.0)
-        .gap(4.0)
-        .child(
-            text(tr_ref(language, "Terminal & Split"))
-                .font(k.ty.small_medium)
-                .color(k.c.text_faint)
-                .pb(2.0),
+            vec![
+                which_key_item(k, "t-t", &["t"], tr_ref(language, "Toggle terminal")),
+                which_key_item(k, "t-c", &["c"], tr_ref(language, "New Tab")),
+                which_key_item(k, "t-x", &["x"], tr_ref(language, "Close tab")),
+                which_key_item(k, "t-h", &["h", "v"], tr_ref(language, "Split")),
+                which_key_item(k, "t-z", &["z"], tr_ref(language, "Zoom")),
+                which_key_item(k, "t-f", &["/", "["], tr_ref(language, "Search")),
+            ],
         )
-        .child(which_key_item(
-            k,
-            "new-tab",
-            &["c"],
-            tr_ref(language, "New Tab"),
-        ))
-        .child(which_key_item(
-            k,
-            "split",
-            &["s", "v"],
-            tr_ref(language, "Split"),
-        ))
-        .child(which_key_item(
-            k,
-            "pane-tab",
-            &["1–4"],
-            tr_ref(language, "Pane/Tab"),
-        ))
-        .child(which_key_item(k, "zoom", &["z"], tr_ref(language, "Zoom")))
-        .child(which_key_item(k, "help", &["?"], tr_ref(language, "Help")));
-
-    let grid = row()
-        .key("which-key-grid")
-        .w_full()
-        .equal_columns(3)
-        .gap(20.0)
         .px(16.0)
-        .py(12.0)
-        .child(col_nav)
-        .child(col_panels)
-        .child(col_term);
+        .py(12.0),
+        Some(keymap::LeaderGroup::Git) => which_key_column(
+            k,
+            "git",
+            tr_ref(language, "Git"),
+            vec![
+                which_key_item(k, "git-g", &["g"], tr_ref(language, "Git inspector")),
+                which_key_item(k, "git-d", &["d"], tr_ref(language, "Diff")),
+            ],
+        )
+        .px(16.0)
+        .py(12.0),
+        Some(keymap::LeaderGroup::Plugin) => which_key_column(
+            k,
+            "plugins",
+            tr_ref(language, "Plugins"),
+            vec![
+                which_key_item(k, "p-p", &["p"], tr_ref(language, "Sessions")),
+                which_key_item(k, "p-k", &["k"], tr_ref(language, "Palette")),
+            ],
+        )
+        .px(16.0)
+        .py(12.0),
+        Some(keymap::LeaderGroup::Open) => which_key_column(
+            k,
+            "open",
+            tr_ref(language, "Open"),
+            vec![
+                which_key_item(k, "o-h", &["h"], tr_ref(language, "Home")),
+                which_key_item(k, "o-i", &["i"], tr_ref(language, "Inbox")),
+                which_key_item(k, "o-t", &["t"], tr_ref(language, "Tasks")),
+                which_key_item(k, "o-s", &["s"], tr_ref(language, "Settings")),
+                which_key_item(k, "o-?", &["?"], tr_ref(language, "Help")),
+            ],
+        )
+        .px(16.0)
+        .py(12.0),
+    };
 
     let card = col()
         .key("which-key-card")

@@ -100,12 +100,187 @@ pub fn insert(node: &mut TileNode, target: usize, new: usize, size: [f32; 2]) {
         .into_iter()
         .find(|(i, _)| *i == target)
         .is_none_or(|(_, r)| r[2] >= r[3]);
+    insert_with_axis(node, target, new, across);
+}
+
+/// Split pane `target` along an explicit axis (`across`: `true` = side by side, `false` = stacked).
+pub fn insert_with_axis(node: &mut TileNode, target: usize, new: usize, across: bool) {
     replace_leaf(node, target, &mut |old| TileNode::Split {
         across,
         ratio: 0.5,
         a: Box::new(old),
         b: Box::new(TileNode::Leaf(new)),
     });
+}
+
+/// Flip the orientation (`across`) of the split node immediately containing `target`
+/// (Omarchy 4.5 / Hyprland `togglesplit`, `Super+J`).
+pub fn toggle_parent_split(node: &mut TileNode, target: usize) -> bool {
+    fn contains(n: &TileNode, target: usize) -> bool {
+        match n {
+            TileNode::Leaf(i) => *i == target,
+            TileNode::Split { a, b, .. } => contains(a, target) || contains(b, target),
+        }
+    }
+    match node {
+        TileNode::Leaf(_) => false,
+        TileNode::Split { across, a, b, .. } => {
+            if matches!(a.as_ref(), TileNode::Leaf(i) if *i == target)
+                || matches!(b.as_ref(), TileNode::Leaf(i) if *i == target)
+            {
+                *across = !*across;
+                return true;
+            }
+            if contains(a, target) && toggle_parent_split(a, target) {
+                return true;
+            }
+            if contains(b, target) && toggle_parent_split(b, target) {
+                return true;
+            }
+            false
+        }
+    }
+}
+
+/// Reset every split ratio in `node` to `0.5`.
+pub fn equalize(node: &mut TileNode) {
+    if let TileNode::Split { ratio, a, b, .. } = node {
+        *ratio = 0.5;
+        equalize(a);
+        equalize(b);
+    }
+}
+
+/// Drop zone inside a target tile during drag-and-drop reordering/re-splitting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropZone {
+    /// Center 50%: swap the dragged tile with the target tile.
+    Center,
+    /// Left 25% edge: split target horizontally, dragged tile on the left.
+    Left,
+    /// Right 25% edge: split target horizontally, dragged tile on the right.
+    Right,
+    /// Top 25% edge: split target vertically, dragged tile on top.
+    Top,
+    /// Bottom 25% edge: split target vertically, dragged tile on the bottom.
+    Bottom,
+}
+
+/// Determine which [`DropZone`] of `rect` contains `(px, py)`.
+pub fn drop_zone(rect: Rect, px: f32, py: f32) -> DropZone {
+    let [x, y, w, h] = rect;
+    let u = ((px - x) / w.max(1.0)).clamp(0.0, 1.0);
+    let v = ((py - y) / h.max(1.0)).clamp(0.0, 1.0);
+    if u > 0.25 && u < 0.75 && v > 0.25 && v < 0.75 {
+        return DropZone::Center;
+    }
+    let dl = u;
+    let dr = 1.0 - u;
+    let dt = v;
+    let db = 1.0 - v;
+    let min = dl.min(dr).min(dt).min(db);
+    if (min - dl).abs() < 1e-5 {
+        DropZone::Left
+    } else if (min - dr).abs() < 1e-5 {
+        DropZone::Right
+    } else if (min - dt).abs() < 1e-5 {
+        DropZone::Top
+    } else {
+        DropZone::Bottom
+    }
+}
+
+/// Visual snap preview rectangle for `zone` inside `rect`.
+pub fn drop_preview_rect(rect: Rect, zone: DropZone) -> Rect {
+    let [x, y, w, h] = rect;
+    match zone {
+        DropZone::Center => rect,
+        DropZone::Left => [x, y, w * 0.5, h],
+        DropZone::Right => [x + w * 0.5, y, w * 0.5, h],
+        DropZone::Top => [x, y, w, h * 0.5],
+        DropZone::Bottom => [x, y + h * 0.5, w, h * 0.5],
+    }
+}
+
+fn detach_without_renumber(node: TileNode, target: usize) -> Option<TileNode> {
+    match node {
+        TileNode::Leaf(i) if i == target => None,
+        TileNode::Leaf(i) => Some(TileNode::Leaf(i)),
+        TileNode::Split {
+            across,
+            ratio,
+            a,
+            b,
+        } => match (
+            detach_without_renumber(*a, target),
+            detach_without_renumber(*b, target),
+        ) {
+            (Some(a), Some(b)) => Some(TileNode::Split {
+                across,
+                ratio,
+                a: Box::new(a),
+                b: Box::new(b),
+            }),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        },
+    }
+}
+
+fn swap_leaves(node: &mut TileNode, x: usize, y: usize) {
+    match node {
+        TileNode::Leaf(i) if *i == x => *i = y,
+        TileNode::Leaf(i) if *i == y => *i = x,
+        TileNode::Leaf(_) => {}
+        TileNode::Split { a, b, .. } => {
+            swap_leaves(a, x, y);
+            swap_leaves(b, x, y);
+        }
+    }
+}
+
+/// Move leaf `src` to `dst` according to `zone`:
+/// - `DropZone::Center` swaps `src` and `dst` in the tree.
+/// - `Left`/`Right`/`Top`/`Bottom` detaches `src` and splits `dst` along that edge.
+pub fn move_and_split(node: &TileNode, src: usize, dst: usize, zone: DropZone) -> TileNode {
+    if src == dst {
+        return node.clone();
+    }
+    if zone == DropZone::Center {
+        let mut out = node.clone();
+        swap_leaves(&mut out, src, dst);
+        return out;
+    }
+    let Some(mut tree) = detach_without_renumber(node.clone(), src) else {
+        return node.clone();
+    };
+    replace_leaf(&mut tree, dst, &mut |old_dst| match zone {
+        DropZone::Left => TileNode::Split {
+            across: true,
+            ratio: 0.5,
+            a: Box::new(TileNode::Leaf(src)),
+            b: Box::new(old_dst),
+        },
+        DropZone::Right | DropZone::Center => TileNode::Split {
+            across: true,
+            ratio: 0.5,
+            a: Box::new(old_dst),
+            b: Box::new(TileNode::Leaf(src)),
+        },
+        DropZone::Top => TileNode::Split {
+            across: false,
+            ratio: 0.5,
+            a: Box::new(TileNode::Leaf(src)),
+            b: Box::new(old_dst),
+        },
+        DropZone::Bottom => TileNode::Split {
+            across: false,
+            ratio: 0.5,
+            a: Box::new(old_dst),
+            b: Box::new(TileNode::Leaf(src)),
+        },
+    });
+    tree
 }
 
 fn replace_leaf(node: &mut TileNode, target: usize, f: &mut dyn FnMut(TileNode) -> TileNode) {
@@ -261,5 +436,38 @@ mod tests {
                 "from {from}, {key:?}"
             );
         }
+    }
+
+    #[test]
+    fn toggle_parent_split_and_move_and_split_edges() {
+        let mut tree = build(2, WIDE);
+        let placed = rects(&tree, [0.0, 0.0, WIDE[0], WIDE[1]]);
+        assert_eq!(placed[0].1, [0.0, 0.0, 800.0, 900.0]);
+        assert_eq!(placed[1].1, [800.0, 0.0, 800.0, 900.0]);
+
+        // Toggle parent split of pane 1 (horizontal -> vertical)
+        assert!(toggle_parent_split(&mut tree, 1));
+        let placed = rects(&tree, [0.0, 0.0, WIDE[0], WIDE[1]]);
+        assert_eq!(placed[0].1, [0.0, 0.0, 1600.0, 450.0]);
+        assert_eq!(placed[1].1, [0.0, 450.0, 1600.0, 450.0]);
+
+        // Drag-and-drop edge re-split on 3 panes
+        let tree3 = build(3, WIDE);
+        // Move pane 2 to bottom edge of pane 0
+        let moved = move_and_split(&tree3, 2, 0, DropZone::Bottom);
+        assert!(moved.fits(3));
+        let placed = rects(&moved, [0.0, 0.0, WIDE[0], WIDE[1]]);
+        let at = |i: usize| placed.iter().find(|(j, _)| *j == i).unwrap().1;
+        assert_eq!(at(0), [0.0, 0.0, 800.0, 450.0]);
+        assert_eq!(at(2), [0.0, 450.0, 800.0, 450.0]);
+        assert_eq!(at(1), [800.0, 0.0, 800.0, 900.0]);
+
+        // Drop zone detection
+        let r = [100.0, 100.0, 400.0, 300.0];
+        assert_eq!(drop_zone(r, 300.0, 250.0), DropZone::Center);
+        assert_eq!(drop_zone(r, 120.0, 250.0), DropZone::Left);
+        assert_eq!(drop_zone(r, 480.0, 250.0), DropZone::Right);
+        assert_eq!(drop_zone(r, 300.0, 110.0), DropZone::Top);
+        assert_eq!(drop_zone(r, 300.0, 390.0), DropZone::Bottom);
     }
 }

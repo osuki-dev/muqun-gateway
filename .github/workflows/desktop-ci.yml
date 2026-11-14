@@ -84,11 +84,18 @@ jobs:
       - name: build release
         run: cargo build --release --locked -p muqun-desktop
 
+      - name: Package Linux candidate
+        if: runner.os == 'Linux'
+        run: bash desktop/scripts/package-linux.sh --no-build
+
       - name: Collect binary
         run: |
           mkdir out
           cp target/release/muqun-desktop* out/ 2>/dev/null || true
           rm -f out/*.d out/*.pdb
+          if [ "$RUNNER_OS" = Linux ]; then
+            cp target/desktop-package/*.tar.gz target/desktop-package/*.sha256 out/
+          fi
           ls -l out
       - uses: actions/upload-artifact@v4
         with:

@@ -41,7 +41,9 @@ fn nav(s: &UiState, k: &Kit, label: &str, icon: &'static rune::Icon, mode: Mode)
         Some(glyph) => row.avatar(glyph),
         None => row.icon(icon),
     }
-    .selected(s.mode == mode)
+    .selected(
+        s.mode == mode && (mode != Mode::Settings || s.settings_tab != super::SettingsTab::Plugins),
+    )
     .on_select(move |s: &mut UiState, _: &mut Tx| s.go(mode));
     if mode == Mode::Inbox {
         let waiting = s.waiting_count();
@@ -667,6 +669,17 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         sidebar = sidebar.footer(running);
     }
     let sidebar = sidebar
+        .footer(
+            SidebarRow::new(super::copy::tr_ref(language, "Plugins"))
+                .icon(&super::icons::GRID)
+                .selected(s.mode == Mode::Settings && s.settings_tab == super::SettingsTab::Plugins)
+                .on_select(|s: &mut UiState, _: &mut Tx| {
+                    s.go(Mode::Settings);
+                    super::settings::open(s, super::SettingsTab::Plugins);
+                })
+                .build(k)
+                .key("nav-plugins"),
+        )
         .footer(nav(
             s,
             k,

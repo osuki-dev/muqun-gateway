@@ -370,7 +370,7 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
             agent: None,
         });
     }
-    for plugin in s.plugins.all() {
+    for plugin in s.plugins.all_enabled(&s.cfg.plugins_disabled) {
         let pid = plugin.id().to_string();
         let ptitle = plugin.title(language);
         let pdesc = plugin.description(language).unwrap_or_default();

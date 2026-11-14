@@ -5,7 +5,7 @@
 //! and user extensions to seamlessly plug into desktop split tiles, full-screen
 //! pages, right-hand drawers, commands, and workspace panels.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use muqun_gateway::agents::AgentSessionId;
@@ -24,12 +24,24 @@ use crate::ui::{Mode, ToastLevel, UiState};
 
 pub mod loader;
 pub mod manifest;
+pub mod window;
+pub use window::WindowKind;
 
 pub use loader::{discover_plugins, BunScriptResponse, BunToastResponse, ExternalPlugin};
 pub use manifest::{
     PluginCategory, PluginCommandManifest, PluginManifest, PluginRenderKind, PluginSlot,
     PluginSurface, PluginTileManifest,
 };
+
+/// Built-in plugins that stay on; their Settings toggle is disabled.
+pub fn is_always_on(id: &str) -> bool {
+    matches!(id, "terminal" | "settings")
+}
+
+/// Whether `id` is usable given the owner's disabled set.
+pub fn is_enabled(id: &str, disabled: &BTreeSet<String>) -> bool {
+    is_always_on(id) || !disabled.contains(id)
+}
 
 /// A command contributed by a plugin.
 #[derive(Clone, Debug)]
@@ -71,17 +83,28 @@ impl<'a> PluginViewContext<'a> {
 
 /// Unified Surface Switcher bar rendered on plugin headers so users can seamlessly
 /// switch any plugin between **Tile (Split View) ⇄ Page (Full Screen) ⇄ Drawer (Right Panel)**.
-pub fn surface_switcher(k: &Kit, lang: Language, plugin_id: &str, active: PluginSlot) -> El {
+pub fn surface_switcher(
+    s: &UiState,
+    k: &Kit,
+    lang: Language,
+    plugin_id: &str,
+    active: PluginSlot,
+) -> El {
     let mut bar = row()
         .key(format!("surface-switcher-{plugin_id}-{active:?}"))
         .gap(4.0)
         .center_y();
 
-    for (slot, label_en) in [
-        (PluginSlot::Tile, "Tile"),
-        (PluginSlot::Page, "Page"),
-        (PluginSlot::Drawer, "Drawer"),
-    ] {
+    for kind in WindowKind::ALL {
+        let slot = kind.slot();
+        let label_en = kind.label();
+        if !s
+            .plugins
+            .get(plugin_id)
+            .is_some_and(|plugin| plugin.supports_surface(slot))
+        {
+            continue;
+        }
         let pid = plugin_id.to_string();
         let is_active = active == slot;
         let btn = Button::new(tr_ref(lang, label_en))
@@ -100,16 +123,23 @@ pub fn surface_switcher(k: &Kit, lang: Language, plugin_id: &str, active: Plugin
     }
 
     if matches!(active, PluginSlot::Page | PluginSlot::Drawer) {
-        let close_btn = Button::new(tr_ref(lang, "Close"))
-            .variant(ButtonVariant::Ghost)
-            .control_size(ControlSize::Small)
-            .on_press(move |s: &mut UiState| match active {
-                PluginSlot::Page => s.close_plugin_page(),
-                PluginSlot::Drawer => s.close_plugin_drawer(),
-                _ => {}
-            })
-            .build(k)
-            .key(format!("surf-close-{plugin_id}-{active:?}"));
+        let close_btn = Button::new(tr_ref(
+            lang,
+            if active == PluginSlot::Page && s.plugin_page_origin.is_some() {
+                "Restore"
+            } else {
+                "Close"
+            },
+        ))
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Small)
+        .on_press(move |s: &mut UiState| match active {
+            PluginSlot::Page => s.close_plugin_page(),
+            PluginSlot::Drawer => s.close_plugin_drawer(),
+            _ => {}
+        })
+        .build(k)
+        .key(format!("surf-close-{plugin_id}-{active:?}"));
         bar = bar.child(close_btn);
     }
 
@@ -171,6 +201,11 @@ pub trait DesktopPlugin: Send + Sync {
         Vec::new()
     }
 
+    /// Fold background work into UI state without blocking input.
+    fn poll(&self, _s: &mut UiState, _tx: &mut Tx) -> bool {
+        false
+    }
+
     /// Handle invocation of a plugin command.
     fn on_command(&self, s: &mut UiState, command_id: &str) -> bool {
         let _ = (s, command_id);
@@ -195,6 +230,7 @@ impl PluginRegistry {
     pub fn default_registry() -> Self {
         let mut r = Self::new();
         r.register(Arc::new(TerminalPlugin));
+        r.register(Arc::new(FilePlugin));
         r.register(Arc::new(DiffPlugin));
         r.register(Arc::new(InspectorPlugin));
         r.register(Arc::new(TasksPlugin));
@@ -225,10 +261,28 @@ impl PluginRegistry {
         self.plugins.get(id).cloned()
     }
 
+    /// Look up a plugin by id when it is enabled.
+    pub fn get_enabled(
+        &self,
+        id: &str,
+        disabled: &BTreeSet<String>,
+    ) -> Option<Arc<dyn DesktopPlugin>> {
+        if !is_enabled(id, disabled) {
+            return None;
+        }
+        self.get(id)
+    }
+
     /// Retrieve all plugins that support split view tiles.
     pub fn tile_plugins(&self) -> Vec<Arc<dyn DesktopPlugin>> {
+        self.tile_plugins_enabled(&BTreeSet::new())
+    }
+
+    /// Tile-capable plugins, excluding those in `disabled`.
+    pub fn tile_plugins_enabled(&self, disabled: &BTreeSet<String>) -> Vec<Arc<dyn DesktopPlugin>> {
         self.order
             .iter()
+            .filter(|id| is_enabled(id, disabled))
             .filter_map(|id| self.plugins.get(id))
             .filter(|p| p.supports_tile())
             .cloned()
@@ -237,18 +291,38 @@ impl PluginRegistry {
 
     /// Retrieve all plugins that support a given [`PluginSlot`].
     pub fn plugins_for_surface(&self, slot: PluginSlot) -> Vec<Arc<dyn DesktopPlugin>> {
+        self.plugins_for_surface_enabled(slot, &BTreeSet::new())
+    }
+
+    /// Surface-capable plugins, excluding those in `disabled`.
+    pub fn plugins_for_surface_enabled(
+        &self,
+        slot: PluginSlot,
+        disabled: &BTreeSet<String>,
+    ) -> Vec<Arc<dyn DesktopPlugin>> {
         self.order
             .iter()
+            .filter(|id| is_enabled(id, disabled))
             .filter_map(|id| self.plugins.get(id))
             .filter(|p| p.supports_surface(slot))
             .cloned()
             .collect()
     }
 
-    /// Retrieve all registered plugins.
+    /// Retrieve all registered plugins (including disabled).
     pub fn all(&self) -> Vec<Arc<dyn DesktopPlugin>> {
         self.order
             .iter()
+            .filter_map(|id| self.plugins.get(id))
+            .cloned()
+            .collect()
+    }
+
+    /// Registered plugins that are currently enabled.
+    pub fn all_enabled(&self, disabled: &BTreeSet<String>) -> Vec<Arc<dyn DesktopPlugin>> {
+        self.order
+            .iter()
+            .filter(|id| is_enabled(id, disabled))
             .filter_map(|id| self.plugins.get(id))
             .cloned()
             .collect()
@@ -319,8 +393,7 @@ impl DesktopPlugin for TerminalPlugin {
                         .font(ctx.k.ty.ui_medium)
                         .color(ctx.k.c.text_base),
                 )
-                .child(el().grow(1.0))
-                .child(surface_switcher(ctx.k, lang, self.id(), ctx.surface));
+                .child(el().grow(1.0));
             return Some(
                 col()
                     .key(format!("term-plugin-{:?}-{}", ctx.surface, ctx.tile_id))
@@ -482,8 +555,7 @@ impl DesktopPlugin for SysInfoPlugin {
                     .font(k.ty.ui_medium)
                     .color(k.c.text_base),
             )
-            .child(el().grow(1.0))
-            .child(surface_switcher(k, lang, self.id(), ctx.surface));
+            .child(el().grow(1.0));
 
         let host_name = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("HOST"))
@@ -848,8 +920,7 @@ impl DesktopPlugin for QuickNotesPlugin {
                     .font(k.ty.ui_medium)
                     .color(k.c.text_base),
             )
-            .child(el().grow(1.0))
-            .child(surface_switcher(k, lang, self.id(), ctx.surface));
+            .child(el().grow(1.0));
 
         let actions_bar = row()
             .w_full()
@@ -1047,8 +1118,7 @@ impl DesktopPlugin for DiffPlugin {
                     .font(k.ty.ui_medium)
                     .color(k.c.text_base),
             )
-            .child(el().grow(1.0))
-            .child(surface_switcher(k, lang, self.id(), ctx.surface));
+            .child(el().grow(1.0));
 
         let actions_bar = row()
             .w_full()
@@ -1480,6 +1550,26 @@ impl DesktopPlugin for SettingsPlugin {
     }
 }
 
+/// The built-in preview follows exactly the same window contract as external plugins.
+struct FilePlugin;
+impl DesktopPlugin for FilePlugin {
+    fn id(&self) -> &'static str {
+        "files"
+    }
+    fn title(&self, lang: Language) -> String {
+        tr_ref(lang, "Files").into()
+    }
+    fn icon(&self) -> &'static Icon {
+        &icons::STORAGE
+    }
+    fn category(&self) -> PluginCategory {
+        PluginCategory::Core
+    }
+    fn render_tile(&self, ctx: &PluginViewContext<'_>, _: &mut Vec<El>) -> Option<El> {
+        Some(crate::ui::viewer::content(ctx.s, ctx.k, ctx.scale))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1551,6 +1641,43 @@ mod tests {
         assert!(s.active_plugin_drawer.is_none());
         assert!(!s.right_open);
         assert_eq!(s.active_plugin_page.as_deref(), Some("sysinfo"));
+    }
+
+    #[test]
+    fn maximizing_restores_the_tile_and_docking_keeps_other_tiles() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.sessions = vec![sample_session("s1")];
+        s.open_session("s1");
+        s.open_plugin_tile("quicknotes");
+        s.open_plugin_tile("sysinfo");
+        let before = s.tiles.len();
+        let at = s.tile_of_plugin("sysinfo").unwrap();
+        s.tiles[at].floating_rect = Some([40.0, 60.0, 480.0, 360.0]);
+        s.switch_plugin_surface("sysinfo", PluginSlot::Page);
+        assert_eq!(s.tiles.len(), before);
+        s.close_plugin_page();
+        assert_eq!(s.focus, at);
+        assert_eq!(s.tiles[at].floating_rect, Some([40.0, 60.0, 480.0, 360.0]));
+        s.switch_plugin_surface("sysinfo", PluginSlot::Drawer);
+        assert!(s.in_split());
+        assert!(s.tile_of_plugin("quicknotes").is_some());
+        assert_eq!(s.tiles.len(), before - 1);
+        s.switch_plugin_surface("sysinfo", PluginSlot::Page);
+        s.close_plugin_page();
+        assert_eq!(s.active_plugin_drawer.as_deref(), Some("sysinfo"));
+        assert!(s.right_open);
+        // Unsupported destinations must not close the existing surface first.
+        s.switch_plugin_surface("settings", PluginSlot::Drawer);
+        assert_eq!(s.active_plugin_drawer.as_deref(), Some("sysinfo"));
+        s.edit(crate::config::ConfigEdit::PluginEnabled {
+            plugin: "sysinfo".into(),
+            on: false,
+        });
+        assert!(s.active_plugin_drawer.is_none());
+        assert!(s.tile_of_plugin("quicknotes").is_some());
+        s.switch_plugin_surface("sysinfo", PluginSlot::Page);
+        assert!(s.active_plugin_page.is_none());
     }
 
     #[test]

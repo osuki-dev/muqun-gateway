@@ -1,0 +1,25 @@
+{
+  "id": "review-center",
+  "name": "Pull Requests & Issues",
+  "version": "0.1.0",
+  "description": "Read GitHub pull requests and issues for the current workspace with your existing gh login.",
+  "category": "extensions",
+  "icon": "branch",
+  "surfaces": [
+    "tile",
+    "page",
+    "drawer"
+  ],
+  "commands": [
+    {
+      "id": "review.refresh",
+      "title": "Refresh PRs & issues",
+      "script": "review.ts"
+    }
+  ],
+  "tile": {
+    "kind": "markdown",
+    "title": "Pull Requests & Issues",
+    "entry": "README.md"
+  }
+}

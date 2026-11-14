@@ -6,7 +6,7 @@
 //! [`OpencodeConfig`], serialized exactly as the gateway's `config.json`
 //! names it, so the two files read the same.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -41,6 +41,10 @@ pub struct DesktopConfig {
     /// Currently active computer id ("local" or peer server_id / name).
     #[serde(default = "default_computer")]
     pub current_computer: String,
+    /// Plugin ids the owner turned off in Settings → Plugins.
+    /// Core always-on plugins (`terminal`, `settings`) are ignored here.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub plugins_disabled: BTreeSet<String>,
 }
 
 /// User-customized keyboard shortcuts and global leader key (`Settings → Shortcuts`).
@@ -110,6 +114,7 @@ impl Default for DesktopConfig {
             keymap: KeymapConfig::default(),
             computers: HashMap::new(),
             current_computer: default_computer(),
+            plugins_disabled: BTreeSet::new(),
         }
     }
 }
@@ -299,6 +304,8 @@ pub struct General {
     pub editor_command: Option<String>,
     /// The top bar's "Open in …": the editor used last.
     pub editor: crate::platform::editors::Editor,
+    /// Open text/code directly in the configured editor instead of previewing.
+    pub files_in_editor: bool,
     /// Closing the window keeps Muqun running behind its status icon
     /// (where there is one); off quits.
     pub close_to_tray: bool,
@@ -602,9 +609,59 @@ pub struct UiPrefs {
     /// How those panes tile (`ui/dwindle.rs`), its leaves indexing `tiles`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tile_layout: Option<TileNode>,
+    /// Active workspace layout mode (`Dwindle`, `Scrolling`, or `Floating`).
+    #[serde(default)]
+    pub tile_mode: TileLayoutMode,
     /// The sidebar's Running list is open (`ui/running.rs`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub running_open: bool,
+}
+
+/// Omarchy 4.5 / Hyprland workspace layout modes for split tiles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TileLayoutMode {
+    /// Binary tree spiral tiling (`dwindle.rs`).
+    #[default]
+    Dwindle,
+    /// Horizontal scrolling columns side by side.
+    Scrolling,
+    /// Free-floating, draggable, resizable window cards.
+    Floating,
+}
+
+impl TileLayoutMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Dwindle => Self::Scrolling,
+            Self::Scrolling => Self::Floating,
+            Self::Floating => Self::Dwindle,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Dwindle => Self::Floating,
+            Self::Scrolling => Self::Dwindle,
+            Self::Floating => Self::Scrolling,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dwindle => "Tiling (Dwindle)",
+            Self::Scrolling => "Scrolling",
+            Self::Floating => "Floating",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Dwindle => "Dwindle",
+            Self::Scrolling => "Scrolling",
+            Self::Floating => "Floating",
+        }
+    }
 }
 
 /// A split view's tiling, as Hyprland's dwindle layout keeps it: a leaf is
@@ -686,6 +743,7 @@ impl Default for UiPrefs {
             recent_commands: Vec::new(),
             tiles: Vec::new(),
             tile_layout: None,
+            tile_mode: TileLayoutMode::Dwindle,
             running_open: false,
         }
     }
@@ -706,6 +764,8 @@ pub enum ConfigEdit {
         asids: Vec<String>,
         layout: Option<TileNode>,
     },
+    /// Active tile layout mode (`Dwindle`, `Scrolling`, `Floating`).
+    TileMode(TileLayoutMode),
     /// What the owner chose for one project (pin, hide, name), by root.
     Project {
         root: String,
@@ -728,6 +788,7 @@ pub enum ConfigEdit {
     RecentCommands(Vec<String>),
     Voice(VoiceConfig),
     EditorCommand(Option<String>),
+    FilesInEditor(bool),
     /// Where "New session" starts for an agent with no remembered folder.
     DefaultCwd(Option<PathBuf>),
     AgentEnabled {
@@ -787,6 +848,11 @@ pub enum ConfigEdit {
     },
     /// Reset all custom keybindings and the leader key to defaults.
     ResetKeymap,
+    /// Enable or disable a desktop plugin by id (`Settings → Plugins`).
+    PluginEnabled {
+        plugin: String,
+        on: bool,
+    },
 }
 
 impl DesktopConfig {
@@ -801,6 +867,7 @@ impl DesktopConfig {
                 self.ui.tiles = asids;
                 self.ui.tile_layout = layout;
             }
+            ConfigEdit::TileMode(mode) => self.ui.tile_mode = mode,
             ConfigEdit::Project { root, prefs } => {
                 if prefs.is_default() {
                     self.ui.projects.remove(&root);
@@ -809,6 +876,7 @@ impl DesktopConfig {
                 }
             }
             ConfigEdit::Editor(editor) => self.general.editor = editor,
+            ConfigEdit::FilesInEditor(on) => self.general.files_in_editor = on,
             ConfigEdit::Scheme(scheme) => self.appearance.scheme = scheme,
             ConfigEdit::Language(language) => self.general.language = language,
             ConfigEdit::Density(density) => self.appearance.density = density,
@@ -937,6 +1005,13 @@ impl DesktopConfig {
             ConfigEdit::ResetKeymap => {
                 self.keymap.bindings.clear();
                 self.keymap.leader = KeymapConfig::DEFAULT_LEADER.to_string();
+            }
+            ConfigEdit::PluginEnabled { plugin, on } => {
+                if on || crate::plugin::is_always_on(&plugin) {
+                    self.plugins_disabled.remove(&plugin);
+                } else {
+                    self.plugins_disabled.insert(plugin);
+                }
             }
         }
     }
@@ -1393,5 +1468,32 @@ mod tests {
         assert!(config.keymap.is_default());
         assert_eq!(config.keymap.leader, "ctrl+space");
         assert!(config.keymap.bindings.is_empty());
+    }
+
+    #[test]
+    fn plugin_enablement_uses_disabled_set() {
+        let mut config = DesktopConfig::default();
+        assert!(config.plugins_disabled.is_empty());
+
+        config.apply(ConfigEdit::PluginEnabled {
+            plugin: "quicknotes".into(),
+            on: false,
+        });
+        assert!(config.plugins_disabled.contains("quicknotes"));
+
+        config.apply(ConfigEdit::PluginEnabled {
+            plugin: "terminal".into(),
+            on: false,
+        });
+        assert!(
+            !config.plugins_disabled.contains("terminal"),
+            "always-on plugins stay enabled"
+        );
+
+        config.apply(ConfigEdit::PluginEnabled {
+            plugin: "quicknotes".into(),
+            on: true,
+        });
+        assert!(!config.plugins_disabled.contains("quicknotes"));
     }
 }

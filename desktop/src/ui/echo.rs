@@ -154,13 +154,21 @@ pub fn claim_inbox(echoes: &mut [Echo], items: &[InboxItem]) -> bool {
         if echoes.iter().any(|e| e.inbox.as_ref() == Some(&item.id)) {
             continue;
         }
-        if let Some(e) = echoes.iter_mut().find(|e| {
-            e.inbox.is_none()
-                && e.state != EchoState::Failed
-                && e.files.len() == item.files.len()
-                && e.says(words(&item.text))
-        }) {
-            e.inbox = Some(item.id.clone());
+        let claim = echoes
+            .iter()
+            .position(|e| {
+                e.inbox.is_none()
+                    && e.state != EchoState::Failed
+                    && e.files.len() == item.files.len()
+                    && e.says(words(&item.text))
+            })
+            .or_else(|| {
+                echoes.iter().position(|e| {
+                    e.inbox.is_none() && e.state != EchoState::Failed && e.says(words(&item.text))
+                })
+            });
+        if let Some(i) = claim {
+            echoes[i].inbox = Some(item.id.clone());
             changed = true;
         }
     }
@@ -244,6 +252,24 @@ impl UiState {
             .is_some_and(|v| v.iter().any(|e| e.inbox.as_deref() == Some(id)))
     }
 
+    /// Whether `item` is already represented by a live echo in the timeline
+    /// (by claimed inbox id or by matching active steer words).
+    pub fn item_echoed(&self, item: &InboxItem) -> bool {
+        if self.echoed(&item.id) {
+            return true;
+        }
+        item.steer
+            && self
+                .selected
+                .as_deref()
+                .and_then(|asid| self.echoes.get(asid))
+                .is_some_and(|v| {
+                    v.iter().any(|e| {
+                        e.steer && e.state != EchoState::Failed && e.says(words(&item.text))
+                    })
+                })
+    }
+
     pub fn echoes_of(&self, asid: &str) -> &[Echo] {
         self.echoes.get(asid).map_or(&[], Vec::as_slice)
     }
@@ -284,12 +310,20 @@ impl UiState {
 
     /// Pull a steered echo back into the composer draft for editing before the agent reads it.
     pub fn edit_steered_echo(&mut self, asid: &str, token: u64, inbox_id: &str, text: String) {
-        if !inbox_id.is_empty() {
+        let resolved_id = if !inbox_id.is_empty() {
+            Some(inbox_id.to_string())
+        } else {
+            self.queue
+                .iter()
+                .find(|q| q.steer && words(&q.text) == words(&text))
+                .map(|q| q.id.clone())
+        };
+        if let Some(item_id) = resolved_id {
             self.send(Command::Compose(ComposeCommand::InboxCancel {
                 asid: AgentSessionId(asid.to_string()),
-                item: inbox_id.to_string(),
+                item: item_id.clone(),
             }));
-            self.queue.retain(|q| q.id != inbox_id);
+            self.queue.retain(|q| q.id != item_id);
         }
         self.discard_echo(asid, token);
         let len = text.len();
@@ -300,12 +334,26 @@ impl UiState {
 
     /// Cancel a steered echo before the agent reads it.
     pub fn cancel_steered_echo(&mut self, asid: &str, token: u64, inbox_id: &str) {
-        if !inbox_id.is_empty() {
+        let echo_text = self
+            .echoes
+            .get(asid)
+            .and_then(|v| v.iter().find(|e| e.token == token))
+            .map(|e| e.text.clone())
+            .unwrap_or_default();
+        let resolved_id = if !inbox_id.is_empty() {
+            Some(inbox_id.to_string())
+        } else {
+            self.queue
+                .iter()
+                .find(|q| q.steer && words(&q.text) == words(&echo_text))
+                .map(|q| q.id.clone())
+        };
+        if let Some(item_id) = resolved_id {
             self.send(Command::Compose(ComposeCommand::InboxCancel {
                 asid: AgentSessionId(asid.to_string()),
-                item: inbox_id.to_string(),
+                item: item_id.clone(),
             }));
-            self.queue.retain(|q| q.id != inbox_id);
+            self.queue.retain(|q| q.id != item_id);
         }
         self.discard_echo(asid, token);
     }
@@ -385,7 +433,7 @@ pub fn view(cx: &Tcx, echo: &Echo) -> El {
                 .child(Spinner::new().size(10.0).build(k).key("echo-spin"))
                 .child(note(cx.t("Sending…"), k.c.text_faint)),
         ),
-        EchoState::Sent if echo.inbox.is_some() => {
+        EchoState::Sent if echo.inbox.is_some() || echo.steer => {
             let asid = cx.asid.to_string();
             let token = echo.token;
             let inbox_id = echo.inbox.clone().unwrap_or_default();
@@ -602,5 +650,25 @@ mod tests {
             }
         }
         assert!(found);
+    }
+
+    #[test]
+    fn steered_prompt_is_deduplicated_even_before_inbox_claim() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.selected = Some("s1".into());
+        s.echo_sent("s1", 99, "refactor the tile layout".into(), &[], true);
+        let item = steer("q-steer-1", "refactor the tile layout");
+        // Even before `echo_inbox` claims `q-steer-1`, `item_echoed` recognizes the live steer echo!
+        assert!(s.item_echoed(&item));
+
+        // Non-steered queued item with different text is not echoed
+        let queued = InboxItem {
+            id: "q-queue-2".into(),
+            text: "run clippy afterwards".into(),
+            steer: false,
+            files: vec![],
+        };
+        assert!(!s.item_echoed(&queued));
     }
 }

@@ -39,7 +39,7 @@ fn session(
 ) -> AgentSessionInfo {
     serde_json::from_value(json!({
         "asid": asid, "agent_id": agent, "title": title, "status": status,
-        "directory": dir, "updated_ms": 1_800_000_000_000u64 - age,
+        "directory": std::env::var("MUQUN_SCENE_WORKSPACE").unwrap_or_else(|_| dir.to_string()), "updated_ms": 1_800_000_000_000u64 - age,
         "model": { "provider_id": "anthropic", "model_id": "sonnet" },
     }))
     .expect("demo session")
@@ -150,8 +150,7 @@ fn splash_scene(s: &mut UiState) {
     base(s);
     s.mode = Mode::Home;
     s.selected = None;
-    let mut splash = super::splash::Splash::start(super::splash::SplashKind::Boot);
-    splash.started = std::time::Instant::now() - std::time::Duration::from_millis(1000);
+    let splash = super::splash::Splash::start(super::splash::SplashKind::Boot);
     s.hub_label.clear();
     s.splash = Some(splash);
     s.demo = true;
@@ -731,8 +730,8 @@ fn viewer_with(s: &mut UiState, name: &str, kind: crate::model::viewer::FileKind
         body: text_body(body.into(), false),
         zoom: None,
         source: false,
-        docked: false,
     });
+    s.show_file_window();
 }
 
 fn viewer_code(s: &mut UiState) {

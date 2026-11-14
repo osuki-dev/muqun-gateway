@@ -37,9 +37,10 @@ pub(crate) mod terminal_panel;
 mod tiles;
 mod timeline;
 mod tray;
-mod viewer;
+pub(crate) mod viewer;
 mod voice;
 mod welcome;
+mod windows;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -296,16 +297,15 @@ pub struct Tile {
     pub asid: Option<String>,
     pub term_tab: Option<usize>,
     pub slot: SessionSlot,
+    /// Whether this tile is popped out as a pinned floating overlay window (Omarchy `Super+O`).
+    pub popped: bool,
+    /// Custom floating geometry `[x, y, w, h]` when floating or popped out.
+    pub floating_rect: Option<[f32; 4]>,
 }
 
 impl Tile {
     pub fn empty() -> Self {
-        Self {
-            content: TileContent::Empty,
-            asid: None,
-            term_tab: None,
-            slot: SessionSlot::default(),
-        }
+        Self::default()
     }
 
     pub fn session(asid: impl Into<String>) -> Self {
@@ -313,17 +313,14 @@ impl Tile {
         Self {
             content: TileContent::Session(asid.clone()),
             asid: Some(asid),
-            term_tab: None,
-            slot: SessionSlot::default(),
+            ..Self::default()
         }
     }
 
     pub fn terminal() -> Self {
         Self {
             content: TileContent::Terminal,
-            asid: None,
-            term_tab: None,
-            slot: SessionSlot::default(),
+            ..Self::default()
         }
     }
 
@@ -359,8 +356,8 @@ impl Tile {
     }
 }
 
-/// How many sessions may be open side by side.
-pub const MAX_TILES: usize = 4;
+/// How many sessions/windows may be open side by side.
+pub const MAX_TILES: usize = 8;
 
 static INITIAL_CONFIG: OnceLock<DesktopConfig> = OnceLock::new();
 
@@ -593,6 +590,8 @@ pub struct UiState {
     pub keys_sheet: Option<shortcuts::Sheet>,
     /// Global leader key timestamp when armed (`Which-Key` mode).
     pub leader_armed: Option<std::time::Instant>,
+    /// Active 2nd-level semantic sub-group in `Which-Key` mode (`+session`, `+window`, etc.).
+    pub leader_group: Option<keymap::LeaderGroup>,
     /// Active shortcut recording target in `Settings → Shortcuts`.
     pub recording_key: Option<keymap::RecordingTarget>,
     /// Sink for any overlay `TextInput` during its exit transition after close.
@@ -611,6 +610,10 @@ pub struct UiState {
     pub focus: usize,
     /// How the tiles sit (`dwindle.rs`); [`UiState::tile_layout`] reads it.
     pub tile_tree: crate::config::TileNode,
+    /// Temporarily maximized tile index (Omarchy `Super+Alt+F`).
+    pub zoomed_tile: Option<usize>,
+    /// Active drag-and-drop state when reordering or re-splitting tiles by their header.
+    pub tile_card_drag: Option<tiles::TileCardDrag>,
     /// An empty tile waiting for the next opened session.
     pub pending_tile: Option<usize>,
     /// Pending optimistic session being created from home composer: (placeholder_asid, token).
@@ -625,6 +628,7 @@ pub struct UiState {
     pub plugins: crate::plugin::PluginRegistry,
     /// Active plugin opened in the full-screen Page slot (`PluginSlot::Page`).
     pub active_plugin_page: Option<String>,
+    pub plugin_page_origin: Option<crate::plugin::PluginSlot>,
     /// Active plugin opened in the right-hand Drawer slot (`PluginSlot::Drawer`).
     pub active_plugin_drawer: Option<String>,
     /// Interactive text buffer for the Quick Notes (`"quicknotes"`) scratchpad plugin.
@@ -643,7 +647,7 @@ impl UiState {
     pub fn new(commands: CommandSender) -> Self {
         let cfg = INITIAL_CONFIG.get().cloned().unwrap_or_default();
         let dark = !matches!(cfg.appearance.scheme, Scheme::Light);
-        let mut draft = TextEdit::new("");
+        let mut draft = TextEdit::new("").rich();
         draft.focused = true;
         let start_draft = TextEdit::new(
             cfg.general
@@ -651,7 +655,8 @@ impl UiState {
                 .get(crate::config::START_DRAFT)
                 .cloned()
                 .unwrap_or_default(),
-        );
+        )
+        .rich();
         let cwd_input = TextEdit::new(
             cfg.general
                 .default_cwd
@@ -797,6 +802,7 @@ impl UiState {
             palette: None,
             keys_sheet: None,
             leader_armed: None,
+            leader_group: None,
             recording_key: None,
             closed_edit: TextEdit::new(""),
             tray_shown: None,
@@ -805,6 +811,8 @@ impl UiState {
             tiles: Vec::new(),
             focus: 0,
             tile_tree: crate::config::TileNode::Leaf(0),
+            zoomed_tile: None,
+            tile_card_drag: None,
             pending_tile: None,
             pending_start: None,
             tile_grid: [0.0; 2],
@@ -813,6 +821,7 @@ impl UiState {
             tiles_restored: false,
             plugins: crate::plugin::PluginRegistry::default_registry(),
             active_plugin_page: None,
+            plugin_page_origin: None,
             active_plugin_drawer: None,
             quick_notes_edit: TextEdit::new(""),
             quick_notes: HashMap::new(),
@@ -882,22 +891,26 @@ impl UiState {
     /// Keep the window waking while the splash is animating.
     /// Every frame Rune asks: the splash and a recording's waveform animate.
     pub fn poll_frame(&mut self, t: f64, tx: &mut Tx) -> bool {
+        let mut plugins = false;
+        for plugin in self.plugins.all() {
+            plugins |= plugin.poll(self, tx);
+        }
         let voice = self.poll_voice();
         let fit = self.fit_panes();
         let term = self.poll_terminal(t, tx);
         let search = self.poll_search(tx);
         let echoes = self.poll_echoes(tx);
-        self.poll_splash(t, tx) | voice | fit | term | search | echoes
+        self.poll_splash(t, tx) | voice | fit | term | search | echoes | plugins
     }
 
-    pub fn poll_splash(&mut self, _: f64, _: &mut Tx) -> bool {
+    pub fn poll_splash(&mut self, t: f64, _: &mut Tx) -> bool {
         let Some(splash) = self.splash.as_mut() else {
             return false;
         };
         let hub_ready = !self.hub_label.is_empty();
-        if !splash.tick(self.agents_seen, hub_ready) {
+        if !splash.tick(t, self.agents_seen, hub_ready) {
             self.splash = None;
-            return false;
+            return true;
         }
         true
     }
@@ -911,28 +924,41 @@ impl UiState {
     /// Fold a config edit into the mirror and tell the core.
     pub fn edit(&mut self, edit: ConfigEdit) {
         self.cfg.apply(edit.clone());
+        if let ConfigEdit::PluginEnabled { plugin, on: false } = &edit {
+            if !crate::plugin::is_enabled(plugin, &self.cfg.plugins_disabled) {
+                self.close_plugin_windows(plugin);
+            }
+        }
         keymap::sync_active_keymap(&self.cfg.keymap);
         self.send(Command::Edit(edit));
     }
 
-    /// Whether the global Leader key (`Which-Key` mode) is currently armed and within timeout.
+    /// Whether the global Leader key (`Which-Key` mode) is currently armed.
+    /// Stays open until Esc, a completed chord, or a Leader double-tap — no auto-timeout.
     pub fn is_leader_armed(&self) -> bool {
-        self.leader_armed
-            .is_some_and(|at| at.elapsed() < terminal_panel::PREFIX_TIMEOUT)
-            || self.term.is_prefix_armed()
+        self.leader_armed.is_some()
     }
 
     /// Arm the global Leader key (`Which-Key` mode).
-    pub fn arm_leader(&mut self, tx: &mut Tx) {
+    pub fn arm_leader(&mut self, _tx: &mut Tx) {
         let now = std::time::Instant::now();
         self.leader_armed = Some(now);
+        self.leader_group = None;
         self.term.prefix_armed = Some(now);
-        tx.wake_after(terminal_panel::PREFIX_TIMEOUT);
+    }
+
+    /// Enter a 2nd-level semantic sub-group in `Which-Key` mode.
+    pub fn arm_leader_group(&mut self, group: keymap::LeaderGroup, _tx: &mut Tx) {
+        let now = std::time::Instant::now();
+        self.leader_armed = Some(now);
+        self.leader_group = Some(group);
+        self.term.prefix_armed = Some(now);
     }
 
     /// Disarm the global Leader key (`Which-Key` mode).
     pub fn disarm_leader(&mut self) {
         self.leader_armed = None;
+        self.leader_group = None;
         self.term.prefix_armed = None;
     }
 
@@ -1579,177 +1605,6 @@ impl UiState {
         self.send(Command::InstallManagedRuntime(kind));
     }
 
-    /// Open a plugin in the full-screen Page slot (`PluginSlot::Page`).
-    pub fn open_plugin_page(&mut self, plugin_id: &str) {
-        if self.plugins.get(plugin_id).is_none() {
-            return;
-        }
-        self.active_plugin_page = Some(plugin_id.to_string());
-        if plugin_id == "sysinfo" {
-            self.refresh_runtimes();
-        } else if plugin_id == "terminal" {
-            if self.term.session.is_none() && self.term.tabs.is_empty() {
-                self.start_terminal();
-            }
-            self.focus_terminal();
-        } else if plugin_id == "quicknotes" {
-            self.quick_notes_edit.focused = true;
-            self.draft.focused = false;
-            self.term.sink.focused = false;
-        }
-    }
-
-    /// Close the active full-screen plugin page, returning to the underlying workspace view.
-    pub fn close_plugin_page(&mut self) {
-        self.active_plugin_page = None;
-    }
-
-    /// Open a plugin in the right-hand Drawer slot (`PluginSlot::Drawer`).
-    pub fn open_plugin_drawer(&mut self, plugin_id: &str) {
-        if plugin_id == "terminal" {
-            self.active_plugin_drawer = None;
-            self.open_terminal();
-            return;
-        }
-        if self.plugins.get(plugin_id).is_none() {
-            return;
-        }
-        if self.in_split() {
-            self.unsplit();
-        }
-        if self.mode != Mode::Session {
-            self.mode = Mode::Session;
-        }
-        if self.term.open {
-            self.close_terminal();
-        }
-        self.active_plugin_drawer = Some(plugin_id.to_string());
-        self.right_open = true;
-        self.right.set_open(true);
-        if plugin_id == "sysinfo" {
-            self.refresh_runtimes();
-        } else if plugin_id == "quicknotes" {
-            self.quick_notes_edit.focused = true;
-            self.draft.focused = false;
-        }
-    }
-
-    /// Close the active right-hand plugin drawer.
-    pub fn close_plugin_drawer(&mut self) {
-        if self.active_plugin_drawer.take().is_some() {
-            self.right_open = false;
-            self.right.set_open(false);
-        }
-    }
-
-    /// Find the tile index currently hosting `plugin_id`, if any.
-    pub fn tile_of_plugin(&self, plugin_id: &str) -> Option<usize> {
-        if plugin_id == "terminal" {
-            return self.tile_of_terminal();
-        }
-        self.tiles.iter().position(|t| match &t.content {
-            TileContent::Custom { kind, .. } => kind == plugin_id,
-            TileContent::Diff(_) => plugin_id == "diff",
-            _ => false,
-        })
-    }
-
-    /// Open a plugin in a split-view Tile (`PluginSlot::Tile`).
-    pub fn open_plugin_tile(&mut self, plugin_id: &str) {
-        if plugin_id == "terminal" {
-            self.active_plugin_page = None;
-            self.open_terminal_tile();
-            return;
-        }
-        if self.plugins.get(plugin_id).is_none() {
-            return;
-        }
-        self.active_plugin_page = None;
-        if self.active_plugin_drawer.as_deref() == Some(plugin_id) {
-            self.close_plugin_drawer();
-        }
-        if let Some(i) = self.tile_of_plugin(plugin_id) {
-            self.mode = Mode::Session;
-            self.focus_tile(i);
-            return;
-        }
-        self.close_terminal();
-        self.right_open = false;
-        self.right.set_open(false);
-
-        if self.tiles.is_empty() {
-            let current = self.selected.clone();
-            self.tiles.push(Tile {
-                content: match &current {
-                    Some(asid) => TileContent::Session(asid.clone()),
-                    None => TileContent::Empty,
-                },
-                asid: current,
-                term_tab: None,
-                slot: SessionSlot::default(),
-            });
-            self.focus = 0;
-            self.tile_tree = crate::config::TileNode::Leaf(0);
-        }
-
-        let at = match self.tiles.iter().position(|t| t.is_empty()) {
-            Some(empty) => empty,
-            None if self.tiles.len() < MAX_TILES => self.add_tile(),
-            None => {
-                let f = self.focus;
-                self.tiles[f].content = TileContent::Empty;
-                f
-            }
-        };
-        self.mode = Mode::Session;
-        tiles::fill_plugin_tile(self, at, plugin_id);
-    }
-
-    /// Seamlessly switch `plugin_id` between `Tile` ⇄ `Page` ⇄ `Drawer`.
-    pub fn switch_plugin_surface(&mut self, plugin_id: &str, target: crate::plugin::PluginSlot) {
-        match target {
-            crate::plugin::PluginSlot::Page => {
-                if self.active_plugin_drawer.as_deref() == Some(plugin_id) {
-                    self.close_plugin_drawer();
-                }
-                if plugin_id == "terminal" && self.term.open {
-                    self.close_terminal();
-                }
-                if let Some(i) = self.tile_of_plugin(plugin_id) {
-                    if self.in_split() {
-                        self.close_tile(i);
-                    } else {
-                        self.tiles.clear();
-                    }
-                }
-                self.open_plugin_page(plugin_id);
-            }
-            crate::plugin::PluginSlot::Drawer => {
-                if self.active_plugin_page.as_deref() == Some(plugin_id) {
-                    self.close_plugin_page();
-                }
-                if let Some(i) = self.tile_of_plugin(plugin_id) {
-                    if self.in_split() {
-                        self.close_tile(i);
-                    } else {
-                        self.tiles.clear();
-                    }
-                }
-                self.open_plugin_drawer(plugin_id);
-            }
-            crate::plugin::PluginSlot::Tile => {
-                if self.active_plugin_page.as_deref() == Some(plugin_id) {
-                    self.close_plugin_page();
-                }
-                if self.active_plugin_drawer.as_deref() == Some(plugin_id) {
-                    self.close_plugin_drawer();
-                }
-                self.open_plugin_tile(plugin_id);
-            }
-            _ => {}
-        }
-    }
-
     /// Toggle floating in-session timeline search (Ctrl+F).
     pub fn toggle_timeline_search(&mut self) {
         self.timeline_search.active = !self.timeline_search.active;
@@ -1944,7 +1799,7 @@ impl UiState {
             .get(asid)
             .cloned()
             .unwrap_or_default();
-        self.draft = TextEdit::new(text);
+        self.draft = TextEdit::new(text).rich();
         if !self.term.sink.focused {
             self.draft.focused = true;
         }
@@ -2118,7 +1973,7 @@ impl UiState {
     /// Move the focused session's view state out of the top-level fields.
     fn take_slot(&mut self) -> SessionSlot {
         SessionSlot {
-            draft: std::mem::replace(&mut self.draft, TextEdit::new("")),
+            draft: std::mem::replace(&mut self.draft, TextEdit::new("").rich()),
             queue: std::mem::take(&mut self.queue),
             staged: std::mem::take(&mut self.staged),
             diff_stat: std::mem::take(&mut self.diff_stat),
@@ -2293,7 +2148,8 @@ impl UiState {
                     .get(asid)
                     .cloned()
                     .unwrap_or_default(),
-            ),
+            )
+            .rich(),
             ..SessionSlot::default()
         };
         self.mode = Mode::Session;
@@ -2333,8 +2189,7 @@ impl UiState {
                     None => TileContent::Empty,
                 },
                 asid: current,
-                term_tab: None,
-                slot: SessionSlot::default(),
+                ..Tile::default()
             });
             self.focus = 0;
             self.tile_tree = crate::config::TileNode::Leaf(0);
@@ -2380,8 +2235,178 @@ impl UiState {
         let new = self.tiles.len();
         dwindle::insert(&mut tree, self.focus, new, self.tile_grid);
         self.tile_tree = tree;
-        self.tiles.push(Tile::empty());
+        let mut tile = Tile::empty();
+        if self.cfg.ui.tile_mode == crate::config::TileLayoutMode::Floating {
+            tile.floating_rect = Some(Self::default_floating_rect(new, self.tile_grid));
+        }
+        self.tiles.push(tile);
         new
+    }
+
+    /// Default cascaded floating window rect for tile `i` within `stage`.
+    pub fn default_floating_rect(i: usize, stage: [f32; 2]) -> [f32; 4] {
+        let sw = if stage[0] > 100.0 { stage[0] } else { 1120.0 };
+        let sh = if stage[1] > 100.0 { stage[1] } else { 760.0 };
+        let w = (sw * 0.56).clamp(420.0, (sw - 48.0).max(420.0));
+        let h = (sh * 0.68).clamp(320.0, (sh - 48.0).max(320.0));
+        let step = (i % 6) as f32 * 32.0;
+        let x = (36.0 + step).min((sw - w - 16.0).max(16.0));
+        let y = (28.0 + step).min((sh - h - 16.0).max(16.0));
+        [x, y, w, h]
+    }
+
+    /// Active tile layout mode (`Dwindle`, `Scrolling`, or `Floating`).
+    pub fn tile_layout_mode(&self) -> crate::config::TileLayoutMode {
+        self.cfg.ui.tile_mode
+    }
+
+    /// Switch the workspace tile layout mode (`Dwindle`, `Scrolling`, `Floating`).
+    pub fn set_tile_layout_mode(&mut self, mode: crate::config::TileLayoutMode) {
+        self.zoomed_tile = None;
+        if mode == crate::config::TileLayoutMode::Floating {
+            let grid = self.tile_grid;
+            for (i, t) in self.tiles.iter_mut().enumerate() {
+                if t.floating_rect.is_none() {
+                    t.floating_rect = Some(Self::default_floating_rect(i, grid));
+                }
+            }
+        }
+        self.edit(ConfigEdit::TileMode(mode));
+        let language = self.cfg.general.language;
+        let msg = format!(
+            "{}: {}",
+            copy::tr(language, "Layout"),
+            copy::tr(language, mode.label())
+        );
+        self.toast(msg, None);
+    }
+
+    /// Cycle through Omarchy 4.5 workspace layout modes (`Dwindle` → `Scrolling` → `Floating`).
+    pub fn cycle_tile_layout(&mut self) {
+        let next = self.cfg.ui.tile_mode.next();
+        self.set_tile_layout_mode(next);
+    }
+
+    /// Cycle backward through workspace layout modes.
+    pub fn cycle_tile_layout_prev(&mut self) {
+        let prev = self.cfg.ui.tile_mode.prev();
+        self.set_tile_layout_mode(prev);
+    }
+
+    /// Flip the orientation of the focused tile's parent split (Omarchy `Super+J`).
+    pub fn toggle_tile_split_axis(&mut self) {
+        if !self.in_split() {
+            return;
+        }
+        let mut tree = self.tile_layout();
+        if dwindle::toggle_parent_split(&mut tree, self.focus) {
+            self.tile_tree = tree;
+            self.persist_tiles();
+        }
+    }
+
+    /// Reset all split ratios in the tile tree to 50/50.
+    pub fn equalize_tiles(&mut self) {
+        if !self.in_split() {
+            return;
+        }
+        let mut tree = self.tile_layout();
+        dwindle::equalize(&mut tree);
+        self.tile_tree = tree;
+        self.persist_tiles();
+    }
+
+    /// Split the focused tile explicitly side-by-side (`across = true`) or stacked (`across = false`).
+    pub fn split_tile_with_axis(&mut self, across: bool) {
+        if self.tiles.len() >= MAX_TILES {
+            return;
+        }
+        self.right_open = false;
+        self.right.set_open(false);
+        self.zoomed_tile = None;
+        if self.tiles.is_empty() {
+            let Some(current) = self.selected.clone() else {
+                return;
+            };
+            self.tiles.push(Tile::session(current));
+            self.focus = 0;
+            self.tile_tree = crate::config::TileNode::Leaf(0);
+        }
+        let mut tree = self.tile_layout();
+        let new = self.tiles.len();
+        dwindle::insert_with_axis(&mut tree, self.focus, new, across);
+        self.tile_tree = tree;
+        let mut tile = Tile::empty();
+        if self.cfg.ui.tile_mode == crate::config::TileLayoutMode::Floating {
+            tile.floating_rect = Some(Self::default_floating_rect(new, self.tile_grid));
+        }
+        self.tiles.push(tile);
+        self.mode = Mode::Session;
+        self.focus_tile(new);
+    }
+
+    /// Maximize / restore the focused tile (Omarchy `Super+Alt+F`).
+    pub fn toggle_tile_zoom(&mut self) {
+        self.toggle_tile_zoom_at(self.focus);
+    }
+
+    /// Maximize / restore tile `i`.
+    pub fn toggle_tile_zoom_at(&mut self, i: usize) {
+        if !self.in_split() || i >= self.tiles.len() {
+            self.zoomed_tile = None;
+            return;
+        }
+        if self.zoomed_tile == Some(i) {
+            self.zoomed_tile = None;
+        } else {
+            self.focus_tile(i);
+            self.zoomed_tile = Some(i);
+        }
+    }
+
+    /// Pop out / un-pop the focused tile as a pinned floating overlay window (Omarchy `Super+O`).
+    pub fn toggle_tile_pop(&mut self) {
+        self.toggle_tile_pop_at(self.focus);
+    }
+
+    /// Pop out / un-pop tile `i` as a pinned floating overlay window.
+    pub fn toggle_tile_pop_at(&mut self, i: usize) {
+        if !self.in_split() || i >= self.tiles.len() {
+            return;
+        }
+        let grid = self.tile_grid;
+        let next = !self.tiles[i].popped;
+        // Ensure at least one tile remains un-popped in the background.
+        let unpopped_others = self
+            .tiles
+            .iter()
+            .enumerate()
+            .filter(|(idx, t)| *idx != i && !t.popped)
+            .count();
+        if next && unpopped_others == 0 {
+            self.set_tile_layout_mode(crate::config::TileLayoutMode::Floating);
+            return;
+        }
+        self.tiles[i].popped = next;
+        if next && self.tiles[i].floating_rect.is_none() {
+            self.tiles[i].floating_rect = Some(Self::default_floating_rect(i, grid));
+        }
+        self.focus_tile(i);
+    }
+
+    /// Complete a drag-and-drop of tile `src` onto tile `dst` in `zone`.
+    pub fn drop_tile_on(&mut self, src: usize, dst: usize, zone: dwindle::DropZone) {
+        if src >= self.tiles.len() || dst >= self.tiles.len() || src == dst {
+            return;
+        }
+        if zone == dwindle::DropZone::Center {
+            self.swap_tiles(src, dst);
+        } else {
+            let tree = self.tile_layout();
+            self.tile_tree = dwindle::move_and_split(&tree, src, dst, zone);
+            self.focus_tile(src);
+            self.persist_tiles();
+        }
     }
 
     /// How the tiles sit: the kept tree, or (when it no longer matches the
@@ -2413,6 +2438,7 @@ impl UiState {
         // The inspector describes one session; tiles need the width.
         self.right_open = false;
         self.right.set_open(false);
+        self.zoomed_tile = None;
         if self.tiles.is_empty() {
             let Some(current) = self.selected.clone() else {
                 return;
@@ -2428,6 +2454,8 @@ impl UiState {
 
     /// Leave split view: keep the focused pane's session, close the others.
     pub fn unsplit(&mut self) {
+        self.zoomed_tile = None;
+        self.tile_card_drag = None;
         let mut j = self.tiles.len();
         while j > 0 {
             j -= 1;
@@ -2441,6 +2469,14 @@ impl UiState {
     pub fn close_tile(&mut self, i: usize) {
         if i >= self.tiles.len() {
             return;
+        }
+        self.tile_card_drag = None;
+        if let Some(z) = self.zoomed_tile {
+            if z == i {
+                self.zoomed_tile = None;
+            } else if z > i {
+                self.zoomed_tile = Some(z - 1);
+            }
         }
         if i == self.focus {
             // Hand focus to a neighbour first so its state comes to the top.
@@ -2477,6 +2513,7 @@ impl UiState {
             }
         }
         if self.tiles.len() <= 1 {
+            self.zoomed_tile = None;
             let last_tile = self.tiles.pop();
             self.tiles.clear();
             self.tile_tree = crate::config::TileNode::Leaf(0);
@@ -2486,6 +2523,9 @@ impl UiState {
                     self.open_session(&asid);
                 } else if tile.is_terminal() {
                     self.open_terminal();
+                } else if let TileContent::Custom { kind, .. } = tile.content {
+                    self.plugin_page_origin = None;
+                    self.open_plugin_page(&kind);
                 }
             } else if self.selected.is_none() {
                 self.mode = Mode::Home;
@@ -2517,6 +2557,11 @@ impl UiState {
             self.focus = j;
         } else if self.focus == j {
             self.focus = i;
+        }
+        if self.zoomed_tile == Some(i) {
+            self.zoomed_tile = Some(j);
+        } else if self.zoomed_tile == Some(j) {
+            self.zoomed_tile = Some(i);
         }
         self.menu = None;
         self.persist_tiles();
@@ -2597,15 +2642,11 @@ impl UiState {
                 TileContent::Session(asid) => self.tiles.push(Tile::session(asid)),
                 TileContent::Diff(path) => self.tiles.push(Tile {
                     content: TileContent::Diff(path),
-                    asid: None,
-                    term_tab: None,
-                    slot: SessionSlot::default(),
+                    ..Tile::default()
                 }),
                 TileContent::Custom { id, kind, title } => self.tiles.push(Tile {
                     content: TileContent::Custom { id, kind, title },
-                    asid: None,
-                    term_tab: None,
-                    slot: SessionSlot::default(),
+                    ..Tile::default()
                 }),
                 TileContent::Empty => self.tiles.push(Tile::empty()),
             }
@@ -3653,25 +3694,10 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     parts::pane::row_menu(s, &k, &mut layer);
     welcome::mount(s, &k, &mut layer);
     if let (Some(splash), Some(images)) = (s.splash.as_ref(), s.images.as_ref()) {
-        let hub_ready = !s.hub_label.is_empty();
-        let loading = match splash.kind {
-            splash::SplashKind::Boot => {
-                !splash::Splash::data_ready(splash.kind, s.agents_seen, hub_ready)
-            }
-            splash::SplashKind::Theme => false,
-        };
-        if let Some(stage) = splash.view(
-            images,
-            &k,
-            &s.look(),
-            scheme,
-            s.cfg.general.language,
-            loading,
-        ) {
+        if let Some(stage) = splash.view(images, &k, &s.look(), scheme) {
             layer.push(stage);
         }
     }
-    viewer::mount(s, &k, cx.env().scale, &mut layer);
     palette::mount(s, &k, &mut layer);
     shortcuts::mount(s, &k, &mut layer);
     pair_computer::mount(s, &k, &mut layer);

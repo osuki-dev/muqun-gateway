@@ -25,6 +25,11 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
     let notify_title = tr_ref(language, "System notifications");
     let tray_title = tr_ref(language, "Keep running in the tray");
     vec![
+        group(k, "file-opening", tr_ref(language, "Files"), vec![row(k, "files-in-editor",
+            tr_ref(language, "Open files directly in editor"),
+            tr_ref(language, "Text and code use the editor below; images keep the built-in preview."),
+            flag(k, "files-in-editor", s.cfg.general.files_in_editor, tr_ref(language, "Enabled"),
+                |s| s.edit(ConfigEdit::FilesInEditor(!s.cfg.general.files_in_editor))))]),
         group(
             k,
             "general-language",

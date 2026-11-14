@@ -18,9 +18,7 @@ use std::time::SystemTime;
 
 use rune::{col, el, rich, row, text, El, SurfaceFit};
 use rune_kit::syntax::{self, SyntaxTheme};
-use rune_kit::{
-    Button, ButtonVariant, IconButton, IconButtonVariant, Kit, Markdown, SegmentedControl,
-};
+use rune_kit::{Button, ButtonVariant, Kit, Markdown, SegmentedControl};
 
 use super::copy::{tr, tr_ref};
 use super::UiState;
@@ -40,8 +38,6 @@ pub struct Viewer {
     pub zoom: Option<f32>,
     /// Markdown: show the source instead of the rendering.
     pub source: bool,
-    /// Side-docked mode: sits as a right-hand drawer without obscuring the chat/composer.
-    pub docked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +118,12 @@ impl UiState {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| target.display_name());
         let kind = files::kind_of(path.as_deref().unwrap_or(Path::new(&name)), target.mime());
+        if self.cfg.general.files_in_editor && kind.reads_text() {
+            if let Some(path) = path.as_deref() {
+                self.open_editor_file(path);
+                return;
+            }
+        }
         let mut meta = path.as_deref().map(Meta::of).unwrap_or_default();
         if let FileRef::Asset { asset, .. } = &target {
             meta.size = meta.size.or(asset.size);
@@ -144,12 +146,54 @@ impl UiState {
             body,
             zoom: None,
             source: false,
-            docked: false,
         });
+        self.show_file_window();
+    }
+
+    pub fn show_file_window(&mut self) {
+        let newly_opened = self.tile_of_plugin("files").is_none();
+        self.open_plugin_tile("files");
+        if let Some(i) = self.tile_of_plugin("files") {
+            if let (Some(v), super::TileContent::Custom { title, .. }) =
+                (&self.viewer, &mut self.tiles[i].content)
+            {
+                *title = v.name.clone();
+            }
+            if newly_opened {
+                let [width, height] = self.tile_grid;
+                let w = if width > 100.0 { width } else { 1120.0 };
+                let h = if height > 100.0 { height } else { 760.0 };
+                self.tiles[i].floating_rect = Some([w * 0.08, h * 0.06, w * 0.84, h * 0.88]);
+            }
+            if !self.tiles[i].popped {
+                self.toggle_tile_pop_at(i);
+            }
+        }
+    }
+
+    pub fn file_window_focused(&self) -> bool {
+        if self.viewer.is_none() || self.term.sink.focused {
+            return false;
+        }
+        if let Some(id) = &self.active_plugin_page {
+            return id == "files";
+        }
+        self.active_plugin_drawer.as_deref() == Some("files")
+            || self.tile_of_plugin("files") == Some(self.focus)
     }
 
     pub fn close_viewer(&mut self) {
         self.viewer = None;
+        if self.active_plugin_page.as_deref() == Some("files") {
+            self.active_plugin_page = None;
+            self.plugin_page_origin = None;
+        }
+        if self.active_plugin_drawer.as_deref() == Some("files") {
+            self.close_plugin_drawer();
+        }
+        if let Some(i) = self.tile_of_plugin("files") {
+            self.close_tile(i);
+        }
     }
 
     /// Open a file with the configured editor. Terminal editors (such as nvim)
@@ -258,94 +302,21 @@ pub fn text_body(text: Arc<str>, truncated: bool) -> Body {
     }
 }
 
-/// Mount the viewer above the window when it is open.
-pub fn mount(s: &UiState, k: &Kit, scale: f32, layer: &mut Vec<El>) {
+/// File content uses the same host-owned window as any extension.
+pub fn content(s: &UiState, k: &Kit, scale: f32) -> El {
     let Some(v) = s.viewer.as_ref() else {
-        return;
+        return el().center().child(text(tr_ref(
+            s.cfg.general.language,
+            "Open a file to preview it",
+        )));
     };
-    let language = s.cfg.general.language;
-    let look = s.look();
-
-    if !v.docked {
-        let mut scrim = el()
-            .key("viewer-scrim")
-            .absolute(0.0, 0.0)
-            .w_full()
-            .h_full()
-            .fill(k.c.scrim)
-            .token_motion(k.motion.overlay)
-            .a11y_hidden();
-        if look.blur {
-            scrim = scrim.backdrop_blur(14.0);
-        }
-        layer.push(scrim);
-
-        let panel = col()
-            .key("viewer-panel")
-            .role("dialog")
-            .label(v.name.clone())
-            .w_full()
-            .h_full()
-            .max_w(1180.0)
-            .max_h(900.0);
-        let mut panel = look
-            .panel(k, panel, k.radius.xl)
-            .child(header(v, k, language))
-            .child(
-                el().key("viewer-rule")
-                    .w_full()
-                    .h(1.0)
-                    .fill(k.c.border_muted),
-            )
-            .child(body(s, v, k, scale, language))
-            .token_motion(k.motion.overlay)
-            .modal(true, |s: &mut UiState| s.close_viewer());
-        for shadow in k.shadow_layers(&k.elevation.overlay) {
-            panel = panel.box_shadow(shadow);
-        }
-        layer.push(
-            el().key("viewer-layer")
-                .absolute(0.0, 0.0)
-                .w_full()
-                .h_full()
-                .padding(28.0)
-                .center()
-                .child(panel),
-        );
-    } else {
-        // Docked to the right side (Drawer mode):
-        // Leaves the left timeline and bottom composer completely interactive!
-        let panel = col()
-            .key("viewer-panel")
-            .role("region")
-            .label(v.name.clone())
-            .w(640.0)
-            .h_full();
-        let mut panel = look
-            .panel(k, panel, 0.0)
-            .border(1.0, k.c.border_base)
-            .child(header(v, k, language))
-            .child(
-                el().key("viewer-rule")
-                    .w_full()
-                    .h(1.0)
-                    .fill(k.c.border_muted),
-            )
-            .child(body(s, v, k, scale, language))
-            .token_motion(k.motion.overlay);
-        for shadow in k.shadow_layers(&k.elevation.overlay) {
-            panel = panel.box_shadow(shadow);
-        }
-        layer.push(
-            row()
-                .key("viewer-layer-docked")
-                .absolute(0.0, 0.0)
-                .w_full()
-                .h_full()
-                .child(el().grow(1.0))
-                .child(panel),
-        );
-    }
+    col()
+        .key("viewer-panel")
+        .w_full()
+        .h_full()
+        .min_h(0.0)
+        .child(header(v, k, s.cfg.general.language))
+        .child(body(s, v, k, scale, s.cfg.general.language))
 }
 
 fn kind_label(kind: FileKind, language: Language) -> String {
@@ -474,6 +445,7 @@ fn header(v: &Viewer, k: &Kit, language: Language) -> El {
     }
     let mut bar = row()
         .key("viewer-header")
+        .flex_wrap()
         .w_full()
         .gap(12.0)
         .center_y()
@@ -545,30 +517,7 @@ fn header(v: &Viewer, k: &Kit, language: Language) -> El {
                     .key("viewer-save"),
             );
     }
-    let docked = v.docked;
-    bar = bar.child(
-        Button::new(if docked {
-            crate::ui::copy::t_ref(language, "Center")
-        } else {
-            crate::ui::copy::t_ref(language, "Dock right")
-        })
-        .variant(ButtonVariant::Ghost)
-        .on_press(|s: &mut UiState| {
-            if let Some(v) = s.viewer.as_mut() {
-                v.docked = !v.docked;
-            }
-        })
-        .build(k)
-        .key("viewer-dock-toggle"),
-    );
-    bar.child(
-        IconButton::new(k.glyph.close)
-            .variant(IconButtonVariant::Ghost)
-            .label(tr_ref(language, "Close"))
-            .on_press(|s: &mut UiState| s.close_viewer())
-            .build(k)
-            .key("viewer-close"),
-    )
+    bar
 }
 
 fn zoom_controls(v: &Viewer, k: &Kit, language: Language) -> El {
@@ -900,6 +849,23 @@ fn notice(k: &Kit, title: String, detail: String) -> El {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_neovim_opens_directly_without_a_preview_window() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.cfg.general.editor = crate::platform::editors::Editor::Neovim;
+        s.cfg.general.files_in_editor = true;
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/config.rs");
+        s.open_file(path.clone());
+        assert!(s.viewer.is_none());
+        assert!(s.tile_of_plugin("files").is_none());
+        assert!(s.term.open && s.term.sink.focused);
+        assert_eq!(
+            s.term.pending_command.as_deref(),
+            Some(format!("nvim '{}'\n", path.display()).as_str())
+        );
+    }
 
     #[test]
     fn the_gutter_numbers_every_line_once() {

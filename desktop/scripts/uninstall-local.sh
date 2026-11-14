@@ -22,6 +22,14 @@ remove() {
   fi
 }
 
+PLUGIN_DIR="$PREFIX/share/$APP_ID/bundled-plugins/review-center"
+remove "$PLUGIN_DIR/plugin.json"
+remove "$PLUGIN_DIR/review.ts"
+remove "$PLUGIN_DIR/README.md"
+if [[ -d "$PLUGIN_DIR" ]]; then
+  rmdir "$PLUGIN_DIR" 2>/dev/null || true
+fi
+
 remove "$BIN_DIR/$APP_ID"
 remove "$APPS_DIR/$APP_ID.desktop"
 for icon in "$ICONS_DIR"/*/apps/"$APP_ID".png; do

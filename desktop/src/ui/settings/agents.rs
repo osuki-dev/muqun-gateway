@@ -124,7 +124,7 @@ fn agent_field(s: &UiState, k: &Kit, layer: &mut Vec<El>, agent: &str, field: Fi
 /// switch at the trailing edge (where every row keeps its control).
 fn head(s: &UiState, k: &Kit, id: &str, standing: Standing, version: Option<&str>) -> El {
     let language = s.cfg.general.language;
-    let enabled = s.cfg.agents.enabled(id);
+    let enabled = s.cfg.agents_for(s.current_computer()).enabled(id);
     let brand = crate::ui::agents::color(id, s.dark);
     let name = crate::ui::agents::name(id, &s.agents);
     let variant = match standing {
@@ -184,6 +184,95 @@ fn head(s: &UiState, k: &Kit, id: &str, standing: Standing, version: Option<&str
         ))
 }
 
+/// Totals are snapshots from loaded sessions, never increments from repeated events.
+#[derive(Default)]
+struct Usage {
+    sessions: usize,
+    reported: usize,
+    input: u64,
+    output: u64,
+    cost: Option<f64>,
+    cost_sessions: usize,
+}
+
+fn usage<'a>(
+    sessions: impl Iterator<Item = &'a muqun_gateway::agents::AgentSessionInfo>,
+    agent: &str,
+) -> Usage {
+    let mut total = Usage::default();
+    let mut seen = std::collections::HashSet::new();
+    for session in sessions.filter(|session| session.agent_id == agent) {
+        if !seen.insert(&session.asid) {
+            continue;
+        }
+        total.sessions += 1;
+        if let Some(tokens) = &session.tokens {
+            total.reported += 1;
+            total.input = total.input.saturating_add(tokens.input);
+            total.output = total.output.saturating_add(tokens.output);
+        }
+        if let Some(cost) = session.cost.filter(|cost| cost.is_finite() && *cost >= 0.0) {
+            total.cost = Some(total.cost.unwrap_or(0.0) + cost);
+            total.cost_sessions += 1;
+        }
+    }
+    total
+}
+
+fn usage_card(s: &UiState, k: &Kit, agent: &str) -> El {
+    let t = |en| tr_ref(s.cfg.general.language, en);
+    let total = usage(s.sessions.iter(), agent);
+    let missing = t("Not reported");
+    let values = [
+        ("Sessions", total.sessions.to_string()),
+        (
+            "Input tokens",
+            if total.reported > 0 {
+                total.input.to_string()
+            } else {
+                missing.to_string()
+            },
+        ),
+        (
+            "Output tokens",
+            if total.reported > 0 {
+                total.output.to_string()
+            } else {
+                missing.to_string()
+            },
+        ),
+        (
+            "Estimated cost",
+            total
+                .cost
+                .map(|cost| format!("${cost:.4}"))
+                .unwrap_or_else(|| missing.to_string()),
+        ),
+    ];
+    let mut cards = hrow().key("usage-metrics").w_full().gap(8.0).flex_wrap();
+    for (label, value) in values {
+        cards = cards.child(
+            col()
+                .key(label)
+                .min_w(120.0)
+                .grow(1.0)
+                .px(12.0)
+                .py(12.0)
+                .gap(6.0)
+                .radius(k.radius.sm)
+                .fill(k.c.bg_accent.alpha(0.06))
+                .child(text(t(label)).font(k.ty.small).color(k.c.text_muted))
+                .child(text(value).font(k.ty.mono).color(k.c.text_base)),
+        );
+    }
+    col().key("agent-usage").w_full().gap(8.0).py(12.0)
+        .child(cards)
+        .child(text(t("Loaded sessions in this view only; not account quota. Input/output exclude separately reported cache and reasoning tokens."))
+            .font(k.ty.small).color(k.c.text_muted).wrap().w_full())
+        .child(text(format!("{}: {}/{} · {}: {}/{}", t("Token coverage"), total.reported, total.sessions,
+            t("Cost coverage"), total.cost_sessions, total.sessions)).font(k.ty.small).color(k.c.text_faint))
+}
+
 pub(super) fn actions(s: &UiState, k: &Kit) -> Vec<El> {
     let language = s.cfg.general.language;
     vec![super::button(tr_ref(language, "Look again"))
@@ -214,7 +303,7 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
         crate::ui::agents::by_standing(&s.agents)
             .into_iter()
             .map(|(a, standing)| {
-                let mut rows: Vec<El> = Vec::new();
+                let mut rows: Vec<El> = vec![usage_card(s, k, &a.id)];
                 if let Some(reason) = &a.reason {
                     rows.push(el().key("reason").w_full().py(10.0).child(status(
                         k,
@@ -242,4 +331,38 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
 
     elements.extend(agent_groups);
     elements
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn usage_counts_reported_snapshots_once_and_preserves_unknowns() {
+        let reported: muqun_gateway::agents::AgentSessionInfo =
+            serde_json::from_value(serde_json::json!({
+                "asid":"a", "agent_id":"codex", "title":"one", "status":"idle", "updated_ms":0,
+                "tokens":{"input":100,"output":20,"cache_read":300}, "cost":0.25
+            }))
+            .unwrap();
+        let mut unknown = reported.clone();
+        unknown.asid.0 = "b".into();
+        unknown.tokens = None;
+        unknown.cost = None;
+        let mut other = reported.clone();
+        other.asid.0 = "c".into();
+        other.agent_id = "claude".into();
+        let total = usage(
+            [&reported, &reported, &unknown, &other].into_iter(),
+            "codex",
+        );
+        assert_eq!(
+            (total.sessions, total.reported, total.input, total.output),
+            (2, 1, 100, 20)
+        );
+        assert_eq!(total.cost, Some(0.25));
+        assert_eq!(total.cost_sessions, 1);
+        let missing = usage([&unknown].into_iter(), "codex");
+        assert_eq!(missing.cost, None);
+        assert_eq!(missing.reported, 0);
+    }
 }

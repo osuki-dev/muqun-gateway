@@ -4,28 +4,28 @@
 //! parses their manifests, and instantiates [`ExternalPlugin`] which implements
 //! [`DesktopPlugin`].
 
-use std::io::Read as _;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 use muqun_gateway::platform::runtimes::{self, RuntimeKind};
 use rune::{col, el, icon, row, text, El, Icon};
-use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Markdown};
+use rune_kit::{Button, ButtonVariant, ControlSize, Markdown};
 
 use crate::config::Language;
 use crate::plugin::manifest::{
     PluginCategory, PluginCommandManifest, PluginManifest, PluginRenderKind, PluginSlot,
 };
-use crate::plugin::{surface_switcher, DesktopPlugin, PluginCommand, PluginViewContext};
+use crate::plugin::{DesktopPlugin, PluginCommand, PluginViewContext};
 use crate::ui::copy::tr_ref;
 use crate::ui::icons;
 use crate::ui::terminal_panel;
 use crate::ui::{ToastLevel, UiState};
 
-/// Maximum execution time for a synchronous Bun plugin command script.
-const BUN_SCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum execution time for a background Bun plugin command script.
+const BUN_SCRIPT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Structured toast notification returned by a Bun plugin script on stdout.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -57,6 +57,8 @@ pub struct ExternalPlugin {
     dir: PathBuf,
     commands: Vec<PluginCommand>,
     dynamic_markdown: Mutex<Option<String>>,
+    script_job: Mutex<Option<mpsc::Receiver<Result<String, String>>>>,
+    script_title: Mutex<String>,
     /// Optional override for the Bun binary resolution:
     /// - `None`: resolve via `muqun_gateway::platform::runtimes::resolve_binary(RuntimeKind::Bun, None)`
     /// - `Some(Some(path))`: resolve with `configured = Some(path)`
@@ -67,6 +69,11 @@ pub struct ExternalPlugin {
 impl ExternalPlugin {
     /// Construct an external plugin instance from a parsed manifest and directory.
     pub fn new(manifest: PluginManifest, dir: PathBuf) -> Self {
+        let dir = if dir.is_absolute() {
+            dir
+        } else {
+            std::env::current_dir().unwrap_or_default().join(dir)
+        };
         let id: &'static str = Box::leak(manifest.id.clone().into_boxed_str());
         let commands = manifest
             .commands
@@ -91,6 +98,8 @@ impl ExternalPlugin {
             dir,
             commands,
             dynamic_markdown: Mutex::new(None),
+            script_job: Mutex::new(None),
+            script_title: Mutex::new(String::new()),
             bun_binary_override: Mutex::new(None),
         }
     }
@@ -228,80 +237,20 @@ impl ExternalPlugin {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut child = match command.spawn() {
-            Ok(c) => c,
-            Err(err) => {
-                s.notify(
-                    ToastLevel::Error,
-                    format!("{}: Failed to start Bun", self.manifest.name),
-                    Some(err.to_string()),
-                );
-                return true;
-            }
-        };
-
-        let deadline = Instant::now() + BUN_SCRIPT_TIMEOUT;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(st)) => break st,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    s.notify(
-                        ToastLevel::Error,
-                        format!("{}: Script timed out", self.manifest.name),
-                        Some(format!(
-                            "`{}` exceeded {:?}",
-                            script_path.display(),
-                            BUN_SCRIPT_TIMEOUT
-                        )),
-                    );
-                    return true;
-                }
-                Err(err) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    s.notify(
-                        ToastLevel::Error,
-                        format!("{}: Execution error", self.manifest.name),
-                        Some(err.to_string()),
-                    );
-                    return true;
-                }
-            }
-        };
-
-        let mut stdout_bytes = Vec::new();
-        if let Some(out) = child.stdout.take() {
-            let _ = out.take(64 * 1024).read_to_end(&mut stdout_bytes);
-        }
-        let mut stderr_bytes = Vec::new();
-        if let Some(err) = child.stderr.take() {
-            let _ = err.take(16 * 1024).read_to_end(&mut stderr_bytes);
-        }
-
-        let stdout_str = String::from_utf8_lossy(&stdout_bytes).trim().to_string();
-        let stderr_str = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
-
-        if !status.success() {
-            let detail = if !stderr_str.is_empty() {
-                stderr_str
-            } else if !stdout_str.is_empty() {
-                stdout_str
-            } else {
-                format!("Exited with status {status}")
-            };
-            s.notify(
-                ToastLevel::Error,
-                format!("{}: {} failed", self.manifest.name, command_title),
-                Some(detail),
-            );
+        let mut job = self.script_job.lock().unwrap();
+        if job.is_some() {
             return true;
         }
+        let (tx, rx) = mpsc::channel();
+        *job = Some(rx);
+        *self.script_title.lock().unwrap() = command_title.to_string();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_script(command));
+        });
+        true
+    }
 
+    fn apply_script_output(&self, s: &mut UiState, command_title: &str, stdout_str: String) {
         // Parse structured JSON response from full stdout or the last JSON line.
         let parsed_json = serde_json::from_str::<BunScriptResponse>(&stdout_str).or_else(|_| {
             stdout_str
@@ -361,8 +310,6 @@ impl ExternalPlugin {
                 None,
             );
         }
-
-        true
     }
 
     /// Attempt to load markdown content from dynamic output, configured tile entry, or README.md.
@@ -452,59 +399,6 @@ impl DesktopPlugin for ExternalPlugin {
         let pid = self.id.to_string();
         let render_kind = self.manifest.render_kind();
 
-        let header_icon = icon(self.icon(), 14.0).color(k.c.text_accent);
-        let title_text = text(&self.manifest.name)
-            .font(k.ty.ui_medium)
-            .color(k.c.text_base);
-        let category_badge = text(self.category().label(lang))
-            .font(k.ty.caption())
-            .color(k.c.text_muted);
-        let version_badge = text(format!("v{}", self.manifest.version))
-            .font(k.ty.caption())
-            .color(k.c.text_faint);
-
-        let mut header = row()
-            .w_full()
-            .h(36.0)
-            .px(12.0)
-            .gap(8.0)
-            .center_y()
-            .fill(k.alpha(k.c.layer_01, 0.45))
-            .child(header_icon)
-            .child(title_text)
-            .child(category_badge)
-            .child(version_badge);
-
-        if matches!(render_kind, PluginRenderKind::BunScript { .. }) {
-            header = header.child(
-                Badge::new("Bun")
-                    .variant(BadgeVariant::Accent)
-                    .build(k)
-                    .key(format!("bun-badge-{tile_id}")),
-            );
-        } else if matches!(render_kind, PluginRenderKind::TerminalTui { .. }) {
-            header = header.child(
-                Badge::new("TUI")
-                    .variant(BadgeVariant::Subtle)
-                    .build(k)
-                    .key(format!("tui-badge-{tile_id}")),
-            );
-        }
-
-        header = header.child(el().grow(1.0));
-
-        if let Some(author) = &self.manifest.author {
-            header = header.child(
-                text(format!("by {author}"))
-                    .font(k.ty.caption())
-                    .color(k.c.text_faint),
-            );
-        }
-
-        header = header.child(surface_switcher(k, lang, self.id, ctx.surface));
-
-        let divider = el().w_full().h(1.0).fill(k.alpha(k.c.border_weak, 0.35));
-
         if let PluginRenderKind::TerminalTui { command, cwd } = &render_kind {
             let cmd_str = command.join(" ");
             let cwd_opt = cwd.clone();
@@ -564,8 +458,6 @@ impl DesktopPlugin for ExternalPlugin {
                     .grow(1.0)
                     .w_full()
                     .min_h(0.0)
-                    .child(header)
-                    .child(divider)
                     .child(tui_bar)
                     .child(term_view),
             );
@@ -610,6 +502,7 @@ impl DesktopPlugin for ExternalPlugin {
                     let cmd_id = cmd.id.clone();
                     let pid_clone = pid.clone();
                     let btn = Button::new(&cmd.title)
+                        .disabled(self.script_job.lock().unwrap().is_some())
                         .variant(ButtonVariant::Ghost)
                         .control_size(ControlSize::Small)
                         .on_press(move |s: &mut UiState| {
@@ -618,7 +511,14 @@ impl DesktopPlugin for ExternalPlugin {
                             }
                         })
                         .build(k);
-                    cmd_bar = cmd_bar.child(btn);
+                    cmd_bar = cmd_bar.child(btn.key(format!("plugin-command-{}", cmd.id)));
+                }
+                if self.script_job.lock().unwrap().is_some() {
+                    cmd_bar = cmd_bar.child(
+                        text(tr_ref(lang, "Loading…"))
+                            .font(k.ty.small)
+                            .color(k.c.text_muted),
+                    );
                 }
                 col_inner = col_inner.child(cmd_bar);
             }
@@ -814,14 +714,51 @@ impl DesktopPlugin for ExternalPlugin {
                 .grow(1.0)
                 .w_full()
                 .min_h(0.0)
-                .child(header)
-                .child(divider)
                 .child(body),
         )
     }
 
     fn commands(&self) -> Vec<PluginCommand> {
         self.commands.clone()
+    }
+
+    fn poll(&self, s: &mut UiState, tx: &mut rune::Tx) -> bool {
+        if !super::is_enabled(self.id, &s.cfg.plugins_disabled) {
+            self.script_job.lock().unwrap().take();
+            return false;
+        }
+        let result = {
+            let mut job = self.script_job.lock().unwrap();
+            let Some(rx) = job.as_ref() else {
+                return false;
+            };
+            match rx.try_recv() {
+                Ok(result) => {
+                    *job = None;
+                    Some(result)
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    tx.wake_after(Duration::from_millis(16));
+                    None
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    *job = None;
+                    Some(Err("Plugin worker stopped".into()))
+                }
+            }
+        };
+        match result {
+            Some(Ok(output)) => {
+                self.apply_script_output(s, &self.script_title.lock().unwrap(), output)
+            }
+            Some(Err(error)) => s.notify(
+                ToastLevel::Error,
+                format!("{}: command failed", self.manifest.name),
+                Some(error),
+            ),
+            None => return false,
+        }
+        true
     }
 
     fn on_command(&self, s: &mut UiState, command_id: &str) -> bool {
@@ -877,6 +814,57 @@ impl DesktopPlugin for ExternalPlugin {
     }
 }
 
+/// Drain both pipes concurrently: a verbose child must never block on a full pipe.
+fn run_script(mut command: ProcessCommand) -> Result<String, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    fn drain(mut pipe: impl Read, cap: usize) -> String {
+        let mut bytes = Vec::new();
+        let _ = pipe.by_ref().take(cap as u64).read_to_end(&mut bytes);
+        let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+        String::from_utf8_lossy(&bytes).trim().to_string()
+    }
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let out = std::thread::spawn(move || drain(stdout, 64 * 1024));
+    let err = std::thread::spawn(move || drain(stderr, 16 * 1024));
+    let deadline = Instant::now() + BUN_SCRIPT_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            result => {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(result
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "Plugin command timed out".into()));
+            }
+        }
+    };
+    // A completed script must not leave descendants holding its pipes open.
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let stdout = out.join().unwrap_or_default();
+    let stderr = err.join().unwrap_or_default();
+    if status?.success() {
+        Ok(stdout)
+    } else {
+        Err(if stderr.is_empty() { stdout } else { stderr })
+    }
+}
+
 /// Resolve icon string from manifest to static Rune Icon.
 pub fn resolve_icon(name: Option<&str>) -> &'static Icon {
     match name.map(|s| s.to_ascii_lowercase()).as_deref() {
@@ -912,11 +900,7 @@ pub fn default_plugin_dirs() -> Vec<PathBuf> {
     if let Some(data_dir) = dirs::data_dir() {
         dirs.push(data_dir.join("muqun-desktop").join("plugins"));
     }
-    #[cfg(target_os = "linux")]
-    {
-        dirs.push(PathBuf::from("/usr/share/muqun-desktop/plugins"));
-        dirs.push(PathBuf::from("/usr/local/share/muqun-desktop/plugins"));
-    }
+    dirs.extend(crate::platform::bundled_plugin_dirs());
 
     let local_assets = PathBuf::from("desktop/assets/plugins");
     if local_assets.is_dir() {
@@ -1002,6 +986,17 @@ pub fn discover_plugins(plugin_dirs: &[PathBuf]) -> Vec<ExternalPlugin> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn verbose_scripts_drain_both_pipes_without_deadlocking() {
+        let mut command = ProcessCommand::new("/bin/sh");
+        command.args(["-c", "i=0; while [ $i -lt 9000 ]; do printf 0123456789; printf 0123456789 >&2; i=$((i+1)); done"])
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let output =
+            run_script(command).expect("a full stdout/stderr pipe must not stall the worker");
+        assert_eq!(output.len(), 64 * 1024);
+    }
 
     #[test]
     fn discover_plugins_scans_and_filters() {
@@ -1235,6 +1230,16 @@ printf '{"toast":{"title":"Bun Executed %s","detail":"session=%s cmd=%s","level"
         s.toasts.clear();
         s.draft.text.clear();
         assert!(plugin.on_command(&mut s, "bun.analyze"));
+        let result = plugin
+            .script_job
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        plugin.apply_script_output(&mut s, "Analyze workspace", result);
         assert_eq!(s.toasts.len(), 1);
         assert_eq!(s.toasts[0].level, ToastLevel::Success);
         assert_eq!(s.toasts[0].title, "Bun Executed bun-demo");

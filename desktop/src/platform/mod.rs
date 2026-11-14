@@ -56,6 +56,22 @@ pub fn is_macos() -> bool {
     cfg!(target_os = "macos")
 }
 
+/// Package-owned extensions stay separate from the user's custom plugins.
+pub fn bundled_plugin_dirs() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(prefix) = executable.parent().and_then(std::path::Path::parent) {
+            paths.push(prefix.join("share/muqun-desktop/bundled-plugins"));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        paths.push(PathBuf::from("/usr/share/muqun-desktop/plugins"));
+        paths.push(PathBuf::from("/usr/local/share/muqun-desktop/plugins"));
+    }
+    paths
+}
+
 /// What the window's own controls take at the titlebar's leading edge:
 /// macOS's traffic lights, as Rune reports them. Elsewhere nothing sits
 /// there (a headless render still reports the Mac's, so ignore it).

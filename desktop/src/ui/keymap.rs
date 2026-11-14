@@ -28,6 +28,53 @@ pub enum RecordingTarget {
     Action(Action),
 }
 
+/// 2nd-level Which-Key semantic group (`Leader` then `s`/`w`/`t`/`g`/`p`/`o`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaderGroup {
+    Session,
+    Window,
+    Terminal,
+    Git,
+    Plugin,
+    Open,
+}
+
+impl LeaderGroup {
+    pub fn from_key(ch: char) -> Option<Self> {
+        match ch.to_ascii_lowercase() {
+            's' => Some(Self::Session),
+            'w' => Some(Self::Window),
+            't' => Some(Self::Terminal),
+            'g' => Some(Self::Git),
+            'p' => Some(Self::Plugin),
+            'o' => Some(Self::Open),
+            _ => None,
+        }
+    }
+
+    pub fn key(self) -> char {
+        match self {
+            Self::Session => 's',
+            Self::Window => 'w',
+            Self::Terminal => 't',
+            Self::Git => 'g',
+            Self::Plugin => 'p',
+            Self::Open => 'o',
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Session => "Session",
+            Self::Window => "Window",
+            Self::Terminal => "Terminal",
+            Self::Git => "Git",
+            Self::Plugin => "Plugins",
+            Self::Open => "Open",
+        }
+    }
+}
+
 thread_local! {
     static ACTIVE_KEYMAP: std::cell::RefCell<KeymapConfig> =
         std::cell::RefCell::new(KeymapConfig::default());
@@ -128,6 +175,13 @@ pub enum Action {
     Deny,
     MarkDone,
     CancelTask,
+    CycleTileLayout,
+    ToggleTileSplitAxis,
+    ToggleTileZoom,
+    ToggleTilePop,
+    EqualizeTiles,
+    SplitHorizontal,
+    SplitVertical,
 }
 
 impl Action {
@@ -188,6 +242,13 @@ impl Action {
             Self::Deny => "deny",
             Self::MarkDone => "mark_done",
             Self::CancelTask => "cancel_task",
+            Self::CycleTileLayout => "cycle_tile_layout",
+            Self::ToggleTileSplitAxis => "toggle_tile_split_axis",
+            Self::ToggleTileZoom => "toggle_tile_zoom",
+            Self::ToggleTilePop => "toggle_tile_pop",
+            Self::EqualizeTiles => "equalize_tiles",
+            Self::SplitHorizontal => "split_horizontal",
+            Self::SplitVertical => "split_vertical",
         }
     }
 
@@ -465,6 +526,48 @@ pub static ENTRIES: &[Entry] = &[
         G::Split,
         "mod+alt+shift+left, mod+alt+shift+right, mod+alt+shift+up, mod+alt+shift+down",
         "Swap the pane with the one that way",
+    ),
+    e(
+        A::CycleTileLayout,
+        G::Split,
+        "mod+alt+l",
+        "Cycle tile layout (Dwindle / Scrolling / Floating)",
+    ),
+    e(
+        A::ToggleTileSplitAxis,
+        G::Split,
+        "mod+j",
+        "Toggle horizontal / vertical split",
+    ),
+    e(
+        A::ToggleTileZoom,
+        G::Split,
+        "mod+alt+f",
+        "Maximize or restore the focused pane",
+    ),
+    e(
+        A::ToggleTilePop,
+        G::Split,
+        "mod+alt+o",
+        "Pop out or dock the focused pane",
+    ),
+    e(
+        A::EqualizeTiles,
+        G::Split,
+        "mod+alt+e",
+        "Equalize split sizes",
+    ),
+    e(
+        A::SplitHorizontal,
+        G::Split,
+        "mod+alt+-",
+        "Split the focused pane stacked",
+    ),
+    e(
+        A::SplitVertical,
+        G::Split,
+        "mod+alt+\\",
+        "Split the focused pane side by side",
     ),
     owned(
         e(
@@ -968,13 +1071,140 @@ pub fn is_leader_event(s: &UiState, ev: &KeyEvent, tx: &Tx) -> bool {
     keybind_matches(&bind, ev, tx)
 }
 
+fn leader_char(ev: &KeyEvent) -> Option<char> {
+    let raw_ch = match &ev.key {
+        rune::Key::Text(t) => t.chars().next(),
+        rune::Key::Command(c) => Some(*c),
+        _ => None,
+    };
+    match (raw_ch, ev.mods.shift) {
+        (Some('/'), true) => Some('?'),
+        (Some('\\'), true) => Some('|'),
+        (Some(';'), true) => Some(':'),
+        (Some(c), true) if c.is_ascii_alphabetic() => Some(c.to_ascii_uppercase()),
+        (c, _) => c,
+    }
+}
+
+fn handle_leader_group(
+    s: &mut UiState,
+    group: LeaderGroup,
+    ch: Option<char>,
+    ev: &KeyEvent,
+    tx: &mut Tx,
+) {
+    match group {
+        LeaderGroup::Session => match ch {
+            Some('n') => {
+                let _ = run(s, Action::NewSession, ev, tx);
+            }
+            Some('p' | '[') => {
+                let _ = step_session(s, false);
+            }
+            Some(']') => {
+                let _ = step_session(s, true);
+            }
+            Some('r') => {
+                let _ = run(s, Action::ToggleRecentSession, ev, tx);
+            }
+            Some('/' | 'f' | 'F') => {
+                let _ = run(s, Action::SearchMessages, ev, tx);
+            }
+            Some('c') => {
+                let _ = run(s, Action::FocusComposer, ev, tx);
+            }
+            _ => {}
+        },
+        LeaderGroup::Window => match ch {
+            Some('s' | '\\' | '|') => s.split(),
+            Some('x' | 'w' | 'W') if s.in_split() => s.close_tile(s.focus),
+            Some('h' | '-') => s.split_tile_with_axis(false),
+            Some('v' | 'V') => s.split_tile_with_axis(true),
+            Some('j') => s.toggle_tile_split_axis(),
+            Some('z' | 'Z') => s.toggle_tile_zoom(),
+            Some('o') => s.toggle_tile_pop(),
+            Some('e') => s.equalize_tiles(),
+            Some('l') => s.cycle_tile_layout(),
+            Some('L') => s.cycle_tile_layout_prev(),
+            Some(d @ '1'..='8') => {
+                let idx = (d as u8 - b'1') as usize;
+                if s.in_split() && idx < s.tiles.len() {
+                    s.focus_tile(idx);
+                    if s.tiles.get(idx).is_some_and(|t| t.is_terminal()) {
+                        s.focus_terminal_tx(tx);
+                    }
+                }
+            }
+            _ => {}
+        },
+        LeaderGroup::Terminal => match ch {
+            Some('t') => s.toggle_terminal_tx(tx),
+            Some('c' | 'C') => {
+                s.term_new_tab();
+                s.focus_terminal_tx(tx);
+            }
+            Some('x' | 'X') => {
+                if s.in_split() && s.tiles.get(s.focus).is_some_and(|t| t.is_terminal()) {
+                    s.close_tile(s.focus);
+                } else if s.term.open || s.has_terminal_tile() {
+                    s.term_close_tab(s.term.active_tab);
+                }
+            }
+            Some('h' | '-') => {
+                s.split_terminal_with_axis(false);
+                s.focus_terminal_tx(tx);
+            }
+            Some('v' | 'V' | '\\' | '|') => {
+                s.split_terminal_with_axis(true);
+                s.focus_terminal_tx(tx);
+            }
+            Some('z' | 'Z') => s.toggle_terminal_zoom(),
+            Some('/' | 'f' | 'F' | '[') => s.open_terminal_search(),
+            Some(',') => {
+                let _ = step_session(s, false);
+            }
+            Some(']') => s.term_next_tab(),
+            Some(d @ '1'..='9') => s.term_switch_tab((d as u8 - b'1') as usize),
+            Some('d' | 'D') => s.close_terminal(),
+            _ => {}
+        },
+        LeaderGroup::Git => match ch {
+            Some('g') => {
+                if !run(s, Action::ToggleGit, ev, tx) {
+                    s.open_git_inspector();
+                }
+            }
+            Some('d') => s.show_diff = !s.show_diff,
+            _ => {}
+        },
+        LeaderGroup::Plugin => match ch {
+            Some('p' | 'o') => s.toggle_palette(true),
+            Some('k') => s.toggle_palette(false),
+            _ => {}
+        },
+        LeaderGroup::Open => match ch {
+            Some('h' | 'H') => s.go(Mode::Home),
+            Some('i' | 'I') => s.go(Mode::Inbox),
+            Some('t' | 'T') => s.go(Mode::Tasks),
+            Some('s' | 'S') => s.go(Mode::Settings),
+            Some('?') => s.toggle_keys_sheet(),
+            _ => {}
+        },
+    }
+}
+
 /// Execute a follow-up chord when `leader_armed` is active.
 pub fn handle_leader_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
     let was_term_focused = s.is_terminal_focused();
-    s.disarm_leader();
 
-    // Double-tap Leader key: disarm and forward literal key to terminal if focused.
+    if ev.key == rune::Key::Escape {
+        s.disarm_leader();
+        return true;
+    }
+
+    // Double-tap Leader: disarm and forward literal key to terminal if focused.
     if is_leader_event(s, ev, tx) {
+        s.disarm_leader();
         if was_term_focused {
             let leader_str = s.cfg.keymap.leader.trim();
             if crate::term::input::is_ctrl_space(ev, tx.physical_key())
@@ -991,7 +1221,10 @@ pub fn handle_leader_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         return true;
     }
 
-    if ev.key == rune::Key::Escape {
+    if let Some(group) = s.leader_group {
+        let ch = leader_char(ev);
+        handle_leader_group(s, group, ch, ev, tx);
+        s.disarm_leader();
         return true;
     }
 
@@ -999,10 +1232,9 @@ pub fn handle_leader_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         ev.key,
         rune::Key::Left | rune::Key::Right | rune::Key::Up | rune::Key::Down
     ) {
+        s.disarm_leader();
         if s.in_split() {
-            if let Some(j) =
-                super::dwindle::neighbour(&s.tile_layout(), s.tile_grid, s.focus, &ev.key)
-            {
+            if let Some(j) = super::tiles::neighbour(s, &ev.key) {
                 s.focus_tile(j);
                 if s.tiles.get(s.focus).is_some_and(|t| t.is_terminal()) {
                     s.focus_terminal_tx(tx);
@@ -1024,38 +1256,32 @@ pub fn handle_leader_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         return true;
     }
 
-    let raw_ch = match &ev.key {
-        rune::Key::Text(t) => t.chars().next(),
-        rune::Key::Command(c) => Some(*c),
-        _ => None,
-    };
-    let ch = match (raw_ch, ev.mods.shift) {
-        (Some('/'), true) => Some('?'),
-        (Some('\\'), true) => Some('|'),
-        (Some(';'), true) => Some(':'),
-        (Some(c), true) if c.is_ascii_alphabetic() => Some(c.to_ascii_uppercase()),
-        (c, _) => c,
-    };
+    let ch = leader_char(ev);
 
+    // Root level: enter a semantic subgroup and keep Leader armed.
+    if let Some(c) = ch {
+        if let Some(group) = LeaderGroup::from_key(c) {
+            // Uppercase page jumps stay direct (`H`/`I`/`T`/`S`).
+            if !c.is_ascii_uppercase() {
+                s.arm_leader_group(group, tx);
+                return true;
+            }
+        }
+    }
+
+    s.disarm_leader();
     match ch {
         Some(' ' | ';') => s.toggle_focus_tx(tx),
         Some('k' | ':') => s.toggle_palette(false),
-        Some('p' | 'o') => s.toggle_palette(true),
         Some('n') => {
             let _ = run(s, Action::NewSession, ev, tx);
         }
         Some('b') => s.sidebar.toggle(),
-        Some('g') => {
-            if !run(s, Action::ToggleGit, ev, tx) {
-                s.open_git_inspector();
-            }
-        }
         Some('i') => {
             if !run(s, Action::ToggleInspector, ev, tx) {
                 s.toggle_inspector();
             }
         }
-        Some('t') => s.toggle_terminal_tx(tx),
         Some('c' | 'C') => {
             s.term_new_tab();
             s.focus_terminal_tx(tx);
@@ -1069,17 +1295,20 @@ pub fn handle_leader_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
                 s.close_tile(s.focus);
             }
         }
-        Some('[' | ',') => {
-            if ch == Some('[') && (was_term_focused || s.term.open) {
+        Some('[') => {
+            if was_term_focused || s.term.open {
                 s.open_terminal_search();
             } else {
                 let _ = step_session(s, false);
             }
         }
+        Some(',') => {
+            let _ = step_session(s, false);
+        }
         Some(']') => {
             let _ = step_session(s, true);
         }
-        Some('h' | 's' | '-') => {
+        Some('h' | '-') => {
             s.split_terminal_with_axis(false);
             s.focus_terminal_tx(tx);
         }
@@ -1088,11 +1317,6 @@ pub fn handle_leader_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
             s.focus_terminal_tx(tx);
         }
         Some('z' | 'Z') => s.toggle_terminal_zoom(),
-        Some('w' | 'W') => {
-            if s.in_split() {
-                s.close_tile(s.focus);
-            }
-        }
         Some(d @ '1'..='4') => {
             let idx = (d as u8 - b'1') as usize;
             if s.in_split() {
@@ -1237,7 +1461,7 @@ pub(crate) fn bind_matches_cfg(entry: &Entry, cfg: &KeymapConfig, ev: &KeyEvent,
 
 /// Check registered plugin commands for a matching `shortcut` chord and execute it.
 pub fn dispatch_plugin_shortcut(s: &mut UiState, ev: &KeyEvent, tx: &Tx) -> bool {
-    let plugins = s.plugins.all();
+    let plugins = s.plugins.all_enabled(&s.cfg.plugins_disabled);
     for plugin in plugins {
         for cmd in plugin.commands() {
             let Some(sc) = cmd.shortcut.map(str::trim).filter(|s| !s.is_empty()) else {
@@ -1306,6 +1530,15 @@ pub fn field_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx, at_end: bool) -> b
         A::FocusPane,
         A::FocusPaneToward,
         A::SwapPaneToward,
+        A::AddSplit,
+        A::RemoveSplit,
+        A::CycleTileLayout,
+        A::ToggleTileSplitAxis,
+        A::ToggleTileZoom,
+        A::ToggleTilePop,
+        A::EqualizeTiles,
+        A::SplitHorizontal,
+        A::SplitVertical,
         A::ExpandComposer,
         A::PromptHistory,
     ] {
@@ -1397,6 +1630,13 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
             return step_session(s, action == A::NextSession);
         }
         A::AddSplit => s.split(),
+        A::SplitHorizontal => s.split_tile_with_axis(false),
+        A::SplitVertical => s.split_tile_with_axis(true),
+        A::CycleTileLayout => s.cycle_tile_layout(),
+        A::ToggleTileSplitAxis => s.toggle_tile_split_axis(),
+        A::ToggleTileZoom => s.toggle_tile_zoom(),
+        A::ToggleTilePop => s.toggle_tile_pop(),
+        A::EqualizeTiles => s.equalize_tiles(),
         A::RemoveSplit if s.in_split() => s.close_tile(s.focus),
         A::FocusPane => {
             let n = ['1', '2', '3', '4']
@@ -1553,7 +1793,10 @@ pub fn esc_step(s: &UiState) -> Option<EscStep> {
     if s.menu.is_some() || s.row_menu.is_some() || s.context_open.is_some() {
         return Some(EscStep::Popup);
     }
-    if s.voice.is_some() || s.viewer.is_some() || s.zoom.is_some() || s.detail.is_some() {
+    if s.active_plugin_page.is_some() {
+        return Some(EscStep::Page);
+    }
+    if s.voice.is_some() || s.file_window_focused() || s.zoom.is_some() || s.detail.is_some() {
         return Some(EscStep::Dialog);
     }
     if s.show_diff {
@@ -1614,7 +1857,7 @@ pub fn escape(s: &mut UiState) -> bool {
                 s.close_pairing();
             } else if s.voice.is_some() {
                 s.cancel_voice();
-            } else if s.viewer.is_some() {
+            } else if s.file_window_focused() {
                 s.close_viewer();
             } else if s.zoom.take().is_none() {
                 s.close_detail();
@@ -1749,6 +1992,44 @@ mod tests {
             .expect("the session scene");
         scene(&mut s);
         s
+    }
+
+    #[test]
+    fn composer_keeps_workspace_shortcuts_after_taking_focus() {
+        use rune::{Env, Key, Mods, Runtime};
+        let mut s = state();
+        s.split();
+        s.focus_tile(0);
+        let mut rt = Runtime::new(s, super::super::view, (1440.0, 900.0), Env::new(true, 1.0));
+        rt.on_key = Some(super::super::on_key);
+        rt.frame(0.0);
+        let chord = |c| KeyEvent {
+            key: Key::Command(c),
+            mods: Mods {
+                ctrl: !cfg!(target_os = "macos"),
+                cmd: cfg!(target_os = "macos"),
+                alt: true,
+                ..Default::default()
+            },
+        };
+        rt.key(chord('f'));
+        rt.frame(0.1);
+        assert_eq!(rt.state.zoomed_tile, Some(0));
+        rt.key(chord('f'));
+        rt.frame(0.2);
+        assert_eq!(rt.state.zoomed_tile, None);
+        rt.key(chord('l'));
+        rt.frame(0.3);
+        assert_eq!(
+            rt.state.tile_layout_mode(),
+            crate::config::TileLayoutMode::Scrolling
+        );
+        assert!(rt.state.draft.text.is_empty());
+        rt.state.open_terminal_tile();
+        rt.frame(0.4);
+        rt.key(chord('f'));
+        rt.frame(0.5);
+        assert_eq!(rt.state.zoomed_tile, Some(rt.state.focus));
     }
 
     #[test]
@@ -1984,6 +2265,90 @@ mod tests {
         assert!(after_reset.is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_b_leader_and_arrows_reach_a_real_raw_pty() {
+        use crate::term::{engine::Size, session::Session};
+        use rune::{Env, Key, Mods, Runtime};
+        use std::time::{Duration, Instant};
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "stty raw -echo; printf READY; dd bs=1 count=13 2>/dev/null | od -An -tx1; cat >/dev/null",
+        ]);
+        let session = Session::start_command(
+            command,
+            Size {
+                cols: 80,
+                rows: 24,
+                cell_w: 8,
+                cell_h: 16,
+            },
+            super::super::terminal_panel::colors(
+                &rune_kit::Kit::neutral(true),
+                crate::theme::color_scheme::ColorScheme::Dark,
+            ),
+            std::sync::Arc::new(|| {}),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session
+            .dump_plain_text()
+            .unwrap_or_default()
+            .contains("READY")
+        {
+            assert!(Instant::now() < deadline, "raw PTY did not become ready");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let mut s = state();
+        s.cfg.keymap.leader = "ctrl+b".into();
+        s.open_terminal();
+        s.term.session = Some(session.clone());
+        s.term.sink.focused = true;
+        s.draft.focused = false;
+        let mut rt = Runtime::new(s, super::super::view, (1440.0, 900.0), Env::new(true, 1.0));
+        rt.on_key = Some(super::super::on_key);
+        rt.frame(0.0);
+        let started = Instant::now();
+        for key in [Key::Up, Key::Down, Key::Right, Key::Left] {
+            rt.key(KeyEvent {
+                key,
+                mods: Mods::default(),
+            });
+        }
+        let leader = KeyEvent {
+            key: Key::Command('b'),
+            mods: Mods {
+                ctrl: true,
+                cmd: true,
+                ..Default::default()
+            },
+        };
+        rt.key(leader.clone());
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.is_leader_armed());
+        rt.key(leader);
+        rt.frame(2.0 / 60.0);
+        assert!(!rt.state.is_leader_armed());
+        let expected = "1b 5b 41 1b 5b 42 1b 5b 43 1b 5b 44 02";
+        while !session
+            .dump_plain_text()
+            .unwrap_or_default()
+            .contains(expected)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "raw keys were lost: {}",
+                session.dump_plain_text().unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        eprintln!(
+            "four arrows + double Leader round trip in {:?}",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn global_leader_arms_in_session_and_terminal_executes_which_key_and_double_taps() {
         use rune::{Env, Key, Mods, Runtime};
@@ -2074,7 +2439,7 @@ mod tests {
         assert_eq!(*rt.state.term.sent_log.borrow(), ["key G ctrl=true"]);
 
         // Custom leader (Ctrl+G) followed by Shift+S navigates to Settings
-        rt.key(ctrl_g);
+        rt.key(ctrl_g.clone());
         rt.key(KeyEvent {
             key: Key::Text("S".into()),
             mods: Mods {
@@ -2084,5 +2449,23 @@ mod tests {
         });
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.mode, Mode::Settings);
+
+        // 6. Two-level Which-Key: Leader → w arms Window group; w then z zooms
+        rt.state.mode = Mode::Session;
+        rt.state.open_session("s1");
+        rt.state.open_terminal_tile();
+        assert!(rt.state.in_split());
+        assert!(rt.state.zoomed_tile.is_none());
+        rt.key(ctrl_g.clone());
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.is_leader_armed());
+        rt.key(plain('w'));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.is_leader_armed());
+        assert_eq!(rt.state.leader_group, Some(LeaderGroup::Window));
+        rt.key(plain('z'));
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.is_leader_armed());
+        assert_eq!(rt.state.zoomed_tile, Some(rt.state.focus));
     }
 }

@@ -45,6 +45,9 @@ if [[ "$BUILD" == 1 ]]; then
 fi
 # cargo puts the build where CARGO_TARGET_DIR says, when it is set.
 BIN_SRC="${CARGO_TARGET_DIR:-$ROOT/target}/release/muqun-desktop"
+if [[ "$BUILD" == 0 && -x "$ROOT/bin/muqun-desktop" ]]; then
+  BIN_SRC="$ROOT/bin/muqun-desktop"
+fi
 if [[ ! -x "$BIN_SRC" ]]; then
   echo "missing release binary: $BIN_SRC (run without --no-build)" >&2
   exit 1
@@ -65,10 +68,20 @@ for dir in "$PACKAGING"/icons/hicolor/*/apps; do
   install -m 644 "$dir/$APP_ID.png" "$ICONS_DIR/$size/apps/$APP_ID.png"
 done
 
+# Package files never overwrite the separate user plugins/ directory.
+PLUGIN_DIR="$PREFIX/share/$APP_ID/bundled-plugins/review-center"
+mkdir -p "$PLUGIN_DIR"
+install -m 644 "$ROOT/desktop/assets/plugins/review-center/plugin.json" "$PLUGIN_DIR/plugin.json"
+install -m 644 "$ROOT/desktop/assets/plugins/review-center/review.ts" "$PLUGIN_DIR/review.ts"
+install -m 644 "$ROOT/desktop/assets/plugins/review-center/README.md" "$PLUGIN_DIR/README.md"
+
 # The launcher runs the installed binary by its full path, so it works even
 # when $PREFIX/bin is not on the session's PATH.
-sed -e "s|^Exec=muqun-desktop|Exec=$BIN_DIR/$APP_ID|" \
-  -e "s|^TryExec=muqun-desktop|TryExec=$BIN_DIR/$APP_ID|" \
+exec_path="$(printf '%s' "$BIN_DIR/$APP_ID" | sed 's/[\\"`$]/\\\\&/g')"
+exec_replacement="$(printf '"%s"' "$exec_path" | sed 's/[\\&|]/\\&/g')"
+try_replacement="$(printf '%s' "$BIN_DIR/$APP_ID" | sed 's/[\\&|]/\\&/g')"
+sed -e "s|^Exec=muqun-desktop|Exec=$exec_replacement|" \
+  -e "s|^TryExec=muqun-desktop|TryExec=$try_replacement|" \
   "$PACKAGING/$APP_ID.desktop" >"$APPS_DIR/$APP_ID.desktop"
 chmod 644 "$APPS_DIR/$APP_ID.desktop"
 

@@ -239,6 +239,7 @@ pub fn spawn(
     tokio::spawn(super::notify::watch(core.hub.clone(), core.inbox.clone()));
     if let Some(mut link) = core.hub.link() {
         let inbox = core.inbox.clone();
+        inbox.push(Update::HubLink(link.borrow_and_update().clone()));
         tokio::spawn(async move {
             while link.changed().await.is_ok() {
                 let down = link.borrow_and_update().clone();

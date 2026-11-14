@@ -278,6 +278,57 @@ impl Look {
         }
     }
 
+    /// Lit glass chrome shared by workspace windows and the input deck.
+    pub fn luminous(&self, k: &Kit, e: El, active: bool) -> El {
+        let accent = k.c.bg_accent;
+        let e = e
+            .border_gradient(
+                1.0,
+                if active {
+                    accent.alpha(0.95)
+                } else {
+                    k.c.border_base
+                },
+                if active {
+                    k.c.info.icon.alpha(0.45)
+                } else {
+                    k.c.border_muted
+                },
+            )
+            .box_shadow(Shadow {
+                x: 0.0,
+                y: 14.0,
+                blur: 40.0,
+                spread: -6.0,
+                color: k.c.black.alpha(if self.dark { 0.5 } else { 0.12 }),
+                inset: false,
+            });
+        self.glow(e, accent, if active { 0.8 } else { 0.0 })
+    }
+
+    /// A two-tone edge light; only a busy surface breathes.
+    pub fn energy_line(&self, k: &Kit, key: &str, busy: bool) -> El {
+        let line = el()
+            .key(key.to_string())
+            .h(2.0)
+            .linear_gradient(
+                std::f32::consts::FRAC_PI_2,
+                [
+                    (0.0, k.c.bg_accent.alpha(0.0)),
+                    (0.2, k.c.bg_accent),
+                    (0.65, k.c.info.icon),
+                    (1.0, k.c.info.icon.alpha(0.0)),
+                ],
+            )
+            .a11y_hidden();
+        let line = self.spark(line, k.c.bg_accent);
+        if busy && self.motion {
+            self.pulse(line)
+        } else {
+            line
+        }
+    }
+
     /// A small lit mark (a status dot): a tight glow sized for it.
     pub fn spark(&self, e: El, color: rune::Color) -> El {
         e.box_shadow(Shadow {

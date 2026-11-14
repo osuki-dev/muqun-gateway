@@ -28,8 +28,8 @@ const CHIP_THUMB_H: f32 = 40.0;
 /// list scrolls, as `/` and `$` (uncapped, as the App) do.
 const MAX_FILE_ROWS: usize = 20;
 
-pub(crate) fn fresh(text: String) -> TextEdit {
-    let mut edit = TextEdit::new(text);
+pub(crate) fn fresh(text: impl Into<String>) -> TextEdit {
+    let mut edit = TextEdit::new(text).rich();
     edit.focused = true;
     edit
 }
@@ -234,9 +234,7 @@ pub(super) fn note_skill_args(s: &mut UiState, deliver: &Deliver) {
 
 /// Send the draft. While the agent works it steers the running turn, as on
 /// the App; [`queue_session`] (Alt+Enter) waits for the turn to end instead.
-/// The composer card surface: a floating theme-aware panel with a signature
-/// accent rim, elevation shadows, backdrop blur when glass is enabled, and
-/// an illuminated accent glow while focused or while the agent is running.
+/// A quiet composer surface with a visible focus border and shallow elevation.
 pub fn composer_card(
     k: &Kit,
     look: &crate::theme::look::Look,
@@ -245,105 +243,36 @@ pub fn composer_card(
     busy: bool,
     drop_hover: bool,
 ) -> El {
-    let radius = crate::theme::look::PANEL_RADIUS + 2.0;
+    let active = focused || busy || drop_hover;
     let accent = k.c.bg_accent;
-    let dark = look.dark;
-
-    let mut e = card.radius(radius).clip_rounded(radius);
-
-    if look.glass && look.blur {
-        e = e.backdrop_blur(18.0);
-    }
-
-    // Surface fill: follows theme surfaces, stepped toward accent on focus / busy / drop_hover
-    let fill = if drop_hover {
-        look.panel_fill(k)
-            .mix(accent, if dark { 0.16 } else { 0.10 })
-    } else if focused {
-        look.emphasis(look.panel_fill(k), accent)
-    } else if busy {
-        look.emphasis(look.panel_fill(k), accent.alpha(0.4))
-    } else {
-        look.panel_fill(k)
-    };
-    e = e.fill(fill);
-
-    // Border: top edge catching theme accent light
-    if drop_hover {
-        e = e.border(2.0, accent);
-    } else if focused {
-        let top = accent.alpha(if dark { 0.85 } else { 0.75 });
-        let bottom = accent.alpha(if dark { 0.30 } else { 0.20 });
-        e = e.border_gradient(1.2, top, bottom);
-    } else if busy {
-        let top = accent.alpha(if dark { 0.65 } else { 0.55 });
-        let bottom = accent.alpha(if dark { 0.22 } else { 0.15 });
-        e = e.border_gradient(1.2, top, bottom);
-    } else if look.glass {
-        let top = accent
-            .mix(if dark { k.c.white } else { k.c.black }, 0.2)
-            .alpha(if dark { 0.40 } else { 0.26 });
-        let bottom = if dark {
-            k.c.white.alpha(0.04)
-        } else {
-            k.c.black.alpha(0.08)
-        };
-        e = e.border_gradient(1.0, top, bottom);
-    } else {
-        e = e.border(1.0, k.c.border_base);
-    }
-
-    // Elevation shadows & ambient theme glow
-    let shadow_alpha = if dark { 0.38 } else { 0.10 };
-    let mid_alpha = if dark { 0.20 } else { 0.05 };
-    e = e
-        .box_shadow(rune::Shadow {
-            x: 0.0,
-            y: 8.0,
-            blur: 24.0,
-            spread: 0.0,
-            color: k.c.black.alpha(shadow_alpha),
-            inset: false,
-        })
-        .box_shadow(rune::Shadow {
-            x: 0.0,
-            y: 2.0,
-            blur: 8.0,
-            spread: 0.0,
-            color: k.c.black.alpha(mid_alpha),
-            inset: false,
-        });
-
-    if drop_hover {
-        e = e.box_shadow(rune::Shadow {
-            x: 0.0,
-            y: 0.0,
-            blur: 28.0,
-            spread: 2.0,
-            color: accent.alpha(if dark { 0.45 } else { 0.30 }),
-            inset: false,
-        });
-    } else if focused {
-        e = e.box_shadow(rune::Shadow {
-            x: 0.0,
-            y: 0.0,
-            blur: 22.0,
-            spread: 1.0,
-            color: accent.alpha(if dark { 0.32 } else { 0.20 }),
-            inset: false,
-        });
-    } else if busy {
-        e = e.box_shadow(rune::Shadow {
-            x: 0.0,
-            y: 0.0,
-            blur: 16.0,
-            spread: 0.5,
-            color: accent.alpha(if dark { 0.26 } else { 0.16 }),
-            inset: false,
-        });
-    }
-
-    e.motion(k.motion.control)
+    let radius = k.radius.lg;
+    let card = card
+        .radius(radius)
+        .clip_rounded(radius)
+        .fill(k.c.surface_raised_base)
+        .linear_gradient(
+            0.35,
+            [
+                (
+                    0.0,
+                    k.c.surface_raised_base
+                        .mix(accent, if look.dark { 0.15 } else { 0.05 }),
+                ),
+                (0.55, k.c.surface_raised_base),
+                (
+                    1.0,
+                    k.c.surface_raised_base
+                        .mix(k.c.info.icon, if look.dark { 0.09 } else { 0.03 }),
+                ),
+            ],
+        )
+        .child(
+            look.energy_line(k, "composer-energy", busy)
+                .pin(Some(14.0), Some(0.0), Some(14.0), None)
+                .opacity(if active { 1.0 } else { 0.35 }),
+        )
+        .motion(look.focus_fade());
+    look.luminous(k, card, active)
 }
 
 /// A composer card (a [`Look::panel`](crate::theme::look::Look::panel))
@@ -355,12 +284,19 @@ pub fn focus_tone(k: &Kit, look: &crate::theme::look::Look, card: El, focused: b
 
 /// The kit a composer's text field is built with: the field draws no box of
 /// its own (fill, shadow, focus ring), so the composer card around it is the
-/// one surface and the one focus mark.
+/// one surface and the one focus mark. Selection contrast is boosted so
+/// double-click and drag selections stand out clearly against the card fill.
 pub fn bare_field(k: &Kit) -> Kit {
     let mut bare = k.clone();
+    bare.blend_over = None;
     bare.c.bg_base = k.c.bg_base.alpha(0.0);
     bare.c.hover = k.c.hover.alpha(0.0);
     bare.c.border_focus = k.c.border_focus.alpha(0.0);
+    bare.c.text_accent = if k.dark {
+        k.c.bg_accent.mix(k.c.white, 0.25)
+    } else {
+        k.c.bg_accent.mix(k.c.text_accent, 0.5)
+    };
     bare.elevation.button_neutral = Vec::new();
     bare
 }
@@ -401,8 +337,7 @@ fn send_session(s: &mut UiState, queue: bool) {
     if let (Deliver::Prompt(words), false) = (&deliver, queue && busy) {
         let staged = std::mem::take(&mut s.staged);
         s.echo_sent(&asid, token, words.clone(), &staged, busy);
-        s.draft = TextEdit::new("");
-        s.draft.focused = true;
+        s.draft = fresh("");
         s.persist_draft(Slot::Session);
     }
     s.send(Command::Compose(ComposeCommand::Submit {
@@ -814,31 +749,51 @@ fn queued_chip(
                 .on_select(move |s: &mut UiState| cancel_queued(s, &cancel_id)),
         )
         .build(k, layer);
+    let mut chip_row = row()
+        .key(format!("queued-row-{id}"))
+        .gap(4.0)
+        .center_y()
+        .px(4.0)
+        .py(2.0)
+        .radius(k.radius.md)
+        .fill(k.c.bg_base.alpha(0.65))
+        .border(1.0, k.c.border_weak);
     let thumbs: Vec<&str> = item
         .files
         .iter()
         .filter(|f| f.image)
         .map(|f| f.path.as_str())
         .collect();
-    match queue_thumbs(s, k, &format!("q-{id}"), &thumbs) {
-        Some(thumbs) => row()
-            .key(format!("queued-row-{id}"))
-            .gap(6.0)
-            .center_y()
-            .px(4.0)
-            .py(2.0)
-            .radius(k.radius.md)
-            .fill(k.c.bg_base)
-            .border(1.0, k.c.border_weak)
-            .child(thumbs)
-            .child(pill),
-        None => pill,
+    if let Some(thumbs) = queue_thumbs(s, k, &format!("q-{id}"), &thumbs) {
+        chip_row = chip_row.child(thumbs);
     }
+    chip_row = chip_row.child(pill);
+    if item.files.is_empty() {
+        let (edit_id, text) = (id.clone(), item.text.clone());
+        chip_row = chip_row.child(
+            Button::new(tr_ref(language, "Edit"))
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut UiState| edit_queued(s, &edit_id, text.clone()))
+                .build(k)
+                .key(format!("queued-edit-{id}")),
+        );
+    }
+    let cancel_inline_id = id.clone();
+    chip_row.child(
+        rune_kit::IconButton::new(k.glyph.close)
+            .variant(rune_kit::IconButtonVariant::GhostMuted)
+            .control_size(ControlSize::Small)
+            .label(tr_ref(language, "Cancel"))
+            .on_press(move |s: &mut UiState| cancel_queued(s, &cancel_inline_id))
+            .build(k)
+            .key(format!("queued-cancel-{id}")),
+    )
 }
 
 pub(super) fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
     // A steer the timeline already shows as its echo is not listed twice.
-    let queue: Vec<_> = s.queue.iter().filter(|q| !s.echoed(&q.id)).collect();
+    let queue: Vec<_> = s.queue.iter().filter(|q| !s.item_echoed(q)).collect();
     if s.staged.is_empty() && queue.is_empty() {
         return None;
     }
@@ -1992,8 +1947,11 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     );
     let tools_w = 4.0 * 24.0 + 4.0 * ACTION_GAP;
     let controls = controls_row::Controls::read(s);
+    // Keep a readable model/mode row in narrow panes instead of compressing
+    // it into a run of indistinguishable icons beside microphone and send.
     let beside = controls
         .as_ref()
+        .filter(|_| inner - buttons >= 220.0)
         .and_then(|c| controls_row::beside(s, c, k, layer, inner - buttons));
     let mut own_line = None;
     if beside.is_none() {
@@ -2044,7 +2002,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let send = Button::new(send_label)
         .variant(ButtonVariant::Submit)
         .control_size(ControlSize::Regular)
-        .disabled(!has_session || s.pending_submit.is_some())
+        .disabled(!has_session || !has_text || s.pending_submit.is_some())
         .shortcut("Primary+Enter")
         .help(if busy {
             format!(
@@ -2059,11 +2017,10 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .on_press(submit_session)
         .build(k)
         .key("send");
-    // The send button lights up once there is something to send.
     actions = actions.child(look.glow(
         send,
         k.c.bg_accent,
-        if has_text && has_session { 0.6 } else { 0.0 },
+        if has_text && has_session { 0.9 } else { 0.0 },
     ));
 
     popup(s, k, layer, Slot::Session);
@@ -2073,48 +2030,44 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .w_full()
         .gap(8.0)
         .px(12.0)
-        .pt(6.0)
+        .pt(8.0)
         .pb(10.0);
 
     let resizer = row()
         .key("composer-resizer")
         .w_full()
-        .h(6.0)
+        .h(4.0)
         .center()
-        .cursor(Cursor::ResizeRow)
-        .role("separator")
-        .label(tr_ref(language, "Resize composer"))
-        .on_double_press(|s: &mut UiState| {
-            s.composer_rows = None;
-            s.composer_expanded = false;
-        })
-        .on_drag(
-            |s: &mut UiState, d: &mut rune::Drag, _: &mut Tx| match d.phase {
-                Phase::Down => {
-                    let cur = s
-                        .composer_rows
-                        .unwrap_or(if s.composer_expanded { 12 } else { 3 });
-                    d.data = cur as f32;
-                }
-                Phase::Move => {
-                    let delta = (-d.dy / 18.0).round() as i32;
-                    let target = (d.data as i32 + delta).clamp(2, 24) as usize;
-                    s.composer_rows = Some(target);
-                }
-                _ => {}
-            },
-        )
         .child(
             el().key("composer-resizer-pill")
-                .w(32.0)
-                .h(3.0)
-                .radius(1.5)
+                .w(36.0)
+                .h(4.0)
+                .radius(2.0)
+                .cursor(Cursor::ResizeRow)
+                .role("separator")
+                .label(tr_ref(language, "Resize composer"))
                 .fill(if s.composer_rows.is_some() {
                     k.c.bg_accent.alpha(0.7)
                 } else {
-                    k.c.border_muted
+                    k.c.border_muted.alpha(0.5)
                 })
-                .hover(k.c.bg_accent),
+                .hover(k.c.bg_accent)
+                .on_drag(
+                    |s: &mut UiState, d: &mut rune::Drag, _: &mut Tx| match d.phase {
+                        Phase::Down => {
+                            let cur =
+                                s.composer_rows
+                                    .unwrap_or(if s.composer_expanded { 12 } else { 3 });
+                            d.data = cur as f32;
+                        }
+                        Phase::Move => {
+                            let delta = (-d.dy / 18.0).round() as i32;
+                            let target = (d.data as i32 + delta).clamp(2, 24) as usize;
+                            s.composer_rows = Some(target);
+                        }
+                        _ => {}
+                    },
+                ),
         );
     card = card.child(resizer);
     if let Some(chips) = chips(s, k, layer) {
@@ -2226,13 +2179,19 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             .key("draft")
             .w_full(),
     );
+    card = card.child(
+        el().key("composer-controls-rule")
+            .w_full()
+            .h(1.0)
+            .fill(k.c.border_muted)
+            .a11y_hidden(),
+    );
     if let Some(line) = own_line {
         card = card.child(line);
     }
     card = card.child(actions);
 
-    // The floating card: theme-accent border rim, elevation shadows,
-    // and illuminated accent glow while focused, busy, or drop hovering.
+    // Keep focus visible without competing with the message content.
     let card = composer_card(k, &look, card, focused, busy, s.drop_hover)
         .on_drop_files(|s: &mut UiState, files, _| attach_dropped_files(s, files))
         .on_drop_hover(|s: &mut UiState, over, _| s.drop_hover = over);
@@ -2365,5 +2324,97 @@ mod tests {
         // Test view generation
         let look = s.look();
         let _card = composer_card(&k, &look, col(), false, false, false);
+    }
+
+    #[test]
+    fn composer_double_click_word_and_triple_click_line_selection() {
+        use rune::{Env, Runtime};
+
+        let (tx, _rx) = crate::ui::commands::channel();
+        let mut s = UiState::new(tx);
+        s.splash = None;
+        let (_, scene) = crate::ui::scenes::scenes()
+            .iter()
+            .find(|(name, _)| *name == "session")
+            .expect("session scene");
+        scene(&mut s);
+        s.draft = fresh("refactor dwindle layout\nand update tests");
+
+        let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+        rt.on_key = Some(crate::ui::on_key);
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+
+        let draft = rt
+            .elements()
+            .into_iter()
+            .find(|n| n.key.as_deref() == Some("draft"))
+            .expect("draft node");
+        // Click inside the first word ("refactor")
+        let (x, y) = (draft.rect[0] + 18.0, draft.rect[1] + 16.0);
+
+        // Single click places caret
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.draft.focused);
+        assert_eq!(rt.state.draft.anchor, rt.state.draft.focus);
+
+        // Second click within double-click interval selects the word "refactor"
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.draft.selected(), "refactor");
+
+        // Third click within interval selects the whole first line
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        let line = rt.state.draft.selected();
+        assert!(
+            line.starts_with("refactor dwindle layout"),
+            "triple-click should select the line, got {line:?}"
+        );
+
+        // bare_field clears blend_over so selection keeps full linear alpha
+        let mut k = Kit::neutral(true);
+        k.blend_over = Some(rune::Color {
+            r: 0.05,
+            g: 0.08,
+            b: 0.07,
+            a: 1.0,
+        });
+        let bare = bare_field(&k);
+        assert!(bare.blend_over.is_none());
+        assert!(bare.selection().a >= 0.29);
+    }
+
+    #[test]
+    fn steered_prompt_chip_is_deduplicated_when_echo_is_active() {
+        use crate::model::compose::InboxItem;
+        let (tx, _rx) = crate::ui::commands::channel();
+        let mut s = UiState::new(tx);
+        s.selected = Some("s1".into());
+        s.echo_sent("s1", 10, "steer the agent now".into(), &[], true);
+        s.queue.push(InboxItem {
+            id: "inbox-steer-1".into(),
+            text: "steer the agent now".into(),
+            steer: true,
+            files: vec![],
+        });
+
+        let k = Kit::neutral(s.dark);
+        let mut layer = Vec::new();
+        // Should return None because the steered item is already shown as an Echo!
+        assert!(chips(&s, &k, &mut layer).is_none());
+
+        // Adding a non-steered queued item renders a chip with inline Edit and Cancel buttons
+        s.queue.push(InboxItem {
+            id: "inbox-queue-2".into(),
+            text: "follow up later".into(),
+            steer: false,
+            files: vec![],
+        });
+        assert!(chips(&s, &k, &mut layer).is_some());
     }
 }

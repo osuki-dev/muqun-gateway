@@ -283,7 +283,7 @@ fn start_core(
         .name("muqun-core-main".into())
         .spawn(move || {
             runtime.block_on(async move {
-                let hub = select_hub(settings, &state_dir).await;
+                let hub = select_hub(settings, &state_dir, &store.get()).await;
                 let dynamic_hub = hub::DynamicHub::new(hub);
                 projection::spawn(dynamic_hub, inbox, store, commands);
                 std::future::pending::<()>().await;
@@ -295,7 +295,13 @@ fn start_core(
 async fn select_hub(
     settings: RuntimeSettings,
     state_dir: &std::path::Path,
+    config: &DesktopConfig,
 ) -> Arc<dyn hub::SessionHub> {
+    // The sidebar restores this computer too. Restore its actual connection
+    // before issuing any reads or prompts, including when it is offline.
+    if let Some(remote) = configured_remote_hub(config) {
+        return remote;
+    }
     if let Some(gateway) = hub::discover_local_gateway().await {
         match hub::RemoteHub::start(gateway.clone()) {
             Ok(remote) => {
@@ -312,4 +318,30 @@ async fn select_hub(
     }
     agents.spawn_supervisor();
     Arc::new(hub::LocalHub::new(agents))
+}
+
+fn configured_remote_hub(config: &DesktopConfig) -> Option<Arc<dyn hub::SessionHub>> {
+    if matches!(
+        config.current_computer.as_str(),
+        "" | "local" | "self" | "all"
+    ) {
+        return None;
+    }
+    let profile = config.computers.get(&config.current_computer)?;
+    let remote = hub::RemoteHub::start(hub::LocalGateway {
+        url: profile.url.clone()?,
+        token: profile.token.clone()?,
+        device_id: profile.device_id.clone(),
+        transport_key: profile.transport_key.clone(),
+    });
+    match remote {
+        Ok(remote) => {
+            tracing::info!(computer = %config.current_computer, "hub: restored remote computer");
+            Some(remote)
+        }
+        Err(err) => {
+            tracing::warn!(%err, "saved computer connection is invalid");
+            None
+        }
+    }
 }

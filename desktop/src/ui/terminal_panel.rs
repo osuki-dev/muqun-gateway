@@ -134,9 +134,6 @@ pub struct TermHoverLink {
     pub col_end: u16,
 }
 
-/// How long the Herdr `Ctrl+Space` prefix remains armed waiting for the next key.
-pub const PREFIX_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
-
 /// What the panel keeps between frames.
 pub struct TermPanel {
     pub open: bool,
@@ -218,10 +215,10 @@ impl TermPanel {
         }
     }
 
-    /// Whether the Herdr `Ctrl+Space` prefix is currently armed and within timeout.
+    /// Whether the Herdr / Leader prefix is currently armed.
+    /// Matches global Which-Key: stays until Esc or a completed chord.
     pub fn is_prefix_armed(&self) -> bool {
-        self.prefix_armed
-            .is_some_and(|at| at.elapsed() < PREFIX_TIMEOUT)
+        self.prefix_armed.is_some()
     }
 
     /// Whether the panel is in the window (open, or sliding shut over a
@@ -1267,15 +1264,8 @@ impl UiState {
     pub fn poll_terminal(&mut self, now: f64, tx: &mut Tx) -> bool {
         self.term.now = now;
         let mut changed = false;
-        if let Some(armed_at) = self.leader_armed.or(self.term.prefix_armed) {
-            let elapsed = armed_at.elapsed();
-            if elapsed >= PREFIX_TIMEOUT {
-                self.disarm_leader();
-                changed = true;
-            } else {
-                tx.wake_after(PREFIX_TIMEOUT.saturating_sub(elapsed));
-            }
-        }
+        // Global Leader / Which-Key stays open until Esc or a chord; it does
+        // not share the short Herdr prefix timeout.
         let dragging = self.term.pane.is_resizing() || self.tile_drag.is_some();
         if let Some(size) = self.term.resize.due(now, dragging) {
             if self.term.size != Some(size) {
@@ -1446,6 +1436,24 @@ impl UiState {
             }
             self.focus_terminal_tx(tx);
             return true;
+        }
+
+        // Workspace chords with Alt belong to the application even when a shell
+        // has focus. Plain Ctrl+J and other shell editing keys stay in the PTY.
+        if self.in_split() && ev.mods.alt {
+            use super::keymap::{bind_matches_cfg, entry, run, Action};
+            for action in [
+                Action::CycleTileLayout,
+                Action::ToggleTileZoom,
+                Action::ToggleTilePop,
+                Action::EqualizeTiles,
+                Action::SplitHorizontal,
+                Action::SplitVertical,
+            ] {
+                if bind_matches_cfg(entry(action), &self.cfg.keymap, ev, tx) {
+                    return run(self, action, ev, tx);
+                }
+            }
         }
 
         // 3. Split view pane navigation (`Ctrl+Alt+Arrows`, `Ctrl+Alt+Shift+Arrows`, `Mod+1..4`):
@@ -1837,6 +1845,87 @@ impl UiState {
 }
 
 /// The panel.
+fn shell_tab(k: &Kit, key: String, title: String, active: bool, number: usize) -> El {
+    let caption = if title.starts_with('/') || title.starts_with("~/") {
+        std::path::Path::new(&title)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .unwrap_or(&title)
+            .to_string()
+    } else {
+        title.clone()
+    };
+    let track = format!(
+        "{}-active-light",
+        key.rsplit_once('-').map_or(key.as_str(), |(p, _)| p)
+    );
+    let ink = if active {
+        k.c.text_base
+    } else {
+        k.c.text_muted
+    };
+    k.interactive(
+        row()
+            .key(key)
+            .h(32.0)
+            .min_w(76.0)
+            .max_w(190.0)
+            .shrink()
+            .pl(10.0)
+            .pr(4.0)
+            .gap(8.0)
+            .center_y()
+            .radius(k.radius.sm)
+            .fill(if active {
+                k.c.surface_raised.mix(k.c.bg_accent, 0.14)
+            } else {
+                k.c.bg_base.alpha(0.0)
+            })
+            .motion(crate::theme::look::MOVE)
+            .role("tab")
+            .label(title.clone())
+            .help(title.clone())
+            .cursor(rune::Cursor::Pointer)
+            .preserve_focus_on_press(true)
+            .child(
+                text(format!("{:02}", number + 1))
+                    .font(k.ty.small)
+                    .color(if active {
+                        k.c.text_accent
+                    } else {
+                        k.c.text_faint
+                    }),
+            )
+            .child(
+                text(caption)
+                    .font(k.ty.small_medium)
+                    .color(ink)
+                    .truncate()
+                    .shrink()
+                    .min_w(0.0),
+            )
+            .children(active.then(|| {
+                el().key("tab-indicator")
+                    .matched(track)
+                    .pin(Some(10.0), None, Some(10.0), Some(0.0))
+                    .h(3.0)
+                    .radius(1.5)
+                    .box_shadow(rune::Shadow {
+                        x: 0.0,
+                        y: 0.0,
+                        blur: 12.0,
+                        spread: 1.0,
+                        color: k.c.bg_accent.alpha(0.6),
+                        inset: false,
+                    })
+                    .fill(k.c.bg_accent)
+                    .opacity(if active { 1.0 } else { 0.0 })
+                    .a11y_hidden()
+            })),
+    )
+}
+
 pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut Vec<El>) -> El {
     let language = s.cfg.general.language;
     let colors = colors(k, scheme);
@@ -1885,20 +1974,6 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
             format!("Tab {}", i + 1)
         };
 
-        let (bg_color, fg_color, border_color) = if is_active {
-            (
-                k.c.surface_raised,
-                k.c.text_base,
-                k.alpha(k.c.border_weak, 0.45),
-            )
-        } else {
-            (
-                k.c.bg_base.alpha(0.0),
-                k.c.text_muted,
-                k.c.border_base.alpha(0.0),
-            )
-        };
-
         let close_tab = if tab_count > 1 {
             Some(
                 IconButton::new(k.glyph.close)
@@ -1918,43 +1993,11 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
             None
         };
 
-        let mut tab_pill = row()
-            .key(format!("terminal-tab-{i}"))
-            .h(28.0)
-            .pl(10.0)
-            .pr(if close_tab.is_some() { 4.0 } else { 10.0 })
-            .gap(6.0)
-            .center_y()
-            .fill(bg_color)
-            .border(1.0, border_color)
-            .clip_rounded(6.0)
-            .cursor(rune::Cursor::Pointer)
-            .preserve_focus_on_press(true)
+        let mut tab_pill = shell_tab(k, format!("terminal-tab-{i}"), tab_title, is_active, i)
             .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
                 s.term_switch_tab(i);
                 s.focus_terminal_tx(tx);
-            })
-            .child(
-                rune::icon(&TERMINAL_WINDOW, 12.0)
-                    .color(if is_active {
-                        k.c.text_accent
-                    } else {
-                        k.c.icon_muted
-                    })
-                    .a11y_hidden(),
-            )
-            .child(
-                text(tab_title)
-                    .font(if is_active {
-                        k.ty.small_medium
-                    } else {
-                        k.ty.small
-                    })
-                    .color(fg_color)
-                    .truncate()
-                    .shrink()
-                    .max_w(140.0),
-            );
+            });
 
         if let Some(btn) = close_tab {
             tab_pill = tab_pill.child(btn);
@@ -1973,7 +2016,6 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         })
         .build(k)
         .key("terminal-new-tab");
-    tabs_strip = tabs_strip.child(add_tab_btn);
 
     let sync_cwd_btn = IconButton::new(&rune_kit::glyphs::FOLDER)
         .variant(IconButtonVariant::GhostMuted)
@@ -1985,7 +2027,6 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         })
         .build(k)
         .key("terminal-sync-cwd");
-    tabs_strip = tabs_strip.child(sync_cwd_btn);
 
     let mut header = row()
         .key("terminal-head")
@@ -1997,7 +2038,17 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
         .center_y()
         .fill(k.alpha(k.c.layer_01, 0.65))
         .preserve_focus_on_press(true)
-        .child(tabs_strip);
+        .child(
+            el().key("shell-tabs-viewport")
+                .scroll_x()
+                .h(34.0)
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .child(tabs_strip),
+        )
+        .child(add_tab_btn)
+        .child(sync_cwd_btn);
     if s.term.is_prefix_armed() {
         header = header.child(prefix_badge(k, ""));
     }
@@ -2214,20 +2265,6 @@ pub fn tile_body_for(
             format!("Tab {}", i + 1)
         };
 
-        let (bg_color, fg_color, border_color) = if is_active {
-            (
-                k.c.surface_raised,
-                k.c.text_base,
-                k.alpha(k.c.border_weak, 0.45),
-            )
-        } else {
-            (
-                k.c.bg_base.alpha(0.0),
-                k.c.text_muted,
-                k.c.border_base.alpha(0.0),
-            )
-        };
-
         let close_tab = if tab_count > 1 {
             Some(
                 IconButton::new(k.glyph.close)
@@ -2248,43 +2285,17 @@ pub fn tile_body_for(
             None
         };
 
-        let mut tab_pill = row()
-            .key(format!("tile-terminal-tab{sfx}-{i}"))
-            .h(26.0)
-            .pl(8.0)
-            .pr(if close_tab.is_some() { 4.0 } else { 8.0 })
-            .gap(5.0)
-            .center_y()
-            .fill(bg_color)
-            .border(1.0, border_color)
-            .clip_rounded(6.0)
-            .cursor(rune::Cursor::Pointer)
-            .preserve_focus_on_press(true)
-            .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
-                s.term_switch_tab_for_tile(tile_idx, i);
-                s.focus_terminal_tile_tx(tile_idx, tx);
-            })
-            .child(
-                rune::icon(&TERMINAL_WINDOW, 11.0)
-                    .color(if is_active {
-                        k.c.text_accent
-                    } else {
-                        k.c.icon_muted
-                    })
-                    .a11y_hidden(),
-            )
-            .child(
-                text(tab_title)
-                    .font(if is_active {
-                        k.ty.small_medium
-                    } else {
-                        k.ty.small
-                    })
-                    .color(fg_color)
-                    .truncate()
-                    .shrink()
-                    .max_w(130.0),
-            );
+        let mut tab_pill = shell_tab(
+            k,
+            format!("tile-terminal-tab{sfx}-{i}"),
+            tab_title,
+            is_active,
+            i,
+        )
+        .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
+            s.term_switch_tab_for_tile(tile_idx, i);
+            s.focus_terminal_tile_tx(tile_idx, tx);
+        });
 
         if let Some(btn) = close_tab {
             tab_pill = tab_pill.child(btn);
@@ -2304,7 +2315,6 @@ pub fn tile_body_for(
         })
         .build(k)
         .key(format!("tile-terminal-new-tab{sfx}"));
-    tabs_strip = tabs_strip.child(add_tab_btn);
 
     let sync_cwd_btn = IconButton::new(&rune_kit::glyphs::FOLDER)
         .variant(IconButtonVariant::GhostMuted)
@@ -2317,19 +2327,28 @@ pub fn tile_body_for(
         })
         .build(k)
         .key(format!("tile-terminal-sync-cwd{sfx}"));
-    tabs_strip = tabs_strip.child(sync_cwd_btn);
 
     let mut subheader = row()
         .key(format!("tile-terminal-subhead{sfx}"))
         .w_full()
-        .h(30.0)
+        .h(40.0)
         .pl(8.0)
         .pr(8.0)
         .gap(6.0)
         .center_y()
         .fill(k.alpha(k.c.layer_01, 0.45))
         .preserve_focus_on_press(true)
-        .child(tabs_strip);
+        .child(
+            el().key("shell-tabs-viewport")
+                .scroll_x()
+                .h(34.0)
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .child(tabs_strip),
+        )
+        .child(add_tab_btn)
+        .child(sync_cwd_btn);
     if live && s.term.is_prefix_armed() {
         subheader = subheader.child(prefix_badge(k, &sfx));
     }

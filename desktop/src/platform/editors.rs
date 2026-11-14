@@ -331,7 +331,7 @@ pub fn resolve_terminal_editor(
     if let Some(cmd) = custom_command.filter(|c| !c.trim().is_empty()) {
         let first = cmd.split_whitespace().next().unwrap_or("");
         if is_terminal_editor(first) {
-            return Some(first.to_string());
+            return Some(cmd.to_string());
         }
         return None;
     }

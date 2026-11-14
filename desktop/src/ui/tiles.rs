@@ -26,6 +26,18 @@ use crate::config::TileNode;
 use crate::model::commands::Command;
 use crate::theme::look::Look;
 
+/// Active header drag while reordering, edge-splitting, or moving a floating tile.
+#[derive(Debug, Clone)]
+pub struct TileCardDrag {
+    pub src: usize,
+    /// Pointer in the tiles stage, when known.
+    pub pointer: [f32; 2],
+    pub over: Option<usize>,
+    pub zone: Option<dwindle::DropZone>,
+    /// Floating/popped card geometry at drag start, if moving that card.
+    pub start_rect: Option<[f32; 4]>,
+}
+
 /// The see-through gap between two panes: the frame around the window's
 /// panels.
 const GAP: f32 = super::panes::FRAME;
@@ -43,7 +55,7 @@ pub fn arrow_key(s: &mut UiState, ev: &KeyEvent) -> bool {
     if !s.in_split() || !ev.mods.primary() || !ev.mods.alt {
         return false;
     }
-    let toward = super::dwindle::neighbour(&s.tile_layout(), s.tile_grid, s.focus, &ev.key);
+    let toward = neighbour(s, &ev.key);
     match toward {
         // The terminal lends its Ctrl chords with Shift added (Windows and
         // Linux), so from there the arrows only ever move focus.
@@ -60,6 +72,138 @@ pub fn arrow_key(s: &mut UiState, ev: &KeyEvent) -> bool {
         None => matches!(ev.key, Key::Left | Key::Right | Key::Up | Key::Down),
     }
 }
+/// One geometry source for rendering, directional focus and drag targets.
+fn scrolling_rects(s: &UiState) -> Vec<(usize, dwindle::Rect)> {
+    let visible: Vec<_> = (0..s.tiles.len()).filter(|&i| !s.tiles[i].popped).collect();
+    let w = s.tile_grid[0].max(1.0);
+    let h = s.tile_grid[1].max(1.0);
+    let width = if visible.len() <= 1 {
+        w
+    } else {
+        (w * 0.62).max(360.0).min(w)
+    };
+    let focus = visible.iter().position(|&i| i == s.focus).unwrap_or(0) as f32;
+    let total = visible.len() as f32 * (width + GAP) - GAP;
+    let offset = (focus * (width + GAP) - (w - width) * 0.5).clamp(0.0, (total - w).max(0.0));
+    visible
+        .into_iter()
+        .enumerate()
+        .map(|(n, i)| (i, [n as f32 * (width + GAP) - offset, 0.0, width, h]))
+        .collect()
+}
+
+fn visible(node: &TileNode, s: &UiState) -> bool {
+    match node {
+        TileNode::Leaf(i) => s.tiles.get(*i).is_some_and(|tile| !tile.popped),
+        TileNode::Split { a, b, .. } => visible(a, s) || visible(b, s),
+    }
+}
+
+fn background_rects(
+    node: &TileNode,
+    s: &UiState,
+    rect: dwindle::Rect,
+    out: &mut Vec<(usize, dwindle::Rect)>,
+) {
+    match node {
+        TileNode::Leaf(i) => {
+            if visible(node, s) {
+                out.push((*i, rect));
+            }
+        }
+        TileNode::Split {
+            across,
+            ratio,
+            a,
+            b,
+        } => match (visible(a, s), visible(b, s)) {
+            (true, false) => background_rects(a, s, rect, out),
+            (false, true) => background_rects(b, s, rect, out),
+            (true, true) => {
+                let (ra, rb) = dwindle::cut(rect, *across, *ratio);
+                background_rects(a, s, ra, out);
+                background_rects(b, s, rb, out);
+            }
+            _ => {}
+        },
+    }
+}
+
+fn placed_rects(s: &UiState) -> Vec<(usize, dwindle::Rect)> {
+    let mut rects = match s.tile_layout_mode() {
+        crate::config::TileLayoutMode::Scrolling => scrolling_rects(s),
+        crate::config::TileLayoutMode::Floating => Vec::new(),
+        crate::config::TileLayoutMode::Dwindle => {
+            let mut out = Vec::new();
+            background_rects(
+                &s.tile_layout(),
+                s,
+                [0.0, 0.0, s.tile_grid[0].max(1.0), s.tile_grid[1].max(1.0)],
+                &mut out,
+            );
+            out
+        }
+    };
+    for (i, t) in s.tiles.iter().enumerate() {
+        if t.popped || s.tile_layout_mode() == crate::config::TileLayoutMode::Floating {
+            rects.push((
+                i,
+                fit_floating(
+                    t.floating_rect
+                        .unwrap_or_else(|| UiState::default_floating_rect(i, s.tile_grid)),
+                    s.tile_grid,
+                ),
+            ));
+        }
+    }
+    rects
+}
+
+/// Keep every floating titlebar and resize handle reachable after a window resize.
+fn fit_floating(r: dwindle::Rect, stage: [f32; 2]) -> dwindle::Rect {
+    let sw = stage[0].max(1.0);
+    let sh = stage[1].max(1.0);
+    let w = r[2].max(280.0).min(sw);
+    let h = r[3].max(180.0).min(sh);
+    [r[0].clamp(0.0, sw - w), r[1].clamp(0.0, sh - h), w, h]
+}
+
+pub(super) fn neighbour(s: &UiState, key: &Key) -> Option<usize> {
+    if s.tile_layout_mode() == crate::config::TileLayoutMode::Dwindle
+        && !s.tiles.iter().any(|t| t.popped)
+    {
+        return dwindle::neighbour(&s.tile_layout(), s.tile_grid, s.focus, key);
+    }
+    let rects = placed_rects(s);
+    let (_, from) = rects.iter().find(|(i, _)| *i == s.focus)?;
+    let center = |r: &dwindle::Rect| [r[0] + r[2] * 0.5, r[1] + r[3] * 0.5];
+    let a = center(from);
+    rects
+        .iter()
+        .filter(|(i, _)| *i != s.focus)
+        .filter_map(|(i, r)| {
+            let b = center(r);
+            let (forward, side) = match key {
+                Key::Left => (a[0] - b[0], (a[1] - b[1]).abs()),
+                Key::Right => (b[0] - a[0], (a[1] - b[1]).abs()),
+                Key::Up => (a[1] - b[1], (a[0] - b[0]).abs()),
+                Key::Down => (b[1] - a[1], (a[0] - b[0]).abs()),
+                _ => return None,
+            };
+            (forward > 0.5).then_some((*i, forward + side * 2.0))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
+}
+
+fn layout_motion(s: &UiState) -> rune::Spring {
+    if s.cfg.appearance.reduced_motion || s.tile_card_drag.is_some() || s.tile_drag.is_some() {
+        rune::Spring::NONE
+    } else {
+        rune::Spring::new(0.38, 0.06)
+    }
+}
+
 /// Fewest sessions to show in an empty tile's picker.
 const PICK_ROWS: usize = 6;
 
@@ -139,7 +283,7 @@ pub fn fill_plugin_tile(s: &mut UiState, i: usize, plugin_id: &str) {
     if s.tiles.get(i).is_none_or(|t| !t.is_empty()) {
         return;
     }
-    if let Some(plugin) = s.plugins.get(plugin_id) {
+    if let Some(plugin) = s.plugins.get_enabled(plugin_id, &s.cfg.plugins_disabled) {
         let lang = s.cfg.general.language;
         let title = plugin.title(lang);
         let token = s.next_token;
@@ -319,15 +463,24 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
             );
         }
     }
-    // The header row stands where a title bar would: its empty middle
-    // moves the window.
-    head = head.child(
+    // The header's empty middle: drag to reorder/split panes, or move a
+    // floating/popped card. Outside split view it still moves the window.
+    head = head.child(if s.in_split() {
+        el().key("tile-spacer")
+            .grow(1.0)
+            .h_full()
+            .cursor(Cursor::Grab)
+            .on_drag(move |s: &mut UiState, d: &mut rune::Drag, _: &mut Tx| {
+                header_tile_drag(s, i, d);
+            })
+            .a11y_hidden()
+    } else {
         el().key("tile-spacer")
             .grow(1.0)
             .h_full()
             .window_drag()
-            .a11y_hidden(),
-    );
+            .a11y_hidden()
+    });
     // Move and close: visible under the pointer, always reachable by menu.
     let menu_open = s.menu == Some(OpenMenu::Tile(i));
     let mut menu = Menu::new(format!("tile-menu-{i}"))
@@ -443,7 +596,43 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
         }
         _ => {}
     }
+    let zoomed = s.zoomed_tile == Some(i);
+    let popped = s.tiles.get(i).is_some_and(|t| t.popped);
     menu = menu
+        .separator()
+        .item(
+            MenuItem::new(tr(
+                language,
+                if zoomed {
+                    "Restore pane size"
+                } else {
+                    "Maximize pane"
+                },
+            ))
+            .shortcut(if focused {
+                super::keymap::label(super::keymap::Action::ToggleTileZoom)
+            } else {
+                String::new()
+            })
+            .on_select(move |s: &mut UiState| s.toggle_tile_zoom_at(i)),
+        )
+        .item(
+            MenuItem::new(tr(
+                language,
+                if popped { "Dock pane" } else { "Pop out pane" },
+            ))
+            .shortcut(if focused {
+                super::keymap::label(super::keymap::Action::ToggleTilePop)
+            } else {
+                String::new()
+            })
+            .on_select(move |s: &mut UiState| s.toggle_tile_pop_at(i)),
+        )
+        .item(
+            MenuItem::new(tr(language, "Cycle tile layout")).on_select(|s: &mut UiState| {
+                s.cycle_tile_layout();
+            }),
+        )
         .separator()
         .item(
             MenuItem::new(tr(language, "Remove from split view"))
@@ -723,28 +912,37 @@ fn picker(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         }
         list = list.child(look.pressable(k, look.row_card(k, line, 10.0)));
     }
-    let mut actions = row().gap(8.0).wrap().center_y();
-    actions = actions.child(
-        Button::new(tr_ref(language, "New session…"))
-            .variant(ButtonVariant::Outline)
-            .control_size(ControlSize::Regular)
-            .on_press(move |s: &mut UiState| {
-                s.pending_tile = Some(i);
-                s.go(Mode::Home);
-            })
-            .build(k)
-            .key(format!("tile-new-{i}")),
-    );
-    for plugin in s.plugins.tile_plugins() {
+    let new_session = Button::new(tr_ref(language, "New session…"))
+        .variant(ButtonVariant::Outline)
+        .control_size(ControlSize::Regular)
+        .on_press(move |s: &mut UiState| {
+            s.pending_tile = Some(i);
+            s.go(Mode::Home);
+        })
+        .build(k)
+        .key(format!("tile-new-{i}"));
+
+    // Icon grid for tile plugins: labels live in tooltips so many entries
+    // wrap cleanly inside the same width as the session list.
+    let mut plugins = row()
+        .key("tile-pick-plugins")
+        .w_full()
+        .max_w(420.0)
+        .gap(4.0)
+        .flex_wrap()
+        .justify_center()
+        .center_y();
+    for plugin in s.plugins.tile_plugins_enabled(&s.cfg.plugins_disabled) {
         let plugin_id = plugin.id();
         let plugin_title = plugin.title(language);
         let plugin_icon = plugin.icon();
         let pid = plugin_id.to_string();
-        actions = actions.child(
-            Button::new(plugin_title)
-                .icon(plugin_icon)
-                .variant(ButtonVariant::Outline)
+        plugins = plugins.child(
+            IconButton::new(plugin_icon)
+                .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Regular)
+                .label(plugin_title.clone())
+                .help(plugin_title)
                 .on_press(move |s: &mut UiState| {
                     fill_plugin_tile(s, i, &pid);
                 })
@@ -752,6 +950,16 @@ fn picker(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
                 .key(format!("tile-plugin-{plugin_id}-{i}")),
         );
     }
+
+    let actions = col()
+        .key("tile-pick-actions")
+        .w_full()
+        .max_w(420.0)
+        .gap(10.0)
+        .items_center()
+        .child(new_session)
+        .child(plugins);
+
     col()
         .key("tile-empty")
         .grow(1.0)
@@ -810,6 +1018,8 @@ fn tile(
     let mut body = col()
         .key(id.clone())
         .matched(id.clone())
+        .matched_crop()
+        .hold_landing_width()
         .grow(1.0)
         // Panes share a cramped window by the split, rather than the first
         // giving all its room up to the others' floors.
@@ -818,8 +1028,20 @@ fn tile(
         .radius(radius)
         .clip_rounded(radius)
         .fill(under)
-        .border(1.0, k.c.border_muted)
-        .motion(crate::theme::look::MOVE)
+        .border(
+            1.0,
+            if focused {
+                k.c.bg_accent.alpha(0.65)
+            } else {
+                k.c.border_muted
+            },
+        )
+        .motion(layout_motion(s))
+        .transition(if look.motion {
+            rune::Transition::scale(0.92).combined(rune::Transition::offset(0.0, 18.0))
+        } else {
+            rune::Transition::none()
+        })
         .on_press(move |s: &mut UiState| s.focus_tile(i));
     if let Some(over) = over {
         body = body.child(
@@ -863,7 +1085,7 @@ fn tile(
                 surface: crate::plugin::PluginSlot::Tile,
             };
             if let Some(plugin) = s.plugins.get(kind) {
-                if let Some(view) = plugin.render_surface(&ctx, layer) {
+                if let Some(view) = crate::plugin::window::render(plugin.as_ref(), &ctx, layer) {
                     body = body.child(view);
                 }
             }
@@ -878,7 +1100,7 @@ fn tile(
                 surface: crate::plugin::PluginSlot::Tile,
             };
             if let Some(plugin) = s.plugins.get("diff") {
-                if let Some(view) = plugin.render_surface(&ctx, layer) {
+                if let Some(view) = crate::plugin::window::render(plugin.as_ref(), &ctx, layer) {
                     body = body.child(view);
                 }
             }
@@ -912,11 +1134,200 @@ fn tile(
             .opacity_motion(look.focus_fade())
             .a11y_hidden(),
     );
-    body.role("region").label(format!(
-        "{} {}",
-        tr_ref(s.cfg.general.language, "Pane"),
-        i + 1
-    ))
+    body = body.child(
+        look.energy_line(k, "window-energy", false)
+            .pin(Some(12.0), Some(0.0), Some(12.0), None)
+            .opacity(if focused { 1.0 } else { 0.12 })
+            .opacity_motion(look.focus_fade()),
+    );
+    look.luminous(k, body, focused)
+        .role("region")
+        .label(format!(
+            "{} {}",
+            tr_ref(s.cfg.general.language, "Pane"),
+            i + 1
+        ))
+}
+
+fn header_tile_drag(s: &mut UiState, i: usize, d: &mut rune::Drag) {
+    let floating = s.tile_layout_mode() == crate::config::TileLayoutMode::Floating
+        || s.tiles.get(i).is_some_and(|t| t.popped);
+    match d.phase {
+        Phase::Down => {
+            s.focus_tile(i);
+            let start_rect = if floating {
+                let rect = s
+                    .tiles
+                    .get(i)
+                    .and_then(|t| t.floating_rect)
+                    .unwrap_or_else(|| UiState::default_floating_rect(i, s.tile_grid));
+                if let Some(tile) = s.tiles.get_mut(i) {
+                    tile.floating_rect = Some(rect);
+                }
+                Some(fit_floating(rect, s.tile_grid))
+            } else {
+                None
+            };
+            s.tile_card_drag = Some(TileCardDrag {
+                src: i,
+                pointer: [0.0, 0.0],
+                over: None,
+                zone: None,
+                start_rect,
+            });
+        }
+        Phase::Move => {
+            if floating {
+                if let Some(start) = s.tile_card_drag.as_ref().and_then(|d| d.start_rect) {
+                    let [sw, sh] = s.tile_grid;
+                    let x = (start[0] + d.dx).clamp(0.0, (sw - 120.0).max(0.0));
+                    let y = (start[1] + d.dy).clamp(0.0, (sh - 80.0).max(0.0));
+                    if let Some(tile) = s.tiles.get_mut(i) {
+                        tile.floating_rect =
+                            Some(fit_floating([x, y, start[2], start[3]], [sw, sh]));
+                    }
+                }
+            } else {
+                // Approximate stage pointer from the tile's dwindle rect + local drag.
+                let placed = placed_rects(s);
+                if let Some((_, rect)) = placed.iter().find(|(idx, _)| *idx == i) {
+                    let px = rect[0] + d.start_x + d.dx;
+                    let py = rect[1] + d.start_y + d.dy;
+                    if let Some(drag) = s.tile_card_drag.as_mut() {
+                        drag.pointer = [px, py];
+                    }
+                    hit_test_tile_drag(s, px, py);
+                }
+            }
+        }
+        Phase::Up => {
+            if let Some(drag) = s.tile_card_drag.take() {
+                if !floating {
+                    if let (Some(dst), Some(zone)) = (drag.over, drag.zone) {
+                        s.drop_tile_on(drag.src, dst, zone);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn hit_test_tile_drag(s: &mut UiState, px: f32, py: f32) {
+    let Some(src) = s.tile_card_drag.as_ref().map(|d| d.src) else {
+        return;
+    };
+    let hits = placed_rects(s);
+    let mut over = None;
+    let mut zone = None;
+    for (i, rect) in hits {
+        if i == src {
+            continue;
+        }
+        let [x, y, rw, rh] = rect;
+        if px >= x && px <= x + rw && py >= y && py <= y + rh {
+            over = Some(i);
+            zone = Some(dwindle::drop_zone(rect, px, py));
+            break;
+        }
+    }
+    if let Some(drag) = s.tile_card_drag.as_mut() {
+        drag.over = over;
+        drag.zone = zone;
+        drag.pointer = [px, py];
+    }
+}
+
+fn drop_preview_overlay(s: &UiState, k: &Kit) -> Option<El> {
+    let drag = s.tile_card_drag.as_ref()?;
+    let dst = drag.over?;
+    let zone = drag.zone?;
+    let rect = placed_rects(s).into_iter().find(|(i, _)| *i == dst)?.1;
+    let [x, y, pw, ph] = dwindle::drop_preview_rect(rect, zone);
+    Some(
+        el().key("tile-drop-preview")
+            .motion(layout_motion(s))
+            .transition(rune::Transition::opacity())
+            .paint_order(20)
+            .absolute(x, y)
+            .w(pw)
+            .h(ph)
+            .radius(k.radius.md)
+            .fill(k.c.bg_accent.alpha(0.22))
+            .border(1.0, k.c.bg_accent.alpha(0.55))
+            .a11y_hidden(),
+    )
+}
+
+fn floating_card(
+    s: &UiState,
+    k: &Kit,
+    look: &Look,
+    i: usize,
+    scale: f32,
+    layer: &mut Vec<El>,
+) -> El {
+    let rect = s
+        .tiles
+        .get(i)
+        .and_then(|t| t.floating_rect)
+        .unwrap_or_else(|| UiState::default_floating_rect(i, s.tile_grid));
+    let [x, y, w, h] = fit_floating(rect, s.tile_grid);
+    let card = tile(s, k, look, i, Place::default(), scale, layer);
+    let resize_i = i;
+    let handle = el()
+        .key(format!("tile-float-resize-{i}"))
+        .absolute(w - 14.0, h - 14.0)
+        .size(14.0, 14.0)
+        .cursor(Cursor::ResizeColumn)
+        .fill(k.c.border_muted)
+        .radius(3.0)
+        .on_drag(move |s: &mut UiState, d: &mut rune::Drag, _: &mut Tx| {
+            if d.phase == Phase::Down {
+                s.focus_tile(resize_i);
+                let start = s
+                    .tiles
+                    .get(resize_i)
+                    .and_then(|t| t.floating_rect)
+                    .unwrap_or([0.0, 0.0, 420.0, 320.0]);
+                let start = fit_floating(start, s.tile_grid);
+                d.data = start[2];
+                if let Some(drag) = s.tile_card_drag.as_mut() {
+                    drag.start_rect = Some(start);
+                } else {
+                    s.tile_card_drag = Some(TileCardDrag {
+                        src: resize_i,
+                        pointer: [0.0, 0.0],
+                        over: None,
+                        zone: None,
+                        start_rect: Some(start),
+                    });
+                }
+            } else if matches!(d.phase, Phase::Move | Phase::Up) {
+                let start = s
+                    .tile_card_drag
+                    .as_ref()
+                    .and_then(|d| d.start_rect)
+                    .unwrap_or([0.0, 0.0, 420.0, 320.0]);
+                let nw = (start[2] + d.dx).max(280.0);
+                let nh = (start[3] + d.dy).max(180.0);
+                if let Some(tile) = s.tiles.get_mut(resize_i) {
+                    tile.floating_rect =
+                        Some(fit_floating([start[0], start[1], nw, nh], s.tile_grid));
+                }
+                if d.phase == Phase::Up {
+                    s.tile_card_drag = None;
+                }
+            }
+        })
+        .a11y_hidden();
+    el().key(format!("tile-float-{i}"))
+        .paint_order(if i == s.focus { 2 } else { 1 })
+        .motion(layout_motion(s))
+        .absolute(x, y)
+        .w(w)
+        .h(h)
+        .child(card.w_full().h_full())
+        .child(handle)
 }
 
 /// The gap between the two halves of the split at `path`: the window shows
@@ -986,6 +1397,16 @@ fn arrange(
             a,
             b,
         } => {
+            match (visible(a, s), visible(b, s)) {
+                (true, false) | (false, true) => {
+                    let take_b = !visible(a, s);
+                    path.push(take_b);
+                    let view = arrange(s, k, if take_b { b } else { a }, path, rect, cards);
+                    path.pop();
+                    return view;
+                }
+                _ => {}
+            }
             let (ra, rb) = dwindle::cut(rect, *across, *ratio);
             let room = if *across { rect[2] } else { rect[3] } - GAP;
             let gap = gap(s, k, path, *across, *ratio, room);
@@ -1022,41 +1443,188 @@ pub fn toggle_clearance(s: &UiState, inset: f32) -> f32 {
     lights + 28.0 + 8.0 - super::panes::FRAME - 12.0
 }
 
+fn ghost_leaf(i: usize) -> El {
+    el().key(format!("tile-ghost-{i}"))
+        .grow(1.0)
+        .min_w(0.0)
+        .min_h(0.0)
+        .a11y_hidden()
+}
+
 /// The panes, each its own card on the window with gaps between (the
 /// main card steps aside for them); `clear` keeps the top-left header
 /// clear of the window's corner ([`toggle_clearance`]).
 pub fn view(s: &UiState, k: &Kit, clear: f32, scale: f32, layer: &mut Vec<El>) -> El {
     let look = s.look();
-    let tree = s.tile_layout();
+    let mode = s.tile_layout_mode();
     let [w, h] = s.tile_grid;
     let size = [w.max(1.0), h.max(1.0)];
-    let placed = dwindle::rects(&tree, [0.0, 0.0, size[0], size[1]]);
-    let top_left = placed
-        .iter()
-        .min_by(|x, y| (x.1[1] + x.1[0]).total_cmp(&(y.1[1] + y.1[0])))
-        .map(|p| p.0);
-    let top_right = placed
-        .iter()
-        .filter(|(_, r)| r[1] < 1.0)
-        .max_by(|x, y| x.1[0].total_cmp(&y.1[0]))
-        .map(|p| p.0);
-    let mut cards: Vec<Option<El>> = (0..s.tiles.len())
-        .map(|i| {
-            let place = Place {
-                clear: if Some(i) == top_left { clear } else { 0.0 },
-                corner: Some(i) == top_right,
-            };
-            Some(tile(s, k, &look, i, place, scale, layer))
-        })
-        .collect();
-    let body = arrange(
-        s,
-        k,
-        &tree,
-        &mut Vec::new(),
-        [0.0, 0.0, size[0], size[1]],
-        &mut cards,
-    );
+
+    let mut stage = el()
+        .key("tiles-stage")
+        .w_full()
+        .h_full()
+        .min_w(0.0)
+        .min_h(0.0);
+
+    // A stationary workbench makes floating motion legible against the desktop.
+    // Gradients and a sparse grid use ordinary quads, without full-window blur.
+    let mut backdrop = el()
+        .key("workspace-depth")
+        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+        .clip_soft(0.0)
+        .fill(k.c.bg_base)
+        .child(look.light("workspace-aurora", [0.15, 0.2], [0.8, 0.8], k.c.bg_accent))
+        .child(look.light(
+            "workspace-horizon",
+            [0.9, 0.85],
+            [0.75, 0.65],
+            k.c.info.icon,
+        ))
+        .a11y_hidden();
+    let scheme = if s.dark {
+        crate::theme::color_scheme::ColorScheme::Dark
+    } else {
+        crate::theme::color_scheme::ColorScheme::Light
+    };
+    if let (Some(images), Some(wallpaper)) = (
+        s.images.as_ref(),
+        crate::theme::apply::backdrop(scheme, false),
+    ) {
+        backdrop = backdrop.child(
+            super::art::cover(
+                images,
+                &wallpaper,
+                "workspace-theme-wallpaper",
+                size[0],
+                size[1],
+            )
+            .absolute(0.0, 0.0)
+            .opacity(wallpaper.look.opacity),
+        );
+    }
+    if mode == crate::config::TileLayoutMode::Floating && look.glass {
+        for n in 1..24 {
+            backdrop = backdrop.child(
+                el().key(format!("workspace-grid-v-{n}"))
+                    .absolute(size[0] * n as f32 / 24.0, 0.0)
+                    .w(1.0)
+                    .h_full()
+                    .fill(k.c.bg_accent.alpha(0.045))
+                    .a11y_hidden(),
+            );
+        }
+        for n in 1..16 {
+            backdrop = backdrop.child(
+                el().key(format!("workspace-grid-h-{n}"))
+                    .absolute(0.0, size[1] * n as f32 / 16.0)
+                    .h(1.0)
+                    .w_full()
+                    .fill(k.c.bg_accent.alpha(0.045))
+                    .a11y_hidden(),
+            );
+        }
+    }
+    stage = stage.child(backdrop);
+
+    if let Some(z) = s.zoomed_tile.filter(|&i| i < s.tiles.len()) {
+        stage = stage.child(tile(
+            s,
+            k,
+            &look,
+            z,
+            Place {
+                clear,
+                corner: true,
+            },
+            scale,
+            layer,
+        ));
+    } else {
+        match mode {
+            crate::config::TileLayoutMode::Scrolling => {
+                let mut viewport = el().key("tiles-scrolling").w_full().h_full().clip_soft(0.0);
+                let placed = scrolling_rects(s);
+                for (i, [x, y, width, height]) in placed {
+                    viewport = viewport.child(
+                        tile(
+                            s,
+                            k,
+                            &look,
+                            i,
+                            Place {
+                                clear: if x <= 0.0 { clear } else { 0.0 },
+                                corner: i == s.focus,
+                            },
+                            scale,
+                            layer,
+                        )
+                        .absolute(x, y)
+                        .w(width)
+                        .h(height),
+                    );
+                }
+                stage = stage.child(viewport);
+            }
+
+            crate::config::TileLayoutMode::Floating => {
+                for i in 0..s.tiles.len() {
+                    if s.tiles[i].popped {
+                        continue;
+                    }
+                    stage = stage.child(floating_card(s, k, &look, i, scale, layer));
+                }
+            }
+            crate::config::TileLayoutMode::Dwindle => {
+                let tree = s.tile_layout();
+                let placed = dwindle::rects(&tree, [0.0, 0.0, size[0], size[1]]);
+                let top_left = placed
+                    .iter()
+                    .filter(|(i, _)| s.tiles.get(*i).is_some_and(|t| !t.popped))
+                    .min_by(|x, y| (x.1[1] + x.1[0]).total_cmp(&(y.1[1] + y.1[0])))
+                    .map(|p| p.0);
+                let top_right = placed
+                    .iter()
+                    .filter(|(i, r)| r[1] < 1.0 && s.tiles.get(*i).is_some_and(|t| !t.popped))
+                    .max_by(|x, y| x.1[0].total_cmp(&y.1[0]))
+                    .map(|p| p.0);
+                let mut cards: Vec<Option<El>> = (0..s.tiles.len())
+                    .map(|i| {
+                        if s.tiles[i].popped {
+                            return Some(ghost_leaf(i));
+                        }
+                        let place = Place {
+                            clear: if Some(i) == top_left { clear } else { 0.0 },
+                            corner: Some(i) == top_right,
+                        };
+                        Some(tile(s, k, &look, i, place, scale, layer))
+                    })
+                    .collect();
+                let body = arrange(
+                    s,
+                    k,
+                    &tree,
+                    &mut Vec::new(),
+                    [0.0, 0.0, size[0], size[1]],
+                    &mut cards,
+                );
+                stage = stage.child(body);
+            }
+        }
+    }
+
+    // Popped tiles float above the tiled/scrolling body.
+    if s.zoomed_tile.is_none() {
+        for i in 0..s.tiles.len() {
+            if s.tiles[i].popped {
+                stage = stage.child(floating_card(s, k, &look, i, scale, layer));
+            }
+        }
+    }
+    if let Some(preview) = drop_preview_overlay(s, k) {
+        stage = stage.child(preview);
+    }
+
     // No toolbar: the panes rise under the window's empty toolbar row, so
     // their headers sit at the top, a frame's width from the window's edge.
     el().key("tiles-frame").w_full().grow(1.0).min_h(0.0).child(
@@ -1069,7 +1637,14 @@ pub fn view(s: &UiState, k: &Kit, clear: f32, scale: f32, layer: &mut Vec<El>) -
                 Some(0.0),
             )
             .on_layout(|s: &mut UiState, rect: [f32; 4]| s.tile_grid = [rect[2], rect[3]])
-            .child(body),
+            .on_pointer_move_local(|s: &mut UiState, ev, _| {
+                if s.tile_card_drag.is_some()
+                    && s.tile_layout_mode() != crate::config::TileLayoutMode::Floating
+                {
+                    hit_test_tile_drag(s, ev.x, ev.y);
+                }
+            })
+            .child(stage),
     )
 }
 
@@ -1077,39 +1652,53 @@ pub fn view(s: &UiState, k: &Kit, clear: f32, scale: f32, layer: &mut Vec<El>) -
 mod tests {
     use super::*;
     use crate::ui::Tile;
-    use muqun_gateway::agents::AgentSessionInfo;
-    use rune::TextEdit;
 
     #[test]
-    fn parked_composer_shows_agent_identity_and_dynamic_placeholder() {
+    fn scrolling_focus_reveals_readable_columns_and_uses_their_direction() {
         let (tx, _rx) = crate::model::commands::channel();
         let mut s = UiState::new(tx);
-        let session: AgentSessionInfo = serde_json::from_value(serde_json::json!({
-            "asid": "s1",
-            "agent_id": "claude",
-            "title": "Fix bug",
-            "status": "idle",
-            "updated_ms": 1000u64,
-        }))
-        .unwrap();
-        s.sessions = vec![session];
-        s.tiles = vec![Tile::session("s1")];
+        s.tiles = vec![Tile::session("a"), Tile::session("b"), Tile::session("c")];
+        s.tile_grid = [1000.0, 600.0];
+        s.cfg.ui.tile_mode = crate::config::TileLayoutMode::Scrolling;
+        s.focus = 1;
+        let rects = scrolling_rects(&s);
+        assert!(rects[1].1[0] >= 0.0 && rects[1].1[0] + rects[1].1[2] <= 1000.0);
+        assert!(rects[1].1[2] >= 600.0);
+        assert_eq!(neighbour(&s, &Key::Left), Some(0));
+        assert_eq!(neighbour(&s, &Key::Right), Some(2));
+        assert_eq!(neighbour(&s, &Key::Down), None);
+        s.focus = 2;
+        let end = scrolling_rects(&s)[2].1;
+        assert_eq!(end[0] + end[2], 1000.0);
+        s.tiles[1].popped = true;
+        assert_eq!(scrolling_rects(&s).len(), 2);
+    }
 
-        let k = Kit::neutral(s.dark);
-        let look = s.look();
-        let _el = parked_composer(&s, &k, &look, 0);
-
-        // Test in Chinese
-        s.cfg.general.language = crate::config::Language::ZhCn;
-        let _el_zh = parked_composer(&s, &k, &look, 0);
-
-        // Test with draft
-        s.tiles[0].slot.draft = TextEdit::new("Draft message to Claude");
-        let _el_draft = parked_composer(&s, &k, &look, 0);
-
-        // Test with busy status
-        s.sessions[0].status = muqun_gateway::agents::AgentSessionStatus::Busy;
-        let _el_busy = parked_composer(&s, &k, &look, 0);
+    #[test]
+    fn floating_bounds_and_navigation_follow_visible_windows() {
+        assert_eq!(
+            fit_floating([900.0, 500.0, 600.0, 500.0], [800.0, 400.0]),
+            [200.0, 0.0, 600.0, 400.0]
+        );
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.tiles = vec![Tile::session("a"), Tile::session("b")];
+        s.tile_grid = [1000.0, 700.0];
+        s.cfg.ui.tile_mode = crate::config::TileLayoutMode::Floating;
+        s.tiles[0].floating_rect = Some([500.0, 0.0, 300.0, 300.0]);
+        s.tiles[1].floating_rect = Some([0.0, 0.0, 300.0, 300.0]);
+        s.focus = 0;
+        assert_eq!(neighbour(&s, &Key::Left), Some(1));
+        assert_eq!(neighbour(&s, &Key::Right), None);
+        s.cfg.ui.tile_mode = crate::config::TileLayoutMode::Dwindle;
+        s.tiles[1].popped = true;
+        let rects = placed_rects(&s);
+        assert_eq!(
+            rects.iter().find(|(i, _)| *i == 0).unwrap().1,
+            [0.0, 0.0, 1000.0, 700.0]
+        );
+        s.tiles[1].popped = false;
+        assert!(placed_rects(&s).iter().find(|(i, _)| *i == 0).unwrap().1[2] < 1000.0);
     }
 
     #[test]
@@ -1274,5 +1863,49 @@ mod tests {
         // Test vertical split gap as well
         let g_vert = gap(&s, &k, &path, false, 0.4, 600.0);
         let _ = g_vert;
+    }
+
+    #[test]
+    fn omarchy_layout_zoom_pop_and_drop_zones() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.open_session("s1");
+        s.open_terminal_tile();
+        assert_eq!(s.tile_layout_mode(), crate::config::TileLayoutMode::Dwindle);
+
+        s.cycle_tile_layout();
+        assert_eq!(
+            s.tile_layout_mode(),
+            crate::config::TileLayoutMode::Scrolling
+        );
+        s.cycle_tile_layout();
+        assert_eq!(
+            s.tile_layout_mode(),
+            crate::config::TileLayoutMode::Floating
+        );
+        s.cycle_tile_layout();
+        assert_eq!(s.tile_layout_mode(), crate::config::TileLayoutMode::Dwindle);
+
+        s.toggle_tile_zoom();
+        assert_eq!(s.zoomed_tile, Some(s.focus));
+        s.toggle_tile_zoom();
+        assert!(s.zoomed_tile.is_none());
+
+        let focus = s.focus;
+        s.toggle_tile_pop();
+        assert!(s.tiles[focus].popped);
+        assert!(s.tiles[focus].floating_rect.is_some());
+        s.toggle_tile_pop();
+        assert!(!s.tiles[focus].popped);
+
+        s.split();
+        assert_eq!(s.tiles.len(), 3);
+        let before = format!("{:?}", s.tile_layout());
+        s.drop_tile_on(2, 0, dwindle::DropZone::Left);
+        let after = format!("{:?}", s.tile_layout());
+        assert_ne!(before, after);
+
+        s.toggle_tile_split_axis();
+        s.equalize_tiles();
     }
 }

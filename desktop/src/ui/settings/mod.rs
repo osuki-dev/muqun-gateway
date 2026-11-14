@@ -13,6 +13,7 @@ mod agents;
 mod appearance;
 mod general;
 mod keys;
+mod plugins;
 mod storage;
 mod themes;
 pub use themes::ThemeTab;
@@ -37,12 +38,13 @@ pub enum SettingsTab {
     Agents,
     Voice,
     Shortcuts,
+    Plugins,
     Storage,
     About,
 }
 
 /// Every page in nav order, with its name.
-pub(super) fn tabs(language: Language) -> [(&'static str, SettingsTab); 8] {
+pub(super) fn tabs(language: Language) -> [(&'static str, SettingsTab); 9] {
     use SettingsTab as T;
     [
         (tr_ref(language, "General"), T::General),
@@ -51,6 +53,7 @@ pub(super) fn tabs(language: Language) -> [(&'static str, SettingsTab); 8] {
         (tr_ref(language, "Agents"), T::Agents),
         (tr_ref(language, "Voice"), T::Voice),
         (tr_ref(language, "Shortcuts"), T::Shortcuts),
+        (tr_ref(language, "Plugins"), T::Plugins),
         (tr_ref(language, "Storage"), T::Storage),
         (tr_ref(language, "About"), T::About),
     ]
@@ -66,6 +69,7 @@ impl SettingsTab {
             Self::Agents => &i::AGENT,
             Self::Voice => &super::voice::MIC,
             Self::Shortcuts => &i::KEYBOARD,
+            Self::Plugins => &i::GRID,
             Self::Storage => &i::STORAGE,
             Self::About => &i::INFORMATION,
         }
@@ -89,6 +93,10 @@ impl SettingsTab {
             ),
             Self::Voice => super::voice::subtitle(language),
             Self::Shortcuts => tr_ref(language, "Every key the window answers to."),
+            Self::Plugins => tr_ref(
+                language,
+                "Built-in and loaded plugins, and the Bun and Herdr runtimes.",
+            ),
             Self::Storage => tr_ref(language, "What Muqun keeps on this computer."),
             Self::About => tr_ref(language, "Version, connection, links and licences."),
         }
@@ -101,6 +109,7 @@ pub(super) fn open(s: &mut UiState, tab: SettingsTab) {
     s.menu = None;
     match tab {
         SettingsTab::Themes => s.send(Command::ThemeRefresh),
+        SettingsTab::Plugins => s.refresh_runtimes(),
         SettingsTab::Storage => s.send(Command::ScanStorage),
         _ => {}
     }
@@ -314,9 +323,22 @@ pub(super) fn flag(
     label: &str,
     f: impl Fn(&mut UiState) + 'static,
 ) -> El {
+    flag_disabled(k, key, on, label, false, f)
+}
+
+/// [`flag`] that can stay on and ignore presses (core always-on plugins).
+pub(super) fn flag_disabled(
+    k: &Kit,
+    key: &str,
+    on: bool,
+    label: &str,
+    disabled: bool,
+    f: impl Fn(&mut UiState) + 'static,
+) -> El {
     Switch::new(on)
         .label(label)
         .hide_label()
+        .disabled(disabled)
         .on_toggle(f)
         .build(k)
         .key(format!("sw-{key}"))
@@ -503,7 +525,7 @@ fn nav(s: &UiState, k: &Kit, rail: bool) -> El {
     for (i, (name, tab)) in tabs(language).into_iter().enumerate() {
         // A breath between what the window looks like, what it runs, and
         // what it keeps.
-        if i == 3 || i == 6 {
+        if i == 3 || i == 7 {
             list = list.child(el().key(format!("nav-gap-{i}")).h(10.0));
         }
         let selected = s.settings_tab == tab;
@@ -622,6 +644,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         SettingsTab::Agents => (agents::actions(s, k), None, agents::page(s, k, layer)),
         SettingsTab::Voice => (Vec::new(), None, super::voice::settings(s, k, layer)),
         SettingsTab::Shortcuts => (keys::actions(s, k), None, keys::page(s, k)),
+        SettingsTab::Plugins => (plugins::actions(s, k), None, plugins::page(s, k)),
         SettingsTab::Storage => (Vec::new(), None, storage::page(s, k)),
         SettingsTab::About => (Vec::new(), None, about::page(s, k)),
     };

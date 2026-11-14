@@ -39,7 +39,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         let content = s
             .plugins
             .get(pid)
-            .and_then(|p| p.render_surface(&ctx, layer))
+            .and_then(|p| crate::plugin::window::render(p.as_ref(), &ctx, layer))
             .unwrap_or_else(|| el().key("empty-plugin-page"));
         super::card_stage("plugin-page", content)
     } else {
@@ -148,7 +148,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             toolbar(s, k, &look, layer)
         },
     );
-    let plugin_drawer = s.right_open && s.active_plugin_drawer.is_some() && !s.in_split();
+    let plugin_drawer = s.right_open && s.active_plugin_drawer.is_some();
     let inspector_here =
         (s.right_open && s.mode == Mode::Session && !s.in_split()) || plugin_drawer;
     // A row's details take the right-hand slot while they are open; an open
@@ -185,6 +185,15 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         };
         let surface = super::terminal_panel::surface(s, k, scheme).alpha(alpha);
         let view = super::terminal_panel::view(s, k, scheme, scale, layer);
+        let ctx = crate::plugin::PluginViewContext::new(
+            s,
+            k,
+            &look,
+            "terminal-dock",
+            scale,
+            crate::plugin::PluginSlot::Drawer,
+        );
+        let view = crate::plugin::window::chrome("terminal", &ctx, view);
         split = split.inspector(
             &s.term.pane,
             super::terminal_pane,
@@ -211,7 +220,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         let drawer_content = s
             .plugins
             .get(pid)
-            .and_then(|p| p.render_surface(&ctx, layer))
+            .and_then(|p| crate::plugin::window::render(p.as_ref(), &ctx, layer))
             .unwrap_or_else(|| inspector::view(s, k));
         split = split.inspector(
             &s.right,

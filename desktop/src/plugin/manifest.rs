@@ -87,6 +87,18 @@ impl Default for PluginRenderKind {
     }
 }
 
+impl PluginRenderKind {
+    /// Short label for settings lists and badges.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Native { .. } => "Native",
+            Self::TerminalTui { .. } => "Terminal TUI",
+            Self::WebView { .. } => "Web",
+            Self::BunScript { .. } => "Bun",
+        }
+    }
+}
+
 /// Category of the plugin for filtering and presentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
