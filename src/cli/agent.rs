@@ -13,7 +13,7 @@ use clap::Subcommand;
 use crate::agents::adapters::deepseek::DeepseekEndpoint;
 use crate::agents::adapters::t3::{T3Credential, T3Endpoint};
 use crate::agents::runtime::{binary_version, resolve_binary, DEFAULT_T3_URL};
-use crate::agents::{AgentRuntime, DeepseekConfig, T3Config};
+use crate::agents::{DeepseekConfig, T3Config};
 use crate::discovery::{AgentAvailability, AgentDiscoveryInfo};
 use crate::platform::service::SERVICE_LABEL;
 use crate::{
@@ -302,25 +302,16 @@ async fn running_gateway_discovery(config: &Config) -> Option<serde_json::Value>
 /// Probe the agents from this shell, the way the gateway would, with
 /// nothing attached.
 async fn local_probe(config: &Config) -> anyhow::Result<Vec<AgentDiscoveryInfo>> {
-    let runtime = if config.agent_runtime.enabled {
-        AgentRuntime::with_local_configs(
-            config.opencode.clone(),
-            config.deepseek.clone(),
-            config.t3.clone(),
-            crate::agents::runtime::LocalAgentConfigs {
-                codex: config.codex.clone(),
-                fx: config.fx.clone(),
-                qoder: config.qoder.clone(),
-                antigravity: config.antigravity.clone(),
-                cursor: config.cursor.clone(),
-                pi: config.pi.clone(),
-                claude: config.claude.clone(),
-            },
-            Some(state_dir()?),
-        )
+    let state_directory = if config.agent_runtime.enabled {
+        Some(state_dir()?)
     } else {
-        AgentRuntime::disabled()
+        None
     };
+    let runtime = crate::agents::compose::build_runtime(
+        crate::agents::compose::RuntimeSettings::from_config(config),
+        config.agent_runtime.enabled,
+        state_directory,
+    );
     // The uncached probe: `discover_agents` gives up after a few seconds
     // and would report everything offline while a catalog is still loading.
     let mut agents = runtime.probe_agents().await.agents;

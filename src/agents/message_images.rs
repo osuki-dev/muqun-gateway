@@ -24,9 +24,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
-use crate::agents::domain::{AgentDomainEvent, AgentPart, MessageImageAsset, TimelineItem};
+use crate::agents::domain::{
+    AgentDomainEvent, AgentPart, MessageImageAsset, TimelineItem, TimelineRole,
+};
+use crate::agents::ports::agent::split_uploaded_attachment_suffix;
 use crate::{
     api_error, asset_id, asset_json, content_envelope, read_asset_head, require_device,
     sniff_asset_type, ApiResult, AppState, AssetEntry, AssetKind,
@@ -81,7 +84,14 @@ impl MessageImages {
 
     /// Note where a session works, from anything that says so.
     pub(crate) fn remember_root(&self, asid: &str, directory: Option<&str>) -> Option<PathBuf> {
-        let root = image_root(directory?)?;
+        let directory = directory?;
+        {
+            let inner = self.inner.lock().ok()?;
+            if let Some(root) = inner.roots.get(asid) {
+                return Some(root.clone());
+            }
+        }
+        let root = image_root(directory)?;
         let mut inner = self.inner.lock().ok()?;
         if inner.roots.insert(asid.to_owned(), root.clone()).is_none() {
             inner.root_order.push_back(asid.to_owned());
@@ -184,6 +194,166 @@ fn may_embed_image(item: &TimelineItem) -> bool {
 pub(crate) fn image_root(directory: &str) -> Option<PathBuf> {
     let root = std::fs::canonicalize(directory.trim()).ok()?;
     (root.is_dir() && root.parent().is_some()).then_some(root)
+}
+
+/// Process-local image map for in-process clients (Muqun Desktop) that never
+/// hit the HTTP attach path. Same fencing rules as the gateway routes.
+fn local_images() -> &'static MessageImages {
+    static IMAGES: OnceLock<MessageImages> = OnceLock::new();
+    IMAGES.get_or_init(Default::default)
+}
+
+/// Promote the App's ByPath "Attached files (on this host)" suffix into
+/// `attachments` and strip it from the visible text — same as the App's
+/// `parseTimelineItem` / `splitUploadedAttachmentSuffix`.
+fn promote_uploaded_attachment_suffix(items: &mut [TimelineItem]) {
+    for item in items {
+        if item.role != TimelineRole::User {
+            continue;
+        }
+        let AgentPart::Text { text } = &item.part else {
+            continue;
+        };
+        let (body, paths) = split_uploaded_attachment_suffix(text);
+        if paths.is_empty() {
+            continue;
+        }
+        let body = body.to_owned();
+        let paths: Vec<String> = paths.into_iter().map(str::to_owned).collect();
+        let attachments = item.attachments.get_or_insert_with(Vec::new);
+        for path in paths {
+            if !attachments.iter().any(|existing| existing == &path) {
+                attachments.push(path);
+            }
+        }
+        if let AgentPart::Text { text } = &mut item.part {
+            *text = body;
+        }
+    }
+}
+
+/// Attach `image_assets` the way the HTTP egress does for the App
+/// (`attach_to_items` / `originals::attach`), for an in-process desktop that
+/// never hits `/api`. Same fields the App reads on each text part.
+pub fn enrich_timeline(asid: &str, directory: Option<&str>, items: &mut [TimelineItem]) {
+    promote_uploaded_attachment_suffix(items);
+    // Tool `content` media is resolved at paint time; only text embeds and
+    // attachments need the host map (and must not run on every tool delta).
+    if !items.iter().any(may_embed_image) && !items.iter().any(|item| item.attachments.is_some()) {
+        return;
+    }
+    let images = local_images();
+    let root = directory
+        .filter(|d| !d.is_empty())
+        .and_then(|d| images.remember_root(asid, Some(d)));
+    if let Some(root) = root.as_ref() {
+        images.attach(root, items);
+    }
+    // Codex / Cursor put user photos in `attachments` (often absolute uploads)
+    // with `[Image #N]` in the text. The HTTP path runs `originals::attach`;
+    // Desktop gets the same `image_assets` shape here, including when the
+    // session directory is not known yet.
+    attach_local_attachments(root.as_deref(), items);
+}
+
+/// Resolve bare `attachments` paths into `image_assets` for in-process clients.
+fn attach_local_attachments(root: Option<&Path>, items: &mut [TimelineItem]) {
+    for item in items {
+        let Some(sources) = item.attachments.clone() else {
+            continue;
+        };
+        let assets = item.image_assets.get_or_insert_with(Vec::new);
+        for src in sources {
+            if assets
+                .iter()
+                .any(|a| a.src == src || a.url == src || a.src.ends_with(&src))
+            {
+                continue;
+            }
+            let Some(path) = root
+                .and_then(|root| hosted_file(&src, root).map(|(path, _)| path))
+                .or_else(|| {
+                    let raw = src.strip_prefix("file://").unwrap_or(&src);
+                    let path = Path::new(raw);
+                    path.is_absolute()
+                        .then(|| std::fs::canonicalize(path).ok())
+                        .flatten()
+                        .filter(|p| p.is_file())
+                })
+            else {
+                continue;
+            };
+            let head = read_asset_head(&path);
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| src.clone());
+            let kind = sniff_asset_type(&head, &name);
+            if kind.kind != AssetKind::Image {
+                continue;
+            }
+            let (width, height) = image_dimensions(&head).unzip();
+            // Same map the App consumes: src stays the wire source, url is what
+            // the client loads (here a host path; over HTTP it is /api/assets/…).
+            assets.push(MessageImageAsset {
+                src: src.clone(),
+                asset_id: String::new(),
+                url: path.to_string_lossy().into_owned(),
+                mime: kind.mime.to_owned(),
+                width,
+                height,
+                thumbnail_url: None,
+                preview_url: None,
+                download_url: None,
+                version_url: None,
+                size: std::fs::metadata(&path).ok().map(|m| m.len()),
+                unavailable_reason: None,
+            });
+        }
+    }
+}
+
+/// Resolve a media `src` (markdown destination, attachment path, or gateway
+/// `/api/assets|agent-images/…` URL) to a local file the desktop can draw.
+pub fn resolve_host_media(src: &str, session_directory: Option<&str>) -> Option<PathBuf> {
+    let src = src.trim();
+    if src.is_empty() {
+        return None;
+    }
+    if let Some(id) = asset_id_from_api(src) {
+        if let Some(served) = local_images().served(&id) {
+            return Some(served.path);
+        }
+    }
+    if let Some(directory) = session_directory.filter(|d| !d.is_empty()) {
+        if let Some(root) = image_root(directory) {
+            if let Some((path, _)) = hosted_file(src, &root) {
+                return Some(path);
+            }
+        }
+    }
+    // Same machine as the agent: absolute / file:// paths that still exist.
+    let raw = src.strip_prefix("file://").unwrap_or(src);
+    let raw = raw.strip_prefix("localhost").unwrap_or(raw);
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return std::fs::canonicalize(path).ok().filter(|p| p.is_file());
+    }
+    None
+}
+
+fn asset_id_from_api(src: &str) -> Option<String> {
+    let path = src.split('?').next()?;
+    for prefix in ["/api/assets/", "/api/agent-images/"] {
+        let Some(rest) = path.strip_prefix(prefix) else {
+            continue;
+        };
+        let id = rest.split('/').next()?.trim();
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    None
 }
 
 /// The directory a session's images are fenced to: remembered, else asked of
@@ -391,6 +561,9 @@ pub(crate) async fn attach_to_items(
     directory: Option<&str>,
     items: &mut [TimelineItem],
 ) {
+    // Same client-side recovery the App runs in `parseTimelineItem`, so HTTP
+    // and Desktop both attach originals for ByPath handoffs.
+    promote_uploaded_attachment_suffix(items);
     let needs_files = items.iter().any(|item| {
         item.attachments.is_some()
             || matches!(&item.part, AgentPart::Tool(call) if call.content.is_some())
@@ -458,6 +631,7 @@ pub(crate) async fn attach_to_inbox(state: &AppState, asid: &str, items: &mut [s
                 attachments: Some(sources),
                 image_assets: None,
                 generation: None,
+                origin: None,
             },
         ));
     }
@@ -893,6 +1067,17 @@ fn percent_decode(text: &str) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
+}
+
+/// Width / height from an image file's header when the format is known.
+/// Best effort: layout can proceed without them.
+pub fn peek_image_dimensions(path: &Path) -> Option<(u32, u32)> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).ok()?;
+    // JPEG SOF can sit past the first few KB; 256 KiB covers typical EXIF.
+    let mut head = Vec::new();
+    file.take(256 * 1024).read_to_end(&mut head).ok()?;
+    image_dimensions(&head)
 }
 
 /// Width and height from the first bytes of a PNG, GIF, WebP or JPEG, when
@@ -1378,6 +1563,7 @@ mod tests {
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         }
     }
 
@@ -1733,5 +1919,27 @@ mod tests {
         ];
         assert_eq!(image_dimensions(&jpeg), Some((64, 32)));
         assert_eq!(image_dimensions(b"not an image"), None);
+    }
+
+    #[test]
+    fn desktop_resolve_finds_session_and_absolute_paths() {
+        let (_dir, root) = workspace();
+        let flow = root.join("out/flow.png");
+        assert_eq!(
+            resolve_host_media("./out/flow.png", root.to_str()),
+            Some(flow.clone())
+        );
+        assert_eq!(
+            resolve_host_media(flow.to_str().unwrap(), None),
+            Some(std::fs::canonicalize(&flow).unwrap())
+        );
+        assert_eq!(
+            asset_id_from_api(&format!("/api/assets/{}/content", asset_id(&flow))),
+            Some(asset_id(&flow))
+        );
+        assert_eq!(
+            asset_id_from_api("/api/agent-images/ai_abc/thumbnail"),
+            Some("ai_abc".into())
+        );
     }
 }

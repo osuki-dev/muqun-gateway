@@ -1,0 +1,58 @@
+From 647784f321f210acd2d2a60db8f80ba389cff1e5 Mon Sep 17 00:00:00 2001
+From: ryu <213640356+ryuhzk@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 14:06:13 +0800
+Subject: [PATCH 2/3] Add SplitView::sidebar_leading for brand in the title-bar
+ band.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ crates/rune-kit/src/shell/split.rs | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/crates/rune-kit/src/shell/split.rs b/crates/rune-kit/src/shell/split.rs
+index 5210465..abaf81d 100644
+--- a/crates/rune-kit/src/shell/split.rs
++++ b/crates/rune-kit/src/shell/split.rs
+@@ -136,6 +136,8 @@ pub struct SplitView {
+     sidebar: Option<Pane>,
+     inspector: Option<Pane>,
+     toolbar: Option<Toolbar>,
++    /// Brand / home control in the sidebar's title-bar band, past the traffic-light clearance.
++    sidebar_leading: Option<El>,
+     inset: f32,
+     show_toggle: bool,
+     toggle: SidebarToggle,
+@@ -154,6 +156,7 @@ impl SplitView {
+             sidebar: None,
+             inspector: None,
+             toolbar: None,
++            sidebar_leading: None,
+             inset: 0.0,
+             show_toggle: true,
+             toggle: SidebarToggle::new(),
+@@ -165,6 +168,12 @@ impl SplitView {
+             reduced: false,
+         }
+     }
++    /// Content in the sidebar's title-bar band (a brand mark that goes Home), past the
++    /// traffic lights and before the toggle's spacer.
++    pub fn sidebar_leading(mut self, e: El) -> Self {
++        self.sidebar_leading = Some(e);
++        self
++    }
+     /// The leading pane. `access` finds its state in the app's; the grip and the toggle button
+     /// write to it. `content` is usually a built `Sidebar`.
+     pub fn sidebar<S: 'static>(mut self, state: &PaneState, access: fn(&mut S) -> &mut PaneState, content: El) -> Self {
+@@ -322,6 +331,9 @@ impl SplitView {
+                 .center_y()
+                 .window_drag()
+                 .child(el().key("sidebar-titlebar-clear").w((clear - self.padding[0]).max(0.0)).motion(spring).a11y_hidden());
++            if let Some(leading) = self.sidebar_leading {
++                band = band.child(leading);
++            }
+             if toggle && t.in_header {
+                 band = band.child(el().key("sidebar-spacer").grow(1.0).a11y_hidden()).child(el().key("sidebar-toggle-slot").w(side).ml(8.0).a11y_hidden());
+             }
+-- 
+2.56.0
+

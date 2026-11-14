@@ -7,6 +7,7 @@
 mod herdr;
 mod keys;
 mod model;
+pub mod muqun_term;
 mod process_identity;
 mod registry;
 mod tmux;
@@ -26,6 +27,7 @@ pub use model::{
     StartAgent, StartedAgent, Tab, TabId, TerminalBackend, Workspace, WorkspaceId, Worktree,
     WorktreePlacement, WorktreeRequest,
 };
+pub use muqun_term::MuqunTermBackend;
 pub(crate) use process_identity::SUPPORTED as PROCESS_IDENTITY_SUPPORTED;
 pub(crate) use process_identity::{descends_from, parent_of as process_parent};
 pub use registry::BackendRegistry;

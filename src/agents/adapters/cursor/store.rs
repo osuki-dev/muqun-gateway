@@ -255,19 +255,27 @@ pub(super) fn timeline_of(snapshot: &NativeSnapshot) -> Vec<crate::agents::domai
             .flatten()
             .filter_map(Value::as_str)
             .collect();
-        for (kind, text) in [
-            (
-                "user_message_chunk",
-                entry["user"].as_str().unwrap_or_default().to_owned(),
-            ),
-            ("agent_message_chunk", replies.join("\n\n")),
-        ] {
-            if !text.is_empty() {
-                let _ = projection.update(&json!({
-                    "sessionUpdate": kind,
-                    "content": { "type": "text", "text": text },
-                }));
-            }
+        let user = entry["user"].as_str().unwrap_or_default();
+        if !user.is_empty() {
+            let _ = projection.update(&json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": { "type": "text", "text": user },
+            }));
+            let paths: Vec<String> = entry["attachments"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            projection.bind_latest_user_attachments(paths);
+        }
+        let reply = replies.join("\n\n");
+        if !reply.is_empty() {
+            let _ = projection.update(&json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": reply },
+            }));
         }
     }
     projection.timeline()
@@ -341,7 +349,7 @@ fn snapshot_of(
         return Err(unavailable());
     }
     let mut snapshot = NativeSnapshot::empty(id);
-    let mut turn: Option<(String, Vec<Value>, Vec<String>)> = None;
+    let mut turn: Option<Turn> = None;
     for message_id in message_ids {
         if stop.is_cancelled() {
             return Err(unavailable());
@@ -354,22 +362,28 @@ fn snapshot_of(
                 if let Some(done) = turn.take() {
                     snapshot.entries.push(entry(done));
                 }
+                let attachments = materialize_user_images(id, &message["content"]);
                 snapshot.last_user = Some(query.clone());
                 snapshot.last_assistant = None;
-                turn = Some((query, Vec::new(), vec![role]));
+                turn = Some(Turn {
+                    user: query,
+                    replies: Vec::new(),
+                    roles: vec![role],
+                    attachments,
+                });
                 continue;
             }
         }
         // The system prompt and injected context come before the first prompt.
-        let Some((_, replies, roles)) = turn.as_mut() else {
+        let Some(open) = turn.as_mut() else {
             continue;
         };
-        roles.push(role.clone());
+        open.roles.push(role.clone());
         if role == "assistant" {
             let text = text_parts(&message["content"]);
             if !text.is_empty() {
                 snapshot.last_assistant = Some(text.clone());
-                replies.push(json!(text));
+                open.replies.push(json!(text));
             }
         }
     }
@@ -379,8 +393,94 @@ fn snapshot_of(
     Ok(snapshot)
 }
 
-fn entry((user, replies, roles): (String, Vec<Value>, Vec<String>)) -> Value {
-    json!({ "user": user, "replies": replies, "roles": roles })
+struct Turn {
+    user: String,
+    replies: Vec<Value>,
+    roles: Vec<String>,
+    attachments: Vec<String>,
+}
+
+fn entry(turn: Turn) -> Value {
+    let mut row = json!({
+        "user": turn.user,
+        "replies": turn.replies,
+        "roles": turn.roles,
+    });
+    if !turn.attachments.is_empty() {
+        row["attachments"] = json!(turn.attachments);
+    }
+    row
+}
+
+/// Cursor stores pasted photos as `content` parts `{type:"image", image:{hex}}`.
+/// Materialize them under the gateway uploads tree as ordinary attachment
+/// paths so `attach_to_items` / desktop `enrich_timeline` can mint the same
+/// `image_assets` map the App already consumes over HTTP.
+fn materialize_user_images(session_id: &str, content: &Value) -> Vec<String> {
+    let Some(parts) = content.as_array() else {
+        return Vec::new();
+    };
+    let Ok(root) = crate::platform::uploads::uploads_dir()
+        .map(|dir| dir.join("cursor-store").join(session_id))
+    else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for part in parts.iter().filter(|part| part["type"] == "image") {
+        let Some(bytes) = image_bytes(part) else {
+            continue;
+        };
+        if bytes.is_empty() || bytes.len() > 12 * 1024 * 1024 {
+            continue;
+        }
+        let ext = match crate::platform::uploads::sniff_upload_kind(&bytes).map(|k| k.mime) {
+            Some("image/png") => "png",
+            Some("image/jpeg") => "jpg",
+            Some("image/webp") => "webp",
+            Some("image/gif") => "gif",
+            _ => continue,
+        };
+        let digest = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(&bytes))
+        };
+        let path = root.join(format!("{digest}.{ext}"));
+        if !path.is_file() {
+            if std::fs::create_dir_all(&root).is_err() {
+                continue;
+            }
+            if std::fs::write(&path, &bytes).is_err() {
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+        if let Some(text) = path.to_str() {
+            paths.push(text.to_owned());
+        }
+        if paths.len() >= 16 {
+            break;
+        }
+    }
+    paths
+}
+
+fn image_bytes(part: &Value) -> Option<Vec<u8>> {
+    if let Some(hex) = part
+        .pointer("/image/hex")
+        .and_then(Value::as_str)
+        .or_else(|| part.get("hex").and_then(Value::as_str))
+    {
+        return hex::decode(hex).ok();
+    }
+    if let Some(data) = part.get("data").and_then(Value::as_str) {
+        use base64::Engine as _;
+        return base64::engine::general_purpose::STANDARD.decode(data).ok();
+    }
+    None
 }
 
 /// The prompt as sent, from the CLI's `<user_query>` wrapper.

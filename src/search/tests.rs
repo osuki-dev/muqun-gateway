@@ -112,6 +112,7 @@ fn a_task_session_is_indexed_without_its_plumbing() {
         attachments: None,
         image_assets: None,
         generation: None,
+        origin: None,
     };
     let goal = format!("Rename the module. {}", crate::mcp::inject::TASK_SENTENCE);
     let mut items = vec![

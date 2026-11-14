@@ -2,6 +2,67 @@
 
 ## Changes and fixes
 
+- **Timeline shows real photos the same way the App does — via gateway
+  `image_assets`.** Live upserts and snapshots run the in-process enrich that
+  mirrors HTTP `attach_to_event` / `attach_to_items`. ByPath
+  `Attached files (on this host)` suffixes are promoted into `attachments` and
+  stripped from the visible text (App `parseTimelineItem`). The gallery walks
+  `attachments` through `image_assets` like App `MessageAttachments`, under the
+  prose. Cursor store history that only had `[Image #N]` text plus binary
+  `image` parts restores those as attachments first, then the same enrich mints
+  `image_assets`. Tool cards show a running spinner, short outputs inline, and
+  any image content they return.
+
+- **Home no longer draws an empty white toolbar strip.** Session / Inbox /
+  Tasks / Settings keep the toolbar; Home stays full-bleed. The sidebar brand
+  mark stays vertically centred. The always-on sidebar Refresh control is
+  gone (live events already update the tree; unreachable errors still offer
+  Retry). The redundant composer **Paste image** button is removed — Ctrl/Cmd+V
+  still stages clipboard files and images.
+
+- **Desktop launch splash loads the workspace behind a cooler Rune motion
+  stage.** Agents, themes and tasks start refreshing while the kick/bloom
+  entrance plays; the shell reveals once discovery is ready (or after a short
+  timeout), so the first frame after the fade is usable instead of empty.
+
+- **Sidebar Home / Inbox / Tasks / Settings sit at the bottom again, with the
+  App glyph set.** The nav block was floating above the session tree with
+  mismatched kit placeholders; it now pins under the tree and uses the synced
+  `home` / `inbox` / `task` / `settings` icons.
+
+- **Settings Themes is a full gallery with preview cards.** Library and
+  catalogue themes show 8×5 thumbnails (plus palette swatches), the current
+  theme gets a hero strip, and Agents / Appearance / General / About use
+  clearer section intros; Appearance links into Themes.
+
+- **Ctrl/Cmd+V pastes files or a clipboard image into the prompt.** Copied
+  Finder/Nautilus files and screenshots stage as attachments on the Home and
+  session drafts; plain text still pastes into the field as before.
+
+- **Queued and staged image attachments show thumbnails.** Composer chips and
+  the inspector Queue list draw a small preview for each image file instead of
+  a bare name count.
+
+- **Desktop compresses images (and large videos) before staging.** Picked or
+  pasted photos are resized to a 2048px long edge and re-encoded as JPEG so
+  they stay under ACP's native 5 MiB encoded-image limit; GIFs are left alone.
+  Videos over 8 MiB are re-encoded with `ffmpeg` to ≤1080p H.264 when it is on
+  `PATH`. Compression failures keep the original file.
+
+- **Sidebar title bar shows the Muqun mark; click it for Home.** The footer
+  Home row is gone — the brand in the empty title-bar slot is the way back.
+
+- **Composer `@` / `$` / `/` match the App.** `/` lists host commands at draft
+  start; `$` lists every catalog skill; `@` is a word-boundary mention of
+  computers and workspace files (caret-aware, fuzzy-ranked). Send routing
+  follows the App: unknown `/` stays a prompt; `$name` runs a skill. Home's
+  first prompt uses the same popups and routing. Attachments skip slash/skill
+  parse; unreachable `@` computers stay listed but cannot be picked; typed
+  skill arguments are announced and not sent on the wire. Mentions render as
+  pills (computers vs files), backspace removes a whole mention, the `@` list
+  groups Computers / Files, commands show an args hint when they have a
+  template, and placeholders follow the UI language.
+
 - **The agent catalog lists Claude Code's, Cursor's, Qoder's and Pi's
   skills, so the App's and the desktop's `$` picker offers them.**
   `GET /api/agent-catalog` answered `skills: []` for every agent but Codex,
@@ -71,8 +132,11 @@
   and FX take their bypass only at launch (`--dangerously-skip-permissions`,
   `--force`, `FX_PERMISSION_MODE=full-access`), so the switch relaunches that
   session's agent process with or without it and loads the same session
-  again (an agent that is working refuses: switch when it is idle; the
-  setting lasts until the Gateway restarts). Pi's `MUQUN_PI_APPROVALS=never`
+  again; a brand-new empty Cursor/FX session is replaced through
+  `session/new` under the same App-facing asid instead of `session/load`
+  (which would answer -32602 and leave the conversation broken). An agent
+  that is working refuses: switch when it is idle; the setting lasts until
+  the Gateway restarts. Pi's `MUQUN_PI_APPROVALS=never`
   is launch-only and the switch answers 501; DeepSeek has per-request
   approvals only. A bypass mode is still never remembered as a new session's
   default. Switching on from a device is allowed by default; an owner who

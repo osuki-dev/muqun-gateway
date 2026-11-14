@@ -215,6 +215,9 @@ mod tests {
             text,
             format!("look\n\nAttached files (on this host):\n- {one}\n- {two}")
         );
+        let (body, paths) = crate::agents::ports::agent::split_attachment_paths(&text);
+        assert_eq!(body, "look");
+        assert_eq!(paths, vec![one.as_str(), two.as_str()]);
     }
 
     #[test]

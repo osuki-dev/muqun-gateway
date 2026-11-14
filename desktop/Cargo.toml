@@ -1,0 +1,65 @@
+[package]
+name = "muqun-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Muqun Desktop: a native client for the coding agents on this computer."
+repository = "https://github.com/osuki-dev/muqun-gateway"
+publish = false
+
+[[bin]]
+name = "muqun-desktop"
+path = "src/main.rs"
+
+# UI: Rune. `muqun-desktop-apis` carries TextArea::on_input_paste and
+# SplitView::sidebar_leading on top of anomalyco/rune@50d5c6d until those
+# land upstream; patches live in desktop/patches/rune/ for review.
+[dependencies]
+muqun-gateway = { path = ".." }
+rune = { git = "https://github.com/ryuhzk/rune", rev = "5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3" }
+rune-kit = { git = "https://github.com/ryuhzk/rune", rev = "5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3", features = ["markdown"] }
+# GPU effect layers (`ui/fx.rs`): glow and liquid metal at effect slots.
+rune-fx = { git = "https://github.com/ryuhzk/rune", rev = "5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3" }
+rune-i18n = { git = "https://github.com/ryuhzk/rune", rev = "5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3" }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl"] }
+anyhow = "1.0.103"
+uuid = { version = "1.29.0", features = ["v4"] }
+base64 = "0.23.1"
+dirs = "7.0.0"
+libc = "0.2.191"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "sync", "time", "macros", "signal", "fs", "net", "io-util"] }
+# Remote hub (`hub/remote.rs`): HTTP / WebSocket clients.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "multipart"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+futures = { version = "0.3.32", default-features = false, features = ["std"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["ansi", "env-filter", "fmt", "std"] }
+# Theme packs (`theme/pack.rs`, `theme/gallery.rs`): ZIP inflate, CRC, SHA-256.
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
+crc32fast = "1.5.3"
+sha2 = "0.11.1"
+hex = "0.4"
+# Native file / folder dialogs (`platform/dialogs.rs`).
+rfd = "0.17.2"
+unicode-segmentation = "1.13"
+# The terminal panel's emulator (`term/`). Its -sys crate builds Ghostty's
+# libghostty-vt from source with Zig 0.15.2 (`mise exec zig@0.15.2 -- cargo …`).
+libghostty-vt = "0.2.2"
+# Dictation's microphone (`platform/mic.rs`): ALSA, Core Audio, WASAPI.
+cpal = "0.17.3"
+unicode-width = "0.2"
+
+# System notifications (`platform/notify.rs`): the freedesktop notification
+# server over the session bus. Same zbus as Rune's own D-Bus services.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "6.2.1", default-features = false, features = ["tokio", "proxy"] }
+
+[build-dependencies]
+rune-i18n = { git = "https://github.com/ryuhzk/rune", rev = "5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3", features = ["codegen"] }
+
+
+[dev-dependencies]
+tokio = { version = "1.53.3", features = ["test-util"] }

@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use serde_json::Value;
 
 use crate::agents::domain::*;
-use crate::agents::ports::agent::AgentError;
+use crate::agents::ports::agent::{prompt_display_body, AgentError};
 
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -408,7 +408,7 @@ pub(crate) struct Permission {
 /// What an agent's own tool vocabulary means for a permission
 /// ([`super::session::AcpProvider::PERMISSION_FIELDS`]).
 #[derive(Clone, Copy)]
-pub(crate) struct PermissionFields {
+pub struct PermissionFields {
     /// The `rawInput` fields, in order, that may carry an execute
     /// permission's complete command text. The ACP convention is `command`.
     pub shell_command: &'static [&'static str],
@@ -593,6 +593,65 @@ fn row_bytes(part: &AgentPart) -> usize {
         }
 }
 
+fn is_todo_tool_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "updatetodos" | "update_todos" | "todowrite" | "todoread" | "todo" | "tasks"
+    )
+}
+
+fn is_todo_tool(call: &ToolCall) -> bool {
+    if is_todo_tool_name(&call.name) {
+        return true;
+    }
+    if call.title.as_deref().is_some_and(is_todo_tool_name) {
+        return true;
+    }
+    call.input
+        .get("_toolName")
+        .and_then(Value::as_str)
+        .is_some_and(is_todo_tool_name)
+}
+
+/// `(id, optional text, optional done)` — merge may omit fields that stay.
+fn todo_entries(params: &Value) -> Vec<(String, Option<String>, Option<bool>)> {
+    let Some(arr) = params
+        .get("todos")
+        .or_else(|| params.get("items"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    arr.iter()
+        .enumerate()
+        .filter_map(|(i, item)| {
+            if let Some(s) = item.as_str() {
+                return Some((format!("todo-{i}"), Some(s.to_owned()), Some(false)));
+            }
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("todo-{i}"));
+            let text = item
+                .get("content")
+                .or_else(|| item.get("text"))
+                .or_else(|| item.get("title"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let done = item
+                .get("status")
+                .and_then(Value::as_str)
+                .map(|s| s.eq_ignore_ascii_case("completed"))
+                .or_else(|| item.get("done").and_then(Value::as_bool));
+            if text.is_none() && done.is_none() && item.get("id").is_none() {
+                return None;
+            }
+            Some((id, text, done))
+        })
+        .collect()
+}
+
 pub(crate) struct Projection {
     require_message_id: bool,
     anonymous: Option<(String, String)>,
@@ -613,6 +672,11 @@ pub(crate) struct Projection {
     current: Option<String>,
     thought: Option<String>,
     tool_groups: HashMap<String, String>,
+    /// Stable checklist from `cursor/update_todos` / updateTodos tool calls.
+    todo_order: Vec<String>,
+    todos: HashMap<String, TodoItem>,
+    /// ACP toolCallIds folded into the checklist (never shown as tool cards).
+    todo_tool_ids: HashSet<String>,
     permission_contexts: HashMap<String, Value>,
     permission_turn_active: bool,
 }
@@ -649,6 +713,9 @@ impl Projection {
             current: None,
             thought: None,
             tool_groups: HashMap::new(),
+            todo_order: Vec::new(),
+            todos: HashMap::new(),
+            todo_tool_ids: HashSet::new(),
             permission_contexts: HashMap::new(),
             permission_turn_active: false,
         }
@@ -685,9 +752,30 @@ impl Projection {
             .map(|(_, text)| text)
     }
 
+    /// Bind host file paths onto the newest user text row (Cursor store photos
+    /// arrive as separate content parts beside the `[Image #N]` prompt text).
+    pub fn bind_latest_user_attachments(&mut self, paths: Vec<String>) {
+        if paths.is_empty() {
+            return;
+        }
+        let Some(id) = self
+            .rows
+            .values()
+            .filter(|row| row.role == TimelineRole::User)
+            .filter(|row| matches!(row.part, AgentPart::Text { .. }))
+            .max_by_key(|row| row.ordinal)
+            .map(|row| row.id.clone())
+        else {
+            return;
+        };
+        if let Some(row) = self.rows.get_mut(&id) {
+            row.attachments = Some(paths);
+        }
+    }
+
     /// The ordinary live ACP stream omits user echoes. This row records only
     /// the Gateway's flushed submission, and is replaced by native history on load.
-    pub fn submitted(&mut self, text: &str) -> TimelineItem {
+    pub fn submitted(&mut self, text: &str, attachments: Option<Vec<String>>) -> TimelineItem {
         self.begin_turn();
         if !self.require_message_id {
             self.submission_echo = Some((text.into(), String::new()));
@@ -699,12 +787,13 @@ impl Projection {
             group,
             TimelineRole::User,
             AgentPart::Text { text: text.into() },
+            attachments.filter(|paths| !paths.is_empty()),
         )
     }
 
     /// A prompt steered into the running turn: a user row after the turn's
     /// output so far. The turn, its permissions and its tools go on.
-    pub fn steered(&mut self, text: &str) -> TimelineItem {
+    pub fn steered(&mut self, text: &str, attachments: Option<Vec<String>>) -> TimelineItem {
         self.current = None;
         self.thought = None;
         self.anonymous = None;
@@ -715,6 +804,7 @@ impl Projection {
             group,
             TimelineRole::User,
             AgentPart::Text { text: text.into() },
+            attachments.filter(|paths| !paths.is_empty()),
         )
     }
 
@@ -757,6 +847,66 @@ impl Projection {
         self.permission_turn_active = false;
     }
 
+    /// Cursor `cursor/update_todos` (and the updateTodos tool): one checklist row.
+    pub fn apply_todos(&mut self, params: &Value) -> Result<Option<TimelineItem>, AgentError> {
+        let merge = params
+            .get("merge")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        self.upsert_todos(params, merge)
+    }
+
+    fn upsert_todos(
+        &mut self,
+        params: &Value,
+        merge: bool,
+    ) -> Result<Option<TimelineItem>, AgentError> {
+        let entries = todo_entries(params);
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        if !merge {
+            self.todo_order.clear();
+            self.todos.clear();
+        }
+        for (id, text, done) in entries {
+            if let Some(existing) = self.todos.get_mut(&id) {
+                if let Some(text) = text {
+                    existing.text = text;
+                }
+                if let Some(done) = done {
+                    existing.done = done;
+                }
+            } else {
+                self.todo_order.push(id.clone());
+                self.todos.insert(
+                    id,
+                    TodoItem {
+                        text: text.unwrap_or_default(),
+                        done: done.unwrap_or(false),
+                    },
+                );
+            }
+        }
+        let items: Vec<TodoItem> = self
+            .todo_order
+            .iter()
+            .filter_map(|id| self.todos.get(id).cloned())
+            .collect();
+        if items.is_empty() {
+            return Ok(None);
+        }
+        let id = "acp-todo:list".to_string();
+        let group = self.group("acp-todo:list");
+        Ok(Some(self.row(
+            id,
+            group,
+            TimelineRole::Assistant,
+            AgentPart::Todo { items },
+            None,
+        )))
+    }
+
     fn assistant_group(&mut self) -> String {
         if let Some(group) = &self.current {
             return group.clone();
@@ -773,6 +923,7 @@ impl Projection {
         group: String,
         role: TimelineRole,
         part: AgentPart,
+        attachments: Option<Vec<String>>,
     ) -> TimelineItem {
         let ordinal = match self.rows.get(&id) {
             Some(row) => {
@@ -786,6 +937,10 @@ impl Projection {
                 self.next_row
             }
         };
+        // Keep attachments already bound to this row when a later chunk only
+        // refreshes the text (Cursor may rewrite photos as `[Image #N]`).
+        let attachments =
+            attachments.or_else(|| self.rows.get(&id).and_then(|row| row.attachments.clone()));
         self.retained_bytes += row_bytes(&part);
         let row = TimelineItem {
             id: id.clone(),
@@ -795,9 +950,10 @@ impl Projection {
             seq: ordinal,
             updated_ms: now_ms(),
             ordinal,
-            attachments: None,
+            attachments,
             image_assets: None,
             generation: None,
+            origin: None,
         };
         self.rows.insert(id.clone(), row.clone());
         self.evict(&id);
@@ -861,6 +1017,7 @@ impl Projection {
                         text: format!("{severity}: {text}"),
                         description: Some("ACP session notice".into()),
                     },
+                    None,
                 )))
             }
             "agent_message_chunk" | "user_message_chunk" | "agent_thought_chunk" => {
@@ -892,9 +1049,22 @@ impl Projection {
                     (id, group)
                 } else {
                     if user && !self.require_message_id {
-                        if let Some((expected, seen)) = &mut self.submission_echo {
+                        if let Some((expected, mut seen)) = self.submission_echo.take() {
                             seen.push_str(text);
-                            if expected.starts_with(seen.as_str()) {
+                            let matched = if expected.starts_with(seen.as_str()) {
+                                true
+                            } else {
+                                // Cursor (and similar) rewrite photos as `[Image #N]`
+                                // while keeping the typed prose; treat that as the
+                                // same flushed submission so attachments stay put.
+                                let expected_body = prompt_display_body(&expected);
+                                let seen_body = prompt_display_body(&seen);
+                                !expected_body.is_empty()
+                                    && (expected_body == seen_body
+                                        || expected_body.starts_with(seen_body))
+                            };
+                            self.submission_echo = Some((expected, seen));
+                            if matched {
                                 return Ok(None);
                             }
                             return Err(AgentError::Protocol("ACP user echo differs from the submitted prompt; refresh before sending again".into()));
@@ -959,6 +1129,7 @@ impl Projection {
                         TimelineRole::Assistant
                     },
                     part,
+                    None,
                 )))
             }
             "tool_call" | "tool_call_update" => {
@@ -1066,6 +1237,22 @@ impl Projection {
                         self.permission_contexts.remove(native);
                     }
                 }
+                // Cursor/OpenCode checklists are a Todo part, never a tool card.
+                let todo_tool = is_todo_tool(&call)
+                    || update["kind"].as_str().is_some_and(is_todo_tool_name)
+                    || self.todo_tool_ids.contains(native);
+                if todo_tool {
+                    self.todo_tool_ids.insert(native.into());
+                    let merge = call
+                        .input
+                        .get("merge")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if let Some(row) = self.upsert_todos(&call.input, merge)? {
+                        return Ok(Some(row));
+                    }
+                    return Ok(None);
+                }
                 let group = if let Some(group) = self.tool_groups.get(native) {
                     group.clone()
                 } else {
@@ -1078,6 +1265,7 @@ impl Projection {
                     group,
                     TimelineRole::Assistant,
                     AgentPart::Tool(call),
+                    None,
                 )))
             }
             _ => Ok(None),
@@ -1249,7 +1437,7 @@ mod tests {
     #[test]
     fn idless_stream_merges_chunks_but_splits_at_tools_and_turns() {
         let mut projection = Projection::new(false);
-        projection.submitted("question");
+        projection.submitted("question", None);
         for update in [
             json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"One"}}),
             json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" two"}}),
@@ -1259,7 +1447,7 @@ mod tests {
         ] {
             projection.update(&update).unwrap();
         }
-        projection.submitted("follow up");
+        projection.submitted("follow up", None);
         projection.update(&json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Four"}})).unwrap();
         let rows = projection.timeline();
         assert_eq!(rows.len(), 6);
@@ -1275,7 +1463,7 @@ mod tests {
     #[test]
     fn a_tool_update_without_a_name_keeps_the_call_name() {
         let mut projection = Projection::new(false);
-        projection.submitted("question");
+        projection.submitted("question", None);
         // claude-agent-acp 0.99.1: the call names the tool; the refinement
         // and result repeat only `kind`.
         for update in [
@@ -1298,7 +1486,7 @@ mod tests {
     #[test]
     fn live_user_echo_reconciles_one_flushed_submission_without_duplicate_rows() {
         let mut projection = Projection::new(false);
-        let submitted = projection.submitted("hello world");
+        let submitted = projection.submitted("hello world", None);
         for text in ["hello", " world"] {
             assert!(projection.update(&json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":text}})).unwrap().is_none());
         }
@@ -1307,6 +1495,29 @@ mod tests {
         assert_eq!(rows[0].id, submitted.id);
         assert!(matches!(&rows[0].part, AgentPart::Text{text} if text == "hello world"));
         assert!(projection.update(&json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"unexpected"}})).is_err());
+    }
+
+    #[test]
+    fn image_label_echo_keeps_submission_attachments() {
+        use crate::agents::ports::agent::ATTACHED_FILES_MARKER;
+        let path = "/tmp/muqun-upload.png";
+        let transcript = format!("inspect icon{ATTACHED_FILES_MARKER}\n- {path}");
+        let mut projection = Projection::new(false);
+        let submitted = projection.submitted(&transcript, Some(vec![path.to_owned()]));
+        assert!(projection
+            .update(&json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": { "type": "text", "text": "[Image #1] inspect icon" },
+            }))
+            .unwrap()
+            .is_none());
+        let rows = projection.timeline();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, submitted.id);
+        assert_eq!(
+            rows[0].attachments.as_deref(),
+            Some([path.to_owned()].as_slice())
+        );
     }
 
     #[test]
@@ -1513,7 +1724,7 @@ mod tests {
         assert!(projection
             .permission(json!(1), &shell_permission(None), PERMISSION_FIELDS)
             .is_err());
-        projection.submitted("start");
+        projection.submitted("start", None);
         projection.update(&update).unwrap();
         assert_eq!(
             projection
@@ -1542,13 +1753,13 @@ mod tests {
             .is_err());
 
         let mut projection = Projection::new(false);
-        projection.submitted("one");
+        projection.submitted("one", None);
         projection.update(&update).unwrap();
         projection.end_turn();
         assert!(projection
             .permission(json!(1), &shell_permission(None), PERMISSION_FIELDS)
             .is_err());
-        projection.submitted("two");
+        projection.submitted("two", None);
         assert!(projection
             .permission(json!(1), &shell_permission(None), PERMISSION_FIELDS)
             .is_err());
@@ -1689,5 +1900,81 @@ mod tests {
         assert!(catalog.modes.is_empty());
         assert_eq!(catalog.defaults.model, Some(model));
         assert!(catalog.defaults.mode.is_none());
+    }
+
+    #[test]
+    fn cursor_update_todos_merges_into_one_checklist_row() {
+        let mut projection = Projection::new(true);
+        let first = projection
+            .apply_todos(&json!({
+                "todos": [
+                    {"id": "a", "content": "Wire todos", "status": "in_progress"},
+                    {"id": "b", "content": "Polish UI", "status": "pending"}
+                ],
+                "merge": false
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.id, "acp-todo:list");
+        match &first.part {
+            AgentPart::Todo { items } => {
+                assert_eq!(items.len(), 2);
+                assert!(!items[0].done);
+                assert_eq!(items[0].text, "Wire todos");
+            }
+            other => panic!("expected Todo, got {other:?}"),
+        }
+        let second = projection
+            .apply_todos(&json!({
+                "todos": [
+                    {"id": "a", "status": "completed"},
+                    {"id": "c", "content": "Ship it", "status": "pending"}
+                ],
+                "merge": true
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.id, "acp-todo:list");
+        match &second.part {
+            AgentPart::Todo { items } => {
+                assert_eq!(items.len(), 3);
+                assert!(items[0].done);
+                assert_eq!(items[0].text, "Wire todos");
+                assert_eq!(items[2].text, "Ship it");
+            }
+            other => panic!("expected Todo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_todos_tool_call_folds_into_todo_part() {
+        let mut projection = Projection::new(true);
+        let row = projection
+            .update(&json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-1",
+                "name": "updateTodos",
+                "status": "completed",
+                "rawInput": {
+                    "_toolName": "updateTodos",
+                    "merge": false,
+                    "todos": [
+                        {"id": "1", "content": "Show checklist", "status": "completed"}
+                    ]
+                }
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.id, "acp-todo:list");
+        assert!(matches!(row.part, AgentPart::Todo { .. }));
+        assert!(projection
+            .update(&json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-1",
+                "status": "completed"
+            }))
+            .unwrap()
+            .is_none());
+        assert!(!projection.rows.contains_key("acp-tool:tc-1"));
     }
 }

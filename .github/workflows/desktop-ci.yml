@@ -1,0 +1,172 @@
+name: Desktop CI
+
+# muqun-desktop depends on Rune via git (desktop/Cargo.toml). Build/smoke run
+# on every desktop-related push/PR; no private fork variables required.
+
+on:
+  push:
+    branches: [main]
+    paths: ["desktop/**", "Cargo.toml", "Cargo.lock", ".github/workflows/desktop-ci.yml"]
+  pull_request:
+    paths: ["desktop/**", "Cargo.toml", "Cargo.lock", ".github/workflows/desktop-ci.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  lint-platform-cfg:
+    name: No cfg(target_os) outside platform/
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Grep
+        run: |
+          hits="$(grep -rn --include='*.rs' 'cfg(target_os' desktop/src | grep -v '^desktop/src/platform/' || true)"
+          if [ -n "$hits" ]; then
+            echo "$hits"
+            echo "::error::cfg(target_os) is only allowed under desktop/src/platform/"
+            exit 1
+          fi
+      - name: No colour literals outside the theme
+        run: desktop/scripts/lint-theme-tokens.sh
+
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Gateway release matrix is macOS + Linux only; Windows desktop needs a
+        # separate OpenSSL/sqlcipher story (vendored openssl-sys fails on GHA).
+        os: [ubuntu-latest, macos-15]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      # Package list covers winit/wgpu (wayland, xkbcommon, X11, vulkan, GL/EGL),
+      # fontconfig, gtk/glib (rfd dialogs), and lavapipe for the smoke test.
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libwayland-dev libxrandr-dev libxinerama-dev \
+            libxcursor-dev libxi-dev libx11-dev libgl1-mesa-dev libegl1-mesa-dev \
+            libvulkan-dev mesa-vulkan-drivers libfontconfig1-dev fonts-dejavu-core \
+            libglib2.0-dev libatk1.0-dev libgtk-3-dev libdbus-1-dev libasound2-dev \
+            xvfb
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # The terminal panel's emulator (libghostty-vt-sys) builds Ghostty's
+      # libghostty-vt from source: it clones Ghostty and runs `zig build`.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+      # Workspace clippy still typechecks the gateway; full gateway tests stay
+      # in ci.yml (tmux + its own flakes). Desktop CI owns desktop only.
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: test desktop
+        run: cargo test -p muqun-desktop --locked
+      - name: build release
+        run: cargo build --release --locked -p muqun-desktop
+
+      - name: Package Linux candidate
+        if: runner.os == 'Linux'
+        run: bash desktop/scripts/package-linux.sh --no-build
+
+      - name: Collect binary
+        run: |
+          mkdir out
+          cp target/release/muqun-desktop* out/ 2>/dev/null || true
+          rm -f out/*.d out/*.pdb
+          if [ "$RUNNER_OS" = Linux ]; then
+            cp target/desktop-package/*.tar.gz target/desktop-package/*.sha256 out/
+          fi
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: muqun-desktop-${{ runner.os }}
+          path: out/*
+          if-no-files-found: error
+
+  # Smoke: start the release binary, wait for the first UI frame (`build_ui` at
+  # debug from ui::view), then SIGTERM. Lavapipe on GHA can take >5 s to the
+  # first frame, so the budget is 25 s. Success is judged by the log.
+  smoke-x11:
+    name: Smoke (Linux, X11/xvfb)
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: muqun-desktop-Linux
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb mesa-vulkan-drivers libvulkan1 libxkbcommon-x11-0 libgtk-3-0 fonts-dejavu-core
+          sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2
+      - name: Run until first frame
+        run: |
+          chmod +x muqun-desktop
+          export HOME="$RUNNER_TEMP/home" && mkdir -p "$HOME"
+          set +e
+          RUST_LOG=info,muqun_desktop=debug WINIT_UNIX_BACKEND=x11 \
+            xvfb-run -a -s "-screen 0 1280x800x24" \
+            timeout -s TERM 25 ./muqun-desktop > smoke.log 2>&1
+          code=$?
+          set -e
+          cat smoke.log
+          echo "exit code: $code (124 = still running at SIGTERM, 143 = killed by it)"
+          grep -q "muqun-desktop starting" smoke.log
+          grep -q "build_ui" smoke.log || { echo "::error::no first frame logged"; exit 1; }
+          ! grep -qi "panicked" smoke.log
+          case "$code" in 0|124|143) ;; *) echo "::error::unexpected exit $code"; exit 1;; esac
+
+  smoke-wayland:
+    name: Smoke (Linux, Wayland/weston)
+    needs: [build]
+    runs-on: ubuntu-latest
+    # Headless weston + lavapipe on hosted runners is unproven for wgpu's
+    # Wayland path; informational until it has been seen passing.
+    continue-on-error: true
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: muqun-desktop-Linux
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y weston mesa-vulkan-drivers libvulkan1 libwayland-client0 libxkbcommon0 libgtk-3-0 fonts-dejavu-core
+          sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2
+      - name: Run until first frame
+        run: |
+          chmod +x muqun-desktop
+          export HOME="$RUNNER_TEMP/home" && mkdir -p "$HOME"
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg" && mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+          weston --backend=headless --socket=wl-ci --width=1280 --height=800 > weston.log 2>&1 &
+          wpid=$!
+          for _ in $(seq 1 20); do [ -S "$XDG_RUNTIME_DIR/wl-ci" ] && break; sleep 0.5; done
+          set +e
+          RUST_LOG=info,muqun_desktop=debug WAYLAND_DISPLAY=wl-ci WINIT_UNIX_BACKEND=wayland \
+            env -u DISPLAY timeout -s TERM 25 ./muqun-desktop > smoke.log 2>&1
+          code=$?
+          set -e
+          kill "$wpid" || true
+          cat smoke.log
+          echo "exit code: $code"
+          grep -q "build_ui" smoke.log || { echo "::error::no first frame logged"; exit 1; }
+          ! grep -qi "panicked" smoke.log

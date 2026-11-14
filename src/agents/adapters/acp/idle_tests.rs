@@ -1098,9 +1098,10 @@ fn launches(fixture: &Fixture) -> Vec<String> {
         .collect()
 }
 
-// The switch relaunches the session's own child with the flag (and its
-// environment) added or removed and loads the same session; a running turn
-// is refused, not killed, and its pending approval is left to the owner.
+// An empty session (no turns yet) cannot be session/load'd on Cursor/FX —
+// the switch session/new's under the flag and keeps the App-facing asid.
+// After a turn exists, the switch session/load's again. A running turn is
+// refused, not killed, and its pending approval is left to the owner.
 #[tokio::test]
 async fn launch_scoped_auto_approve_relaunches_the_session_and_refuses_a_busy_one() {
     let fixture = Fixture::new().await;
@@ -1121,6 +1122,22 @@ async fn launch_scoped_auto_approve_relaunches_the_session_and_refuses_a_busy_on
     assert_eq!(launches(&fixture), ["acp|-"]);
     assert_eq!(driver.auto_approve(id).await.unwrap(), Some(false));
 
+    let loads = |fixture: &Fixture| {
+        fixture
+            .methods()
+            .iter()
+            .filter(|method| *method == "session/load")
+            .count()
+    };
+    let news = |fixture: &Fixture| {
+        fixture
+            .methods()
+            .iter()
+            .filter(|method| *method == "session/new")
+            .count()
+    };
+    // Empty: session/new under the flag, same asid, never session/load.
+    assert_eq!(news(&fixture), 1);
     for (enabled, launched) in [(true, "--force acp --after|full-access"), (false, "acp|-")] {
         driver.set_auto_approve(id, enabled).await.unwrap();
         assert_eq!(driver.auto_approve(id).await.unwrap(), Some(enabled));
@@ -1130,16 +1147,25 @@ async fn launch_scoped_auto_approve_relaunches_the_session_and_refuses_a_busy_on
             .unwrap()
             .connected
             .load(Ordering::Acquire));
+        assert_eq!(
+            driver.retained(id).unwrap().state.lock().await.info.asid.0,
+            id
+        );
     }
     assert_eq!(launches(&fixture).len(), 3);
-    let loads = |fixture: &Fixture| {
-        fixture
-            .methods()
-            .iter()
-            .filter(|method| *method == "session/load")
-            .count()
-    };
-    assert_eq!(loads(&fixture), 2);
+    assert_eq!(loads(&fixture), 0);
+    assert_eq!(news(&fixture), 3);
+
+    // First turn makes the conversation non-empty; further switches load.
+    driver.send_prompt(id, "hello", &[], None).await.unwrap();
+    idle(&driver, id).await.unwrap();
+    driver.set_auto_approve(id, true).await.unwrap();
+    assert_eq!(driver.auto_approve(id).await.unwrap(), Some(true));
+    assert_eq!(
+        launches(&fixture).last().unwrap(),
+        "--force acp --after|full-access"
+    );
+    assert_eq!(loads(&fixture), 1);
 
     // A turn waits on an approval: refused, same process, nothing resolved.
     driver.send_prompt(id, "approval", &[], None).await.unwrap();
@@ -1158,13 +1184,12 @@ async fn launch_scoped_auto_approve_relaunches_the_session_and_refuses_a_busy_on
     })
     .await
     .unwrap();
-    let refusal = driver.set_auto_approve(id, true).await.unwrap_err();
+    let refusal = driver.set_auto_approve(id, false).await.unwrap_err();
     assert!(refusal
         .to_string()
         .contains("Bypass fixture is working; switch YOLO when it is idle"));
-    assert_eq!(driver.auto_approve(id).await.unwrap(), Some(false));
-    assert_eq!(launches(&fixture).len(), 3);
-    assert_eq!(loads(&fixture), 2);
+    assert_eq!(driver.auto_approve(id).await.unwrap(), Some(true));
+    assert_eq!(loads(&fixture), 1);
     assert!(!driver
         .retained(id)
         .unwrap()

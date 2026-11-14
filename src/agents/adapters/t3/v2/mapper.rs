@@ -534,6 +534,7 @@ pub fn timeline(thread_id: &str, projection: &Value, seq: u64) -> Vec<TimelineIt
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         });
     }
     result

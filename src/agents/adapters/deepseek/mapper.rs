@@ -537,6 +537,7 @@ fn map_content_blocks(
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         });
     }
     items
@@ -623,6 +624,7 @@ pub fn map_record(event: &Value) -> Vec<TimelineItem> {
                 attachments: None,
                 image_assets: None,
                 generation: None,
+                origin: None,
             }]
         }
         _ => Vec::new(),

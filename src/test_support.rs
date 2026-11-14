@@ -1122,6 +1122,11 @@ pub(crate) struct FakeAgent {
     pub session_deletion: bool,
     /// An agent whose service takes MCP servers at runtime.
     pub mcp: Option<Arc<Mutex<FakeMcp>>>,
+    /// When true, `reply_permission` answers as if another client already
+    /// cleared the request (G3 R4 duplicate-reply coverage).
+    pub reply_permission_gone: bool,
+    /// Same idea for forms.
+    pub reply_form_gone: bool,
 }
 
 /// A fake agent service's MCP registration.
@@ -1155,6 +1160,8 @@ impl FakeAgent {
             http_404: Vec::new(),
             session_deletion: false,
             mcp: None,
+            reply_permission_gone: false,
+            reply_form_gone: false,
         }
     }
 
@@ -1468,20 +1475,36 @@ impl agents::ports::agent::AgentPort for FakeAgent {
     }
     fn reply_permission<'a>(
         &'a self,
-        _session_id: &'a str,
-        _request_id: &'a str,
+        session_id: &'a str,
+        request_id: &'a str,
         _decision: agents::domain::PermissionDecision,
         _message: Option<&'a str>,
     ) -> agents::ports::agent::AgentFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            self.record(&format!("reply_permission:{session_id}:{request_id}"));
+            if self.reply_permission_gone {
+                return Err(agents::ports::agent::AgentError::InvalidRequest(
+                    "permission is no longer pending".into(),
+                ));
+            }
+            Ok(())
+        })
     }
     fn reply_form<'a>(
         &'a self,
-        _session_id: &'a str,
-        _form_id: &'a str,
+        session_id: &'a str,
+        form_id: &'a str,
         _answers: serde_json::Value,
     ) -> agents::ports::agent::AgentFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            self.record(&format!("reply_form:{session_id}:{form_id}"));
+            if self.reply_form_gone {
+                return Err(agents::ports::agent::AgentError::InvalidRequest(
+                    "form is no longer pending".into(),
+                ));
+            }
+            Ok(())
+        })
     }
     fn get_catalog<'a>(
         &'a self,
