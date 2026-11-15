@@ -1,0 +1,85 @@
+name: Verify Desktop macOS signing
+
+on:
+  workflow_call:
+    secrets:
+      DESKTOP_MACOS_CERTIFICATE_P12:
+        required: true
+      DESKTOP_MACOS_CERTIFICATE_PASSWORD:
+        required: true
+      DESKTOP_MACOS_SIGN_IDENTITY:
+        required: true
+      DESKTOP_APPLE_API_KEY_P8:
+        required: true
+      DESKTOP_APPLE_KEY_ID:
+        required: true
+      DESKTOP_APPLE_ISSUER_ID:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: muqun-desktop-macOS
+          path: candidate
+      - name: Sign and notarize the checked candidate
+        env:
+          CERT: ${{ secrets.DESKTOP_MACOS_CERTIFICATE_P12 }}
+          CERT_PASSWORD: ${{ secrets.DESKTOP_MACOS_CERTIFICATE_PASSWORD }}
+          IDENTITY: ${{ secrets.DESKTOP_MACOS_SIGN_IDENTITY }}
+          API_KEY: ${{ secrets.DESKTOP_APPLE_API_KEY_P8 }}
+          KEY_ID: ${{ secrets.DESKTOP_APPLE_KEY_ID }}
+          ISSUER: ${{ secrets.DESKTOP_APPLE_ISSUER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          keychain="$RUNNER_TEMP/desktop-signing.keychain-db"
+          password="$(openssl rand -hex 32)"
+          echo "::add-mask::$password"
+          printf '%s' "$CERT" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          printf '%s' "$API_KEY" > "$RUNNER_TEMP/notary.p8"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+          cd candidate
+          shasum -a 256 -c *.zip.sha256
+          archives=(muqun-desktop-*-macos-arm64.zip)
+          test "${#archives[@]}" -eq 1
+          archive="${archives[0]}"
+          test -f "$archive"
+          ditto -x -k "$archive" "$RUNNER_TEMP/app"
+          app="$RUNNER_TEMP/app/Muqun Desktop.app"
+          codesign --force --options runtime --timestamp --keychain "$keychain" --sign "$IDENTITY" "$app"
+          codesign --verify --strict "$app"
+          mkdir -p ../signed
+          ditto -c -k --keepParent "$app" "../signed/$archive"
+          xcrun notarytool submit "../signed/$archive" --key "$RUNNER_TEMP/notary.p8" --key-id "$KEY_ID" --issuer "$ISSUER" --wait --timeout 30m --output-format json > "$RUNNER_TEMP/notary-result.json"
+          python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["status"] == "Accepted"' "$RUNNER_TEMP/notary-result.json"
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute "$app"
+          rm "../signed/$archive"
+          ditto -c -k --keepParent "$app" "../signed/$archive"
+          cd ../signed
+          shasum -a 256 "$archive" > "$archive.sha256"
+      - name: Remove signing credentials
+        if: always()
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/desktop-signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/notary.p8"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-preview-signed-macos
+          path: signed/*
+          if-no-files-found: error
+

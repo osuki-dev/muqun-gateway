@@ -10,6 +10,11 @@ on:
   pull_request:
     paths: ["src/**", "build.rs", "desktop/**", "Cargo.toml", "Cargo.lock", ".github/workflows/desktop-ci.yml"]
   workflow_dispatch:
+    inputs:
+      notarize:
+        description: Verify macOS signing and notarization without publishing
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       preview_version:
@@ -234,3 +239,9 @@ jobs:
           test ! -e "$PREFIX/share/applications/muqun-desktop.desktop"
           test ! -e "$PREFIX/share/muqun-desktop/bundled-plugins/review-center/plugin.json"
           test -f "$XDG_CONFIG_HOME/muqun-desktop/keep-on-uninstall"
+
+  verify-macos-signing:
+    if: github.event_name == 'workflow_dispatch' && inputs.notarize
+    needs: [build, smoke-x11, lint-platform-cfg]
+    uses: ./.github/workflows/desktop-notarize.yml
+    secrets: inherit
