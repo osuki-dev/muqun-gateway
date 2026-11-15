@@ -1543,8 +1543,8 @@ pub fn view(s: &UiState, k: &Kit, clear: f32, scale: f32, layer: &mut Vec<El>) -
         }
     }
     // Tiled gaps reveal the same window backdrop as the sidebar gutter.
-    // Only floating windows need a separate workbench beneath them.
-    if mode == crate::config::TileLayoutMode::Floating {
+    // Transparent windows keep the desktop visible even between floating panes.
+    if mode == crate::config::TileLayoutMode::Floating && !look.see_through {
         stage = stage.child(backdrop);
     }
 
