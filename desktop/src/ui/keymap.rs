@@ -147,7 +147,6 @@ pub enum Action {
     FocusPaneToward,
     SwapPaneToward,
     FocusComposer,
-    ExpandComposer,
     PromptHistory,
     Send,
     Queue,
@@ -214,7 +213,6 @@ impl Action {
             Self::FocusPaneToward => "focus_pane_toward",
             Self::SwapPaneToward => "swap_pane_toward",
             Self::FocusComposer => "focus_composer",
-            Self::ExpandComposer => "expand_composer",
             Self::PromptHistory => "prompt_history",
             Self::Send => "send",
             Self::Queue => "queue",
@@ -425,15 +423,6 @@ pub static ENTRIES: &[Entry] = &[
         G::Session,
         "mod+l",
         "Focus the message field",
-    ),
-    owned(
-        e(
-            A::ExpandComposer,
-            G::Session,
-            "mod+shift+e",
-            "Expand or collapse the composer",
-        ),
-        Owner::Composer,
     ),
     owned(
         e(
@@ -1498,9 +1487,7 @@ pub fn dispatch_window(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
     }
     if let Some(found) = ENTRIES
         .iter()
-        .filter(|e| {
-            e.owner == Owner::Window || matches!(e.action, A::ExpandComposer | A::PromptHistory)
-        })
+        .filter(|e| e.owner == Owner::Window || e.action == A::PromptHistory)
         .find(|e| bind_matches_cfg(e, &s.cfg.keymap, ev, tx))
     {
         return run(s, found.action, ev, tx);
@@ -1539,7 +1526,6 @@ pub fn field_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx, at_end: bool) -> b
         A::EqualizeTiles,
         A::SplitHorizontal,
         A::SplitVertical,
-        A::ExpandComposer,
         A::PromptHistory,
     ] {
         if bind_matches_cfg(entry(action), &s.cfg.keymap, ev, tx) {
@@ -1678,15 +1664,6 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
             }
             _ => return false,
         },
-        A::ExpandComposer if session => {
-            if s.composer_expanded || s.composer_rows.is_some() {
-                s.composer_expanded = false;
-                s.composer_rows = None;
-            } else {
-                s.composer_expanded = true;
-                s.composer_rows = Some(14);
-            }
-        }
         A::PromptHistory if session => {
             s.composer_history_open = !s.composer_history_open;
         }

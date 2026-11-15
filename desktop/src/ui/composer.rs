@@ -5,9 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use muqun_gateway::agents::{AgentSessionId, ModelRef};
-use rune::{
-    col, el, row, text, Cursor, El, ImageCache, Phase, PillStyle, SurfaceFit, TextEdit, Tx,
-};
+use rune::{col, el, row, text, Cursor, El, ImageCache, PillStyle, SurfaceFit, TextEdit, Tx};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, Menu, MenuItem, ScrollBar,
     TextArea,
@@ -2024,6 +2022,18 @@ pub fn editor(
             if super::keymap::intercept_global_key(s, ev, tx) {
                 return true;
             }
+            if super::keymap::bind_matches_cfg(
+                super::keymap::entry(super::keymap::Action::Send),
+                &s.cfg.keymap,
+                ev,
+                tx,
+            ) {
+                match slot {
+                    Slot::Start => super::home::submit_start(s),
+                    Slot::Session => submit_session(s),
+                }
+                return true;
+            }
             if slot == Slot::Start {
                 if ev.key == rune::Key::Escape && s.error.is_some() {
                     s.error = None;
@@ -2067,10 +2077,12 @@ pub fn editor(
                 return true;
             }
             // Alt+Enter while the agent works: queue after this turn.
-            if super::keymap::entry(super::keymap::Action::Queue)
-                .keybind()
-                .matches_tx(ev, tx)
-                && s.busy()
+            if super::keymap::bind_matches_cfg(
+                super::keymap::entry(super::keymap::Action::Queue),
+                &s.cfg.keymap,
+                ev,
+                tx,
+            ) && s.busy()
             {
                 queue_session(s);
                 return true;
@@ -2079,12 +2091,9 @@ pub fn editor(
             let at_end = caret_at_end(&s.draft);
             super::keymap::field_key(s, ev, tx, at_end)
         })
-        .on_submit(move |s: &mut UiState, _: &mut Tx| match slot {
-            Slot::Start => super::home::submit_start(s),
-            Slot::Session => submit_session(s),
-        })
         .on_input_paste(|s: &mut UiState, content, _: &mut Tx| take_paste(s, content))
         .build(&bare_field(k))
+        .motion(s.look().focus_fade())
         .key(if slot == Slot::Start {
             "start-draft"
         } else {
@@ -2118,44 +2127,6 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     use super::composer_row::{self as controls_row, ACTION_GAP, CARD_PAD};
     let inner = rune::memo::layout_with("composer-card", |r| r[2].round())
         .map_or(f32::INFINITY, |w| w - CARD_PAD - 24.0);
-    let expand_icon = if s.composer_expanded || s.composer_rows.is_some() {
-        &super::icons::COLLAPSE
-    } else {
-        &super::icons::EXPAND
-    };
-    let expand_label = if s.composer_expanded || s.composer_rows.is_some() {
-        tr_ref(language, "Collapse")
-    } else {
-        tr_ref(language, "Expand")
-    };
-    let expand_help = if s.composer_expanded || s.composer_rows.is_some() {
-        super::keymap::tip(
-            tr_ref(language, "Collapse composer"),
-            super::keymap::Action::ExpandComposer,
-        )
-    } else {
-        super::keymap::tip(
-            tr_ref(language, "Expand composer"),
-            super::keymap::Action::ExpandComposer,
-        )
-    };
-    let expand_btn = rune_kit::IconButton::new(expand_icon)
-        .control_size(ControlSize::ExtraLarge)
-        .variant(rune_kit::IconButtonVariant::GhostMuted)
-        .label(expand_label)
-        .help(expand_help)
-        .on_press(|s: &mut UiState| {
-            if s.composer_expanded || s.composer_rows.is_some() {
-                s.composer_expanded = false;
-                s.composer_rows = None;
-            } else {
-                s.composer_expanded = true;
-                s.composer_rows = Some(14);
-            }
-        })
-        .build(k)
-        .key("composer-expand");
-
     let history_btn = rune_kit::IconButton::new(&super::parts::glyphs::TIME)
         .control_size(ControlSize::ExtraLarge)
         .variant(if s.composer_history_open {
@@ -2179,8 +2150,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .center_y()
         .child(attach)
         .child(super::voice::mic_button(s, k))
-        .child(history_btn)
-        .child(expand_btn);
+        .child(history_btn);
     let controls = controls_row::Controls::read(s);
     let own_line = controls.as_ref().map(|c| {
         controls_row::beside(s, c, k, layer, inner)
@@ -2195,7 +2165,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .variant(ButtonVariant::Neutral)
                 .control_size(ControlSize::Regular)
                 .disabled(!has_session || !has_text || s.pending_submit.is_some())
-                .shortcut("Alt+Enter")
+                .shortcut(super::keymap::label(super::keymap::Action::Queue))
                 .on_press(queue_session)
                 .build(k)
                 .key("composer-queue")
@@ -2229,12 +2199,12 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .variant(ButtonVariant::Submit)
         .control_size(ControlSize::Regular)
         .disabled(!has_session || !has_text || s.pending_submit.is_some())
-        .shortcut("Primary+Enter")
+        .shortcut(super::keymap::label(super::keymap::Action::Send))
         .help(if busy {
             format!(
                 "{} · {} {}",
                 tr_ref(language, "Steer the running turn"),
-                crate::platform::keys::label("Alt+Enter"),
+                super::keymap::label(super::keymap::Action::Queue),
                 tr_ref(language, "queues it instead")
             )
         } else {
@@ -2273,45 +2243,6 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     history_popup(s, k, layer, Slot::Session);
     let mut card = body().key("composer-card");
 
-    let resizer = row()
-        .key("composer-resizer")
-        .pin(Some(0.0), Some(6.0), Some(0.0), None)
-        .w_full()
-        .h(4.0)
-        .center()
-        .child(
-            el().key("composer-resizer-pill")
-                .w(36.0)
-                .h(4.0)
-                .radius(2.0)
-                .cursor(Cursor::ResizeRow)
-                .role("separator")
-                .label(tr_ref(language, "Resize composer"))
-                .fill(if s.composer_rows.is_some() {
-                    k.c.bg_accent.alpha(0.7)
-                } else {
-                    k.c.border_muted.alpha(0.5)
-                })
-                .hover(k.c.bg_accent)
-                .on_drag(
-                    |s: &mut UiState, d: &mut rune::Drag, _: &mut Tx| match d.phase {
-                        Phase::Down => {
-                            let cur =
-                                s.composer_rows
-                                    .unwrap_or(if s.composer_expanded { 12 } else { 3 });
-                            d.data = cur as f32;
-                        }
-                        Phase::Move => {
-                            let delta = (-d.dy / 18.0).round() as i32;
-                            let target = (d.data as i32 + delta).clamp(2, 24) as usize;
-                            s.composer_rows = Some(target);
-                        }
-                        _ => {}
-                    },
-                ),
-        );
-    card = card.child(resizer);
-
     if s.drop_hover {
         card = card.child(drop_hint(k, &look, language));
     }
@@ -2320,17 +2251,10 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     } else {
         tr_ref(language, "Pick a session first")
     };
-    let (min_rows, max_rows) = if let Some(r) = s.composer_rows {
-        (r, r.max(8))
-    } else if s.composer_expanded {
-        (10, 24)
-    } else {
-        (2, 12)
-    };
     if let Some(dictation) = super::voice::strip(s, k) {
         card = card.child(dictation);
     }
-    card = card.child(editor(s, k, Slot::Session, placeholder, min_rows, max_rows));
+    card = card.child(editor(s, k, Slot::Session, placeholder, 2, 12));
     card = card.child(actions.w_full());
 
     // Keep focus visible without competing with the message content.
@@ -2359,6 +2283,120 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composer_grows_and_shrinks_with_content_in_both_contexts() {
+        use rune::{Env, Runtime};
+        for scene_name in ["home", "session"] {
+            let (tx, _rx) = crate::ui::commands::channel();
+            let mut s = UiState::new(tx);
+            s.splash = None;
+            let (_, scene) = crate::ui::scenes::scenes()
+                .iter()
+                .find(|(name, _)| *name == scene_name)
+                .unwrap();
+            scene(&mut s);
+            let slot = if scene_name == "home" {
+                Slot::Start
+            } else {
+                Slot::Session
+            };
+            let key = if slot == Slot::Start {
+                "start-draft"
+            } else {
+                "draft"
+            };
+            *draft_of_mut(&mut s, slot) = fresh("");
+            let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+            for _ in 0..60 {
+                rt.frame(1.0 / 60.0);
+            }
+            let height = |rt: &Runtime<UiState>| {
+                rt.elements()
+                    .into_iter()
+                    .find(|n| n.key.as_deref() == Some(key))
+                    .unwrap()
+                    .rect[3]
+            };
+            let initial = height(&rt);
+            *draft_of_mut(&mut rt.state, slot) =
+                fresh("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+            rt.invalidate();
+            for _ in 0..60 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert!(height(&rt) > initial + 40.0, "{scene_name} did not grow");
+            *draft_of_mut(&mut rt.state, slot) = fresh("");
+            rt.invalidate();
+            for _ in 0..60 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert!(
+                (height(&rt) - initial).abs() < 1.0,
+                "{scene_name} did not shrink"
+            );
+        }
+    }
+
+    #[test]
+    fn remapped_send_replaces_default_in_both_composers() {
+        use rune::{Env, Key, KeyEvent, Mods, Runtime};
+        for scene_name in ["home", "session"] {
+            let (tx, mut rx) = crate::ui::commands::channel();
+            let mut s = UiState::new(tx);
+            s.splash = None;
+            let (_, scene) = crate::ui::scenes::scenes()
+                .iter()
+                .find(|(name, _)| *name == scene_name)
+                .unwrap();
+            scene(&mut s);
+            s.cfg.keymap.bindings.insert("send".into(), "alt+s".into());
+            let slot = if scene_name == "home" {
+                Slot::Start
+            } else {
+                Slot::Session
+            };
+            *draft_of_mut(&mut s, slot) = fresh("Verify keyboard routing");
+            let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+            rt.on_key = Some(crate::ui::on_key);
+            rt.frame(0.0);
+            rt.frame(0.02);
+            while rx.try_recv().is_ok() {}
+            rt.key(KeyEvent {
+                key: Key::Enter,
+                mods: Mods {
+                    ctrl: !cfg!(target_os = "macos"),
+                    cmd: cfg!(target_os = "macos"),
+                    ..Default::default()
+                },
+            });
+            rt.frame(0.04);
+            while let Ok(command) = rx.try_recv() {
+                assert!(
+                    !matches!(command, Command::Compose(ComposeCommand::Submit { .. })),
+                    "old send chord still submits on {scene_name}"
+                );
+            }
+            rt.key(KeyEvent {
+                key: Key::Command('s'),
+                mods: Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+            });
+            rt.frame(0.06);
+            let mut submits = 0;
+            while let Ok(command) = rx.try_recv() {
+                if matches!(command, Command::Compose(ComposeCommand::Submit { .. })) {
+                    submits += 1;
+                }
+            }
+            assert_eq!(
+                submits, 1,
+                "custom send must submit exactly once on {scene_name}"
+            );
+        }
+    }
 
     #[test]
     fn inserting_multiple_images_paces_and_numbers_them() {
@@ -2436,41 +2474,6 @@ mod tests {
             }
         }
         assert_eq!(staged_names, vec!["test-screenshot.png", "app.log"]);
-    }
-
-    #[test]
-    fn composer_resize_expand_and_history_popup() {
-        let (tx, _rx) = crate::ui::commands::channel();
-        let mut s = UiState::new(tx);
-        assert_eq!(s.composer_rows, None);
-        assert!(!s.composer_expanded);
-        assert!(!s.composer_history_open);
-
-        // Record prompts into history
-        s.record_prompt_history("cargo check");
-        s.record_prompt_history("git diff --staged");
-        assert_eq!(s.prompt_history.len(), 2);
-
-        // Toggle history popup
-        s.composer_history_open = true;
-        assert!(s.composer_history_open);
-
-        let k = Kit::neutral(s.dark);
-        let mut layer = Vec::new();
-        history_popup(&s, &k, &mut layer, Slot::Session);
-        assert!(!layer.is_empty());
-
-        // Test expanding composer
-        s.composer_expanded = true;
-        assert!(s.composer_expanded);
-
-        // Test manual row resize override
-        s.composer_rows = Some(16);
-        assert_eq!(s.composer_rows, Some(16));
-
-        // Test view generation
-        let look = s.look();
-        let _card = composer_card(&k, &look, col(), false, false, false);
     }
 
     #[test]

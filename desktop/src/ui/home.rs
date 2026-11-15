@@ -665,7 +665,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
                     .help(format!(
                         "{} · {}",
                         tr_ref(language, "Start"),
-                        crate::platform::keys::label("Primary+Enter")
+                        super::keymap::label(super::keymap::Action::Send)
                     ))
                     .variant(ButtonVariant::Submit)
                     .control_size(ControlSize::Large)

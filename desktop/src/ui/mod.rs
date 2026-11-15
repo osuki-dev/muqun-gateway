@@ -576,10 +576,6 @@ pub struct UiState {
     pub composer_history_open: bool,
     pub composer_queue_expanded: bool,
     pub composer_queue_page: Option<String>,
-    /// Manual height override for the composer textarea (number of rows).
-    pub composer_rows: Option<usize>,
-    /// Whether the composer textarea is toggled into expanded multiline mode.
-    pub composer_expanded: bool,
     /// Timeline in-session search state (Ctrl+F in session mode).
     pub timeline_search: TimelineSearch,
     /// First agents discovery finished (empty list still counts).
@@ -803,8 +799,6 @@ impl UiState {
             composer_history_open: false,
             composer_queue_expanded: false,
             composer_queue_page: None,
-            composer_rows: None,
-            composer_expanded: false,
             timeline_search: TimelineSearch::default(),
             agents_seen: false,
             demo: false,
