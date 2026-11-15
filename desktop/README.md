@@ -55,6 +55,9 @@ Set `MACOS_SIGN_IDENTITY` to use an existing Developer ID identity; otherwise th
 candidate is ad-hoc signed for local testing. Public distribution additionally
 requires notarization and stapling.
 
+Manually run **Desktop CI** with `notarize=true` to validate signing and
+notarization of its macOS artifact without publishing a release.
+
 The **Desktop preview** workflow builds, checks, signs and notarizes candidates.
 Its `publish` input defaults to false, so validation does not create a tag or
 release. Only an explicitly requested publication should set `publish=true`;
