@@ -463,24 +463,30 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
             );
         }
     }
-    // The header's empty middle: drag to reorder/split panes, or move a
-    // floating/popped card. Outside split view it still moves the window.
-    head = head.child(if s.in_split() {
-        el().key("tile-spacer")
-            .grow(1.0)
-            .h_full()
-            .cursor(Cursor::Grab)
-            .on_drag(move |s: &mut UiState, d: &mut rune::Drag, _: &mut Tx| {
-                header_tile_drag(s, i, d);
-            })
-            .a11y_hidden()
+    // The complete title region is draggable, even when a long title leaves
+    // no blank spacer. Action buttons stay outside this drag target.
+    head = head.child(el().key("tile-spacer").grow(1.0).h_full().a11y_hidden());
+    let drag_area = head
+        .key(format!("tile-drag-region-{i}"))
+        .w(0.0)
+        .grow(1.0)
+        .min_w(0.0);
+    let drag_area = if s.in_split() {
+        drag_area.cursor(Cursor::Grab).on_drag(
+            move |s: &mut UiState, d: &mut rune::Drag, _: &mut Tx| header_tile_drag(s, i, d),
+        )
     } else {
-        el().key("tile-spacer")
-            .grow(1.0)
-            .h_full()
-            .window_drag()
-            .a11y_hidden()
-    });
+        drag_area.window_drag()
+    };
+    let mut head = row()
+        .key("tile-head")
+        .w_full()
+        .h(HEAD_H)
+        .pr(6.0)
+        .gap(4.0)
+        .center_y()
+        .hover_group()
+        .child(drag_area);
     // Move and close: visible under the pointer, always reachable by menu.
     let menu_open = s.menu == Some(OpenMenu::Tile(i));
     let mut menu = Menu::new(format!("tile-menu-{i}"))
@@ -1197,6 +1203,8 @@ fn header_tile_drag(s: &mut UiState, i: usize, d: &mut rune::Drag) {
                     if let (Some(dst), Some(zone)) = (drag.over, drag.zone) {
                         s.drop_tile_on(drag.src, dst, zone);
                     }
+                } else {
+                    s.persist_tiles();
                 }
             }
         }
@@ -1307,11 +1315,29 @@ fn floating_card(
                 }
                 if d.phase == Phase::Up {
                     s.tile_card_drag = None;
+                    s.persist_tiles();
                 }
             }
         })
         .a11y_hidden();
     el().key(format!("tile-float-{i}"))
+        .radius(k.radius.lg)
+        .box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 18.0,
+            blur: 48.0,
+            spread: 0.0,
+            color: k.c.black.alpha(if look.dark { 0.65 } else { 0.22 }),
+            inset: false,
+        })
+        .box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 2.0,
+            blur: 8.0,
+            spread: 1.0,
+            color: k.c.black.alpha(0.24),
+            inset: false,
+        })
         .paint_order(if i == s.focus { 2 } else { 1 })
         .motion(layout_motion(s))
         .absolute(x, y)
