@@ -584,6 +584,7 @@ pub(super) fn edit_queued(s: &mut UiState, id: &str, text: String) {
     let Some(item) = s.queue.iter().find(|q| q.id == id).cloned() else {
         return;
     };
+    s.composer_queue_delivery = !item.steer;
     for file in item.files {
         if !s.staged.iter().any(|f| f.path == file.path) {
             s.staged.push(crate::model::compose::StagedFile {
@@ -2243,29 +2244,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     use super::composer_row::{self as controls_row, ACTION_GAP, CARD_PAD};
     let inner = rune::memo::layout_with("composer-card", |r| r[2].round())
         .map_or(f32::INFINITY, |w| w - CARD_PAD - 24.0);
-    let history_btn = rune_kit::IconButton::new(&super::parts::glyphs::TIME)
-        .control_size(ControlSize::ExtraLarge)
-        .variant(if s.composer_history_open {
-            rune_kit::IconButtonVariant::Contrast
-        } else {
-            rune_kit::IconButtonVariant::GhostMuted
-        })
-        .label(tr_ref(language, "History"))
-        .help(super::keymap::tip(
-            tr_ref(language, "Prompt history"),
-            super::keymap::Action::PromptHistory,
-        ))
-        .on_press(|s: &mut UiState| {
-            s.composer_history_open = !s.composer_history_open;
-        })
-        .build(k)
-        .key("composer-history");
-
-    let tools = row()
-        .gap(ACTION_GAP)
-        .center_y()
-        .child(attach)
-        .child(history_btn);
+    let tools = row().gap(ACTION_GAP).center_y().child(attach);
     let controls = controls_row::Controls::read(s);
     let controls_room = if busy {
         (inner - 160.0).max(200.0)
@@ -2404,6 +2383,46 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editing_a_steered_image_preserves_files_and_delivery_without_sending() {
+        use crate::model::compose::{InboxItem, QueuedFile};
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.selected = Some("session".into());
+        s.composer_queue_delivery = true;
+        s.queue.push(InboxItem {
+            id: "pending".into(),
+            text: "Look at this image".into(),
+            steer: true,
+            files: vec![QueuedFile {
+                path: "/uploads/image.png".into(),
+                name: "image.png".into(),
+                image: true,
+            }],
+        });
+        edit_queued(&mut s, "pending", "Look at this image".into());
+        assert_eq!(s.draft.text, "Look at this image");
+        assert!(!s.composer_queue_delivery);
+        assert_eq!(s.staged.len(), 1);
+        assert_eq!(s.staged[0].path, "/uploads/image.png");
+        assert!(s.staged[0].image);
+        assert!(s.queue.is_empty());
+        let mut cancelled = false;
+        while let Ok(command) = rx.try_recv() {
+            match command {
+                Command::Compose(ComposeCommand::InboxCancel { item, .. }) => {
+                    assert_eq!(item, "pending");
+                    cancelled = true;
+                }
+                Command::Compose(ComposeCommand::Submit { .. }) => {
+                    panic!("editing must not submit")
+                }
+                _ => {}
+            }
+        }
+        assert!(cancelled);
+    }
 
     #[test]
     fn composer_grows_and_shrinks_with_content_in_both_contexts() {
