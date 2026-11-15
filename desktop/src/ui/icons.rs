@@ -39,16 +39,6 @@ pub static SETTINGS: Icon = Icon {
     ),
 };
 
-/// `undo.svg`: roll back to a message.
-pub static UNDO: Icon = Icon {
-    name: "undo",
-    view: 24.0,
-    body: concat!(
-        r#"<path d="m8 3-5 5 5 5M3 8h10a7 7 0 0 1 0 14""#,
-        r#" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-    ),
-};
-
 /// `fork.svg`: fork a session from a message.
 pub static FORK: Icon = Icon {
     name: "fork",

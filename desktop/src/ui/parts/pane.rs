@@ -442,18 +442,7 @@ pub fn row_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
 
     if is_user_text {
         if let Some(f) = found {
-            let rollback_asid = muqun_gateway::agents::AgentSessionId(asid.clone());
-            let rollback_id = f.message_id.clone();
             m = m.separator();
-            m = m.item(
-                MenuItem::new(t("Roll back to here")).on_select(move |s: &mut UiState| {
-                    s.row_menu = None;
-                    s.send(crate::model::commands::Command::StageRevert {
-                        asid: rollback_asid.clone(),
-                        message_id: rollback_id.clone(),
-                    });
-                }),
-            );
             let fork_asid = muqun_gateway::agents::AgentSessionId(asid.clone());
             let fork_id = f.message_id.clone();
             m = m.item(

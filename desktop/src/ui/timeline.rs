@@ -733,12 +733,11 @@ fn working_row(cx: &Tcx) -> El {
         )
 }
 
-/// Copy message text, roll back to here, and fork from here: small icon buttons on a raised chip,
+/// Copy message text and fork from here: small icon buttons on a raised chip,
 /// shown while the pointer is on the message. No hover tooltip popovers.
 fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
     let k = cx.k;
     let asid = AgentSessionId(cx.asid.to_string());
-    let (rollback_asid, rollback_id) = (asid.clone(), it.message_id.clone());
     let fork_id = it.message_id.clone();
     let text = match &it.part {
         AgentPart::Text { text } => {
@@ -775,20 +774,6 @@ fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
                 })
                 .build(k)
                 .key(format!("copy-{}", copy_id)),
-        )
-        .child(
-            IconButton::new(&super::icons::UNDO)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(cx.t("Roll back to here"))
-                .on_press(move |s: &mut UiState| {
-                    s.send(Command::StageRevert {
-                        asid: rollback_asid.clone(),
-                        message_id: rollback_id.clone(),
-                    })
-                })
-                .build(k)
-                .key(format!("rollback-{}", it.id)),
         )
         .child(
             IconButton::new(&super::icons::FORK)
