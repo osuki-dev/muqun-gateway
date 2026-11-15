@@ -1948,7 +1948,7 @@ pub(super) fn effort_menu(
 }
 
 pub const AGENT_ICON: f32 = 16.0;
-pub const SEND_ICON: f32 = 22.0;
+pub const SEND_ICON: f32 = 18.0;
 
 pub fn body() -> El {
     col().w_full().gap(18.0).px(24.0).pt(20.0).pb(18.0)
@@ -2236,7 +2236,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let send = if busy {
         send.h(36.0).radius(k.radius.lg)
     } else {
-        send.size(44.0, 44.0).radius(k.radius.xl)
+        send.size(36.0, 36.0).radius(k.radius.lg)
     };
     actions = actions.child(look.glow(
         send,

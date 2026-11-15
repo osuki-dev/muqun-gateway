@@ -609,7 +609,11 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
 /// Context above the editor; agent and delivery actions below it.
 fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f32; 2]) -> El {
     let language = s.cfg.general.language;
-    let mut card = composer::body().key("home-card");
+    let mut card = composer::body()
+        .key("home-card")
+        .gap(12.0)
+        .pt(16.0)
+        .pb(14.0);
     let mut context = row()
         .gap(8.0)
         .center_y()
@@ -625,7 +629,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
         card = card.child(composer::drop_hint(k, look, language));
     }
     let placeholder = tr_ref(language, "Describe the task…");
-    card = card.child(composer::editor(s, k, Slot::Start, placeholder, 3, 12));
+    card = card.child(composer::editor(s, k, Slot::Start, placeholder, 2, 12));
     // Where and how, in one row with the button that acts on them.
     let mut controls = row()
         .key("start-controls")
@@ -692,8 +696,8 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
                     .on_press(submit_start)
                     .build(k)
                     .key("start")
-                    .size(44.0, 44.0)
-                    .radius(k.radius.xl),
+                    .size(36.0, 36.0)
+                    .radius(k.radius.lg),
                 k.c.bg_accent,
                 if s.start_draft.text.trim().is_empty() {
                     0.0
