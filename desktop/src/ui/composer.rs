@@ -2134,6 +2134,90 @@ pub fn editor(
         .w_full()
 }
 
+fn delivery_button(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+    let language = s.cfg.general.language;
+    let queue = s.composer_queue_delivery;
+    let open = s.menu == Some(OpenMenu::ComposerDelivery);
+    let disabled = s.selected.is_none()
+        || (s.draft.text.trim().is_empty() && s.staged.is_empty())
+        || s.pending_submit.is_some();
+    let caption = tr_ref(language, if queue { "Queue" } else { "Steer" });
+    let action = if queue {
+        super::keymap::Action::Queue
+    } else {
+        super::keymap::Action::Send
+    };
+    let menu = Menu::new("composer-delivery-menu")
+        .trigger(
+            rune_kit::IconButton::new(k.glyph.chevron_down)
+                .variant(rune_kit::IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::ExtraLarge)
+                .label(format!(
+                    "{} / {}",
+                    tr_ref(language, "Steer"),
+                    tr_ref(language, "Queue")
+                ))
+                .on_press(move |s: &mut UiState| {
+                    s.menu = (!open).then_some(OpenMenu::ComposerDelivery)
+                })
+                .build(k)
+                .key("composer-delivery-options"),
+        )
+        .open(open)
+        .min_width(180.0)
+        .on_close(|s: &mut UiState| s.menu = None)
+        .item(
+            MenuItem::new(tr_ref(language, "Steer"))
+                .checked(!queue)
+                .shortcut(super::keymap::label_with(
+                    super::keymap::Action::Send,
+                    Some(&s.cfg.keymap),
+                ))
+                .on_select(|s: &mut UiState| {
+                    s.composer_queue_delivery = false;
+                    s.menu = None;
+                }),
+        )
+        .item(
+            MenuItem::new(tr_ref(language, "Queue"))
+                .checked(queue)
+                .shortcut(super::keymap::label_with(
+                    super::keymap::Action::Queue,
+                    Some(&s.cfg.keymap),
+                ))
+                .on_select(|s: &mut UiState| {
+                    s.composer_queue_delivery = true;
+                    s.menu = None;
+                }),
+        );
+    row()
+        .key("composer-delivery")
+        .h(36.0)
+        .center_y()
+        .radius(k.radius.lg)
+        .fill(k.c.layer_01)
+        .border(1.0, k.c.border_weak)
+        .child(
+            Button::new(caption)
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Regular)
+                .disabled(disabled)
+                .shortcut(super::keymap::label_with(action, Some(&s.cfg.keymap)))
+                .on_press(|s: &mut UiState| {
+                    if s.composer_queue_delivery {
+                        queue_session(s);
+                    } else {
+                        submit_session(s);
+                    }
+                })
+                .build(k)
+                .key("composer-deliver")
+                .h(36.0),
+        )
+        .child(el().w(1.0).h(16.0).fill(k.c.border_weak))
+        .child(menu.build(k, layer))
+}
+
 pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let look = s.look();
     let language = s.cfg.general.language;
@@ -2199,23 +2283,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .gap(ACTION_GAP)
         .center_y()
         .child(super::voice::mic_button(s, k));
-    let mut delivery = row().gap(8.0).center_y();
     if busy {
-        delivery = delivery.child(
-            Button::new(tr_ref(language, "Queue"))
-                .variant(ButtonVariant::Neutral)
-                .control_size(ControlSize::Regular)
-                .disabled(!has_session || !has_text || s.pending_submit.is_some())
-                .shortcut(super::keymap::label_with(
-                    super::keymap::Action::Queue,
-                    Some(&s.cfg.keymap),
-                ))
-                .on_press(queue_session)
-                .build(k)
-                .key("composer-queue")
-                .h(36.0)
-                .radius(k.radius.lg),
-        );
         if let Some(asid) = s.selected.clone() {
             actions = actions.child(
                 Button::new(stop_label)
@@ -2273,9 +2341,8 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         k.c.bg_accent,
         if has_text && has_session { 0.9 } else { 0.0 },
     );
-    if busy {
-        delivery = delivery.child(send);
-    } else {
+    let delivery = busy.then(|| delivery_button(s, k, layer));
+    if !busy {
         actions = actions.child(send);
     }
 
@@ -2320,7 +2387,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     if let Some(controls) = own_line {
         footer = footer.child(controls.w(0.0).grow(1.0).min_w(200.0));
     }
-    if busy {
+    if let Some(delivery) = delivery {
         footer = footer.child(delivery);
     }
     deck = deck.child(card.w_full()).child(footer);
@@ -2389,6 +2456,65 @@ mod tests {
                 (height(&rt) - initial).abs() < 1.0,
                 "{scene_name} did not shrink"
             );
+        }
+    }
+
+    #[test]
+    fn delivery_picker_changes_mode_without_sending_until_pressed() {
+        use rune::{Env, Runtime};
+        for (item, expected) in [(1, "queue"), (0, "steer")] {
+            let (tx, mut rx) = crate::ui::commands::channel();
+            let mut state = UiState::new(tx);
+            state.splash = None;
+            let (_, scene) = crate::ui::scenes::scenes()
+                .iter()
+                .find(|(n, _)| *n == "session")
+                .unwrap();
+            scene(&mut state);
+            state.draft = fresh("Follow-up with chosen delivery");
+            let mut rt = Runtime::new(
+                state,
+                crate::ui::view,
+                (1440.0, 1000.0),
+                Env::new(true, 1.0),
+            );
+            for _ in 0..60 {
+                rt.frame(1.0 / 60.0);
+            }
+            while rx.try_recv().is_ok() {}
+            let click = |rt: &mut Runtime<UiState>, key: &str| {
+                let node = rt
+                    .elements()
+                    .into_iter()
+                    .find(|n| n.key.as_deref() == Some(key))
+                    .unwrap();
+                let (x, y) = (
+                    node.rect[0] + node.rect[2] / 2.0,
+                    node.rect[1] + node.rect[3] / 2.0,
+                );
+                rt.pointer_down(x, y);
+                rt.pointer_up(x, y);
+                for _ in 0..30 {
+                    rt.frame(1.0 / 60.0);
+                }
+            };
+            click(&mut rt, "composer-delivery-options");
+            click(&mut rt, &format!("composer-delivery-menu-item{item}"));
+            assert_eq!(rt.state.composer_queue_delivery, expected == "queue");
+            while let Ok(command) = rx.try_recv() {
+                assert!(!matches!(
+                    command,
+                    Command::Compose(ComposeCommand::Submit { .. })
+                ));
+            }
+            click(&mut rt, "composer-deliver");
+            let mut sent = Vec::new();
+            while let Ok(command) = rx.try_recv() {
+                if let Command::Compose(ComposeCommand::Submit { delivery, .. }) = command {
+                    sent.push(delivery);
+                }
+            }
+            assert_eq!(sent, vec![Some(expected.into())]);
         }
     }
 

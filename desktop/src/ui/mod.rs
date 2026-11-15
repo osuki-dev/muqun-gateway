@@ -166,6 +166,7 @@ pub enum OpenMenu {
     /// (what a narrow composer folds away).
     Mode,
     ComposerMore,
+    ComposerDelivery,
     /// The start page's model, mode and branch menus.
     StartModel,
     StartMode,
@@ -574,6 +575,7 @@ pub struct UiState {
     pub prompt_history_draft_stash: Option<String>,
     /// Whether the composer prompt history picker popup is open.
     pub composer_history_open: bool,
+    pub composer_queue_delivery: bool,
     pub composer_queue_expanded: bool,
     pub composer_queue_page: Option<String>,
     /// Timeline in-session search state (Ctrl+F in session mode).
@@ -797,6 +799,7 @@ impl UiState {
             prompt_history_cursor: None,
             prompt_history_draft_stash: None,
             composer_history_open: false,
+            composer_queue_delivery: false,
             composer_queue_expanded: false,
             composer_queue_page: None,
             timeline_search: TimelineSearch::default(),
