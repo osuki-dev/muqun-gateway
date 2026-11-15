@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 [[ "$(uname -s)" == Linux ]] || { echo 'Linux packaging requires Linux' >&2; exit 1; }
 if [[ "${1:-}" != --no-build ]]; then
   [[ $# == 0 ]] || { echo 'usage: package-linux.sh [--no-build]' >&2; exit 1; }
-  cargo build --manifest-path "$ROOT/Cargo.toml" -p muqun-desktop --release --locked
+  bash "$ROOT/desktop/scripts/build-release.sh"
 fi
 [[ $# -le 1 ]] || exit 1
 BIN="${CARGO_TARGET_DIR:-$ROOT/target}/release/muqun-desktop"
@@ -21,10 +21,11 @@ cp "$ROOT/desktop/scripts/install-local.sh" "$ROOT/desktop/scripts/uninstall-loc
 cp -R "$ROOT/desktop/packaging/linux" "$PKG/desktop/packaging/"
 cp "$ROOT/desktop/assets/plugins/review-center/plugin.json" "$ROOT/desktop/assets/plugins/review-center/review.ts" "$ROOT/desktop/assets/plugins/review-center/README.md" "$PKG/desktop/assets/plugins/review-center/"
 cp "$ROOT/desktop/README.md" "$PKG/README.md"
+cp "$ROOT/LICENSE" "$ROOT/LICENSE-MIT" "$PKG/"
 git -C "$ROOT" rev-parse HEAD > "$PKG/SOURCE"
 if [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then
   printf 'dirty working tree; local candidate only\n' >> "$PKG/SOURCE"
 fi
-tar -czf "$OUT/$NAME.tar.gz" -C "$STAGE" "$NAME"
+tar -cf - -C "$STAGE" "$NAME" | gzip -9n > "$OUT/$NAME.tar.gz"
 (cd "$OUT" && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
 printf 'Created %s\nInstall after extraction: bash %s/desktop/scripts/install-local.sh --no-build\n' "$OUT/$NAME.tar.gz" "$NAME"
