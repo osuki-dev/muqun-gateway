@@ -192,7 +192,7 @@ fn agents(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                         .child(text(format!("{selected} ▾")).font(font).color(ink))
                 })
                 .variant(ButtonVariant::Neutral)
-                .control_size(ControlSize::Regular)
+                .control_size(ControlSize::Small)
                 .expanded(open)
                 .on_press(move |s: &mut UiState| s.menu = (!open).then_some(OpenMenu::StartAgents))
                 .build(k)
@@ -200,7 +200,7 @@ fn agents(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .radius(k.radius.lg)
                 .h(32.0)
                 .px(12.0)
-                .py(8.0)
+                .py(0.0)
                 .border(1.0, k.c.info.icon.alpha(0.35)),
         )
         .open(open)

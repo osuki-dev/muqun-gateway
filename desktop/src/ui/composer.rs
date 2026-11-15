@@ -1774,7 +1774,7 @@ pub fn pill(k: &Kit, key: &str, label: String, open: bool, menu: OpenMenu) -> El
         .radius(k.radius.lg)
         .h(32.0)
         .px(12.0)
-        .py(7.0)
+        .py(0.0)
         .fill(k.c.layer_01.alpha(0.35))
         .border(1.0, k.c.border_muted.alpha(0.25))
 }
