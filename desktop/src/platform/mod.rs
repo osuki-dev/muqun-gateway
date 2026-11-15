@@ -44,11 +44,10 @@ pub fn directories() -> anyhow::Result<(PathBuf, PathBuf)> {
 /// Whether the window is made see-through, so the sidebar and the main card
 /// float on the desktop and the frame around them shows what is behind the
 /// window. Linux compositors draw that, Hyprland and KWin blurred, which
-/// costs the app nothing; macOS and Windows keep the opaque frame until it
-/// is checked there. Under reduce transparency the app paints the frame
-/// solid anyway.
+/// costs the app nothing; macOS uses native materials inside this transparent
+/// surface. Under reduce transparency the app paints the frame solid anyway.
 pub fn see_through_window() -> bool {
-    cfg!(target_os = "linux")
+    cfg!(any(target_os = "linux", target_os = "macos"))
 }
 
 /// Whether this build is running on macOS.

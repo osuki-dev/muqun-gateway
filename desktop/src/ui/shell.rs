@@ -388,7 +388,18 @@ fn sidebar_panel(s: &UiState, k: &Kit, wash: f32) -> El {
     } else {
         super::panes::SPRING
     };
-    panel_surface(k, "sidebar-panel", wash, s.look().dark)
+    let panel = panel_surface(k, "sidebar-panel", wash, s.look().dark);
+    let panel = if crate::platform::is_macos() && s.look().glass {
+        col()
+            .key("sidebar-panel")
+            .radius(k.radius.lg)
+            .fill(k.c.bg_base.alpha(0.85))
+            .border(1.0, k.c.border_muted)
+            .system_material(rune::SystemMaterial::Glass)
+    } else {
+        panel
+    };
+    panel
         .pin(Some(frame), Some(frame), None, Some(frame))
         .w((s.sidebar.width() - frame * 2.0).max(0.0))
         .opacity(if open { 1.0 } else { 0.0 })
