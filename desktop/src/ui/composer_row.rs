@@ -57,7 +57,7 @@ static MORE: Icon = Icon {
 static AUTO_APPROVE: Icon = Icon {
     name: "cmp-approval-always",
     view: 24.0,
-    body: r#"<path d="m3 12 4 4L17 6m-5 11 3 3 7-9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    body: r#"<path d="M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6l-8-3Zm-4 9 3 3 5-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
 static BRANCH: Icon = Icon {
@@ -125,7 +125,6 @@ enum ModelLook {
 struct Fold {
     agent_icon: bool,
     model: ModelLook,
-    auto_icon: bool,
     mode_icon: bool,
     branch_icon: bool,
     more_branch: bool,
@@ -137,7 +136,6 @@ struct Fold {
 const FULL: Fold = Fold {
     agent_icon: false,
     model: ModelLook::Split,
-    auto_icon: false,
     mode_icon: false,
     branch_icon: false,
     more_branch: false,
@@ -149,10 +147,9 @@ const FULL: Fold = Fold {
 /// The steps, in the order the row gives them up: words before meaning;
 /// the permission mode (a bypass is worth seeing) is the last to leave, after
 /// the agent, which the pane's header names anyway.
-const FOLDS: [fn(&mut Fold); 12] = [
+const FOLDS: [fn(&mut Fold); 11] = [
     |f| f.agent_icon = true,
     |f| f.model = ModelLook::Joined,
-    |f| f.auto_icon = true,
     |f| f.mode_icon = true,
     |f| f.branch_icon = true,
     |f| f.model = ModelLook::Name,
@@ -353,12 +350,7 @@ impl Controls {
             }
         }
         if !f.more_auto {
-            items.push(if f.auto_icon {
-                ICON_PILL
-            } else {
-                // The switch's label, its gap and the small track.
-                text_w(self.tr("Auto-approve"), small) + 8.0 + 44.0
-            });
+            items.push(ICON_PILL);
         }
         if self.has_more(f) {
             items.push(ICON_PILL);
@@ -721,38 +713,22 @@ fn auto_help(c: &Controls) -> String {
     )
 }
 
-fn auto_control(c: &Controls, k: &Kit, f: Fold) -> El {
+fn auto_control(c: &Controls, k: &Kit) -> El {
     let (on, asid) = (c.auto_on, c.asid.clone());
-    let label = c.tr("Auto-approve");
-    if !f.auto_icon {
-        return rune_kit::Switch::new(on)
-            .label(label)
-            .on_toggle(move |s: &mut UiState| set_auto(s, &asid, !on))
-            .build(k)
-            .key("auto-approve")
-            .h(36.0)
-            .px(8.0)
-            .radius(k.radius.lg)
-            .fill(k.c.layer_01.alpha(0.25));
-    }
-    // A toggle: lit in the accent while on.
-    let tone = if on { k.c.bg_accent } else { k.c.icon_muted };
-    let b = Button::new(label)
-        .variant(ButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
+    rune_kit::IconButton::new(&AUTO_APPROVE)
+        .variant(if on {
+            rune_kit::IconButtonVariant::Contrast
+        } else {
+            rune_kit::IconButtonVariant::GhostMuted
+        })
+        .control_size(ControlSize::ExtraLarge)
+        .label(c.tr("Auto-approve"))
         .help(auto_help(c))
-        .label_with(move |_, _| icon(&AUTO_APPROVE, GLYPH).color(tone))
         .on_press(move |s: &mut UiState| set_auto(s, &asid, !on))
         .build(k)
         .key("auto-approve")
         .role("switch")
         .checked(on)
-        .px(3.0);
-    if on {
-        b.fill(k.c.bg_accent.alpha(0.14))
-    } else {
-        b
-    }
 }
 
 fn branch_control(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -> Option<El> {
@@ -893,7 +869,7 @@ fn build(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -> El
         }
     }
     if !f.more_auto {
-        line = line.child(auto_control(c, k, f));
+        line = line.child(auto_control(c, k));
     }
     if c.has_more(f) {
         line = line.child(more_menu(s, c, k, layer, f));
