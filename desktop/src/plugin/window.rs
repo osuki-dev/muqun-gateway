@@ -50,7 +50,7 @@ pub fn chrome(id: &str, ctx: &PluginViewContext<'_>, body: El, layer: &mut Vec<E
     let mut header = row()
         .key(format!("window-header-{id}-{:?}", ctx.surface))
         .w_full()
-        .min_h(44.0)
+        .min_h(rune_kit::shell::TOOLBAR_HEIGHT)
         .px(10.0)
         .py(4.0)
         .gap(8.0)

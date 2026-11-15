@@ -43,17 +43,6 @@ pub fn is_ctrl_space(ev: &KeyEvent, physical: Option<PhysicalKeyCode>) -> bool {
     space && m.ctrl && !m.alt && !m.shift && !m.logo
 }
 
-/// Whether `ev` is Ctrl+; (or Cmd+; on macOS) to switch focus between
-/// the terminal and the session composer.
-pub fn is_focus_toggle(ev: &KeyEvent, physical: Option<PhysicalKeyCode>, mac: bool) -> bool {
-    let m = ev.mods;
-    let semi = physical == Some(PhysicalKeyCode::Semicolon)
-        || matches!(&ev.key, Key::Command(';'))
-        || matches!(&ev.key, Key::Text(t) if t == ";");
-    let primary = m.ctrl || (mac && m.logo);
-    semi && primary && !m.alt && !m.shift
-}
-
 /// Route a key the terminal heard. `mac`: ⌘ chords are the app's, as in
 /// Terminal.app and every macOS terminal.
 pub fn route(ev: &KeyEvent, physical: Option<PhysicalKeyCode>, mac: bool) -> Route {

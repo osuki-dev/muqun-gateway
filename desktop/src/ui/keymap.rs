@@ -601,7 +601,7 @@ pub static ENTRIES: &[Entry] = &[
         e(
             A::TermCycleTab,
             G::Terminal,
-            "alt+left, alt+right, ctrl+tab, ctrl+shift+tab",
+            "alt+left, alt+right, ctrl+tab, ctrl+shift+tab, ctrl+pageup, ctrl+pagedown, ctrl+shift+[, ctrl+shift+]",
             "Previous or next terminal tab",
         ),
         Owner::Terminal,
@@ -1645,7 +1645,7 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
             if was_term {
                 s.term.sink.focused = false;
             }
-            let handled = super::tiles::arrow_key(s, ev);
+            let handled = super::tiles::move_toward(s, &ev.key, action == A::SwapPaneToward);
             if s.in_split() && s.tiles.get(s.focus).is_some_and(|t| t.is_terminal()) {
                 s.focus_terminal_tx(tx);
             } else if was_term && !handled {
