@@ -12,7 +12,7 @@ use super::{muted, Mode, OpenMenu, Slot, UiState};
 use crate::config::ConfigEdit;
 use crate::model::commands::Command;
 use crate::model::compose::{ComposeCommand, Target};
-use crate::theme::look::{Look, PANEL_RADIUS};
+use crate::theme::look::Look;
 
 /// The widest the composer gets, on a very wide window.
 const DOCK_MAX: f32 = 1180.0;
@@ -150,46 +150,8 @@ fn usable_agents(s: &UiState) -> Vec<muqun_gateway::platform::discovery::AgentDi
     usable
 }
 
-/// Which of `widths` (in order) fit on one line `room` wide with `gap`
-/// between them, keeping `keep` in and leaving `more` for the overflow
-/// button when any are left out. Returns the shown indices, in order.
-fn fit_on_line(widths: &[f32], room: f32, gap: f32, more: f32, keep: Option<usize>) -> Vec<usize> {
-    let total: f32 = widths.iter().sum::<f32>() + gap * widths.len().saturating_sub(1) as f32;
-    if total <= room {
-        return (0..widths.len()).collect();
-    }
-    let room = room - more - gap;
-    let mut shown = Vec::new();
-    let mut used = 0.0;
-    for (i, w) in widths.iter().enumerate() {
-        let next = used + if shown.is_empty() { 0.0 } else { gap } + w;
-        if next > room {
-            break;
-        }
-        used = next;
-        shown.push(i);
-    }
-    if let Some(k) = keep {
-        if !shown.contains(&k) {
-            // The chosen one stays on the line, in place of the last that fit.
-            while !shown.is_empty() {
-                let width: f32 = shown.iter().map(|&i| widths[i]).sum::<f32>()
-                    + widths[k]
-                    + gap * shown.len() as f32;
-                if width <= room {
-                    break;
-                }
-                shown.pop();
-            }
-            shown.push(k);
-        }
-    }
-    shown
-}
-
-/// The agent picker: one line of chips, the agents in use first; the rest
-/// in a "More" menu, so the line never wraps into a ragged second row.
-fn agents(s: &UiState, k: &Kit, layer: &mut Vec<El>, room: f32) -> El {
+/// A compact agent selector; all available agents remain one click away.
+fn agents(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let usable = usable_agents(s);
     let language = s.cfg.general.language;
     if usable.is_empty() {
@@ -215,91 +177,45 @@ fn agents(s: &UiState, k: &Kit, layer: &mut Vec<El>, room: f32) -> El {
                     .key("agents-settings"),
             );
     }
+    let open = s.menu == Some(OpenMenu::StartAgents);
+    let selected = super::agents::name(&s.start_agent, &s.agents);
+    let agent_id = s.start_agent.clone();
     let dark = s.dark;
-    let names: Vec<String> = usable
-        .iter()
-        .map(|a| super::agents::name(&a.id, &s.agents))
-        .collect();
-    // A chip: its padding, the mark and the gap beside it, and the label.
-    let widths: Vec<f32> = names
-        .iter()
-        .map(|n| rune::text::measure(n, &[], k.ty.ui, None).0 + 12.0 * 2.0 + 15.0 + 7.0 + 2.0)
-        .collect();
-    let more_label =
-        |n: usize| super::copy::localize(language, format!("+{} {}", n, tr(language, "more")));
-    let more_w = rune::text::measure(&more_label(widths.len()), &[], k.ty.small, None).0 + 40.0;
-    let picked = usable.iter().position(|a| a.id == s.start_agent);
-    let shown = fit_on_line(&widths, room, 8.0, more_w, picked);
-    let mut line = row().key("agents").w_full().gap(8.0).center_y();
-    for &i in &shown {
-        let a = &usable[i];
-        let selected = a.id == s.start_agent;
-        let id = a.id.clone();
-        let label = names[i].clone();
-        let brand = super::agents::color(&a.id, dark);
-        let chip = Button::new(label.clone())
-            .variant(if selected {
-                ButtonVariant::Outline
-            } else {
-                ButtonVariant::GhostMuted
-            })
-            .control_size(ControlSize::Regular)
-            .label_with({
-                let id = id.clone();
-                move |font, ink| {
+    let mut menu = rune_kit::Menu::new("start-agents")
+        .placement(rune_kit::Placement::TopStart)
+        .trigger(
+            Button::new(format!("{selected} ▾"))
+                .label_with(move |font, ink| {
                     row()
-                        .gap(7.0)
+                        .gap(8.0)
                         .center_y()
-                        .child(if selected {
-                            super::agents::mark(&id, 15.0, dark)
-                        } else {
-                            super::agents::mark_idle(&id, 15.0, ink)
-                        })
-                        .child(text(label).font(font).color(ink))
-                }
-            })
-            .on_press(move |s: &mut UiState| pick_agent(s, id.clone()))
-            .build(k)
-            .key(format!("agent-{}", a.id));
-        // The chosen agent is lit in its own colour.
-        let chip = if selected {
-            s.look()
-                .glow(chip.border(1.0, brand.alpha(0.55)), brand, 0.5)
-        } else {
-            chip
-        };
-        line = line.child(chip);
+                        .child(super::agents::mark(&agent_id, 20.0, dark))
+                        .child(text(format!("{selected} ▾")).font(font).color(ink))
+                })
+                .variant(ButtonVariant::Neutral)
+                .control_size(ControlSize::Regular)
+                .expanded(open)
+                .on_press(move |s: &mut UiState| s.menu = (!open).then_some(OpenMenu::StartAgents))
+                .build(k)
+                .key("agents-more")
+                .radius(22.0)
+                .h(40.0)
+                .px(16.0)
+                .py(10.0)
+                .border(1.0, k.c.info.icon.alpha(0.35)),
+        )
+        .open(open)
+        .min_width(220.0)
+        .on_close(|s: &mut UiState| s.menu = None);
+    for agent in usable {
+        let id = agent.id;
+        menu = menu.item(
+            rune_kit::MenuItem::new(super::agents::name(&id, &s.agents))
+                .lead(super::agents::mark(&id, 15.0, s.dark))
+                .on_select(move |s: &mut UiState| pick_agent(s, id.clone())),
+        );
     }
-    let rest: Vec<usize> = (0..usable.len()).filter(|i| !shown.contains(i)).collect();
-    if !rest.is_empty() {
-        let open = s.menu == Some(OpenMenu::StartAgents);
-        let mut menu = rune_kit::Menu::new("start-agents")
-            .placement(rune_kit::Placement::TopStart)
-            .trigger(
-                Button::new(more_label(rest.len()))
-                    .variant(ButtonVariant::GhostMuted)
-                    .control_size(ControlSize::Regular)
-                    .expanded(open)
-                    .on_press(move |s: &mut UiState| {
-                        s.menu = (!open).then_some(OpenMenu::StartAgents)
-                    })
-                    .build(k)
-                    .key("agents-more"),
-            )
-            .open(open)
-            .min_width(200.0)
-            .on_close(|s: &mut UiState| s.menu = None);
-        for i in rest {
-            let id = usable[i].id.clone();
-            menu = menu.item(
-                rune_kit::MenuItem::new(names[i].clone())
-                    .lead(super::agents::mark(&id, 15.0, dark))
-                    .on_select(move |s: &mut UiState| pick_agent(s, id.clone())),
-            );
-        }
-        line = line.child(menu.build(k, layer));
-    }
-    line
+    menu.build(k, layer)
 }
 
 /// One folder the picker offers: what to call it, where it is, its branch.
@@ -691,18 +607,26 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
 
 // ---- the page ------------------------------------------------------------------------
 
-/// The start form: which agent, the first prompt, and under it one quiet
-/// row of choices (folder, branch, model, mode, worktree) beside Start.
+/// Context above the editor; agent and delivery actions below it.
 fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f32; 2]) -> El {
     let language = s.cfg.general.language;
     let mut card = col()
         .key("home-card")
         .w_full()
-        .gap(16.0)
+        .gap(24.0)
         .px(START_PAD)
         .pt(START_PAD - 4.0)
-        .pb(START_PAD - 6.0)
-        .child(agents(s, k, layer, size[0] - START_PAD * 2.0));
+        .pb(START_PAD - 6.0);
+    let mut context = row()
+        .gap(8.0)
+        .center_y()
+        .flex_wrap()
+        .child(folder(s, k, layer));
+    if let Some(branch) = start_branch(s, k, layer) {
+        context = context.child(branch);
+    }
+    context = context.child(worktree(s, k));
+    let context = composer::context_capsule(k, look, context);
     composer::popup(s, k, layer, Slot::Start);
     if let Some(chips) = composer::chips(s, k, layer) {
         card = card.child(chips);
@@ -710,10 +634,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
     if s.drop_hover {
         card = card.child(composer::drop_hint(k, look, language));
     }
-    let placeholder = tr_ref(
-        language,
-        "Describe the task…  (/ commands, $ skills, @ mentions)",
-    );
+    let placeholder = tr_ref(language, "Describe the task…");
     let accent = k.c.bg_accent;
     let info = k.c.info.icon;
     card = card.child(
@@ -761,14 +682,12 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
         .w_full()
         .gap(4.0)
         .center_y()
-        .child(folder(s, k, layer));
-    if let Some(branch) = start_branch(s, k, layer) {
-        actions = actions.child(branch);
-    }
+        .flex_wrap()
+        .child(agents(s, k, layer));
     if let Some(pills) = start_pills(s, k, layer) {
         actions = actions.child(pills.ml(4.0));
     }
-    actions = actions.child(worktree(s, k));
+
     if let Some(i) = s.pending_tile {
         actions = actions.child(
             rune_kit::Badge::new(format!(
@@ -780,28 +699,46 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
             .build(k),
         );
     }
+    let attach_cwd = PathBuf::from(s.start_cwd.text.trim());
+    let tools = row().gap(6.0).center_y().child(
+        rune_kit::IconButton::new(&super::parts::glyphs::ATTACH)
+            .variant(rune_kit::IconButtonVariant::GhostMuted)
+            .label(tr_ref(language, "Attach"))
+            .help(tr_ref(language, "Add files or an image"))
+            .on_press(move |_: &mut UiState| {
+                crate::platform::dialogs::attach_files(Some(attach_cwd.clone()))
+            })
+            .build(k)
+            .key("start-attach")
+            .size(36.0, 36.0)
+            .radius(18.0)
+            .fill(k.c.layer_01.alpha(0.40))
+            .border(1.0, k.c.border_muted.alpha(0.25)),
+    );
     actions = actions
         .child(el().grow(1.0).a11y_hidden())
-        .child(
-            muted(
-                k,
-                format!(
-                    "{} {}",
-                    crate::platform::keys::label("Primary+Enter"),
-                    tr_ref(language, "to start")
-                ),
-            )
-            .mr(8.0),
-        )
+        .child(tools)
         .child(
             look.glow(
                 Button::new(tr_ref(language, "Start"))
+                    .label_with(|_, ink| rune::icon(&composer::SEND, 20.0).color(ink))
+                    .help(format!(
+                        "{} · {}",
+                        tr_ref(language, "Start"),
+                        crate::platform::keys::label("Primary+Enter")
+                    ))
                     .variant(ButtonVariant::Submit)
                     .control_size(ControlSize::Large)
-                    .disabled(s.pending_submit.is_some())
+                    .disabled(
+                        s.pending_submit.is_some()
+                            || s.start_draft.text.trim().is_empty()
+                            || s.start_agent.is_empty(),
+                    )
                     .on_press(submit_start)
                     .build(k)
-                    .key("start"),
+                    .key("start")
+                    .size(44.0, 44.0)
+                    .radius(22.0),
                 k.c.bg_accent,
                 if s.start_draft.text.trim().is_empty() {
                     0.0
@@ -811,13 +748,15 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
             ),
         );
     card = card.child(actions);
-    let card = look.panel(k, card, PANEL_RADIUS).motion(k.motion.control);
     let card = composer::composer_card(k, look, card, s.start_draft.focused, false, s.drop_hover)
         .on_drop_files(|s: &mut UiState, files, _| composer::attach_dropped_files(s, files))
         .on_drop_hover(|s: &mut UiState, over, _| s.drop_hover = over);
     // A frame the pack drew to reach past the field sits over its edges.
-    el().key("home-dock")
+    col()
+        .key("home-dock")
         .w_full()
+        .gap(12.0)
+        .child(row().child(context))
         .child(card)
         .children(composer_frame(s, size))
 }
@@ -1063,23 +1002,4 @@ pub fn view(
         .child(stage)
         .on_drop_files(|s: &mut UiState, files, _| composer::attach_dropped_files(s, files))
         .on_drop_hover(|s: &mut UiState, over, _| s.drop_hover = over)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn agent_chips_stay_on_one_line_with_the_chosen_one() {
-        let widths = [100.0, 100.0, 100.0, 100.0, 100.0];
-        // All fit: no overflow.
-        assert_eq!(
-            fit_on_line(&widths, 600.0, 10.0, 60.0, Some(4)),
-            [0, 1, 2, 3, 4]
-        );
-        // Some fit, the rest go to "More"; the chosen one is among them.
-        assert_eq!(fit_on_line(&widths, 400.0, 10.0, 60.0, Some(1)), [0, 1, 2]);
-        // A chosen one past the fold takes the last shown place.
-        assert_eq!(fit_on_line(&widths, 400.0, 10.0, 60.0, Some(4)), [0, 1, 4]);
-    }
 }

@@ -1,4 +1,6 @@
 {
+  "Describe the task…": "描述你的任务…",
+  "Message…": "输入消息…",
   "Open": "打开",
   "Remove": "移除",
   "Steer:": "插队：",
@@ -600,5 +602,10 @@
   "A command or path. Empty looks it up on PATH.": "命令或路径；留空时从 PATH 查找。",
   "Start with Muqun": "随 Muqun 启动",
   "Launch its server when Muqun starts.": "启动 Muqun 时启动对应服务。",
-  "The coding agents found on this computer. Changes save as you type.": "当前电脑发现的编程 Agent，修改会自动保存。"
+  "The coding agents found on this computer. Changes save as you type.": "当前电脑发现的编程 Agent，修改会自动保存。",
+  "Recent sessions": "最近会话",
+  "All sessions": "所有会话",
+  "Browse every session. Search always includes all sessions.": "查看所有会话；搜索始终覆盖全部会话。",
+  "Last 3 days, up to 8 recent sessions. Pinned, open and active sessions stay visible.": "最近 3 天，最多 8 个近期会话；置顶、已打开和进行中的会话始终保留。",
+  "No recent sessions. Open All sessions to continue earlier work.": "暂无最近会话，打开「所有会话」继续之前的工作。"
 }

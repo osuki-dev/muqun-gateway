@@ -34,6 +34,12 @@ pub(crate) fn fresh(text: impl Into<String>) -> TextEdit {
     edit
 }
 
+pub static SEND: rune::Icon = rune::Icon {
+    name: "composer-send",
+    view: 24.0,
+    body: r#"<path d="M6 18 18 6M6 6h12v12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
 pub static PHOTO: rune::Icon = rune::Icon {
     name: "composer-photo",
     view: 24.0,
@@ -232,9 +238,13 @@ pub(super) fn note_skill_args(s: &mut UiState, deliver: &Deliver) {
     );
 }
 
-/// Send the draft. While the agent works it steers the running turn, as on
-/// the App; [`queue_session`] (Alt+Enter) waits for the turn to end instead.
-/// A quiet composer surface with a visible focus border and shallow elevation.
+/// A compact floating capsule for the active project or session controls.
+pub fn context_capsule(k: &Kit, look: &crate::theme::look::Look, content: El) -> El {
+    look.panel(k, content.px(14.0).py(8.0), 24.0)
+        .border(1.0, k.c.border_muted.alpha(0.45))
+}
+
+/// A single frosted surface with a soft, theme-aware rim.
 pub fn composer_card(
     k: &Kit,
     look: &crate::theme::look::Look,
@@ -243,36 +253,42 @@ pub fn composer_card(
     busy: bool,
     drop_hover: bool,
 ) -> El {
-    let active = focused || busy || drop_hover;
-    let accent = k.c.bg_accent;
-    let radius = k.radius.lg;
-    let card = card
-        .radius(radius)
-        .clip_rounded(radius)
-        .fill(k.c.surface_raised_base)
+    let active = focused || drop_hover;
+    let base = look.panel_fill(k);
+    let card = look
+        .panel(k, card, 24.0)
         .linear_gradient(
-            0.35,
+            0.65,
             [
-                (
-                    0.0,
-                    k.c.surface_raised_base
-                        .mix(accent, if look.dark { 0.15 } else { 0.05 }),
-                ),
-                (0.55, k.c.surface_raised_base),
-                (
-                    1.0,
-                    k.c.surface_raised_base
-                        .mix(k.c.info.icon, if look.dark { 0.09 } else { 0.03 }),
-                ),
+                (0.0, base.mix(k.c.info.icon, 0.08)),
+                (0.55, base),
+                (1.0, base.mix(k.c.bg_accent, 0.10)),
             ],
         )
-        .child(
-            look.energy_line(k, "composer-energy", busy)
-                .pin(Some(14.0), Some(0.0), Some(14.0), None)
-                .opacity(if active { 1.0 } else { 0.35 }),
+        .border_gradient(
+            1.0,
+            k.c.info.icon.alpha(if active { 0.80 } else { 0.30 }),
+            k.c.bg_accent.alpha(if active { 0.65 } else { 0.25 }),
         )
+        .box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 16.0,
+            blur: 42.0,
+            spread: -8.0,
+            color: k.c.black.alpha(if look.dark { 0.45 } else { 0.12 }),
+            inset: false,
+        })
         .motion(look.focus_fade());
-    look.luminous(k, card, active)
+    if busy {
+        card.child(look.energy_line(k, "composer-energy", true).w(120.0).pin(
+            Some(28.0),
+            Some(0.0),
+            None,
+            None,
+        ))
+    } else {
+        card
+    }
 }
 
 /// A composer card (a [`Look::panel`](crate::theme::look::Look::panel))
@@ -1668,6 +1684,12 @@ pub fn pill(k: &Kit, key: &str, label: String, open: bool, menu: OpenMenu) -> El
         .on_press(move |s: &mut UiState| s.menu = (!open).then(|| menu.clone()))
         .build(k)
         .key(key.to_string())
+        .radius(18.0)
+        .h(32.0)
+        .px(12.0)
+        .py(7.0)
+        .fill(k.c.layer_01.alpha(0.35))
+        .border(1.0, k.c.border_muted.alpha(0.25))
 }
 
 /// The model menu: every enabled model of the agent's catalogue, by provider.
@@ -1867,21 +1889,10 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         tr_ref(language, "Send")
     };
 
-    // The controls fold to fit beside the buttons, measured on the card
-    // itself (a split pane is narrower than the window); only when even
-    // their narrowest fold does not fit do they take a line of their own.
+    // Measure the actual card so controls also fold inside split panes.
     use super::composer_row::{self as controls_row, ACTION_GAP, CARD_PAD};
     let inner = rune::memo::layout_with("composer-card", |r| r[2].round())
-        .map_or(f32::INFINITY, |w| w - CARD_PAD);
-    let button_w = |label: &str| rune::text::measure(label, &[], k.ty.ui_medium, None).0 + 24.0;
-    // Mic, Attach, History, Expand (24 pt each), Send, Stop while working, the gaps.
-    let mut buttons = 4.0 * 24.0 + button_w(send_label) + 5.0 * ACTION_GAP;
-    if busy {
-        buttons += button_w(stop_label) + ACTION_GAP;
-    }
-    // Narrower still, Mic, Attach, History and Expand join the controls' line
-    // so Stop and Send keep their words.
-    let squeezed = inner < buttons;
+        .map_or(f32::INFINITY, |w| w - CARD_PAD - 24.0);
     let expand_icon = if s.composer_expanded || s.composer_rows.is_some() {
         &super::icons::COLLAPSE
     } else {
@@ -1936,55 +1947,39 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .build(k)
         .key("composer-history");
 
-    let mut tools = Some(
-        row()
-            .gap(ACTION_GAP)
-            .center_y()
-            .child(super::voice::mic_button(s, k))
-            .child(attach)
-            .child(history_btn)
-            .child(expand_btn),
-    );
-    let tools_w = 4.0 * 24.0 + 4.0 * ACTION_GAP;
+    let tools = row()
+        .gap(ACTION_GAP)
+        .center_y()
+        .child(attach)
+        .child(super::voice::mic_button(s, k))
+        .child(history_btn)
+        .child(expand_btn);
     let controls = controls_row::Controls::read(s);
-    // Keep a readable model/mode row in narrow panes instead of compressing
-    // it into a run of indistinguishable icons beside microphone and send.
-    let beside = controls
-        .as_ref()
-        .filter(|_| inner - buttons >= 220.0)
-        .and_then(|c| controls_row::beside(s, c, k, layer, inner - buttons));
-    let mut own_line = None;
-    if beside.is_none() {
-        let mut line = row()
+    let own_line = controls.as_ref().map(|c| {
+        controls_row::beside(s, c, k, layer, inner)
+            .unwrap_or_else(|| controls_row::own_line(s, c, k, layer, inner))
             .key("composer-controls")
             .w_full()
-            .gap(ACTION_GAP)
-            .center_y();
-        let mut room = inner;
-        if squeezed {
-            line = line.children(tools.take());
-            room -= tools_w;
-        }
-        if let Some(c) = &controls {
-            line = line.child(controls_row::own_line(s, c, k, layer, room));
-        }
-        own_line = Some(line);
-    }
+    });
     let mut actions = row()
         .key("composer-actions")
         .w_full()
         .gap(ACTION_GAP)
-        .center_y();
-    if let Some(r) = beside {
-        actions = actions.child(r.shrink().min_w(0.0)).child(el().grow(1.0));
-    }
-    if let Some(tools) = tools {
-        actions = actions.child(tools);
-    }
-    if own_line.is_some() {
-        actions = actions.child(el().grow(1.0));
-    }
+        .center_y()
+        .flex_wrap()
+        .child(tools)
+        .child(el().grow(1.0));
     if busy {
+        actions = actions.child(
+            Button::new(tr_ref(language, "Queue"))
+                .variant(ButtonVariant::Neutral)
+                .control_size(ControlSize::Regular)
+                .disabled(!has_session || !has_text || s.pending_submit.is_some())
+                .shortcut("Alt+Enter")
+                .on_press(queue_session)
+                .build(k)
+                .key("composer-queue"),
+        );
         if let Some(asid) = s.selected.clone() {
             actions = actions.child(
                 Button::new(stop_label)
@@ -2000,6 +1995,13 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         }
     }
     let send = Button::new(send_label)
+        .label_with(move |font, ink| {
+            if busy {
+                text(send_label).font(font).color(ink)
+            } else {
+                rune::icon(&SEND, 20.0).color(ink)
+            }
+        })
         .variant(ButtonVariant::Submit)
         .control_size(ControlSize::Regular)
         .disabled(!has_session || !has_text || s.pending_submit.is_some())
@@ -2017,6 +2019,11 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .on_press(submit_session)
         .build(k)
         .key("send");
+    let send = if busy {
+        send
+    } else {
+        send.size(44.0, 44.0).radius(22.0)
+    };
     actions = actions.child(look.glow(
         send,
         k.c.bg_accent,
@@ -2028,10 +2035,10 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let mut card = col()
         .key("composer-card")
         .w_full()
-        .gap(8.0)
-        .px(12.0)
-        .pt(8.0)
-        .pb(10.0);
+        .gap(12.0)
+        .px(24.0)
+        .pt(16.0)
+        .pb(18.0);
 
     let resizer = row()
         .key("composer-resizer")
@@ -2070,6 +2077,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 ),
         );
     card = card.child(resizer);
+
     if let Some(chips) = chips(s, k, layer) {
         card = card.child(chips);
     }
@@ -2077,13 +2085,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         card = card.child(drop_hint(k, &look, language));
     }
     let placeholder = if has_session {
-        let full = tr_ref(language, "Message…  (/ commands, $ skills, @ mentions)");
-        // A narrow card keeps the hint to one line.
-        if rune::text::measure(full, &[], k.ty.ui, None).0 + 24.0 <= inner {
-            full
-        } else {
-            tr_ref(language, "Message…  (/ $ @)")
-        }
+        tr_ref(language, "Message…")
     } else {
         tr_ref(language, "Pick a session first")
     };
@@ -2179,16 +2181,6 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             .key("draft")
             .w_full(),
     );
-    card = card.child(
-        el().key("composer-controls-rule")
-            .w_full()
-            .h(1.0)
-            .fill(k.c.border_muted)
-            .a11y_hidden(),
-    );
-    if let Some(line) = own_line {
-        card = card.child(line);
-    }
     card = card.child(actions);
 
     // Keep focus visible without competing with the message content.
@@ -2206,6 +2198,8 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .px(16.0)
         .pt(6.0)
         .pb(14.0)
+        .children(own_line.map(|line| context_capsule(k, &look, line).max_w(column)))
+        .gap(10.0)
         .child(card.w_full().max_w(column))
 }
 

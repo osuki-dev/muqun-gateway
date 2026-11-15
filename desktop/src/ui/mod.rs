@@ -502,6 +502,8 @@ pub struct UiState {
     pub worktrees: Vec<WorktreeRow>,
 
     pub search: TextEdit,
+    pub sidebar_all_sessions: bool,
+    pub sidebar_opened: HashMap<String, u64>,
     pub pairing_target: Option<String>,
     pub pairing_request_id: Option<String>,
     pub pairing_code_input: TextEdit,
@@ -745,6 +747,8 @@ impl UiState {
             shells: Vec::new(),
             worktrees: Vec::new(),
             search: TextEdit::new(""),
+            sidebar_all_sessions: false,
+            sidebar_opened: HashMap::new(),
             pairing_target: None,
             pairing_request_id: None,
             pairing_code_input: TextEdit::new(""),
@@ -1363,6 +1367,19 @@ impl UiState {
     /// Show session `asid`. In split view it joins as a new pane (or takes
     /// focus where it already is); otherwise it fills the main card.
     pub fn open_session(&mut self, asid: &str) {
+        let key = format!("{}:{asid}", self.current_computer());
+        self.sidebar_opened.insert(key, now_ms());
+        if self.sidebar_opened.len() > 256 {
+            if let Some(oldest) = self
+                .sidebar_opened
+                .iter()
+                .min_by_key(|(_, time)| *time)
+                .map(|(id, _)| id.clone())
+            {
+                self.sidebar_opened.remove(&oldest);
+            }
+        }
+        self.sidebar_all_sessions = false;
         self.active_plugin_page = None;
         if self.in_split() && self.tile_of(asid).is_none() {
             crate::platform::notify::withdraw(asid);

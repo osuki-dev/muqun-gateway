@@ -453,9 +453,7 @@ fn pill_button(
     } else {
         k.c.border_muted.alpha(0.30)
     };
-    e.radius(k.radius.xs)
-        .fill(chip_fill)
-        .border(0.5, chip_border)
+    e.radius(18.0).fill(chip_fill).border(0.5, chip_border)
 }
 
 fn agent_chip(c: &Controls, k: &Kit, f: Fold) -> El {
