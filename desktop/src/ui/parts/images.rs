@@ -217,8 +217,7 @@ fn thumbnail(k: &Kit, s: &UiState, path: &Path, key: String, height: f32) -> El 
             .shrink()
             .h(height)
             .radius(k.radius.md)
-            .clip_rounded(k.radius.md)
-            .border(1.0, k.c.border_weak),
+            .clip_rounded(k.radius.md),
     )
     .cursor(Cursor::Pointer)
     .label(label)
