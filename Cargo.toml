@@ -100,3 +100,11 @@ opt-level = 3
 # Optional local override (not required for CI): point at a sibling checkout
 # with `cargo --config 'patch."https://github.com/ryuhzk/rune".rune.path="../rune/crates/rune"'`
 # (and the matching rune-kit path) while iterating on Rune itself.
+
+# Rune platform patches, pinned with the UI framework.
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de" }
+winit = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de" }
+parley_engine = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de" }
+accesskit_windows = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de" }
+accesskit_macos = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de" }
