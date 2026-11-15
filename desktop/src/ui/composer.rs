@@ -577,13 +577,25 @@ fn apply_pick(
     s.persist_draft(slot);
 }
 
-/// Pull a queued prompt back into the draft (App parity). Attachments cannot
-/// follow, so those items stay cancel-only.
+/// Pull a queued prompt and its uploaded attachments back into the draft.
 pub(super) fn edit_queued(s: &mut UiState, id: &str, text: String) {
     s.menu = None;
     let Some(asid) = s.selected.clone() else {
         return;
     };
+    let Some(item) = s.queue.iter().find(|q| q.id == id).cloned() else {
+        return;
+    };
+    for file in item.files {
+        if !s.staged.iter().any(|f| f.path == file.path) {
+            s.staged.push(crate::model::compose::StagedFile {
+                path: file.path,
+                name: file.name,
+                image: file.image,
+                size: 0,
+            });
+        }
+    }
     s.queue.retain(|q| q.id != id);
     s.send(Command::Compose(ComposeCommand::InboxCancel {
         asid: AgentSessionId(asid),
@@ -743,13 +755,6 @@ fn queued_chip(
         .open(open)
         .min_width(160.0)
         .on_close(|s: &mut UiState| s.menu = None);
-    if item.files.is_empty() {
-        let (edit_id, text) = (id.clone(), item.text.clone());
-        menu = menu.item(
-            MenuItem::new(tr_ref(language, "Edit"))
-                .on_select(move |s: &mut UiState| edit_queued(s, &edit_id, text.clone())),
-        );
-    }
     let (steer_id, next_steer) = (id.clone(), !item.steer);
     menu = menu.item(
         MenuItem::new(if item.steer {
@@ -759,14 +764,7 @@ fn queued_chip(
         })
         .on_select(move |s: &mut UiState| toggle_queued_steer(s, &steer_id, next_steer)),
     );
-    let cancel_id = id.clone();
-    let pill = menu
-        .item(
-            MenuItem::new(tr_ref(language, "Cancel"))
-                .danger(true)
-                .on_select(move |s: &mut UiState| cancel_queued(s, &cancel_id)),
-        )
-        .build(k, layer);
+    let pill = menu.build(k, layer);
     let mut chip_row = row()
         .key(format!("queued-row-{id}"))
         .matched(format!("queued-row-{id}"))
@@ -789,7 +787,7 @@ fn queued_chip(
         chip_row = chip_row.child(thumbs);
     }
     chip_row = chip_row.child(pill.grow(1.0).min_w(0.0));
-    if item.files.is_empty() {
+    {
         let (edit_id, text) = (id.clone(), item.text.clone());
         chip_row = chip_row.child(
             rune_kit::IconButton::new(&super::parts::glyphs::EDIT_FILE)
@@ -1949,25 +1947,6 @@ pub fn body() -> El {
     col().w_full().gap(18.0).px(24.0).pt(20.0).pb(18.0)
 }
 
-pub fn toolbar(k: &Kit, controls: El, actions: El, width: f32) -> El {
-    if width < 720.0 {
-        col()
-            .w_full()
-            .gap(10.0)
-            .child(controls)
-            .child(actions.w_full())
-    } else {
-        row()
-            .w_full()
-            .gap(12.0)
-            .center_y()
-            .child(controls.shrink().min_w(0.0))
-            .child(el().grow(1.0))
-            .child(actions)
-    }
-    .motion(k.motion.control)
-}
-
 /// One editor, key handling and attachment paste path for both composer contexts.
 pub fn editor(
     s: &UiState,
@@ -2325,7 +2304,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         card = card.child(dictation);
     }
     card = card.child(editor(s, k, Slot::Session, placeholder, min_rows, max_rows));
-    card = card.child(toolbar(k, own_line.unwrap_or_else(el), actions, inner));
+    card = card.child(actions.w_full());
 
     // Keep focus visible without competing with the message content.
     let card = composer_card(k, &look, card, focused, busy, s.drop_hover)
@@ -2339,7 +2318,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     if let Some(chips) = chips(s, k, layer) {
         deck = deck.child(chips);
     }
-    deck = deck.child(card.w_full());
+    deck = deck.child(card.w_full()).children(own_line);
     col()
         .key("composer")
         .w_full()

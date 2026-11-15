@@ -325,6 +325,25 @@ impl UiState {
             }));
             self.queue.retain(|q| q.id != item_id);
         }
+        if let Some(echo) = self
+            .echoes
+            .get(asid)
+            .and_then(|v| v.iter().find(|e| e.token == token))
+        {
+            for path in &echo.files {
+                if !self.staged.iter().any(|f| &f.path == path) {
+                    self.staged.push(crate::model::compose::StagedFile {
+                        name: PathBuf::from(path)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "attachment".into()),
+                        path: path.clone(),
+                        image: echo.images.contains(path),
+                        size: 0,
+                    });
+                }
+            }
+        }
         self.discard_echo(asid, token);
         let len = text.len();
         self.draft = super::composer::fresh(text);
@@ -442,7 +461,7 @@ pub fn view(cx: &Tcx, echo: &Echo) -> El {
                 cx.t("Steered · the agent reads it at its next step"),
                 k.c.text_faint,
             ));
-            if echo.files.is_empty() {
+            {
                 let edit_asid = asid.clone();
                 let edit_inbox_id = inbox_id.clone();
                 let edit_text = text;
@@ -623,7 +642,18 @@ mod tests {
         let mut s = UiState::new(tx);
         s.selected = Some("s1".into());
         let token = 42;
-        s.echo_sent("s1", token, "typo in my prompt".into(), &[], true);
+        s.echo_sent(
+            "s1",
+            token,
+            "typo in my prompt".into(),
+            &[crate::model::compose::StagedFile {
+                path: "/uploads/example.png".into(),
+                name: "example.png".into(),
+                size: 100,
+                image: true,
+            }],
+            true,
+        );
         s.queue.push(steer("inbox-1", "typo in my prompt"));
         s.echo_inbox("s1", &s.queue.clone());
         assert_eq!(s.echoes_of("s1")[0].inbox.as_deref(), Some("inbox-1"));
@@ -634,6 +664,9 @@ mod tests {
         // Echo is removed and draft is restored with the text
         assert!(s.echoes_of("s1").is_empty());
         assert_eq!(s.draft.text, "typo in my prompt");
+        assert_eq!(s.staged.len(), 1);
+        assert_eq!(s.staged[0].path, "/uploads/example.png");
+        assert!(s.staged[0].image);
         assert!(s.draft.focused);
         assert!(s.queue.is_empty());
 

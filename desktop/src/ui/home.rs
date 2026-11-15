@@ -702,7 +702,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
                 },
             ),
         );
-    card = card.child(composer::toolbar(k, controls, actions, size[0] - 48.0));
+    card = card.child(actions.w_full());
     let card = composer::composer_card(k, look, card, s.start_draft.focused, false, s.drop_hover)
         .on_drop_files(|s: &mut UiState, files, _| composer::attach_dropped_files(s, files))
         .on_drop_hover(|s: &mut UiState, over, _| s.drop_hover = over);
@@ -714,6 +714,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
         .child(row().child(context))
         .children(composer::chips(s, k, layer))
         .child(card)
+        .child(controls)
         .children(composer_frame(s, size))
 }
 

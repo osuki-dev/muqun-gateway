@@ -200,7 +200,7 @@ fn queue(s: &UiState, k: &Kit) -> Vec<El> {
         let steer = q.steer;
         let (id2, a2) = (id.clone(), a.clone());
         let mut action = row().gap(4.0);
-        if q.files.is_empty() {
+        {
             let (edit_id, text) = (q.id.clone(), q.text.clone());
             action = action.child(small(
                 k,
