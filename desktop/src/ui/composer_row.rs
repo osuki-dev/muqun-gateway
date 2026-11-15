@@ -90,8 +90,8 @@ fn mode_glyph(id: &str) -> (&'static Icon, bool) {
 
 /// A pill (`ControlSize::Small` ghost button): 10 pt each side.
 const PILL_PAD: f32 = 20.0;
-/// An icon-only pill: 14 pt glyph and 3 pt each side.
-const ICON_PILL: f32 = 20.0;
+/// Compact controls keep enough room around their glyph.
+const ICON_PILL: f32 = 36.0;
 const GLYPH: f32 = 14.0;
 /// Between pills in the row.
 const ROW_GAP: f32 = 2.0;

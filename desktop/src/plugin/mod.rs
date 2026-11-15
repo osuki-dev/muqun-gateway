@@ -89,15 +89,27 @@ pub fn surface_switcher(
     lang: Language,
     plugin_id: &str,
     active: PluginSlot,
+    layer: &mut Vec<El>,
 ) -> El {
-    let mut bar = row()
-        .key(format!("surface-switcher-{plugin_id}-{active:?}"))
-        .gap(4.0)
-        .center_y();
-
+    let menu_id = format!("surface-{plugin_id}-{active:?}");
+    let open = s.menu == Some(crate::ui::OpenMenu::WindowSurface(menu_id.clone()));
+    let title = WindowKind::from_slot(active).map_or("Window", WindowKind::label);
+    let mut menu = rune_kit::Menu::new(menu_id.clone())
+        .trigger(
+            Button::new(format!("{} ▾", tr_ref(lang, title)))
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Large)
+                .on_press(move |s: &mut UiState| {
+                    s.menu = (!open).then(|| crate::ui::OpenMenu::WindowSurface(menu_id.clone()));
+                })
+                .build(k)
+                .key(format!("surf-menu-{plugin_id}-{active:?}")),
+        )
+        .open(open)
+        .min_width(180.0)
+        .on_close(|s: &mut UiState| s.menu = None);
     for kind in WindowKind::ALL {
         let slot = kind.slot();
-        let label_en = kind.label();
         if !s
             .plugins
             .get(plugin_id)
@@ -106,40 +118,42 @@ pub fn surface_switcher(
             continue;
         }
         let pid = plugin_id.to_string();
-        let is_active = active == slot;
-        let btn = Button::new(tr_ref(lang, label_en))
-            .variant(if is_active {
-                ButtonVariant::Contrast
-            } else {
-                ButtonVariant::Ghost
-            })
-            .control_size(ControlSize::Large)
-            .on_press(move |s: &mut UiState| {
-                s.switch_plugin_surface(&pid, slot);
-            })
-            .build(k)
-            .key(format!("surf-btn-{plugin_id}-{slot:?}"));
-        bar = bar.child(btn);
+        menu = menu.item(
+            rune_kit::MenuItem::new(tr_ref(lang, kind.label()))
+                .checked(active == slot)
+                .on_select(move |s: &mut UiState| {
+                    s.menu = None;
+                    s.switch_plugin_surface(&pid, slot);
+                }),
+        );
     }
+    let mut bar = row()
+        .key(format!("surface-switcher-{plugin_id}-{active:?}"))
+        .gap(4.0)
+        .center_y()
+        .child(menu.build(k, layer));
 
     if matches!(active, PluginSlot::Page | PluginSlot::Drawer) {
-        let close_btn = Button::new(tr_ref(
+        let close_label = tr_ref(
             lang,
             if active == PluginSlot::Page && s.plugin_page_origin.is_some() {
                 "Restore"
             } else {
                 "Close"
             },
-        ))
-        .variant(ButtonVariant::Ghost)
-        .control_size(ControlSize::Large)
-        .on_press(move |s: &mut UiState| match active {
-            PluginSlot::Page => s.close_plugin_page(),
-            PluginSlot::Drawer => s.close_plugin_drawer(),
-            _ => {}
-        })
-        .build(k)
-        .key(format!("surf-close-{plugin_id}-{active:?}"));
+        );
+        let close_btn = rune_kit::IconButton::new(k.glyph.close)
+            .label(close_label)
+            .help(close_label)
+            .variant(rune_kit::IconButtonVariant::GhostMuted)
+            .control_size(ControlSize::Large)
+            .on_press(move |s: &mut UiState| match active {
+                PluginSlot::Page => s.close_plugin_page(),
+                PluginSlot::Drawer => s.close_plugin_drawer(),
+                _ => {}
+            })
+            .build(k)
+            .key(format!("surf-close-{plugin_id}-{active:?}"));
         bar = bar.child(close_btn);
     }
 

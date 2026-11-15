@@ -190,6 +190,7 @@ pub enum OpenMenu {
     ComputerPicker,
     /// The sidebar inventory scope. Search remains global.
     SidebarScope,
+    WindowSurface(String),
     /// The tasks page's computer filter picker.
     TasksComputerPicker,
 }
@@ -573,6 +574,8 @@ pub struct UiState {
     pub prompt_history_draft_stash: Option<String>,
     /// Whether the composer prompt history picker popup is open.
     pub composer_history_open: bool,
+    pub composer_queue_expanded: bool,
+    pub composer_queue_page: Option<String>,
     /// Manual height override for the composer textarea (number of rows).
     pub composer_rows: Option<usize>,
     /// Whether the composer textarea is toggled into expanded multiline mode.
@@ -798,6 +801,8 @@ impl UiState {
             prompt_history_cursor: None,
             prompt_history_draft_stash: None,
             composer_history_open: false,
+            composer_queue_expanded: false,
+            composer_queue_page: None,
             composer_rows: None,
             composer_expanded: false,
             timeline_search: TimelineSearch::default(),

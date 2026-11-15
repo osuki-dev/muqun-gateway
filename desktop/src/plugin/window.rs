@@ -40,10 +40,10 @@ pub fn render(
         return None;
     }
     let body = plugin.render_surface(ctx, layer)?;
-    Some(chrome(plugin.id(), ctx, body))
+    Some(chrome(plugin.id(), ctx, body, layer))
 }
 
-pub fn chrome(id: &str, ctx: &PluginViewContext<'_>, body: El) -> El {
+pub fn chrome(id: &str, ctx: &PluginViewContext<'_>, body: El, layer: &mut Vec<El>) -> El {
     let mut header = row()
         .key(format!("window-header-{id}-{:?}", ctx.surface))
         .w_full()
@@ -68,6 +68,7 @@ pub fn chrome(id: &str, ctx: &PluginViewContext<'_>, body: El) -> El {
         ctx.s.cfg.general.language,
         id,
         ctx.surface,
+        layer,
     ));
     col()
         .key(format!("plugin-window-{id}-{:?}", ctx.surface))

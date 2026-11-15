@@ -727,7 +727,7 @@ fn queued_chip(
         .trigger(
             Button::new(label)
                 .variant(ButtonVariant::Outline)
-                .control_size(ControlSize::Small)
+                .control_size(ControlSize::Large)
                 .expanded(open)
                 .on_press({
                     let id = id.clone();
@@ -736,7 +736,9 @@ fn queued_chip(
                     }
                 })
                 .build(k)
-                .key(format!("queued-pill-{id}")),
+                .key(format!("queued-pill-{id}"))
+                .min_w(0.0)
+                .w_full(),
         )
         .open(open)
         .min_width(160.0)
@@ -767,6 +769,9 @@ fn queued_chip(
         .build(k, layer);
     let mut chip_row = row()
         .key(format!("queued-row-{id}"))
+        .matched(format!("queued-row-{id}"))
+        .w_full()
+        .min_w(0.0)
         .gap(4.0)
         .center_y()
         .px(4.0)
@@ -783,7 +788,7 @@ fn queued_chip(
     if let Some(thumbs) = queue_thumbs(s, k, &format!("q-{id}"), &thumbs) {
         chip_row = chip_row.child(thumbs);
     }
-    chip_row = chip_row.child(pill);
+    chip_row = chip_row.child(pill.grow(1.0).min_w(0.0));
     if item.files.is_empty() {
         let (edit_id, text) = (id.clone(), item.text.clone());
         chip_row = chip_row.child(
@@ -813,12 +818,94 @@ pub(super) fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
     if s.staged.is_empty() && queue.is_empty() {
         return None;
     }
-    let mut line = row().key("chips").w_full().gap(6.0).flex_wrap().center_y();
-    for (i, file) in s.staged.iter().enumerate() {
-        line = line.child(staged_chip(s, k, i, file));
+    let look = s.look();
+    let mut line = col().key("chips").w_full().gap(8.0);
+    if !s.staged.is_empty() {
+        let mut files = row().w_full().gap(6.0).flex_wrap();
+        for (i, file) in s.staged.iter().enumerate() {
+            files = files.child(staged_chip(s, k, i, file));
+        }
+        line = line.child(files);
     }
-    for item in queue {
-        line = line.child(queued_chip(s, k, layer, item));
+    if !queue.is_empty() {
+        let page = s
+            .composer_queue_page
+            .as_ref()
+            .and_then(|id| queue.iter().position(|q| &q.id == id))
+            .unwrap_or(0);
+        let mut deck = col().key("queue-deck").w_full().max_w(600.0).gap(6.0);
+        if queue.len() > 1 {
+            let next = queue[(page + 1) % queue.len()].id.clone();
+            deck = deck.child(
+                row()
+                    .gap(6.0)
+                    .center_y()
+                    .child(
+                        Button::new(format!(
+                            "{} · {}/{}",
+                            tr_ref(s.cfg.general.language, "Queued:"),
+                            page + 1,
+                            queue.len()
+                        ))
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Large)
+                        .on_press(|s: &mut UiState| {
+                            s.composer_queue_expanded = !s.composer_queue_expanded
+                        })
+                        .build(k)
+                        .key("queue-deck-expand"),
+                    )
+                    .child(
+                        Button::new("›")
+                            .variant(ButtonVariant::GhostMuted)
+                            .control_size(ControlSize::Large)
+                            .help(tr_ref(s.cfg.general.language, "Next"))
+                            .on_press(move |s: &mut UiState| {
+                                s.composer_queue_page = Some(next.clone())
+                            })
+                            .build(k)
+                            .key("queue-deck-next"),
+                    ),
+            );
+        }
+        if s.composer_queue_expanded {
+            let mut pages = col().w_full().gap(6.0);
+            for item in &queue {
+                pages = pages.child(look.arrive(queued_chip(s, k, layer, item), 0));
+            }
+            deck = deck.child(
+                col()
+                    .w_full()
+                    .h((queue.len() as f32 * 44.0).min(220.0))
+                    .scroll(rune::ScrollSpec {
+                        stick_bottom: false,
+                    })
+                    .clip_soft(0.0)
+                    .child(pages)
+                    .scroll_bar(k),
+            );
+        } else {
+            let depth = (queue.len() - 1).min(2);
+            let mut stack = el().w_full().pb(depth as f32 * 5.0);
+            for n in (1..=depth).rev() {
+                stack = stack.child(
+                    el().key(format!("queue-page-{n}"))
+                        .pin(
+                            Some(n as f32 * 8.0),
+                            Some(n as f32 * 5.0),
+                            Some(n as f32 * 8.0),
+                            Some(0.0),
+                        )
+                        .radius(k.radius.lg)
+                        .fill(k.c.layer_01)
+                        .border(1.0, k.c.border_weak)
+                        .a11y_hidden(),
+                );
+            }
+            stack = stack.child(look.arrive(queued_chip(s, k, layer, queue[page]), 0));
+            deck = deck.child(stack);
+        }
+        line = line.child(deck);
     }
     Some(line)
 }
@@ -2217,9 +2304,6 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         );
     card = card.child(resizer);
 
-    if let Some(chips) = chips(s, k, layer) {
-        card = card.child(chips);
-    }
     if s.drop_hover {
         card = card.child(drop_hint(k, &look, language));
     }
@@ -2249,6 +2333,11 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     // The messages' reading column: as wide and as centred as they are on
     // a wide window, the whole width on a narrow one.
     let column = super::timeline::FEED_MAX_W;
+    let mut deck = col().w_full().max_w(column).gap(8.0);
+    if let Some(chips) = chips(s, k, layer) {
+        deck = deck.child(chips);
+    }
+    deck = deck.child(card.w_full());
     col()
         .key("composer")
         .w_full()
@@ -2256,7 +2345,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .px(16.0)
         .pt(6.0)
         .pb(14.0)
-        .child(card.w_full().max_w(column))
+        .child(deck)
 }
 
 #[cfg(test)]

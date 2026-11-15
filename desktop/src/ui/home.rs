@@ -621,9 +621,6 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
     context = context.child(worktree(s, k));
     let context = composer::context_capsule(k, look, context);
     composer::popup(s, k, layer, Slot::Start);
-    if let Some(chips) = composer::chips(s, k, layer) {
-        card = card.child(chips);
-    }
     if s.drop_hover {
         card = card.child(composer::drop_hint(k, look, language));
     }
@@ -715,6 +712,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
         .w_full()
         .gap(12.0)
         .child(row().child(context))
+        .children(composer::chips(s, k, layer))
         .child(card)
         .children(composer_frame(s, size))
 }

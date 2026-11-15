@@ -193,7 +193,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             scale,
             crate::plugin::PluginSlot::Drawer,
         );
-        let view = crate::plugin::window::chrome("terminal", &ctx, view);
+        let view = crate::plugin::window::chrome("terminal", &ctx, view, layer);
         split = split.inspector(
             &s.term.pane,
             super::terminal_pane,
