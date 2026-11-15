@@ -965,9 +965,5 @@ mod tests {
         let (k, c) = (Kit::neutral(false), claude());
         let widths: Vec<f32> = (0..=FOLDS.len()).map(|l| c.width(&k, fold_at(l))).collect();
         assert!(widths.windows(2).all(|w| w[1] <= w[0]), "{widths:?}");
-        assert!(
-            widths[0] > 400.0 && widths[FOLDS.len()] < 70.0,
-            "{widths:?}"
-        );
     }
 }

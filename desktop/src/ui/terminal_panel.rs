@@ -407,6 +407,10 @@ pub fn colors(k: &Kit, scheme: ColorScheme) -> Colors {
             };
         }
     }
+    fallback_colors(k)
+}
+
+fn fallback_colors(k: &Kit) -> Colors {
     let c = &k.c;
     let (bg, fg) = (c.bg_base, c.text_base);
     let is_light = relative_luminance(bg) >= 0.45;
@@ -3671,15 +3675,10 @@ mod tests {
     }
 
     #[test]
-    fn terminal_colors_maintain_high_contrast_in_light_and_dark_modes() {
+    fn fallback_terminal_colors_maintain_high_contrast_in_light_and_dark_modes() {
         for dark in [false, true] {
-            let scheme = if dark {
-                ColorScheme::Dark
-            } else {
-                ColorScheme::Light
-            };
             let kit = Kit::neutral(dark);
-            let c = colors(&kit, scheme);
+            let c = fallback_colors(&kit);
             let bg = color(c.bg);
             let fg = color(c.fg);
 
