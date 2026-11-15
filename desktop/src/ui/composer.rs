@@ -726,7 +726,7 @@ fn queued_chip(
     let mut menu = Menu::new(format!("queued-{id}"))
         .trigger(
             Button::new(label)
-                .variant(ButtonVariant::Outline)
+                .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Large)
                 .expanded(open)
                 .on_press({
@@ -775,8 +775,8 @@ fn queued_chip(
         .gap(4.0)
         .center_y()
         .px(4.0)
-        .py(2.0)
-        .radius(k.radius.md)
+        .py(4.0)
+        .radius(k.radius.xl)
         .fill(k.c.bg_base.alpha(0.65))
         .border(1.0, k.c.border_weak);
     let thumbs: Vec<&str> = item
@@ -792,9 +792,11 @@ fn queued_chip(
     if item.files.is_empty() {
         let (edit_id, text) = (id.clone(), item.text.clone());
         chip_row = chip_row.child(
-            Button::new(tr_ref(language, "Edit"))
-                .variant(ButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
+            rune_kit::IconButton::new(&super::parts::glyphs::EDIT_FILE)
+                .label(tr_ref(language, "Edit"))
+                .help(tr_ref(language, "Edit"))
+                .variant(rune_kit::IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Large)
                 .on_press(move |s: &mut UiState| edit_queued(s, &edit_id, text.clone()))
                 .build(k)
                 .key(format!("queued-edit-{id}")),
