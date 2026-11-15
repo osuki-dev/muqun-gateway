@@ -161,7 +161,9 @@ fn main() -> anyhow::Result<()> {
     });
 
     #[cfg(target_os = "macos")]
-    let app = app.titlebar(rune::Titlebar::new(64.0));
+    let app = app
+        .titlebar(rune::Titlebar::new(64.0))
+        .macos_window(rune::MacWindowOptions::default().shadow(false));
 
     let handle = app.handle();
     // SIGTERM / SIGINT quit through the event loop, as the tray's Quit does,

@@ -656,7 +656,11 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .px(PAD_X)
         .pt(14.0)
         .pb(56.0)
-        .gap(40.0);
+        .gap(if tab == SettingsTab::Agents {
+            16.0
+        } else {
+            40.0
+        });
     for (i, child) in body.into_iter().enumerate() {
         page = page.child(look.arrive(child, i.min(4)));
     }

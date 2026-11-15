@@ -633,9 +633,14 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .min_w(0.0),
         )
         .child(
-            rune::text(status_desc)
-                .font(k.ty.caption())
-                .color(k.c.text_muted),
+            el().size(5.0, 5.0)
+                .radius(2.5)
+                .fill(if s.peer_by_id(curr).is_none_or(|p| p.reachable) {
+                    k.c.success.fg
+                } else {
+                    k.c.warning.fg
+                })
+                .help(status_desc),
         )
         .child(
             rune::text(if open { "▴" } else { "▾" })
@@ -729,6 +734,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .child(computer_switcher(s, k, layer).grow(1.0).min_w(0.0))
                 .child(
                     IconButton::new(&super::icons::PLUS)
+                        .control_size(ControlSize::ExtraLarge)
                         .variant(IconButtonVariant::Ghost)
                         .label(super::copy::tr_ref(language, "New session"))
                         .help(super::copy::tr_ref(language, "New session"))

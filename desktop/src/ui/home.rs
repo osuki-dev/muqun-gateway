@@ -198,7 +198,7 @@ fn agents(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .build(k)
                 .key("agents-more")
                 .radius(k.radius.lg)
-                .h(36.0)
+                .h(32.0)
                 .px(12.0)
                 .py(8.0)
                 .border(1.0, k.c.info.icon.alpha(0.35)),
@@ -629,12 +629,12 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
     // Where and how, in one row with the button that acts on them.
     let mut controls = row()
         .key("start-controls")
-        .gap(4.0)
+        .gap(8.0)
         .center_y()
         .flex_wrap()
         .child(agents(s, k, layer));
     if let Some(pills) = start_pills(s, k, layer) {
-        controls = controls.child(pills.ml(4.0));
+        controls = controls.child(pills);
     }
 
     if let Some(i) = s.pending_tile {

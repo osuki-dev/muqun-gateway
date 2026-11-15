@@ -2,9 +2,9 @@
 //! switch in the group's header and its own fields as rows.
 
 use rune::{col, el, row as hrow, text, El, TextEdit, Tx};
-use rune_kit::{Badge, BadgeVariant, Kit, TextInput};
+use rune_kit::{Kit, TextInput};
 
-use super::{choice, edit_of, empty, flag, group_with, row, select, status, Tone};
+use super::{choice, edit_of, empty, flag, row, select, status, Tone};
 use crate::agent_fields::{fields, Field, Kind};
 use crate::config::{AgentConfigs, ConfigEdit, Language};
 use crate::model::commands::Command;
@@ -127,11 +127,6 @@ fn head(s: &UiState, k: &Kit, id: &str, standing: Standing, version: Option<&str
     let enabled = s.cfg.agents_for(s.current_computer()).enabled(id);
     let brand = crate::ui::agents::color(id, s.dark);
     let name = crate::ui::agents::name(id, &s.agents);
-    let variant = match standing {
-        Standing::Usable => BadgeVariant::Accent,
-        Standing::Checking => BadgeVariant::Subtle,
-        _ => BadgeVariant::Neutral,
-    };
     let mark = el()
         .key("mark")
         .size(32.0, 32.0)
@@ -141,9 +136,9 @@ fn head(s: &UiState, k: &Kit, id: &str, standing: Standing, version: Option<&str
         .child(crate::ui::agents::mark(id, 18.0, s.dark))
         .a11y_hidden();
     let mut meta = hrow().key("meta").gap(8.0).center_y().child(
-        Badge::new(standing.word(language).to_string())
-            .variant(variant)
-            .build(k),
+        text(standing.word(language))
+            .font(k.ty.small)
+            .color(k.c.text_muted),
     );
     if let Some(v) = version {
         meta = meta.child(text(format!("v{v}")).font(k.ty.small).color(k.c.text_faint));
@@ -287,21 +282,23 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                     crate::ui::parts::context::limits_section(s, k, &a.id).unwrap_or_else(|| {
                         crate::ui::muted(k, tr_ref(language, "No quota values reported"))
                     });
-                let mut rows = vec![quota.py(16.0)];
+                let mut rows = vec![quota.py(8.0)];
                 let expanded = s.agent_details.contains(&a.id);
                 let id = a.id.clone();
                 rows.push(
-                    rune_kit::Button::new(tr_ref(language, "Details"))
-                        .variant(rune_kit::ButtonVariant::Ghost)
-                        .control_size(rune_kit::ControlSize::Large)
-                        .expanded(expanded)
-                        .on_press(move |s: &mut UiState| {
-                            if !s.agent_details.remove(&id) {
-                                s.agent_details.insert(id.clone());
-                            }
-                        })
-                        .build(k)
-                        .key(format!("agent-details-{}", a.id)),
+                    hrow().w_full().child(
+                        rune_kit::Button::new(tr_ref(language, "Details"))
+                            .variant(rune_kit::ButtonVariant::Ghost)
+                            .control_size(rune_kit::ControlSize::Large)
+                            .expanded(expanded)
+                            .on_press(move |s: &mut UiState| {
+                                if !s.agent_details.remove(&id) {
+                                    s.agent_details.insert(id.clone());
+                                }
+                            })
+                            .build(k)
+                            .key(format!("agent-details-{}", a.id)),
+                    ),
                 );
                 if expanded {
                     rows.push(usage_card(s, k, &a.id));
@@ -318,12 +315,16 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                     }
                 }
                 let enabled = s.cfg.agents_for(s.current_computer()).enabled(&a.id);
-                let group = group_with(
-                    k,
-                    &format!("agent-{}", a.id),
-                    head(s, k, &a.id, standing, a.version.as_deref()),
-                    rows,
-                );
+                let group = col()
+                    .key(format!("agent-{}", a.id))
+                    .w_full()
+                    .gap(12.0)
+                    .px(16.0)
+                    .py(16.0)
+                    .radius(k.radius.lg)
+                    .fill(k.c.layer_01.alpha(0.3))
+                    .child(head(s, k, &a.id, standing, a.version.as_deref()))
+                    .children(rows);
                 if enabled {
                     group
                 } else {

@@ -394,7 +394,6 @@ fn sidebar_panel(s: &UiState, k: &Kit, wash: f32) -> El {
             .key("sidebar-panel")
             .radius(k.radius.lg)
             .fill(k.c.bg_base.alpha(0.85))
-            .border(1.0, k.c.border_muted)
             .system_material(rune::SystemMaterial::Glass)
     } else {
         panel

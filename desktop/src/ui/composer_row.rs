@@ -94,7 +94,7 @@ const PILL_PAD: f32 = 20.0;
 const ICON_PILL: f32 = 36.0;
 const GLYPH: f32 = 14.0;
 /// Between pills in the row.
-const ROW_GAP: f32 = 2.0;
+const ROW_GAP: f32 = 8.0;
 /// Between the composer's action buttons.
 pub const ACTION_GAP: f32 = 6.0;
 /// The card's own side padding (12 pt each side).
@@ -458,7 +458,7 @@ fn agent_chip(c: &Controls, k: &Kit, f: Fold) -> El {
         .role("image")
         .label(c.agent_name.clone())
         .center_y()
-        .h(36.0)
+        .h(32.0)
         .radius(k.radius.lg)
         .fill(k.c.layer_01.alpha(0.35))
         .border(0.5, k.c.border_muted.alpha(0.30))
@@ -716,17 +716,28 @@ fn auto_help(c: &Controls) -> String {
 fn auto_control(c: &Controls, k: &Kit) -> El {
     let (on, asid) = (c.auto_on, c.asid.clone());
     rune_kit::IconButton::new(&AUTO_APPROVE)
-        .variant(if on {
-            rune_kit::IconButtonVariant::Contrast
-        } else {
-            rune_kit::IconButtonVariant::GhostMuted
-        })
-        .control_size(ControlSize::ExtraLarge)
+        .variant(rune_kit::IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Large)
         .label(c.tr("Auto-approve"))
         .help(auto_help(c))
         .on_press(move |s: &mut UiState| set_auto(s, &asid, !on))
         .build(k)
         .key("auto-approve")
+        .size(32.0, 32.0)
+        .radius(k.radius.lg)
+        .fill(if on {
+            k.c.bg_accent.alpha(0.16)
+        } else {
+            k.c.layer_01.alpha(0.35)
+        })
+        .border(
+            0.5,
+            if on {
+                k.c.bg_accent.alpha(0.5)
+            } else {
+                k.c.border_muted.alpha(0.3)
+            },
+        )
         .role("switch")
         .checked(on)
 }

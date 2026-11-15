@@ -1837,10 +1837,17 @@ pub fn branch_menu(
     let label = format!("⎇ {current}");
     if info.local.len() < 2 {
         return Some(
-            Badge::new(label)
-                .variant(BadgeVariant::Neutral)
-                .build(k)
-                .key(key),
+            row()
+                .key(key)
+                .gap(6.0)
+                .center_y()
+                .child(rune::icon(&super::icons::BRANCH, 16.0).color(k.c.icon_muted))
+                .child(text(current).font(k.ty.small).color(k.c.text_muted))
+                .h(32.0)
+                .px(10.0)
+                .radius(k.radius.lg)
+                .fill(k.c.layer_01.alpha(0.35))
+                .border(0.5, k.c.border_muted.alpha(0.3)),
         );
     }
     let menu = Menu::new(key)
@@ -1940,7 +1947,7 @@ pub(super) fn effort_menu(
     menu.build(k, layer)
 }
 
-pub const AGENT_ICON: f32 = 20.0;
+pub const AGENT_ICON: f32 = 16.0;
 pub const SEND_ICON: f32 = 22.0;
 
 pub fn body() -> El {
