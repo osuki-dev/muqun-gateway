@@ -2856,6 +2856,7 @@ dependencies = [
  "libc",
  "libghostty-vt",
  "muqun-gateway",
+ "pulldown-cmark",
  "reqwest",
  "rfd",
  "rune",
