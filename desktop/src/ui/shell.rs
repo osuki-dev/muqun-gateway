@@ -861,7 +861,10 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
                 .key("terminal-toggle"),
         );
     }
-    if s.mode == Mode::Session && !s.in_split() {
+    if s.mode == Mode::Session
+        && !s.in_split()
+        && crate::plugin::is_enabled("inspector", &s.cfg.plugins_disabled)
+    {
         let is_git_open = s.right_open && !s.term.open && s.inspector_tab == InspectorTab::Git;
         bar = bar.trailing(
             IconButton::new(&super::icons::BRANCH)

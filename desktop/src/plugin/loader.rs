@@ -7,7 +7,10 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::{mpsc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
+};
 use std::time::{Duration, Instant};
 
 use muqun_gateway::platform::runtimes::{self, RuntimeKind};
@@ -59,6 +62,7 @@ pub struct ExternalPlugin {
     dynamic_markdown: Mutex<Option<String>>,
     script_job: Mutex<Option<mpsc::Receiver<Result<String, String>>>>,
     script_title: Mutex<String>,
+    script_cancel: Mutex<Option<Arc<AtomicBool>>>,
     /// Optional override for the Bun binary resolution:
     /// - `None`: resolve via `muqun_gateway::platform::runtimes::resolve_binary(RuntimeKind::Bun, None)`
     /// - `Some(Some(path))`: resolve with `configured = Some(path)`
@@ -98,6 +102,7 @@ impl ExternalPlugin {
             dir,
             commands,
             dynamic_markdown: Mutex::new(None),
+            script_cancel: Mutex::new(None),
             script_job: Mutex::new(None),
             script_title: Mutex::new(String::new()),
             bun_binary_override: Mutex::new(None),
@@ -244,8 +249,10 @@ impl ExternalPlugin {
         let (tx, rx) = mpsc::channel();
         *job = Some(rx);
         *self.script_title.lock().unwrap() = command_title.to_string();
+        let cancel = Arc::new(AtomicBool::new(false));
+        *self.script_cancel.lock().unwrap() = Some(cancel.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(run_script(command));
+            let _ = tx.send(run_script(command, cancel));
         });
         true
     }
@@ -722,9 +729,18 @@ impl DesktopPlugin for ExternalPlugin {
         self.commands.clone()
     }
 
+    fn enabled_changed(&self, enabled: bool) {
+        if !enabled {
+            if let Some(cancel) = self.script_cancel.lock().unwrap().take() {
+                cancel.store(true, Ordering::Release);
+            }
+            self.script_job.lock().unwrap().take();
+        }
+    }
+
     fn poll(&self, s: &mut UiState, tx: &mut rune::Tx) -> bool {
         if !super::is_enabled(self.id, &s.cfg.plugins_disabled) {
-            self.script_job.lock().unwrap().take();
+            self.enabled_changed(false);
             return false;
         }
         let result = {
@@ -762,6 +778,9 @@ impl DesktopPlugin for ExternalPlugin {
     }
 
     fn on_command(&self, s: &mut UiState, command_id: &str) -> bool {
+        if !super::is_enabled(self.id, &s.cfg.plugins_disabled) {
+            return false;
+        }
         if command_id == "__run_entry__" {
             match self.manifest.render_kind() {
                 PluginRenderKind::BunScript { entry } => {
@@ -815,7 +834,7 @@ impl DesktopPlugin for ExternalPlugin {
 }
 
 /// Drain both pipes concurrently: a verbose child must never block on a full pipe.
-fn run_script(mut command: ProcessCommand) -> Result<String, String> {
+fn run_script(mut command: ProcessCommand, cancel: Arc<AtomicBool>) -> Result<String, String> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -836,7 +855,9 @@ fn run_script(mut command: ProcessCommand) -> Result<String, String> {
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) if !cancel.load(Ordering::Acquire) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
             result => {
                 #[cfg(unix)]
                 unsafe {
@@ -844,10 +865,13 @@ fn run_script(mut command: ProcessCommand) -> Result<String, String> {
                 }
                 let _ = child.kill();
                 let _ = child.wait();
-                break Err(result
-                    .err()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "Plugin command timed out".into()));
+                break Err(result.err().map(|e| e.to_string()).unwrap_or_else(|| {
+                    if cancel.load(Ordering::Acquire) {
+                        "Plugin command cancelled".into()
+                    } else {
+                        "Plugin command timed out".into()
+                    }
+                }));
             }
         }
     };
@@ -989,12 +1013,66 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn disabling_a_plugin_cancels_its_running_process() {
+        let dir =
+            std::env::temp_dir().join(format!("muqun-plugin-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let mut command = ProcessCommand::new("/bin/sh");
+        command
+            .args(["-c", "echo $$ > pid; exec sleep 30"])
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let manifest: PluginManifest = serde_json::from_str(
+            r#"{"id":"cancel-test","name":"Cancel","version":"1","description":""}"#,
+        )
+        .unwrap();
+        let plugin = Arc::new(ExternalPlugin::new(manifest, dir.clone()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        *plugin.script_cancel.lock().unwrap() = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        *plugin.script_job.lock().unwrap() = Some(receiver);
+        let worker = std::thread::spawn(move || {
+            let result = run_script(command, cancel);
+            let _ = sender.send(result.clone());
+            result
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !pid_file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let (tx, _) = crate::model::commands::channel();
+        let mut state = UiState::new(tx);
+        state.plugins.register(plugin.clone());
+        state.edit(crate::config::ConfigEdit::PluginEnabled {
+            plugin: "cancel-test".into(),
+            on: false,
+        });
+        assert_eq!(
+            worker.join().unwrap().unwrap_err(),
+            "Plugin command cancelled"
+        );
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert!(plugin.script_job.lock().unwrap().is_none());
+        assert!(!plugin.on_command(&mut state, "__run_entry__"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn verbose_scripts_drain_both_pipes_without_deadlocking() {
         let mut command = ProcessCommand::new("/bin/sh");
         command.args(["-c", "i=0; while [ $i -lt 9000 ]; do printf 0123456789; printf 0123456789 >&2; i=$((i+1)); done"])
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let output =
-            run_script(command).expect("a full stdout/stderr pipe must not stall the worker");
+        let output = run_script(command, Arc::new(AtomicBool::new(false)))
+            .expect("a full stdout/stderr pipe must not stall the worker");
         assert_eq!(output.len(), 64 * 1024);
     }
 

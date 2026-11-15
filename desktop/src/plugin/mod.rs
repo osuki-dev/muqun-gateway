@@ -217,6 +217,9 @@ pub trait DesktopPlugin: Send + Sync {
         Vec::new()
     }
 
+    /// Apply a runtime enablement change without restarting the host.
+    fn enabled_changed(&self, _enabled: bool) {}
+
     /// Fold background work into UI state without blocking input.
     fn poll(&self, _s: &mut UiState, _tx: &mut Tx) -> bool {
         false

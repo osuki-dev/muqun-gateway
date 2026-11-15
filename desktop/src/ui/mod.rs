@@ -934,8 +934,14 @@ impl UiState {
     /// Fold a config edit into the mirror and tell the core.
     pub fn edit(&mut self, edit: ConfigEdit) {
         self.cfg.apply(edit.clone());
-        if let ConfigEdit::PluginEnabled { plugin, on: false } = &edit {
-            if !crate::plugin::is_enabled(plugin, &self.cfg.plugins_disabled) {
+        if let ConfigEdit::PluginEnabled { plugin, .. } = &edit {
+            let enabled = crate::plugin::is_enabled(plugin, &self.cfg.plugins_disabled);
+            if let Some(instance) = self.plugins.get(plugin) {
+                instance.enabled_changed(enabled);
+            }
+            if !enabled {
+                self.palette = None;
+                self.menu = None;
                 self.close_plugin_windows(plugin);
             }
         }
@@ -1758,6 +1764,14 @@ impl UiState {
     }
 
     pub fn go(&mut self, mode: Mode) {
+        let plugin = match mode {
+            Mode::Tasks => Some("tasks"),
+            Mode::Inbox => Some("inbox"),
+            _ => None,
+        };
+        if plugin.is_some_and(|id| !crate::plugin::is_enabled(id, &self.cfg.plugins_disabled)) {
+            return;
+        }
         self.active_plugin_page = None;
         self.mode = mode;
         match mode {
@@ -1905,6 +1919,9 @@ impl UiState {
     }
 
     pub fn toggle_inspector(&mut self) {
+        if !crate::plugin::is_enabled("inspector", &self.cfg.plugins_disabled) {
+            return;
+        }
         self.active_plugin_drawer = None;
         if self.term.open {
             // One panel on the right at a time: the inspector takes it back.
@@ -1919,6 +1936,9 @@ impl UiState {
     }
 
     pub fn open_git_inspector(&mut self) {
+        if !crate::plugin::is_enabled("inspector", &self.cfg.plugins_disabled) {
+            return;
+        }
         self.active_plugin_drawer = None;
         if self.mode != Mode::Session && self.selected.is_some() {
             self.go(Mode::Session);

@@ -199,7 +199,7 @@ pub(super) fn label(k: &Kit, title: &str, detail: &str) -> El {
     let mut copy = col()
         .key("label")
         .w(LABEL_MIN_W)
-        .min_w(LABEL_MIN_W)
+        .min_w(LABEL_MIN_W.min(INNER_W.get()))
         .grow(1.0)
         .shrink()
         .gap(3.0)

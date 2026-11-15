@@ -816,45 +816,29 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .fold(0.0_f32, f32::max)
         .ceil();
     let cell = |item: El| item.w(0.0).grow(1.0).min_w(cell_width);
-    let pair = |left: El, right: El| {
-        rune::row()
-            .w_full()
-            .gap(6.0)
-            .flex_wrap()
-            .child(cell(left))
-            .child(cell(right))
-    };
-    let footer = rune::col()
+    let mut entries = vec![plugins];
+    for (id, label, glyph, mode) in [
+        ("inbox", "Inbox", &INBOX, Mode::Inbox),
+        ("tasks", "Tasks", &TASK, Mode::Tasks),
+        ("settings", "Settings", &SETTINGS, Mode::Settings),
+    ] {
+        if crate::plugin::is_enabled(id, &s.cfg.plugins_disabled) {
+            entries.push(nav(s, k, super::copy::tr_ref(language, label), glyph, mode));
+        }
+    }
+    let mut footer = rune::col()
         .key("sidebar-navigation")
         .w_full()
         .gap(6.0)
-        .pt(10.0)
-        .child(pair(
-            plugins,
-            nav(
-                s,
-                k,
-                super::copy::tr_ref(language, "Inbox"),
-                &INBOX,
-                Mode::Inbox,
-            ),
-        ))
-        .child(pair(
-            nav(
-                s,
-                k,
-                super::copy::tr_ref(language, "Tasks"),
-                &TASK,
-                Mode::Tasks,
-            ),
-            nav(
-                s,
-                k,
-                super::copy::tr_ref(language, "Settings"),
-                &SETTINGS,
-                Mode::Settings,
-            ),
-        ));
+        .pt(10.0);
+    let mut entries = entries.into_iter();
+    while let Some(left) = entries.next() {
+        let mut pair = rune::row().w_full().gap(6.0).flex_wrap().child(cell(left));
+        if let Some(right) = entries.next() {
+            pair = pair.child(cell(right));
+        }
+        footer = footer.child(pair);
+    }
     let sidebar = sidebar.footer(footer);
     match link_warning(s, k) {
         Some(warning) => sidebar.footer(warning),

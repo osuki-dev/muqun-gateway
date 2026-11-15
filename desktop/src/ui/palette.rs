@@ -564,7 +564,10 @@ impl UiState {
                 plugin_id,
                 command_id,
             } => {
-                if let Some(plugin) = self.plugins.get(&plugin_id) {
+                if let Some(plugin) = self
+                    .plugins
+                    .get_enabled(&plugin_id, &self.cfg.plugins_disabled)
+                {
                     plugin.on_command(self, &command_id);
                 }
             }
