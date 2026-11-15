@@ -199,12 +199,15 @@ fn entry_row(s: &UiState, k: &Kit, e: &Entry<'_>, now: u64) -> El {
         .center()
         .child(mark)
         .child(look.pulse(dot).a11y_hidden());
+    let help = title.clone();
     let mut r = SidebarRow::new(title)
-        .depth(1)
+        .depth(0)
         .height(ENTRY_H)
         .avatar(avatar)
-        .subtitle(step)
-        .detail(elapsed(now.saturating_sub(e.since(s)), language))
+        .subtitle(format!(
+            "{step} · {}",
+            elapsed(now.saturating_sub(e.since(s)), language)
+        ))
         .selected(asid.is_some() && s.mode == Mode::Session && s.selected == asid);
     if waiting {
         r = r.subtitle_color(k.c.warning.fg);
@@ -216,6 +219,7 @@ fn entry_row(s: &UiState, k: &Kit, e: &Entry<'_>, now: u64) -> El {
     })
     .build(k)
     .key(format!("running-{key}"))
+    .help(help)
 }
 
 /// The Running row and, when open, its list. Nothing while nothing runs.

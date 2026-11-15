@@ -806,54 +806,55 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         })
         .build(k)
         .key("nav-plugins");
+    // Measure localized labels at the active text scale; each pair wraps
+    // to one column when its two complete labels no longer fit.
+    let cell_width = ["Plugins", "Inbox", "Tasks", "Settings"]
+        .iter()
+        .map(|label| {
+            rune::text::measure(super::copy::tr_ref(language, label), &[], k.ty.ui, None).0 + 64.0
+        })
+        .fold(0.0_f32, f32::max)
+        .ceil();
+    let cell = |item: El| item.w(0.0).grow(1.0).min_w(cell_width);
+    let pair = |left: El, right: El| {
+        rune::row()
+            .w_full()
+            .gap(6.0)
+            .flex_wrap()
+            .child(cell(left))
+            .child(cell(right))
+    };
     let footer = rune::col()
+        .key("sidebar-navigation")
         .w_full()
         .gap(6.0)
         .pt(10.0)
-        .child(
-            rune::row()
-                .w_full()
-                .gap(6.0)
-                .child(plugins.grow(1.0).min_w(0.0))
-                .child(
-                    nav(
-                        s,
-                        k,
-                        super::copy::tr_ref(language, "Inbox"),
-                        &INBOX,
-                        Mode::Inbox,
-                    )
-                    .grow(1.0)
-                    .min_w(0.0),
-                ),
-        )
-        .child(
-            rune::row()
-                .w_full()
-                .gap(6.0)
-                .child(
-                    nav(
-                        s,
-                        k,
-                        super::copy::tr_ref(language, "Tasks"),
-                        &TASK,
-                        Mode::Tasks,
-                    )
-                    .grow(1.0)
-                    .min_w(0.0),
-                )
-                .child(
-                    nav(
-                        s,
-                        k,
-                        super::copy::tr_ref(language, "Settings"),
-                        &SETTINGS,
-                        Mode::Settings,
-                    )
-                    .grow(1.0)
-                    .min_w(0.0),
-                ),
-        );
+        .child(pair(
+            plugins,
+            nav(
+                s,
+                k,
+                super::copy::tr_ref(language, "Inbox"),
+                &INBOX,
+                Mode::Inbox,
+            ),
+        ))
+        .child(pair(
+            nav(
+                s,
+                k,
+                super::copy::tr_ref(language, "Tasks"),
+                &TASK,
+                Mode::Tasks,
+            ),
+            nav(
+                s,
+                k,
+                super::copy::tr_ref(language, "Settings"),
+                &SETTINGS,
+                Mode::Settings,
+            ),
+        ));
     let sidebar = sidebar.footer(footer);
     match link_warning(s, k) {
         Some(warning) => sidebar.footer(warning),

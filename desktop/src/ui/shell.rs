@@ -521,6 +521,10 @@ fn home_brand(s: &UiState, k: &Kit, look: &Look, lights: f32) -> El {
     // With no window controls at the leading edge the mark lines up with
     // the rows' icons below it; past traffic lights it keeps a small gap.
     let lead = if lights > 0.0 { 6.0 } else { 16.0 };
+    let width = rune::memo::layout_with("sidebar-frame", |r| r[2])
+        .unwrap_or_else(|| s.sidebar.shown_width());
+    let name_width = rune::text::measure(APP_NAME, &[], k.ty.ui_medium, None).0;
+    let show_name = width >= lights + lead + MARK + 8.0 + name_width + 48.0;
     row()
         .key("home-brand")
         .ml(lead)
@@ -530,7 +534,7 @@ fn home_brand(s: &UiState, k: &Kit, look: &Look, lights: f32) -> El {
         .role("button")
         .label(tr_ref(language, "Home"))
         .child(mark)
-        .child(
+        .children(show_name.then(|| {
             text(APP_NAME)
                 .key("home-name")
                 .font(k.ty.ui_medium.lh(MARK))
@@ -538,8 +542,8 @@ fn home_brand(s: &UiState, k: &Kit, look: &Look, lights: f32) -> El {
                     k.c.text_base
                 } else {
                     k.c.text_muted
-                }),
-        )
+                })
+        }))
         .on_press(|s: &mut UiState| s.go(Mode::Home))
 }
 
