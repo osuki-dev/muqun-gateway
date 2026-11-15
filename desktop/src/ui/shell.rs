@@ -184,7 +184,15 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             1.0
         };
         let surface = super::terminal_panel::surface(s, k, scheme).alpha(alpha);
-        let view = super::terminal_panel::view(s, k, scheme, scale, layer);
+        let controls = crate::plugin::surface_switcher(
+            s,
+            k,
+            s.cfg.general.language,
+            "terminal",
+            crate::plugin::PluginSlot::Drawer,
+            layer,
+        );
+        let view = super::terminal_panel::view(s, k, scheme, scale, layer, controls);
         let ctx = crate::plugin::PluginViewContext::new(
             s,
             k,

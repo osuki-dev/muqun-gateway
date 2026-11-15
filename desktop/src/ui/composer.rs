@@ -735,7 +735,16 @@ fn queued_chip(
     );
     let mut menu = Menu::new(format!("queued-{id}"))
         .trigger(
-            Button::new(label)
+            Button::new(label.clone())
+                .label_with(move |font, ink| {
+                    row().w_full().min_w(0.0).child(
+                        text(label.clone())
+                            .font(font)
+                            .color(ink)
+                            .truncate()
+                            .min_w(0.0),
+                    )
+                })
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Large)
                 .expanded(open)
@@ -763,15 +772,18 @@ fn queued_chip(
         .on_select(move |s: &mut UiState| toggle_queued_steer(s, &steer_id, next_steer)),
     );
     let pill = menu.build(k, layer);
-    let mut chip_row = row()
+    let chip_row = row()
         .key(format!("queued-row-{id}"))
         .matched(format!("queued-row-{id}"))
         .w_full()
         .min_w(0.0)
-        .gap(4.0)
+        .gap(8.0)
+        .center_y();
+    let mut content = row()
+        .grow(1.0)
+        .min_w(0.0)
         .center_y()
         .px(4.0)
-        .py(4.0)
         .radius(k.radius.xl)
         .fill(k.c.bg_base.alpha(0.65))
         .border(1.0, k.c.border_weak);
@@ -782,9 +794,9 @@ fn queued_chip(
         .map(|f| f.path.as_str())
         .collect();
     if let Some(thumbs) = queue_thumbs(s, k, &format!("q-{id}"), &thumbs) {
-        chip_row = chip_row.child(thumbs);
+        content = content.child(thumbs);
     }
-    chip_row = chip_row.child(pill.grow(1.0).min_w(0.0));
+    let mut chip_row = chip_row.child(content.child(pill.grow(1.0).min_w(0.0)));
     {
         let (edit_id, text) = (id.clone(), item.text.clone());
         chip_row = chip_row.child(
@@ -795,18 +807,24 @@ fn queued_chip(
                 .control_size(ControlSize::Large)
                 .on_press(move |s: &mut UiState| edit_queued(s, &edit_id, text.clone()))
                 .build(k)
-                .key(format!("queued-edit-{id}")),
+                .key(format!("queued-edit-{id}"))
+                .radius(k.radius.xl)
+                .fill(k.c.bg_base.alpha(0.65))
+                .border(1.0, k.c.border_weak),
         );
     }
     let cancel_inline_id = id.clone();
     chip_row.child(
         rune_kit::IconButton::new(k.glyph.close)
             .variant(rune_kit::IconButtonVariant::GhostMuted)
-            .control_size(ControlSize::Small)
+            .control_size(ControlSize::Large)
             .label(tr_ref(language, "Cancel"))
             .on_press(move |s: &mut UiState| cancel_queued(s, &cancel_inline_id))
             .build(k)
-            .key(format!("queued-cancel-{id}")),
+            .key(format!("queued-cancel-{id}"))
+            .radius(k.radius.xl)
+            .fill(k.c.bg_base.alpha(0.65))
+            .border(1.0, k.c.border_weak),
     )
 }
 
@@ -891,7 +909,7 @@ pub(super) fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
                         .pin(
                             Some(n as f32 * 8.0),
                             Some(n as f32 * 5.0),
-                            Some(n as f32 * 8.0),
+                            Some(80.0 + n as f32 * 8.0),
                             Some(0.0),
                         )
                         .radius(k.radius.lg)
@@ -1979,6 +1997,18 @@ pub fn attachment_button(
 }
 
 /// One editor, key handling and attachment paste path for both composer contexts.
+fn newline_key(s: &mut UiState, slot: Slot, ev: &rune::KeyEvent) -> bool {
+    if ev.key != rune::Key::Enter || ev.mods.ctrl || ev.mods.cmd || ev.mods.alt || ev.mods.shift {
+        return false;
+    }
+    let draft = draft_of_mut(s, slot);
+    if draft.key(ev, None).submit {
+        draft.insert("\n");
+    }
+    on_draft_change(s, slot);
+    true
+}
+
 pub fn editor(
     s: &UiState,
     k: &Kit,
@@ -2039,9 +2069,11 @@ pub fn editor(
                     s.error = None;
                     return true;
                 }
-                return popup_key(s, slot, ev) || super::keymap::field_key(s, ev, tx, false);
+                return popup_key(s, slot, ev)
+                    || newline_key(s, slot, ev)
+                    || super::keymap::field_key(s, ev, tx, false);
             }
-            if popup_key(s, Slot::Session, ev) {
+            if popup_key(s, Slot::Session, ev) || newline_key(s, slot, ev) {
                 return true;
             }
             if ev.key == rune::Key::Escape && s.composer_history_open {
@@ -2149,23 +2181,35 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .gap(ACTION_GAP)
         .center_y()
         .child(attach)
-        .child(super::voice::mic_button(s, k))
         .child(history_btn);
     let controls = controls_row::Controls::read(s);
+    let controls_room = if busy {
+        (inner - 160.0).max(200.0)
+    } else {
+        inner
+    };
     let own_line = controls.as_ref().map(|c| {
-        controls_row::beside(s, c, k, layer, inner)
-            .unwrap_or_else(|| controls_row::own_line(s, c, k, layer, inner))
+        controls_row::beside(s, c, k, layer, controls_room)
+            .unwrap_or_else(|| controls_row::own_line(s, c, k, layer, controls_room))
             .key("composer-controls")
             .w_full()
     });
-    let mut actions = row().key("composer-actions").gap(ACTION_GAP).center_y();
+    let mut actions = row()
+        .key("composer-actions")
+        .gap(ACTION_GAP)
+        .center_y()
+        .child(super::voice::mic_button(s, k));
+    let mut delivery = row().gap(8.0).center_y();
     if busy {
-        actions = actions.child(
+        delivery = delivery.child(
             Button::new(tr_ref(language, "Queue"))
                 .variant(ButtonVariant::Neutral)
                 .control_size(ControlSize::Regular)
                 .disabled(!has_session || !has_text || s.pending_submit.is_some())
-                .shortcut(super::keymap::label(super::keymap::Action::Queue))
+                .shortcut(super::keymap::label_with(
+                    super::keymap::Action::Queue,
+                    Some(&s.cfg.keymap),
+                ))
                 .on_press(queue_session)
                 .build(k)
                 .key("composer-queue")
@@ -2177,7 +2221,10 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 Button::new(stop_label)
                     .variant(ButtonVariant::Danger)
                     .control_size(ControlSize::Regular)
-                    .shortcut(super::keymap::label(super::keymap::Action::Stop))
+                    .shortcut(super::keymap::label_with(
+                        super::keymap::Action::Stop,
+                        Some(&s.cfg.keymap),
+                    ))
                     .on_press(move |s: &mut UiState| {
                         s.send(Command::Interrupt(AgentSessionId(asid.clone())))
                     })
@@ -2199,12 +2246,15 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .variant(ButtonVariant::Submit)
         .control_size(ControlSize::Regular)
         .disabled(!has_session || !has_text || s.pending_submit.is_some())
-        .shortcut(super::keymap::label(super::keymap::Action::Send))
+        .shortcut(super::keymap::label_with(
+            super::keymap::Action::Send,
+            Some(&s.cfg.keymap),
+        ))
         .help(if busy {
             format!(
                 "{} · {} {}",
                 tr_ref(language, "Steer the running turn"),
-                super::keymap::label(super::keymap::Action::Queue),
+                super::keymap::label_with(super::keymap::Action::Queue, Some(&s.cfg.keymap)),
                 tr_ref(language, "queues it instead")
             )
         } else {
@@ -2218,26 +2268,23 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     } else {
         send.size(36.0, 36.0).radius(k.radius.lg)
     };
-    actions = actions.child(look.glow(
+    let send = look.glow(
         send,
         k.c.bg_accent,
         if has_text && has_session { 0.9 } else { 0.0 },
-    ));
-
-    let actions = if busy && inner < 440.0 {
-        col()
-            .w_full()
-            .gap(8.0)
-            .child(tools)
-            .child(actions.w_full().justify_end())
+    );
+    if busy {
+        delivery = delivery.child(send);
     } else {
-        row()
-            .w_full()
-            .center_y()
-            .child(tools)
-            .child(el().grow(1.0))
-            .child(actions)
-    };
+        actions = actions.child(send);
+    }
+
+    let actions = row()
+        .w_full()
+        .center_y()
+        .child(tools)
+        .child(el().grow(1.0))
+        .child(actions);
 
     popup(s, k, layer, Slot::Session);
     history_popup(s, k, layer, Slot::Session);
@@ -2269,7 +2316,14 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     if let Some(chips) = chips(s, k, layer) {
         deck = deck.child(chips);
     }
-    deck = deck.child(card.w_full()).children(own_line);
+    let mut footer = row().w_full().min_w(0.0).gap(8.0).center_y().flex_wrap();
+    if let Some(controls) = own_line {
+        footer = footer.child(controls.w(0.0).grow(1.0).min_w(200.0));
+    }
+    if busy {
+        footer = footer.child(delivery);
+    }
+    deck = deck.child(card.w_full()).child(footer);
     col()
         .key("composer")
         .w_full()
@@ -2339,6 +2393,64 @@ mod tests {
     }
 
     #[test]
+    fn enter_send_setting_keeps_shift_enter_for_newlines() {
+        use rune::{Env, Key, KeyEvent, Mods, Runtime};
+        for name in ["home", "session"] {
+            let (tx, mut rx) = crate::ui::commands::channel();
+            let mut state = UiState::new(tx);
+            state.splash = None;
+            let (_, scene) = crate::ui::scenes::scenes()
+                .iter()
+                .find(|(n, _)| *n == name)
+                .unwrap();
+            scene(&mut state);
+            state
+                .cfg
+                .keymap
+                .bindings
+                .insert("send".into(), "enter".into());
+            let slot = if name == "home" {
+                Slot::Start
+            } else {
+                Slot::Session
+            };
+            *draft_of_mut(&mut state, slot) = fresh("Keyboard check");
+            let mut rt = Runtime::new(state, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+            rt.on_key = Some(crate::ui::on_key);
+            rt.frame(0.0);
+            rt.frame(0.02);
+            while rx.try_recv().is_ok() {}
+            rt.key(KeyEvent {
+                key: Key::Enter,
+                mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+            });
+            rt.frame(0.02);
+            assert!(draft_of(&rt.state, slot).text.contains('\n'));
+            while let Ok(command) = rx.try_recv() {
+                assert!(!matches!(
+                    command,
+                    Command::Compose(ComposeCommand::Submit { .. })
+                ));
+            }
+            rt.key(KeyEvent {
+                key: Key::Enter,
+                mods: Mods::default(),
+            });
+            rt.frame(0.02);
+            let mut submits = 0;
+            while let Ok(command) = rx.try_recv() {
+                if matches!(command, Command::Compose(ComposeCommand::Submit { .. })) {
+                    submits += 1;
+                }
+            }
+            assert_eq!(submits, 1, "configured Enter must send once on {name}");
+        }
+    }
+
+    #[test]
     fn remapped_send_replaces_default_in_both_composers() {
         use rune::{Env, Key, KeyEvent, Mods, Runtime};
         for scene_name in ["home", "session"] {
@@ -2362,6 +2474,23 @@ mod tests {
             rt.frame(0.0);
             rt.frame(0.02);
             while rx.try_recv().is_ok() {}
+            let before = draft_of(&rt.state, slot).text.clone();
+            rt.key(KeyEvent {
+                key: Key::Enter,
+                mods: Mods::default(),
+            });
+            rt.frame(0.02);
+            assert_eq!(
+                draft_of(&rt.state, slot).text.matches('\n').count(),
+                before.matches('\n').count() + 1,
+                "Enter must insert a newline on {scene_name}"
+            );
+            while let Ok(command) = rx.try_recv() {
+                assert!(!matches!(
+                    command,
+                    Command::Compose(ComposeCommand::Submit { .. })
+                ));
+            }
             rt.key(KeyEvent {
                 key: Key::Enter,
                 mods: Mods {

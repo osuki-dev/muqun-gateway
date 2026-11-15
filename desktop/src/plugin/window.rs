@@ -44,6 +44,9 @@ pub fn render(
 }
 
 pub fn chrome(id: &str, ctx: &PluginViewContext<'_>, body: El, layer: &mut Vec<El>) -> El {
+    if id == "terminal" {
+        return body;
+    }
     let mut header = row()
         .key(format!("window-header-{id}-{:?}", ctx.surface))
         .w_full()

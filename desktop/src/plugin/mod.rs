@@ -142,6 +142,7 @@ pub fn surface_switcher(
                 "Close"
             },
         );
+        let terminal = plugin_id == "terminal";
         let close_btn = rune_kit::IconButton::new(k.glyph.close)
             .label(close_label)
             .help(close_label)
@@ -149,6 +150,7 @@ pub fn surface_switcher(
             .control_size(ControlSize::Large)
             .on_press(move |s: &mut UiState| match active {
                 PluginSlot::Page => s.close_plugin_page(),
+                PluginSlot::Drawer if terminal => s.close_terminal(),
                 PluginSlot::Drawer => s.close_plugin_drawer(),
                 _ => {}
             })
@@ -391,34 +393,17 @@ impl DesktopPlugin for TerminalPlugin {
         } else {
             ColorScheme::Light
         };
-        let lang = ctx.s.cfg.general.language;
-        let body = terminal_panel::tile_body(ctx.s, ctx.k, scheme, ctx.scale, layer);
-        if matches!(ctx.surface, PluginSlot::Page | PluginSlot::Drawer) {
-            let header = row()
-                .w_full()
-                .h(36.0)
-                .px(12.0)
-                .gap(8.0)
-                .center_y()
-                .fill(ctx.k.alpha(ctx.k.c.layer_01, 0.45))
-                .child(icon(&terminal_panel::TERMINAL_WINDOW, 14.0).color(ctx.k.c.text_accent))
-                .child(
-                    text(tr_ref(lang, "Terminal"))
-                        .font(ctx.k.ty.ui_medium)
-                        .color(ctx.k.c.text_base),
-                )
-                .child(el().grow(1.0));
-            return Some(
-                col()
-                    .key(format!("term-plugin-{:?}-{}", ctx.surface, ctx.tile_id))
-                    .grow(1.0)
-                    .w_full()
-                    .min_h(0.0)
-                    .child(header)
-                    .child(body),
-            );
-        }
-        Some(body)
+        let controls = Some(surface_switcher(
+            ctx.s,
+            ctx.k,
+            ctx.s.cfg.general.language,
+            "terminal",
+            ctx.surface,
+            layer,
+        ));
+        Some(terminal_panel::tile_body_with_controls(
+            ctx.s, ctx.k, scheme, ctx.scale, layer, None, controls,
+        ))
     }
 
     fn commands(&self) -> Vec<PluginCommand> {

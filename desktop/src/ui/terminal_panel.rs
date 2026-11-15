@@ -1858,10 +1858,6 @@ fn shell_tab(k: &Kit, key: String, title: String, active: bool, number: usize) -
     } else {
         title.clone()
     };
-    let track = format!(
-        "{}-active-light",
-        key.rsplit_once('-').map_or(key.as_str(), |(p, _)| p)
-    );
     let ink = if active {
         k.c.text_base
     } else {
@@ -1878,7 +1874,7 @@ fn shell_tab(k: &Kit, key: String, title: String, active: bool, number: usize) -
             .pr(4.0)
             .gap(8.0)
             .center_y()
-            .radius(k.radius.sm)
+            .radius(k.radius.lg)
             .fill(if active {
                 k.c.surface_raised.mix(k.c.bg_accent, 0.14)
             } else {
@@ -1906,29 +1902,18 @@ fn shell_tab(k: &Kit, key: String, title: String, active: bool, number: usize) -
                     .truncate()
                     .shrink()
                     .min_w(0.0),
-            )
-            .children(active.then(|| {
-                el().key("tab-indicator")
-                    .matched(track)
-                    .pin(Some(10.0), None, Some(10.0), Some(0.0))
-                    .h(3.0)
-                    .radius(1.5)
-                    .box_shadow(rune::Shadow {
-                        x: 0.0,
-                        y: 0.0,
-                        blur: 12.0,
-                        spread: 1.0,
-                        color: k.c.bg_accent.alpha(0.6),
-                        inset: false,
-                    })
-                    .fill(k.c.bg_accent)
-                    .opacity(if active { 1.0 } else { 0.0 })
-                    .a11y_hidden()
-            })),
+            ),
     )
 }
 
-pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut Vec<El>) -> El {
+pub fn view(
+    s: &UiState,
+    k: &Kit,
+    scheme: ColorScheme,
+    scale: f32,
+    layer: &mut Vec<El>,
+    controls: El,
+) -> El {
     let language = s.cfg.general.language;
     let colors = colors(k, scheme);
     s.term.want.set(Some(colors));
@@ -2067,41 +2052,7 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
                 .build(k)
                 .key("terminal-restart"),
         )
-        .child(
-            IconButton::new(&super::icons::PLUS)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Add to split view"))
-                .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
-                    s.open_terminal_tile();
-                    s.focus_terminal_tx(tx);
-                })
-                .build(k)
-                .key("terminal-dock-split"),
-        )
-        .child(
-            IconButton::new(k.glyph.chevron_down)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Hide terminal"))
-                .on_press(|s: &mut UiState| s.close_terminal())
-                .build(k)
-                .key("terminal-hide"),
-        )
-        .child(
-            IconButton::new(k.glyph.close)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Close tab"))
-                .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
-                    s.term_close_tab(s.term.active_tab);
-                    if s.term.open || s.has_terminal_tile() {
-                        s.focus_terminal_tx(tx);
-                    }
-                })
-                .build(k)
-                .key("terminal-close"),
-        );
+        .child(controls);
 
     let ended_now = s.term.fixture_ended.is_some()
         || s.term.session.as_ref().is_some_and(|x| x.ended().is_some());
@@ -2191,6 +2142,18 @@ pub fn tile_body_for(
     scale: f32,
     layer: &mut Vec<El>,
     tile_idx: Option<usize>,
+) -> El {
+    tile_body_with_controls(s, k, scheme, scale, layer, tile_idx, None)
+}
+
+pub fn tile_body_with_controls(
+    s: &UiState,
+    k: &Kit,
+    scheme: ColorScheme,
+    scale: f32,
+    layer: &mut Vec<El>,
+    tile_idx: Option<usize>,
+    controls: Option<El>,
 ) -> El {
     let language = s.cfg.general.language;
     let colors = colors(k, scheme);
@@ -2368,6 +2331,7 @@ pub fn tile_body_for(
             .key(format!("tile-terminal-restart{sfx}")),
     );
 
+    let subheader = subheader.children(controls);
     let view = GridView {
         tile_idx,
         live,
