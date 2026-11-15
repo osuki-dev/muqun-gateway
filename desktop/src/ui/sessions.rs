@@ -531,7 +531,7 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
         title_of(info)
     ))
     .depth(if flat { 0 } else { 1 })
-    .height(if flat { 64.0 } else { 52.0 })
+    .height(if flat { 52.0 } else { 48.0 })
     .avatar(avatar_with_state(s, k, &look, info, activity))
     .subtitle(subtitle)
     .subtitle_color(k.c.text_muted.alpha(0.72))

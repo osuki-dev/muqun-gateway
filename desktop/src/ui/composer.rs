@@ -2178,13 +2178,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             .key("composer-controls")
             .w_full()
     });
-    let mut actions = row()
-        .key("composer-actions")
-        .gap(ACTION_GAP)
-        .center_y()
-        .flex_wrap()
-        .child(tools)
-        .child(el().grow(1.0));
+    let mut actions = row().key("composer-actions").gap(ACTION_GAP).center_y();
     if busy {
         actions = actions.child(
             Button::new(tr_ref(language, "Queue"))
@@ -2249,6 +2243,21 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         k.c.bg_accent,
         if has_text && has_session { 0.9 } else { 0.0 },
     ));
+
+    let actions = if busy && inner < 440.0 {
+        col()
+            .w_full()
+            .gap(8.0)
+            .child(tools)
+            .child(actions.w_full().justify_end())
+    } else {
+        row()
+            .w_full()
+            .center_y()
+            .child(tools)
+            .child(el().grow(1.0))
+            .child(actions)
+    };
 
     popup(s, k, layer, Slot::Session);
     history_popup(s, k, layer, Slot::Session);
