@@ -212,9 +212,24 @@ pub fn open_markdown_link(s: &mut UiState, url: &str, tx: &mut rune::Tx) {
     s.open_timeline_file(path);
 }
 
+/// Theme roles keep rich text readable in both palette variants.
+fn message_style(k: &Kit) -> MarkdownStyle {
+    MarkdownStyle::from_kit(k)
+        .link(k.c.text_accent)
+        .link_underline(k.c.bg_accent.alpha(0.35))
+        .inline_code_bg(k.c.bg_accent.alpha(0.10))
+        .quote(k.c.bg_accent.alpha(0.55), 2.0, 14.0, k.c.text_muted)
+        .rule(k.c.border_muted.alpha(0.6))
+        .list(24.0, 6.0)
+        .code_block(k.c.layer_01, k.c.border_muted.alpha(0.45))
+        .code_block_padding(14.0, 12.0)
+        .code_margin(12.0, 12.0)
+}
+
 /// Prose an agent wrote, as Markdown.
 pub fn prose(cx: &Tcx, key: &str, body: &str) -> El {
     Markdown::new(body)
+        .style(message_style(cx.k))
         .selectable(true)
         .on_link_tx(|s: &mut UiState, url: &str, tx: &mut rune::Tx| {
             open_markdown_link(s, url, tx);
@@ -378,7 +393,7 @@ impl<'a> ToolCard<'a> {
         let glyph_color = if failed {
             k.c.danger.icon
         } else {
-            self.accent.unwrap_or(k.c.icon_faint)
+            self.accent.unwrap_or(k.c.text_accent)
         };
         let selected = cx.selected(&id);
         let mut line = row()

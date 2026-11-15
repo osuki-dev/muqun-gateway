@@ -104,7 +104,7 @@ pub fn view(cx: &Tcx, items: &[TimelineItem]) -> El {
         .child(
             icon(&glyphs::CHEVRON, 11.0)
                 .key("chevron")
-                .color(k.c.icon_faint)
+                .color(k.c.text_accent)
                 .rotate(turn)
                 .a11y_hidden(),
         );
@@ -174,7 +174,7 @@ pub fn view(cx: &Tcx, items: &[TimelineItem]) -> El {
                     .h_full()
                     .ml(11.0)
                     .mr(6.0)
-                    .fill(k.c.border_weak),
+                    .fill(k.c.bg_accent.alpha(0.25)),
             )
             .child(list);
         if !cx.reduced_motion() {
