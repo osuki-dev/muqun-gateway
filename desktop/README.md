@@ -69,6 +69,10 @@ and JetBrains Mono Nerd Font (`src/platform/fonts.rs`) — missing ones fall bac
 
 ## Release build
 
+Desktop candidate CI uses Rust 1.99.1, matching the validated Linux and macOS
+builds. Rust 1.100 currently fails to compile the locked async-stream activity
+stream; upgrading the compiler requires resolving that compatibility issue.
+
 Use `bash desktop/scripts/build-release.sh` for the same optimized build used by
 packaging and CI. It checks Zig 0.15.2 (including an existing mise install), selects
 the macOS SDK and preserves the portable CPU baseline. It does not install tools,

@@ -569,7 +569,7 @@ impl TerminalBackend for TmuxBackend {
                         // read as a lie rather than a clue.
                         Err(failure) => yield Err(failure),
                     }
-                };
+                }
             };
             Ok(Box::pin(activity) as BackendActivityStream)
         })
