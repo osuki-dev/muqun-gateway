@@ -2690,6 +2690,13 @@ impl UiState {
         }
         if let Some(first_asid) = self.tiles.iter().find_map(|t| t.asid.clone()) {
             self.open_session(&first_asid);
+            // Watching only subscribes to future events. Every restored pane
+            // needs its initial snapshot, including panes nobody has clicked.
+            for asid in self.tiles.iter().filter_map(|tile| tile.asid.as_ref()) {
+                if asid != &first_asid && !asid.starts_with("new-") {
+                    self.send(Command::OpenTile(AgentSessionId(asid.clone())));
+                }
+            }
         }
         // The saved tiling, when every saved pane came back.
         if let Some(layout) = self.cfg.ui.tile_layout.clone() {
@@ -3827,6 +3834,40 @@ pub fn spawn_inbox_pump(inbox: Arc<Inbox>, handle: rune::AppHandle<UiState>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn restored_split_loads_every_session_without_focus_clicks() {
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = super::UiState::new(tx);
+        s.demo = false;
+        s.tiles_restored = false;
+        s.cfg.ui.tiles = vec!["session:left".into(), "session:right".into()];
+        s.sessions = ["left", "right"]
+            .into_iter()
+            .map(|id| {
+                serde_json::from_value(serde_json::json!({
+                    "asid": id, "agent_id": "codex", "title": id,
+                    "status": "idle", "directory": "/project", "updated_ms": 1
+                }))
+                .unwrap()
+            })
+            .collect();
+        s.restore_tiles();
+        let mut opened = std::collections::HashSet::new();
+        while let Ok(command) = rx.try_recv() {
+            if let crate::model::commands::Command::OpenSession(id)
+            | crate::model::commands::Command::OpenTile(id) = command
+            {
+                opened.insert(id.0);
+            }
+        }
+        assert_eq!(
+            opened,
+            ["left".to_string(), "right".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(s.selected.as_deref(), Some("left"));
+    }
     use super::*;
 
     #[test]
