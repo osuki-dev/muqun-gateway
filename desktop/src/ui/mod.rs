@@ -188,6 +188,8 @@ pub enum OpenMenu {
     Setting(String),
     /// The sidebar's computer picker.
     ComputerPicker,
+    /// The sidebar inventory scope. Search remains global.
+    SidebarScope,
     /// The tasks page's computer filter picker.
     TasksComputerPicker,
 }
@@ -437,6 +439,7 @@ pub struct UiState {
     pub context_open: Option<String>,
     /// Account rate windows by agent, once asked for (`None`: it has none).
     pub account_limits: HashMap<String, Option<serde_json::Value>>,
+    pub agent_details: std::collections::HashSet<String>,
     pub status: String,
     pub hub_label: String,
     pub error: Option<UiError>,
@@ -701,6 +704,7 @@ impl UiState {
             row_menu: None,
             context_open: None,
             account_limits: HashMap::new(),
+            agent_details: std::collections::HashSet::new(),
             status: "Starting…".into(),
             hub_label: String::new(),
             error: None,
@@ -1741,6 +1745,16 @@ impl UiState {
         self.timeline_search_jump_to_current(tx);
     }
 
+    pub fn refresh_account_limits(&self) {
+        for a in &self.agents {
+            if a.features.extra.get("accountLimits") == Some(&serde_json::Value::Bool(true)) {
+                self.send(Command::LoadAccountLimits {
+                    agent: a.id.clone(),
+                });
+            }
+        }
+    }
+
     pub fn go(&mut self, mode: Mode) {
         self.active_plugin_page = None;
         self.mode = mode;
@@ -1756,6 +1770,7 @@ impl UiState {
                 ));
             }
             Mode::Settings => {
+                self.refresh_account_limits();
                 self.send(Command::ThemeRefresh);
                 self.send(Command::ScanStorage);
             }
@@ -3639,7 +3654,7 @@ pub fn activity_mark(
         .px(8.0)
         .gap(6.0)
         .center_y()
-        .radius(10.0)
+        .radius(k.radius.lg)
         .fill(color.alpha(if activity == Activity::Idle {
             0.08
         } else {

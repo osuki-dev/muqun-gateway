@@ -1014,7 +1014,6 @@ fn tile(
         super::TileContent::Empty => format!("tile-empty-{i}"),
     };
     let radius = k.radius.lg;
-    let (under, over) = super::shell::card_floor_colors(k, look);
     let mut body = col()
         .key(id.clone())
         .matched(id.clone())
@@ -1027,7 +1026,6 @@ fn tile(
         .min_h(0.0)
         .radius(radius)
         .clip_rounded(radius)
-        .fill(under)
         .border(
             1.0,
             if focused {
@@ -1043,14 +1041,7 @@ fn tile(
             rune::Transition::none()
         })
         .on_press(move |s: &mut UiState| s.focus_tile(i));
-    if let Some(over) = over {
-        body = body.child(
-            el().key("tile-floor")
-                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-                .fill(over)
-                .a11y_hidden(),
-        );
-    }
+    body = look.panel(k, body, radius);
     body = body.child(header(s, k, look, i, place, layer)).child(
         el().key("tile-rule")
             .w_full()
@@ -1525,7 +1516,11 @@ pub fn view(s: &UiState, k: &Kit, clear: f32, scale: f32, layer: &mut Vec<El>) -
             );
         }
     }
-    stage = stage.child(backdrop);
+    // Tiled gaps reveal the same window backdrop as the sidebar gutter.
+    // Only floating windows need a separate workbench beneath them.
+    if mode == crate::config::TileLayoutMode::Floating {
+        stage = stage.child(backdrop);
+    }
 
     if let Some(z) = s.zoomed_tile.filter(|&i| i < s.tiles.len()) {
         stage = stage.child(tile(

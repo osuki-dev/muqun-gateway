@@ -320,7 +320,7 @@ pub fn zoom_overlay(s: &UiState, k: &Kit) -> Option<El> {
                     .key("zoom-close")
                     .size(32.0, 32.0)
                     .center()
-                    .radius(16.0)
+                    .radius(k.radius.lg)
                     .child(icon(&glyphs::CLOSE, 16.0).color(k.c.white)),
             )
             .cursor(Cursor::Pointer)

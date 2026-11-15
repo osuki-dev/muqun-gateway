@@ -309,7 +309,7 @@ impl Controls {
             items.push(if f.agent_icon {
                 ICON_PILL
             } else {
-                8.0 + 12.0 + 6.0 + text_w(&self.agent_name, k.ty.small_medium) + 8.0
+                8.0 + 20.0 + 6.0 + text_w(&self.agent_name, k.ty.small_medium) + 8.0
             });
         }
         if let Some(m) = &self.model {
@@ -453,18 +453,21 @@ fn pill_button(
     } else {
         k.c.border_muted.alpha(0.30)
     };
-    e.radius(18.0).fill(chip_fill).border(0.5, chip_border)
+    e.h(32.0)
+        .radius(k.radius.lg)
+        .fill(chip_fill)
+        .border(0.5, chip_border)
 }
 
 fn agent_chip(c: &Controls, k: &Kit, f: Fold) -> El {
-    let mark = super::agents::mark(&c.agent_id, 12.0, c.dark).a11y_hidden();
+    let mark = super::agents::mark(&c.agent_id, super::composer::AGENT_ICON, c.dark).a11y_hidden();
     let mut chip = row()
         .key("agent")
         .role("image")
         .label(c.agent_name.clone())
         .center_y()
-        .h(22.0)
-        .radius(k.radius.xs)
+        .h(36.0)
+        .radius(k.radius.lg)
         .fill(k.c.layer_01.alpha(0.35))
         .border(0.5, k.c.border_muted.alpha(0.30))
         .child(mark);
@@ -536,6 +539,9 @@ fn model_chips(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold,
                 .variant(BadgeVariant::Subtle)
                 .build(k)
                 .key("model")
+                .h(32.0)
+                .px(10.0)
+                .radius(k.radius.lg)
         } else {
             let current = m.current.as_ref().map(|(p, i)| (p.as_str(), i.as_str()));
             model_menu(
@@ -576,7 +582,10 @@ fn model_chips(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold,
         })
         .variant(BadgeVariant::Subtle)
         .build(k)
-        .key("model");
+        .key("model")
+        .h(32.0)
+        .px(10.0)
+        .radius(k.radius.lg);
         return line.child(badge);
     }
     let trigger = pill_button(
@@ -720,7 +729,11 @@ fn auto_control(c: &Controls, k: &Kit, f: Fold) -> El {
             .label(label)
             .on_toggle(move |s: &mut UiState| set_auto(s, &asid, !on))
             .build(k)
-            .key("auto-approve");
+            .key("auto-approve")
+            .h(36.0)
+            .px(8.0)
+            .radius(k.radius.lg)
+            .fill(k.c.layer_01.alpha(0.25));
     }
     // A toggle: lit in the accent while on.
     let tone = if on { k.c.bg_accent } else { k.c.icon_muted };
@@ -815,7 +828,11 @@ fn more_menu(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -
     if f.more_agent {
         menu = section(menu).item(
             MenuItem::new(c.agent_name.clone())
-                .lead(super::agents::mark(&c.agent_id, 12.0, c.dark))
+                .lead(super::agents::mark(
+                    &c.agent_id,
+                    super::composer::AGENT_ICON,
+                    c.dark,
+                ))
                 .disabled(true),
         );
     }

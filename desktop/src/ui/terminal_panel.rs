@@ -396,16 +396,14 @@ pub fn colors(k: &Kit, scheme: ColorScheme) -> Colors {
             hex(&t.cursor),
             hex(&t.selection),
         ) {
-            let mut adjusted_ansi = ansi;
-            for slot in &mut adjusted_ansi {
-                *slot = to_rgb(ensure_contrast(color(*slot), bg, 4.65));
-            }
+            // Explicit terminal palettes carry ANSI semantics (including black
+            // and dim colours). Do not recolour them as generic UI text.
             return Colors {
-                fg: to_rgb(ensure_contrast(fg, bg, 4.65)),
+                fg: to_rgb(fg),
                 bg: to_rgb(bg),
                 cursor: to_rgb(cursor),
                 selection: to_rgb(bg.mix(sel.alpha(1.0), sel.a.max(0.25))),
-                ansi: adjusted_ansi,
+                ansi,
             };
         }
     }
@@ -2494,7 +2492,7 @@ fn terminal_search_bar(s: &UiState, k: &Kit) -> El {
         .center_y()
         .px(10.0)
         .py(4.0)
-        .radius(crate::theme::look::CARD_RADIUS)
+        .radius(k.radius.lg)
         .fill(k.c.layer_01)
         .border(1.0, k.c.border_muted)
         .child(field)

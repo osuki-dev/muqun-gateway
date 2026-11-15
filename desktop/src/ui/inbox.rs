@@ -870,7 +870,7 @@ fn empty(k: &Kit, language: Language) -> El {
             row()
                 .key("empty-mark")
                 .size(40.0, 40.0)
-                .radius(20.0)
+                .radius(k.radius.xl)
                 .center()
                 .fill(k.alpha(k.c.success.icon, 0.12))
                 .child(icon(&glyphs::DONE, 18.0).color(k.c.success.icon))

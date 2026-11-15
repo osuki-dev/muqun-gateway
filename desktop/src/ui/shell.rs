@@ -311,22 +311,6 @@ fn hide_card(chrome: &mut Kit) {
     chrome.c.border_muted = chrome.c.border_muted.alpha(0.0);
 }
 
-/// A split-view pane's floor, as the main card's would be: the colour to
-/// fill it with, and on a see-through window the page colour to lay over
-/// that (the window floor first, then the card's surface).
-pub fn card_floor_colors(k: &Kit, look: &Look) -> (rune::Color, Option<rune::Color>) {
-    if look.see_through {
-        (
-            k.c.bg_deep.alpha(SEE_THROUGH_CARD[usize::from(look.dark)]),
-            Some(k.c.bg_base.alpha(CARD_ALPHA)),
-        )
-    } else if look.glass {
-        (k.c.bg_base.alpha(CARD_ALPHA), None)
-    } else {
-        (k.c.bg_base, None)
-    }
-}
-
 /// The least of the window floor that returns under the sidebar's lists,
 /// so a picture there is felt rather than read (light, dark): a picture
 /// over a light floor reads louder.

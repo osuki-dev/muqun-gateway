@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use muqun_gateway::agents::ModelRef;
 use rune::{col, el, row, text, El, ScrollSpec, Tx};
-use rune_kit::{Button, ButtonVariant, ControlSize, Kit, SegmentedControl, TextArea, TextInput};
+use rune_kit::{Button, ButtonVariant, ControlSize, Kit, SegmentedControl, TextInput};
 
 use super::composer::{self, branch_menu, catalog_models, model_menu};
 use super::copy::{tr, tr_ref};
@@ -29,7 +29,6 @@ const ART_MIN_H: f32 = 140.0;
 /// How far below the card's top edge the art may rise.
 const ART_TOP: f32 = 20.0;
 /// The start card's padding.
-const START_PAD: f32 = 24.0;
 /// The folder picker's width.
 const FOLDER_PICKER_W: f32 = 308.0;
 /// The most folders the folder picker lists.
@@ -189,7 +188,7 @@ fn agents(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                     row()
                         .gap(8.0)
                         .center_y()
-                        .child(super::agents::mark(&agent_id, 20.0, dark))
+                        .child(super::agents::mark(&agent_id, composer::AGENT_ICON, dark))
                         .child(text(format!("{selected} ▾")).font(font).color(ink))
                 })
                 .variant(ButtonVariant::Neutral)
@@ -198,10 +197,10 @@ fn agents(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .on_press(move |s: &mut UiState| s.menu = (!open).then_some(OpenMenu::StartAgents))
                 .build(k)
                 .key("agents-more")
-                .radius(22.0)
-                .h(40.0)
-                .px(16.0)
-                .py(10.0)
+                .radius(k.radius.lg)
+                .h(36.0)
+                .px(12.0)
+                .py(8.0)
                 .border(1.0, k.c.info.icon.alpha(0.35)),
         )
         .open(open)
@@ -610,13 +609,7 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
 /// Context above the editor; agent and delivery actions below it.
 fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f32; 2]) -> El {
     let language = s.cfg.general.language;
-    let mut card = col()
-        .key("home-card")
-        .w_full()
-        .gap(24.0)
-        .px(START_PAD)
-        .pt(START_PAD - 4.0)
-        .pb(START_PAD - 6.0);
+    let mut card = composer::body().key("home-card");
     let mut context = row()
         .gap(8.0)
         .center_y()
@@ -635,61 +628,20 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
         card = card.child(composer::drop_hint(k, look, language));
     }
     let placeholder = tr_ref(language, "Describe the task…");
-    let accent = k.c.bg_accent;
-    let info = k.c.info.icon;
-    card = card.child(
-        TextArea::new(&s.start_draft)
-            .placeholder(placeholder)
-            .label(tr_ref(language, "First prompt"))
-            .width(None)
-            .auto_grow(3, 12)
-            .pill_style(move |id| {
-                if id.starts_with("computer:") {
-                    rune::PillStyle::default().bg(accent.alpha(0.22)).fg(accent)
-                } else if id.starts_with("file:") {
-                    rune::PillStyle::default().bg(info.alpha(0.18)).fg(info)
-                } else if id.starts_with("image:") {
-                    rune::PillStyle::default()
-                        .bg(info.mix(accent, 0.4).alpha(0.22))
-                        .fg(accent)
-                        .icon(&composer::PHOTO)
-                } else {
-                    rune::PillStyle::default()
-                }
-            })
-            .on_edit(|s: &mut UiState| &mut s.start_draft)
-            .on_key(|s: &mut UiState, ev: &rune::KeyEvent, tx: &mut Tx| {
-                if super::keymap::intercept_global_key(s, ev, tx) {
-                    return true;
-                }
-                if ev.key == rune::Key::Escape && s.error.is_some() {
-                    s.error = None;
-                    return true;
-                }
-                composer::popup_key(s, Slot::Start, ev)
-                    || super::keymap::field_key(s, ev, tx, false)
-            })
-            .on_change(|s: &mut UiState, _: &mut Tx| composer::on_draft_change(s, Slot::Start))
-            .on_submit(|s: &mut UiState, _: &mut Tx| submit_start(s))
-            .on_input_paste(|s: &mut UiState, content, _: &mut Tx| composer::take_paste(s, content))
-            .build(&composer::bare_field(k))
-            .key("start-draft")
-            .w_full(),
-    );
+    card = card.child(composer::editor(s, k, Slot::Start, placeholder, 3, 12));
     // Where and how, in one row with the button that acts on them.
-    let mut actions = row()
-        .key("start-actions")
-        .w_full()
+    let mut controls = row()
+        .key("start-controls")
         .gap(4.0)
         .center_y()
         .flex_wrap()
         .child(agents(s, k, layer));
     if let Some(pills) = start_pills(s, k, layer) {
-        actions = actions.child(pills.ml(4.0));
+        controls = controls.child(pills.ml(4.0));
     }
 
     if let Some(i) = s.pending_tile {
-        actions = actions.child(
+        controls = controls.child(
             rune_kit::Badge::new(format!(
                 "{} {}",
                 tr_ref(language, "into split view pane"),
@@ -702,6 +654,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
     let attach_cwd = PathBuf::from(s.start_cwd.text.trim());
     let tools = row().gap(6.0).center_y().child(
         rune_kit::IconButton::new(&super::parts::glyphs::ATTACH)
+            .control_size(ControlSize::ExtraLarge)
             .variant(rune_kit::IconButtonVariant::GhostMuted)
             .label(tr_ref(language, "Attach"))
             .help(tr_ref(language, "Add files or an image"))
@@ -711,17 +664,22 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
             .build(k)
             .key("start-attach")
             .size(36.0, 36.0)
-            .radius(18.0)
+            .radius(k.radius.lg)
             .fill(k.c.layer_01.alpha(0.40))
             .border(1.0, k.c.border_muted.alpha(0.25)),
     );
-    actions = actions
+    let actions = row()
+        .key("start-actions")
+        .gap(6.0)
+        .center_y()
         .child(el().grow(1.0).a11y_hidden())
         .child(tools)
         .child(
             look.glow(
                 Button::new(tr_ref(language, "Start"))
-                    .label_with(|_, ink| rune::icon(&composer::SEND, 20.0).color(ink))
+                    .label_with(|_, ink| {
+                        rune::icon(&composer::SEND, composer::SEND_ICON).color(ink)
+                    })
                     .help(format!(
                         "{} · {}",
                         tr_ref(language, "Start"),
@@ -738,7 +696,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
                     .build(k)
                     .key("start")
                     .size(44.0, 44.0)
-                    .radius(22.0),
+                    .radius(k.radius.xl),
                 k.c.bg_accent,
                 if s.start_draft.text.trim().is_empty() {
                     0.0
@@ -747,7 +705,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
                 },
             ),
         );
-    card = card.child(actions);
+    card = card.child(composer::toolbar(k, controls, actions, size[0] - 48.0));
     let card = composer::composer_card(k, look, card, s.start_draft.focused, false, s.drop_hover)
         .on_drop_files(|s: &mut UiState, files, _| composer::attach_dropped_files(s, files))
         .on_drop_hover(|s: &mut UiState, over, _| s.drop_hover = over);

@@ -135,7 +135,7 @@ fn head(s: &UiState, k: &Kit, id: &str, standing: Standing, version: Option<&str
     let mark = el()
         .key("mark")
         .size(32.0, 32.0)
-        .radius(9.0)
+        .radius(k.radius.md)
         .fill(brand.alpha(if enabled { 0.16 } else { 0.08 }))
         .center()
         .child(crate::ui::agents::mark(id, 18.0, s.dark))
@@ -222,55 +222,32 @@ fn usage<'a>(
 fn usage_card(s: &UiState, k: &Kit, agent: &str) -> El {
     let t = |en| tr_ref(s.cfg.general.language, en);
     let total = usage(s.sessions.iter(), agent);
-    let missing = t("Not reported");
-    let values = [
-        ("Sessions", total.sessions.to_string()),
-        (
-            "Input tokens",
-            if total.reported > 0 {
-                total.input.to_string()
-            } else {
-                missing.to_string()
-            },
-        ),
-        (
-            "Output tokens",
-            if total.reported > 0 {
-                total.output.to_string()
-            } else {
-                missing.to_string()
-            },
-        ),
-        (
-            "Estimated cost",
-            total
-                .cost
-                .map(|cost| format!("${cost:.4}"))
-                .unwrap_or_else(|| missing.to_string()),
-        ),
-    ];
-    let mut cards = hrow().key("usage-metrics").w_full().gap(8.0).flex_wrap();
-    for (label, value) in values {
-        cards = cards.child(
-            col()
-                .key(label)
-                .min_w(120.0)
-                .grow(1.0)
-                .px(12.0)
-                .py(12.0)
-                .gap(6.0)
-                .radius(k.radius.sm)
-                .fill(k.c.bg_accent.alpha(0.06))
-                .child(text(t(label)).font(k.ty.small).color(k.c.text_muted))
-                .child(text(value).font(k.ty.mono).color(k.c.text_base)),
+    let mut line = hrow().w_full().gap(16.0).flex_wrap().child(
+        text(format!("{} {}", total.sessions, t("Sessions")))
+            .font(k.ty.small)
+            .color(k.c.text_muted),
+    );
+    if total.reported > 0 {
+        line = line.child(
+            text(format!(
+                "{} {} · {} {}",
+                t("Input tokens"),
+                crate::ui::parts::context::compact(total.input),
+                t("Output tokens"),
+                crate::ui::parts::context::compact(total.output)
+            ))
+            .font(k.ty.small)
+            .color(k.c.text_muted),
         );
     }
-    col().key("agent-usage").w_full().gap(8.0).py(12.0)
-        .child(cards)
-        .child(text(t("Loaded sessions in this view only; not account quota. Input/output exclude separately reported cache and reasoning tokens."))
-            .font(k.ty.small).color(k.c.text_muted).wrap().w_full())
-        .child(text(format!("{}: {}/{} · {}: {}/{}", t("Token coverage"), total.reported, total.sessions,
-            t("Cost coverage"), total.cost_sessions, total.sessions)).font(k.ty.small).color(k.c.text_faint))
+    if let Some(cost) = total.cost {
+        line = line.child(
+            text(format!("{} ${cost:.2}", t("Estimated cost")))
+                .font(k.ty.small)
+                .color(k.c.text_muted),
+        );
+    }
+    line.help(t("Loaded sessions in this view only; not account quota. Input/output exclude separately reported cache and reasoning tokens."))
 }
 
 pub(super) fn actions(s: &UiState, k: &Kit) -> Vec<El> {
@@ -278,7 +255,10 @@ pub(super) fn actions(s: &UiState, k: &Kit) -> Vec<El> {
     vec![super::button(tr_ref(language, "Look again"))
         .icon(&crate::ui::icons::REFRESH)
         .help(tr_ref(language, "Probe this computer for agents again"))
-        .on_press(|s: &mut UiState| s.send(Command::Refresh))
+        .on_press(|s: &mut UiState| {
+            s.send(Command::Refresh);
+            s.refresh_account_limits();
+        })
         .build(k)
         .key("agents-refresh")]
 }
@@ -303,17 +283,39 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
         crate::ui::agents::by_standing(&s.agents)
             .into_iter()
             .map(|(a, standing)| {
-                let mut rows: Vec<El> = vec![usage_card(s, k, &a.id)];
-                if let Some(reason) = &a.reason {
-                    rows.push(el().key("reason").w_full().py(10.0).child(status(
-                        k,
-                        "reason",
-                        Tone::Quiet,
-                        reason.clone(),
-                    )));
-                }
-                for f in fields(&a.id) {
-                    rows.push(agent_field(s, k, layer, &a.id, *f));
+                let quota =
+                    crate::ui::parts::context::limits_section(s, k, &a.id).unwrap_or_else(|| {
+                        crate::ui::muted(k, tr_ref(language, "No quota values reported"))
+                    });
+                let mut rows = vec![quota.py(16.0)];
+                let expanded = s.agent_details.contains(&a.id);
+                let id = a.id.clone();
+                rows.push(
+                    rune_kit::Button::new(tr_ref(language, "Details"))
+                        .variant(rune_kit::ButtonVariant::Ghost)
+                        .control_size(rune_kit::ControlSize::Large)
+                        .expanded(expanded)
+                        .on_press(move |s: &mut UiState| {
+                            if !s.agent_details.remove(&id) {
+                                s.agent_details.insert(id.clone());
+                            }
+                        })
+                        .build(k)
+                        .key(format!("agent-details-{}", a.id)),
+                );
+                if expanded {
+                    rows.push(usage_card(s, k, &a.id));
+                    if let Some(reason) = &a.reason {
+                        rows.push(el().key("reason").w_full().py(10.0).child(status(
+                            k,
+                            "reason",
+                            Tone::Quiet,
+                            reason.clone(),
+                        )));
+                    }
+                    for f in fields(&a.id) {
+                        rows.push(agent_field(s, k, layer, &a.id, *f));
+                    }
                 }
                 let enabled = s.cfg.agents_for(s.current_computer()).enabled(&a.id);
                 let group = group_with(

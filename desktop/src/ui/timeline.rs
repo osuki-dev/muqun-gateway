@@ -538,7 +538,7 @@ fn latest_pill(s: &UiState, k: &Kit, asid: &str, unseen: usize) -> El {
         .px(12.0)
         .gap(6.0)
         .center_y()
-        .radius(14.0)
+        .radius(k.radius.lg)
         .fill(k.c.bg_base)
         .border(1.0, k.c.border_muted)
         .child(
@@ -546,7 +546,7 @@ fn latest_pill(s: &UiState, k: &Kit, asid: &str, unseen: usize) -> El {
                 .absolute(0.0, 0.0)
                 .w_full()
                 .h_full()
-                .radius(14.0)
+                .radius(k.radius.lg)
                 .fill(fill)
                 .a11y_hidden(),
         )
@@ -654,7 +654,7 @@ fn timeline_search_bar(s: &UiState, k: &Kit, asid: &str) -> El {
         .center_y()
         .px(10.0)
         .py(4.0)
-        .radius(crate::theme::look::CARD_RADIUS)
+        .radius(k.radius.lg)
         .fill(k.c.layer_01)
         .border(1.0, k.c.border_muted)
         .child(field)

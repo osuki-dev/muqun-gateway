@@ -123,22 +123,40 @@ fn projects(s: &UiState) -> Vec<Project> {
     projects
 }
 
-fn scope(s: &UiState, k: &Kit) -> El {
-    let mut tabs = rune::row().w_full().gap(4.0);
-    for (all, word, key) in [
-        (false, "Recent sessions", "sidebar-recent"),
-        (true, "All sessions", "sidebar-all"),
-    ] {
-        let selected = s.sidebar_all_sessions == all;
-        let label = super::copy::tr(s.cfg.general.language, word);
-        tabs = tabs.child(Button::new(label)
-            .variant(if selected { ButtonVariant::Neutral } else { ButtonVariant::Ghost })
-            .control_size(ControlSize::Small)
-            .help(super::copy::tr(s.cfg.general.language, if all { "Browse every session. Search always includes all sessions." } else { "Last 3 days, up to 8 recent sessions. Pinned, open and active sessions stay visible." }))
-            .on_press(move |s: &mut UiState| { s.sidebar_all_sessions = all; })
-            .build(k).key(key).grow(1.0).min_w(0.0));
+fn scope(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+    let open = s.menu == Some(OpenMenu::SidebarScope);
+    let t = |word| super::copy::tr(s.cfg.general.language, word);
+    let title = t(if s.sidebar_all_sessions {
+        "All sessions"
+    } else {
+        "Recent sessions"
+    });
+    let trigger = Button::new(title)
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Large)
+        .on_press(move |s: &mut UiState| {
+            s.menu = (!open).then_some(OpenMenu::SidebarScope);
+        })
+        .build(k)
+        .key("sidebar-scope")
+        .child(rune::icon(&TRIANGLE_DOWN, 12.0).color(k.c.text_faint));
+    let mut menu = Menu::new("sidebar-scope-menu")
+        .trigger(trigger)
+        .open(open)
+        .min_width(220.0)
+        .placement(rune_kit::Placement::BottomStart)
+        .on_close(|s: &mut UiState| s.menu = None);
+    for (all, word) in [(false, "Recent sessions"), (true, "All sessions")] {
+        menu = menu.item(
+            MenuItem::new(t(word))
+                .checked(s.sidebar_all_sessions == all)
+                .on_select(move |s: &mut UiState| {
+                    s.sidebar_all_sessions = all;
+                    s.menu = None;
+                }),
+        );
     }
-    tabs
+    rune::row().w_full().center_y().child(menu.build(k, layer))
 }
 
 fn project_label(language: crate::config::Language, p: &Project) -> String {
@@ -506,10 +524,7 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
         .as_deref()
         .and_then(|path| std::path::Path::new(path).file_name())
         .map(|name| name.to_string_lossy().into_owned());
-    let subtitle = match directory {
-        Some(dir) => format!("{dir} · {}", s.agent_name(&info.agent_id)),
-        None => s.agent_name(&info.agent_id),
-    };
+    let subtitle = directory.unwrap_or_default();
     let mut row = SidebarRow::new(format!(
         "{}{}",
         if pinned { "★ " } else { "" },
@@ -519,6 +534,7 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     .height(if flat { 64.0 } else { 52.0 })
     .avatar(avatar_with_state(s, k, &look, info, activity))
     .subtitle(subtitle)
+    .subtitle_color(k.c.text_muted.alpha(0.72))
     .detail(when)
     .selected(super::search::row_selected(s, asid));
     if in_tile {
@@ -553,7 +569,7 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     .build(k)
     .key(format!("session-{asid}"))
     .help(info.directory.clone().unwrap_or_default())
-    .radius(12.0)
+    .radius(k.radius.lg)
     .mb(4.0)
     .on_secondary_press(move |s: &mut UiState, _, _: &mut Tx| {
         s.menu = Some(OpenMenu::Session(menu_id.clone()));
@@ -594,20 +610,16 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let trigger = rune::row()
         .key("computer-switcher-trigger")
         .w_full()
-        .h(42.0)
-        .px(12.0)
+        .h(36.0)
+        .px(10.0)
         .gap(8.0)
         .center_y()
         .radius(k.radius.md)
-        .fill(k.c.layer_01)
-        .border(
-            1.0,
-            if open {
-                k.c.border_focus
-            } else {
-                k.c.border_weak
-            },
-        )
+        .fill(if open {
+            k.c.layer_01
+        } else {
+            k.c.layer_01.alpha(0.35)
+        })
         .cursor(rune::Cursor::Pointer)
         .role("button")
         .label(super::copy::tr_ref(language, "Switch computer"))
@@ -724,12 +736,12 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                         .build(k)
                         .key("sidebar-new-session")
                         .size(36.0, 36.0)
-                        .radius(12.0)
+                        .radius(k.radius.lg)
                         .fill(k.c.bg_accent.alpha(0.12)),
                 ),
         )
         .child(search(s, k))
-        .child(scope(s, k));
+        .child(scope(s, k, layer));
 
     let mut sidebar = Sidebar::new()
         .label(super::copy::tr_ref(language, "Sessions"))
@@ -891,7 +903,7 @@ fn search(s: &UiState, k: &Kit) -> El {
                     .px(7.0)
                     .mr(4.0)
                     .center_y()
-                    .radius(10.0)
+                    .radius(k.radius.lg)
                     .fill(k.c.bg_accent.alpha(if s.dark { 0.22 } else { 0.14 }))
                     .role("button")
                     .label(super::copy::tr(language, "Messages only"))

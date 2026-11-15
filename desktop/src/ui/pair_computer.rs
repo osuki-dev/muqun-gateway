@@ -50,7 +50,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .key("pair-device-badge")
         .w(48.0)
         .h(48.0)
-        .radius(12.0)
+        .radius(k.radius.lg)
         .fill(k.c.layer_01)
         .border(1.0, k.c.border_base)
         .items_center()
@@ -62,7 +62,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .w_full()
         .px(16.0)
         .py(14.0)
-        .radius(14.0)
+        .radius(k.radius.lg)
         .fill(k.c.layer_01.alpha(0.6))
         .border(1.0, k.c.border_weak)
         .center_y()
@@ -153,7 +153,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                 .center_y()
                 .px(14.0)
                 .py(10.0)
-                .radius(10.0)
+                .radius(k.radius.lg)
                 .fill(k.c.danger.bg)
                 .border(1.0, k.c.danger.border)
                 .child(icon(&glyphs::TRUST_WARNING, 16.0).color(k.c.danger.fg))
@@ -294,7 +294,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
             .center_y()
             .px(12.0)
             .py(8.0)
-            .radius(8.0)
+            .radius(k.radius.md)
             .fill(k.c.layer_01.alpha(0.5))
             .border(1.0, k.c.border_weak)
             .child(icon(&glyphs::TRUST_WARNING, 14.0).color(k.c.text_muted))
@@ -418,7 +418,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
             .gap(14.0)
             .px(20.0)
             .py(20.0)
-            .radius(14.0)
+            .radius(k.radius.lg)
             .fill(k.c.layer_01.alpha(0.6))
             .border(1.0, k.c.border_weak)
             .child(
@@ -435,7 +435,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                                 col()
                                     .w(44.0)
                                     .h(44.0)
-                                    .radius(10.0)
+                                    .radius(k.radius.lg)
                                     .fill(k.c.surface_base)
                                     .border(1.0, k.c.border_base)
                                     .items_center()
@@ -471,7 +471,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                                 col()
                                     .w(44.0)
                                     .h(44.0)
-                                    .radius(10.0)
+                                    .radius(k.radius.lg)
                                     .fill(k.c.surface_base)
                                     .border(1.0, k.c.border_base)
                                     .items_center()
@@ -548,7 +548,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
     }
 
     let mut panel = look
-        .panel(k, card, crate::theme::look::PANEL_RADIUS)
+        .panel(k, card, k.radius.xl)
         .fill(k.c.surface_raised_base.alpha(0.97));
     for shadow in k.shadow_layers(&k.elevation.overlay) {
         panel = panel.box_shadow(shadow);
@@ -632,7 +632,7 @@ fn build_pin_matrix(clean_code: &str, busy: bool, k: &Kit) -> El {
         .w_full()
         .py(16.0)
         .px(12.0)
-        .radius(12.0)
+        .radius(k.radius.lg)
         .fill(k.c.surface_base.alpha(0.5))
         .border(
             1.5,
@@ -658,7 +658,7 @@ fn render_pin_cell(index: usize, chars: &[char], busy: bool, is_complete: bool, 
         .key(format!("pin-cell-{index}"))
         .w(44.0)
         .h(56.0)
-        .radius(10.0)
+        .radius(k.radius.lg)
         .items_center()
         .justify_center();
 

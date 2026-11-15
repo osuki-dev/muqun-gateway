@@ -87,10 +87,10 @@ impl UiState {
 
     /// Close the active right-hand plugin drawer.
     pub fn close_plugin_drawer(&mut self) {
-        if self.active_plugin_drawer.take().is_some() {
-            self.right_open = false;
-            self.right.set_open(false);
-        }
+        self.active_plugin_drawer = None;
+        self.right_open = false;
+        self.right.set_open(false);
+        self.draft.focused = true;
     }
 
     /// Find the tile index currently hosting `plugin_id`, if any.
@@ -229,5 +229,27 @@ impl UiState {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ui::UiState;
+    #[test]
+    fn closing_implicit_inspector_closes_pane_and_restores_draft_focus() {
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.right_open = true;
+        s.right.set_open(true);
+        s.draft.focused = false;
+        assert!(s.active_plugin_drawer.is_none());
+        s.close_plugin_drawer();
+        assert!(!s.right_open);
+        assert!(!s.right.is_open());
+        assert!(s.draft.focused);
+        s.toggle_inspector();
+        assert!(s.right_open);
+        s.close_plugin_drawer();
+        assert!(!s.right_open);
     }
 }

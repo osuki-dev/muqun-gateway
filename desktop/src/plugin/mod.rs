@@ -113,7 +113,7 @@ pub fn surface_switcher(
             } else {
                 ButtonVariant::Ghost
             })
-            .control_size(ControlSize::Small)
+            .control_size(ControlSize::Large)
             .on_press(move |s: &mut UiState| {
                 s.switch_plugin_surface(&pid, slot);
             })
@@ -132,7 +132,7 @@ pub fn surface_switcher(
             },
         ))
         .variant(ButtonVariant::Ghost)
-        .control_size(ControlSize::Small)
+        .control_size(ControlSize::Large)
         .on_press(move |s: &mut UiState| match active {
             PluginSlot::Page => s.close_plugin_page(),
             PluginSlot::Drawer => s.close_plugin_drawer(),

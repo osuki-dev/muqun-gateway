@@ -274,6 +274,7 @@ pub fn mic_button(s: &UiState, k: &Kit) -> El {
         None => tr(language, "Dictate"),
     };
     IconButton::new(&MIC)
+        .control_size(rune_kit::ControlSize::ExtraLarge)
         .variant(if recording.is_some() {
             IconButtonVariant::Contrast
         } else {

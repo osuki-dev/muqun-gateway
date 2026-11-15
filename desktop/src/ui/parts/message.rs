@@ -199,7 +199,7 @@ fn render_code_card(cx: &Tcx, id: &str, i: usize, lang: &str, code_str: &str) ->
     col()
         .key(format!("{id}-code-{i}"))
         .w_full()
-        .radius(crate::theme::look::CARD_RADIUS)
+        .radius(cx.k.radius.lg)
         .fill(cx.k.c.layer_01.alpha(0.6))
         .border(1.0, cx.k.c.border_weak)
         .mt(4.0)

@@ -240,7 +240,7 @@ pub(super) fn note_skill_args(s: &mut UiState, deliver: &Deliver) {
 
 /// A compact floating capsule for the active project or session controls.
 pub fn context_capsule(k: &Kit, look: &crate::theme::look::Look, content: El) -> El {
-    look.panel(k, content.px(14.0).py(8.0), 24.0)
+    look.panel(k, content.px(14.0).py(8.0), k.radius.xl)
         .border(1.0, k.c.border_muted.alpha(0.45))
 }
 
@@ -256,7 +256,7 @@ pub fn composer_card(
     let active = focused || drop_hover;
     let base = look.panel_fill(k);
     let card = look
-        .panel(k, card, 24.0)
+        .panel(k, card, k.radius.xl)
         .linear_gradient(
             0.65,
             [
@@ -837,7 +837,7 @@ pub fn drop_hint(
         .center()
         .gap(8.0)
         .py(6.0)
-        .radius(crate::theme::look::PANEL_RADIUS)
+        .radius(k.radius.xl)
         .fill(accent.alpha(if dark { 0.20 } else { 0.12 }))
         .border(1.0, accent.alpha(0.6))
         .child(rune::icon(&DROP_ICON, 14.0).color(accent))
@@ -1684,7 +1684,7 @@ pub fn pill(k: &Kit, key: &str, label: String, open: bool, menu: OpenMenu) -> El
         .on_press(move |s: &mut UiState| s.menu = (!open).then(|| menu.clone()))
         .build(k)
         .key(key.to_string())
-        .radius(18.0)
+        .radius(k.radius.lg)
         .h(32.0)
         .px(12.0)
         .py(7.0)
@@ -1853,6 +1853,145 @@ pub(super) fn effort_menu(
     menu.build(k, layer)
 }
 
+pub const AGENT_ICON: f32 = 20.0;
+pub const SEND_ICON: f32 = 22.0;
+
+pub fn body() -> El {
+    col().w_full().gap(18.0).px(24.0).pt(20.0).pb(18.0)
+}
+
+pub fn toolbar(k: &Kit, controls: El, actions: El, width: f32) -> El {
+    if width < 720.0 {
+        col()
+            .w_full()
+            .gap(10.0)
+            .child(controls)
+            .child(actions.w_full())
+    } else {
+        row()
+            .w_full()
+            .gap(12.0)
+            .center_y()
+            .child(controls.shrink().min_w(0.0))
+            .child(el().grow(1.0))
+            .child(actions)
+    }
+    .motion(k.motion.control)
+}
+
+/// One editor, key handling and attachment paste path for both composer contexts.
+pub fn editor(
+    s: &UiState,
+    k: &Kit,
+    slot: Slot,
+    placeholder: &str,
+    min_rows: usize,
+    max_rows: usize,
+) -> El {
+    let language = s.cfg.general.language;
+    let accent = k.c.bg_accent;
+    let info = k.c.info.icon;
+    TextArea::new(draft_of(s, slot))
+        .placeholder(placeholder)
+        .label(tr_ref(
+            language,
+            if slot == Slot::Start {
+                "First prompt"
+            } else {
+                "Draft"
+            },
+        ))
+        .width(None)
+        .auto_grow(min_rows, max_rows)
+        .pill_style(move |id| {
+            if id.starts_with("computer:") {
+                PillStyle::default().bg(accent.alpha(0.22)).fg(accent)
+            } else if id.starts_with("file:") {
+                PillStyle::default().bg(info.alpha(0.18)).fg(info)
+            } else if id.starts_with("image:") {
+                PillStyle::default()
+                    .bg(info.mix(accent, 0.4).alpha(0.22))
+                    .fg(accent)
+                    .icon(&PHOTO)
+            } else {
+                PillStyle::default()
+            }
+        })
+        .on_edit(move |s: &mut UiState| draft_of_mut(s, slot))
+        .on_change(move |s: &mut UiState, _: &mut Tx| on_draft_change(s, slot))
+        .on_key(move |s: &mut UiState, ev: &rune::KeyEvent, tx: &mut Tx| {
+            if super::keymap::intercept_global_key(s, ev, tx) {
+                return true;
+            }
+            if slot == Slot::Start {
+                if ev.key == rune::Key::Escape && s.error.is_some() {
+                    s.error = None;
+                    return true;
+                }
+                return popup_key(s, slot, ev) || super::keymap::field_key(s, ev, tx, false);
+            }
+            if popup_key(s, Slot::Session, ev) {
+                return true;
+            }
+            if ev.key == rune::Key::Escape && s.composer_history_open {
+                s.composer_history_open = false;
+                return true;
+            }
+            if ev.key == rune::Key::Up
+                && !ev.mods.cmd
+                && !ev.mods.alt
+                && (s.draft.text.is_empty() || s.prompt_history_cursor.is_some())
+                && s.prompt_history_prev()
+            {
+                return true;
+            }
+            if ev.key == rune::Key::Down
+                && !ev.mods.cmd
+                && !ev.mods.alt
+                && s.prompt_history_cursor.is_some()
+                && s.prompt_history_next()
+            {
+                return true;
+            }
+            if ev.key == rune::Key::Escape && s.prompt_history_cursor.is_some() {
+                s.reset_prompt_history_cursor();
+                return true;
+            }
+            if ev.key == rune::Key::Escape && s.error.is_some() {
+                s.error = None;
+                return true;
+            }
+            if ev.key == rune::Key::Escape && s.show_diff {
+                s.show_diff = false;
+                return true;
+            }
+            // Alt+Enter while the agent works: queue after this turn.
+            if super::keymap::entry(super::keymap::Action::Queue)
+                .keybind()
+                .matches_tx(ev, tx)
+                && s.busy()
+            {
+                queue_session(s);
+                return true;
+            }
+            // Sidebar, pane, and composer keys, ahead of the field's caret moves.
+            let at_end = caret_at_end(&s.draft);
+            super::keymap::field_key(s, ev, tx, at_end)
+        })
+        .on_submit(move |s: &mut UiState, _: &mut Tx| match slot {
+            Slot::Start => super::home::submit_start(s),
+            Slot::Session => submit_session(s),
+        })
+        .on_input_paste(|s: &mut UiState, content, _: &mut Tx| take_paste(s, content))
+        .build(&bare_field(k))
+        .key(if slot == Slot::Start {
+            "start-draft"
+        } else {
+            "draft"
+        })
+        .w_full()
+}
+
 pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let look = s.look();
     let language = s.cfg.general.language;
@@ -1875,6 +2014,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         crate::platform::dialogs::attach_files(start.clone());
     };
     let attach = rune_kit::IconButton::new(&super::parts::glyphs::ATTACH)
+        .control_size(ControlSize::ExtraLarge)
         .variant(rune_kit::IconButtonVariant::GhostMuted)
         .label(tr_ref(language, "Attach"))
         .help(attach_help)
@@ -1915,6 +2055,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         )
     };
     let expand_btn = rune_kit::IconButton::new(expand_icon)
+        .control_size(ControlSize::ExtraLarge)
         .variant(rune_kit::IconButtonVariant::GhostMuted)
         .label(expand_label)
         .help(expand_help)
@@ -1931,6 +2072,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .key("composer-expand");
 
     let history_btn = rune_kit::IconButton::new(&super::parts::glyphs::TIME)
+        .control_size(ControlSize::ExtraLarge)
         .variant(if s.composer_history_open {
             rune_kit::IconButtonVariant::Contrast
         } else {
@@ -1963,7 +2105,6 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     });
     let mut actions = row()
         .key("composer-actions")
-        .w_full()
         .gap(ACTION_GAP)
         .center_y()
         .flex_wrap()
@@ -1978,7 +2119,9 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .shortcut("Alt+Enter")
                 .on_press(queue_session)
                 .build(k)
-                .key("composer-queue"),
+                .key("composer-queue")
+                .h(36.0)
+                .radius(k.radius.lg),
         );
         if let Some(asid) = s.selected.clone() {
             actions = actions.child(
@@ -1990,7 +2133,9 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                         s.send(Command::Interrupt(AgentSessionId(asid.clone())))
                     })
                     .build(k)
-                    .key("stop"),
+                    .key("stop")
+                    .h(36.0)
+                    .radius(k.radius.lg),
             );
         }
     }
@@ -1999,7 +2144,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             if busy {
                 text(send_label).font(font).color(ink)
             } else {
-                rune::icon(&SEND, 20.0).color(ink)
+                rune::icon(&SEND, SEND_ICON).color(ink)
             }
         })
         .variant(ButtonVariant::Submit)
@@ -2020,9 +2165,9 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .build(k)
         .key("send");
     let send = if busy {
-        send
+        send.h(36.0).radius(k.radius.lg)
     } else {
-        send.size(44.0, 44.0).radius(22.0)
+        send.size(44.0, 44.0).radius(k.radius.xl)
     };
     actions = actions.child(look.glow(
         send,
@@ -2032,13 +2177,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
 
     popup(s, k, layer, Slot::Session);
     history_popup(s, k, layer, Slot::Session);
-    let mut card = col()
-        .key("composer-card")
-        .w_full()
-        .gap(12.0)
-        .px(24.0)
-        .pt(16.0)
-        .pb(18.0);
+    let mut card = body().key("composer-card");
 
     let resizer = row()
         .key("composer-resizer")
@@ -2089,8 +2228,6 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     } else {
         tr_ref(language, "Pick a session first")
     };
-    let accent = k.c.bg_accent;
-    let info = k.c.info.icon;
     let (min_rows, max_rows) = if let Some(r) = s.composer_rows {
         (r, r.max(8))
     } else if s.composer_expanded {
@@ -2101,87 +2238,8 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     if let Some(dictation) = super::voice::strip(s, k) {
         card = card.child(dictation);
     }
-    card = card.child(
-        TextArea::new(&s.draft)
-            .placeholder(placeholder)
-            .label(tr_ref(language, "Draft"))
-            .width(None)
-            .auto_grow(min_rows, max_rows)
-            .pill_style(move |id| {
-                if id.starts_with("computer:") {
-                    PillStyle::default().bg(accent.alpha(0.22)).fg(accent)
-                } else if id.starts_with("file:") {
-                    PillStyle::default().bg(info.alpha(0.18)).fg(info)
-                } else if id.starts_with("image:") {
-                    PillStyle::default()
-                        .bg(info.mix(accent, 0.4).alpha(0.22))
-                        .fg(accent)
-                        .icon(&PHOTO)
-                } else {
-                    PillStyle::default()
-                }
-            })
-            .on_edit(|s: &mut UiState| &mut s.draft)
-            .on_change(|s: &mut UiState, _: &mut Tx| on_draft_change(s, Slot::Session))
-            .on_key(|s: &mut UiState, ev: &rune::KeyEvent, tx: &mut Tx| {
-                if super::keymap::intercept_global_key(s, ev, tx) {
-                    return true;
-                }
-                if popup_key(s, Slot::Session, ev) {
-                    return true;
-                }
-                if ev.key == rune::Key::Escape && s.composer_history_open {
-                    s.composer_history_open = false;
-                    return true;
-                }
-                if ev.key == rune::Key::Up
-                    && !ev.mods.cmd
-                    && !ev.mods.alt
-                    && (s.draft.text.is_empty() || s.prompt_history_cursor.is_some())
-                    && s.prompt_history_prev()
-                {
-                    return true;
-                }
-                if ev.key == rune::Key::Down
-                    && !ev.mods.cmd
-                    && !ev.mods.alt
-                    && s.prompt_history_cursor.is_some()
-                    && s.prompt_history_next()
-                {
-                    return true;
-                }
-                if ev.key == rune::Key::Escape && s.prompt_history_cursor.is_some() {
-                    s.reset_prompt_history_cursor();
-                    return true;
-                }
-                if ev.key == rune::Key::Escape && s.error.is_some() {
-                    s.error = None;
-                    return true;
-                }
-                if ev.key == rune::Key::Escape && s.show_diff {
-                    s.show_diff = false;
-                    return true;
-                }
-                // Alt+Enter while the agent works: queue after this turn.
-                if super::keymap::entry(super::keymap::Action::Queue)
-                    .keybind()
-                    .matches_tx(ev, tx)
-                    && s.busy()
-                {
-                    queue_session(s);
-                    return true;
-                }
-                // Sidebar, pane, and composer keys, ahead of the field's caret moves.
-                let at_end = caret_at_end(&s.draft);
-                super::keymap::field_key(s, ev, tx, at_end)
-            })
-            .on_submit(|s: &mut UiState, _: &mut Tx| submit_session(s))
-            .on_input_paste(|s: &mut UiState, content, _: &mut Tx| take_paste(s, content))
-            .build(&bare_field(k))
-            .key("draft")
-            .w_full(),
-    );
-    card = card.child(actions);
+    card = card.child(editor(s, k, Slot::Session, placeholder, min_rows, max_rows));
+    card = card.child(toolbar(k, own_line.unwrap_or_else(el), actions, inner));
 
     // Keep focus visible without competing with the message content.
     let card = composer_card(k, &look, card, focused, busy, s.drop_hover)
@@ -2198,8 +2256,6 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .px(16.0)
         .pt(6.0)
         .pb(14.0)
-        .children(own_line.map(|line| context_capsule(k, &look, line).max_w(column)))
-        .gap(10.0)
         .child(card.w_full().max_w(column))
 }
 

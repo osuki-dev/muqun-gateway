@@ -192,7 +192,23 @@ fn until(language: Language, at_ms: u64) -> String {
     }
 }
 
-fn limits_section(s: &UiState, k: &Kit, agent: &str) -> Option<El> {
+fn remaining_fraction(window: &Value) -> Option<f32> {
+    let remaining = window
+        .get("remaining")?
+        .as_f64()
+        .filter(|n| n.is_finite())?;
+    let limit = if window.get("unit").and_then(Value::as_str) == Some("percent") {
+        100.0
+    } else {
+        window
+            .get("limit")?
+            .as_f64()
+            .filter(|n| n.is_finite() && *n > 0.0)?
+    };
+    Some((remaining / limit).clamp(0.0, 1.0) as f32)
+}
+
+pub fn limits_section(s: &UiState, k: &Kit, agent: &str) -> Option<El> {
     if !supports_limits(s, agent) {
         return None;
     }
@@ -296,11 +312,32 @@ fn limits_section(s: &UiState, k: &Kit, agent: &str) -> Option<El> {
             let mut row_block = col()
                 .key(format!("w{bi}-{wi}"))
                 .w_full()
-                .gap(4.0)
+                .gap(10.0)
+                .px(16.0)
+                .py(14.0)
+                .radius(k.radius.lg)
+                .fill(k.c.layer_01.alpha(0.45))
                 .child(fact(k, &label, value));
-            if let (Some(r), "percent") = (remaining, unit) {
-                // The bar shows what is used, filling toward the limit.
-                row_block = row_block.child(bar(k, "used", (100.0 - r as f32) / 100.0, 300.0, 4.0));
+            if let Some(fraction) = remaining_fraction(w) {
+                let color = tone(k, 1.0 - fraction);
+                row_block = row_block.child(
+                    row()
+                        .key("remaining-bar")
+                        .w_full()
+                        .h(8.0)
+                        .radius(k.radius.xs)
+                        .clip_rounded(k.radius.xs)
+                        .fill(k.c.text_base.alpha(0.10))
+                        .child(
+                            col()
+                                .w(0.0)
+                                .grow(fraction)
+                                .h(8.0)
+                                .radius(k.radius.xs)
+                                .linear_gradient(1.57, [(0.0, color.alpha(0.65)), (1.0, color)]),
+                        )
+                        .child(col().w(0.0).grow(1.0 - fraction).h(8.0)),
+                );
             }
             if let Some(at) = w.get("resets_at_ms").and_then(Value::as_u64) {
                 row_block = row_block.child(
@@ -437,20 +474,22 @@ pub fn sheet(s: &UiState, k: &Kit) -> Option<El> {
     if let Some(limits) = limits_section(s, k, &info.agent_id) {
         body = body.child(limits);
     }
-    let panel = k.elevate(
+    let available =
+        rune::memo::layout_with("main-pane", |r| [r[2], r[3]]).unwrap_or([800.0, 700.0]);
+    let panel = s.look().panel(
+        k,
         col()
             .key("context-panel")
-            .w(380.0)
-            .h_full()
-            .fill(k.c.bg_base)
-            .border(1.0, k.c.border_weak)
+            .w((available[0] - 32.0).clamp(280.0, 420.0))
+            .h((available[1] - 32.0).clamp(240.0, 640.0))
             .on_press(|_: &mut UiState| {})
             .child(body)
             .scroll(rune::ScrollSpec {
                 stick_bottom: false,
             }),
-        &k.elevation.overlay,
+        k.radius.xl,
     );
+    let panel = s.look().luminous(k, panel, false);
     let panel = if s.cfg.appearance.reduced_motion {
         panel.transition(rune::Transition::opacity())
     } else {
@@ -463,6 +502,8 @@ pub fn sheet(s: &UiState, k: &Kit) -> Option<El> {
             .w_full()
             .h_full()
             .justify_end()
+            .px(16.0)
+            .py(16.0)
             .fill(k.alpha(k.c.black, 0.18))
             .on_press(close)
             .modal(true, close)

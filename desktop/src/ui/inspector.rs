@@ -31,7 +31,7 @@ fn small(
 ) -> El {
     Button::new(label)
         .variant(variant)
-        .control_size(ControlSize::Small)
+        .control_size(ControlSize::ExtraLarge)
         .on_press(f)
         .build(k)
         .key(key)
@@ -132,7 +132,7 @@ fn item(k: &Kit, key: String, title: String, detail: String, action: Option<El>)
         .center_y()
         .px(10.0)
         .py(6.0)
-        .radius(crate::theme::look::CARD_RADIUS)
+        .radius(k.radius.lg)
         .fill(k.c.layer_01.alpha(0.5))
         .border(1.0, k.c.border_muted)
         .child(copy);
@@ -309,9 +309,13 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
         Some(b) => {
             let cur_branch = b.current.clone().unwrap_or_else(|| "detached".into());
             out.push(
-                Badge::new(cur_branch.clone())
-                    .variant(BadgeVariant::Accent)
-                    .build(k),
+                row().child(
+                    Badge::new(cur_branch.clone())
+                        .variant(BadgeVariant::Accent)
+                        .build(k)
+                        .h(32.0)
+                        .px(12.0),
+                ),
             );
             if !b.local.is_empty() {
                 out.push(muted(k, format!("{} local branch(es)", b.local.len())));
