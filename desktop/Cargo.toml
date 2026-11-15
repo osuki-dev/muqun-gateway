@@ -16,7 +16,7 @@ path = "src/main.rs"
 # land upstream; patches live in desktop/patches/rune/ for review.
 [dependencies]
 muqun-gateway = { path = ".." }
-rune = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de" }
+rune = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de", features = ["tooling"] }
 rune-kit = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de", features = ["markdown"] }
 # GPU effect layers (`ui/fx.rs`): glow and liquid metal at effect slots.
 rune-fx = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de" }
