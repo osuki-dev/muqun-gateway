@@ -1951,7 +1951,33 @@ pub const AGENT_ICON: f32 = 16.0;
 pub const SEND_ICON: f32 = 18.0;
 
 pub fn body() -> El {
-    col().w_full().gap(18.0).px(24.0).pt(20.0).pb(18.0)
+    col().w_full().gap(12.0).px(24.0).pt(16.0).pb(14.0)
+}
+
+pub fn attachment_button(
+    k: &Kit,
+    language: crate::config::Language,
+    start: Option<PathBuf>,
+    enabled: bool,
+    key: &str,
+) -> El {
+    let attach_help = format!(
+        "{} · {}",
+        tr_ref(language, "Add files or an image"),
+        crate::platform::keys::label("Primary+V")
+    );
+    let attach_press = move |_: &mut UiState| {
+        crate::platform::dialogs::attach_files(start.clone());
+    };
+    rune_kit::IconButton::new(&super::parts::glyphs::ATTACH)
+        .control_size(ControlSize::ExtraLarge)
+        .variant(rune_kit::IconButtonVariant::GhostMuted)
+        .label(tr_ref(language, "Attach"))
+        .help(attach_help)
+        .disabled(!enabled)
+        .on_press(attach_press)
+        .build(k)
+        .key(key)
 }
 
 /// One editor, key handling and attachment paste path for both composer contexts.
@@ -2080,23 +2106,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
 
     // The row under the field: the session's controls on the left (see
     // `composer_row`), the actions on the right.
-    let attach_help = format!(
-        "{} · {}",
-        tr_ref(language, "Add files or an image"),
-        crate::platform::keys::label("Primary+V")
-    );
-    let attach_press = move |_: &mut UiState| {
-        crate::platform::dialogs::attach_files(start.clone());
-    };
-    let attach = rune_kit::IconButton::new(&super::parts::glyphs::ATTACH)
-        .control_size(ControlSize::ExtraLarge)
-        .variant(rune_kit::IconButtonVariant::GhostMuted)
-        .label(tr_ref(language, "Attach"))
-        .help(attach_help)
-        .disabled(!has_session)
-        .on_press(attach_press)
-        .build(k)
-        .key("attach");
+    let attach = attachment_button(k, language, start, has_session, "attach");
     let stop_label = tr_ref(language, "Stop");
     let send_label = if busy {
         tr_ref(language, "Steer")
@@ -2265,6 +2275,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
 
     let resizer = row()
         .key("composer-resizer")
+        .pin(Some(0.0), Some(6.0), Some(0.0), None)
         .w_full()
         .h(4.0)
         .center()
@@ -2314,7 +2325,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     } else if s.composer_expanded {
         (10, 24)
     } else {
-        (2, 8)
+        (2, 12)
     };
     if let Some(dictation) = super::voice::strip(s, k) {
         card = card.child(dictation);

@@ -609,11 +609,7 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
 /// Context above the editor; agent and delivery actions below it.
 fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f32; 2]) -> El {
     let language = s.cfg.general.language;
-    let mut card = composer::body()
-        .key("home-card")
-        .gap(12.0)
-        .pt(16.0)
-        .pb(14.0);
+    let mut card = composer::body().key("home-card");
     let mut context = row()
         .gap(8.0)
         .center_y()
@@ -653,28 +649,13 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
         );
     }
     let attach_cwd = PathBuf::from(s.start_cwd.text.trim());
-    let tools = row().gap(6.0).center_y().child(
-        rune_kit::IconButton::new(&super::parts::glyphs::ATTACH)
-            .control_size(ControlSize::ExtraLarge)
-            .variant(rune_kit::IconButtonVariant::GhostMuted)
-            .label(tr_ref(language, "Attach"))
-            .help(tr_ref(language, "Add files or an image"))
-            .on_press(move |_: &mut UiState| {
-                crate::platform::dialogs::attach_files(Some(attach_cwd.clone()))
-            })
-            .build(k)
-            .key("start-attach")
-            .size(36.0, 36.0)
-            .radius(k.radius.lg)
-            .fill(k.c.layer_01.alpha(0.40))
-            .border(1.0, k.c.border_muted.alpha(0.25)),
-    );
+    let tools = composer::attachment_button(k, language, Some(attach_cwd), true, "start-attach");
     let actions = row()
         .key("start-actions")
         .gap(6.0)
         .center_y()
-        .child(el().grow(1.0).a11y_hidden())
         .child(tools)
+        .child(el().grow(1.0).a11y_hidden())
         .child(
             look.glow(
                 Button::new(tr_ref(language, "Start"))
