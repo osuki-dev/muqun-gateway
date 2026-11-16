@@ -2084,7 +2084,7 @@ mod tests {
             key: k,
             mods: Mods {
                 shift,
-                cmd: ctrl,
+                cmd: ctrl && !crate::platform::is_macos(),
                 alt,
                 ctrl,
                 logo: false,
@@ -2118,14 +2118,20 @@ mod tests {
         assert!(rt.state.term.sink.focused);
         rt.frame(1.0 / 60.0);
 
-        rt.key(key(Key::Left, true, false, true));
+        let mut left = key(Key::Left, !crate::platform::is_macos(), false, true);
+        left.mods.cmd = true;
+        left.mods.logo = crate::platform::is_macos();
+        rt.key(left);
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.focus, 0);
         assert!(rt.state.draft.focused);
         assert!(!rt.state.term.sink.focused);
 
         // And from the session composer, `Ctrl+Alt+Right` moves focus back to the terminal tile!
-        rt.key(key(Key::Right, true, false, true));
+        let mut right = key(Key::Right, !crate::platform::is_macos(), false, true);
+        right.mods.cmd = true;
+        right.mods.logo = crate::platform::is_macos();
+        rt.key(right);
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.focus, 1);
         assert!(rt.state.term.sink.focused);
@@ -2297,7 +2303,7 @@ mod tests {
             key: Key::Command('b'),
             mods: Mods {
                 ctrl: true,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 ..Default::default()
             },
         };
@@ -2307,11 +2313,16 @@ mod tests {
         rt.key(leader);
         rt.frame(2.0 / 60.0);
         assert!(!rt.state.is_leader_armed());
-        let expected = "1b 5b 41 1b 5b 42 1b 5b 43 1b 5b 44 02";
-        while !session
+        let expected = [
+            0x1b, 0x5b, 0x41, 0x1b, 0x5b, 0x42, 0x1b, 0x5b, 0x43, 0x1b, 0x5b, 0x44, 0x02,
+        ];
+        while session
             .dump_plain_text()
             .unwrap_or_default()
-            .contains(expected)
+            .split_whitespace()
+            .filter_map(|word| u8::from_str_radix(word, 16).ok())
+            .collect::<Vec<_>>()
+            != expected
         {
             assert!(
                 Instant::now() < deadline,
@@ -2343,7 +2354,7 @@ mod tests {
             key: Key::Text(" ".into()),
             mods: Mods {
                 ctrl: true,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 ..Default::default()
             },
         };
@@ -2396,7 +2407,7 @@ mod tests {
             key: Key::Command('g'),
             mods: Mods {
                 ctrl: true,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 ..Default::default()
             },
         };

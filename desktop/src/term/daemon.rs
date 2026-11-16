@@ -2073,7 +2073,10 @@ mod tests {
 
     #[tokio::test]
     async fn raw_input_reaches_the_shell_while_output_is_backpressured() {
-        let dir = std::env::temp_dir().join(format!("muqun-input-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "mt-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("term.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -2118,7 +2121,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_daemon_server_and_client_lifecycle() {
-        let socket_dir = std::env::temp_dir().join(format!("muqun-test-{}", uuid::Uuid::new_v4()));
+        let socket_dir = std::env::temp_dir().join(format!(
+            "mt-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
         std::fs::create_dir_all(&socket_dir).unwrap();
         let socket_path = socket_dir.join("test-term.sock");
 
@@ -2232,7 +2238,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_concurrent_attached_clients() {
-        let socket_dir = std::env::temp_dir().join(format!("muqun-multi-{}", uuid::Uuid::new_v4()));
+        let socket_dir = std::env::temp_dir().join(format!(
+            "mt-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
         std::fs::create_dir_all(&socket_dir).unwrap();
         let socket_path = socket_dir.join("test-multi.sock");
 
@@ -2293,7 +2302,10 @@ mod tests {
 
     #[test]
     fn test_sync_daemon_client_lifecycle() {
-        let socket_dir = std::env::temp_dir().join(format!("muqun-sync-{}", uuid::Uuid::new_v4()));
+        let socket_dir = std::env::temp_dir().join(format!(
+            "mt-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
         std::fs::create_dir_all(&socket_dir).unwrap();
         let socket_path = socket_dir.join("test-sync.sock");
 
@@ -2494,7 +2506,10 @@ mod tests {
 
     #[test]
     fn test_create_session_with_options_and_read_session_text() {
-        let socket_dir = std::env::temp_dir().join(format!("muqun-opt-{}", uuid::Uuid::new_v4()));
+        let socket_dir = std::env::temp_dir().join(format!(
+            "mt-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
         std::fs::create_dir_all(&socket_dir).unwrap();
         let socket_path = socket_dir.join("test-options.sock");
 
