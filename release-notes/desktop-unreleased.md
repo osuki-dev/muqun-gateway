@@ -4,7 +4,7 @@ This is an early Desktop preview, published separately from Muqun Gateway. It do
 
 ## Changes
 
-- Compact composer footers keep delivery controls on one line in narrow split panes; controls and bottom spacing remain consistent when focus changes.
+- Compact composer footers keep delivery controls on one line in narrow split panes; controls and bottom spacing remain consistent when focus changes. Icon-only controls use matching circular hit areas instead of narrow ovals.
 
 - Upgrade bundled SQLCipher to 4.20.0 / SQLite 3.54.1 through rusqlite 0.42, addressing RUSTSEC-2026-0502 (crafted database/WAL memory disclosure). Existing encryption remains enabled.
 - CI validation and Desktop builds use Rust 1.99.1 consistently; Rust 1.100 support remains pending an async-stream compatibility fix.

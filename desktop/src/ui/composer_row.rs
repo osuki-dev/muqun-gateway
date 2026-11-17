@@ -82,7 +82,7 @@ fn mode_glyph(id: &str) -> (&'static Icon, bool) {
 /// A pill (`ControlSize::Small` ghost button): 10 pt each side.
 const PILL_PAD: f32 = 20.0;
 /// Compact controls keep enough room around their glyph.
-const ICON_PILL: f32 = 36.0;
+const ICON_PILL: f32 = 32.0;
 const GLYPH: f32 = 14.0;
 /// Between pills in the row.
 const ROW_GAP: f32 = 8.0;
@@ -465,7 +465,7 @@ fn pill_button(
     };
     let mut e = b.build(k).key(key.to_string());
     if square {
-        e = e.px(3.0);
+        e = e.w(ICON_PILL).min_w(ICON_PILL).px(0.0);
     }
     let chip_fill = if open {
         k.c.bg_accent.alpha(0.14)
@@ -478,7 +478,7 @@ fn pill_button(
         k.c.border_muted.alpha(0.30)
     };
     e.h(32.0)
-        .radius(k.radius.lg)
+        .radius(if square { ICON_PILL / 2.0 } else { k.radius.lg })
         .fill(chip_fill)
         .border(0.5, chip_border)
 }
@@ -496,7 +496,12 @@ fn agent_chip(c: &Controls, k: &Kit, f: Fold) -> El {
         .border(0.5, k.c.border_muted.alpha(0.30))
         .child(mark);
     if f.agent_icon {
-        return chip.w(ICON_PILL).center().help(c.agent_name.clone());
+        return chip
+            .w(ICON_PILL)
+            .min_w(ICON_PILL)
+            .radius(ICON_PILL / 2.0)
+            .center()
+            .help(c.agent_name.clone());
     }
     chip = chip.gap(5.0).px(7.0).child(
         text(c.agent_name.clone())
@@ -685,7 +690,7 @@ fn mode_control(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold
             .role("image")
             .label(help.clone())
             .help(help)
-            .h(20.0)
+            .h(32.0)
             .center_y()
             .child(
                 icon(glyph, GLYPH)
@@ -764,8 +769,9 @@ fn auto_control(c: &Controls, k: &Kit) -> El {
         .on_press(move |s: &mut UiState| set_auto(s, &asid, !on))
         .build(k)
         .key("auto-approve")
-        .size(32.0, 32.0)
-        .radius(k.radius.lg)
+        .size(ICON_PILL, ICON_PILL)
+        .min_w(ICON_PILL)
+        .radius(ICON_PILL / 2.0)
         .fill(if on {
             k.c.bg_accent.alpha(0.16)
         } else {
