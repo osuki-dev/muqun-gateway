@@ -218,10 +218,6 @@ fn open_task_terminal(s: &mut UiState, pane_id: Option<&str>, cwd: Option<&str>)
     let pane_id = pane_id.filter(|p| !p.is_empty());
     let cwd = cwd.filter(|c| !c.is_empty());
 
-    if s.term.tabs.is_empty() && s.term.session.is_none() {
-        s.start_terminal();
-    }
-
     if let Some(pid) = pane_id {
         if let Some(idx) = s.term.tabs.iter().position(|tab| {
             tab.session
@@ -229,8 +225,7 @@ fn open_task_terminal(s: &mut UiState, pane_id: Option<&str>, cwd: Option<&str>)
                 .and_then(|sess| sess.session_id.as_deref())
                 == Some(pid)
         }) {
-            s.open_terminal();
-            s.term_switch_tab(idx);
+            s.reveal_terminal_tab(idx);
             return;
         }
     }
@@ -238,15 +233,14 @@ fn open_task_terminal(s: &mut UiState, pane_id: Option<&str>, cwd: Option<&str>)
     if let Some(dir) = cwd {
         let target = std::path::PathBuf::from(dir);
         if let Some(idx) = s.term.tabs.iter().position(|tab| tab.cwd == target) {
-            s.open_terminal();
-            s.term_switch_tab(idx);
+            s.reveal_terminal_tab(idx);
             return;
         }
         s.term_new_tab_in(target, None);
         return;
     }
 
-    s.open_terminal();
+    s.open_terminal_default();
 }
 
 /// The Tasks keys (`keymap::run`): j/k and the arrows move, Enter opens
@@ -1327,6 +1321,66 @@ fn empty(s: &UiState, k: &Kit) -> El {
 mod tests {
     use super::*;
     use crate::model::commands;
+
+    #[test]
+    fn task_and_editor_entries_preserve_terminal_surface_and_tab_ownership() {
+        use super::super::Tile;
+        use crate::config::TerminalOpenMode;
+
+        for mode in [
+            TerminalOpenMode::Docked,
+            TerminalOpenMode::Split,
+            TerminalOpenMode::Floating,
+        ] {
+            let (tx, _) = commands::channel();
+            let mut s = UiState::new(tx);
+            s.cfg.ui.terminal_open_mode = mode;
+            open_task_terminal(&mut s, None, Some("/tmp/task-one"));
+            assert_eq!(s.term.tabs.len(), 1);
+            assert_eq!(s.term.open, mode == TerminalOpenMode::Docked);
+            assert_eq!(s.has_terminal_tile(), mode != TerminalOpenMode::Docked);
+            let surfaces = s.tiles.len();
+            s.cfg.ui.terminal_open_mode = TerminalOpenMode::Docked;
+            s.open_file_in_terminal(std::path::Path::new("/tmp/editor.txt"), "vi");
+            assert_eq!(s.term.tabs.len(), 2);
+            assert_eq!(
+                s.term.tabs[1].pending_command.as_deref(),
+                Some("vi '/tmp/editor.txt'\n")
+            );
+            assert_eq!(s.tiles.len(), surfaces);
+            assert_eq!(s.term.open, mode == TerminalOpenMode::Docked);
+            s.term_sync_cwd();
+            assert_eq!(s.term.tabs.len(), 3);
+            assert_eq!(s.tiles.len(), surfaces);
+            assert_eq!(s.term.open, mode == TerminalOpenMode::Docked);
+        }
+
+        let (tx, _) = commands::channel();
+        let mut s = UiState::new(tx);
+        s.cfg.ui.terminal_open_mode = TerminalOpenMode::Split;
+        s.term_new_tab_in("/tmp/task-one".into(), None);
+        s.term_new_tab_in("/tmp/task-two".into(), None);
+        let first = s.tile_of_terminal().unwrap();
+        let mut second = Tile::empty();
+        second.set_terminal_tab(0);
+        s.tiles.push(second);
+        let owner = s.tiles.len() - 1;
+        open_task_terminal(&mut s, None, Some("/tmp/task-one"));
+        assert_eq!(s.focus, owner);
+        assert_eq!(s.term.active_tab, 0);
+        assert_eq!(s.tiles[first].term_tab, Some(1));
+        assert_eq!(s.tiles[owner].term_tab, Some(0));
+        assert!(!s.term.open);
+        assert_eq!(s.term.tabs.len(), 2);
+        // A new tab opened from the conversation uses the existing terminal
+        // surface and remains selected, rather than restoring the old tab.
+        s.focus_tile(0);
+        s.term_new_tab_in("/tmp/task-three".into(), None);
+        assert_eq!(s.term.active_tab, 2);
+        assert_eq!(s.tiles[s.focus].term_tab, Some(2));
+        assert_eq!(s.tiles.len(), 3);
+        assert!(!s.term.open);
+    }
 
     #[test]
     fn cancel_needs_a_second_press_and_moving_disarms_it() {

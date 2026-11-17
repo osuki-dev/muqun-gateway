@@ -693,25 +693,6 @@ impl UiState {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| self.terminal_cwd());
 
-        self.open_terminal();
-
-        if self
-            .term
-            .session
-            .as_ref()
-            .is_some_and(|s| s.ended().is_some())
-        {
-            self.term.pending_command = Some(cmd);
-            self.restart_terminal();
-            return;
-        }
-
-        if self.term.session.is_none() {
-            self.term.pending_command = Some(cmd);
-            self.start_terminal_in(cwd);
-            return;
-        }
-
         self.term_new_tab_in(cwd, Some(cmd));
     }
 
@@ -748,8 +729,10 @@ impl UiState {
     }
 
     pub fn term_new_tab_in(&mut self, cwd: PathBuf, command: Option<String>) {
-        if !self.has_terminal_tile() {
-            self.open_terminal();
+        // Select the existing surface before changing the active tab: focusing
+        // it afterwards could restore its old tab over the newly created shell.
+        if let Some(i) = self.tile_of_terminal() {
+            self.focus_tile(i);
         }
         if self.term.tabs.is_empty() {
             self.ensure_term_tabs_seeded(false);
@@ -776,7 +759,21 @@ impl UiState {
         self.term.frame = None;
         self.term.pending_command = command;
         self.start_terminal_in(cwd);
-        self.focus_terminal();
+        self.open_terminal_default();
+    }
+
+    /// Reveal a task shell in its existing surface without trading tabs between
+    /// tiles or opening a second dock beside an already visible terminal.
+    pub(crate) fn reveal_terminal_tab(&mut self, index: usize) {
+        let owner = self
+            .tiles
+            .iter()
+            .position(|tile| tile.is_terminal() && tile.term_tab == Some(index));
+        if let Some(i) = owner.or_else(|| self.tile_of_terminal()) {
+            self.focus_tile(i);
+        }
+        self.term_switch_tab(index);
+        self.open_terminal_default();
     }
 
     pub fn term_switch_tab(&mut self, index: usize) {
@@ -1005,7 +1002,7 @@ impl UiState {
         } else {
             self.term_new_tab_in(cwd, None);
         }
-        self.open_terminal();
+        self.open_terminal_default();
 
         self.toast(
             super::copy::t(
