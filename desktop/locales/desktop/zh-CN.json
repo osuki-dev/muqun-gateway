@@ -789,5 +789,7 @@
   "Every coding agent on this computer in one window: start sessions, watch several at once, answer approvals, and keep the history. Nothing leaves this machine unless an agent sends it.": "在一个窗口中管理本机的所有编程智能体：启动会话、同时查看多个会话、处理审批并保留历史。除非智能体主动发送，数据不会离开本机。",
   "Docked": "停靠",
   "Default terminal placement": "终端默认打开方式",
-  "Applies when opening a terminal. Existing terminals stay where they are.": "打开终端时应用。已打开的终端保持当前位置。"
+  "Applies when opening a terminal. Existing terminals stay where they are.": "打开终端时应用。已打开的终端保持当前位置。",
+  "Gateway update required": "需要更新 Gateway",
+  "Update this computer’s Gateway to recover approvals and questions after reconnecting. Live requests still appear.": "更新此电脑的 Gateway，才能在重新连接后恢复待确认和待回答的问题。实时请求仍会显示。"
 }

@@ -185,7 +185,7 @@ fn main() -> anyhow::Result<()> {
                 Some(token) => handle.activate(token),
                 None => handle.open(),
             }
-            handle.update(move |s, _| s.open_session(&asid));
+            handle.update(move |s, _| s.open_notification(&asid));
         }
     });
     if let Some(primary) = instance {

@@ -53,6 +53,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_events",
     "multi_agent",
     "agent_forms",
+    "agent_attention_v1",
     "agent_compaction_references_v1",
     "agent_lifecycle_notifications",
     // Pushes about a native agent session carry `asid` and `agent_id` (never

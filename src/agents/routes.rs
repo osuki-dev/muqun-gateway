@@ -404,6 +404,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             "/api/agents/{agent_id}/sessions/{asid}/prepare",
             post(prepare_agent_session_scoped),
         )
+        .route("/api/agent-attention", get(read_agent_attention))
         .route("/api/agent-sessions/{asid}/fork", post(fork_agent_session))
         .route(
             "/api/agents/{agent_id}/sessions/{asid}/fork",
@@ -745,6 +746,21 @@ async fn managers_for_read(
         ));
     }
     Ok(all_managers)
+}
+
+/// Device-authenticated, retained request metadata. Never starts an agent and
+/// never sends question bodies, command arguments, or transcript content.
+async fn read_agent_attention(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let managers = managers_for_read(&state, None).await?;
+    let mut pending = Vec::new();
+    for manager in managers {
+        pending.extend(manager.sessions().pending_snapshots().await);
+    }
+    Ok(Json(content_envelope(json!(pending))))
 }
 
 async fn do_list_agent_sessions(
@@ -4291,6 +4307,10 @@ mod tests {
                 "device_repair_required",
             ),
         ] {
+            let attention_refusal = read_agent_attention(State(state.clone()), headers.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(attention_refusal.0, status);
             let edit_refusal = edit_agent_inbox_item(
                 State(state.clone()),
                 Path(("fixture".into(), "queued".into())),
@@ -4364,6 +4384,43 @@ mod tests {
                 .is_err()
         );
         assert_eq!(log.lock().unwrap().len(), observed + 1);
+    }
+
+    #[tokio::test]
+    async fn attention_reads_retained_request_ids_without_preparing_or_exposing_request_content() {
+        use crate::agents::ports::SessionMirrorPort;
+        let mut agent = FakeAgent::new("opencode").with_sessions(&[("conversation", 1)]);
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        agent.preparation_log = Some(log.clone());
+        let state = state_with(vec![agent]).await;
+        let manager = state.agent_runtime.all_managers().await.remove(0);
+        let asid = AgentSessionId("conversation".into());
+        manager
+            .mirror()
+            .add_form(crate::agents::FormRequest {
+                id: "form-one".into(),
+                asid: asid.clone(),
+                title: "private prompt".into(),
+                fields: vec![],
+                nonblocking: false,
+            })
+            .await;
+        let Json(response) = read_agent_attention(State(state.clone()), device_headers())
+            .await
+            .unwrap();
+        assert_eq!(response["data"][0]["form_ids"], json!(["form-one"]));
+        assert!(response["data"][0].get("timeline").is_none());
+        assert!(response["data"][0].get("forms").is_none());
+        assert!(log.lock().unwrap().is_empty());
+        manager.mirror().resolve_form(&asid, "form-one").await;
+        let Json(resolved) = read_agent_attention(State(state), device_headers())
+            .await
+            .unwrap();
+        assert_eq!(resolved["data"][0]["form_ids"], json!([]));
+        assert!(
+            resolved["data"][0]["seq"].as_u64().unwrap()
+                > response["data"][0]["seq"].as_u64().unwrap()
+        );
     }
 
     #[tokio::test]

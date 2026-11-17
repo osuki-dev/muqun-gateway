@@ -367,6 +367,24 @@ pub(crate) struct DeliveredInputRevision {
 }
 
 impl MemoryMirror {
+    /// Cheap reconciliation across the retained sessions, including empty request
+    /// lists so clients can clear requests answered while they were disconnected.
+    pub(crate) async fn pending_snapshots(
+        &self,
+    ) -> Vec<crate::agents::ports::AgentPendingSnapshot> {
+        self.sessions
+            .read()
+            .await
+            .values()
+            .map(|state| crate::agents::ports::AgentPendingSnapshot {
+                info: state.info.clone(),
+                permission_ids: state.permissions.keys().cloned().collect(),
+                form_ids: state.forms.keys().cloned().collect(),
+                seq: state.current_seq,
+            })
+            .collect()
+    }
+
     pub(crate) async fn delivered_input_revision(
         &self,
         asid: &AgentSessionId,

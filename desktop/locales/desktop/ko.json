@@ -789,5 +789,7 @@
   "Every coding agent on this computer in one window: start sessions, watch several at once, answer approvals, and keep the history. Nothing leaves this machine unless an agent sends it.": "이 컴퓨터의 모든 코딩 에이전트를 한 창에서 관리합니다. 세션 시작, 여러 세션 동시 확인, 승인 응답 및 기록 보관이 가능합니다. 에이전트가 전송하지 않는 한 데이터는 이 컴퓨터를 떠나지 않습니다.",
   "Docked": "도킹",
   "Default terminal placement": "터미널 기본 열기 방식",
-  "Applies when opening a terminal. Existing terminals stay where they are.": "터미널을 열 때 적용됩니다. 이미 열린 터미널의 위치는 유지됩니다."
+  "Applies when opening a terminal. Existing terminals stay where they are.": "터미널을 열 때 적용됩니다. 이미 열린 터미널의 위치는 유지됩니다.",
+  "Gateway update required": "Gateway 업데이트 필요",
+  "Update this computer’s Gateway to recover approvals and questions after reconnecting. Live requests still appear.": "재연결 후 대기 중인 승인과 질문을 복원하려면 이 컴퓨터의 Gateway를 업데이트하세요. 실시간 요청은 계속 표시됩니다."
 }

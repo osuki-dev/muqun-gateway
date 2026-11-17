@@ -3,6 +3,14 @@
 - Upgrade bundled SQLCipher to 4.20.0 / SQLite 3.54.1 through rusqlite 0.42, addressing RUSTSEC-2026-0502 (crafted database/WAL memory disclosure). Existing encryption remains enabled.
 ## Changes and fixes
 
+- **Desktop can recover pending approvals and questions on every paired computer.**
+  The additive `agent_attention_v1` capability exposes authenticated request IDs
+  without transcripts or question contents and without starting agents. Existing
+  App endpoints remain compatible. Update and restart Gateway on each computer
+  for startup/reconnect recovery; older Gateways still deliver live requests.
+  Update and restart Desktop to enable fleet-wide reminders. No data migration
+  or Herdr update is required.
+
 - **Clicking an inactive split composer focuses it immediately.** The first
   click activates that session’s editor, so typing goes into the selected pane
   and each session retains its own draft. Restart Desktop to load the fix; no

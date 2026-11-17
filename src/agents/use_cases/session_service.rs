@@ -24,6 +24,14 @@ pub struct SessionService {
 }
 
 impl SessionService {
+    /// Read retained request identities only. Does not prepare or wake a provider.
+    pub async fn pending_snapshots(&self) -> Vec<crate::agents::ports::AgentPendingSnapshot> {
+        match &self.memory {
+            Some(memory) => memory.pending_snapshots().await,
+            None => Vec::new(),
+        }
+    }
+
     pub fn new(agent: Arc<dyn AgentPort>, mirror: Arc<dyn SessionMirrorPort>) -> Self {
         Self {
             agent,

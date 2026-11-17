@@ -789,5 +789,7 @@
   "Every coding agent on this computer in one window: start sessions, watch several at once, answer approvals, and keep the history. Nothing leaves this machine unless an agent sends it.": "Mọi tác nhân lập trình trên máy này trong một cửa sổ: bắt đầu phiên, theo dõi nhiều phiên, trả lời phê duyệt và giữ lịch sử. Không có gì rời máy trừ khi tác nhân gửi đi.",
   "Docked": "Gắn vào cạnh",
   "Default terminal placement": "Vị trí mở thiết bị đầu cuối mặc định",
-  "Applies when opening a terminal. Existing terminals stay where they are.": "Áp dụng khi mở thiết bị đầu cuối. Các cửa sổ đã mở vẫn giữ nguyên vị trí."
+  "Applies when opening a terminal. Existing terminals stay where they are.": "Áp dụng khi mở thiết bị đầu cuối. Các cửa sổ đã mở vẫn giữ nguyên vị trí.",
+  "Gateway update required": "Cần cập nhật Gateway",
+  "Update this computer’s Gateway to recover approvals and questions after reconnecting. Live requests still appear.": "Cập nhật Gateway trên máy tính này để khôi phục yêu cầu phê duyệt và câu hỏi sau khi kết nối lại. Các yêu cầu mới vẫn xuất hiện."
 }

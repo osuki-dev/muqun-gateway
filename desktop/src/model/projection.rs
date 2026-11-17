@@ -62,6 +62,11 @@ impl ConfigStore {
         self.state.lock().unwrap().0.clone()
     }
 
+    /// Background connection maintenance does not need to clone drafts or UI state.
+    pub(super) fn computer_profiles(&self) -> HashMap<String, crate::config::ComputerProfile> {
+        self.state.lock().unwrap().0.computers.clone()
+    }
+
     /// Change the configuration in memory and mark it unwritten.
     pub fn change(&self, change: impl FnOnce(&mut DesktopConfig)) {
         let mut state = self.state.lock().unwrap();
@@ -206,6 +211,7 @@ struct ConnectionState {
 struct Core {
     connection: Mutex<crate::hub::ConnectionContext>,
     local_hub: Option<Arc<dyn SessionHub>>,
+    fleet: Arc<super::fleet_attention::Fleet>,
     connection_generation: AtomicU64,
     connected: std::sync::atomic::AtomicBool,
     subscriptions: Mutex<Vec<tokio::task::AbortHandle>>,
@@ -234,7 +240,20 @@ pub fn spawn(
         other => other.to_string(),
     };
     let connection = hub.connection(computer, 0);
+    let fleet = Arc::new(super::fleet_attention::Fleet::default());
+    fleet.insert(
+        if initial_connected {
+            connection.computer.clone()
+        } else {
+            "local".into()
+        },
+        connection.hub.clone(),
+        inbox.clone(),
+        &config,
+    );
+    tokio::spawn(fleet.clone().maintain(config.clone(), inbox.clone()));
     let core = Arc::new(Core {
+        fleet,
         local_hub: (connection.computer == "local" || !initial_connected)
             .then(|| connection.hub.clone()),
         connection: Mutex::new(connection),
@@ -295,7 +314,6 @@ impl Core {
             };
             tokio::join!(
                 core.clone().events(),
-                super::notify::watch(core.hub.clone(), core.inbox.clone()),
                 core.clone().watch_agents(),
                 task_events,
                 link_events
@@ -1153,7 +1171,10 @@ impl Core {
         tracing::info!(computer = %target, "switching active computer hub");
 
         let cfg = self.config.get();
-        let maybe_new_hub: Option<Arc<dyn SessionHub>> = if target == "local" || target == "self" {
+        let maybe_new_hub: Option<Arc<dyn SessionHub>> = if let Some(hub) = self.fleet.hub(&target)
+        {
+            Some(hub)
+        } else if target == "local" || target == "self" {
             if let Some(gw) = crate::hub::discover_local_gateway().await {
                 crate::hub::RemoteHub::start(gw)
                     .ok()
@@ -1183,6 +1204,14 @@ impl Core {
         };
 
         if let Some(new_hub) = maybe_new_hub {
+            if self.fleet.hub(&target).is_none() {
+                self.fleet.insert(
+                    target.clone(),
+                    new_hub.clone(),
+                    self.inbox.clone(),
+                    &self.config,
+                );
+            }
             self.hub.switch(new_hub);
             let context = self.hub.connection(target.clone(), generation);
             *self.connection.lock().unwrap() = context.clone();
@@ -2012,6 +2041,7 @@ mod tests {
         Arc::new(Core {
             connection: Mutex::new(hub.connection("local".into(), 0)),
             local_hub: None,
+            fleet: Arc::new(super::super::fleet_attention::Fleet::default()),
             connection_generation: AtomicU64::new(0),
             connected: std::sync::atomic::AtomicBool::new(true),
             subscriptions: Mutex::new(Vec::new()),

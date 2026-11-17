@@ -789,5 +789,7 @@
   "Every coding agent on this computer in one window: start sessions, watch several at once, answer approvals, and keep the history. Nothing leaves this machine unless an agent sends it.": "本機のすべてのコーディングエージェントを1つのウィンドウで管理。セッション開始、複数の同時確認、承認への回答、履歴保存ができます。エージェントが送信しない限りデータは本機を離れません。",
   "Docked": "ドッキング",
   "Default terminal placement": "ターミナルの既定の表示方法",
-  "Applies when opening a terminal. Existing terminals stay where they are.": "ターミナルを開くときに適用します。既存のターミナルの位置は変わりません。"
+  "Applies when opening a terminal. Existing terminals stay where they are.": "ターミナルを開くときに適用します。既存のターミナルの位置は変わりません。",
+  "Gateway update required": "Gateway の更新が必要です",
+  "Update this computer’s Gateway to recover approvals and questions after reconnecting. Live requests still appear.": "再接続後に承認待ちや質問を復元するには、このコンピューターの Gateway を更新してください。新しいリクエストは引き続き表示されます。"
 }

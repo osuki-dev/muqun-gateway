@@ -789,5 +789,7 @@
   "Every coding agent on this computer in one window: start sessions, watch several at once, answer approvals, and keep the history. Nothing leaves this machine unless an agent sends it.": "เอเจนต์เขียนโค้ดทั้งหมดบนคอมพิวเตอร์นี้ในหน้าต่างเดียว เริ่มเซสชัน ดูหลายเซสชันพร้อมกัน ตอบคำขออนุมัติ และเก็บประวัติ ไม่มีข้อมูลออกจากเครื่องเว้นแต่เอเจนต์ส่งไป",
   "Docked": "ยึดกับขอบ",
   "Default terminal placement": "ตำแหน่งเริ่มต้นของเทอร์มินัล",
-  "Applies when opening a terminal. Existing terminals stay where they are.": "ใช้เมื่อเปิดเทอร์มินัล เทอร์มินัลที่เปิดอยู่จะยังอยู่ในตำแหน่งเดิม"
+  "Applies when opening a terminal. Existing terminals stay where they are.": "ใช้เมื่อเปิดเทอร์มินัล เทอร์มินัลที่เปิดอยู่จะยังอยู่ในตำแหน่งเดิม",
+  "Gateway update required": "ต้องอัปเดต Gateway",
+  "Update this computer’s Gateway to recover approvals and questions after reconnecting. Live requests still appear.": "อัปเดต Gateway ของคอมพิวเตอร์นี้เพื่อกู้คืนคำขออนุมัติและคำถามหลังเชื่อมต่อใหม่ คำขอใหม่ยังคงแสดงตามปกติ"
 }

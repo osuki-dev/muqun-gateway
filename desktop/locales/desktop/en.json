@@ -789,5 +789,7 @@
   "Every coding agent on this computer in one window: start sessions, watch several at once, answer approvals, and keep the history. Nothing leaves this machine unless an agent sends it.": "Every coding agent on this computer in one window: start sessions, watch several at once, answer approvals, and keep the history. Nothing leaves this machine unless an agent sends it.",
   "Docked": "Docked",
   "Default terminal placement": "Default terminal placement",
-  "Applies when opening a terminal. Existing terminals stay where they are.": "Applies when opening a terminal. Existing terminals stay where they are."
+  "Applies when opening a terminal. Existing terminals stay where they are.": "Applies when opening a terminal. Existing terminals stay where they are.",
+  "Gateway update required": "Gateway update required",
+  "Update this computer’s Gateway to recover approvals and questions after reconnecting. Live requests still appear.": "Update this computer’s Gateway to recover approvals and questions after reconnecting. Live requests still appear."
 }

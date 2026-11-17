@@ -8,4 +8,4 @@ pub use agent::{
     split_uploaded_attachment_suffix, strip_image_labels, AgentError, AgentFuture, AgentPort,
     FileDiffItem, ATTACHED_FILES_MARKER,
 };
-pub use mirror::{AgentSessionSnapshot, MirrorFuture, SessionMirrorPort};
+pub use mirror::{AgentPendingSnapshot, AgentSessionSnapshot, MirrorFuture, SessionMirrorPort};

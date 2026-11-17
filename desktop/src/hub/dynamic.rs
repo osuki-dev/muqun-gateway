@@ -188,6 +188,12 @@ async fn forward_tasks(
 }
 
 impl SessionHub for DynamicHub {
+    fn pending_attention(
+        &self,
+    ) -> HubFuture<'_, Option<Vec<muqun_gateway::agents::ports::AgentPendingSnapshot>>> {
+        let active = self.active();
+        Box::pin(async move { active.pending_attention().await })
+    }
     fn mode(&self) -> HubMode {
         self.active().mode()
     }

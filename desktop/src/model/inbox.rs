@@ -234,7 +234,8 @@ pub enum Update {
     HubMode(crate::hub::HubMode),
     /// A session wants the owner, or finished (`model/notify.rs`): the UI
     /// raises a system notification unless that session is on screen.
-    Attention(super::notify::Attention),
+    FleetAttention(Box<super::fleet_attention::Change>),
+    FleetAttentionUnavailable(String),
     /// Dictation's progress (`model/voice.rs`).
     Voice(super::voice::VoiceEvent),
     /// Probed status of external runtimes (`bun`, `herdr`).
@@ -317,6 +318,8 @@ impl Inbox {
         if !matches!(
             update,
             Update::Ui(_)
+                | Update::FleetAttention(_)
+                | Update::FleetAttentionUnavailable(_)
                 | Update::Theme(_)
                 | Update::Voice(_)
                 | Update::Storage(_)

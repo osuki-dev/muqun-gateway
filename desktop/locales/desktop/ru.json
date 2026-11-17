@@ -789,5 +789,7 @@
   "Every coding agent on this computer in one window: start sessions, watch several at once, answer approvals, and keep the history. Nothing leaves this machine unless an agent sends it.": "Все агенты программирования этого компьютера в одном окне: запускайте сеансы, следите за несколькими, отвечайте на запросы одобрения и храните историю. Данные не покидают компьютер, если агент их не отправляет.",
   "Docked": "Закреплённый",
   "Default terminal placement": "Расположение терминала по умолчанию",
-  "Applies when opening a terminal. Existing terminals stay where they are.": "Применяется при открытии терминала. Уже открытые терминалы остаются на своих местах."
+  "Applies when opening a terminal. Existing terminals stay where they are.": "Применяется при открытии терминала. Уже открытые терминалы остаются на своих местах.",
+  "Gateway update required": "Требуется обновление Gateway",
+  "Update this computer’s Gateway to recover approvals and questions after reconnecting. Live requests still appear.": "Обновите Gateway на этом компьютере, чтобы восстановить запросы подтверждения и вопросы после переподключения. Новые запросы по-прежнему отображаются."
 }

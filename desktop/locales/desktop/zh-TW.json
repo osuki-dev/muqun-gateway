@@ -789,5 +789,7 @@
   "Every coding agent on this computer in one window: start sessions, watch several at once, answer approvals, and keep the history. Nothing leaves this machine unless an agent sends it.": "在一個視窗中管理本機的所有程式設計代理：啟動工作階段、同時查看多個工作階段、處理核准並保留歷史。除非代理主動傳送，資料不會離開本機。",
   "Docked": "停靠",
   "Default terminal placement": "終端機預設開啟方式",
-  "Applies when opening a terminal. Existing terminals stay where they are.": "開啟終端機時套用。已開啟的終端機維持目前位置。"
+  "Applies when opening a terminal. Existing terminals stay where they are.": "開啟終端機時套用。已開啟的終端機維持目前位置。",
+  "Gateway update required": "需要更新 Gateway",
+  "Update this computer’s Gateway to recover approvals and questions after reconnecting. Live requests still appear.": "更新這台電腦的 Gateway，才能在重新連線後恢復待確認和待回答的問題。即時請求仍會顯示。"
 }

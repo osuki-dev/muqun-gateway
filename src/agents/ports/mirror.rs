@@ -9,6 +9,15 @@ use crate::agents::domain::{
 
 pub type MirrorFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Retained attention metadata, without transcript, question text, or tool arguments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentPendingSnapshot {
+    pub info: AgentSessionInfo,
+    pub permission_ids: Vec<String>,
+    pub form_ids: Vec<String>,
+    pub seq: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSessionSnapshot {
     pub info: AgentSessionInfo,

@@ -789,5 +789,7 @@
   "Every coding agent on this computer in one window: start sessions, watch several at once, answer approvals, and keep the history. Nothing leaves this machine unless an agent sends it.": "Todos os agentes de programação deste computador em uma janela: inicie sessões, acompanhe várias, responda aprovações e guarde o histórico. Nada sai desta máquina a menos que um agente envie.",
   "Docked": "Acoplado",
   "Default terminal placement": "Posição padrão do terminal",
-  "Applies when opening a terminal. Existing terminals stay where they are.": "Aplicado ao abrir um terminal. Os terminais já abertos permanecem na posição atual."
+  "Applies when opening a terminal. Existing terminals stay where they are.": "Aplicado ao abrir um terminal. Os terminais já abertos permanecem na posição atual.",
+  "Gateway update required": "É necessário atualizar o Gateway",
+  "Update this computer’s Gateway to recover approvals and questions after reconnecting. Live requests still appear.": "Atualize o Gateway deste computador para recuperar aprovações e perguntas após reconectar. Novas solicitações continuarão aparecendo."
 }

@@ -90,6 +90,17 @@ impl LocalHub {
 }
 
 impl SessionHub for LocalHub {
+    fn pending_attention(
+        &self,
+    ) -> HubFuture<'_, Option<Vec<muqun_gateway::agents::ports::AgentPendingSnapshot>>> {
+        Box::pin(async {
+            let mut snapshots = Vec::new();
+            for manager in self.runtime.all_managers().await {
+                snapshots.extend(manager.sessions().pending_snapshots().await);
+            }
+            Ok(Some(snapshots))
+        })
+    }
     fn mode(&self) -> HubMode {
         HubMode::Standalone
     }

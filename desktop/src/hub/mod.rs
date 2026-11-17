@@ -351,6 +351,12 @@ pub trait SessionHub: Send + Sync {
     fn agents(&self) -> HubFuture<'_, Vec<AgentDiscoveryInfo>>;
     /// The ids of the agents attached right now, most preferred first.
     fn attached(&self) -> HubFuture<'_, Vec<String>>;
+    /// Retained request metadata for reconnect reconciliation; None on older Gateways.
+    fn pending_attention(
+        &self,
+    ) -> HubFuture<'_, Option<Vec<muqun_gateway::agents::ports::AgentPendingSnapshot>>> {
+        Box::pin(async { Ok(None) })
+    }
     /// One agent's sessions, as its adapter lists them.
     fn sessions<'a>(
         &'a self,

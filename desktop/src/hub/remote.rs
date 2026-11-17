@@ -514,6 +514,18 @@ fn map_error(status: u16, body: &Value, asid: &str, raw: &str) -> HubError {
 }
 
 impl SessionHub for RemoteHub {
+    fn pending_attention(
+        &self,
+    ) -> HubFuture<'_, Option<Vec<muqun_gateway::agents::ports::AgentPendingSnapshot>>> {
+        Box::pin(async {
+            if !self.has_capability("agent_attention_v1").await? {
+                return Ok(None);
+            }
+            self.data(Method::GET, &["api", "agent-attention"], &[], None)
+                .await
+                .map(Some)
+        })
+    }
     fn mode(&self) -> HubMode {
         HubMode::LocalGateway
     }
@@ -1792,6 +1804,8 @@ async fn run_socket(
     }
 
     tracing::info!("event socket connected");
+    // A Gateway upgrade may add optional APIs while Desktop stays open.
+    *hub.capabilities.lock().await = None;
     hub.link.send_replace(None);
     // Also catch up the first connection: initial HTTP reads may have finished
     // before the event subscription, or failed while the gateway was offline.

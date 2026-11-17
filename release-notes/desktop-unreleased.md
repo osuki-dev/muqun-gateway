@@ -4,6 +4,8 @@ This is an early Desktop preview, published separately from Muqun Gateway. It do
 
 ## Changes
 
+- Paired computers keep their approval and question notifications active even while another workspace is selected. Desktop notifications and Inbox entries name the computer and open the correct session; answered requests are withdrawn, and identical session IDs on different computers remain isolated. The new `agent_attention_v1` Gateway capability restores retained pending requests after reconnect without transferring transcripts or waking an agent. Older Gateways retain live notifications and show an upgrade notice for reconnect recovery.
+
 - Terminal settings now offer docked, split, or floating placement for new opens. Normally exited shells remove their empty terminal tiles, including background tabs, without stealing focus from another conversation; failed startups retain their error view.
 
 - Delegated task details use readable line spacing and a bounded scroll area, so a single long instruction cannot expand across the whole conversation. Full instructions remain selectable and copyable.

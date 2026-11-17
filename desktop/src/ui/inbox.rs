@@ -67,6 +67,7 @@ pub enum What<'a> {
     Permission(&'a PermissionRequest),
     Form(&'a FormRequest),
     Task(&'a TaskRow),
+    Remote(&'a crate::model::fleet_attention::Pending),
 }
 
 /// One thing waiting on the owner.
@@ -83,6 +84,9 @@ pub struct Item<'a> {
 impl Item<'_> {
     /// The list groups by this: the session, or the task on its own.
     fn group(&self) -> String {
+        if let What::Remote(p) = self.what {
+            return crate::model::fleet_attention::notice_key(&p.computer, &p.asid);
+        }
         self.asid.map_or_else(|| self.key.clone(), str::to_string)
     }
 }
@@ -124,6 +128,20 @@ pub fn items(s: &UiState) -> Vec<Item<'_>> {
                 what: What::Form(f),
             });
         }
+    }
+    for p in s.external_pending() {
+        let key = p.key();
+        out.push(Item {
+            since: since(&key),
+            key,
+            asid: None,
+            kind: if p.kind == crate::model::notify::AttentionKind::Approval {
+                Kind::Permission
+            } else {
+                Kind::Question
+            },
+            what: What::Remote(p),
+        });
     }
     // A waiting task whose session already shows its prompt is that prompt.
     for t in s.tasks.iter().filter(|t| t.state == "waiting") {
@@ -193,6 +211,7 @@ pub fn note_waiting(s: &mut UiState) {
                 .flatten()
                 .map(|f| format!("f:{}", f.id)),
         )
+        .chain(s.fleet_pending.values().flatten().map(|p| p.key()))
         .collect();
     s.inbox_view.since.retain(|k, _| live.contains(k));
     for key in live {
@@ -230,6 +249,11 @@ pub fn key(s: &mut UiState, action: Action) -> bool {
             true
         }
         Action::OpenRow => {
+            if let What::Remote(p) = list[at].what {
+                let (computer, asid) = (p.computer.clone(), p.asid.clone());
+                s.open_session_on(&computer, &asid);
+                return true;
+            }
             let asid = match &list[at].what {
                 What::Task(t) => t.asid.clone(),
                 _ => list[at].asid.map(str::to_string),
@@ -341,6 +365,21 @@ fn page_head(k: &Kit, language: Language, count: usize) -> El {
 /// The one line a list row leads with.
 fn headline(language: Language, item: &Item<'_>) -> (String, String) {
     match &item.what {
+        What::Remote(p) => (
+            tr(
+                language,
+                if p.kind == crate::model::notify::AttentionKind::Approval {
+                    "Permission"
+                } else {
+                    "Question"
+                },
+            ),
+            if p.title.is_empty() {
+                p.asid.clone()
+            } else {
+                p.title.clone()
+            },
+        ),
         What::Permission(p) => {
             let subject = tv::permission_subject(p);
             let phrase = approval::action_phrase(language, &p.action);
@@ -438,6 +477,7 @@ fn group_head(s: &UiState, k: &Kit, item: &Item<'_>, first: bool) -> El {
     let language = s.cfg.general.language;
     let info = item.asid.and_then(|a| s.session_by_id(a));
     let (mark, title) = match (info, &item.what) {
+        (_, What::Remote(p)) => (None, s.computer_name(&p.computer)),
         (Some(info), _) => (
             Some(super::agents::mark(&info.agent_id, 12.0, s.dark).a11y_hidden()),
             title_of(info),
@@ -506,6 +546,39 @@ fn button(
 
 fn detail(s: &UiState, k: &Kit, item: &Item<'_>) -> El {
     let language = s.cfg.general.language;
+    if let What::Remote(p) = item.what {
+        let (computer, asid) = (p.computer.clone(), p.asid.clone());
+        return col()
+            .key(format!("remote-detail-{}", p.key()))
+            .grow(1.0)
+            .min_w(0.0)
+            .px(24.0)
+            .py(24.0)
+            .gap(16.0)
+            .child(
+                text(s.computer_name(&computer))
+                    .font(k.ty.small_medium)
+                    .color(k.c.text_muted),
+            )
+            .child(
+                text(headline(language, item).0)
+                    .font(k.ty.ui_medium)
+                    .color(k.c.text_base)
+                    .wrap(),
+            )
+            .child(
+                text(p.title.clone())
+                    .font(k.ty.body)
+                    .color(k.c.text_muted)
+                    .wrap(),
+            )
+            .child(
+                Button::new(tr(language, "Open session"))
+                    .variant(ButtonVariant::Submit)
+                    .on_press(move |s: &mut UiState| s.open_session_on(&computer, &asid))
+                    .build(k),
+            );
+    }
     let look = s.look();
     let now = super::now_ms();
     let (title, _) = headline(language, item);
@@ -579,6 +652,7 @@ fn detail(s: &UiState, k: &Kit, item: &Item<'_>) -> El {
     body = body.child(rule(k, "detail-rule"));
 
     match &item.what {
+        What::Remote(_) => unreachable!("remote requests are opened on their owning computer"),
         What::Permission(p) => {
             if let Some(reason) = tv::dangerous_permission(p) {
                 body = body.child(

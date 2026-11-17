@@ -120,6 +120,7 @@ pub struct ToastItem {
     pub title: String,
     pub detail: Option<String>,
     pub created_at: std::time::Instant,
+    pub target: Option<String>,
 }
 
 const MAX_TOASTS: usize = 5;
@@ -376,6 +377,7 @@ pub fn seed_config(config: DesktopConfig) {
 pub struct ComputerData {
     focused_slot: Option<SessionSlot>,
     start_draft: Option<TextEdit>,
+    form_inputs: HashMap<String, TextEdit>,
     pub session_open_errors: HashMap<String, String>,
     pub pending_receipts: Vec<Update>,
     pub pending_submit: Option<(u64, Slot)>,
@@ -553,6 +555,7 @@ pub struct UiState {
     pub waiting_forms: HashMap<String, Vec<FormRequest>>,
     /// The Inbox page's selection and when each prompt first arrived.
     pub inbox_view: inbox::InboxView,
+    pub fleet_pending: HashMap<String, Vec<crate::model::fleet_attention::Pending>>,
     /// The Tasks page's selection, filters and task histories.
     pub tasks_view: tasks::TasksView,
     /// Form answers, by `form id / field key`.
@@ -789,6 +792,7 @@ impl UiState {
             waiting_perms: HashMap::new(),
             waiting_forms: HashMap::new(),
             inbox_view: Default::default(),
+            fleet_pending: HashMap::new(),
             tasks_view: Default::default(),
             form_inputs: HashMap::new(),
             agent_inputs: HashMap::new(),
@@ -1228,9 +1232,12 @@ impl UiState {
         let prev = self.current_computer().to_string();
         let mut pending_receipts = Vec::new();
         if prev != id {
+            self.waiting_perms.clear();
+            self.waiting_forms.clear();
             self.persist_draft(Slot::Session);
             let slot = self.take_slot();
             let data = ComputerData {
+                form_inputs: std::mem::take(&mut self.form_inputs),
                 focused_slot: Some(slot),
                 start_draft: Some(std::mem::replace(&mut self.start_draft, TextEdit::new(""))),
                 session_open_errors: std::mem::take(&mut self.session_open_errors),
@@ -1276,6 +1283,7 @@ impl UiState {
                 self.selected = None;
                 self.mode = Mode::Home;
             } else if let Some(restored) = self.computer_data.remove(&id) {
+                self.form_inputs = restored.form_inputs;
                 self.start_draft = restored.start_draft.unwrap_or_else(|| TextEdit::new(""));
                 self.session_open_errors = restored.session_open_errors;
                 self.pending_submit = restored.pending_submit;
@@ -1374,7 +1382,7 @@ impl UiState {
         if let Some(existing) = self
             .toasts
             .iter_mut()
-            .find(|t| t.title == title && t.detail == detail)
+            .find(|t| t.target.is_none() && t.title == title && t.detail == detail)
         {
             existing.level = level;
             existing.created_at = now;
@@ -1388,6 +1396,7 @@ impl UiState {
             title,
             detail,
             created_at: now,
+            target: None,
         });
         while self.toasts.len() > MAX_TOASTS {
             self.toasts.remove(0);
@@ -1494,13 +1503,55 @@ impl UiState {
         let perms: usize = self.waiting_perms.values().map(Vec::len).sum();
         let forms: usize = self.waiting_forms.values().map(Vec::len).sum();
         let tasks = self.tasks.iter().filter(|t| t.state == "waiting").count();
-        perms + forms + tasks
+        perms + forms + tasks + self.external_pending().len()
+    }
+
+    pub fn external_pending(&self) -> Vec<&crate::model::fleet_attention::Pending> {
+        self.fleet_pending
+            .values()
+            .flatten()
+            .filter(|p| {
+                if p.computer != self.current_computer() {
+                    return true;
+                }
+                if let Some(id) = p.request.strip_prefix("p:") {
+                    !self
+                        .waiting_perms
+                        .get(&p.asid)
+                        .is_some_and(|list| list.iter().any(|r| r.id == id))
+                } else if let Some(id) = p.request.strip_prefix("f:") {
+                    !self
+                        .waiting_forms
+                        .get(&p.asid)
+                        .is_some_and(|list| list.iter().any(|r| r.id == id))
+                } else {
+                    false
+                }
+            })
+            .collect()
     }
 
     /// Show session `asid`. In split view it joins as a new pane (or takes
     /// focus where it already is); otherwise it fills the main card.
     pub fn open_session(&mut self, asid: &str) {
         self.route_session(asid);
+        self.open_session_current(asid);
+    }
+
+    pub fn open_session_on(&mut self, computer: &str, asid: &str) {
+        if self.current_computer() != computer {
+            self.switch_computer(computer.to_owned());
+        }
+        self.open_session_current(asid);
+    }
+
+    pub fn open_notification(&mut self, key: &str) {
+        if let Ok((computer, asid)) = serde_json::from_str::<(String, String)>(key) {
+            self.open_session_on(&computer, &asid);
+        }
+    }
+
+    fn open_session_current(&mut self, asid: &str) {
         self.session_open_errors.remove(asid);
         let key = format!("{}:{asid}", self.current_computer());
         self.sidebar_opened.insert(key, now_ms());
@@ -1517,8 +1568,11 @@ impl UiState {
         self.sidebar_all_sessions = false;
         self.active_plugin_page = None;
         if self.in_split() && self.tile_of(asid).is_none() {
-            crate::platform::notify::withdraw(asid);
-            self.open_in_tile(asid);
+            crate::platform::notify::withdraw(&crate::model::fleet_attention::notice_key(
+                self.current_computer(),
+                asid,
+            ));
+            self.open_in_tile_current(asid);
             return;
         }
         self.open_here(asid);
@@ -1527,7 +1581,10 @@ impl UiState {
     /// Show session `asid` in the focused pane (the main card outside split
     /// view), in place of what it showed.
     fn open_here(&mut self, asid: &str) {
-        crate::platform::notify::withdraw(asid);
+        crate::platform::notify::withdraw(&crate::model::fleet_attention::notice_key(
+            self.current_computer(),
+            asid,
+        ));
         if let Some(i) = self.tile_of(asid) {
             if i != self.focus {
                 self.focus_tile(i);
@@ -2317,6 +2374,10 @@ impl UiState {
     /// focus; a session already in a pane just takes focus.
     pub fn open_in_tile(&mut self, asid: &str) {
         self.route_session(asid);
+        self.open_in_tile_current(asid);
+    }
+
+    fn open_in_tile_current(&mut self, asid: &str) {
         self.session_open_errors.remove(asid);
         if let Some(i) = self.tile_of(asid) {
             self.focus_tile(i);
@@ -3114,7 +3175,10 @@ impl UiState {
                     generation,
                     outcome,
                 } => self.on_search(generation, outcome),
-                Update::Attention(attention) => self.on_attention(&attention),
+                Update::FleetAttention(change) => self.on_fleet_attention(*change),
+                Update::FleetAttentionUnavailable(computer) => {
+                    self.toast(format!("{} · {}", self.computer_name(&computer), copy::tr(self.cfg.general.language, "Gateway update required")), Some(copy::tr(self.cfg.general.language, "Update this computer’s Gateway to recover approvals and questions after reconnecting. Live requests still appear.")));
+                }
                 Update::Voice(event) => self.on_voice(event),
                 Update::Runtimes(statuses) => {
                     self.runtime_statuses = statuses;
@@ -3172,24 +3236,58 @@ impl UiState {
         self.sync_tray();
     }
 
-    /// Raise a system notification unless the owner turned them off or is
-    /// looking at that session (`model/notify.rs` has the rules and words).
-    fn on_attention(&mut self, attention: &crate::model::notify::Attention) {
-        // On screen: the focused session, or any session in a split tile.
-        let on_screen = crate::platform::notify::window_focused()
-            && self.mode == Mode::Session
-            && (self.selected.as_deref() == Some(attention.asid.as_str())
-                || self.tile_of(&attention.asid).is_some());
-        if !self.cfg.notifications.enabled || on_screen {
-            return;
+    fn on_fleet_attention(&mut self, change: crate::model::fleet_attention::Change) {
+        use crate::model::fleet_attention::notice_key;
+        let computer = change.computer;
+        if let Some(previous) = self.fleet_pending.get(&computer) {
+            for prompt in previous {
+                if !change.pending.iter().any(|p| p.asid == prompt.asid) {
+                    let key = notice_key(&computer, &prompt.asid);
+                    crate::platform::notify::withdraw(&key);
+                    self.toasts
+                        .retain(|t| t.target.as_deref() != Some(key.as_str()));
+                }
+            }
         }
-        let info = self.session_by_id(&attention.asid);
-        let agent = info.map(|i| self.agent_name(&i.agent_id));
-        let language = self.cfg.general.language;
-        if let Some(notice) =
-            crate::model::notify::compose(attention, info, agent.as_deref(), language)
-        {
-            crate::platform::notify::show(notice);
+        self.fleet_pending.insert(computer.clone(), change.pending);
+        for attention in change.raised {
+            let on_screen = self.current_computer() == computer
+                && crate::platform::notify::window_focused()
+                && self.mode == Mode::Session
+                && (self.selected.as_deref() == Some(attention.asid.as_str())
+                    || self.tile_of(&attention.asid).is_some());
+            if !self.cfg.notifications.enabled || on_screen {
+                continue;
+            }
+            let info = change.info.get(&attention.asid);
+            let agent = info.map(|i| self.agent_name(&i.agent_id));
+            if let Some(mut notice) = crate::model::notify::compose(
+                &attention,
+                info,
+                agent.as_deref(),
+                self.cfg.general.language,
+            ) {
+                notice.key = notice_key(&computer, &attention.asid);
+                notice.title = format!("{} · {}", self.computer_name(&computer), notice.title);
+                if notice.waiting {
+                    self.toasts
+                        .retain(|t| t.target.as_deref() != Some(notice.key.as_str()));
+                    self.toast_seq += 1;
+                    self.toasts.push(ToastItem {
+                        id: self.toast_seq,
+                        level: ToastLevel::Warning,
+                        title: notice.title.clone(),
+                        detail: Some(notice.body.clone()),
+                        created_at: std::time::Instant::now(),
+                        target: Some(notice.key.clone()),
+                    });
+                    while self.toasts.len() > MAX_TOASTS {
+                        self.toasts.remove(0);
+                    }
+                    HAS_TOASTS.store(true, Ordering::Release);
+                }
+                crate::platform::notify::show(notice);
+            }
         }
     }
 
@@ -4013,6 +4111,18 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
             let mut toast = rune_kit::Toast::new(format!("toast-{id}"), t.title.clone())
                 .lead(dot)
                 .on_close(move |s: &mut UiState| s.toasts.retain(|t| t.id != id));
+            if let Some(target) = &t.target {
+                let target = target.clone();
+                toast = toast.action(
+                    &k,
+                    &copy::tr(s.cfg.general.language, "Open"),
+                    true,
+                    move |s: &mut UiState, _| {
+                        s.open_notification(&target);
+                        s.toasts.retain(|t| t.id != id);
+                    },
+                );
+            }
             if let Some(d) = &t.detail {
                 toast = toast.description(d.clone());
             }
@@ -4077,6 +4187,69 @@ mod tests {
             "status": "idle", "directory": "/project", "updated_ms": 1
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn remote_attention_routes_to_its_owner_without_leaking_local_forms_or_answers() {
+        use crate::model::fleet_attention::{notice_key, Change, Pending};
+        use crate::model::notify::{Attention, AttentionKind};
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.cfg.current_computer = "local".into();
+        s.cfg.notifications.enabled = false;
+        s.sessions = vec![session_fixture("same")];
+        s.waiting_forms.insert(
+            "same".into(),
+            vec![serde_json::from_value(serde_json::json!({
+                "id":"question", "asid":"same", "title":"local", "fields":[]
+            }))
+            .unwrap()],
+        );
+        s.form_inputs.insert(
+            "question/answer".into(),
+            TextEdit::new("local private draft"),
+        );
+        let pending = Pending {
+            computer: "mini".into(),
+            asid: "same".into(),
+            request: "f:question".into(),
+            kind: AttentionKind::Question,
+            title: "remote".into(),
+        };
+        s.apply_updates(vec![Update::FleetAttention(Box::new(Change {
+            computer: "mini".into(),
+            pending: vec![pending.clone()],
+            raised: vec![Attention {
+                asid: "same".into(),
+                kind: AttentionKind::Question,
+            }],
+            info: HashMap::new(),
+        }))]);
+        assert_eq!(s.waiting_count(), 2);
+        assert_eq!(inbox::items(&s).len(), 2);
+        assert!(
+            s.toasts.is_empty(),
+            "disabled notifications leave the inbox available without interrupting"
+        );
+        s.open_notification(&notice_key("mini", "same"));
+        assert_eq!(s.current_computer(), "mini");
+        assert_eq!(s.selected.as_deref(), Some("same"));
+        assert!(s.waiting_forms.is_empty());
+        assert!(s.form_inputs.is_empty());
+        assert_eq!(
+            s.waiting_count(),
+            1,
+            "the pending summary remains visible until the full form loads"
+        );
+        s.apply_updates(vec![Update::FleetAttention(Box::new(Change {
+            computer: "mini".into(),
+            pending: vec![],
+            raised: vec![],
+            info: HashMap::new(),
+        }))]);
+        assert_eq!(s.waiting_count(), 0);
+        s.switch_computer("local".into());
+        assert_eq!(s.form_inputs["question/answer"].text, "local private draft");
     }
 
     #[test]
