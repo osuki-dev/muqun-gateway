@@ -58,7 +58,21 @@ jobs:
           test -f "$archive"
           ditto -x -k "$archive" "$RUNNER_TEMP/app"
           app="$RUNNER_TEMP/app/Muqun Desktop.app"
-          codesign --force --options runtime --timestamp --keychain "$keychain" --sign "$IDENTITY" "$app"
+          python3 - "$keychain" "$app" <<'PY'
+          import re, subprocess, sys
+          keychain, app = sys.argv[1:]
+          listing = subprocess.check_output(
+              ["security", "find-identity", "-v", "-p", "codesigning", keychain], text=True
+          )
+          identities = re.findall(r'([0-9A-Fa-f]{40}) "Developer ID Application: [^"\n]+"', listing)
+          if len(identities) != 1:
+              raise SystemExit("Expected one valid imported Developer ID Application identity; check private key, expiry and certificate chain")
+          print("::add-mask::" + identities[0], flush=True)
+          subprocess.run([
+              "codesign", "--force", "--options", "runtime", "--timestamp",
+              "--keychain", keychain, "--sign", identities[0], app,
+          ], check=True)
+          PY
           codesign --verify --strict "$app"
           mkdir -p ../signed
           ditto -c -k --keepParent "$app" "../signed/$archive"
