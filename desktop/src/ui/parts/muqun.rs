@@ -4,6 +4,7 @@
 
 use muqun_gateway::agents::{TimelineItem, ToolCall};
 use rune::{col, icon, row, text, Cursor, El};
+use rune_kit::ScrollBar;
 
 use super::{caption, chip, fact, glyphs, mono, CardState, Tcx, ToolCard};
 use crate::model::tool_view::{self as tv, Muqun, MuqunOp, MuqunStatus};
@@ -124,7 +125,16 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall, m: &Muqun) -> El {
     card.caption = m
         .command
         .clone()
-        .or_else(|| m.goal.clone().map(|g| tv::first_line(&g).to_string()))
+        .or_else(|| {
+            m.goal.as_ref().map(|goal| {
+                let first = tv::first_line(goal);
+                let mut summary: String = first.chars().take(80).collect();
+                if first.chars().count() > 80 {
+                    summary.push('…');
+                }
+                summary
+            })
+        })
         .or_else(|| m.files.first().map(|f| f.name.clone()))
         .unwrap_or_default();
     let tone = match m.status {
@@ -190,12 +200,31 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall, m: &Muqun) -> El {
         any = true;
     }
     if let Some(goal) = &m.goal {
-        body = body.child(
-            text(super::cap_lines(goal, 4).0)
-                .font(k.ty.small)
-                .color(k.c.text_base)
-                .wrap()
-                .w_full(),
+        card.copy = Some(goal.clone());
+        // Bound rendered height rather than newline count: a delegated goal
+        // is often one long paragraph which wraps into dozens of visual lines.
+        body = body.child(caption(k, cx.t("Task goal"))).child(
+            col()
+                .key("task-goal-scroll")
+                .w_full()
+                .min_h(0.0)
+                .max_h(240.0)
+                .px(10.0)
+                .py(8.0)
+                .radius(k.radius.md)
+                .fill(k.c.layer_01)
+                .scroll(rune::ScrollSpec {
+                    stick_bottom: false,
+                })
+                .scroll_bar(k)
+                .child(
+                    text(goal.clone())
+                        .font(k.ty.ui.lh(k.ty.ui.size * 1.5))
+                        .color(k.c.text_base)
+                        .wrap_anywhere()
+                        .selectable(true)
+                        .w_full(),
+                ),
         );
         any = true;
     }
