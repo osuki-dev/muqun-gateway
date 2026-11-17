@@ -96,7 +96,7 @@ pub fn invisible(item: &TimelineItem) -> bool {
 /// The list's rows: runs of two or more activity items fold into a group
 /// (invisible items inside a run do not break it); everything else is its
 /// own row. Invisible items get no row.
-pub fn blocks(items: &[TimelineItem]) -> Vec<Block> {
+pub fn blocks(items: &[TimelineItem], keep_standalone: impl Fn(&str) -> bool) -> Vec<Block> {
     let mut out = Vec::new();
     let mut run: Option<(usize, usize, usize)> = None; // start, end, members
     let flush = |run: &mut Option<(usize, usize, usize)>, out: &mut Vec<Block>| {
@@ -118,7 +118,22 @@ pub fn blocks(items: &[TimelineItem]) -> Vec<Block> {
             }
             continue;
         }
-        if family(item).is_some() {
+        // Child sessions and background task handles remain discoverable after
+        // the spawning call completes. A running command must not disappear
+        // inside an unrelated run of file reads.
+        let standalone = keep_standalone(&item.id)
+            || match &item.part {
+                AgentPart::Tool(call) => {
+                    tool_kind(call) == ToolKind::Subagent
+                        || call.background
+                        || call.child_session_id.is_some()
+                        || tv::muqun(call).is_some_and(|task| task.task_id.is_some())
+                        || (tool_kind(call) == ToolKind::Shell && running(item))
+                }
+                AgentPart::Shell { .. } => running(item),
+                _ => false,
+            };
+        if !standalone && family(item).is_some() {
             match run.as_mut() {
                 Some(r) => {
                     r.1 = i + 1;
@@ -275,7 +290,7 @@ mod tests {
             text("t2", "Done."),
         ];
         assert_eq!(
-            blocks(&items),
+            blocks(&items, |_| false),
             [
                 Block::Item(0),
                 Block::Group { start: 1, end: 5 },
@@ -285,6 +300,54 @@ mod tests {
                 Block::Item(7),
                 Block::Item(8),
                 Block::Item(9),
+            ]
+        );
+    }
+
+    #[test]
+    fn active_commands_and_child_sessions_remain_visible_between_completed_calls() {
+        let mut items = vec![
+            tool("read", "Read", json!({"file_path":"a.rs"}), json!({})),
+            tool(
+                "run",
+                "bash",
+                json!({"command":"cargo test"}),
+                json!({"state":"running"}),
+            ),
+            tool("read2", "Read", json!({"file_path":"b.rs"}), json!({})),
+            tool(
+                "child",
+                "task",
+                json!({"prompt":"Review"}),
+                json!({"child_session_id":"child-1"}),
+            ),
+        ];
+        assert_eq!(
+            blocks(&items, |_| false),
+            [
+                Block::Item(0),
+                Block::Item(1),
+                Block::Item(2),
+                Block::Item(3)
+            ]
+        );
+        if let AgentPart::Tool(call) = &mut items[1].part {
+            call.state = ToolCallStatus::Completed;
+        }
+        assert_eq!(
+            blocks(&items, |_| false),
+            [Block::Group { start: 0, end: 3 }, Block::Item(3)]
+        );
+        if let AgentPart::Tool(call) = &mut items[1].part {
+            call.background = true;
+        }
+        assert_eq!(
+            blocks(&items, |_| false),
+            [
+                Block::Item(0),
+                Block::Item(1),
+                Block::Item(2),
+                Block::Item(3)
             ]
         );
     }

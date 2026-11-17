@@ -38,12 +38,12 @@ impl From<PathBuf> for FileRef {
 }
 
 impl FileRef {
-    /// The local file this names, if it is on this computer.
+    /// The local file or directory this names, if it is on this computer.
     pub fn resolve(&self) -> Option<PathBuf> {
         match self {
             Self::Path(path) => {
                 let path = expand_home(path);
-                path.is_file()
+                (path.is_file() || path.is_dir())
                     .then(|| std::fs::canonicalize(&path).unwrap_or(path))
             }
             Self::Asset { asset, directory } => [
@@ -272,6 +272,22 @@ pub fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_links_resolve_directories_and_files_but_not_missing_paths() {
+        let dir = std::env::temp_dir().join(format!("muqun-link-resolve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("note.md");
+        std::fs::write(&file, "note").unwrap();
+        for path in [&dir, &file] {
+            assert_eq!(
+                FileRef::Path(path.clone()).resolve(),
+                Some(std::fs::canonicalize(path).unwrap())
+            );
+        }
+        assert!(FileRef::Path(dir.join("missing")).resolve().is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn files_are_drawn_by_what_they_are() {

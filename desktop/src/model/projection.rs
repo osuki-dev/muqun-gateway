@@ -15,7 +15,7 @@ use tokio::sync::{broadcast, watch};
 
 use super::commands::{Command, CommandReceiver};
 use super::compose::{self, ComposeCommand, ComposerUpdate, Deliver, Target};
-use super::inbox::{Inbox, SearchOutcome, UiError, Update, UpdateState};
+use super::inbox::{Inbox, SearchOutcome, UiError, Update};
 use super::types::{DiffStat, SESSION_LIST_LIMIT};
 use crate::config::{ConfigEdit, DesktopConfig};
 use crate::hub::{DynamicHub, HubError, SessionHub, TaskHubEvent, OPENCODE};
@@ -173,10 +173,10 @@ impl Coalesce {
     }
 }
 
-struct Core {
-    hub: Arc<DynamicHub>,
-    inbox: Arc<Inbox>,
-    config: Arc<ConfigStore>,
+/// Mutable read/view bookkeeping belongs to one connection generation.
+/// In-flight work may retain an old state, but cannot write the next connection's state.
+#[derive(Default)]
+struct ConnectionState {
     /// The session the user is looking at, for resyncs.
     active: Mutex<Option<AgentSessionId>>,
     /// Sessions open in split tiles beside the active one: their events
@@ -188,9 +188,6 @@ struct Core {
     relist: Coalesce,
     /// Re-reads of the task list, after a task event.
     retask: Coalesce,
-    completions: watch::Sender<Option<String>>,
-    /// Bumped on every edit; the saver waits for it to go quiet.
-    edits: watch::Sender<u64>,
     /// Session folders already resolved to their projects.
     resolved: Mutex<std::collections::HashSet<String>>,
     /// The newest sequence handed to the UI per session, for catching up
@@ -206,6 +203,21 @@ struct Core {
     fetching: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
+struct Core {
+    connection: Mutex<crate::hub::ConnectionContext>,
+    local_hub: Option<Arc<dyn SessionHub>>,
+    connection_generation: AtomicU64,
+    connected: std::sync::atomic::AtomicBool,
+    subscriptions: Mutex<Vec<tokio::task::AbortHandle>>,
+    hub: Arc<DynamicHub>,
+    inbox: Arc<Inbox>,
+    config: Arc<ConfigStore>,
+    state: Mutex<(u64, Arc<ConnectionState>)>,
+    completions: watch::Sender<Option<(crate::hub::ConnectionContext, String)>>,
+    /// Bumped on every edit; the saver waits for it to go quiet.
+    edits: watch::Sender<u64>,
+}
+
 /// Start the core side. Returns at once; the tasks live as long as the
 /// runtime does.
 pub fn spawn(
@@ -213,46 +225,34 @@ pub fn spawn(
     inbox: Arc<Inbox>,
     config: Arc<ConfigStore>,
     commands: CommandReceiver,
+    initial_connected: bool,
 ) {
     let (completions, completion_rx) = watch::channel(None);
     let (edits, edits_rx) = watch::channel(0);
+    let computer = match config.get().current_computer.as_str() {
+        "" | "self" | "all" => "local".to_string(),
+        other => other.to_string(),
+    };
+    let connection = hub.connection(computer, 0);
     let core = Arc::new(Core {
+        local_hub: (connection.computer == "local" || !initial_connected)
+            .then(|| connection.hub.clone()),
+        connection: Mutex::new(connection),
+        connection_generation: AtomicU64::new(0),
+        connected: std::sync::atomic::AtomicBool::new(initial_connected),
+        subscriptions: Mutex::new(Vec::new()),
         hub,
         inbox,
         config,
-        active: Mutex::new(None),
-        watched: Mutex::new(Vec::new()),
-        reread: Coalesce::default(),
-        relist: Coalesce::default(),
-        retask: Coalesce::default(),
+        state: Mutex::new((0, Arc::new(ConnectionState::default()))),
         completions,
         edits,
-        resolved: Mutex::new(Default::default()),
-        last_seq: Mutex::new(HashMap::new()),
-        beat: AtomicU64::new(0),
-        refreshed_at: Mutex::new(None),
-        tasks_reading: Default::default(),
-        fetching: Default::default(),
     });
-    core.inbox.push(Update::HubMode(core.hub.mode()));
-    tokio::spawn(core.clone().events());
-    tokio::spawn(super::notify::watch(core.hub.clone(), core.inbox.clone()));
-    if let Some(mut link) = core.hub.link() {
-        let inbox = core.inbox.clone();
-        inbox.push(Update::HubLink(link.borrow_and_update().clone()));
-        tokio::spawn(async move {
-            while link.changed().await.is_ok() {
-                let down = link.borrow_and_update().clone();
-                inbox.push(Update::HubLink(down));
-            }
-        });
-    }
-    if let Some(tasks) = core.hub.task_events() {
-        tokio::spawn(core.clone().task_events(tasks));
+    if initial_connected {
+        core.start_subscriptions();
     }
     tokio::spawn(core.clone().complete_directories(completion_rx));
     tokio::spawn(core.clone().save_config(edits_rx));
-    tokio::spawn(core.clone().watch_agents());
     if let Ok(list) = std::env::var("MUQUN_QA_SWITCH") {
         tokio::spawn(core.clone().qa_switch(list));
     }
@@ -260,6 +260,50 @@ pub fn spawn(
 }
 
 impl Core {
+    fn state(&self) -> Arc<ConnectionState> {
+        let state = self.state.lock().unwrap();
+        match crate::hub::connection_origin() {
+            Some((_, generation)) if generation != state.0 => Arc::new(ConnectionState::default()),
+            _ => state.1.clone(),
+        }
+    }
+
+    fn connection_is_current(&self) -> bool {
+        crate::hub::connection_origin()
+            .is_none_or(|(_, generation)| generation == self.state.lock().unwrap().0)
+    }
+
+    fn start_subscriptions(self: &Arc<Self>) {
+        let core = self.clone();
+        let context = self.connection.lock().unwrap().clone();
+        let task = tokio::spawn(context.scope(async move {
+            core.inbox.push(Update::HubMode(core.hub.mode()));
+            let task_events = async {
+                if let Some(events) = core.hub.task_events() {
+                    core.clone().task_events(events).await;
+                }
+            };
+            let link_events = async {
+                if let Some(mut link) = core.hub.link() {
+                    core.inbox
+                        .push(Update::HubLink(link.borrow_and_update().clone()));
+                    while link.changed().await.is_ok() {
+                        core.inbox
+                            .push(Update::HubLink(link.borrow_and_update().clone()));
+                    }
+                }
+            };
+            tokio::join!(
+                core.clone().events(),
+                super::notify::watch(core.hub.clone(), core.inbox.clone()),
+                core.clone().watch_agents(),
+                task_events,
+                link_events
+            );
+        }));
+        self.subscriptions.lock().unwrap().push(task.abort_handle());
+    }
+
     async fn commands(self: Arc<Self>, mut commands: CommandReceiver) {
         // The content search in flight: a newer one cancels it.
         let mut search: Option<tokio::task::AbortHandle> = None;
@@ -270,16 +314,31 @@ impl Core {
                     if let Some(stale) = search.take() {
                         stale.abort();
                     }
-                    let task = tokio::spawn(async move { core.search(generation, query).await });
+                    let connection = self.connection.lock().unwrap().clone();
+                    let task = tokio::spawn(
+                        connection.scope(async move { core.search(generation, query).await }),
+                    );
                     search = Some(task.abort_handle());
                 }
                 Command::CompleteDirectory { prefix } => {
-                    let _ = self.completions.send(Some(prefix));
+                    let connection = self.connection.lock().unwrap().clone();
+                    let _ = self.completions.send(Some((connection, prefix)));
                 }
                 // In this loop, not a task: edits must apply in the order sent.
                 Command::Edit(edit) => self.edit(edit),
+                command @ (Command::PairComputerClaim { .. }
+                | Command::PairComputerToken { .. }) => {
+                    self.clone().run(command).await;
+                }
+                Command::SwitchComputer(target) => {
+                    if let Some(stale) = search.take() {
+                        stale.abort();
+                    }
+                    self.clone().switch_computer(target).await;
+                }
                 command => {
-                    tokio::spawn(async move { core.run(command).await });
+                    let connection = self.connection.lock().unwrap().clone();
+                    tokio::spawn(connection.scope(async move { core.run(command).await }));
                 }
             }
         }
@@ -288,6 +347,13 @@ impl Core {
 
     /// One content search; a first page waits out the typing first.
     async fn search(&self, generation: u64, query: crate::hub::SearchQuery) {
+        if !self.connected.load(Ordering::Acquire) {
+            self.inbox.push(Update::Search {
+                generation,
+                outcome: SearchOutcome::Failed,
+            });
+            return;
+        }
         if query.cursor.is_none() {
             tokio::time::sleep(SEARCH_DEBOUNCE).await;
         }
@@ -306,6 +372,42 @@ impl Core {
     }
 
     async fn run(self: Arc<Self>, command: Command) {
+        if !self.connected.load(Ordering::Acquire)
+            && !matches!(
+                command,
+                Command::SwitchComputer(_)
+                    | Command::PairComputerRequest { .. }
+                    | Command::PairComputerClaim { .. }
+                    | Command::PairComputerToken { .. }
+                    | Command::Voice(_)
+                    | Command::ThemeRefresh
+                    | Command::ThemeInstall(_)
+                    | Command::ThemeRemove(_)
+                    | Command::ThemeApply(..)
+                    | Command::ThemeImportFile(_)
+                    | Command::ThemeImportUrl(_)
+                    | Command::ScanStorage
+                    | Command::ClearStorage
+                    | Command::ProbeRuntimes
+                    | Command::InstallManagedRuntime(_)
+            )
+        {
+            if let Command::OpenSession(asid) | Command::OpenTile(asid) = &command {
+                self.inbox.push(Update::SessionOpenFailed {
+                    asid: asid.0.clone(),
+                    message: "Computer connection failed. Select the computer again to reconnect."
+                        .into(),
+                });
+            }
+            if let Command::Compose(ComposeCommand::Submit { token, .. }) = command {
+                self.inbox
+                    .push(Update::Composer(Box::new(ComposerUpdate::Submitted {
+                        token,
+                        ok: false,
+                    })));
+            }
+            return;
+        }
         match command {
             Command::Refresh => self.refresh().await,
             Command::SwitchComputer(target) => self.switch_computer(target).await,
@@ -419,7 +521,7 @@ impl Core {
                 }
             },
             Command::OpenSession(asid) => {
-                *self.active.lock().unwrap() = Some(asid.clone());
+                *self.state().active.lock().unwrap() = Some(asid.clone());
                 self.open(&asid).await;
             }
             Command::ReadDetail(asid) => {
@@ -444,7 +546,8 @@ impl Core {
             }
             Command::OpenTile(asid) => {
                 {
-                    let mut watched = self.watched.lock().unwrap();
+                    let state = self.state();
+                    let mut watched = state.watched.lock().unwrap();
                     if !watched.contains(&asid) {
                         watched.push(asid.clone());
                     }
@@ -452,20 +555,20 @@ impl Core {
                 self.open(&asid).await;
             }
             Command::FocusSession(asid) => {
-                *self.active.lock().unwrap() = Some(asid.clone());
+                *self.state().active.lock().unwrap() = Some(asid.clone());
                 self.watch_viewed(&asid);
-                tokio::spawn(self.clone().diff(asid.clone()));
-                tokio::spawn(self.clone().descendants(asid.clone()));
+                crate::hub::spawn_connected(self.clone().diff(asid.clone()));
+                crate::hub::spawn_connected(self.clone().descendants(asid.clone()));
             }
             Command::WatchSessions(asids) => {
-                *self.watched.lock().unwrap() = asids;
+                *self.state().watched.lock().unwrap() = asids;
             }
             Command::CreateSession { agent, cwd } => match self.hub.create(&agent, &cwd).await {
                 Ok(info) => {
                     let asid = info.asid.clone();
                     self.resolve_dirs(info.directory.iter().cloned().collect(), false);
                     self.inbox.push(Update::SessionCreated(Box::new(info)));
-                    *self.active.lock().unwrap() = Some(asid.clone());
+                    *self.state().active.lock().unwrap() = Some(asid.clone());
                     self.open(&asid).await;
                     self.config.change(|config| {
                         config.general.last_agent = Some(agent.clone());
@@ -553,7 +656,7 @@ impl Core {
                     .push(Update::Ui(super::inbox::UiAction::ToggleDiffPanel)),
             },
             Command::RefreshDiff(asid) => {
-                tokio::spawn(self.clone().diff(asid));
+                crate::hub::spawn_connected(self.clone().diff(asid));
             }
             Command::StageRevert { asid, message_id } => {
                 if let Err(err) = self.hub.stage_revert(&asid, &message_id, true).await {
@@ -623,13 +726,14 @@ impl Core {
             Command::DeleteSession(asid) => match self.hub.delete(&asid).await {
                 Ok(()) => {
                     if self
+                        .state()
                         .active
                         .lock()
                         .unwrap()
                         .as_ref()
                         .is_some_and(|a| a == &asid)
                     {
-                        *self.active.lock().unwrap() = None;
+                        *self.state().active.lock().unwrap() = None;
                     }
                     self.inbox.push(Update::SessionGone(asid.0));
                 }
@@ -641,7 +745,7 @@ impl Core {
                         let new_asid = info.asid.clone();
                         self.resolve_dirs(info.directory.iter().cloned().collect(), false);
                         self.inbox.push(Update::SessionCreated(Box::new(info)));
-                        *self.active.lock().unwrap() = Some(new_asid.clone());
+                        *self.state().active.lock().unwrap() = Some(new_asid.clone());
                         self.open(&new_asid).await;
                     }
                     Err(err) => self.fail(err),
@@ -794,7 +898,7 @@ impl Core {
                 })
                 .await;
                 if let Some(asid) = asid {
-                    tokio::spawn(self.clone().diff(asid));
+                    crate::hub::spawn_connected(self.clone().diff(asid));
                 }
                 let path = PathBuf::from(&cwd);
                 let info =
@@ -827,7 +931,7 @@ impl Core {
                 })
                 .await;
                 if let Some(asid) = asid {
-                    tokio::spawn(self.clone().diff(asid));
+                    crate::hub::spawn_connected(self.clone().diff(asid));
                 }
                 let path = PathBuf::from(&cwd);
                 let info =
@@ -895,37 +999,6 @@ impl Core {
                     }
                 }
             }
-            Command::CheckUpdate { include_preview } => {
-                let inbox = self.inbox.clone();
-                inbox.push(Update::UpdateState(UpdateState::Checking));
-                tokio::spawn(async move {
-                    match crate::platform::update::check_latest(include_preview).await {
-                        Ok(Some(info)) => {
-                            inbox.push(Update::UpdateState(UpdateState::Available(Box::new(info))));
-                        }
-                        Ok(None) => {
-                            inbox.push(Update::UpdateState(UpdateState::UpToDate));
-                        }
-                        Err(err) => {
-                            inbox.push(Update::UpdateState(UpdateState::Failed(err.to_string())));
-                        }
-                    }
-                });
-            }
-            Command::InstallUpdate(info) => {
-                let inbox = self.inbox.clone();
-                inbox.push(Update::UpdateState(UpdateState::Downloading));
-                tokio::spawn(async move {
-                    match crate::platform::update::download_and_install(&info).await {
-                        Ok(()) => {
-                            inbox.push(Update::UpdateState(UpdateState::ReadyToRestart));
-                        }
-                        Err(err) => {
-                            inbox.push(Update::UpdateState(UpdateState::Failed(err.to_string())));
-                        }
-                    }
-                });
-            }
             Command::ProbeRuntimes => {
                 let inbox = self.inbox.clone();
                 tokio::task::spawn_blocking(move || {
@@ -935,7 +1008,7 @@ impl Core {
             }
             Command::InstallManagedRuntime(kind) => {
                 let inbox = self.inbox.clone();
-                tokio::spawn(async move {
+                crate::hub::spawn_connected(async move {
                     let result =
                         muqun_gateway::platform::runtimes::install_managed(kind, None, None)
                             .await
@@ -1005,7 +1078,7 @@ impl Core {
                     Ok(info) => {
                         let asid = info.asid.clone();
                         self.inbox.push(Update::SessionCreated(Box::new(info)));
-                        *self.active.lock().unwrap() = Some(asid.clone());
+                        *self.state().active.lock().unwrap() = Some(asid.clone());
                         self.open(&asid).await;
                         self.config.change(|config| {
                             config.general.last_agent = Some(agent.clone());
@@ -1058,12 +1131,26 @@ impl Core {
 
     /// Switch active computer target: reconnect or swap the hub and reload data.
     async fn switch_computer(self: Arc<Self>, target: String) {
+        let target = match target.as_str() {
+            "" | "self" => "local".to_string(),
+            _ => target,
+        };
+        if target == "all" {
+            return;
+        }
+        if self.connected.load(Ordering::Acquire)
+            && self.connection.lock().unwrap().computer == target
+        {
+            return;
+        }
+        self.connected.store(false, Ordering::Release);
+        for task in self.subscriptions.lock().unwrap().drain(..) {
+            task.abort();
+        }
+        let generation = self.connection_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        *self.connection.lock().unwrap() = self.hub.connection(target.clone(), generation);
+        *self.state.lock().unwrap() = (generation, Arc::new(ConnectionState::default()));
         tracing::info!(computer = %target, "switching active computer hub");
-        *self.active.lock().unwrap() = None;
-        self.watched.lock().unwrap().clear();
-        self.resolved.lock().unwrap().clear();
-        self.last_seq.lock().unwrap().clear();
-        *self.refreshed_at.lock().unwrap() = None;
 
         let cfg = self.config.get();
         let maybe_new_hub: Option<Arc<dyn SessionHub>> = if target == "local" || target == "self" {
@@ -1072,7 +1159,7 @@ impl Core {
                     .ok()
                     .map(|h| h as Arc<dyn SessionHub>)
             } else {
-                None
+                self.local_hub.clone()
             }
         } else if let Some(profile) = cfg.computers.get(&target) {
             if let (Some(url), Some(token)) = (&profile.url, &profile.token) {
@@ -1097,14 +1184,24 @@ impl Core {
 
         if let Some(new_hub) = maybe_new_hub {
             self.hub.switch(new_hub);
-            self.inbox.push(Update::HubMode(self.hub.mode()));
-            self.refresh().await;
+            let context = self.hub.connection(target.clone(), generation);
+            *self.connection.lock().unwrap() = context.clone();
+            self.connected.store(true, Ordering::Release);
+            self.start_subscriptions();
+            // The barrier covers swapping the backend and subscriptions. Listing
+            // agents must not hold queued session opens behind a slow computer.
+            tokio::spawn(context.scope(self.refresh()));
         } else if target != "all" {
-            self.inbox.push(Update::Error(UiError {
-                message: format!("Computer '{target}' is not configured or unpaired"),
-                detail: Some("Check computer connection in Settings".into()),
-                unreachable: true,
-            }));
+            let context = self.connection.lock().unwrap().clone();
+            context
+                .scope(async {
+                    self.inbox.push(Update::Error(UiError {
+                        message: format!("Computer '{target}' is not configured or unpaired"),
+                        detail: Some("Check computer connection in Settings".into()),
+                        unreachable: true,
+                    }));
+                })
+                .await;
         }
     }
 
@@ -1114,14 +1211,15 @@ impl Core {
     /// not spike the first second of startup.
     async fn refresh(self: Arc<Self>) {
         {
-            let mut at = self.refreshed_at.lock().unwrap();
+            let state = self.state();
+            let mut at = state.refreshed_at.lock().unwrap();
             if at.is_some_and(|t| t.elapsed() < REFRESH_DEDUPE) {
                 return;
             }
             *at = Some(std::time::Instant::now());
         }
-        tokio::spawn(self.clone().refresh_tasks());
-        tokio::spawn(self.clone().refresh_peers());
+        crate::hub::spawn_connected(self.clone().refresh_tasks());
+        crate::hub::spawn_connected(self.clone().refresh_peers());
         match self.hub.agents().await {
             Ok(agents) => self.inbox.push(Update::Agents(agents)),
             Err(err) => {
@@ -1140,11 +1238,11 @@ impl Core {
     /// The delegated task list and the default folder. A gateway without
     /// task routes (or an unreachable one) leaves the list as it was.
     async fn refresh_tasks(self: Arc<Self>) {
-        if self.tasks_reading.swap(true, Ordering::AcqRel) {
+        if self.state().tasks_reading.swap(true, Ordering::AcqRel) {
             return;
         }
         self.clone().read_tasks().await;
-        self.tasks_reading.store(false, Ordering::Release);
+        self.state().tasks_reading.store(false, Ordering::Release);
     }
 
     async fn refresh_peers(self: Arc<Self>) {
@@ -1235,7 +1333,7 @@ impl Core {
             if i > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
-            tokio::spawn(self.clone().list_sessions(agent));
+            crate::hub::spawn_connected(self.clone().list_sessions(agent));
         }
     }
 
@@ -1260,7 +1358,7 @@ impl Core {
                 // continue in the background so a slow agent does not stall Home.
                 self.resolve_dirs(dirs, false);
                 let core = self.clone();
-                tokio::spawn(async move {
+                crate::hub::spawn_connected(async move {
                     core.known_projects(agent).await;
                 });
             }
@@ -1286,6 +1384,7 @@ impl Core {
                 .collect();
             // A refresh that just started lists these already (boot).
             let refreshing = self
+                .state()
                 .refreshed_at
                 .lock()
                 .unwrap()
@@ -1335,15 +1434,15 @@ impl Core {
             return;
         }
         for url in urls {
-            if !self.fetching.lock().unwrap().insert(url.clone()) {
+            if !self.state().fetching.lock().unwrap().insert(url.clone()) {
                 continue;
             }
             let (hub, inbox, fetching) = (
                 Arc::clone(&self.hub),
                 Arc::clone(&self.inbox),
-                Arc::clone(&self.fetching),
+                Arc::clone(&self.state().fetching),
             );
-            tokio::spawn(async move {
+            crate::hub::spawn_connected(async move {
                 let landed = match hub.media(&url).await {
                     Ok(bytes) => super::media::target(&url)
                         .is_some_and(|path| super::media::write(&path, &bytes)),
@@ -1363,8 +1462,12 @@ impl Core {
     /// A session's snapshot to the view, and its waiting prompts to the
     /// composer (the view keeps no inbox).
     fn push_snapshot(&self, mut snapshot: muqun_gateway::agents::ports::AgentSessionSnapshot) {
+        if !self.connection_is_current() {
+            return;
+        }
         self.ready_rows(&mut snapshot.timeline);
-        self.last_seq
+        self.state()
+            .last_seq
             .lock()
             .unwrap()
             .insert(snapshot.info.asid.0.clone(), snapshot.seq);
@@ -1391,7 +1494,7 @@ impl Core {
                 let hub = Arc::clone(&self.hub);
                 let wake = asid.clone();
                 let core = Arc::clone(self);
-                tokio::spawn(async move {
+                crate::hub::spawn_connected(async move {
                     if let Err(err) = hub.wake(&wake).await {
                         tracing::debug!(asid = %wake.0, %err, "background wake after peek failed");
                     }
@@ -1403,8 +1506,8 @@ impl Core {
                         }
                     }
                 });
-                tokio::spawn(self.clone().diff(asid.clone()));
-                tokio::spawn(self.clone().descendants(asid.clone()));
+                crate::hub::spawn_connected(self.clone().diff(asid.clone()));
+                crate::hub::spawn_connected(self.clone().descendants(asid.clone()));
             }
             Ok(None) => match self.hub.open(asid).await {
                 Ok(snapshot) => {
@@ -1420,35 +1523,51 @@ impl Core {
                         cached = false,
                         "session open"
                     );
-                    tokio::spawn(self.clone().diff(asid.clone()));
-                    tokio::spawn(self.clone().descendants(asid.clone()));
+                    crate::hub::spawn_connected(self.clone().diff(asid.clone()));
+                    crate::hub::spawn_connected(self.clone().descendants(asid.clone()));
                 }
                 Err(err) => {
                     if self.is_open(asid) {
+                        self.inbox.push(Update::SessionOpenFailed {
+                            asid: asid.0.clone(),
+                            message: err.to_string(),
+                        });
                         self.fail(err);
                     }
                 }
             },
-            Err(err) => self.fail(err),
+            Err(err) => {
+                self.inbox.push(Update::SessionOpenFailed {
+                    asid: asid.0.clone(),
+                    message: err.to_string(),
+                });
+                self.fail(err);
+            }
         }
     }
 
     /// The session is on screen: the active one or a split tile.
     fn is_open(&self, asid: &AgentSessionId) -> bool {
-        self.active.lock().unwrap().as_ref() == Some(asid)
-            || self.watched.lock().unwrap().contains(asid)
+        if !self.connection_is_current() {
+            return false;
+        }
+        self.state().active.lock().unwrap().as_ref() == Some(asid)
+            || self.state().watched.lock().unwrap().contains(asid)
     }
 
     /// Mark the session read now, and again every [`VIEW_HEARTBEAT`] while it
     /// stays the open one. A newer call ends the heartbeat of an older one.
     fn watch_viewed(self: &Arc<Self>, asid: &AgentSessionId) {
-        let beat = self.beat.fetch_add(1, Ordering::SeqCst) + 1;
+        if !self.connection_is_current() {
+            return;
+        }
+        let beat = self.state().beat.fetch_add(1, Ordering::SeqCst) + 1;
         let core = self.clone();
         let asid = asid.clone();
-        tokio::spawn(async move {
+        crate::hub::spawn_connected(async move {
             loop {
                 let open = core.is_open(&asid);
-                if !open || core.beat.load(Ordering::SeqCst) != beat {
+                if !open || core.state().beat.load(Ordering::SeqCst) != beat {
                     return;
                 }
                 if let Err(err) = core.hub.view(&asid).await {
@@ -1464,6 +1583,7 @@ impl Core {
     /// and the snapshot must be read.
     async fn catch_up(&self, asid: &AgentSessionId) -> bool {
         let after = self
+            .state()
             .last_seq
             .lock()
             .unwrap()
@@ -1477,7 +1597,8 @@ impl Core {
             Ok(mut found) if !found.resync => {
                 self.ready_rows(&mut found.items);
                 if !found.items.is_empty() {
-                    self.last_seq
+                    self.state()
+                        .last_seq
                         .lock()
                         .unwrap()
                         .entry(asid.0.clone())
@@ -1549,8 +1670,12 @@ impl Core {
     /// Resolve session folders to their projects (`projects::resolve`) off
     /// the async threads; each folder once unless `again`.
     fn resolve_dirs(self: &Arc<Self>, dirs: Vec<String>, again: bool) {
+        if !self.connection_is_current() {
+            return;
+        }
         let fresh: Vec<String> = {
-            let mut resolved = self.resolved.lock().unwrap();
+            let state = self.state();
+            let mut resolved = state.resolved.lock().unwrap();
             dirs.into_iter()
                 .filter(|d| !d.is_empty())
                 .filter(|d| resolved.insert(d.clone()) || again)
@@ -1562,7 +1687,7 @@ impl Core {
             return;
         }
         let core = self.clone();
-        tokio::spawn(async move {
+        crate::hub::spawn_connected(async move {
             let started = std::time::Instant::now();
             let found = tokio::task::spawn_blocking(move || {
                 fresh
@@ -1627,8 +1752,8 @@ impl Core {
                     }
                 }
                 Ok(event) => {
-                    let active = self.active.lock().unwrap().clone();
-                    let watched = self.watched.lock().unwrap().clone();
+                    let active = self.state().active.lock().unwrap().clone();
+                    let watched = self.state().watched.lock().unwrap().clone();
                     match &event {
                         AgentDomainEvent::SessionUpdated { info, .. } => {
                             self.resolve_dirs(info.directory.iter().cloned().collect(), false);
@@ -1638,11 +1763,11 @@ impl Core {
                             if (active.as_ref() == Some(asid) || watched.contains(asid))
                                 && *status == muqun_gateway::agents::AgentSessionStatus::Idle =>
                         {
-                            tokio::spawn(self.clone().diff(asid.clone()));
-                            tokio::spawn(self.clone().descendants(asid.clone()));
+                            crate::hub::spawn_connected(self.clone().diff(asid.clone()));
+                            crate::hub::spawn_connected(self.clone().descendants(asid.clone()));
                             let core = self.clone();
                             let s_asid = asid.clone();
-                            tokio::spawn(async move {
+                            crate::hub::spawn_connected(async move {
                                 if !core.catch_up(&s_asid).await {
                                     if let Ok(snapshot) = core.hub.snapshot(&s_asid).await {
                                         if core.is_open(&s_asid) {
@@ -1656,7 +1781,8 @@ impl Core {
                     }
                     if wanted(&event, active.as_ref(), &watched) {
                         if event.seq() != 0 {
-                            self.last_seq
+                            self.state()
+                                .last_seq
                                 .lock()
                                 .unwrap()
                                 .entry(event.asid().0.clone())
@@ -1693,14 +1819,14 @@ impl Core {
     /// Re-read the task list in the background; a burst of events costs at
     /// most one read in flight and one after it.
     fn refresh_tasks_soon(self: &Arc<Self>) {
-        if !self.retask.begin() {
+        if !self.state().retask.begin() {
             return;
         }
         let core = self.clone();
-        tokio::spawn(async move {
+        crate::hub::spawn_connected(async move {
             loop {
                 core.clone().refresh_tasks().await;
-                if !core.retask.again() {
+                if !core.state().retask.again() {
                     break;
                 }
             }
@@ -1718,8 +1844,8 @@ impl Core {
     /// one read in flight and one after it.
     async fn resync(self: &Arc<Self>, asid: Option<&AgentSessionId>) {
         let named = asid.filter(|x| !x.0.is_empty());
-        let active = self.active.lock().unwrap().clone();
-        let watched = self.watched.lock().unwrap().clone();
+        let active = self.state().active.lock().unwrap().clone();
+        let watched = self.state().watched.lock().unwrap().clone();
         let target_asids: Vec<AgentSessionId> = match named {
             Some(target) => {
                 if active.as_ref() == Some(target) || watched.contains(target) {
@@ -1742,9 +1868,9 @@ impl Core {
             }
         };
         let reread = !target_asids.is_empty();
-        if reread && self.reread.begin() {
+        if reread && self.state().reread.begin() {
             let core = self.clone();
-            tokio::spawn(async move {
+            crate::hub::spawn_connected(async move {
                 loop {
                     for asid in &target_asids {
                         if !core.is_open(asid) {
@@ -1759,18 +1885,18 @@ impl Core {
                             }
                         }
                     }
-                    if !core.reread.again() {
+                    if !core.state().reread.again() {
                         break;
                     }
                 }
             });
         }
-        if (named.is_none() || !reread) && self.relist.begin() {
+        if (named.is_none() || !reread) && self.state().relist.begin() {
             let core = self.clone();
-            tokio::spawn(async move {
+            crate::hub::spawn_connected(async move {
                 loop {
                     core.clone().relist().await;
-                    if !core.relist.again() {
+                    if !core.state().relist.again() {
                         break;
                     }
                 }
@@ -1787,14 +1913,17 @@ impl Core {
         let attached = self.hub.attached().await.unwrap_or_default();
         let lists: Vec<_> = attached
             .into_iter()
-            .map(|agent| tokio::spawn(self.clone().list_sessions(agent)))
+            .map(|agent| crate::hub::spawn_connected(self.clone().list_sessions(agent)))
             .collect();
         for list in lists {
             let _ = list.await;
         }
     }
 
-    async fn complete_directories(self: Arc<Self>, mut prefixes: watch::Receiver<Option<String>>) {
+    async fn complete_directories(
+        self: Arc<Self>,
+        mut prefixes: watch::Receiver<Option<(crate::hub::ConnectionContext, String)>>,
+    ) {
         while prefixes.changed().await.is_ok() {
             // Debounce: wait until the prefix stops changing.
             loop {
@@ -1804,25 +1933,32 @@ impl Core {
                     Err(_) => break,
                 }
             }
-            let Some(prefix) = prefixes.borrow_and_update().clone() else {
+            let Some((connection, prefix)) = prefixes.borrow_and_update().clone() else {
                 continue;
             };
-            if prefix.trim().is_empty() {
-                // Nothing typed: nothing to suggest, and any earlier
-                // suggestions stop being offered.
-                self.inbox.push(Update::Completions {
-                    prefix,
-                    entries: Vec::new(),
-                });
-                continue;
-            }
-            match self.hub.directories(&prefix).await {
-                Ok(found) => self.inbox.push(Update::Completions {
-                    prefix,
-                    entries: found.directories,
-                }),
-                Err(err) => tracing::debug!(%err, "directory completion failed"),
-            }
+            connection
+                .scope(async {
+                    if !self.connection_is_current() || !self.connected.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if prefix.trim().is_empty() {
+                        // Nothing typed: nothing to suggest, and any earlier
+                        // suggestions stop being offered.
+                        self.inbox.push(Update::Completions {
+                            prefix,
+                            entries: Vec::new(),
+                        });
+                        return;
+                    }
+                    match self.hub.directories(&prefix).await {
+                        Ok(found) => self.inbox.push(Update::Completions {
+                            prefix,
+                            entries: found.directories,
+                        }),
+                        Err(err) => tracing::debug!(%err, "directory completion failed"),
+                    }
+                })
+                .await;
         }
     }
 
@@ -1862,6 +1998,107 @@ mod tests {
 
     fn id(s: &str) -> AgentSessionId {
         AgentSessionId(s.into())
+    }
+
+    fn test_core() -> Arc<Core> {
+        let backend = crate::hub::RemoteHub::start(crate::hub::LocalGateway {
+            url: "http://127.0.0.1:1".into(),
+            token: "test-only".into(),
+            device_id: None,
+            transport_key: None,
+        })
+        .unwrap();
+        let hub = DynamicHub::new(backend);
+        Arc::new(Core {
+            connection: Mutex::new(hub.connection("local".into(), 0)),
+            local_hub: None,
+            connection_generation: AtomicU64::new(0),
+            connected: std::sync::atomic::AtomicBool::new(true),
+            subscriptions: Mutex::new(Vec::new()),
+            hub,
+            inbox: Arc::new(Inbox::new()),
+            config: ConfigStore::new(PathBuf::new(), DesktopConfig::default()),
+            state: Mutex::new((0, Arc::new(ConnectionState::default()))),
+            completions: watch::channel(None).0,
+            edits: watch::channel(0).0,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_late_reader_cannot_change_the_new_computers_view_or_sequence() {
+        let core = test_core();
+        let old = core.connection.lock().unwrap().clone();
+        let old_state = core.state();
+        *old_state.active.lock().unwrap() = Some(id("shared-id"));
+        let current = Arc::new(ConnectionState::default());
+        *current.active.lock().unwrap() = Some(id("shared-id"));
+        current
+            .last_seq
+            .lock()
+            .unwrap()
+            .insert("shared-id".into(), 5);
+        *core.state.lock().unwrap() = (1, current.clone());
+        old.scope(async {
+            assert!(!core.is_open(&id("shared-id")));
+            // A reader already holding the old state and one resuming after an
+            // await both write outside the current computer's state.
+            old_state
+                .last_seq
+                .lock()
+                .unwrap()
+                .insert("shared-id".into(), 90);
+            core.state()
+                .last_seq
+                .lock()
+                .unwrap()
+                .insert("shared-id".into(), 100);
+            core.resolve_dirs(vec!["/not-on-the-current-computer".into()], false);
+            core.watch_viewed(&id("shared-id"));
+        })
+        .await;
+        assert_eq!(current.last_seq.lock().unwrap().get("shared-id"), Some(&5));
+        assert!(current.resolved.lock().unwrap().is_empty());
+        assert_eq!(current.beat.load(Ordering::SeqCst), 0);
+        assert!(core.inbox.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_switch_rejects_open_and_returns_unsent_prompt_to_its_composer() {
+        let core = test_core();
+        core.clone()
+            .switch_computer("missing-computer".into())
+            .await;
+        let context = core.connection.lock().unwrap().clone();
+        context
+            .scope(async {
+                core.clone()
+                    .run(Command::OpenSession(id("old-computers-session")))
+                    .await;
+                core.clone()
+                    .run(Command::Compose(ComposeCommand::Submit {
+                        token: 71,
+                        target: Target::Session(id("old-computers-session")),
+                        deliver: Deliver::Prompt("must not be sent".into()),
+                        attachments: Vec::new(),
+                        delivery: None,
+                    }))
+                    .await;
+            })
+            .await;
+        assert!(!core.connected.load(Ordering::Acquire));
+        assert!(core.state().active.lock().unwrap().is_none());
+        let updates = core.inbox.take();
+        let batch = updates
+            .into_iter()
+            .find_map(|update| match update {
+                Update::Computer {
+                    computer, updates, ..
+                } if computer == "missing-computer" => Some(updates),
+                _ => None,
+            })
+            .expect("errors and receipts belong to the attempted computer");
+        assert!(batch.iter().any(|update| matches!(update, Update::SessionOpenFailed { asid, .. } if asid == "old-computers-session")));
+        assert!(batch.iter().any(|update| matches!(update, Update::Composer(value) if matches!(**value, ComposerUpdate::Submitted { token: 71, ok: false }))));
     }
 
     #[test]

@@ -13,15 +13,14 @@ pub const FRAME: f32 = 8.0;
 /// A pane's ceiling before the window is known; [`Fit`] brings it down.
 pub const UNBOUNDED: f32 = 4096.0;
 
-/// Side panes open and close quickly and stop dead: no overshoot, no long
-/// tail for the eye to follow. One spring moves both sides (`SplitView`), so
-/// the sidebar gets the same brisk slide.
+/// Side panes share an expressive slide. Keep their contents visible until
+/// the closing tail so the window visibly folds away instead of blinking out.
 pub fn motion() -> PaneMotion {
-    PaneMotion::new().spring(SPRING)
+    PaneMotion::new().spring(SPRING).fade_tail(0.3)
 }
 
 /// The spring [`motion`] moves the panes on, for what moves with them.
-pub const SPRING: Spring = Spring::new(0.15, 0.0);
+pub const SPRING: Spring = Spring::new(0.34, 0.08);
 
 /// The widest a right-hand pane may be in a window `window` points wide
 /// beside a sidebar `sidebar` points wide (0 when closed).

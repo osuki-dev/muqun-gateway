@@ -2,6 +2,45 @@
 
 ## Changes and fixes
 
+- **Clicking an inactive split composer focuses it immediately.** The first
+  click activates that session’s editor, so typing goes into the selected pane
+  and each session retains its own draft. Restart Desktop to load the fix; no
+  Gateway or App update is required.
+
+- **Desktop terminal input no longer waits behind a blocked output socket.**
+  The persistent daemon reads input independently while a slow renderer or
+  reattachment is receiving output/history. A real PTY regression reproduces
+  blocked input before the fix and verifies delivery without draining output.
+  Existing terminal daemons keep running their old code across UI restarts:
+  finish and close persistent terminal sessions before restarting that daemon
+  to load the fix. Do not kill a daemon with work still running. No Gateway
+  or App protocol change is needed.
+
+- **Linux candidates include their review plugin and installation assets.**
+  Package-owned extensions are separate from user extensions; upgrade and
+  uninstall preserve user plugins, settings and session data. Candidate archives
+  include source identity and checksums. This does not enable automatic release
+  publication or add macOS/Windows installers.
+
+- **Desktop workspace motion and controls are clearer.** Scrolling layout keeps
+  readable columns and brings the focused pane into view. Floating panes rise on
+  focus, follow pointer drags directly, and keep their titlebar and resize handle
+  inside the workspace. Directional focus follows the selected layout. Composer
+  and terminal focus no longer swallow the Alt workspace layout/zoom chords.
+  Terminal tabs share a compact numbered design with an active underline and
+  separate fixed actions. The composer uses a quieter focus border and separates
+  model controls from send actions in narrow panes. Restart Desktop; no Gateway
+  or App protocol change is required.
+
+- **Desktop keeps the selected computer connected across switches and restarts.**
+  Connection warnings follow the active computer, missed event bursts request
+  catch-up instead of stopping updates, and initial connections recover reads
+  made before the subscription was ready. Switching away releases the previous
+  idle socket. Startup restores the saved remote computer's connection.
+  Existing Gateway endpoints remain unchanged; restart Desktop to load the fix.
+  Local validation and the remaining paired-App gate are recorded in
+  `docs/desktop-acceptance.md`.
+
 - **Timeline shows real photos the same way the App does — via gateway
   `image_assets`.** Live upserts and snapshots run the in-process enrich that
   mirrors HTTP `attach_to_event` / `attach_to_items`. ByPath
@@ -1004,3 +1043,18 @@ list request that could delay or prevent interruption.
   capturing a refresh revision, preventing the first native refresh from
   conflicting with its own recovery event. Concurrent live updates still fence
   stale refreshes; local queue pressure or cancellation never resends a prompt.
+
+### Desktop window and extension workflow
+
+- Unified plugin Tile, Page and right Dock controls; maximizing restores the
+  original tile geometry or dock, and docking preserves neighbouring tiles.
+- File previews now use the same draggable/resizable workspace window. Settings
+  can send text/code directly to the configured editor, including embedded nvim.
+- Added a sidebar Plugins entry, per-surface launch actions, a custom Markdown
+  example and a GitHub Pull Requests & Issues plugin using the existing gh login.
+- Moved Bun plugin commands off the UI thread, bounded output and execution time,
+  and fixed relative plugin script paths.
+- Agent settings now show reported session usage/cost with coverage and explicit
+  unknown states; these figures are not account-wide billing or quota totals.
+- Theme-driven workspace/composer accents and App-inspired native startup motion
+  follow the selected theme and reduced-motion preferences.

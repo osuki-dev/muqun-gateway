@@ -444,7 +444,7 @@ impl UiState {
 
 /// The list row (its virtual key) holding item `item_id`, else the first
 /// holding a part of message `message_id`.
-fn locate(
+pub(super) fn locate(
     tl: &super::timeline::SessionTimeline,
     item_id: &str,
     message_id: &str,

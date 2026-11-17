@@ -23,17 +23,72 @@ update (a running Muqun keeps its old binary until it is reopened). `--no-build`
 `target/release` as it is; `PREFIX=/some/dir` installs somewhere else (`$PREFIX/bin`,
 `$PREFIX/share`). It also removes the `muqun.desktop` entry an older version of the script wrote.
 
+The installer includes Pull Requests & Issues under
+`$PREFIX/share/muqun-desktop/bundled-plugins/`. User extensions in the config/data
+`plugins/` directories take precedence and are preserved by upgrade and uninstall.
+The review plugin requires Bun and GitHub CLI with an existing login; Neovim is
+only required when selected as the external editor. No dependency is installed
+or account signed in automatically.
+
+To assemble a Linux candidate without publishing it:
+
+```sh
+bash desktop/scripts/package-linux.sh
+# After downloading and extracting a candidate archive:
+bash muqun-desktop-linux-x86_64/desktop/scripts/install-local.sh --no-build
+```
+
+The archive includes the binary, launcher, icons, bundled plugin, install/remove
+scripts, source identity and a separate SHA-256 checksum. A dirty source tree is
+explicitly marked as a local candidate. Compatibility follows the build host's
+system libraries; a successful local Arch build does not establish support for
+older distributions. CI candidates still require platform acceptance before
+publication. Windows packaging remains outside this preview scope.
+
 The launcher entry and icons come from `desktop/packaging/linux/`. The icons are generated from
 `assets/icons/app-icon.png` by `scripts/gen-linux-icons.sh` (ImageMagick) and committed, so
 installing needs no tools beyond `cargo`. The app id — Wayland `app_id`, X11 class, desktop file
 and icon name — is `muqun-desktop` everywhere (`src/branding.rs`).
 
-macOS and Windows build and run (`cargo run -p muqun-desktop --release`) but have no installer or
-bundle yet.
+On macOS, `bash desktop/scripts/package-macos.sh` creates an app bundle and ZIP.
+Set `MACOS_SIGN_IDENTITY` to use an existing Developer ID identity; otherwise the
+candidate is ad-hoc signed for local testing. Public distribution additionally
+requires notarization and stapling.
+
+Manually run **Desktop CI** with `notarize=true` to validate signing and
+notarization of its macOS artifact without publishing a release.
+
+The **Desktop preview** workflow builds, checks, signs and notarizes candidates.
+Its `publish` input defaults to false, so validation does not create a tag or
+release. Only an explicitly requested publication should set `publish=true`;
+it creates a separate Desktop prerelease and leaves Gateway's stable release alone.
 
 Linux needs a GPU stack wgpu can use (Vulkan, or GL through Mesa) and a session D-Bus for
 notifications, file dialogs and "Reveal in folder". For the fonts the UI looks for — Noto Sans CJK
 and JetBrains Mono Nerd Font (`src/platform/fonts.rs`) — missing ones fall back to the system's.
+
+## Release build
+
+Desktop candidate CI uses Rust 1.99.1, matching the validated Linux and macOS
+builds. Rust 1.100 currently fails to compile the locked async-stream activity
+stream; upgrading the compiler requires resolving that compatibility issue.
+
+Use `bash desktop/scripts/build-release.sh` for the same optimized build used by
+packaging and CI. It checks Zig 0.15.2 (including an existing mise install), selects
+the macOS SDK and preserves the portable CPU baseline. It does not install tools,
+change global toolchain settings, sign, publish or restart the app.
+
+The release profile uses optimization level 3, Thin LTO, one codegen unit and
+stripped symbols. Panic unwinding stays enabled because startup cleanup and
+extension/database isolation use `catch_unwind`. Do not use `target-cpu=native`
+for distributable builds, or pack the executable with UPX. Linux archives use
+maximum gzip compression; this reduces download size, not runtime memory.
+
+On the pre-change 74,093,656-byte Linux binary, gzip level 6 produced 33,891,016
+bytes and level 9 produced 33,747,542 bytes (about 140 KiB saved). This is a
+compression measurement only, not a claimed rendering/startup speed improvement.
+More aggressive LTO or size-oriented optimization needs repeatable startup,
+scrolling and terminal-throughput measurements before replacing these defaults.
 
 ## Run
 

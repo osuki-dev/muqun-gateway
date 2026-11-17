@@ -68,6 +68,7 @@ pub fn insert_image_pill(draft: &mut TextEdit, token: u64) -> usize {
 
 pub fn stage_png(s: &mut UiState, png: Vec<u8>) {
     let id = s.next_token;
+    s.pending_image_uploads.insert(id);
     s.next_token += 1;
     s.send(Command::Compose(ComposeCommand::Stage {
         id,
@@ -101,6 +102,7 @@ pub fn attach_dropped_files(s: &mut UiState, files: &[PathBuf]) {
         let token = s.next_token;
         stage_path(s, path.clone());
         if is_img {
+            s.pending_image_uploads.insert(token);
             attached_images += 1;
             let draft = if s.mode == super::Mode::Session {
                 &mut s.draft
@@ -472,6 +474,14 @@ pub(super) fn on_draft_change(s: &mut UiState, slot: Slot) {
         }
     }
 
+    let live: Vec<String> = draft_of(s, slot)
+        .pills()
+        .map(|(_, id)| id.to_owned())
+        .collect();
+    s.staged.retain(|file| {
+        file.draft_token
+            .is_none_or(|id| live.contains(&format!("image:{id}")))
+    });
     ensure_mention_pills(s, slot);
     s.persist_draft(slot);
 
@@ -588,6 +598,7 @@ pub(super) fn edit_queued(s: &mut UiState, id: &str, text: String) {
     for file in item.files {
         if !s.staged.iter().any(|f| f.path == file.path) {
             s.staged.push(crate::model::compose::StagedFile {
+                draft_token: None,
                 path: file.path,
                 name: file.name,
                 image: file.image,
@@ -692,7 +703,16 @@ fn staged_chip(s: &UiState, k: &Kit, i: usize, file: &crate::model::compose::Sta
         .label(format!("{} {}", tr_ref(language, "Remove"), file.name))
         .on_press(move |s: &mut UiState| {
             if i < s.staged.len() {
-                s.staged.remove(i);
+                let file = s.staged.remove(i);
+                if let Some(id) = file.draft_token {
+                    let slot = if s.mode == super::Mode::Session {
+                        Slot::Session
+                    } else {
+                        Slot::Start
+                    };
+                    remove_image_pill(draft_of_mut(s, slot), id);
+                    on_draft_change(s, slot);
+                }
             }
         })
         .build(k)
@@ -1803,6 +1823,7 @@ pub fn model_menu(
     k: &Kit,
     layer: &mut Vec<El>,
     kind: OpenMenu,
+    scope: &str,
     open: bool,
     label: String,
     models: &[(String, String, String)],
@@ -1813,8 +1834,9 @@ pub fn model_menu(
         OpenMenu::StartModel => "start-model",
         _ => "model",
     };
-    // Composers sit at the window's foot: their menus open upward.
-    let mut menu = Menu::new(key)
+    let key = format!("{key}-{scope}");
+    // Each split composer owns its anchor, including inactive previews.
+    let mut menu = Menu::new(&key)
         .placement(rune_kit::Placement::TopStart)
         .trigger(pill(k, &format!("{key}-pill"), label, open, kind))
         .open(open)
@@ -1936,6 +1958,7 @@ pub(super) fn mode_label(id: &str, catalog_name: Option<&str>) -> String {
 pub(super) fn effort_menu(
     k: &Kit,
     layer: &mut Vec<El>,
+    scope: &str,
     open: bool,
     current: Option<&str>,
     variants: &[String],
@@ -1943,7 +1966,8 @@ pub(super) fn effort_menu(
     let label = current
         .map(super::labels::readable_catalog_id)
         .unwrap_or_else(|| "Default".into());
-    let mut menu = Menu::new("effort")
+    let mut menu = Menu::new(format!("effort-{scope}"))
+        .placement(rune_kit::Placement::TopStart)
         .trigger(pill(k, "effort-pill", label, open, OpenMenu::Effort))
         .open(open)
         .min_width(160.0)
@@ -2053,6 +2077,12 @@ pub fn editor(
             if super::keymap::intercept_global_key(s, ev, tx) {
                 return true;
             }
+            if draft_of(s, slot).preedit().is_some() {
+                return false;
+            }
+            if popup_key(s, slot, ev) {
+                return true;
+            }
             if super::keymap::bind_matches_cfg(
                 super::keymap::entry(super::keymap::Action::Send),
                 &s.cfg.keymap,
@@ -2070,11 +2100,9 @@ pub fn editor(
                     s.error = None;
                     return true;
                 }
-                return popup_key(s, slot, ev)
-                    || newline_key(s, slot, ev)
-                    || super::keymap::field_key(s, ev, tx, false);
+                return newline_key(s, slot, ev) || super::keymap::field_key(s, ev, tx, false);
             }
-            if popup_key(s, Slot::Session, ev) || newline_key(s, slot, ev) {
+            if newline_key(s, slot, ev) {
                 return true;
             }
             if ev.key == rune::Key::Escape && s.composer_history_open {
@@ -2135,7 +2163,7 @@ pub fn editor(
         .w_full()
 }
 
-fn delivery_button(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+fn delivery_button(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     let language = s.cfg.general.language;
     let queue = s.composer_queue_delivery;
     let open = s.menu == Some(OpenMenu::ComposerDelivery);
@@ -2148,7 +2176,7 @@ fn delivery_button(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     } else {
         super::keymap::Action::Send
     };
-    let menu = Menu::new("composer-delivery-menu")
+    let menu = Menu::new(format!("composer-delivery-menu-{asid}"))
         .trigger(
             rune_kit::IconButton::new(k.glyph.chevron_down)
                 .variant(rune_kit::IconButtonVariant::GhostMuted)
@@ -2219,6 +2247,81 @@ fn delivery_button(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .child(menu.build(k, layer))
 }
 
+/// The same controls and metrics for focused and parked session composers.
+pub(super) fn session_footer(
+    s: &UiState,
+    k: &Kit,
+    layer: &mut Vec<El>,
+    asid: Option<&str>,
+    catalog: Option<&crate::hub::CatalogView>,
+    diff_stat: &crate::model::types::DiffStat,
+) -> El {
+    use super::composer_row as controls_row;
+    let language = s.cfg.general.language;
+    let busy = asid.is_some_and(|id| s.session_busy(id));
+    let inner = rune::memo::layout_with("composer-card", |r| r[2].round())
+        .map_or(f32::INFINITY, |w| w - controls_row::CARD_PAD - 24.0);
+    let room = (inner - if busy { 340.0 } else { 180.0 }).max(200.0);
+    let own_line = asid
+        .and_then(|id| controls_row::Controls::for_session(s, id, catalog))
+        .map(|c| {
+            controls_row::own_line(s, &c, k, layer, room)
+                .key("composer-controls")
+                .w_full()
+        });
+    let mut footer = row()
+        .key("composer-footer")
+        .w_full()
+        .min_w(0.0)
+        .min_h(36.0)
+        .gap(8.0)
+        .center_y()
+        .flex_wrap();
+    if let Some(controls) = own_line {
+        footer = footer.child(controls.w(0.0).grow(1.0).min_w(200.0));
+    }
+    if let Some(asid) = asid {
+        if crate::plugin::is_enabled("inspector", &s.cfg.plugins_disabled)
+            && s.session_by_id(asid)
+                .and_then(|info| info.directory.as_ref())
+                .and_then(|dir| s.branches.get(dir))
+                .and_then(|b| b.current.as_ref())
+                .is_none()
+        {
+            let label = if diff_stat.files > 0 {
+                format!("Git +{} −{}", diff_stat.added, diff_stat.removed)
+            } else {
+                "Git".into()
+            };
+            footer = footer.child(
+                Button::new(label)
+                    .variant(ButtonVariant::Neutral)
+                    .control_size(ControlSize::Small)
+                    .on_press(|s: &mut UiState| s.toggle_git_inspector())
+                    .build(k)
+                    .key("composer-git")
+                    .h(32.0)
+                    .radius(k.radius.lg),
+            );
+        }
+        let trigger = super::timeline::context_meter(s, k, asid).unwrap_or_else(|| {
+            let target = asid.to_string();
+            Button::new(tr_ref(language, "Context"))
+                .variant(ButtonVariant::Neutral)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut UiState| super::parts::context::open(s, &target))
+                .build(k)
+                .h(32.0)
+                .radius(k.radius.lg)
+        });
+        footer = footer.child(super::parts::context::popover(s, k, layer, asid, trigger));
+    }
+    if busy {
+        footer = footer.child(delivery_button(s, k, layer, asid.unwrap_or("none")));
+    }
+    footer
+}
+
 pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let look = s.look();
     let language = s.cfg.general.language;
@@ -2241,28 +2344,18 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     };
 
     // Measure the actual card so controls also fold inside split panes.
-    use super::composer_row::{self as controls_row, ACTION_GAP, CARD_PAD};
+    use super::composer_row::{ACTION_GAP, CARD_PAD};
     let inner = rune::memo::layout_with("composer-card", |r| r[2].round())
         .map_or(f32::INFINITY, |w| w - CARD_PAD - 24.0);
     let tools = row().gap(ACTION_GAP).center_y().child(attach);
-    let controls = controls_row::Controls::read(s);
-    let controls_room = if busy {
-        (inner - 160.0).max(200.0)
-    } else {
-        inner
-    };
-    let own_line = controls.as_ref().map(|c| {
-        controls_row::beside(s, c, k, layer, controls_room)
-            .unwrap_or_else(|| controls_row::own_line(s, c, k, layer, controls_room))
-            .key("composer-controls")
-            .w_full()
-    });
-    let mut actions = row()
-        .key("composer-actions")
-        .gap(ACTION_GAP)
-        .center_y()
-        .child(super::voice::mic_button(s, k));
-    if busy {
+    let mut actions = row().key("composer-actions").gap(ACTION_GAP).center_y();
+    if s.cfg.voice.usable() || s.voice.is_some() {
+        actions = actions.child(
+            super::voice::controls(s, k, inner - 110.0)
+                .unwrap_or_else(|| super::voice::mic_button(s, k)),
+        );
+    }
+    if busy && s.voice.is_none() {
         if let Some(asid) = s.selected.clone() {
             actions = actions.child(
                 Button::new(stop_label)
@@ -2320,8 +2413,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         k.c.bg_accent,
         if has_text && has_session { 0.9 } else { 0.0 },
     );
-    let delivery = busy.then(|| delivery_button(s, k, layer));
-    if !busy {
+    if !busy && s.voice.is_none() {
         actions = actions.child(send);
     }
 
@@ -2334,7 +2426,13 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
 
     popup(s, k, layer, Slot::Session);
     history_popup(s, k, layer, Slot::Session);
-    let mut card = body().key("composer-card");
+    let compact = s.in_split();
+    let mut card = if compact {
+        col().w_full().gap(4.0).px(16.0).pt(8.0).pb(8.0)
+    } else {
+        body()
+    }
+    .key("composer-card");
 
     if s.drop_hover {
         card = card.child(drop_hint(k, &look, language));
@@ -2344,14 +2442,57 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     } else {
         tr_ref(language, "Pick a session first")
     };
-    if let Some(dictation) = super::voice::strip(s, k) {
-        card = card.child(dictation);
-    }
-    card = card.child(editor(s, k, Slot::Session, placeholder, 2, 12));
+    let draft_editor = editor(
+        s,
+        k,
+        Slot::Session,
+        placeholder,
+        if compact { 1 } else { 2 },
+        12,
+    );
+    let draft_editor =
+        if let Some(voice) = s.voice.as_ref().filter(|v| !v.partial.trim().is_empty()) {
+            let mut preview = s.draft.text.clone();
+            if !preview.is_empty() && !preview.ends_with(char::is_whitespace) {
+                preview.push(' ');
+            }
+            preview.push_str(&voice.partial);
+            // The real draft determines height and stays untouched until final transcription.
+            el().key("voice-draft-preview")
+                .w_full()
+                .child(draft_editor.opacity(0.0))
+                .child(
+                    col()
+                        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                        .clip_soft(0.0)
+                        .scroll(rune::ScrollSpec { stick_bottom: true })
+                        .on_press(|_: &mut UiState| {})
+                        .child(text(preview).font(k.ty.body).color(k.c.text_base)),
+                )
+        } else {
+            draft_editor
+        };
+    card = card.child(draft_editor);
     card = card.child(actions.w_full());
 
     // Keep focus visible without competing with the message content.
     let card = composer_card(k, &look, card, focused, busy, s.drop_hover)
+        .on_hover_change(|s: &mut UiState, inside, _| {
+            if inside
+                && s.menu.is_none()
+                && s.row_menu.is_none()
+                && s.context_open.is_none()
+                && s.zoom.is_none()
+                && s.detail.is_none()
+                && !s.timeline_search.active
+                && s.tile_drag.is_none()
+                && s.tile_card_drag.is_none()
+                && s.draft.preedit().is_none()
+            {
+                s.draft.focused = true;
+                s.term.sink.focused = false;
+            }
+        })
         .on_drop_files(|s: &mut UiState, files, _| attach_dropped_files(s, files))
         .on_drop_hover(|s: &mut UiState, over, _| s.drop_hover = over);
 
@@ -2359,16 +2500,59 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     // a wide window, the whole width on a narrow one.
     let column = super::timeline::FEED_MAX_W;
     let mut deck = col().w_full().max_w(column).gap(8.0);
+    if let Some(asid) = s.selected.as_deref() {
+        let pending = super::parts::question::pending_forms(s, asid);
+        let permissions = s
+            .waiting_perms
+            .get(asid)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if !pending.is_empty() || !permissions.is_empty() {
+            let height = rune::memo::layout_with("main", |r| r[3] * 0.4)
+                .unwrap_or(320.0)
+                .clamp(140.0, 360.0);
+            deck = deck.child(
+                col()
+                    .key("pending-questions")
+                    .motion(look.focus_fade())
+                    .w_full()
+                    .max_h(height)
+                    .gap(8.0)
+                    .children(permissions.iter().map(|request| {
+                        super::parts::approval::permission_card(s, k, request)
+                            .key(format!("pending-permission-{}", request.id))
+                    }))
+                    .children(pending.into_iter().map(|form| {
+                        let card = super::parts::question::form_card(s, k, form)
+                            .key(format!("pending-question-{}", form.id));
+                        if look.motion {
+                            card.transition(
+                                rune::Transition::opacity()
+                                    .combined(rune::Transition::offset(0.0, 6.0)),
+                            )
+                            .motion(look.focus_fade())
+                        } else {
+                            card.motion(rune::Spring::NONE)
+                        }
+                    }))
+                    .scroll(rune::ScrollSpec {
+                        stick_bottom: false,
+                    })
+                    .scroll_bar(k),
+            );
+        }
+    }
     if let Some(chips) = chips(s, k, layer) {
         deck = deck.child(chips);
     }
-    let mut footer = row().w_full().min_w(0.0).gap(8.0).center_y().flex_wrap();
-    if let Some(controls) = own_line {
-        footer = footer.child(controls.w(0.0).grow(1.0).min_w(200.0));
-    }
-    if let Some(delivery) = delivery {
-        footer = footer.child(delivery);
-    }
+    let footer = session_footer(
+        s,
+        k,
+        layer,
+        s.selected.as_deref(),
+        s.catalog.as_deref(),
+        &s.diff_stat,
+    );
     deck = deck.child(card.w_full()).child(footer);
     col()
         .key("composer")
@@ -2518,7 +2702,11 @@ mod tests {
                 }
             };
             click(&mut rt, "composer-delivery-options");
-            click(&mut rt, &format!("composer-delivery-menu-item{item}"));
+            let asid = rt.state.selected.clone().unwrap();
+            click(
+                &mut rt,
+                &format!("composer-delivery-menu-{asid}-item{item}"),
+            );
             assert_eq!(rt.state.composer_queue_delivery, expected == "queue");
             while let Ok(command) = rx.try_recv() {
                 assert!(!matches!(
@@ -2538,7 +2726,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_send_setting_keeps_shift_enter_for_newlines() {
+    fn default_enter_send_keeps_shift_enter_for_newlines() {
         use rune::{Env, Key, KeyEvent, Mods, Runtime};
         for name in ["home", "session"] {
             let (tx, mut rx) = crate::ui::commands::channel();
@@ -2549,11 +2737,6 @@ mod tests {
                 .find(|(n, _)| *n == name)
                 .unwrap();
             scene(&mut state);
-            state
-                .cfg
-                .keymap
-                .bindings
-                .insert("send".into(), "enter".into());
             let slot = if name == "home" {
                 Slot::Start
             } else {
@@ -2842,3 +3025,60 @@ mod tests {
         assert!(chips(&s, &k, &mut layer).is_some());
     }
 }
+
+fn has_image_pill(draft: &TextEdit, id: u64) -> bool {
+    draft.pills().any(|(_, pill)| pill == format!("image:{id}"))
+}
+
+fn remove_image_pill(draft: &mut TextEdit, id: u64) {
+    let ranges: Vec<_> = draft
+        .pills()
+        .filter(|(_, pill)| *pill == format!("image:{id}"))
+        .map(|(range, _)| range)
+        .collect();
+    for range in ranges.into_iter().rev() {
+        draft.set_selection(range.start, range.end);
+        draft.insert("");
+    }
+}
+
+pub(super) fn finish_staging(
+    s: &mut UiState,
+    id: u64,
+    result: Result<crate::model::compose::StagedFile, String>,
+) {
+    let linked = s.pending_image_uploads.remove(&id);
+    let mut file = match result {
+        Ok(file) => file,
+        Err(err) => {
+            if linked {
+                remove_image_pill(&mut s.draft, id);
+                remove_image_pill(&mut s.start_draft, id);
+                for tile in &mut s.tiles {
+                    remove_image_pill(&mut tile.slot.draft, id);
+                }
+            }
+            s.toast_error("Attachment failed", Some(err));
+            return;
+        }
+    };
+    if !linked {
+        s.staged.push(file);
+        return;
+    }
+    file.draft_token = Some(id);
+    if has_image_pill(&s.draft, id) || has_image_pill(&s.start_draft, id) {
+        s.staged.push(file);
+    } else if let Some(tile) = s
+        .tiles
+        .iter_mut()
+        .find(|tile| has_image_pill(&tile.slot.draft, id))
+    {
+        tile.slot.staged.push(file);
+    }
+    // A removed pill cancels staging even if the upload finishes later.
+}
+
+#[cfg(test)]
+#[path = "composer_attachment_tests.rs"]
+mod attachment_tests;

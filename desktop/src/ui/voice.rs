@@ -4,7 +4,7 @@
 //! runs the composer shows a waveform -- a ribbon of bars scrolling at the
 //! display's rate, each a Gaussian blend of the levels around its moment,
 //! with an eased live edge -- and, in realtime mode, the words as the
-//! service hears them, fading in like subtitles. Done (or the shortcut
+//! service hears them in the draft area. Done (or the shortcut
 //! again) transcribes; the text lands in the draft and is never sent.
 //! Escape or Cancel throws the recording away.
 
@@ -12,10 +12,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::model::inbox::UiAction;
 
-use rune::{col, el, row, text, El, Spring, TextEdit, Transition, Tx};
+use rune::{col, el, row, text, El, TextEdit, Tx};
 use rune_kit::{
-    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, SegmentedControl,
-    TextInput,
+    ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, SegmentedControl, TextInput,
 };
 use tokio::sync::mpsc;
 
@@ -273,25 +272,29 @@ pub fn mic_button(s: &UiState, k: &Kit) -> El {
         Some(_) => tr(language, "Transcribing…"),
         None => tr(language, "Dictate"),
     };
-    IconButton::new(&MIC)
-        .control_size(rune_kit::ControlSize::ExtraLarge)
-        .variant(if recording.is_some() {
-            IconButtonVariant::Contrast
-        } else {
-            IconButtonVariant::Ghost
-        })
-        .label(label.clone())
-        .help(format!(
-            "{label} · {}",
-            crate::platform::keys::label("Primary+Shift+Space")
-        ))
-        .disabled(matches!(
-            recording,
-            Some(Phase::Starting | Phase::Transcribing)
-        ))
-        .on_press(|s: &mut UiState| s.toggle_voice())
-        .build(k)
-        .key("mic")
+    IconButton::new(if recording == Some(Phase::Recording) {
+        &rune_kit::glyphs::CHECK
+    } else {
+        &MIC
+    })
+    .control_size(rune_kit::ControlSize::ExtraLarge)
+    .variant(if recording.is_some() {
+        IconButtonVariant::Contrast
+    } else {
+        IconButtonVariant::Ghost
+    })
+    .label(label.clone())
+    .help(format!(
+        "{label} · {}",
+        super::keymap::label_with(super::keymap::Action::Dictation, Some(&s.cfg.keymap))
+    ))
+    .disabled(matches!(
+        recording,
+        Some(Phase::Starting | Phase::Transcribing)
+    ))
+    .on_press(|s: &mut UiState| s.toggle_voice())
+    .build(k)
+    .key("mic")
 }
 
 const WAVE_H: f32 = 34.0;
@@ -299,7 +302,8 @@ const BAR_W: f32 = 3.0;
 const BAR_GAP: f32 = 3.0;
 /// Seconds per bar slot: the ribbon moves 6 pt every 1/14 s (84 pt/s).
 const SLOT: f64 = 1.0 / 14.0;
-const BARS: usize = 120;
+// The inline ribbon is at most 180 points wide; do not build off-screen bars.
+const BARS: usize = 32;
 
 /// The waveform ribbon: bars on a fixed time grid scroll left continuously;
 /// each is the Gaussian-blended level around its slot; the newest eases.
@@ -343,47 +347,8 @@ fn waveform(k: &Kit, v: &Dictation) -> El {
     wave
 }
 
-/// The realtime preview as words that fade in as they arrive; CJK text has
-/// no spaces, so each character is a word.
-fn subtitles(k: &Kit, partial: &str, motion: bool) -> El {
-    let mut words: Vec<String> = Vec::new();
-    for piece in partial.split_inclusive(char::is_whitespace) {
-        let mut current = String::new();
-        for c in piece.chars() {
-            let cjk = matches!(c as u32, 0x3000..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF);
-            if cjk {
-                if !current.is_empty() {
-                    words.push(std::mem::take(&mut current));
-                }
-                words.push(c.to_string());
-            } else {
-                current.push(c);
-            }
-        }
-        if !current.is_empty() {
-            words.push(current);
-        }
-    }
-    // The last two lines' worth; older words have already been read.
-    let skip = words.len().saturating_sub(48);
-    let mut line = row().key("voice-words").w_full().flex_wrap().items_end();
-    for (i, word) in words.iter().enumerate().skip(skip) {
-        let mut w = text(word.clone())
-            .key(format!("w{i}"))
-            .font(k.ty.body)
-            .color(k.c.text_base);
-        if motion {
-            w = w
-                .transition(Transition::opacity().combined(Transition::offset(0.0, 6.0)))
-                .motion(Spring::new(0.35, 0.2));
-        }
-        line = line.child(w);
-    }
-    line
-}
-
-/// What the composer shows while dictating, above the draft.
-pub fn strip(s: &UiState, k: &Kit) -> Option<El> {
+/// Recording stays in the microphone's action row; it never adds draft rows.
+pub fn controls(s: &UiState, k: &Kit, room: f32) -> Option<El> {
     let v = s.voice.as_ref()?;
     let language = s.cfg.general.language;
     let secs = v.meter.now() as u64;
@@ -392,81 +357,51 @@ pub fn strip(s: &UiState, k: &Kit) -> Option<El> {
         Phase::Recording => format!("{}:{:02}", secs / 60, secs % 60),
         Phase::Transcribing => tr(language, "Transcribing…"),
     };
-    let dot =
-        el().key("voice-dot")
-            .size(8.0, 8.0)
-            .radius(4.0)
-            .fill(if v.phase == Phase::Recording {
-                k.c.danger.icon
-            } else {
-                k.c.icon_faint
-            });
+    let dot = el()
+        .key("voice-dot")
+        .size(8.0, 8.0)
+        .radius(4.0)
+        .fill(k.c.danger.icon);
     let dot = if v.phase == Phase::Recording {
         s.look().pulse(dot)
     } else {
         dot
     };
-    let mut head = row()
-        .key("voice-head")
-        .w_full()
-        .gap(10.0)
+    let mut controls = row()
+        .key("voice-controls")
+        .h(36.0)
+        .gap(8.0)
         .center_y()
         .child(dot)
+        .child(text(status).font(k.ty.small_medium).color(k.c.text_muted))
         .child(
-            text(status)
-                .font(k.ty.small_medium)
-                .color(k.c.text_muted)
-                .min_w(44.0),
-        )
-        .child(
-            row()
-                .key("voice-wave-box")
-                .grow(1.0)
-                .shrink()
-                .min_w(0.0)
+            el().key("voice-wave-box")
+                .w((room - 160.0).clamp(24.0, 180.0))
+                .h(34.0)
+                .clip_soft(0.0)
                 .child(waveform(k, v)),
         )
         .child(
-            Button::new(tr_ref(language, "Cancel"))
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Small)
-                .shortcut("Escape")
+            IconButton::new(k.glyph.close)
+                .label(tr_ref(language, "Cancel dictation"))
+                .help(format!(
+                    "{} · {}",
+                    tr_ref(language, "Cancel dictation"),
+                    super::keymap::label_with(
+                        super::keymap::Action::CancelDictation,
+                        Some(&s.cfg.keymap)
+                    )
+                ))
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Large)
                 .on_press(|s: &mut UiState| s.cancel_voice())
                 .build(k)
                 .key("voice-cancel"),
         );
     if v.phase == Phase::Recording {
-        head = head.child(
-            Button::new(tr_ref(language, "Done"))
-                .variant(ButtonVariant::Submit)
-                .control_size(ControlSize::Small)
-                .on_press(|s: &mut UiState| s.finish_voice())
-                .build(k)
-                .key("voice-done"),
-        );
+        controls = controls.child(mic_button(s, k));
     }
-    let mut strip = col()
-        .key("voice-strip")
-        .w_full()
-        .gap(8.0)
-        .px(4.0)
-        .py(4.0)
-        .child(head);
-    if v.mode == VoiceMode::Realtime {
-        let words = if v.partial.trim().is_empty() {
-            text(match v.phase {
-                Phase::Starting => tr(language, "Connecting…"),
-                _ => tr(language, "Listening…"),
-            })
-            .key("voice-words")
-            .font(k.ty.body)
-            .color(k.c.text_faint)
-        } else {
-            subtitles(k, &v.partial, !s.cfg.appearance.reduced_motion)
-        };
-        strip = strip.child(words);
-    }
-    Some(strip)
+    Some(controls)
 }
 
 // ---- Settings → Voice --------------------------------------------------------------

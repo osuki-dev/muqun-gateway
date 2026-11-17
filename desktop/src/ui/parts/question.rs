@@ -16,18 +16,24 @@ use crate::ui::UiState;
 const QUESTION_MAX: usize = 6;
 const OPTION_MAX: usize = 8;
 
-/// The pending form this session is waiting on that no `Form` row of the
-/// timeline shows already: the answer to a live question card.
-fn unshown_form<'a>(cx: &Tcx<'a>) -> Option<&'a FormRequest> {
-    let forms = cx.s.waiting_forms.get(cx.asid)?;
-    let tl = cx.tl();
-    forms.iter().find(|f| {
-        !tl.is_some_and(|t| {
-            t.items.iter().any(|i| {
-                matches!(&i.part, muqun_gateway::agents::AgentPart::Form { request } if request.id == f.id)
+/// Pending questions may arrive as events without a timeline Form item.
+/// Keep those visible above the composer, independent of tool folding/state.
+pub fn pending_forms<'a>(s: &'a UiState, asid: &str) -> Vec<&'a FormRequest> {
+    let Some(forms) = s.waiting_forms.get(asid) else {
+        return Vec::new();
+    };
+    let timeline = s.timelines.get(asid);
+    forms
+        .iter()
+        .filter(|form| {
+            !timeline.is_some_and(|t| {
+                t.items.iter().any(|item| {
+                    matches!(&item.part,
+            muqun_gateway::agents::AgentPart::Form { request } if request.id == form.id)
+                })
             })
         })
-    })
+        .collect()
 }
 
 /// A `question` tool call: live, the form to answer it; answered, the
@@ -44,11 +50,6 @@ pub fn question_card(
     let answers = tv::question_answers(call);
     card.accent = Some(cx.k.c.info.icon);
     if tv::pending(call.state) && !cx.stopped() {
-        if let Some(form) = unshown_form(cx) {
-            card.preview = Some(form_fields(cx.s, cx.k, form, true));
-            card.attention = true;
-            return;
-        }
         card.open_default = true;
     }
     if questions.is_empty() {

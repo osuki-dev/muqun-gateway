@@ -107,6 +107,10 @@ pub struct SessionTimeline {
     pub rev: u64,
     /// The list's rows: items, and runs of tool activity folded together.
     pub blocks: Vec<Block>,
+    /// Commands exposed while running keep their row until the turn ends.
+    /// Otherwise each completion merges adjacent groups and removes visible rows.
+    live_commands: HashSet<String>,
+    row_keys: Vec<String>,
     /// The row the keyboard is on (an item id, or a group's key).
     pub selected: Option<String>,
     /// The reader scrolled up off the bottom: the list stopped following it
@@ -129,6 +133,7 @@ impl SessionTimeline {
         let started = std::time::Instant::now();
         let keep: HashSet<&str> = items.iter().map(|i| i.id.as_str()).collect();
         self.diffs.retain(|id, _| keep.contains(id.as_str()));
+        self.live_commands.retain(|id| keep.contains(id.as_str()));
         for item in &items {
             self.ingest(item);
         }
@@ -182,12 +187,45 @@ impl SessionTimeline {
 
     /// Fold the rows again, after the list changed.
     fn regroup(&mut self) {
-        self.blocks = activity::blocks(&self.items);
-        self.rev += 1;
+        self.blocks = activity::blocks(&self.items, |id| self.live_commands.contains(id));
+        let same_keys = self.blocks.len() == self.row_keys.len()
+            && self
+                .blocks
+                .iter()
+                .zip(&self.row_keys)
+                .all(|(block, key)| match *block {
+                    Block::Item(i) => key == &self.items[i].id,
+                    Block::Group { start, .. } => {
+                        key.strip_prefix("grp-") == Some(self.items[start].id.as_str())
+                    }
+                });
+        // Rune's version caches keys, not row contents or measurements. Updating
+        // output must repaint the row without rescanning the whole list's keys.
+        if !same_keys {
+            self.row_keys = self
+                .blocks
+                .iter()
+                .map(|block| match *block {
+                    Block::Item(i) => self.items[i].id.clone(),
+                    Block::Group { start, .. } => group_key(&self.items[start]),
+                })
+                .collect();
+            self.rev += 1;
+        }
+    }
+
+    /// Once a turn settles, compact its activity once, and release its row pins.
+    pub fn settle_activity(&mut self) {
+        if self.live_commands.is_empty() {
+            return;
+        }
+        self.live_commands.clear();
+        self.regroup();
     }
 
     pub fn remove(&mut self, ids: &[String]) {
         self.items.retain(|t| !ids.contains(&t.id));
+        self.live_commands.retain(|id| !ids.contains(id));
         self.regroup();
         for id in ids {
             self.diffs.remove(id);
@@ -214,6 +252,9 @@ impl SessionTimeline {
 
     /// Parse the item's change (a diff part, an edit's files) once, for drawing.
     fn ingest(&mut self, item: &TimelineItem) {
+        if activity::running(item) && activity::family(item) == Some(activity::Family::Run) {
+            self.live_commands.insert(item.id.clone());
+        }
         match parts::files::diff_source(item) {
             None => {
                 self.diffs.remove(&item.id);
@@ -373,6 +414,35 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
     let Some(tl) = s.timelines.get(asid) else {
         // Opened, its history not read yet.
         let language = s.cfg.general.language;
+        if let Some(message) = s.session_open_errors.get(asid) {
+            let retry_asid = asid.to_string();
+            return col().key(key).w_full().grow(1.0).min_h(0.0).center().child(
+                col()
+                    .max_w(420.0)
+                    .gap(12.0)
+                    .items_center()
+                    .child(
+                        text(
+                            super::i18n::lookup(language, message)
+                                .unwrap_or(message)
+                                .to_string(),
+                        )
+                        .font(k.ty.ui)
+                        .color(k.c.text_muted)
+                        .wrap()
+                        .align(rune::Align::Center),
+                    )
+                    .child(
+                        Button::new(tr_ref(language, "Retry"))
+                            .control_size(ControlSize::Small)
+                            .variant(ButtonVariant::Neutral)
+                            .on_press(move |s: &mut UiState| {
+                                s.retry_open_session(&retry_asid);
+                            })
+                            .build(k),
+                    ),
+            );
+        }
         return col().key(key).w_full().grow(1.0).min_h(0.0).center().child(
             row()
                 .gap(8.0)
@@ -775,24 +845,32 @@ fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
                 .build(k)
                 .key(format!("copy-{}", copy_id)),
         )
-        .child(
-            IconButton::new(&super::icons::FORK)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(cx.t("Fork from here"))
-                .on_press(move |s: &mut UiState| {
-                    s.send(Command::ForkSession {
-                        asid: asid.clone(),
-                        message_id: Some(fork_id.clone()),
+        .children(
+            (!fork_id.is_empty() && cx.s.can_fork_from_message(cx.asid)).then(|| {
+                IconButton::new(&super::icons::FORK)
+                    .variant(IconButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
+                    .label(cx.t("Fork from here"))
+                    .on_press(move |s: &mut UiState| {
+                        if s.can_fork_from_message(&asid.0) {
+                            s.send(Command::ForkSession {
+                                asid: asid.clone(),
+                                message_id: Some(fork_id.clone()),
+                            });
+                        }
                     })
-                })
-                .build(k)
-                .key(format!("fork-{}", it.id)),
+                    .build(k)
+                    .key(format!("fork-{}", it.id))
+            }),
         );
     k.elevate(chip, &k.elevation.floating)
 }
 
 fn item_row(cx: &Tcx, it: &TimelineItem) -> El {
+    let cx = &Tcx {
+        item_id: Some(&it.id),
+        ..*cx
+    };
     let is_text = matches!(it.part, AgentPart::Text { .. });
     let user_text = it.role == TimelineRole::User && is_text;
     let mut wrap = col().key(format!("item-{}", it.id)).w_full().gap(4.0);
@@ -856,9 +934,7 @@ fn item_row(cx: &Tcx, it: &TimelineItem) -> El {
 /// What the timeline draws over the window: an opened picture, else a
 /// subagent's detail sheet, else the context sheet.
 pub fn overlay(s: &UiState, k: &Kit) -> Option<El> {
-    parts::images::zoom_overlay(s, k)
-        .or_else(|| parts::detail::sheet(s, k))
-        .or_else(|| parts::context::sheet(s, k))
+    parts::images::zoom_overlay(s, k).or_else(|| parts::detail::sheet(s, k))
 }
 
 /// The right-hand detail pane, while a row is open in it.
@@ -1367,6 +1443,92 @@ mod tests {
         tl.flip("c");
         tl.replace(vec![text_item("c")]);
         assert!(tl.is_open("c", false));
+    }
+
+    #[test]
+    fn streaming_command_keeps_its_row_until_the_turn_finishes() {
+        use crate::model::inbox::Update;
+        use muqun_gateway::agents::AgentDomainEvent;
+        use serde_json::json;
+
+        let tool = |id: &str, state: &str, output: &str| -> TimelineItem {
+            serde_json::from_value(json!({
+                "id": id, "message_id": id, "role": "assistant", "seq": 0,
+                "updated_ms": 0, "ordinal": 0,
+                "part": { "type": "tool", "id": id, "name": "bash",
+                    "input": {"command": "cargo check"}, "output": output,
+                    "state": state, "status": state }
+            }))
+            .unwrap()
+        };
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.sessions.push(
+            serde_json::from_value(json!({
+                "asid": "commands", "agent_id": "codex", "title": "",
+                "status": "busy", "updated_ms": 1u64
+            }))
+            .unwrap(),
+        );
+        let mut tl = SessionTimeline::default();
+        let mut rows = vec![
+            tool("before-1", "completed", ""),
+            tool("before-2", "completed", ""),
+            tool("live", "running", "checking"),
+            tool("after-1", "completed", ""),
+            tool("after-2", "completed", ""),
+        ];
+        tl.replace(rows.clone());
+        let blocks = tl.blocks.clone();
+        let rev = tl.rev;
+        tl.flip("live");
+        for state in ["running", "completed"] {
+            rows[2] = tool("live", state, "finished output");
+            tl.upsert(vec![rows[2].clone()]);
+            assert_eq!(
+                tl.blocks, blocks,
+                "streaming and completion preserve neighbouring groups"
+            );
+            assert_eq!(tl.rev, rev);
+            assert_eq!(tl.items[2], rows[2], "contents still update");
+        }
+        // A reconnect's snapshot must not undo that stability either.
+        tl.replace(rows);
+        assert_eq!(tl.blocks, blocks);
+        assert_eq!(tl.rev, rev);
+        assert!(tl.is_open("live", false));
+        s.timelines.insert("commands".into(), tl);
+        for status in [
+            AgentSessionStatus::Busy,
+            AgentSessionStatus::Unknown,
+            AgentSessionStatus::Retry,
+        ] {
+            s.apply_updates(vec![Update::event(AgentDomainEvent::StatusChanged {
+                asid: AgentSessionId("commands".into()),
+                status,
+                error: None,
+                seq: 1,
+            })]);
+            assert_eq!(s.timelines["commands"].blocks, blocks);
+            assert_eq!(s.timelines["commands"].rev, rev);
+        }
+        s.apply_updates(vec![Update::event(AgentDomainEvent::StatusChanged {
+            asid: AgentSessionId("commands".into()),
+            status: AgentSessionStatus::Idle,
+            error: None,
+            seq: 1,
+        })]);
+        let tl = &s.timelines["commands"];
+        assert_eq!(tl.blocks, [Block::Group { start: 0, end: 5 }]);
+        assert!(
+            tl.live_commands.is_empty(),
+            "pins are released after the turn"
+        );
+        assert!(tl.rev > rev);
+        assert!(
+            tl.is_open("live", false),
+            "the expanded call survives inside its group"
+        );
     }
 
     #[test]

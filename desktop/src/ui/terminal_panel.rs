@@ -3109,7 +3109,7 @@ mod tests {
             key,
             mods: Mods {
                 shift,
-                cmd: ctrl,
+                cmd: ctrl && !crate::platform::is_macos(),
                 alt: false,
                 ctrl,
                 logo: false,
@@ -3173,7 +3173,10 @@ mod tests {
         for _ in 0..3 {
             rt.frame(1.0 / 60.0);
         }
-        rt.key(key(Key::Command('h'), true, true));
+        let mut home = key(Key::Command('h'), !crate::platform::is_macos(), true);
+        home.mods.cmd = true;
+        home.mods.logo = crate::platform::is_macos();
+        rt.key(home);
         rt.frame(1.0 / 60.0);
         let s = &rt.state;
         assert_eq!(s.mode, super::super::Mode::Home);
@@ -3430,7 +3433,7 @@ mod tests {
             key: Key::Tab,
             mods: Mods {
                 shift: false,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 alt: false,
                 ctrl: true,
                 logo: false,
@@ -3444,7 +3447,7 @@ mod tests {
             key: Key::Tab,
             mods: Mods {
                 shift: true,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 alt: false,
                 ctrl: true,
                 logo: false,
@@ -3458,7 +3461,7 @@ mod tests {
             key: Key::PageUp,
             mods: Mods {
                 shift: false,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 alt: false,
                 ctrl: true,
                 logo: false,
@@ -3472,7 +3475,7 @@ mod tests {
             key: Key::PageDown,
             mods: Mods {
                 shift: false,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 alt: false,
                 ctrl: true,
                 logo: false,
@@ -4099,8 +4102,8 @@ mod tests {
                 shift: false,
                 cmd: true,
                 alt: false,
-                ctrl: true,
-                logo: false,
+                ctrl: !crate::platform::is_macos(),
+                logo: crate::platform::is_macos(),
             },
         };
         assert!(rt.state.term.open && rt.state.term.sink.focused);

@@ -117,6 +117,7 @@ fn main() -> anyhow::Result<()> {
             while rx.blocking_recv().is_some() {}
         });
     } else {
+        theme::omarchy::watch(inbox.clone(), store.clone());
         start_core(
             settings,
             state_dir.clone(),
@@ -128,7 +129,13 @@ fn main() -> anyhow::Result<()> {
     commands::send(&tx, Command::Refresh);
     let _ = theme::install(&config_dir, &state_dir, &config.appearance);
 
-    ui::seed_config(config.clone());
+    let mut ui_config = config.clone();
+    if config.appearance.theme_id == theme::omarchy::ID {
+        if let Some((_, scheme)) = theme::apply::current_choice() {
+            ui_config.appearance.scheme = scheme;
+        }
+    }
+    ui::seed_config(ui_config);
     let geometry = config.window.clamped();
 
     rune::set_app_id(branding::APP_ID);
@@ -160,10 +167,7 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
-    #[cfg(target_os = "macos")]
-    let app = app
-        .titlebar(rune::Titlebar::new(64.0))
-        .macos_window(rune::MacWindowOptions::default().shadow(false));
+    let app = platform::configure_window(app);
 
     let handle = app.handle();
     // SIGTERM / SIGINT quit through the event loop, as the tray's Quit does,
@@ -288,9 +292,9 @@ fn start_core(
         .name("muqun-core-main".into())
         .spawn(move || {
             runtime.block_on(async move {
-                let hub = select_hub(settings, &state_dir, &store.get()).await;
+                let (hub, connected) = select_hub(settings, &state_dir, &store.get()).await;
                 let dynamic_hub = hub::DynamicHub::new(hub);
-                projection::spawn(dynamic_hub, inbox, store, commands);
+                projection::spawn(dynamic_hub, inbox, store, commands, connected);
                 std::future::pending::<()>().await;
             });
         })?;
@@ -301,17 +305,22 @@ async fn select_hub(
     settings: RuntimeSettings,
     state_dir: &std::path::Path,
     config: &DesktopConfig,
-) -> Arc<dyn hub::SessionHub> {
+) -> (Arc<dyn hub::SessionHub>, bool) {
     // The sidebar restores this computer too. Restore its actual connection
     // before issuing any reads or prompts, including when it is offline.
-    if let Some(remote) = configured_remote_hub(config) {
-        return remote;
-    }
+    let connected = match configured_remote_hub(config) {
+        Ok(Some(remote)) => return (remote, true),
+        Ok(None) => true,
+        Err(err) => {
+            tracing::warn!(%err, "saved computer connection is invalid; waiting for reconnection");
+            false
+        }
+    };
     if let Some(gateway) = hub::discover_local_gateway().await {
         match hub::RemoteHub::start(gateway.clone()) {
             Ok(remote) => {
                 tracing::info!("hub: local gateway at {}", gateway.url);
-                return remote;
+                return (remote, connected);
             }
             Err(err) => tracing::warn!("local gateway found but unusable: {err:#}"),
         }
@@ -322,31 +331,77 @@ async fn select_hub(
         tracing::warn!("the session store is unavailable, routes are not kept: {err:#}");
     }
     agents.spawn_supervisor();
-    Arc::new(hub::LocalHub::new(agents))
+    (Arc::new(hub::LocalHub::new(agents)), connected)
 }
 
-fn configured_remote_hub(config: &DesktopConfig) -> Option<Arc<dyn hub::SessionHub>> {
+fn configured_remote_hub(
+    config: &DesktopConfig,
+) -> anyhow::Result<Option<Arc<dyn hub::SessionHub>>> {
     if matches!(
         config.current_computer.as_str(),
         "" | "local" | "self" | "all"
     ) {
-        return None;
+        return Ok(None);
     }
-    let profile = config.computers.get(&config.current_computer)?;
+    let profile = config
+        .computers
+        .get(&config.current_computer)
+        .ok_or_else(|| anyhow::anyhow!("saved computer has no profile"))?;
+    let url = profile
+        .url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("saved computer has no URL"))?;
+    let parsed = reqwest::Url::parse(url)?;
+    anyhow::ensure!(
+        matches!(parsed.scheme(), "http" | "https"),
+        "saved computer URL must use HTTP or HTTPS"
+    );
+    let token = profile
+        .token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("saved computer is not paired"))?;
     let remote = hub::RemoteHub::start(hub::LocalGateway {
-        url: profile.url.clone()?,
-        token: profile.token.clone()?,
+        url: url.to_owned(),
+        token: token.to_owned(),
         device_id: profile.device_id.clone(),
         transport_key: profile.transport_key.clone(),
     });
     match remote {
         Ok(remote) => {
             tracing::info!(computer = %config.current_computer, "hub: restored remote computer");
-            Some(remote)
+            Ok(Some(remote))
         }
-        Err(err) => {
-            tracing::warn!(%err, "saved computer connection is invalid");
-            None
-        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_saved_remote_is_an_error_not_a_local_selection() {
+        let mut config = DesktopConfig {
+            current_computer: "mini".into(),
+            ..Default::default()
+        };
+        assert!(configured_remote_hub(&config).is_err());
+        config.computers.insert(
+            "mini".into(),
+            config::ComputerProfile {
+                url: Some("http://127.0.0.1:9".into()),
+                token: Some(" ".into()),
+                ..Default::default()
+            },
+        );
+        assert!(configured_remote_hub(&config).is_err());
+        let profile = config.computers.get_mut("mini").unwrap();
+        profile.token = Some("fixture".into());
+        profile.url = Some("file:///tmp/wrong".into());
+        assert!(configured_remote_hub(&config).is_err());
+        config.current_computer = "local".into();
+        assert!(configured_remote_hub(&config).unwrap().is_none());
     }
 }

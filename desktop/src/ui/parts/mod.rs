@@ -27,6 +27,7 @@ use super::UiState;
 use crate::config::Language;
 
 /// What every part builder needs: the state, the kit, and whose timeline.
+#[derive(Clone, Copy)]
 pub struct Tcx<'a> {
     pub s: &'a UiState,
     pub k: &'a Kit,
@@ -35,6 +36,7 @@ pub struct Tcx<'a> {
     /// Drawing into the detail pane (everything a call has), not the
     /// timeline's dense rows.
     pub pane: bool,
+    pub item_id: Option<&'a str>,
     /// The timeline is a narrow column: rows drop their secondary words.
     pub narrow: bool,
 }
@@ -47,6 +49,7 @@ impl<'a> Tcx<'a> {
             asid,
             lang: s.cfg.general.language,
             pane: false,
+            item_id: None,
             narrow: false,
         }
     }
@@ -108,6 +111,10 @@ pub fn flip(asid: &str, id: &str) -> impl Fn(&mut UiState) + 'static {
 
 /// The body of one timeline item.
 pub fn part(cx: &Tcx, item: &TimelineItem) -> El {
+    let cx = &Tcx {
+        item_id: Some(&item.id),
+        ..*cx
+    };
     match &item.part {
         AgentPart::Tool(call) => tool::card(cx, item, call),
         AgentPart::Approval { request } => approval::permission_card(cx.s, cx.k, request),
@@ -152,7 +159,27 @@ pub fn mono(cx: &Tcx, key: &str, body: &str, max_lines: usize) -> El {
             .fill(cx.k.c.layer_01);
     }
     let mut block = block.child(
-        text(shown)
+        text(shown.clone())
+            .text_highlights(
+                rune_kit::search::Fold::default()
+                    .find(&shown, search_query(cx))
+                    .into_iter()
+                    .map(|range| {
+                        let mark = rune::TextHighlight::new(
+                            range,
+                            cx.k.c.bg_accent.alpha(if current_search_item(cx) {
+                                0.45
+                            } else {
+                                0.25
+                            }),
+                        );
+                        if current_search_item(cx) {
+                            mark.ring(cx.k.c.text_accent, 1.0)
+                        } else {
+                            mark
+                        }
+                    }),
+            )
             .font(cx.k.ty.mono)
             .color(cx.k.c.text_muted)
             .wrap_anywhere()
@@ -179,6 +206,7 @@ pub fn code(cx: &Tcx, key: &str, body: &str, language: Option<&str>, max_lines: 
     let mut block = col().key(key.to_string()).w_full().gap(4.0).child(
         // The card's body is the surface; the code draws no box of its own.
         Markdown::new(&src)
+            .highlights(search_highlights(cx, &src))
             .selectable(true)
             .style(MarkdownStyle::from_kit(cx.k).code_block(
                 cx.k.alpha(cx.k.c.layer_01, 0.0),
@@ -194,7 +222,7 @@ pub fn code(cx: &Tcx, key: &str, body: &str, language: Option<&str>, max_lines: 
 
 /// Open a URL or file path clicked from a Markdown link.
 /// - Web and mailto URLs (`http://`, `https://`, `mailto:`) open in the default external application.
-/// - Local file URLs (`file://...`) or workspace file paths open in the built-in file viewer.
+/// - Local files open in the built-in viewer; directories open in the system file manager.
 pub fn open_markdown_link(s: &mut UiState, url: &str, tx: &mut rune::Tx) {
     let url = url.trim();
     if url.is_empty() {
@@ -266,10 +294,52 @@ fn prose_accents(
     ranges
 }
 
+fn search_query<'a>(cx: &'a Tcx) -> &'a str {
+    if cx.s.timeline_search.active && cx.s.selected.as_deref() == Some(cx.asid) {
+        cx.s.timeline_search.query.text.trim()
+    } else {
+        ""
+    }
+}
+
+fn current_search_item(cx: &Tcx) -> bool {
+    cx.item_id.is_some_and(|id| {
+        cx.s.timeline_search
+            .matches
+            .get(cx.s.timeline_search.active_index)
+            .is_some_and(|current| current == id)
+    })
+}
+
+fn search_highlights(
+    cx: &Tcx,
+    body: &str,
+) -> Vec<(Vec<std::ops::Range<usize>>, rune_kit::markdown::Highlight)> {
+    use rune_kit::markdown::{Case, Highlight};
+    let query = search_query(cx);
+    if query.is_empty() {
+        return Vec::new();
+    }
+    rune_kit::markdown::find(body, query, Case::Folded(Default::default()))
+        .into_iter()
+        .map(|ranges| {
+            (
+                ranges,
+                Highlight::new().current_match(current_search_item(cx)),
+            )
+        })
+        .collect()
+}
+
 /// Prose an agent wrote, as Markdown.
 pub fn prose(cx: &Tcx, key: &str, body: &str) -> El {
+    let mut highlights: Vec<_> = prose_accents(body, cx.k)
+        .into_iter()
+        .map(|(range, paint)| (vec![range], paint))
+        .collect();
+    highlights.extend(search_highlights(cx, body));
     Markdown::new(body)
-        .highlights(prose_accents(body, cx.k))
+        .highlights(highlights)
         .style(message_style(cx.k))
         .selectable(true)
         .on_link_tx(|s: &mut UiState, url: &str, tx: &mut rune::Tx| {
@@ -965,13 +1035,48 @@ pub fn plate(k: &Kit, key: String) -> El {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn file_urls_strip_scheme_and_fragments() {
-        let raw = "file:///path/to/file.rs#L10-L25";
-        let target = raw.strip_prefix("file://").unwrap_or(raw);
-        let path = target.split('#').next().unwrap_or(target);
-        assert_eq!(path, "/path/to/file.rs");
+    fn session_search_marks_rendered_text_and_clears_when_closed() {
+        use super::*;
+        use serde_json::json;
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.selected = Some("a".into());
+        s.timeline_search.active = true;
+        s.timeline_search.query = rune::TextEdit::new("中文 api");
+        let body = "中文 **API** and [link](https://hidden.example)";
+        let item: TimelineItem = serde_json::from_value(json!({
+            "id":"m", "message_id":"m", "role":"assistant", "seq":0,
+            "updated_ms":0, "ordinal":0, "part":{"type":"text", "text":body}
+        }))
+        .unwrap();
+        let mut timeline = SessionTimeline::default();
+        timeline.replace(vec![item]);
+        s.timelines.insert("a".into(), timeline);
+        s.update_timeline_search_matches("a");
+        assert_eq!(s.timeline_search.matches, ["m"]);
+        let k = Kit::neutral(true);
+        let cx = Tcx {
+            item_id: Some("m"),
+            ..Tcx::new(&s, &k, "a")
+        };
+        let marks = search_highlights(&cx, body);
+        assert_eq!(marks.len(), 1);
+        let visible: String = marks[0]
+            .0
+            .iter()
+            .map(|range| &body[range.clone()])
+            .collect();
+        assert_eq!(visible, "中文 API");
+        assert!(search_highlights(&Tcx::new(&s, &k, "other"), body).is_empty());
+        s.timeline_search.query = rune::TextEdit::new("hidden.example");
+        s.update_timeline_search_matches("a");
+        assert!(
+            s.timeline_search.matches.is_empty(),
+            "hidden link destinations are not visible matches"
+        );
+        s.close_timeline_search();
+        assert!(search_highlights(&Tcx::new(&s, &k, "a"), body).is_empty());
     }
-
     #[test]
     fn tool_stdout_with_git_diff_is_parsed_as_diff() {
         use muqun_gateway::agents::{AgentPart, TimelineItem, TimelineRole, ToolCall};

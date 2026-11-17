@@ -200,7 +200,19 @@ fn layout_motion(s: &UiState) -> rune::Spring {
     if s.cfg.appearance.reduced_motion || s.tile_card_drag.is_some() || s.tile_drag.is_some() {
         rune::Spring::NONE
     } else {
-        rune::Spring::new(0.38, 0.06)
+        rune::Spring::new(0.42, 0.14)
+    }
+}
+
+/// Apply this to structural containers too: closing a split removes its parent,
+/// so a transition on the leaf alone cannot keep the old subtree on screen.
+fn panel_transition(s: &UiState) -> rune::Transition {
+    if s.look().motion {
+        rune::Transition::opacity()
+            .combined(rune::Transition::scale(0.94))
+            .combined(rune::Transition::offset(0.0, 24.0))
+    } else {
+        rune::Transition::none()
     }
 }
 
@@ -463,6 +475,7 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
     // Move and close: visible under the pointer, always reachable by menu.
     let menu_open = s.menu == Some(OpenMenu::Tile(i));
     let mut menu = Menu::new(format!("tile-menu-{i}"))
+        .min_width(320.0)
         .trigger(
             IconButton::new(&TRIANGLE_DOWN)
                 .variant(IconButtonVariant::GhostMuted)
@@ -760,82 +773,132 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
     let language = s.cfg.general.language;
     let asid = s.tiles[i].asid.as_deref().unwrap_or_default();
     let info = s.session_by_id(asid);
-    let agent_id = info.map(|x| x.agent_id.as_str()).unwrap_or("claude");
-    let agent_name = info
-        .map(|x| s.agent_name(&x.agent_id))
-        .unwrap_or_else(|| "Agent".to_string());
-    let activity = info.map(|x| s.activity(x)).unwrap_or(Activity::Idle);
-
-    let draft = s.tiles[i].slot.draft.text.trim().to_string();
-    let is_draft = !draft.is_empty();
-    let (line, ink) = if is_draft {
-        (draft, k.c.text_base)
-    } else {
-        (
-            tr(language, &format!("Message {agent_name}…")),
-            k.c.text_faint,
-        )
-    };
-    let queued = s.tiles[i].slot.queue.len();
-
-    let brand_c = super::agents::color(agent_id, s.dark);
-    let mark_box = el()
-        .key("parked-agent-mark")
-        .size(22.0, 22.0)
-        .radius(6.0)
-        .fill(brand_c.alpha(if s.dark { 0.16 } else { 0.10 }))
-        .border(0.5, brand_c.alpha(if s.dark { 0.32 } else { 0.22 }))
-        .center()
-        .child(super::agents::mark(agent_id, 12.0, s.dark).a11y_hidden());
-
-    let mut strip = row()
-        .key("tile-composer")
+    let mut parked_draft = s.tiles[i].slot.draft.clone();
+    parked_draft.focused = false;
+    let editor = rune_kit::TextArea::new(&parked_draft)
+        .placeholder(tr_ref(language, "Message…"))
+        .label(tr_ref(language, "Draft"))
+        .width(None)
+        .auto_grow(1, 12)
+        .build(&composer::bare_field(k))
+        .key("draft")
+        // This is a preview until its tile is active. Let the card receive the
+        // first click instead of focusing an editor that is replaced on activation.
+        .inert()
+        .w_full();
+    let mut actions = row()
+        .gap(super::composer_row::ACTION_GAP)
         .w_full()
-        .h(42.0)
-        .px(12.0)
-        .gap(8.0)
         .center_y()
-        .role("button")
-        .label(tr_ref(language, "Focus this pane"))
-        .cursor(Cursor::Text)
-        .on_press(move |s: &mut UiState| s.focus_tile(i))
-        .child(mark_box)
         .child(
-            text(line)
-                .font(k.ty.ui)
-                .color(ink)
-                .truncate()
-                .grow(1.0)
-                .shrink()
-                .min_w(0.0),
-        );
-
-    if is_draft {
-        strip = strip.child(
-            rune_kit::Badge::new(tr_ref(language, "Draft"))
-                .variant(rune_kit::BadgeVariant::Subtle)
+            IconButton::new(&super::parts::glyphs::ATTACH)
+                .label(tr_ref(language, "Attach"))
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::ExtraLarge)
+                .on_press(move |s: &mut UiState| {
+                    s.focus_tile(i);
+                    crate::platform::dialogs::attach_files(
+                        s.current()
+                            .and_then(|x| x.directory.as_ref())
+                            .map(std::path::PathBuf::from),
+                    );
+                })
                 .build(k),
+        )
+        .child(el().grow(1.0));
+    if s.cfg.voice.usable() {
+        actions = actions.child(
+            IconButton::new(&super::voice::MIC)
+                .label(tr_ref(language, "Dictate"))
+                .variant(IconButtonVariant::Ghost)
+                .control_size(ControlSize::ExtraLarge)
+                .on_press(move |s: &mut UiState| {
+                    s.focus_tile(i);
+                    s.toggle_voice();
+                })
+                .build(k)
+                .key("mic"),
         );
     }
-    if queued > 0 {
-        strip = strip.child(
-            rune_kit::Badge::new(format!("{queued} {}", tr_ref(language, "queued")))
-                .variant(rune_kit::BadgeVariant::Subtle)
-                .build(k),
-        );
-    }
-    if activity != Activity::Idle {
-        strip = strip.child(activity_pill(k, look, activity, language).key("parked-activity"));
-    }
-
-    let column = super::timeline::FEED_MAX_W;
+    let running = info.is_some_and(|x| {
+        matches!(
+            x.status,
+            muqun_gateway::agents::AgentSessionStatus::Busy
+                | muqun_gateway::agents::AgentSessionStatus::Retry
+        )
+    });
+    let submit = Button::new(tr_ref(language, if running { "Stop" } else { "Send" }))
+        .label_with(move |font, ink| {
+            if running {
+                text(tr_ref(language, "Stop")).font(font).color(ink)
+            } else {
+                rune::icon(&composer::SEND, composer::SEND_ICON).color(ink)
+            }
+        })
+        .control_size(ControlSize::Regular)
+        .variant(if running {
+            ButtonVariant::Danger
+        } else {
+            ButtonVariant::Submit
+        })
+        .disabled(
+            !running
+                && s.tiles[i].slot.draft.text.trim().is_empty()
+                && s.tiles[i].slot.staged.is_empty(),
+        )
+        .on_press(move |s: &mut UiState| {
+            s.focus_tile(i);
+            if running {
+                if let Some(asid) = s.selected.clone() {
+                    s.send(Command::Interrupt(muqun_gateway::agents::AgentSessionId(
+                        asid,
+                    )));
+                }
+            } else {
+                composer::submit_session(s);
+            }
+        })
+        .build(k)
+        .h(36.0)
+        .key(if running { "stop" } else { "send" })
+        .radius(k.radius.lg);
+    actions = actions.child(if running { submit } else { submit.w(36.0) });
+    let card = col()
+        .key("composer-card")
+        .on_background_press(move |s: &mut UiState| s.focus_tile(i))
+        .w_full()
+        .gap(4.0)
+        .px(16.0)
+        .pt(8.0)
+        .pb(8.0)
+        .child(editor)
+        .child(actions);
+    let footer = composer::session_footer(
+        s,
+        k,
+        &mut Vec::new(),
+        Some(asid),
+        s.tiles[i].slot.catalog.as_deref(),
+        &s.tiles[i].slot.diff_stat,
+    );
+    let footer = col()
+        .w_full()
+        .on_background_press(move |s: &mut UiState| s.focus_tile(i))
+        .child(footer.inert());
     col()
         .key("tile-composer-pad")
         .w_full()
         .items_center()
         .px(16.0)
+        .pt(6.0)
         .pb(14.0)
-        .child(look.pressable(k, look.row_card(k, strip.w_full().max_w(column), 10.0)))
+        .gap(8.0)
+        .child(
+            composer::composer_card(k, look, card, false, running, false)
+                .w_full()
+                .max_w(super::timeline::FEED_MAX_W),
+        )
+        .child(footer.max_w(super::timeline::FEED_MAX_W))
 }
 
 /// An empty tile: pick a recent session or start a new one into it.
@@ -966,6 +1029,28 @@ struct Place {
     corner: bool,
 }
 
+/// Hover activation leaves modal interactions and composition with their owner.
+fn focus_hovered_tile(s: &mut UiState, i: usize) {
+    if i == s.focus
+        || i >= s.tiles.len()
+        || s.mode != Mode::Session
+        || s.menu.is_some()
+        || s.row_menu.is_some()
+        || s.context_open.is_some()
+        || s.zoom.is_some()
+        || s.detail.is_some()
+        || s.voice.is_some()
+        || s.draft.preedit().is_some()
+        || s.timeline_search.active
+        || s.tile_drag.is_some()
+        || s.tile_card_drag.is_some()
+        || s.drop_hover
+    {
+        return;
+    }
+    s.focus_tile(i);
+}
+
 /// Pane `i` as its own card: a rounded floor like the sidebar's, a header
 /// line, its timeline and composer.
 fn tile(
@@ -1019,7 +1104,16 @@ fn tile(
         } else {
             rune::Transition::none()
         })
-        .on_press(move |s: &mut UiState| s.focus_tile(i));
+        .on_hover_change(move |s: &mut UiState, inside, _| {
+            if inside {
+                focus_hovered_tile(s, i);
+            }
+        })
+        .on_background_press(move |s: &mut UiState| {
+            if s.focus != i {
+                s.focus_tile(i);
+            }
+        });
     body = look.panel(k, body, radius);
     if !t.is_terminal() {
         body = body.child(header(s, k, look, i, place, layer)).child(
@@ -1095,6 +1189,29 @@ fn tile(
                 .child(timeline::session_view(s, k, asid))
                 .child(parked_composer(s, k, look, i));
         }
+    }
+    if focused && s.right_open && s.inspector_tab == super::InspectorTab::Git {
+        let close = |s: &mut UiState| {
+            s.right_open = false;
+            s.right.set_open(false);
+        };
+        body = body.child(
+            col()
+                .key("tile-git-panel")
+                .pin(Some(8.0), Some(HEAD_H), Some(8.0), Some(8.0))
+                .fill(k.c.bg_base)
+                .radius(k.radius.lg)
+                .motion(look.focus_fade())
+                .child(
+                    row().w_full().justify_end().child(
+                        IconButton::new(k.glyph.close)
+                            .label(tr_ref(s.cfg.general.language, "Close"))
+                            .on_press(close)
+                            .build(k),
+                    ),
+                )
+                .child(super::inspector::view(s, k).grow(1.0).min_h(0.0)),
+        );
     }
     // Focus is contrast: the other panes' content sits a step back under a
     // scrim of the card's own colour (one quad, no layer, no blur) that
@@ -1298,6 +1415,7 @@ fn floating_card(
         })
         .a11y_hidden();
     el().key(format!("tile-float-{i}"))
+        .transition(panel_transition(s))
         .radius(k.radius.lg)
         .box_shadow(rune::Shadow {
             x: 0.0,
@@ -1412,6 +1530,8 @@ fn arrange(
             path.pop();
             let line = if *across { row() } else { col() };
             line.key(path_key("tile-split", path))
+                .motion(layout_motion(s))
+                .transition(panel_transition(s))
                 .grow(1.0)
                 .min_w(0.0)
                 .min_h(0.0)
@@ -1456,6 +1576,8 @@ pub fn view(s: &UiState, k: &Kit, clear: f32, scale: f32, layer: &mut Vec<El>) -
 
     let mut stage = el()
         .key("tiles-stage")
+        .motion(layout_motion(s))
+        .child_exit(panel_transition(s))
         .w_full()
         .h_full()
         .min_w(0.0)
@@ -1650,6 +1772,356 @@ pub fn view(s: &UiState, k: &Kit, clear: f32, scale: f32, layer: &mut Vec<El>) -
 mod tests {
     use super::*;
     use crate::ui::Tile;
+
+    #[test]
+    fn hovering_composer_allows_paste_without_click_and_keeps_controls_still() {
+        use rune::{Env, Runtime};
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        crate::ui::scenes::scenes()
+            .iter()
+            .find(|(name, _)| *name == "split2")
+            .unwrap()
+            .1(&mut s);
+        s.cfg.voice.url = "https://voice.example.test/transcribe".into();
+        for session in &mut s.sessions {
+            session.status = muqun_gateway::agents::AgentSessionStatus::Busy;
+        }
+        s.splash = None;
+        s.focus_tile(0);
+        let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+        for _ in 0..60 {
+            rt.frame(1.0 / 60.0);
+        }
+        for target in [1, 0, 1] {
+            let mut drafts: Vec<_> = rt
+                .elements()
+                .into_iter()
+                .filter(|n| n.key.as_deref() == Some("draft"))
+                .collect();
+            drafts.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
+            let rect = drafts[target].rect;
+            let controls = |rt: &Runtime<UiState>| {
+                let mut out: Vec<_> = rt
+                    .elements()
+                    .into_iter()
+                    .filter(|n| matches!(n.key.as_deref(), Some("mic" | "stop" | "send")))
+                    .map(|n| (n.key, n.rect))
+                    .collect();
+                out.sort_by(|a, b| a.1[0].total_cmp(&b.1[0]));
+                out
+            };
+            let before = controls(&rt);
+            rt.pointer_move(rect[0] + 20.0, rect[1] + 10.0);
+            for _ in 0..30 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert_eq!(rt.state.focus, target);
+            let old = rt.state.draft.text.clone();
+            rt.paste("hover-paste");
+            rt.frame(1.0 / 60.0);
+            assert_ne!(
+                rt.state.draft.text, old,
+                "hovered composer must accept paste without a click"
+            );
+            let after = controls(&rt);
+            assert_eq!(before.len(), after.len());
+            for (before, after) in before.iter().zip(&after) {
+                for axis in 0..4 {
+                    assert!(
+                        (before.1[axis] - after.1[axis]).abs() < 1.0,
+                        "control moved on hover: {before:?} -> {after:?}"
+                    );
+                }
+            }
+        }
+        let message = rt
+            .elements()
+            .into_iter()
+            .find(|n| {
+                n.text.as_deref().is_some_and(|t| t.starts_with("Reading")) && n.rect[0] > 600.0
+            })
+            .unwrap();
+        rt.pointer_move(message.rect[0] + 10.0, message.rect[1] + 10.0);
+        rt.pointer_down(message.rect[0] + 10.0, message.rect[1] + 10.0);
+        rt.pointer_up(message.rect[0] + 10.0, message.rect[1] + 10.0);
+        rt.frame(1.0 / 60.0);
+        let draft = rt
+            .elements()
+            .into_iter()
+            .find(|n| n.key.as_deref() == Some("draft") && n.rect[0] > 600.0)
+            .unwrap();
+        rt.pointer_move(draft.rect[0] + 20.0, draft.rect[1] + 10.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        let before = rt.state.draft.text.clone();
+        rt.paste("after-reading");
+        rt.frame(1.0 / 60.0);
+        assert_ne!(
+            rt.state.draft.text, before,
+            "returning from the timeline must restore composer paste focus"
+        );
+    }
+
+    #[test]
+    fn double_click_selects_message_words_in_split_pane() {
+        use rune::{Env, Runtime};
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        crate::ui::scenes::scenes()
+            .iter()
+            .find(|(name, _)| *name == "split2")
+            .unwrap()
+            .1(&mut s);
+        s.splash = None;
+        s.focus_tile(0);
+        let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+        for _ in 0..60 {
+            rt.frame(1.0 / 60.0);
+        }
+        let node = rt
+            .elements()
+            .into_iter()
+            .find(|n| {
+                n.text.as_deref().is_some_and(|t| t.starts_with("Reading")) && n.rect[0] > 600.0
+            })
+            .expect("message text visible");
+        let [x, y, _, h] = node.rect;
+        rt.pointer_move(x + 10.0, y + h.min(20.0) / 2.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.focus, 1);
+        for _ in 0..2 {
+            rt.pointer_down(x + 10.0, y + h.min(20.0) / 2.0);
+            rt.pointer_up(x + 10.0, y + h.min(20.0) / 2.0);
+            rt.frame(0.08);
+        }
+        assert_eq!(
+            rt.selection().map(|s| s.text().to_owned()).as_deref(),
+            Some("Reading")
+        );
+    }
+
+    #[test]
+    fn context_popup_is_anchored_to_its_own_split_and_closes_on_focus_change() {
+        use rune::{Env, Runtime};
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let (_, scene) = crate::ui::scenes::scenes()
+            .iter()
+            .find(|(name, _)| *name == "split2")
+            .unwrap();
+        scene(&mut s);
+        s.splash = None;
+        let catalog = std::sync::Arc::new(crate::hub::CatalogView {
+            catalog: serde_json::from_value(serde_json::json!({
+                "models": [{"id":"test-model", "name":"Test model", "provider_id":"test"}],
+                "modes": [], "mcp": []
+            }))
+            .unwrap(),
+        });
+        s.catalog = Some(catalog.clone());
+        s.tiles[1].slot.catalog = Some(catalog);
+        s.focus_tile(1);
+        let asid = s.selected.clone().unwrap();
+        let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+        for _ in 0..60 {
+            rt.frame(1.0 / 60.0);
+        }
+        let trigger_key = format!("session-context-{asid}-trigger");
+        let trigger = rt
+            .elements()
+            .into_iter()
+            .find(|n| n.key.as_deref() == Some(&trigger_key))
+            .unwrap();
+        let [x, y, w, h] = trigger.rect;
+        rt.pointer_down(x + w / 2.0, y + h / 2.0);
+        rt.pointer_up(x + w / 2.0, y + h / 2.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.context_open.as_deref(), Some(asid.as_str()));
+        let popup_key = format!("session-context-{asid}-content");
+        let popup = rt
+            .elements()
+            .into_iter()
+            .find(|n| n.key.as_deref() == Some(&popup_key))
+            .unwrap();
+        assert!(
+            popup.rect[0] > 720.0,
+            "right-hand context opened on the left: {:?}",
+            popup.rect
+        );
+        assert!(
+            popup.rect[1] + popup.rect[3] <= y + 1.0,
+            "popup must open above its button"
+        );
+        assert!(popup.rect[3] < 450.0, "context should size to its content");
+        rt.update(|s, _| s.focus_tile(0));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.context_open.is_none());
+        rt.update(|s, _| s.focus_tile(1));
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        let model_key = format!("model-{asid}-trigger");
+        let model = rt
+            .elements()
+            .into_iter()
+            .find(|n| n.key.as_deref() == Some(&model_key))
+            .unwrap();
+        let [x, y, w, h] = model.rect;
+        rt.pointer_down(x + w / 2.0, y + h / 2.0);
+        rt.pointer_up(x + w / 2.0, y + h / 2.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        let choice_key = format!("model-{asid}-item1");
+        let choice = rt
+            .elements()
+            .into_iter()
+            .find(|n| n.key.as_deref() == Some(&choice_key))
+            .unwrap_or_else(|| {
+                panic!(
+                    "rect {:?}, focus {}, menu {:?}, keys {:?}",
+                    [x, y, w, h],
+                    rt.state.focus,
+                    rt.state.menu,
+                    rt.elements()
+                        .iter()
+                        .filter_map(|n| n.key.clone())
+                        .filter(|k| k.contains("model") || k.contains("item"))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            choice.rect[0] > 720.0,
+            "model menu anchored to the other session: {:?}",
+            choice.rect
+        );
+        assert_eq!(rt.state.selected.as_deref(), Some(asid.as_str()));
+    }
+
+    #[test]
+    fn pending_permission_can_be_answered_without_opening_the_inspector() {
+        use muqun_gateway::agents::{PermissionDecision, PermissionRequest};
+        use rune::{Env, Runtime};
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let (_, scene) = crate::ui::scenes::scenes()
+            .iter()
+            .find(|(name, _)| *name == "split2")
+            .unwrap();
+        scene(&mut s);
+        s.splash = None;
+        let asid = s.selected.clone().unwrap();
+        let request: PermissionRequest = serde_json::from_value(serde_json::json!({
+            "id": "pending-shell", "asid": asid, "action": "shell",
+            "resources": [], "prompt": "Run a command", "source_tool_call_id": "folded-tool",
+            "options": [{"index": 0, "label": "No", "decision": "deny"}]
+        }))
+        .unwrap();
+        s.waiting_perms.insert(asid.clone(), vec![request]);
+        let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+        for _ in 0..60 {
+            rt.frame(1.0 / 60.0);
+        }
+        let button = rt
+            .elements()
+            .into_iter()
+            .find(|node| node.key.as_deref() == Some("perm-pending-shell-0"))
+            .expect("pending authorization must be reachable beside the composer");
+        let [x, y, w, h] = button.rect;
+        assert!(w > 0.0 && h > 0.0 && y >= 0.0 && y + h <= 900.0);
+        rt.pointer_down(x + w / 2.0, y + h / 2.0);
+        rt.pointer_up(x + w / 2.0, y + h / 2.0);
+        rt.frame(1.0 / 60.0);
+        let mut answered = false;
+        while let Ok(command) = rx.try_recv() {
+            if let crate::model::commands::Command::ReplyPermission {
+                asid: target,
+                id,
+                decision,
+            } = command
+            {
+                assert_eq!(target.0, asid);
+                assert_eq!(id, "pending-shell");
+                assert_eq!(decision, PermissionDecision::Deny);
+                answered = true;
+            }
+        }
+        assert!(answered);
+        assert!(rt.state.waiting_perms[&asid].is_empty());
+    }
+
+    #[test]
+    fn clicking_parked_composer_focuses_it_and_keeps_drafts_separate() {
+        use rune::{Env, Runtime};
+
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let (_, scene) = crate::ui::scenes::scenes()
+            .iter()
+            .find(|(name, _)| *name == "split2")
+            .unwrap();
+        scene(&mut s);
+        s.splash = None;
+        s.draft = rune::TextEdit::new("first");
+        s.tiles[1].slot.draft = rune::TextEdit::new("second");
+        let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+        rt.on_key = Some(crate::ui::on_key);
+        for _ in 0..60 {
+            rt.frame(1.0 / 60.0);
+        }
+        let sizes = |rt: &Runtime<UiState>| {
+            let mut nodes: Vec<_> = rt
+                .elements()
+                .into_iter()
+                .filter(|node| {
+                    node.key.as_deref() == Some("composer-footer")
+                        || node.key.as_deref() == Some("composer-card")
+                })
+                .map(|node| (node.key.clone(), node.rect))
+                .collect();
+            nodes.sort_by(|a, b| a.1[0].total_cmp(&b.1[0]).then(a.0.cmp(&b.0)));
+            nodes
+        };
+        let before = sizes(&rt);
+        assert_eq!(before.len(), 4);
+        for target in [1, 0] {
+            let mut drafts: Vec<_> = rt
+                .elements()
+                .into_iter()
+                .filter(|node| node.key.as_deref() == Some("draft"))
+                .collect();
+            drafts.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
+            assert_eq!(drafts.len(), 2);
+            let rect = drafts[target].rect;
+            rt.pointer_down(rect[0] + 18.0, rect[1] + 16.0);
+            rt.pointer_up(rect[0] + 18.0, rect[1] + 16.0);
+            rt.frame(1.0 / 60.0);
+            assert_eq!(rt.state.focus, target);
+            assert!(rt.state.draft.focused);
+            rt.paste("!");
+            rt.frame(1.0 / 60.0);
+            assert_eq!(rt.state.draft.text.matches('!').count(), 1);
+            for _ in 0..30 {
+                rt.frame(1.0 / 60.0);
+            }
+            let after = sizes(&rt);
+            for (old, new) in before.iter().zip(&after) {
+                assert!(
+                    (old.1[3] - new.1[3]).abs() < 1.0,
+                    "focus changed composer height: {old:?} -> {new:?}"
+                );
+            }
+        }
+        assert_eq!(rt.state.draft.text.replace('!', ""), "first");
+        assert_eq!(rt.state.tiles[1].slot.draft.text.replace('!', ""), "second");
+        assert_eq!(rt.state.tiles[1].slot.draft.text.matches('!').count(), 1);
+    }
 
     #[test]
     fn scrolling_focus_reveals_readable_columns_and_uses_their_direction() {

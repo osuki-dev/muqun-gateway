@@ -35,6 +35,10 @@ const FOLDER_PICKER_W: f32 = 308.0;
 const FOLDERS_SHOWN: usize = 8;
 
 pub fn submit_start(s: &mut UiState) {
+    // The aggregate list has no execution target. Never use the previous hub.
+    if s.current_computer() == "all" {
+        return;
+    }
     let prompt = s.start_draft.text.trim().to_string();
     if prompt.is_empty() {
         return;
@@ -516,6 +520,7 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
             k,
             layer,
             OpenMenu::StartModel,
+            "home",
             s.menu == Some(OpenMenu::StartModel),
             label,
             &models,
@@ -883,6 +888,46 @@ pub fn view(
     dock: Option<[f32; 2]>,
     layer: &mut Vec<El>,
 ) -> El {
+    if s.current_computer() == "all" {
+        let language = s.cfg.general.language;
+        let mut computers = row().gap(12.0).flex_wrap();
+        for computer in s.all_computers() {
+            let id = computer.server_id;
+            if id == "all" {
+                continue;
+            }
+            computers = computers.child(
+                Button::new(computer.name)
+                    .variant(ButtonVariant::Neutral)
+                    .on_press(move |s: &mut UiState| s.switch_computer(id.clone()))
+                    .build(k),
+            );
+        }
+        let panel = col()
+            .key("computer-picker-panel")
+            .w((card[0] - 48.0).clamp(0.0, 520.0))
+            .padding(24.0)
+            .radius(k.radius.xl)
+            .fill(k.c.bg_base.alpha(0.97))
+            .gap(16.0)
+            .child(
+                text(tr(language, "Choose a computer to start a session"))
+                    .font(k.ty.body_medium)
+                    .color(k.c.text_base),
+            )
+            .child(muted(
+                k,
+                tr(language, "Or open an existing session from the sidebar."),
+            ))
+            .child(computers);
+        return col()
+            .key("all-computers-home")
+            .w_full()
+            .h_full()
+            .items_center()
+            .justify_center()
+            .child(panel);
+    }
     let look = s.look();
     let [w, h] = card;
     let side = (w * 0.04).clamp(24.0, 56.0);
@@ -944,4 +989,21 @@ pub fn view(
         .child(stage)
         .on_drop_files(|s: &mut UiState, files, _| composer::attach_dropped_files(s, files))
         .on_drop_hover(|s: &mut UiState, over, _| s.drop_hover = over)
+}
+
+#[cfg(test)]
+mod aggregate_tests {
+    #[test]
+    fn aggregate_home_cannot_submit_to_previous_computer() {
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = super::UiState::new(tx);
+        s.cfg.current_computer = "all".into();
+        s.start_agent = "codex".into();
+        s.start_draft = rune::TextEdit::new("keep this draft");
+        while rx.try_recv().is_ok() {}
+        super::submit_start(&mut s);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(s.start_draft.text, "keep this draft");
+        assert!(s.pending_start.is_none());
+    }
 }

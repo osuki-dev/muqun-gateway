@@ -21,6 +21,19 @@ pub mod update;
 
 use std::path::PathBuf;
 
+/// Apply native window chrome without platform branches in the UI.
+pub fn configure_window<S: 'static>(app: rune::App<S>) -> rune::App<S> {
+    #[cfg(target_os = "macos")]
+    {
+        app.titlebar(rune::Titlebar::new(64.0))
+            .macos_window(rune::MacWindowOptions::default().shadow(false))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        app
+    }
+}
+
 /// The product's directory name. Deliberately not the gateway's: the gateway
 /// owns `muqun-gateway/` through its state lock, and a second owner there
 /// would push it off the phones it is serving (architecture §4).
@@ -60,6 +73,8 @@ pub fn bundled_plugin_dirs() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Ok(executable) = std::env::current_exe() {
         if let Some(prefix) = executable.parent().and_then(std::path::Path::parent) {
+            #[cfg(target_os = "macos")]
+            paths.push(prefix.join("Resources/bundled-plugins"));
             paths.push(prefix.join("share/muqun-desktop/bundled-plugins"));
         }
     }

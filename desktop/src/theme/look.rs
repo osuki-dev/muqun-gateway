@@ -368,6 +368,21 @@ impl Look {
         .enter_delay(0.045 * i as f32)
     }
 
+    /// Shared dialog entrance/exit: scale and rise, with the same spring for
+    /// command, shortcut and pairing surfaces. Reduced motion keeps a fade.
+    pub fn dialog_motion(&self, panel: El) -> El {
+        if !self.motion {
+            return panel.transition(Transition::opacity());
+        }
+        panel
+            .transition(
+                Transition::opacity()
+                    .combined(Transition::offset(0.0, 12.0))
+                    .combined(Transition::scale(0.96)),
+            )
+            .motion(Spring::new(0.32, 0.16))
+    }
+
     /// A gentle breathing pulse on `e` (opacity 0.55..1 over 1.8 s); still
     /// under reduce motion.
     pub fn pulse(&self, e: El) -> El {

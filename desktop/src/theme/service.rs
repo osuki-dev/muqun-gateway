@@ -88,6 +88,7 @@ pub enum ThemeUpdate {
     Preview { id: String, path: PathBuf },
     Job { id: String, job: Job },
     Applied(AppliedTheme),
+    SystemRefreshed(AppliedTheme),
     Notice(Notice),
 }
 
@@ -624,6 +625,9 @@ pub fn load_applied(
     scheme: Scheme,
     requested: Instant,
 ) -> anyhow::Result<AppliedTheme> {
+    if id == super::omarchy::ID {
+        return super::omarchy::load(requested);
+    }
     let loaded = store.load(id)?;
     applied_from(&loaded, scheme, requested)
 }

@@ -1,0 +1,80 @@
+use super::*;
+use crate::model::compose::StagedFile;
+
+fn uploaded() -> StagedFile {
+    StagedFile {
+        draft_token: None,
+        path: "/uploads/photo.png".into(),
+        name: "photo.png".into(),
+        size: 16,
+        image: true,
+    }
+}
+
+fn state() -> UiState {
+    let (tx, _) = crate::model::commands::channel();
+    let mut s = UiState::new(tx);
+    s.draft = fresh("");
+    insert_image_pill(&mut s.draft, 42);
+    s.pending_image_uploads.insert(42);
+    s
+}
+
+#[test]
+fn deleting_inline_image_removes_only_its_attachment() {
+    let mut s = state();
+    finish_staging(&mut s, 42, Ok(uploaded()));
+    let mut unrelated = uploaded();
+    unrelated.path = "/uploads/other.png".into();
+    s.staged.push(unrelated.clone());
+    s.draft.set_selection(0, s.draft.text.len());
+    s.draft.insert("");
+    on_draft_change(&mut s, Slot::Session);
+    assert_eq!(s.staged, vec![unrelated]);
+}
+
+#[test]
+fn deleted_inline_image_does_not_reappear_after_upload() {
+    let mut s = state();
+    s.draft.set_selection(0, s.draft.text.len());
+    s.draft.insert("");
+    finish_staging(&mut s, 42, Ok(uploaded()));
+    assert!(s.staged.is_empty());
+    assert!(s.pending_image_uploads.is_empty());
+}
+
+#[test]
+fn removing_image_pill_preserves_text_and_other_images() {
+    let mut draft = fresh("before ");
+    draft.set_caret(draft.text.len());
+    insert_image_pill(&mut draft, 42);
+    draft.insert("after ");
+    insert_image_pill(&mut draft, 43);
+    remove_image_pill(&mut draft, 42);
+    assert!(!has_image_pill(&draft, 42));
+    assert!(has_image_pill(&draft, 43));
+    assert!(draft.text.contains("before "));
+    assert!(draft.text.contains("after "));
+}
+
+#[test]
+fn image_upload_finishes_in_its_original_split_pane() {
+    let (tx, _) = crate::model::commands::channel();
+    let mut s = UiState::new(tx);
+    let (_, scene) = crate::ui::scenes::scenes()
+        .iter()
+        .find(|(name, _)| *name == "split2")
+        .unwrap();
+    scene(&mut s);
+    let original = s.focus;
+    insert_image_pill(&mut s.draft, 42);
+    s.pending_image_uploads.insert(42);
+    s.focus_tile(if original == 0 { 1 } else { 0 });
+    finish_staging(&mut s, 42, Ok(uploaded()));
+    assert!(!s.staged.iter().any(|file| file.draft_token == Some(42)));
+    assert!(s.tiles[original]
+        .slot
+        .staged
+        .iter()
+        .any(|file| file.draft_token == Some(42)));
+}

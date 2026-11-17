@@ -333,6 +333,7 @@ impl UiState {
             for path in &echo.files {
                 if !self.staged.iter().any(|f| &f.path == path) {
                     self.staged.push(crate::model::compose::StagedFile {
+                        draft_token: None,
                         name: PathBuf::from(path)
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
@@ -647,6 +648,7 @@ mod tests {
             token,
             "typo in my prompt".into(),
             &[crate::model::compose::StagedFile {
+                draft_token: None,
                 path: "/uploads/example.png".into(),
                 name: "example.png".into(),
                 size: 100,

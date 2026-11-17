@@ -111,20 +111,17 @@ pub enum SearchOutcome {
     Failed,
 }
 
-/// In-app self-update progress and status.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UpdateState {
-    Idle,
-    Checking,
-    Available(Box<crate::platform::update::UpdateInfo>),
-    UpToDate,
-    Downloading,
-    ReadyToRestart,
-    Failed(String),
-}
-
 #[derive(Debug, Clone)]
 pub enum Update {
+    Computer {
+        computer: String,
+        generation: u64,
+        updates: Vec<Update>,
+    },
+    SessionOpenFailed {
+        asid: String,
+        message: String,
+    },
     Agents(Vec<AgentDiscoveryInfo>),
     /// One agent's session list, replacing what was listed for it.
     AgentSessions {
@@ -206,8 +203,6 @@ pub enum Update {
         generation: u64,
         outcome: SearchOutcome,
     },
-    /// In-app self-update progress and availability.
-    UpdateState(UpdateState),
     /// The delegated task list, replacing the last, with the folder a new
     /// task would run in.
     Tasks {
@@ -269,8 +264,31 @@ struct State {
 
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
 
+#[derive(Default)]
+struct ComputerUpdates {
+    generation: u64,
+    states: HashMap<(String, u64), State>,
+}
+
+impl ComputerUpdates {
+    fn accept(&mut self, origin: (String, u64), update: Update) -> bool {
+        self.generation = self.generation.max(origin.1);
+        // A delivery already sent to an old connection must still settle its
+        // parked draft. Other old reads cannot update the new workspace.
+        if origin.1 < self.generation
+            && !matches!(&update, Update::SessionCreated(_))
+            && !matches!(&update,
+            Update::Composer(value) if matches!(**value, super::compose::ComposerUpdate::Submitted { .. }))
+        {
+            return false;
+        }
+        self.states.entry(origin).or_default().accept(update)
+    }
+}
+
 pub struct Inbox {
     state: Mutex<State>,
+    computers: Mutex<ComputerUpdates>,
     wake: Mutex<Option<Wake>>,
 }
 
@@ -284,6 +302,7 @@ impl Inbox {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(State::default()),
+            computers: Mutex::new(ComputerUpdates::default()),
             wake: Mutex::new(None),
         }
     }
@@ -295,6 +314,25 @@ impl Inbox {
     }
 
     pub fn push(&self, update: Update) {
+        if !matches!(
+            update,
+            Update::Ui(_)
+                | Update::Theme(_)
+                | Update::Voice(_)
+                | Update::Storage(_)
+                | Update::Runtimes(_)
+                | Update::RuntimeInstalled { .. }
+                | Update::ComputerPairingRequested { .. }
+                | Update::ComputerPairingOutcome { .. }
+        ) {
+            if let Some(origin) = crate::hub::connection_origin() {
+                let kept = self.computers.lock().unwrap().accept(origin, update);
+                if kept {
+                    self.wake();
+                }
+                return;
+            }
+        }
         let kept = {
             let mut state = self.state.lock().unwrap();
             state.accept(update)
@@ -315,12 +353,40 @@ impl Inbox {
     pub fn take(&self) -> Vec<Update> {
         let mut state = self.state.lock().unwrap();
         state.upserts.clear();
-        std::mem::take(&mut state.pending)
+        let mut pending = std::mem::take(&mut state.pending);
+        drop(state);
+        let mut computers = self.computers.lock().unwrap();
+        for ((computer, generation), state) in computers.states.iter_mut() {
+            state.upserts.clear();
+            if !state.pending.is_empty() {
+                pending.push(Update::Computer {
+                    computer: computer.clone(),
+                    generation: *generation,
+                    updates: std::mem::take(&mut state.pending),
+                });
+            }
+        }
+        let generation = computers.generation;
+        computers
+            .states
+            .retain(|(_, epoch), _| *epoch == generation);
+        pending.sort_by_key(|update| match update {
+            Update::Computer { generation, .. } => *generation,
+            _ => 0,
+        });
+        pending
     }
 
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.state.lock().unwrap().pending.is_empty()
+            && self
+                .computers
+                .lock()
+                .unwrap()
+                .states
+                .values()
+                .all(|state| state.pending.is_empty())
     }
 }
 
@@ -400,6 +466,53 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_generations_retire_without_losing_delivered_prompt_receipts() {
+        let inbox = Inbox::new();
+        let list = || Update::AgentSessions {
+            agent: "codex".into(),
+            sessions: vec![],
+        };
+        for generation in 0..128 {
+            inbox
+                .computers
+                .lock()
+                .unwrap()
+                .accept(("mini".into(), generation), list());
+            assert!(!inbox.is_empty());
+            assert_eq!(inbox.take().len(), 1);
+            assert_eq!(inbox.computers.lock().unwrap().states.len(), 1);
+        }
+        let mut updates = inbox.computers.lock().unwrap();
+        assert!(!updates.accept(("mini".into(), 0), list()));
+        let created = serde_json::from_value(serde_json::json!({
+            "asid": "created", "agent_id": "codex", "title": "created", "status": "idle",
+            "updated_ms": 1
+        }))
+        .unwrap();
+        assert!(updates.accept(
+            ("mini".into(), 0),
+            Update::SessionCreated(Box::new(created))
+        ));
+        assert!(updates.accept(
+            ("mini".into(), 0),
+            Update::Composer(Box::new(super::super::compose::ComposerUpdate::Submitted {
+                token: 42,
+                ok: true
+            }))
+        ));
+        drop(updates);
+        let pending = inbox.take();
+        assert!(
+            matches!(&pending[..], [Update::Computer { generation: 0, updates, .. }]
+            if matches!(&updates[..], [Update::SessionCreated(_), Update::Composer(value)] if matches!(**value,
+                super::super::compose::ComposerUpdate::Submitted { token: 42, ok: true })))
+        );
+        assert_eq!(inbox.computers.lock().unwrap().states.len(), 1);
+        assert!(inbox.is_empty());
+    }
+
     use muqun_gateway::agents::{
         AgentPart, AgentSessionId, AgentSessionStatus, TimelineItem, TimelineRole,
     };

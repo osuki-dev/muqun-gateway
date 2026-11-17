@@ -554,7 +554,9 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         panel = panel.box_shadow(shadow);
     }
 
-    let panel = panel.modal(true, |s: &mut UiState| s.close_pairing());
+    let panel = look
+        .dialog_motion(panel)
+        .modal(true, |s: &mut UiState| s.close_pairing());
 
     // Scrim overlay
     layer.push(

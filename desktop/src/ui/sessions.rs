@@ -746,8 +746,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                         .fill(k.c.bg_accent.alpha(0.12)),
                 ),
         )
-        .child(search(s, k))
-        .child(scope(s, k, layer));
+        .child(search_toolbar(s, k, layer));
 
     let mut sidebar = Sidebar::new()
         .label(super::copy::tr_ref(language, "Sessions"))
@@ -852,13 +851,65 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     })
 }
 
+/// Keep the scope and search on one row; retain the input while a query exists.
+fn search_toolbar(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+    let expanded = s.search.focused || !s.search.text.is_empty();
+    let motion = if s.cfg.appearance.reduced_motion {
+        rune::Spring::NONE
+    } else {
+        rune::Spring::new(0.3, 0.04)
+    };
+    rune::row()
+        .key("sidebar-search-toolbar")
+        .w_full()
+        .center_y()
+        .child(
+            rune::row()
+                .key("scope-slot")
+                .w(0.0)
+                .min_w(0.0)
+                .grow(if expanded { 0.0 } else { 1.0 })
+                .clip_soft(0.0)
+                .opacity(if expanded { 0.0 } else { 1.0 })
+                .motion(motion)
+                .child(scope(s, k, layer)),
+        )
+        .child(
+            search(s, k)
+                .w(36.0)
+                .min_w(36.0)
+                .grow(if expanded { 1.0 } else { 0.0 })
+                .motion(motion),
+        )
+}
+
 /// The search field: a quiet well the width of the rows, its icon on the
 /// rows' icon column, and a clear button only once there is something to clear.
 fn search(s: &UiState, k: &Kit) -> El {
     let language = s.cfg.general.language;
+    if !s.search.focused && s.search.text.is_empty() {
+        return k
+            .interactive(
+                rune::row()
+                    .key("search")
+                    .h(28.0)
+                    .center()
+                    .radius(k.radius.md)
+                    .fill(k.c.text_base.alpha(0.06))
+                    .role("button")
+                    .label(super::copy::tr_ref(language, "Search sessions"))
+                    .child(rune::icon(&SEARCH, 14.0).color(k.c.text_muted)),
+            )
+            .on_press(|s: &mut UiState| {
+                s.menu = None;
+                s.focus_search(s.content.only);
+            });
+    }
     let only = s.content.only;
     let mut field = TextInput::new(&s.search)
-        .placeholder(if only {
+        .placeholder(if !s.search.focused && s.search.text.is_empty() {
+            ""
+        } else if only {
             super::copy::tr_ref(language, "Search in messages")
         } else if s.content.supported {
             super::copy::tr_ref(language, "Search sessions and messages")
@@ -869,7 +920,12 @@ fn search(s: &UiState, k: &Kit) -> El {
         .leading_icon_size(14.0)
         .width(None)
         .plain()
-        .on_edit(|s: &mut UiState| &mut s.search)
+        .on_edit(|s: &mut UiState| {
+            if s.menu == Some(OpenMenu::SidebarScope) {
+                s.menu = None;
+            }
+            &mut s.search
+        })
         .on_change(|s: &mut UiState, _: &mut Tx| s.search_changed())
         .on_key(|s: &mut UiState, ev: &rune::KeyEvent, tx: &mut Tx| s.search_key(ev, tx));
     if !s.search.text.is_empty() {
@@ -879,7 +935,16 @@ fn search(s: &UiState, k: &Kit) -> El {
     }
     let mut well = rune::row()
         .key("search")
-        .w_full()
+        .on_press(|s: &mut UiState| {
+            if !s.search.focused {
+                if s.menu == Some(OpenMenu::SidebarScope) {
+                    s.menu = None;
+                }
+                s.focus_search(s.content.only);
+            }
+        })
+        .label(super::copy::tr_ref(language, "Search sessions"))
+        .help(super::copy::tr_ref(language, "Search sessions"))
         .center_y()
         .radius(k.radius.md)
         .fill(k.c.text_base.alpha(0.06))
@@ -968,6 +1033,42 @@ fn link_warning(s: &UiState, k: &Kit) -> Option<El> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collapsed_search_click_focuses_input_and_preserves_selected_session() {
+        let (tx, _) = crate::model::commands::channel();
+        let mut state = UiState::new(tx);
+        state.splash = None;
+        let (_, scene) = crate::ui::scenes::scenes()
+            .iter()
+            .find(|(name, _)| *name == "session")
+            .unwrap();
+        scene(&mut state);
+        let selected = state.selected.clone();
+        let mut rt = rune::Runtime::new(
+            state,
+            crate::ui::view,
+            (1280.0, 800.0),
+            rune::Env::new(true, 1.0),
+        );
+        for _ in 0..60 {
+            rt.frame(1.0 / 60.0);
+        }
+        let button = rt
+            .elements()
+            .into_iter()
+            .find(|node| node.key.as_deref() == Some("search"))
+            .unwrap();
+        let x = button.rect[0] + button.rect[2] / 2.0;
+        let y = button.rect[1] + button.rect[3] / 2.0;
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..60 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(rt.state.search.focused);
+        assert_eq!(rt.state.selected, selected);
+    }
 
     fn session(id: &str, updated: u64) -> muqun_gateway::agents::AgentSessionInfo {
         serde_json::from_value(serde_json::json!({"asid":id,"agent_id":"codex","title":id,"status":"idle","directory":"/project","updated_ms":updated})).unwrap()

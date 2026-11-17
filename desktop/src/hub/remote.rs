@@ -1947,7 +1947,7 @@ mod tests {
                 token: Some("isolated-test".into()),
                 ..Default::default()
             });
-            let hub = crate::configured_remote_hub(&config).expect("saved remote selected");
+            let hub = crate::configured_remote_hub(&config).unwrap().expect("saved remote selected");
             let mut events = hub.events();
             let mut socket = accept_subscription(&listener).await;
             assert!(matches!(events.recv().await.unwrap(), AgentDomainEvent::Resync { .. }));

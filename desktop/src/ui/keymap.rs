@@ -153,6 +153,8 @@ pub enum Action {
     Stop,
     ModelPicker,
     Dictation,
+    FinishDictation,
+    CancelDictation,
     JumpLatest,
     NextRow,
     PrevRow,
@@ -219,6 +221,8 @@ impl Action {
             Self::Stop => "stop",
             Self::ModelPicker => "model_picker",
             Self::Dictation => "dictation",
+            Self::FinishDictation => "finish_dictation",
+            Self::CancelDictation => "cancel_dictation",
             Self::JumpLatest => "jump_latest",
             Self::NextRow => "next_row",
             Self::PrevRow => "prev_row",
@@ -437,7 +441,7 @@ pub static ENTRIES: &[Entry] = &[
         e(
             A::Send,
             G::Session,
-            "mod+enter",
+            "enter",
             "Send (steer while the agent works)",
         ),
         Owner::Composer,
@@ -464,6 +468,8 @@ pub static ENTRIES: &[Entry] = &[
         "mod+shift+space",
         "Start or finish dictation",
     ),
+    e(A::FinishDictation, G::Session, "mod+shift+enter", "Finish dictation"),
+    e(A::CancelDictation, G::Session, "mod+shift+backspace", "Cancel dictation"),
     e(
         A::JumpLatest,
         G::Session,
@@ -861,6 +867,12 @@ pub fn clashes_for(
     for (i, a) in rows.iter().enumerate() {
         let bind_a = a.keybind_for(cfg);
         for b in &rows[i + 1..] {
+            // Timeline navigation is inactive while the composer owns focus.
+            if (a.owner == Owner::Composer && b.group == Group::Timeline)
+                || (b.owner == Owner::Composer && a.group == Group::Timeline)
+            {
+                continue;
+            }
             let bind_b = b.keybind_for(cfg);
             for ca in bind_a.chords_on(platform) {
                 if bind_b
@@ -1511,6 +1523,9 @@ pub fn field_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx, at_end: bool) -> b
         return s.terminal_key(ev, tx);
     }
     for action in [
+        A::Dictation,
+        A::FinishDictation,
+        A::CancelDictation,
         A::PrevSession,
         A::NextSession,
         A::ToggleFocus,
@@ -1686,7 +1701,9 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
             }
             s.menu = (s.menu != Some(menu.clone())).then_some(menu);
         }
-        A::Dictation if session => s.toggle_voice(),
+        A::Dictation if session && (s.cfg.voice.usable() || s.voice.is_some()) => s.toggle_voice(),
+        A::FinishDictation if s.voice.is_some() => s.finish_voice(),
+        A::CancelDictation if s.voice.is_some() => s.cancel_voice(),
         A::JumpLatest if session => {
             let Some(asid) = s.selected.clone() else {
                 return false;
@@ -2084,7 +2101,7 @@ mod tests {
             key: k,
             mods: Mods {
                 shift,
-                cmd: ctrl,
+                cmd: ctrl && !crate::platform::is_macos(),
                 alt,
                 ctrl,
                 logo: false,
@@ -2118,14 +2135,20 @@ mod tests {
         assert!(rt.state.term.sink.focused);
         rt.frame(1.0 / 60.0);
 
-        rt.key(key(Key::Left, true, false, true));
+        let mut left = key(Key::Left, !crate::platform::is_macos(), false, true);
+        left.mods.cmd = true;
+        left.mods.logo = crate::platform::is_macos();
+        rt.key(left);
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.focus, 0);
         assert!(rt.state.draft.focused);
         assert!(!rt.state.term.sink.focused);
 
         // And from the session composer, `Ctrl+Alt+Right` moves focus back to the terminal tile!
-        rt.key(key(Key::Right, true, false, true));
+        let mut right = key(Key::Right, !crate::platform::is_macos(), false, true);
+        right.mods.cmd = true;
+        right.mods.logo = crate::platform::is_macos();
+        rt.key(right);
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.focus, 1);
         assert!(rt.state.term.sink.focused);
@@ -2164,6 +2187,53 @@ mod tests {
 
         // `+,` is normalized to `+comma`
         assert!(try_parse_keybind("ctrl+,").is_some());
+    }
+
+    #[test]
+    fn remapped_voice_controls_finish_and_cancel_without_sending_the_draft() {
+        use rune::{Env, Key, Mods, Runtime};
+        let mut s = state();
+        s.mode = Mode::Session;
+        s.draft = rune::TextEdit::new("keep this draft");
+        s.voice = Some(crate::ui::voice::Dictation::preview(
+            crate::config::VoiceMode::Realtime,
+            std::sync::Arc::new(crate::model::voice::Meter::default()),
+            "",
+        ));
+        s.cfg
+            .keymap
+            .bindings
+            .insert("finish_dictation".into(), "alt+f".into());
+        s.cfg
+            .keymap
+            .bindings
+            .insert("cancel_dictation".into(), "alt+x".into());
+        let mut rt = Runtime::new(s, super::super::view, (1440.0, 900.0), Env::new(true, 1.0));
+        rt.on_key = Some(super::super::on_key);
+        rt.frame(0.0);
+        rt.key(KeyEvent {
+            key: Key::Command('f'),
+            mods: Mods {
+                alt: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(
+            rt.state.voice.as_ref().unwrap().phase,
+            crate::ui::voice::Phase::Transcribing
+        );
+        assert_eq!(rt.state.draft.text, "keep this draft");
+        rt.key(KeyEvent {
+            key: Key::Command('x'),
+            mods: Mods {
+                alt: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.voice.is_none());
+        assert_eq!(rt.state.draft.text, "keep this draft");
     }
 
     #[test]
@@ -2297,7 +2367,7 @@ mod tests {
             key: Key::Command('b'),
             mods: Mods {
                 ctrl: true,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 ..Default::default()
             },
         };
@@ -2307,11 +2377,16 @@ mod tests {
         rt.key(leader);
         rt.frame(2.0 / 60.0);
         assert!(!rt.state.is_leader_armed());
-        let expected = "1b 5b 41 1b 5b 42 1b 5b 43 1b 5b 44 02";
-        while !session
+        let expected = [
+            0x1b, 0x5b, 0x41, 0x1b, 0x5b, 0x42, 0x1b, 0x5b, 0x43, 0x1b, 0x5b, 0x44, 0x02,
+        ];
+        while session
             .dump_plain_text()
             .unwrap_or_default()
-            .contains(expected)
+            .split_whitespace()
+            .filter_map(|word| u8::from_str_radix(word, 16).ok())
+            .collect::<Vec<_>>()
+            != expected
         {
             assert!(
                 Instant::now() < deadline,
@@ -2343,7 +2418,7 @@ mod tests {
             key: Key::Text(" ".into()),
             mods: Mods {
                 ctrl: true,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 ..Default::default()
             },
         };
@@ -2396,7 +2471,7 @@ mod tests {
             key: Key::Command('g'),
             mods: Mods {
                 ctrl: true,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 ..Default::default()
             },
         };

@@ -3,7 +3,7 @@
 //! it found and how each stands, and one press to start (or skip). Seen
 //! once (`general.welcomed`); never again after a session exists.
 
-use rune::{col, el, row, text, El, SurfaceFit, Transition};
+use rune::{col, el, row, text, El, SurfaceFit};
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
 
 use super::agents::{by_standing, Standing};
@@ -224,14 +224,8 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                 ),
         );
     let card = look
-        .panel(k, card, k.radius.xl)
-        .modal(true, |s: &mut UiState| s.dismiss_welcome(false))
-        .transition(
-            Transition::scale(0.94)
-                .combined(Transition::opacity())
-                .combined(Transition::offset(0.0, 18.0)),
-        )
-        .motion(crate::theme::look::ARRIVE);
+        .dialog_motion(look.panel(k, card, k.radius.xl))
+        .modal(true, |s: &mut UiState| s.dismiss_welcome(false));
     let card = look.glow(card, k.c.bg_accent, 0.35);
     layer.push(
         el().key("welcome-layer")

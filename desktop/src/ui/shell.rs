@@ -16,7 +16,7 @@ use rune_kit::{
 use super::copy::{tr, tr_ref};
 use super::{
     art, composer, home, inbox, inspector, sessions, settings, tasks, tiles, timeline, title_of,
-    Activity, InspectorTab, OpenMenu,
+    Activity, OpenMenu,
 };
 use super::{Mode, UiState};
 use crate::branding::{APP_MARK_PNG, APP_NAME};
@@ -403,6 +403,16 @@ fn sidebar_panel(s: &UiState, k: &Kit, wash: f32) -> El {
             .radius(k.radius.lg)
             .fill(k.c.bg_base.alpha(0.85))
             .system_material(rune::SystemMaterial::Glass)
+            // Native material replaces this node's fill. A separate themed
+            // wash keeps the sidebar in the palette above the system glass.
+            .child(
+                el().key("sidebar-glass-tint")
+                    .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                    .radius(k.radius.lg)
+                    .continuous_corners()
+                    .fill(k.c.bg_base.alpha(SIDEBAR_TINT[usize::from(s.look().dark)]))
+                    .a11y_hidden(),
+            )
     } else {
         panel
     };
@@ -598,11 +608,8 @@ fn session_identity(s: &UiState, k: &Kit, look: &Look) -> El {
             meta.push(name);
         }
     }
-    let branch = s.branch_of(info);
-    if branch.is_none() {
-        if let Some(folder) = UiState::folder_name(info) {
-            meta.push(folder);
-        }
+    if let Some(folder) = UiState::folder_name(info) {
+        meta.push(folder);
     }
 
     line = line
@@ -645,32 +652,6 @@ fn session_identity(s: &UiState, k: &Kit, look: &Look) -> El {
                             .color(k.c.text_faint)
                             .truncate(),
                     );
-                    if let Some(b) = branch {
-                        meta_row = meta_row.child(
-                            row()
-                                .key("session-branch-chip")
-                                .gap(3.0)
-                                .center_y()
-                                .px(4.0)
-                                .py(1.0)
-                                .fill(k.c.layer_01)
-                                .border(1.0, k.c.border_muted)
-                                .clip_rounded(3.0)
-                                .cursor(rune::Cursor::Pointer)
-                                .help(tr_ref(language, "Git"))
-                                .on_press(|s: &mut UiState| s.open_git_inspector())
-                                .child(
-                                    rune::icon(&super::icons::BRANCH, 10.0).color(k.c.icon_muted),
-                                )
-                                .child(
-                                    text(b)
-                                        .font(k.ty.caption().lh(13.0))
-                                        .color(k.c.text_muted)
-                                        .truncate()
-                                        .max_w(140.0),
-                                ),
-                        );
-                    }
                     meta_row
                 }),
         );
@@ -771,35 +752,6 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
             // A squeezed column keeps the title readable: Split folds away
             // (Ctrl+\\ still splits), then the change count.
             let fit = super::Fit::of("main");
-            if let Some(meter) = timeline::context_meter(s, k, &asid) {
-                bar = bar.trailing(meter);
-            }
-            if s.diff_stat.files > 0 && fit > super::Fit::Tight {
-                let label = format!("+{} −{}", s.diff_stat.added, s.diff_stat.removed);
-                bar = bar.trailing(
-                    Button::new(label)
-                        .variant(if s.show_diff {
-                            ButtonVariant::Contrast
-                        } else {
-                            ButtonVariant::Ghost
-                        })
-                        .control_size(ControlSize::Small)
-                        .help(format!(
-                            "{} {}",
-                            s.diff_stat.files,
-                            tr_ref(language, "changed file(s)")
-                        ))
-                        .on_press(|s: &mut UiState| match s.selected.clone() {
-                            Some(asid) => s.send(Command::OpenDiff {
-                                asid: muqun_gateway::agents::AgentSessionId(asid),
-                                file: None,
-                            }),
-                            None => s.show_diff = !s.show_diff,
-                        })
-                        .build(k)
-                        .key("changes"),
-                );
-            }
             if fit == super::Fit::Wide {
                 bar = bar.trailing(
                     Button::new(tr_ref(language, "Split view"))
@@ -865,23 +817,6 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
         && !s.in_split()
         && crate::plugin::is_enabled("inspector", &s.cfg.plugins_disabled)
     {
-        let is_git_open = s.right_open && !s.term.open && s.inspector_tab == InspectorTab::Git;
-        bar = bar.trailing(
-            IconButton::new(&super::icons::BRANCH)
-                .variant(if is_git_open {
-                    IconButtonVariant::Contrast
-                } else {
-                    IconButtonVariant::Ghost
-                })
-                .label(tr_ref(language, "Git"))
-                .help(super::keymap::tip(
-                    tr_ref(language, "Git"),
-                    super::keymap::Action::ToggleGit,
-                ))
-                .on_press(|s: &mut UiState| s.toggle_git_inspector())
-                .build(k)
-                .key("git-toggle"),
-        );
         bar = bar.trailing(
             IconButton::new(&INSPECTOR)
                 .variant(if s.right_open && !s.term.open {

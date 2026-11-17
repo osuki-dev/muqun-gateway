@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use rune::{col, el, rich, row, text, El, Span, Spring, TextEdit, Transition, Tx};
+use rune::{col, el, rich, row, text, El, Span, TextEdit, Tx};
 use rune_kit::{Kit, TextInput};
 
 use super::copy::{tr, tr_ref};
@@ -761,19 +761,10 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
     for shadow in k.shadow_layers(&k.elevation.overlay) {
         panel = panel.box_shadow(shadow);
     }
-    // A spring drop-in from just above; a plain fade under reduce motion.
-    let panel = if s.cfg.appearance.reduced_motion {
-        panel.transition(Transition::opacity())
-    } else {
-        panel
-            .transition(
-                Transition::opacity()
-                    .combined(Transition::offset(0.0, -12.0))
-                    .combined(Transition::scale(0.97)),
-            )
-            .motion(Spring::new(0.32, 0.16))
-    }
-    .modal(true, |s: &mut UiState| s.palette = None);
+    // Shared dialog motion, including the reduced-motion fallback.
+    let panel = look
+        .dialog_motion(panel)
+        .modal(true, |s: &mut UiState| s.palette = None);
 
     layer.push(
         el().key("palette-scrim")

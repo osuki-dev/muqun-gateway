@@ -76,6 +76,7 @@ fn echo_scene(s: &mut UiState, running: bool, words: &str, picture: bool) -> u64
     composer_session(s, running);
     let staged = if picture {
         vec![crate::model::compose::StagedFile {
+            draft_token: None,
             path: SCENE_PICTURE.into(),
             name: "screenshot.png".into(),
             size: 1,

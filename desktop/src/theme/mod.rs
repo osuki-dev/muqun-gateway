@@ -18,6 +18,7 @@ pub mod color_scheme;
 pub mod gallery;
 pub mod look;
 pub mod muqun_theme;
+pub mod omarchy;
 pub mod pack;
 pub mod service;
 pub mod store;

@@ -24,7 +24,7 @@ use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 use muqun_gateway::platform::StoredUpload;
 use tokio::sync::broadcast;
 
-pub use dynamic::DynamicHub;
+pub use dynamic::{connection_origin, spawn_connected, ConnectionContext, DynamicHub};
 pub use local::LocalHub;
 pub use remote::{discover_local_gateway, LocalGateway, RemoteHub};
 

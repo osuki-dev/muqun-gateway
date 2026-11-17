@@ -198,10 +198,15 @@ fn stage(
                     .opacity(art.look.opacity)
             }
         } else {
-            let bytes = crate::theme::apply::identity()
-                .logo
-                .unwrap_or_else(|| std::sync::Arc::<[u8]>::from(crate::branding::APP_MARK_PNG));
-            art::picture(images, bytes, rune::SurfaceFit::Fit).size(width, height)
+            if let Some(bytes) = crate::theme::apply::identity().logo {
+                art::picture(images, bytes, rune::SurfaceFit::Fit).size(width, height)
+            } else {
+                // The packaged icon has an opaque square background. Mask only
+                // this built-in mark; theme logos retain their own silhouette.
+                art::picture(images, crate::branding::APP_ICON_PNG, rune::SurfaceFit::Fit)
+                    .size(width, height)
+                    .clip_soft(width.min(height) * 0.22)
+            }
         };
         el().key(key.to_string())
             .absolute(x, y)

@@ -203,6 +203,10 @@ mod tests {
             unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
         );
+        // Parallel tests can fork while this fd is open; the child briefly
+        // retains the same flock description until exec. Release explicitly
+        // so this assertion does not race unrelated process spawning.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(holder);
         assert_eq!(probe(&path), GatewayPresence::NotRunning);
         let _ = std::fs::remove_dir_all(&dir);
