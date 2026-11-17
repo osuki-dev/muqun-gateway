@@ -396,19 +396,21 @@ pub fn colors(k: &Kit, scheme: ColorScheme) -> Colors {
             hex(&t.cursor),
             hex(&t.selection),
         ) {
-            let mut adjusted_ansi = ansi;
-            for slot in &mut adjusted_ansi {
-                *slot = to_rgb(ensure_contrast(color(*slot), bg, 4.65));
-            }
+            // Explicit terminal palettes carry ANSI semantics (including black
+            // and dim colours). Do not recolour them as generic UI text.
             return Colors {
-                fg: to_rgb(ensure_contrast(fg, bg, 4.65)),
+                fg: to_rgb(fg),
                 bg: to_rgb(bg),
                 cursor: to_rgb(cursor),
                 selection: to_rgb(bg.mix(sel.alpha(1.0), sel.a.max(0.25))),
-                ansi: adjusted_ansi,
+                ansi,
             };
         }
     }
+    fallback_colors(k)
+}
+
+fn fallback_colors(k: &Kit) -> Colors {
     let c = &k.c;
     let (bg, fg) = (c.bg_base, c.text_base);
     let is_light = relative_luminance(bg) >= 0.45;
@@ -1374,74 +1376,84 @@ impl UiState {
     /// A key while the terminal has the keyboard (the sink's key handler).
     pub(crate) fn terminal_key(&mut self, ev: &KeyEvent, tx: &mut Tx) -> bool {
         let mac = crate::platform::keys::Style::current() == crate::platform::keys::Style::Symbols;
-        let letter =
-            |c: char| matches!(&ev.key, rune::Key::Command(k) if k.eq_ignore_ascii_case(&c));
 
         // 1. Global Leader key / Which-Key & shortcut recording interception:
         if super::keymap::intercept_global_key(self, ev, tx) {
             return true;
         }
 
-        // 2. Global focus toggle between terminal and session composer (`Ctrl+;` / `Cmd+;` or custom):
-        if input::is_focus_toggle(ev, tx.physical_key(), mac)
-            || super::keymap::bind_matches_cfg(
-                super::keymap::entry(super::keymap::Action::ToggleFocus),
-                &self.cfg.keymap,
-                ev,
-                tx,
-            )
-        {
-            self.toggle_focus_tx(tx);
-            return true;
-        }
-
-        // 2b. Configurable terminal actions (if customized or matching entry):
-        if super::keymap::bind_matches_cfg(
-            super::keymap::entry(super::keymap::Action::TermNewTab),
-            &self.cfg.keymap,
-            ev,
-            tx,
-        ) {
-            self.term_new_tab();
-            return true;
-        }
-        if super::keymap::bind_matches_cfg(
-            super::keymap::entry(super::keymap::Action::TermCloseTab),
-            &self.cfg.keymap,
-            ev,
-            tx,
-        ) {
-            self.term_close_tab(self.term.active_tab);
-            return true;
-        }
-        if super::keymap::bind_matches_cfg(
-            super::keymap::entry(super::keymap::Action::TermSearch),
-            &self.cfg.keymap,
-            ev,
-            tx,
-        ) {
-            self.open_terminal_search();
-            return true;
-        }
-        if super::keymap::bind_matches_cfg(
-            super::keymap::entry(super::keymap::Action::TermSplit),
-            &self.cfg.keymap,
-            ev,
-            tx,
-        ) {
-            if self.in_split() {
-                self.split_terminal_tile();
-            } else {
-                self.open_terminal_tile();
+        use super::keymap::{bind_matches_cfg, entry, run, Action};
+        let matches = |action| bind_matches_cfg(entry(action), &self.cfg.keymap, ev, tx);
+        let action = [
+            Action::ToggleFocus,
+            Action::ToggleTerminal,
+            Action::TermNewTab,
+            Action::TermCloseTab,
+            Action::TermSearch,
+            Action::TermSplit,
+            Action::TermCycleTab,
+            Action::TermSwitchTab,
+            Action::TermCopy,
+            Action::TermPaste,
+        ]
+        .into_iter()
+        .find(|action| matches(*action));
+        if let Some(action) = action {
+            match action {
+                Action::ToggleFocus => self.toggle_focus_tx(tx),
+                Action::ToggleTerminal => self.toggle_terminal_tx(tx),
+                Action::TermNewTab => self.term_new_tab(),
+                Action::TermCloseTab => self.term_close_tab(self.term.active_tab),
+                Action::TermSearch => self.open_terminal_search(),
+                Action::TermSplit => {
+                    if self.in_split() {
+                        self.split_terminal_tile();
+                    } else {
+                        self.open_terminal_tile();
+                    }
+                    self.focus_terminal_tx(tx);
+                }
+                Action::TermCycleTab => {
+                    let previous = ev.mods.shift
+                        || matches!(
+                            ev.key,
+                            rune::Key::Left | rune::Key::PageUp | rune::Key::Command('[')
+                        )
+                        || tx.physical_key() == Some(rune::PhysicalKeyCode::BracketLeft);
+                    if previous {
+                        self.term_prev_tab();
+                    } else {
+                        self.term_next_tab();
+                    }
+                }
+                Action::TermSwitchTab => {
+                    let digit = match &ev.key {
+                        rune::Key::Command(c) => c.to_digit(10),
+                        rune::Key::Text(t) => t.chars().next().and_then(|c| c.to_digit(10)),
+                        _ => None,
+                    };
+                    if let Some(d @ 1..=9) = digit {
+                        let target = if d == 9 {
+                            self.term.tabs.len().saturating_sub(1)
+                        } else {
+                            d as usize - 1
+                        };
+                        if target < self.term.tabs.len() {
+                            self.term_switch_tab(target);
+                        }
+                    }
+                }
+                Action::TermCopy => {
+                    if let Some(text) = self.term.frame.as_ref().and_then(|f| f.selection.clone()) {
+                        tx.copy(text);
+                    }
+                }
+                Action::TermPaste => tx.request_paste(),
+                _ => unreachable!(),
             }
-            self.focus_terminal_tx(tx);
             return true;
         }
-
-        // Workspace chords with Alt belong to the application even when a shell
-        // has focus. Plain Ctrl+J and other shell editing keys stay in the PTY.
-        if self.in_split() && ev.mods.alt {
-            use super::keymap::{bind_matches_cfg, entry, run, Action};
+        if self.in_split() {
             for action in [
                 Action::CycleTileLayout,
                 Action::ToggleTileZoom,
@@ -1449,43 +1461,13 @@ impl UiState {
                 Action::EqualizeTiles,
                 Action::SplitHorizontal,
                 Action::SplitVertical,
+                Action::FocusPaneToward,
+                Action::SwapPaneToward,
+                Action::FocusPane,
             ] {
                 if bind_matches_cfg(entry(action), &self.cfg.keymap, ev, tx) {
                     return run(self, action, ev, tx);
                 }
-            }
-        }
-
-        // 3. Split view pane navigation (`Ctrl+Alt+Arrows`, `Ctrl+Alt+Shift+Arrows`, `Mod+1..4`):
-        if self.in_split() {
-            if super::keymap::entry(super::keymap::Action::FocusPaneToward)
-                .keybind()
-                .matches_tx(ev, tx)
-                || super::keymap::entry(super::keymap::Action::SwapPaneToward)
-                    .keybind()
-                    .matches_tx(ev, tx)
-                || (ev.mods.primary()
-                    && ev.mods.alt
-                    && matches!(
-                        ev.key,
-                        rune::Key::Left | rune::Key::Right | rune::Key::Up | rune::Key::Down
-                    ))
-            {
-                self.term.sink.focused = false;
-                let handled = super::tiles::arrow_key(self, ev);
-                if self.tiles.get(self.focus).is_some_and(|t| t.is_terminal()) {
-                    self.focus_terminal_tx(tx);
-                }
-                if handled {
-                    return true;
-                }
-            }
-            if super::keymap::entry(super::keymap::Action::FocusPane)
-                .keybind()
-                .matches_tx(ev, tx)
-                && super::keymap::run(self, super::keymap::Action::FocusPane, ev, tx)
-            {
-                return true;
             }
         }
 
@@ -1494,157 +1476,21 @@ impl UiState {
             return true;
         }
 
-        // 4. Herdr direct navigation chords (when terminal is focused):
-        // Alt+Left / Alt+Right: Previous / Next terminal tab
-        if ev.mods.alt && !ev.mods.ctrl && !ev.mods.shift && !ev.mods.logo {
-            if ev.key == rune::Key::Left {
-                self.term_prev_tab();
-                return true;
+        // Legacy routing remains for shell/application ownership, but customized
+        // actions must not also fire through their old clipboard/toggle aliases.
+        let route = match input::route(ev, tx.physical_key(), mac) {
+            Route::Copy if entry(Action::TermCopy).is_overridden(&self.cfg.keymap) => {
+                Route::Terminal
             }
-            if ev.key == rune::Key::Right {
-                self.term_next_tab();
-                return true;
+            Route::Paste if entry(Action::TermPaste).is_overridden(&self.cfg.keymap) => {
+                Route::Terminal
             }
-            if ev.key == rune::Key::Escape {
-                if self.in_split() && self.tiles.get(self.focus).is_some_and(|t| t.is_terminal()) {
-                    self.close_tile(self.focus);
-                } else {
-                    self.close_terminal();
-                }
-                return true;
+            Route::Toggle if entry(Action::ToggleTerminal).is_overridden(&self.cfg.keymap) => {
+                Route::Terminal
             }
-        }
-        // Alt+Enter / Alt+Shift+Enter: Split terminal tile
-        if ev.key == rune::Key::Enter && ev.mods.alt && !ev.mods.ctrl && !ev.mods.logo {
-            if self.in_split() {
-                self.split_terminal_tile();
-            } else {
-                self.open_terminal_tile();
-            }
-            self.focus_terminal_tx(tx);
-            return true;
-        }
-
-        // Tab, search & split shortcuts: Ctrl+Shift+T (new tab), Ctrl+Shift+W (close tab),
-        // Ctrl+Shift+F (find in terminal), Ctrl+Shift+D / Ctrl+Shift+\ (dock/split terminal pane)
-        if (ev.mods.ctrl && ev.mods.shift && !ev.mods.alt) || (mac && ev.mods.logo && ev.mods.shift)
-        {
-            if letter('f') {
-                self.open_terminal_search();
-                return true;
-            }
-            if letter('t') {
-                self.term_new_tab();
-                return true;
-            }
-            if letter('w') {
-                self.term_close_tab(self.term.active_tab);
-                return true;
-            }
-            if letter('d')
-                || matches!(&ev.key, rune::Key::Command('\\'))
-                || matches!(&ev.key, rune::Key::Text(t) if t == "\\" || t == "|")
-                || tx.physical_key() == Some(rune::PhysicalKeyCode::Backslash)
-            {
-                if self.in_split() {
-                    self.split_terminal_tile();
-                } else {
-                    self.open_terminal_tile();
-                }
-                return true;
-            }
-            if matches!(&ev.key, rune::Key::Command(']'))
-                || matches!(&ev.key, rune::Key::Text(t) if t == "]" || t == "}")
-                || tx.physical_key() == Some(rune::PhysicalKeyCode::BracketRight)
-            {
-                self.term_next_tab();
-                return true;
-            }
-            if matches!(&ev.key, rune::Key::Command('['))
-                || matches!(&ev.key, rune::Key::Text(t) if t == "[" || t == "{")
-                || tx.physical_key() == Some(rune::PhysicalKeyCode::BracketLeft)
-            {
-                self.term_prev_tab();
-                return true;
-            }
-        }
-        // Herdr / global split shortcut inside terminal: Ctrl+\ (or Cmd+D / Cmd+\ on macOS)
-        if (ev.mods.ctrl
-            && !ev.mods.shift
-            && !ev.mods.alt
-            && (matches!(&ev.key, rune::Key::Command('\\'))
-                || tx.physical_key() == Some(rune::PhysicalKeyCode::Backslash)))
-            || (mac
-                && ev.mods.logo
-                && !ev.mods.shift
-                && !ev.mods.alt
-                && (letter('d') || matches!(&ev.key, rune::Key::Command('\\'))))
-        {
-            if self.in_split() {
-                self.split();
-            } else {
-                self.open_terminal_tile();
-            }
-            return true;
-        }
-        // Terminal shortcuts on macOS: Cmd+F (search), Cmd+T (new tab)
-        if mac && ev.mods.logo && !ev.mods.shift && !ev.mods.alt {
-            if letter('f') {
-                self.open_terminal_search();
-                return true;
-            }
-            if letter('t') {
-                self.term_new_tab();
-                return true;
-            }
-        }
-        // Tab switching: Ctrl+Tab (next), Ctrl+Shift+Tab (prev)
-        if ev.key == rune::Key::Tab && ev.mods.ctrl && !ev.mods.alt {
-            if ev.mods.shift {
-                self.term_prev_tab();
-            } else {
-                self.term_next_tab();
-            }
-            return true;
-        }
-        // PageDown / PageUp with Ctrl: Next / Prev tab
-        if ev.mods.ctrl && !ev.mods.alt && !ev.mods.shift {
-            if ev.key == rune::Key::PageDown {
-                self.term_next_tab();
-                return true;
-            }
-            if ev.key == rune::Key::PageUp {
-                self.term_prev_tab();
-                return true;
-            }
-        }
-        // Direct jump: Alt+1..Alt+9 (or Cmd+1..Cmd+9 on macOS when not in split view)
-        let is_jump_mod = (ev.mods.alt && !ev.mods.ctrl && !ev.mods.shift && !ev.mods.cmd)
-            || (mac && ev.mods.logo && !ev.mods.ctrl && !ev.mods.shift && !self.in_split());
-        if is_jump_mod {
-            let digit = match &ev.key {
-                rune::Key::Command(c) if c.is_ascii_digit() => c.to_digit(10),
-                rune::Key::Text(t)
-                    if t.len() == 1 && t.chars().next().unwrap().is_ascii_digit() =>
-                {
-                    t.chars().next().unwrap().to_digit(10)
-                }
-                _ => None,
-            };
-            if let Some(d) = digit {
-                if (1..=8).contains(&d) {
-                    let target = (d - 1) as usize;
-                    if target < self.term.tabs.len() {
-                        self.term_switch_tab(target);
-                        return true;
-                    }
-                } else if d == 9 && !self.term.tabs.is_empty() {
-                    self.term_switch_tab(self.term.tabs.len() - 1);
-                    return true;
-                }
-            }
-        }
-        match input::route(ev, tx.physical_key(), mac) {
+            other => other,
+        };
+        match route {
             Route::Toggle => self.toggle_terminal_tx(tx),
             Route::Copy => {
                 if let Some(text) = self.term.frame.as_ref().and_then(|f| f.selection.clone()) {
@@ -1856,10 +1702,6 @@ fn shell_tab(k: &Kit, key: String, title: String, active: bool, number: usize) -
     } else {
         title.clone()
     };
-    let track = format!(
-        "{}-active-light",
-        key.rsplit_once('-').map_or(key.as_str(), |(p, _)| p)
-    );
     let ink = if active {
         k.c.text_base
     } else {
@@ -1876,7 +1718,7 @@ fn shell_tab(k: &Kit, key: String, title: String, active: bool, number: usize) -
             .pr(4.0)
             .gap(8.0)
             .center_y()
-            .radius(k.radius.sm)
+            .radius(k.radius.lg)
             .fill(if active {
                 k.c.surface_raised.mix(k.c.bg_accent, 0.14)
             } else {
@@ -1904,29 +1746,18 @@ fn shell_tab(k: &Kit, key: String, title: String, active: bool, number: usize) -
                     .truncate()
                     .shrink()
                     .min_w(0.0),
-            )
-            .children(active.then(|| {
-                el().key("tab-indicator")
-                    .matched(track)
-                    .pin(Some(10.0), None, Some(10.0), Some(0.0))
-                    .h(3.0)
-                    .radius(1.5)
-                    .box_shadow(rune::Shadow {
-                        x: 0.0,
-                        y: 0.0,
-                        blur: 12.0,
-                        spread: 1.0,
-                        color: k.c.bg_accent.alpha(0.6),
-                        inset: false,
-                    })
-                    .fill(k.c.bg_accent)
-                    .opacity(if active { 1.0 } else { 0.0 })
-                    .a11y_hidden()
-            })),
+            ),
     )
 }
 
-pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut Vec<El>) -> El {
+pub fn view(
+    s: &UiState,
+    k: &Kit,
+    scheme: ColorScheme,
+    scale: f32,
+    layer: &mut Vec<El>,
+    controls: El,
+) -> El {
     let language = s.cfg.general.language;
     let colors = colors(k, scheme);
     s.term.want.set(Some(colors));
@@ -2065,41 +1896,7 @@ pub fn view(s: &UiState, k: &Kit, scheme: ColorScheme, scale: f32, layer: &mut V
                 .build(k)
                 .key("terminal-restart"),
         )
-        .child(
-            IconButton::new(&super::icons::PLUS)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Add to split view"))
-                .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
-                    s.open_terminal_tile();
-                    s.focus_terminal_tx(tx);
-                })
-                .build(k)
-                .key("terminal-dock-split"),
-        )
-        .child(
-            IconButton::new(k.glyph.chevron_down)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Hide terminal"))
-                .on_press(|s: &mut UiState| s.close_terminal())
-                .build(k)
-                .key("terminal-hide"),
-        )
-        .child(
-            IconButton::new(k.glyph.close)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Close tab"))
-                .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
-                    s.term_close_tab(s.term.active_tab);
-                    if s.term.open || s.has_terminal_tile() {
-                        s.focus_terminal_tx(tx);
-                    }
-                })
-                .build(k)
-                .key("terminal-close"),
-        );
+        .child(controls);
 
     let ended_now = s.term.fixture_ended.is_some()
         || s.term.session.as_ref().is_some_and(|x| x.ended().is_some());
@@ -2189,6 +1986,18 @@ pub fn tile_body_for(
     scale: f32,
     layer: &mut Vec<El>,
     tile_idx: Option<usize>,
+) -> El {
+    tile_body_with_controls(s, k, scheme, scale, layer, tile_idx, None)
+}
+
+pub fn tile_body_with_controls(
+    s: &UiState,
+    k: &Kit,
+    scheme: ColorScheme,
+    scale: f32,
+    layer: &mut Vec<El>,
+    tile_idx: Option<usize>,
+    controls: Option<El>,
 ) -> El {
     let language = s.cfg.general.language;
     let colors = colors(k, scheme);
@@ -2331,7 +2140,7 @@ pub fn tile_body_for(
     let mut subheader = row()
         .key(format!("tile-terminal-subhead{sfx}"))
         .w_full()
-        .h(40.0)
+        .h(HEAD)
         .pl(8.0)
         .pr(8.0)
         .gap(6.0)
@@ -2366,6 +2175,7 @@ pub fn tile_body_for(
             .key(format!("tile-terminal-restart{sfx}")),
     );
 
+    let subheader = subheader.children(controls);
     let view = GridView {
         tile_idx,
         live,
@@ -2494,7 +2304,7 @@ fn terminal_search_bar(s: &UiState, k: &Kit) -> El {
         .center_y()
         .px(10.0)
         .py(4.0)
-        .radius(crate::theme::look::CARD_RADIUS)
+        .radius(k.radius.lg)
         .fill(k.c.layer_01)
         .border(1.0, k.c.border_muted)
         .child(field)
@@ -3299,7 +3109,7 @@ mod tests {
             key,
             mods: Mods {
                 shift,
-                cmd: ctrl,
+                cmd: ctrl && !crate::platform::is_macos(),
                 alt: false,
                 ctrl,
                 logo: false,
@@ -3363,7 +3173,10 @@ mod tests {
         for _ in 0..3 {
             rt.frame(1.0 / 60.0);
         }
-        rt.key(key(Key::Command('h'), true, true));
+        let mut home = key(Key::Command('h'), !crate::platform::is_macos(), true);
+        home.mods.cmd = true;
+        home.mods.logo = crate::platform::is_macos();
+        rt.key(home);
         rt.frame(1.0 / 60.0);
         let s = &rt.state;
         assert_eq!(s.mode, super::super::Mode::Home);
@@ -3620,7 +3433,7 @@ mod tests {
             key: Key::Tab,
             mods: Mods {
                 shift: false,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 alt: false,
                 ctrl: true,
                 logo: false,
@@ -3634,7 +3447,7 @@ mod tests {
             key: Key::Tab,
             mods: Mods {
                 shift: true,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 alt: false,
                 ctrl: true,
                 logo: false,
@@ -3648,7 +3461,7 @@ mod tests {
             key: Key::PageUp,
             mods: Mods {
                 shift: false,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 alt: false,
                 ctrl: true,
                 logo: false,
@@ -3662,7 +3475,7 @@ mod tests {
             key: Key::PageDown,
             mods: Mods {
                 shift: false,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 alt: false,
                 ctrl: true,
                 logo: false,
@@ -3670,18 +3483,37 @@ mod tests {
         });
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.term.active_tab, 2);
+        // A custom binding replaces the old aliases immediately.
+        rt.state.edit(crate::config::ConfigEdit::SetKeybind {
+            action: "term_cycle_tab".into(),
+            spec: Some("ctrl+shift+q".into()),
+        });
+        rt.key(KeyEvent {
+            key: Key::Tab,
+            mods: Mods {
+                ctrl: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.2);
+        assert_eq!(rt.state.term.active_tab, 2);
+        rt.key(KeyEvent {
+            key: Key::Command('q'),
+            mods: Mods {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(0.3);
+        assert_eq!(rt.state.term.active_tab, 1);
     }
 
     #[test]
-    fn terminal_colors_maintain_high_contrast_in_light_and_dark_modes() {
+    fn fallback_terminal_colors_maintain_high_contrast_in_light_and_dark_modes() {
         for dark in [false, true] {
-            let scheme = if dark {
-                ColorScheme::Dark
-            } else {
-                ColorScheme::Light
-            };
             let kit = Kit::neutral(dark);
-            let c = colors(&kit, scheme);
+            let c = fallback_colors(&kit);
             let bg = color(c.bg);
             let fg = color(c.fg);
 
@@ -4270,8 +4102,8 @@ mod tests {
                 shift: false,
                 cmd: true,
                 alt: false,
-                ctrl: true,
-                logo: false,
+                ctrl: !crate::platform::is_macos(),
+                logo: crate::platform::is_macos(),
             },
         };
         assert!(rt.state.term.open && rt.state.term.sink.focused);

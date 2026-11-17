@@ -83,9 +83,10 @@ toml = "1.1.8"
 tokio = { version = "1.53.3", features = ["test-util"] }
 
 [profile.release]
-# The gateway ships as a single prebuilt binary per platform. Thin LTO and one
+# Gateway and Desktop ship as prebuilt binaries per platform. Thin LTO and one
 # codegen unit trade a slower release build for a smaller, faster artifact;
 # stripping drops the symbol tables nothing needs at runtime.
+opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
@@ -100,3 +101,11 @@ opt-level = 3
 # Optional local override (not required for CI): point at a sibling checkout
 # with `cargo --config 'patch."https://github.com/ryuhzk/rune".rune.path="../rune/crates/rune"'`
 # (and the matching rune-kit path) while iterating on Rune itself.
+
+# Rune platform patches, pinned with the UI framework.
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de" }
+winit = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de" }
+parley_engine = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de" }
+accesskit_windows = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de" }
+accesskit_macos = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de" }

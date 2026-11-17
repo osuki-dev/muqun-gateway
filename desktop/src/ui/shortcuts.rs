@@ -391,7 +391,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .child(foot);
     // Denser than the palette's glass: the sheet is text to read.
     let mut panel = look
-        .panel(k, panel, crate::theme::look::PANEL_RADIUS)
+        .panel(k, panel, k.radius.xl)
         .fill(k.c.surface_raised_base.alpha(0.97));
     for shadow in k.shadow_layers(&k.elevation.overlay) {
         panel = panel.box_shadow(shadow);
@@ -670,7 +670,7 @@ fn mount_which_key(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .child(grid);
 
     let mut card = look
-        .panel(k, card, crate::theme::look::PANEL_RADIUS)
+        .panel(k, card, k.radius.xl)
         .fill(k.c.surface_raised_base.alpha(0.97));
     for shadow in k.shadow_layers(&k.elevation.overlay) {
         card = card.box_shadow(shadow);

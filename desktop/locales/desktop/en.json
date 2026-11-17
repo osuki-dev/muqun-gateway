@@ -1,4 +1,6 @@
 {
+  "Describe the task…": "Describe the task…",
+  "Message…": "Message…",
   "Open": "Open",
   "Remove": "Remove",
   "Steer:": "Steer:",
@@ -600,5 +602,10 @@
   "A command or path. Empty looks it up on PATH.": "A command or path. Empty looks it up on PATH.",
   "Start with Muqun": "Start with Muqun",
   "Launch its server when Muqun starts.": "Launch its server when Muqun starts.",
-  "The coding agents found on this computer. Changes save as you type.": "The coding agents found on this computer. Changes save as you type."
+  "The coding agents found on this computer. Changes save as you type.": "The coding agents found on this computer. Changes save as you type.",
+  "Recent sessions": "Recent",
+  "All sessions": "All sessions",
+  "Browse every session. Search always includes all sessions.": "Browse every session. Search always includes all sessions.",
+  "Last 3 days, up to 8 recent sessions. Pinned, open and active sessions stay visible.": "Last 3 days, up to 8 recent sessions. Pinned, open and active sessions stay visible.",
+  "No recent sessions. Open All sessions to continue earlier work.": "No recent sessions. Open All sessions to continue earlier work."
 }

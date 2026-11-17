@@ -160,6 +160,8 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
+    let app = platform::configure_window(app);
+
     let handle = app.handle();
     // SIGTERM / SIGINT quit through the event loop, as the tray's Quit does,
     // so the window and its GPU device go away on this thread.

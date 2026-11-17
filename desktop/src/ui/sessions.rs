@@ -8,7 +8,10 @@ use rune::El;
 use rune::{el, TextEdit, Tx};
 use rune_kit::glyphs::{FOLDER, FOLDER_OPEN, SEARCH, TRIANGLE_DOWN};
 use rune_kit::shell::{Sidebar, SidebarRow};
-use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem, TextInput};
+use rune_kit::{
+    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem,
+    TextInput,
+};
 
 use super::icons::{INBOX, SETTINGS, TASK};
 use super::{ago, now_ms, title_of, Activity, Mode, OpenMenu, UiState};
@@ -21,6 +24,38 @@ use crate::model::types::ListedSession;
 
 const DEFAULT_OPEN: usize = 3;
 const PER_PROJECT: usize = 8;
+const RECENT_LIMIT: usize = 8;
+const RECENT_AGE_MS: u64 = 3 * 24 * 60 * 60 * 1000;
+
+fn recent_sessions(s: &UiState, now: u64) -> Vec<&muqun_gateway::agents::AgentSessionInfo> {
+    let mut sessions: Vec<_> = s.sessions.iter().collect();
+    let last_worked = |info: &muqun_gateway::agents::AgentSessionInfo| {
+        info.updated_ms.max(info.time_viewed.unwrap_or(0)).max(
+            s.sidebar_opened
+                .get(&format!("{}:{}", s.current_computer(), info.asid.0))
+                .copied()
+                .unwrap_or(0),
+        )
+    };
+    sessions.sort_by_cached_key(|info| std::cmp::Reverse(last_worked(info)));
+    let mut ordinary = 0;
+    sessions.retain(|info| {
+        let id = &info.asid.0;
+        if s.selected.as_ref() == Some(id)
+            || s.tile_of(id).is_some()
+            || s.cfg.general.pinned.contains(id)
+            || matches!(s.activity(info), Activity::Working | Activity::NeedsYou)
+        {
+            return true;
+        }
+        if now.saturating_sub(last_worked(info)) > RECENT_AGE_MS || ordinary >= RECENT_LIMIT {
+            return false;
+        }
+        ordinary += 1;
+        true
+    });
+    sessions
+}
 
 fn nav(s: &UiState, k: &Kit, label: &str, icon: &'static rune::Icon, mode: Mode) -> El {
     // The theme's own glyph for the row, when its pack draws one.
@@ -55,9 +90,16 @@ fn nav(s: &UiState, k: &Kit, label: &str, icon: &'static rune::Icon, mode: Mode)
 }
 
 fn projects(s: &UiState) -> Vec<Project> {
-    let listed: Vec<ListedSession> = s
-        .sessions
-        .iter()
+    // Search always receives the complete inventory, independent of the
+    // sidebar scope. Nothing is deleted, archived or hidden in the backend.
+    let recent_only = !s.sidebar_all_sessions && s.search.text.trim().is_empty();
+    let sessions = if recent_only {
+        recent_sessions(s, now_ms())
+    } else {
+        s.sessions.iter().collect()
+    };
+    let listed: Vec<ListedSession> = sessions
+        .into_iter()
         .map(|x| ListedSession {
             asid: x.asid.0.clone(),
             directory: x.directory.clone(),
@@ -66,7 +108,7 @@ fn projects(s: &UiState) -> Vec<Project> {
     let known: Vec<AgentProject> = s.known_projects.values().flatten().cloned().collect();
     let recent: Vec<PathBuf> = s.cfg.general.last_cwd.values().cloned().collect();
     let home = dirs::home_dir();
-    derive(&Sources {
+    let mut projects = derive(&Sources {
         sessions: &listed,
         dirs: &s.directories,
         known: &known,
@@ -74,7 +116,47 @@ fn projects(s: &UiState) -> Vec<Project> {
         prefs: &s.cfg.ui.projects,
         session_pins: &s.cfg.general.pinned,
         home: home.as_deref(),
-    })
+    });
+    if recent_only {
+        projects.retain(|p| p.pinned || !p.sessions.is_empty());
+    }
+    projects
+}
+
+fn scope(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+    let open = s.menu == Some(OpenMenu::SidebarScope);
+    let t = |word| super::copy::tr(s.cfg.general.language, word);
+    let title = t(if s.sidebar_all_sessions {
+        "All sessions"
+    } else {
+        "Recent sessions"
+    });
+    let trigger = Button::new(title)
+        .variant(ButtonVariant::Ghost)
+        .control_size(ControlSize::Large)
+        .on_press(move |s: &mut UiState| {
+            s.menu = (!open).then_some(OpenMenu::SidebarScope);
+        })
+        .build(k)
+        .key("sidebar-scope")
+        .child(rune::icon(&TRIANGLE_DOWN, 12.0).color(k.c.text_faint));
+    let mut menu = Menu::new("sidebar-scope-menu")
+        .trigger(trigger)
+        .open(open)
+        .min_width(220.0)
+        .placement(rune_kit::Placement::BottomStart)
+        .on_close(|s: &mut UiState| s.menu = None);
+    for (all, word) in [(false, "Recent sessions"), (true, "All sessions")] {
+        menu = menu.item(
+            MenuItem::new(t(word))
+                .checked(s.sidebar_all_sessions == all)
+                .on_select(move |s: &mut UiState| {
+                    s.sidebar_all_sessions = all;
+                    s.menu = None;
+                }),
+        );
+    }
+    rune::row().w_full().center_y().child(menu.build(k, layer))
 }
 
 fn project_label(language: crate::config::Language, p: &Project) -> String {
@@ -96,8 +178,16 @@ fn tree_rows(s: &UiState, all: &[Project]) -> Vec<TreeRow> {
             query: &query,
             open: &s.open_projects,
             full: &s.full_projects,
-            default_open: DEFAULT_OPEN,
-            per_project: PER_PROJECT,
+            default_open: if !s.sidebar_all_sessions && query.is_empty() {
+                usize::MAX
+            } else {
+                DEFAULT_OPEN
+            },
+            per_project: if !s.sidebar_all_sessions && query.is_empty() {
+                usize::MAX
+            } else {
+                PER_PROJECT
+            },
         },
         |asid| s.session_by_id(asid).map(title_of),
     )
@@ -105,6 +195,12 @@ fn tree_rows(s: &UiState, all: &[Project]) -> Vec<TreeRow> {
 
 /// The sessions the sidebar shows, top to bottom (Alt+↑ / Alt+↓ walk them).
 pub fn listed(s: &UiState) -> Vec<String> {
+    if !s.sidebar_all_sessions && s.search.text.trim().is_empty() {
+        return recent_sessions(s, now_ms())
+            .into_iter()
+            .map(|i| i.asid.0.clone())
+            .collect();
+    }
     tree_rows(s, &projects(s))
         .into_iter()
         .filter_map(|row| match row {
@@ -115,6 +211,12 @@ pub fn listed(s: &UiState) -> Vec<String> {
 }
 
 fn tree(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
+    if !s.sidebar_all_sessions && s.search.text.trim().is_empty() {
+        return listed(s)
+            .into_iter()
+            .map(|id| session_row(s, k, layer, &id))
+            .collect();
+    }
     let all = projects(s);
     let by_id: HashMap<&str, &Project> = all.iter().map(|p| (p.id.as_str(), p)).collect();
     let rows = tree_rows(s, &all);
@@ -416,36 +518,24 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     let pinned = s.cfg.general.pinned.iter().any(|p| p == asid);
     let in_tile = s.in_split() && s.tile_of(asid).is_some();
     let when = ago(info.updated_ms, now_ms(), s.cfg.general.language);
-    let mut subtitle = if when.is_empty() {
-        s.agent_name(&info.agent_id)
-    } else {
-        format!("{} · {when}", s.agent_name(&info.agent_id))
-    };
-    // The state in words too, so the row says it without the mark.
-    match activity {
-        Activity::Working => {
-            subtitle = format!(
-                "{} · {subtitle}",
-                super::copy::tr(s.cfg.general.language, "Working")
-            );
-        }
-        Activity::NeedsYou => {
-            subtitle = format!(
-                "{} · {subtitle}",
-                super::copy::tr(s.cfg.general.language, "Needs you")
-            );
-        }
-        _ => {}
-    }
+    let flat = !s.sidebar_all_sessions && s.search.text.trim().is_empty();
+    let directory = info
+        .directory
+        .as_deref()
+        .and_then(|path| std::path::Path::new(path).file_name())
+        .map(|name| name.to_string_lossy().into_owned());
+    let subtitle = directory.unwrap_or_default();
     let mut row = SidebarRow::new(format!(
         "{}{}",
         if pinned { "★ " } else { "" },
         title_of(info)
     ))
-    .depth(1)
-    .height(45.0)
+    .depth(if flat { 0 } else { 1 })
+    .height(if flat { 52.0 } else { 48.0 })
     .avatar(avatar_with_state(s, k, &look, info, activity))
     .subtitle(subtitle)
+    .subtitle_color(k.c.text_muted.alpha(0.72))
+    .detail(when)
     .selected(super::search::row_selected(s, asid));
     if in_tile {
         row = row.detail(super::copy::tr(s.cfg.general.language, "split"));
@@ -478,6 +568,9 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     .on_double_click(move |s: &mut UiState, _: &mut Tx| start_rename(s, &rename_id))
     .build(k)
     .key(format!("session-{asid}"))
+    .help(info.directory.clone().unwrap_or_default())
+    .radius(k.radius.lg)
+    .mb(4.0)
     .on_secondary_press(move |s: &mut UiState, _, _: &mut Tx| {
         s.menu = Some(OpenMenu::Session(menu_id.clone()));
     })
@@ -517,20 +610,16 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let trigger = rune::row()
         .key("computer-switcher-trigger")
         .w_full()
-        .h(32.0)
+        .h(36.0)
         .px(10.0)
         .gap(8.0)
         .center_y()
         .radius(k.radius.md)
-        .fill(k.c.layer_01)
-        .border(
-            1.0,
-            if open {
-                k.c.border_focus
-            } else {
-                k.c.border_weak
-            },
-        )
+        .fill(if open {
+            k.c.layer_01
+        } else {
+            k.c.layer_01.alpha(0.35)
+        })
         .cursor(rune::Cursor::Pointer)
         .role("button")
         .label(super::copy::tr_ref(language, "Switch computer"))
@@ -544,9 +633,14 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .min_w(0.0),
         )
         .child(
-            rune::text(status_desc)
-                .font(k.ty.caption())
-                .color(k.c.text_muted),
+            el().size(5.0, 5.0)
+                .radius(2.5)
+                .fill(if s.peer_by_id(curr).is_none_or(|p| p.reachable) {
+                    k.c.success.fg
+                } else {
+                    k.c.warning.fg
+                })
+                .help(status_desc),
         )
         .child(
             rune::text(if open { "▴" } else { "▾" })
@@ -630,9 +724,30 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let header_box = rune::col()
         .key("sidebar-header-box")
         .w_full()
-        .gap(8.0)
-        .child(computer_switcher(s, k, layer))
-        .child(search(s, k));
+        .gap(12.0)
+        .pb(10.0)
+        .child(
+            rune::row()
+                .w_full()
+                .gap(8.0)
+                .center_y()
+                .child(computer_switcher(s, k, layer).grow(1.0).min_w(0.0))
+                .child(
+                    IconButton::new(&super::icons::PLUS)
+                        .control_size(ControlSize::ExtraLarge)
+                        .variant(IconButtonVariant::Ghost)
+                        .label(super::copy::tr_ref(language, "New session"))
+                        .help(super::copy::tr_ref(language, "New session"))
+                        .on_press(|s: &mut UiState| s.go(Mode::Home))
+                        .build(k)
+                        .key("sidebar-new-session")
+                        .size(36.0, 36.0)
+                        .radius(k.radius.lg)
+                        .fill(k.c.bg_accent.alpha(0.12)),
+                ),
+        )
+        .child(search(s, k))
+        .child(scope(s, k, layer));
 
     let mut sidebar = Sidebar::new()
         .label(super::copy::tr_ref(language, "Sessions"))
@@ -649,6 +764,20 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         );
     }
     let searching = !s.search.text.trim().is_empty();
+    if !searching
+        && !s.sidebar_all_sessions
+        && !s.sessions.is_empty()
+        && recent_sessions(s, now_ms()).is_empty()
+    {
+        sidebar = sidebar.child(super::search::note(
+            k,
+            "no-recent",
+            super::copy::tr(
+                language,
+                "No recent sessions. Open All sessions to continue earlier work.",
+            ),
+        ));
+    }
     if super::search::titles_shown(s) {
         let rows = tree(s, k, layer);
         if searching && !s.sessions.is_empty() && listed(s).is_empty() {
@@ -668,44 +797,59 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     if let Some(running) = super::running::view(s, k) {
         sidebar = sidebar.footer(running);
     }
-    let sidebar = sidebar
-        .footer(
-            SidebarRow::new(super::copy::tr_ref(language, "Plugins"))
-                .icon(&super::icons::GRID)
-                .selected(s.mode == Mode::Settings && s.settings_tab == super::SettingsTab::Plugins)
-                .on_select(|s: &mut UiState, _: &mut Tx| {
-                    s.go(Mode::Settings);
-                    super::settings::open(s, super::SettingsTab::Plugins);
-                })
-                .build(k)
-                .key("nav-plugins"),
-        )
-        .footer(nav(
-            s,
-            k,
-            super::copy::tr_ref(language, "Inbox"),
-            &INBOX,
-            Mode::Inbox,
-        ))
-        .footer(nav(
-            s,
-            k,
-            super::copy::tr_ref(language, "Tasks"),
-            &TASK,
-            Mode::Tasks,
-        ))
-        .footer(nav(
-            s,
-            k,
-            super::copy::tr_ref(language, "Settings"),
-            &SETTINGS,
-            Mode::Settings,
-        ));
+    let plugins = SidebarRow::new(super::copy::tr_ref(language, "Plugins"))
+        .icon(&super::icons::GRID)
+        .selected(s.mode == Mode::Settings && s.settings_tab == super::SettingsTab::Plugins)
+        .on_select(|s: &mut UiState, _: &mut Tx| {
+            s.go(Mode::Settings);
+            super::settings::open(s, super::SettingsTab::Plugins);
+        })
+        .build(k)
+        .key("nav-plugins");
+    // Measure localized labels at the active text scale; each pair wraps
+    // to one column when its two complete labels no longer fit.
+    let cell_width = ["Plugins", "Inbox", "Tasks", "Settings"]
+        .iter()
+        .map(|label| {
+            rune::text::measure(super::copy::tr_ref(language, label), &[], k.ty.ui, None).0 + 64.0
+        })
+        .fold(0.0_f32, f32::max)
+        .ceil();
+    let cell = |item: El| item.w(0.0).grow(1.0).min_w(cell_width);
+    let mut entries = vec![plugins];
+    for (id, label, glyph, mode) in [
+        ("inbox", "Inbox", &INBOX, Mode::Inbox),
+        ("tasks", "Tasks", &TASK, Mode::Tasks),
+        ("settings", "Settings", &SETTINGS, Mode::Settings),
+    ] {
+        if crate::plugin::is_enabled(id, &s.cfg.plugins_disabled) {
+            entries.push(nav(s, k, super::copy::tr_ref(language, label), glyph, mode));
+        }
+    }
+    let mut footer = rune::col()
+        .key("sidebar-navigation")
+        .w_full()
+        .gap(6.0)
+        .pt(10.0);
+    let mut entries = entries.into_iter();
+    while let Some(left) = entries.next() {
+        let mut pair = rune::row().w_full().gap(6.0).flex_wrap().child(cell(left));
+        if let Some(right) = entries.next() {
+            pair = pair.child(cell(right));
+        }
+        footer = footer.child(pair);
+    }
+    let sidebar = sidebar.footer(footer);
     match link_warning(s, k) {
         Some(warning) => sidebar.footer(warning),
         None => sidebar,
     }
     .build(k)
+    .key(if s.sidebar_all_sessions {
+        "sidebar-all-view"
+    } else {
+        "sidebar-recent-view"
+    })
 }
 
 /// The search field: a quiet well the width of the rows, its icon on the
@@ -750,7 +894,7 @@ fn search(s: &UiState, k: &Kit) -> El {
                     .px(7.0)
                     .mr(4.0)
                     .center_y()
-                    .radius(10.0)
+                    .radius(k.radius.lg)
                     .fill(k.c.bg_accent.alpha(if s.dark { 0.22 } else { 0.14 }))
                     .role("button")
                     .label(super::copy::tr(language, "Messages only"))
@@ -824,6 +968,86 @@ fn link_warning(s: &UiState, k: &Kit) -> Option<El> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session(id: &str, updated: u64) -> muqun_gateway::agents::AgentSessionInfo {
+        serde_json::from_value(serde_json::json!({"asid":id,"agent_id":"codex","title":id,"status":"idle","directory":"/project","updated_ms":updated})).unwrap()
+    }
+
+    #[test]
+    fn recent_scope_bounds_idle_history_but_preserves_pinned_open_and_working_sessions() {
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.sessions = (0..20)
+            .map(|n| session(&format!("recent-{n}"), now_ms() - n))
+            .collect();
+        let old = now_ms() - RECENT_AGE_MS - 1;
+        s.sessions.extend([
+            session("old", old),
+            session("pinned", old),
+            session("open", old),
+            session("working", old),
+            session("waiting", old),
+        ]);
+        s.cfg.general.pinned = vec!["pinned".into()];
+        s.selected = Some("open".into());
+        s.sessions
+            .iter_mut()
+            .find(|i| i.asid.0 == "working")
+            .unwrap()
+            .status = muqun_gateway::agents::AgentSessionStatus::Busy;
+        s.waiting_forms.insert("waiting".into(),vec![serde_json::from_value(serde_json::json!({"id":"question","asid":"waiting","title":"Question","fields":[],"nonblocking":false})).unwrap()]);
+        let ids: Vec<_> = recent_sessions(&s, now_ms())
+            .iter()
+            .map(|i| i.asid.0.as_str())
+            .collect();
+        assert_eq!(ids.len(), RECENT_LIMIT + 4);
+        for id in ["pinned", "open", "working", "waiting"] {
+            assert!(ids.contains(&id));
+        }
+        assert!(!ids.contains(&"old"));
+        assert!(!ids.contains(&"recent-19"));
+    }
+
+    #[test]
+    fn recent_navigation_orders_activity_across_directories_and_ignores_folder_folds() {
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let now = now_ms();
+        let mut oldest = session("oldest", now - 30);
+        oldest.directory = Some("/a".into());
+        let mut newest = session("newest", now);
+        newest.directory = Some("/z".into());
+        s.sessions = vec![oldest, newest, session("middle", now - 10)];
+        s.open_projects.insert("/z".into(), false);
+        assert_eq!(listed(&s), vec!["newest", "middle", "oldest"]);
+        s.sidebar_opened
+            .insert(format!("{}:oldest", s.current_computer()), now + 1);
+        assert_eq!(listed(&s), vec!["oldest", "newest", "middle"]);
+    }
+
+    #[test]
+    fn search_and_all_scope_reveal_old_sessions_without_changing_the_conversation() {
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.sessions = vec![
+            session("current", now_ms()),
+            session("historic", now_ms() - RECENT_AGE_MS - 1),
+        ];
+        s.selected = Some("current".into());
+        s.draft = TextEdit::new("unfinished draft");
+        assert!(!listed(&s).contains(&"historic".into()));
+        s.sidebar_all_sessions = true;
+        assert!(listed(&s).contains(&"historic".into()));
+        assert_eq!(s.selected.as_deref(), Some("current"));
+        assert_eq!(s.draft.text, "unfinished draft");
+        s.sidebar_all_sessions = false;
+        s.search = TextEdit::new("historic");
+        assert_eq!(listed(&s), vec!["historic"]);
+        s.open_session("historic");
+        s.search = TextEdit::new("");
+        s.selected = Some("current".into());
+        assert!(listed(&s).contains(&"historic".into()));
+    }
 
     #[test]
     fn computer_switcher_lists_and_switches_computers() {

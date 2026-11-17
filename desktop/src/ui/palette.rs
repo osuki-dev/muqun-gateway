@@ -564,7 +564,10 @@ impl UiState {
                 plugin_id,
                 command_id,
             } => {
-                if let Some(plugin) = self.plugins.get(&plugin_id) {
+                if let Some(plugin) = self
+                    .plugins
+                    .get_enabled(&plugin_id, &self.cfg.plugins_disabled)
+                {
                     plugin.on_command(self, &command_id);
                 }
             }
@@ -754,7 +757,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .child(list)
         .child(el().w_full().h(1.0).fill(k.c.border_muted))
         .child(foot);
-    let mut panel = look.panel(k, panel, crate::theme::look::PANEL_RADIUS);
+    let mut panel = look.panel(k, panel, k.radius.xl);
     for shadow in k.shadow_layers(&k.elevation.overlay) {
         panel = panel.box_shadow(shadow);
     }

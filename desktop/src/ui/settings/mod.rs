@@ -108,6 +108,7 @@ pub(super) fn open(s: &mut UiState, tab: SettingsTab) {
     s.settings_tab = tab;
     s.menu = None;
     match tab {
+        SettingsTab::Agents => s.refresh_account_limits(),
         SettingsTab::Themes => s.send(Command::ThemeRefresh),
         SettingsTab::Plugins => s.refresh_runtimes(),
         SettingsTab::Storage => s.send(Command::ScanStorage),
@@ -198,7 +199,7 @@ pub(super) fn label(k: &Kit, title: &str, detail: &str) -> El {
     let mut copy = col()
         .key("label")
         .w(LABEL_MIN_W)
-        .min_w(LABEL_MIN_W)
+        .min_w(LABEL_MIN_W.min(INNER_W.get()))
         .grow(1.0)
         .shrink()
         .gap(3.0)
@@ -655,7 +656,11 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .px(PAD_X)
         .pt(14.0)
         .pb(56.0)
-        .gap(40.0);
+        .gap(if tab == SettingsTab::Agents {
+            16.0
+        } else {
+            40.0
+        });
     for (i, child) in body.into_iter().enumerate() {
         page = page.child(look.arrive(child, i.min(4)));
     }

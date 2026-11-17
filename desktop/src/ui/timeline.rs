@@ -538,7 +538,7 @@ fn latest_pill(s: &UiState, k: &Kit, asid: &str, unseen: usize) -> El {
         .px(12.0)
         .gap(6.0)
         .center_y()
-        .radius(14.0)
+        .radius(k.radius.lg)
         .fill(k.c.bg_base)
         .border(1.0, k.c.border_muted)
         .child(
@@ -546,7 +546,7 @@ fn latest_pill(s: &UiState, k: &Kit, asid: &str, unseen: usize) -> El {
                 .absolute(0.0, 0.0)
                 .w_full()
                 .h_full()
-                .radius(14.0)
+                .radius(k.radius.lg)
                 .fill(fill)
                 .a11y_hidden(),
         )
@@ -654,7 +654,7 @@ fn timeline_search_bar(s: &UiState, k: &Kit, asid: &str) -> El {
         .center_y()
         .px(10.0)
         .py(4.0)
-        .radius(crate::theme::look::CARD_RADIUS)
+        .radius(k.radius.lg)
         .fill(k.c.layer_01)
         .border(1.0, k.c.border_muted)
         .child(field)
@@ -733,12 +733,11 @@ fn working_row(cx: &Tcx) -> El {
         )
 }
 
-/// Copy message text, roll back to here, and fork from here: small icon buttons on a raised chip,
+/// Copy message text and fork from here: small icon buttons on a raised chip,
 /// shown while the pointer is on the message. No hover tooltip popovers.
 fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
     let k = cx.k;
     let asid = AgentSessionId(cx.asid.to_string());
-    let (rollback_asid, rollback_id) = (asid.clone(), it.message_id.clone());
     let fork_id = it.message_id.clone();
     let text = match &it.part {
         AgentPart::Text { text } => {
@@ -775,20 +774,6 @@ fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
                 })
                 .build(k)
                 .key(format!("copy-{}", copy_id)),
-        )
-        .child(
-            IconButton::new(&super::icons::UNDO)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(cx.t("Roll back to here"))
-                .on_press(move |s: &mut UiState| {
-                    s.send(Command::StageRevert {
-                        asid: rollback_asid.clone(),
-                        message_id: rollback_id.clone(),
-                    })
-                })
-                .build(k)
-                .key(format!("rollback-{}", it.id)),
         )
         .child(
             IconButton::new(&super::icons::FORK)

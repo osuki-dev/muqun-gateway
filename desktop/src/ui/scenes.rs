@@ -1375,9 +1375,11 @@ fn base_scenes() -> &'static [Scene] {
         }),
         ("terminal-ime", |s| {
             terminal_scene(s, shell_fixture);
-            s.term
-                .sink
-                .ime(&rune::Ime::Preedit("ni hao".into(), Some((6, 6))));
+            s.term.sink.ime(&rune::Ime::Preedit(
+                "ni hao".into(),
+                Some((6, 6)),
+                Vec::new(),
+            ));
         }),
         ("terminal-jade", |s| {
             with_pack(s, "jade-tempest");

@@ -147,7 +147,6 @@ pub enum Action {
     FocusPaneToward,
     SwapPaneToward,
     FocusComposer,
-    ExpandComposer,
     PromptHistory,
     Send,
     Queue,
@@ -214,7 +213,6 @@ impl Action {
             Self::FocusPaneToward => "focus_pane_toward",
             Self::SwapPaneToward => "swap_pane_toward",
             Self::FocusComposer => "focus_composer",
-            Self::ExpandComposer => "expand_composer",
             Self::PromptHistory => "prompt_history",
             Self::Send => "send",
             Self::Queue => "queue",
@@ -428,15 +426,6 @@ pub static ENTRIES: &[Entry] = &[
     ),
     owned(
         e(
-            A::ExpandComposer,
-            G::Session,
-            "mod+shift+e",
-            "Expand or collapse the composer",
-        ),
-        Owner::Composer,
-    ),
-    owned(
-        e(
             A::PromptHistory,
             G::Session,
             "alt+h, ctrl+r",
@@ -612,7 +601,7 @@ pub static ENTRIES: &[Entry] = &[
         e(
             A::TermCycleTab,
             G::Terminal,
-            "alt+left, alt+right, ctrl+tab, ctrl+shift+tab",
+            "alt+left, alt+right, ctrl+tab, ctrl+shift+tab, ctrl+pageup, ctrl+pagedown, ctrl+shift+[, ctrl+shift+]",
             "Previous or next terminal tab",
         ),
         Owner::Terminal,
@@ -1498,9 +1487,7 @@ pub fn dispatch_window(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
     }
     if let Some(found) = ENTRIES
         .iter()
-        .filter(|e| {
-            e.owner == Owner::Window || matches!(e.action, A::ExpandComposer | A::PromptHistory)
-        })
+        .filter(|e| e.owner == Owner::Window || e.action == A::PromptHistory)
         .find(|e| bind_matches_cfg(e, &s.cfg.keymap, ev, tx))
     {
         return run(s, found.action, ev, tx);
@@ -1539,7 +1526,6 @@ pub fn field_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx, at_end: bool) -> b
         A::EqualizeTiles,
         A::SplitHorizontal,
         A::SplitVertical,
-        A::ExpandComposer,
         A::PromptHistory,
     ] {
         if bind_matches_cfg(entry(action), &s.cfg.keymap, ev, tx) {
@@ -1659,7 +1645,7 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
             if was_term {
                 s.term.sink.focused = false;
             }
-            let handled = super::tiles::arrow_key(s, ev);
+            let handled = super::tiles::move_toward(s, &ev.key, action == A::SwapPaneToward);
             if s.in_split() && s.tiles.get(s.focus).is_some_and(|t| t.is_terminal()) {
                 s.focus_terminal_tx(tx);
             } else if was_term && !handled {
@@ -1678,15 +1664,6 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
             }
             _ => return false,
         },
-        A::ExpandComposer if session => {
-            if s.composer_expanded || s.composer_rows.is_some() {
-                s.composer_expanded = false;
-                s.composer_rows = None;
-            } else {
-                s.composer_expanded = true;
-                s.composer_rows = Some(14);
-            }
-        }
         A::PromptHistory if session => {
             s.composer_history_open = !s.composer_history_open;
         }
@@ -2107,7 +2084,7 @@ mod tests {
             key: k,
             mods: Mods {
                 shift,
-                cmd: ctrl,
+                cmd: ctrl && !crate::platform::is_macos(),
                 alt,
                 ctrl,
                 logo: false,
@@ -2141,14 +2118,20 @@ mod tests {
         assert!(rt.state.term.sink.focused);
         rt.frame(1.0 / 60.0);
 
-        rt.key(key(Key::Left, true, false, true));
+        let mut left = key(Key::Left, !crate::platform::is_macos(), false, true);
+        left.mods.cmd = true;
+        left.mods.logo = crate::platform::is_macos();
+        rt.key(left);
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.focus, 0);
         assert!(rt.state.draft.focused);
         assert!(!rt.state.term.sink.focused);
 
         // And from the session composer, `Ctrl+Alt+Right` moves focus back to the terminal tile!
-        rt.key(key(Key::Right, true, false, true));
+        let mut right = key(Key::Right, !crate::platform::is_macos(), false, true);
+        right.mods.cmd = true;
+        right.mods.logo = crate::platform::is_macos();
+        rt.key(right);
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.focus, 1);
         assert!(rt.state.term.sink.focused);
@@ -2320,7 +2303,7 @@ mod tests {
             key: Key::Command('b'),
             mods: Mods {
                 ctrl: true,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 ..Default::default()
             },
         };
@@ -2330,11 +2313,16 @@ mod tests {
         rt.key(leader);
         rt.frame(2.0 / 60.0);
         assert!(!rt.state.is_leader_armed());
-        let expected = "1b 5b 41 1b 5b 42 1b 5b 43 1b 5b 44 02";
-        while !session
+        let expected = [
+            0x1b, 0x5b, 0x41, 0x1b, 0x5b, 0x42, 0x1b, 0x5b, 0x43, 0x1b, 0x5b, 0x44, 0x02,
+        ];
+        while session
             .dump_plain_text()
             .unwrap_or_default()
-            .contains(expected)
+            .split_whitespace()
+            .filter_map(|word| u8::from_str_radix(word, 16).ok())
+            .collect::<Vec<_>>()
+            != expected
         {
             assert!(
                 Instant::now() < deadline,
@@ -2366,7 +2354,7 @@ mod tests {
             key: Key::Text(" ".into()),
             mods: Mods {
                 ctrl: true,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 ..Default::default()
             },
         };
@@ -2419,7 +2407,7 @@ mod tests {
             key: Key::Command('g'),
             mods: Mods {
                 ctrl: true,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 ..Default::default()
             },
         };

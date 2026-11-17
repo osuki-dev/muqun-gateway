@@ -212,15 +212,72 @@ pub fn open_markdown_link(s: &mut UiState, url: &str, tx: &mut rune::Tx) {
     s.open_timeline_file(path);
 }
 
+/// Theme roles keep rich text readable in both palette variants.
+fn message_style(k: &Kit) -> MarkdownStyle {
+    MarkdownStyle::from_kit(k)
+        .body_font(k.ty.body.lh(k.ty.body.size * 1.65))
+        .strong_weight(650.0)
+        .link(k.c.text_accent)
+        .link_underline(k.c.bg_accent.alpha(0.35))
+        .inline_code_bg(k.c.bg_accent.alpha(0.10))
+        .quote(k.c.bg_accent.alpha(0.55), 2.0, 14.0, k.c.text_muted)
+        .rule(k.c.border_muted.alpha(0.6))
+        .list(24.0, 8.0)
+        .table(k.c.border_muted.alpha(0.45), k.c.bg_accent.alpha(0.08))
+        .table_header_text(k.c.text_base.mix(k.c.text_accent, 0.75))
+        .table_header_weight(650.0)
+        .table_header_rule(k.c.bg_accent.alpha(0.25))
+        .table_cell_padding(12.0, 9.0)
+        .table_margin(14.0, 18.0)
+        .code_block(k.c.layer_01, k.c.border_muted.alpha(0.45))
+        .code_block_padding(14.0, 12.0)
+        .code_margin(12.0, 12.0)
+}
+
+/// Accent structural emphasis without changing the source or copied text.
+fn prose_accents(
+    body: &str,
+    k: &Kit,
+) -> Vec<(std::ops::Range<usize>, rune_kit::markdown::Highlight)> {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+    let mut emphasis = 0_u32;
+    let mut heading = false;
+    let mut ranges = Vec::new();
+    for (event, range) in Parser::new_ext(body, Options::all()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Heading { .. }) => heading = true,
+            Event::End(TagEnd::Heading(_)) => heading = false,
+            Event::Start(Tag::Strong) => emphasis += 1,
+            Event::End(TagEnd::Strong) => emphasis = emphasis.saturating_sub(1),
+            Event::Text(_) if heading || emphasis > 0 => {
+                ranges.push((
+                    range,
+                    rune_kit::markdown::Highlight::new()
+                        .bg(k.c.bg_base.alpha(0.0))
+                        .fg(k
+                            .c
+                            .text_base
+                            .mix(k.c.text_accent, if heading { 0.85 } else { 0.65 })),
+                ));
+            }
+            _ => {}
+        }
+    }
+    ranges
+}
+
 /// Prose an agent wrote, as Markdown.
 pub fn prose(cx: &Tcx, key: &str, body: &str) -> El {
     Markdown::new(body)
+        .highlights(prose_accents(body, cx.k))
+        .style(message_style(cx.k))
         .selectable(true)
         .on_link_tx(|s: &mut UiState, url: &str, tx: &mut rune::Tx| {
             open_markdown_link(s, url, tx);
         })
         .build(cx.k)
         .key(format!("md-{key}"))
+        .max_w(760.0)
 }
 
 pub fn more_lines(cx: &Tcx, hidden: usize) -> El {
@@ -378,17 +435,18 @@ impl<'a> ToolCard<'a> {
         let glyph_color = if failed {
             k.c.danger.icon
         } else {
-            self.accent.unwrap_or(k.c.icon_faint)
+            self.accent.unwrap_or(k.c.text_accent)
         };
         let selected = cx.selected(&id);
         let mut line = row()
             .key("line")
             .w_full()
-            .h(ROW_H)
+            .h(30.0)
             .px(6.0)
             .gap(8.0)
             .center_y()
-            .radius(k.radius.sm)
+            .radius(k.radius.md)
+            .fill(k.c.bg_accent.alpha(0.04))
             .child(icon(self.glyph, 13.0).color(glyph_color).a11y_hidden());
         if !self.verb.is_empty() {
             line = line.child(
@@ -398,7 +456,7 @@ impl<'a> ToolCard<'a> {
                     .color(if failed {
                         k.c.danger.fg
                     } else {
-                        k.c.text_muted
+                        k.c.text_accent
                     })
                     .single_line(),
             );

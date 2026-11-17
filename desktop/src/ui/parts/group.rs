@@ -6,7 +6,7 @@ use muqun_gateway::agents::{AgentPart, TimelineItem};
 use rune::{col, icon, row, text, Cursor, El};
 use rune_kit::Spinner;
 
-use super::{glyphs, Tcx, ROW_H};
+use super::{glyphs, Tcx};
 use crate::model::activity::{self, Summary};
 use crate::model::tool_view as tv;
 use crate::ui::timeline::group_key;
@@ -96,15 +96,16 @@ pub fn view(cx: &Tcx, items: &[TimelineItem]) -> El {
     let mut line = row()
         .key("summary")
         .w_full()
-        .h(ROW_H)
-        .px(6.0)
+        .h(32.0)
+        .px(10.0)
         .gap(8.0)
         .center_y()
-        .radius(k.radius.sm)
+        .radius(k.radius.md)
+        .fill(k.c.bg_accent.alpha(0.07))
         .child(
             icon(&glyphs::CHEVRON, 11.0)
                 .key("chevron")
-                .color(k.c.icon_faint)
+                .color(k.c.text_accent)
                 .rotate(turn)
                 .a11y_hidden(),
         );
@@ -114,7 +115,7 @@ pub fn view(cx: &Tcx, items: &[TimelineItem]) -> El {
         text(words)
             .key("words")
             .font(k.ty.small_medium)
-            .color(k.c.text_muted)
+            .color(k.c.text_accent)
             .single_line(),
     );
     if summary.failed > 0 {
@@ -156,11 +157,11 @@ pub fn view(cx: &Tcx, items: &[TimelineItem]) -> El {
     let mut block = col()
         .key(format!("group-{key}"))
         .w_full()
-        .gap(1.0)
+        .gap(4.0)
         .child(line);
     if open {
         // The calls, on a hairline rail under the chevron.
-        let mut list = col().key("calls").w_full().gap(1.0).grow(1.0).shrink();
+        let mut list = col().key("calls").w_full().gap(4.0).grow(1.0).shrink();
         for item in items.iter().filter(|i| !activity::invisible(i)) {
             list = list.child(super::part(cx, item).key(format!("in-{}", item.id)));
         }
@@ -174,7 +175,7 @@ pub fn view(cx: &Tcx, items: &[TimelineItem]) -> El {
                     .h_full()
                     .ml(11.0)
                     .mr(6.0)
-                    .fill(k.c.border_weak),
+                    .fill(k.c.bg_accent.alpha(0.25)),
             )
             .child(list);
         if !cx.reduced_motion() {

@@ -156,6 +156,8 @@ pub fn open_file(
 
 /// Try opening a code/text file with the system's default editor (Omarchy launcher, $EDITOR, or terminal).
 pub fn try_open_editor(path: &Path) -> std::io::Result<bool> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let _ = path;
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         if try_omarchy_launcher(path)? {

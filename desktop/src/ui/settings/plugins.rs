@@ -57,7 +57,7 @@ fn plugin_label(
     col()
         .key("label")
         .w(super::LABEL_MIN_W)
-        .min_w(super::LABEL_MIN_W)
+        .min_w(super::LABEL_MIN_W.min(super::INNER_W.get()))
         .grow(1.0)
         .shrink()
         .gap(4.0)

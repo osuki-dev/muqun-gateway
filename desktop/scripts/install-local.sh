@@ -41,7 +41,7 @@ fi
 
 if [[ "$BUILD" == 1 ]]; then
   echo "building muqun-desktop (release)…"
-  cargo build --manifest-path "$ROOT/Cargo.toml" -p muqun-desktop --release --locked
+  bash "$ROOT/desktop/scripts/build-release.sh"
 fi
 # cargo puts the build where CARGO_TARGET_DIR says, when it is set.
 BIN_SRC="${CARGO_TARGET_DIR:-$ROOT/target}/release/muqun-desktop"

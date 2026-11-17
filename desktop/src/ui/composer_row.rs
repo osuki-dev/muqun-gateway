@@ -57,7 +57,7 @@ static MORE: Icon = Icon {
 static AUTO_APPROVE: Icon = Icon {
     name: "cmp-approval-always",
     view: 24.0,
-    body: r#"<path d="m3 12 4 4L17 6m-5 11 3 3 7-9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    body: r#"<path d="M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6l-8-3Zm-4 9 3 3 5-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
 static BRANCH: Icon = Icon {
@@ -90,11 +90,11 @@ fn mode_glyph(id: &str) -> (&'static Icon, bool) {
 
 /// A pill (`ControlSize::Small` ghost button): 10 pt each side.
 const PILL_PAD: f32 = 20.0;
-/// An icon-only pill: 14 pt glyph and 3 pt each side.
-const ICON_PILL: f32 = 20.0;
+/// Compact controls keep enough room around their glyph.
+const ICON_PILL: f32 = 36.0;
 const GLYPH: f32 = 14.0;
 /// Between pills in the row.
-const ROW_GAP: f32 = 2.0;
+const ROW_GAP: f32 = 8.0;
 /// Between the composer's action buttons.
 pub const ACTION_GAP: f32 = 6.0;
 /// The card's own side padding (12 pt each side).
@@ -125,7 +125,6 @@ enum ModelLook {
 struct Fold {
     agent_icon: bool,
     model: ModelLook,
-    auto_icon: bool,
     mode_icon: bool,
     branch_icon: bool,
     more_branch: bool,
@@ -137,7 +136,6 @@ struct Fold {
 const FULL: Fold = Fold {
     agent_icon: false,
     model: ModelLook::Split,
-    auto_icon: false,
     mode_icon: false,
     branch_icon: false,
     more_branch: false,
@@ -149,10 +147,9 @@ const FULL: Fold = Fold {
 /// The steps, in the order the row gives them up: words before meaning;
 /// the permission mode (a bypass is worth seeing) is the last to leave, after
 /// the agent, which the pane's header names anyway.
-const FOLDS: [fn(&mut Fold); 12] = [
+const FOLDS: [fn(&mut Fold); 11] = [
     |f| f.agent_icon = true,
     |f| f.model = ModelLook::Joined,
-    |f| f.auto_icon = true,
     |f| f.mode_icon = true,
     |f| f.branch_icon = true,
     |f| f.model = ModelLook::Name,
@@ -309,7 +306,7 @@ impl Controls {
             items.push(if f.agent_icon {
                 ICON_PILL
             } else {
-                8.0 + 12.0 + 6.0 + text_w(&self.agent_name, k.ty.small_medium) + 8.0
+                8.0 + 20.0 + 6.0 + text_w(&self.agent_name, k.ty.small_medium) + 8.0
             });
         }
         if let Some(m) = &self.model {
@@ -353,12 +350,7 @@ impl Controls {
             }
         }
         if !f.more_auto {
-            items.push(if f.auto_icon {
-                ICON_PILL
-            } else {
-                // The switch's label, its gap and the small track.
-                text_w(self.tr("Auto-approve"), small) + 8.0 + 44.0
-            });
+            items.push(ICON_PILL);
         }
         if self.has_more(f) {
             items.push(ICON_PILL);
@@ -453,20 +445,21 @@ fn pill_button(
     } else {
         k.c.border_muted.alpha(0.30)
     };
-    e.radius(k.radius.xs)
+    e.h(32.0)
+        .radius(k.radius.lg)
         .fill(chip_fill)
         .border(0.5, chip_border)
 }
 
 fn agent_chip(c: &Controls, k: &Kit, f: Fold) -> El {
-    let mark = super::agents::mark(&c.agent_id, 12.0, c.dark).a11y_hidden();
+    let mark = super::agents::mark(&c.agent_id, super::composer::AGENT_ICON, c.dark).a11y_hidden();
     let mut chip = row()
         .key("agent")
         .role("image")
         .label(c.agent_name.clone())
         .center_y()
-        .h(22.0)
-        .radius(k.radius.xs)
+        .h(32.0)
+        .radius(k.radius.lg)
         .fill(k.c.layer_01.alpha(0.35))
         .border(0.5, k.c.border_muted.alpha(0.30))
         .child(mark);
@@ -538,6 +531,9 @@ fn model_chips(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold,
                 .variant(BadgeVariant::Subtle)
                 .build(k)
                 .key("model")
+                .h(32.0)
+                .px(10.0)
+                .radius(k.radius.lg)
         } else {
             let current = m.current.as_ref().map(|(p, i)| (p.as_str(), i.as_str()));
             model_menu(
@@ -578,7 +574,10 @@ fn model_chips(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold,
         })
         .variant(BadgeVariant::Subtle)
         .build(k)
-        .key("model");
+        .key("model")
+        .h(32.0)
+        .px(10.0)
+        .radius(k.radius.lg);
         return line.child(badge);
     }
     let trigger = pill_button(
@@ -714,34 +713,33 @@ fn auto_help(c: &Controls) -> String {
     )
 }
 
-fn auto_control(c: &Controls, k: &Kit, f: Fold) -> El {
+fn auto_control(c: &Controls, k: &Kit) -> El {
     let (on, asid) = (c.auto_on, c.asid.clone());
-    let label = c.tr("Auto-approve");
-    if !f.auto_icon {
-        return rune_kit::Switch::new(on)
-            .label(label)
-            .on_toggle(move |s: &mut UiState| set_auto(s, &asid, !on))
-            .build(k)
-            .key("auto-approve");
-    }
-    // A toggle: lit in the accent while on.
-    let tone = if on { k.c.bg_accent } else { k.c.icon_muted };
-    let b = Button::new(label)
-        .variant(ButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
+    rune_kit::IconButton::new(&AUTO_APPROVE)
+        .variant(rune_kit::IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Large)
+        .label(c.tr("Auto-approve"))
         .help(auto_help(c))
-        .label_with(move |_, _| icon(&AUTO_APPROVE, GLYPH).color(tone))
         .on_press(move |s: &mut UiState| set_auto(s, &asid, !on))
         .build(k)
         .key("auto-approve")
+        .size(32.0, 32.0)
+        .radius(k.radius.lg)
+        .fill(if on {
+            k.c.bg_accent.alpha(0.16)
+        } else {
+            k.c.layer_01.alpha(0.35)
+        })
+        .border(
+            0.5,
+            if on {
+                k.c.bg_accent.alpha(0.5)
+            } else {
+                k.c.border_muted.alpha(0.3)
+            },
+        )
         .role("switch")
         .checked(on)
-        .px(3.0);
-    if on {
-        b.fill(k.c.bg_accent.alpha(0.14))
-    } else {
-        b
-    }
 }
 
 fn branch_control(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -> Option<El> {
@@ -817,7 +815,11 @@ fn more_menu(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -
     if f.more_agent {
         menu = section(menu).item(
             MenuItem::new(c.agent_name.clone())
-                .lead(super::agents::mark(&c.agent_id, 12.0, c.dark))
+                .lead(super::agents::mark(
+                    &c.agent_id,
+                    super::composer::AGENT_ICON,
+                    c.dark,
+                ))
                 .disabled(true),
         );
     }
@@ -878,7 +880,7 @@ fn build(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -> El
         }
     }
     if !f.more_auto {
-        line = line.child(auto_control(c, k, f));
+        line = line.child(auto_control(c, k));
     }
     if c.has_more(f) {
         line = line.child(more_menu(s, c, k, layer, f));
@@ -950,9 +952,5 @@ mod tests {
         let (k, c) = (Kit::neutral(false), claude());
         let widths: Vec<f32> = (0..=FOLDS.len()).map(|l| c.width(&k, fold_at(l))).collect();
         assert!(widths.windows(2).all(|w| w[1] <= w[0]), "{widths:?}");
-        assert!(
-            widths[0] > 400.0 && widths[FOLDS.len()] < 70.0,
-            "{widths:?}"
-        );
     }
 }

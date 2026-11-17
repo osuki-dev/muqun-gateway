@@ -20,7 +20,7 @@ fn banner(s: &UiState, k: &Kit) -> El {
     let line = line.unwrap_or_default();
     const H: f32 = 176.0;
     const ART_W: f32 = 460.0;
-    let radius = crate::theme::look::CARD_RADIUS;
+    let radius = k.radius.lg;
     let art = crate::theme::apply::home_artwork(scheme)
         .or_else(|| crate::theme::apply::backdrop(scheme, true));
     let mut banner = el()

@@ -11,7 +11,7 @@
 //! `Primary+Alt+Shift+arrows` swap it with the one that way,
 //! `Primary+\` adds one, `Primary+W` removes the focused one.
 
-use rune::{col, el, row, text, Cursor, El, Key, KeyEvent, Phase, Tx};
+use rune::{col, el, row, text, Cursor, El, Key, Phase, Tx};
 use rune_kit::glyphs::{CLOSE, TRIANGLE_DOWN};
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem,
@@ -42,7 +42,7 @@ pub struct TileCardDrag {
 /// panels.
 const GAP: f32 = super::panes::FRAME;
 /// A pane header's height.
-const HEAD_H: f32 = 36.0;
+const HEAD_H: f32 = rune_kit::shell::TOOLBAR_HEIGHT;
 /// How far an unfocused pane's content sits back: the alpha of the card
 /// colour laid over it (light, dark), about a tenth of its contrast either
 /// way (blending is in linear light, so dark needs more).
@@ -51,15 +51,15 @@ const UNFOCUSED_SCRIM: [f32; 2] = [0.12, 0.22];
 /// `Primary+Alt+arrow` in split view: focus the pane that way; with Shift,
 /// swap the focused pane's session with that pane's. Text fields pass it
 /// here first (their own word moves take the plain chord).
-pub fn arrow_key(s: &mut UiState, ev: &KeyEvent) -> bool {
-    if !s.in_split() || !ev.mods.primary() || !ev.mods.alt {
+pub fn move_toward(s: &mut UiState, key: &Key, swap: bool) -> bool {
+    if !s.in_split() {
         return false;
     }
-    let toward = neighbour(s, &ev.key);
+    let toward = neighbour(s, key);
     match toward {
         // The terminal lends its Ctrl chords with Shift added (Windows and
         // Linux), so from there the arrows only ever move focus.
-        Some(j) if ev.mods.shift && !s.term.sink.focused => {
+        Some(j) if swap => {
             let i = s.focus;
             s.swap_tiles(i, j);
             true
@@ -69,7 +69,7 @@ pub fn arrow_key(s: &mut UiState, ev: &KeyEvent) -> bool {
             true
         }
         // An arrow toward the edge is still ours: it must not move the caret.
-        None => matches!(ev.key, Key::Left | Key::Right | Key::Up | Key::Down),
+        None => matches!(key, Key::Left | Key::Right | Key::Up | Key::Down),
     }
 }
 /// One geometry source for rendering, directional focus and drag targets.
@@ -319,7 +319,6 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
     let content = &s.tiles[i].content;
     let mut head = row()
         .key("tile-head")
-        .w_full()
         .h(HEAD_H)
         .pl(12.0 + place.clear)
         .motion(super::panes::SPRING)
@@ -376,40 +375,11 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
             }
         }
         super::TileContent::Terminal => {
-            let title = s.term_tile_title(i);
-            head = head
-                .child(
-                    rune::icon(&super::terminal_panel::TERMINAL_WINDOW, 14.0)
-                        .color(if focused {
-                            k.c.text_accent
-                        } else {
-                            k.c.icon_muted
-                        })
-                        .a11y_hidden(),
-                )
-                .child(
-                    text(title)
-                        .key("tile-title")
-                        .font(title_font)
-                        .color(if focused {
-                            k.c.text_base
-                        } else {
-                            k.c.text_muted
-                        })
-                        .motion(look.focus_fade())
-                        .truncate()
-                        .shrink()
-                        .min_w(48.0),
-                )
-                .child(
-                    text(tr(language, "Terminal"))
-                        .key("tile-agent")
-                        .font(k.ty.small)
-                        .color(k.c.text_faint)
-                        .truncate()
-                        .shrink()
-                        .min_w(0.0),
-                );
+            head = head.child(
+                rune::icon(&super::terminal_panel::TERMINAL_WINDOW, 16.0)
+                    .color(k.c.icon_muted)
+                    .help(tr_ref(language, "Drag to move")),
+            );
         }
         super::TileContent::Diff(path) => {
             head = head
@@ -463,24 +433,33 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
             );
         }
     }
-    // The header's empty middle: drag to reorder/split panes, or move a
-    // floating/popped card. Outside split view it still moves the window.
-    head = head.child(if s.in_split() {
-        el().key("tile-spacer")
-            .grow(1.0)
-            .h_full()
-            .cursor(Cursor::Grab)
-            .on_drag(move |s: &mut UiState, d: &mut rune::Drag, _: &mut Tx| {
-                header_tile_drag(s, i, d);
-            })
-            .a11y_hidden()
+    // The complete title region is draggable, even when a long title leaves
+    // no blank spacer. Action buttons stay outside this drag target.
+    head = head.child(el().key("tile-spacer").grow(1.0).h_full().a11y_hidden());
+    let drag_area = head
+        .key(format!("tile-drag-region-{i}"))
+        .w(0.0)
+        .grow(1.0)
+        .min_w(0.0);
+    let drag_area = if s.in_split() {
+        drag_area.cursor(Cursor::Grab).on_drag(
+            move |s: &mut UiState, d: &mut rune::Drag, _: &mut Tx| header_tile_drag(s, i, d),
+        )
     } else {
-        el().key("tile-spacer")
-            .grow(1.0)
-            .h_full()
-            .window_drag()
-            .a11y_hidden()
-    });
+        drag_area.window_drag()
+    };
+    let mut head = row()
+        .key("tile-head")
+        .h(HEAD_H)
+        .pr(6.0)
+        .gap(4.0)
+        .center_y()
+        .hover_group();
+    head = if matches!(content, super::TileContent::Terminal) {
+        head.child(drag_area.w(28.0).grow(0.0).pl(4.0))
+    } else {
+        head.w_full().child(drag_area)
+    };
     // Move and close: visible under the pointer, always reachable by menu.
     let menu_open = s.menu == Some(OpenMenu::Tile(i));
     let mut menu = Menu::new(format!("tile-menu-{i}"))
@@ -1014,7 +993,6 @@ fn tile(
         super::TileContent::Empty => format!("tile-empty-{i}"),
     };
     let radius = k.radius.lg;
-    let (under, over) = super::shell::card_floor_colors(k, look);
     let mut body = col()
         .key(id.clone())
         .matched(id.clone())
@@ -1027,7 +1005,6 @@ fn tile(
         .min_h(0.0)
         .radius(radius)
         .clip_rounded(radius)
-        .fill(under)
         .border(
             1.0,
             if focused {
@@ -1043,21 +1020,16 @@ fn tile(
             rune::Transition::none()
         })
         .on_press(move |s: &mut UiState| s.focus_tile(i));
-    if let Some(over) = over {
-        body = body.child(
-            el().key("tile-floor")
-                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-                .fill(over)
+    body = look.panel(k, body, radius);
+    if !t.is_terminal() {
+        body = body.child(header(s, k, look, i, place, layer)).child(
+            el().key("tile-rule")
+                .w_full()
+                .h(1.0)
+                .fill(k.c.border_muted)
                 .a11y_hidden(),
         );
     }
-    body = body.child(header(s, k, look, i, place, layer)).child(
-        el().key("tile-rule")
-            .w_full()
-            .h(1.0)
-            .fill(k.c.border_muted)
-            .a11y_hidden(),
-    );
     match (&t.content, focused) {
         (super::TileContent::Empty, _) => body = body.child(picker(s, k, look, i)),
         (super::TileContent::Terminal, _) => {
@@ -1066,13 +1038,15 @@ fn tile(
             } else {
                 crate::theme::color_scheme::ColorScheme::Light
             };
-            body = body.child(super::terminal_panel::tile_body_for(
+            let controls = header(s, k, look, i, place, layer);
+            body = body.child(super::terminal_panel::tile_body_with_controls(
                 s,
                 k,
                 scheme,
                 scale,
                 layer,
                 Some(i),
+                Some(controls),
             ));
         }
         (super::TileContent::Custom { id, kind, .. }, _) => {
@@ -1206,6 +1180,8 @@ fn header_tile_drag(s: &mut UiState, i: usize, d: &mut rune::Drag) {
                     if let (Some(dst), Some(zone)) = (drag.over, drag.zone) {
                         s.drop_tile_on(drag.src, dst, zone);
                     }
+                } else {
+                    s.persist_tiles();
                 }
             }
         }
@@ -1316,11 +1292,29 @@ fn floating_card(
                 }
                 if d.phase == Phase::Up {
                     s.tile_card_drag = None;
+                    s.persist_tiles();
                 }
             }
         })
         .a11y_hidden();
     el().key(format!("tile-float-{i}"))
+        .radius(k.radius.lg)
+        .box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 18.0,
+            blur: 48.0,
+            spread: 0.0,
+            color: k.c.black.alpha(if look.dark { 0.65 } else { 0.22 }),
+            inset: false,
+        })
+        .box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 2.0,
+            blur: 8.0,
+            spread: 1.0,
+            color: k.c.black.alpha(0.24),
+            inset: false,
+        })
         .paint_order(if i == s.focus { 2 } else { 1 })
         .motion(layout_motion(s))
         .absolute(x, y)
@@ -1525,7 +1519,11 @@ pub fn view(s: &UiState, k: &Kit, clear: f32, scale: f32, layer: &mut Vec<El>) -
             );
         }
     }
-    stage = stage.child(backdrop);
+    // Tiled gaps reveal the same window backdrop as the sidebar gutter.
+    // Transparent windows keep the desktop visible even between floating panes.
+    if mode == crate::config::TileLayoutMode::Floating && !look.see_through {
+        stage = stage.child(backdrop);
+    }
 
     if let Some(z) = s.zoomed_tile.filter(|&i| i < s.tiles.len()) {
         stage = stage.child(tile(

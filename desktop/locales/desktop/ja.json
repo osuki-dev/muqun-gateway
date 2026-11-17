@@ -1,4 +1,6 @@
 {
+  "Describe the task…": "Describe the task…",
+  "Message…": "Message…",
   "Open": "開く",
   "Remove": "削除",
   "Steer:": "割り込み：",
@@ -581,5 +583,10 @@
   "Floating": "Floating",
   "Layout": "Layout",
   "Esc to close": "Esc to close",
-  "Group key or chord · Leader again to send to terminal · Esc to close": "Group key or chord · Leader again to send to terminal · Esc to close"
+  "Group key or chord · Leader again to send to terminal · Esc to close": "Group key or chord · Leader again to send to terminal · Esc to close",
+  "Recent sessions": "最近の会話",
+  "All sessions": "すべての会話",
+  "Browse every session. Search always includes all sessions.": "Browse every session. Search always includes all sessions.",
+  "Last 3 days, up to 8 recent sessions. Pinned, open and active sessions stay visible.": "Last 3 days, up to 8 recent sessions. Pinned, open and active sessions stay visible.",
+  "No recent sessions. Open All sessions to continue earlier work.": "No recent sessions. Open All sessions to continue earlier work."
 }

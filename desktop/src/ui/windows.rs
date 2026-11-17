@@ -4,6 +4,20 @@ use crate::plugin::WindowKind;
 
 impl UiState {
     pub fn close_plugin_windows(&mut self, id: &str) {
+        if matches!(
+            (id, self.mode),
+            ("tasks", Mode::Tasks) | ("inbox", Mode::Inbox)
+        ) {
+            self.go(if self.selected.is_some() {
+                Mode::Session
+            } else {
+                Mode::Home
+            });
+        }
+        if id == "inspector" && self.active_plugin_drawer.is_none() && self.right_open {
+            self.right_open = false;
+            self.right.set_open(false);
+        }
         if self.active_plugin_page.as_deref() == Some(id) {
             self.active_plugin_page = None;
             self.plugin_page_origin = None;
@@ -87,10 +101,10 @@ impl UiState {
 
     /// Close the active right-hand plugin drawer.
     pub fn close_plugin_drawer(&mut self) {
-        if self.active_plugin_drawer.take().is_some() {
-            self.right_open = false;
-            self.right.set_open(false);
-        }
+        self.active_plugin_drawer = None;
+        self.right_open = false;
+        self.right.set_open(false);
+        self.draft.focused = true;
     }
 
     /// Find the tile index currently hosting `plugin_id`, if any.
@@ -229,5 +243,67 @@ impl UiState {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ui::UiState;
+    #[test]
+    fn disabling_builtins_closes_current_surfaces_and_reenable_works_immediately() {
+        use crate::config::ConfigEdit;
+        use crate::ui::Mode;
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        for (plugin, mode) in [("tasks", Mode::Tasks), ("inbox", Mode::Inbox)] {
+            s.go(mode);
+            assert_eq!(s.mode, mode);
+            s.edit(ConfigEdit::PluginEnabled {
+                plugin: plugin.into(),
+                on: false,
+            });
+            assert_eq!(s.mode, Mode::Home);
+            s.go(mode);
+            assert_eq!(s.mode, Mode::Home);
+            s.edit(ConfigEdit::PluginEnabled {
+                plugin: plugin.into(),
+                on: true,
+            });
+            s.go(mode);
+            assert_eq!(s.mode, mode);
+        }
+        s.toggle_inspector();
+        assert!(s.right_open);
+        s.edit(ConfigEdit::PluginEnabled {
+            plugin: "inspector".into(),
+            on: false,
+        });
+        assert!(!s.right_open);
+        s.toggle_inspector();
+        assert!(!s.right_open);
+        s.edit(ConfigEdit::PluginEnabled {
+            plugin: "inspector".into(),
+            on: true,
+        });
+        s.toggle_inspector();
+        assert!(s.right_open);
+    }
+
+    #[test]
+    fn closing_implicit_inspector_closes_pane_and_restores_draft_focus() {
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.right_open = true;
+        s.right.set_open(true);
+        s.draft.focused = false;
+        assert!(s.active_plugin_drawer.is_none());
+        s.close_plugin_drawer();
+        assert!(!s.right_open);
+        assert!(!s.right.is_open());
+        assert!(s.draft.focused);
+        s.toggle_inspector();
+        assert!(s.right_open);
+        s.close_plugin_drawer();
+        assert!(!s.right_open);
     }
 }

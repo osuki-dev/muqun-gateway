@@ -117,11 +117,6 @@ pub fn mark(id: &str, size: f32, dark: bool) -> El {
     icon(mark_icon(id), size).color(color(id, dark))
 }
 
-/// Same mark, muted (for disabled / idle agents).
-pub fn mark_idle(id: &str, size: f32, muted: Color) -> El {
-    icon(mark_icon(id), size).color(muted)
-}
-
 /// A small filled disc in the agent's brand colour.
 #[allow(dead_code)]
 pub fn dot(id: &str, dark: bool) -> El {

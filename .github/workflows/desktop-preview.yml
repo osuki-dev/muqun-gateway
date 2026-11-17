@@ -1,0 +1,105 @@
+name: Desktop preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the verified preview as a GitHub prerelease
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-preview-publication
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify signing prerequisites
+        env:
+          CERT: ${{ secrets.DESKTOP_MACOS_CERTIFICATE_P12 }}
+          CERT_PASSWORD: ${{ secrets.DESKTOP_MACOS_CERTIFICATE_PASSWORD }}
+          IDENTITY: ${{ secrets.DESKTOP_MACOS_SIGN_IDENTITY }}
+          API_KEY: ${{ secrets.DESKTOP_APPLE_API_KEY_P8 }}
+          KEY_ID: ${{ secrets.DESKTOP_APPLE_KEY_ID }}
+          ISSUER: ${{ secrets.DESKTOP_APPLE_ISSUER_ID }}
+        run: |
+          for name in CERT CERT_PASSWORD IDENTITY API_KEY KEY_ID ISSUER; do
+            test -n "${!name}" || { echo "::error::Missing Desktop signing prerequisite: $name"; exit 1; }
+          done
+      - name: Stamp preview
+        id: version
+        run: python3 desktop/scripts/prepare-preview.py
+
+  checks-and-build:
+    needs: prepare
+    uses: ./.github/workflows/desktop-ci.yml
+    with:
+      preview_version: ${{ needs.prepare.outputs.version }}
+
+  sign-macos:
+    needs: [prepare, checks-and-build]
+    uses: ./.github/workflows/desktop-notarize.yml
+    secrets: inherit
+
+  publish:
+    if: inputs.publish
+    needs: [prepare, checks-and-build, sign-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: muqun-desktop-Linux
+          path: linux
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-preview-signed-macos
+          path: artifacts
+      - name: Publish separate Desktop prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp linux/*.tar.gz linux/*.tar.gz.sha256 artifacts/
+          cd artifacts
+          test -s "muqun-desktop-$VERSION-macos-arm64.zip"
+          test -s muqun-desktop-linux-x86_64.tar.gz
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 4
+          sha256sum -c ./*.sha256
+          cd ..
+          tag="desktop-v$VERSION"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag"; then
+            echo 'Desktop preview tag exists; refusing to overwrite.' >&2
+            exit 1
+          else
+            test "$?" -eq 2
+          fi
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          notes = Path('release-notes/desktop-unreleased.md').read_text().strip()
+          assert notes
+          Path('desktop-preview-notes.md').write_text(notes + '\n\nSource: ' + os.environ['SOURCE_SHA'] + '\nDesktop version: ' + os.environ['VERSION'] + '\n')
+          PY
+          gh release create "$tag" artifacts/* --target "$SOURCE_SHA" --title "Muqun Desktop $VERSION" --notes-file desktop-preview-notes.md --prerelease --latest=false
+          gh release view "$tag" --json isPrerelease,assets,body > release.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          r = json.loads(Path('release.json').read_text())
+          assert r['isPrerelease'] and r['body'].strip()
+          assert {a['name'] for a in r['assets']} == {p.name for p in Path('artifacts').iterdir()}
+          PY

@@ -166,6 +166,7 @@ pub enum OpenMenu {
     /// (what a narrow composer folds away).
     Mode,
     ComposerMore,
+    ComposerDelivery,
     /// The start page's model, mode and branch menus.
     StartModel,
     StartMode,
@@ -188,6 +189,9 @@ pub enum OpenMenu {
     Setting(String),
     /// The sidebar's computer picker.
     ComputerPicker,
+    /// The sidebar inventory scope. Search remains global.
+    SidebarScope,
+    WindowSurface(String),
     /// The tasks page's computer filter picker.
     TasksComputerPicker,
 }
@@ -437,6 +441,7 @@ pub struct UiState {
     pub context_open: Option<String>,
     /// Account rate windows by agent, once asked for (`None`: it has none).
     pub account_limits: HashMap<String, Option<serde_json::Value>>,
+    pub agent_details: std::collections::HashSet<String>,
     pub status: String,
     pub hub_label: String,
     pub error: Option<UiError>,
@@ -502,6 +507,8 @@ pub struct UiState {
     pub worktrees: Vec<WorktreeRow>,
 
     pub search: TextEdit,
+    pub sidebar_all_sessions: bool,
+    pub sidebar_opened: HashMap<String, u64>,
     pub pairing_target: Option<String>,
     pub pairing_request_id: Option<String>,
     pub pairing_code_input: TextEdit,
@@ -568,10 +575,9 @@ pub struct UiState {
     pub prompt_history_draft_stash: Option<String>,
     /// Whether the composer prompt history picker popup is open.
     pub composer_history_open: bool,
-    /// Manual height override for the composer textarea (number of rows).
-    pub composer_rows: Option<usize>,
-    /// Whether the composer textarea is toggled into expanded multiline mode.
-    pub composer_expanded: bool,
+    pub composer_queue_delivery: bool,
+    pub composer_queue_expanded: bool,
+    pub composer_queue_page: Option<String>,
     /// Timeline in-session search state (Ctrl+F in session mode).
     pub timeline_search: TimelineSearch,
     /// First agents discovery finished (empty list still counts).
@@ -699,6 +705,7 @@ impl UiState {
             row_menu: None,
             context_open: None,
             account_limits: HashMap::new(),
+            agent_details: std::collections::HashSet::new(),
             status: "Starting…".into(),
             hub_label: String::new(),
             error: None,
@@ -745,6 +752,8 @@ impl UiState {
             shells: Vec::new(),
             worktrees: Vec::new(),
             search: TextEdit::new(""),
+            sidebar_all_sessions: false,
+            sidebar_opened: HashMap::new(),
             pairing_target: None,
             pairing_request_id: None,
             pairing_code_input: TextEdit::new(""),
@@ -790,8 +799,9 @@ impl UiState {
             prompt_history_cursor: None,
             prompt_history_draft_stash: None,
             composer_history_open: false,
-            composer_rows: None,
-            composer_expanded: false,
+            composer_queue_delivery: false,
+            composer_queue_expanded: false,
+            composer_queue_page: None,
             timeline_search: TimelineSearch::default(),
             agents_seen: false,
             demo: false,
@@ -924,8 +934,14 @@ impl UiState {
     /// Fold a config edit into the mirror and tell the core.
     pub fn edit(&mut self, edit: ConfigEdit) {
         self.cfg.apply(edit.clone());
-        if let ConfigEdit::PluginEnabled { plugin, on: false } = &edit {
-            if !crate::plugin::is_enabled(plugin, &self.cfg.plugins_disabled) {
+        if let ConfigEdit::PluginEnabled { plugin, .. } = &edit {
+            let enabled = crate::plugin::is_enabled(plugin, &self.cfg.plugins_disabled);
+            if let Some(instance) = self.plugins.get(plugin) {
+                instance.enabled_changed(enabled);
+            }
+            if !enabled {
+                self.palette = None;
+                self.menu = None;
                 self.close_plugin_windows(plugin);
             }
         }
@@ -1363,6 +1379,19 @@ impl UiState {
     /// Show session `asid`. In split view it joins as a new pane (or takes
     /// focus where it already is); otherwise it fills the main card.
     pub fn open_session(&mut self, asid: &str) {
+        let key = format!("{}:{asid}", self.current_computer());
+        self.sidebar_opened.insert(key, now_ms());
+        if self.sidebar_opened.len() > 256 {
+            if let Some(oldest) = self
+                .sidebar_opened
+                .iter()
+                .min_by_key(|(_, time)| *time)
+                .map(|(id, _)| id.clone())
+            {
+                self.sidebar_opened.remove(&oldest);
+            }
+        }
+        self.sidebar_all_sessions = false;
         self.active_plugin_page = None;
         if self.in_split() && self.tile_of(asid).is_none() {
             crate::platform::notify::withdraw(asid);
@@ -1724,7 +1753,25 @@ impl UiState {
         self.timeline_search_jump_to_current(tx);
     }
 
+    pub fn refresh_account_limits(&self) {
+        for a in &self.agents {
+            if a.features.extra.get("accountLimits") == Some(&serde_json::Value::Bool(true)) {
+                self.send(Command::LoadAccountLimits {
+                    agent: a.id.clone(),
+                });
+            }
+        }
+    }
+
     pub fn go(&mut self, mode: Mode) {
+        let plugin = match mode {
+            Mode::Tasks => Some("tasks"),
+            Mode::Inbox => Some("inbox"),
+            _ => None,
+        };
+        if plugin.is_some_and(|id| !crate::plugin::is_enabled(id, &self.cfg.plugins_disabled)) {
+            return;
+        }
         self.active_plugin_page = None;
         self.mode = mode;
         match mode {
@@ -1739,6 +1786,7 @@ impl UiState {
                 ));
             }
             Mode::Settings => {
+                self.refresh_account_limits();
                 self.send(Command::ThemeRefresh);
                 self.send(Command::ScanStorage);
             }
@@ -1871,6 +1919,9 @@ impl UiState {
     }
 
     pub fn toggle_inspector(&mut self) {
+        if !crate::plugin::is_enabled("inspector", &self.cfg.plugins_disabled) {
+            return;
+        }
         self.active_plugin_drawer = None;
         if self.term.open {
             // One panel on the right at a time: the inspector takes it back.
@@ -1885,6 +1936,9 @@ impl UiState {
     }
 
     pub fn open_git_inspector(&mut self) {
+        if !crate::plugin::is_enabled("inspector", &self.cfg.plugins_disabled) {
+            return;
+        }
         self.active_plugin_drawer = None;
         if self.mode != Mode::Session && self.selected.is_some() {
             self.go(Mode::Session);
@@ -2653,6 +2707,13 @@ impl UiState {
         }
         if let Some(first_asid) = self.tiles.iter().find_map(|t| t.asid.clone()) {
             self.open_session(&first_asid);
+            // Watching only subscribes to future events. Every restored pane
+            // needs its initial snapshot, including panes nobody has clicked.
+            for asid in self.tiles.iter().filter_map(|tile| tile.asid.as_ref()) {
+                if asid != &first_asid && !asid.starts_with("new-") {
+                    self.send(Command::OpenTile(AgentSessionId(asid.clone())));
+                }
+            }
         }
         // The saved tiling, when every saved pane came back.
         if let Some(layout) = self.cfg.ui.tile_layout.clone() {
@@ -3622,7 +3683,7 @@ pub fn activity_mark(
         .px(8.0)
         .gap(6.0)
         .center_y()
-        .radius(10.0)
+        .radius(k.radius.lg)
         .fill(color.alpha(if activity == Activity::Idle {
             0.08
         } else {
@@ -3790,6 +3851,40 @@ pub fn spawn_inbox_pump(inbox: Arc<Inbox>, handle: rune::AppHandle<UiState>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn restored_split_loads_every_session_without_focus_clicks() {
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = super::UiState::new(tx);
+        s.demo = false;
+        s.tiles_restored = false;
+        s.cfg.ui.tiles = vec!["session:left".into(), "session:right".into()];
+        s.sessions = ["left", "right"]
+            .into_iter()
+            .map(|id| {
+                serde_json::from_value(serde_json::json!({
+                    "asid": id, "agent_id": "codex", "title": id,
+                    "status": "idle", "directory": "/project", "updated_ms": 1
+                }))
+                .unwrap()
+            })
+            .collect();
+        s.restore_tiles();
+        let mut opened = std::collections::HashSet::new();
+        while let Ok(command) = rx.try_recv() {
+            if let crate::model::commands::Command::OpenSession(id)
+            | crate::model::commands::Command::OpenTile(id) = command
+            {
+                opened.insert(id.0);
+            }
+        }
+        assert_eq!(
+            opened,
+            ["left".to_string(), "right".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(s.selected.as_deref(), Some("left"));
+    }
     use super::*;
 
     #[test]

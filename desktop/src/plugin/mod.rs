@@ -89,15 +89,27 @@ pub fn surface_switcher(
     lang: Language,
     plugin_id: &str,
     active: PluginSlot,
+    layer: &mut Vec<El>,
 ) -> El {
-    let mut bar = row()
-        .key(format!("surface-switcher-{plugin_id}-{active:?}"))
-        .gap(4.0)
-        .center_y();
-
+    let menu_id = format!("surface-{plugin_id}-{active:?}");
+    let open = s.menu == Some(crate::ui::OpenMenu::WindowSurface(menu_id.clone()));
+    let title = WindowKind::from_slot(active).map_or("Window", WindowKind::label);
+    let mut menu = rune_kit::Menu::new(menu_id.clone())
+        .trigger(
+            Button::new(format!("{} ▾", tr_ref(lang, title)))
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Large)
+                .on_press(move |s: &mut UiState| {
+                    s.menu = (!open).then(|| crate::ui::OpenMenu::WindowSurface(menu_id.clone()));
+                })
+                .build(k)
+                .key(format!("surf-menu-{plugin_id}-{active:?}")),
+        )
+        .open(open)
+        .min_width(180.0)
+        .on_close(|s: &mut UiState| s.menu = None);
     for kind in WindowKind::ALL {
         let slot = kind.slot();
-        let label_en = kind.label();
         if !s
             .plugins
             .get(plugin_id)
@@ -106,40 +118,44 @@ pub fn surface_switcher(
             continue;
         }
         let pid = plugin_id.to_string();
-        let is_active = active == slot;
-        let btn = Button::new(tr_ref(lang, label_en))
-            .variant(if is_active {
-                ButtonVariant::Contrast
-            } else {
-                ButtonVariant::Ghost
-            })
-            .control_size(ControlSize::Small)
-            .on_press(move |s: &mut UiState| {
-                s.switch_plugin_surface(&pid, slot);
-            })
-            .build(k)
-            .key(format!("surf-btn-{plugin_id}-{slot:?}"));
-        bar = bar.child(btn);
+        menu = menu.item(
+            rune_kit::MenuItem::new(tr_ref(lang, kind.label()))
+                .checked(active == slot)
+                .on_select(move |s: &mut UiState| {
+                    s.menu = None;
+                    s.switch_plugin_surface(&pid, slot);
+                }),
+        );
     }
+    let mut bar = row()
+        .key(format!("surface-switcher-{plugin_id}-{active:?}"))
+        .gap(4.0)
+        .center_y()
+        .child(menu.build(k, layer));
 
     if matches!(active, PluginSlot::Page | PluginSlot::Drawer) {
-        let close_btn = Button::new(tr_ref(
+        let close_label = tr_ref(
             lang,
             if active == PluginSlot::Page && s.plugin_page_origin.is_some() {
                 "Restore"
             } else {
                 "Close"
             },
-        ))
-        .variant(ButtonVariant::Ghost)
-        .control_size(ControlSize::Small)
-        .on_press(move |s: &mut UiState| match active {
-            PluginSlot::Page => s.close_plugin_page(),
-            PluginSlot::Drawer => s.close_plugin_drawer(),
-            _ => {}
-        })
-        .build(k)
-        .key(format!("surf-close-{plugin_id}-{active:?}"));
+        );
+        let terminal = plugin_id == "terminal";
+        let close_btn = rune_kit::IconButton::new(k.glyph.close)
+            .label(close_label)
+            .help(close_label)
+            .variant(rune_kit::IconButtonVariant::GhostMuted)
+            .control_size(ControlSize::Large)
+            .on_press(move |s: &mut UiState| match active {
+                PluginSlot::Page => s.close_plugin_page(),
+                PluginSlot::Drawer if terminal => s.close_terminal(),
+                PluginSlot::Drawer => s.close_plugin_drawer(),
+                _ => {}
+            })
+            .build(k)
+            .key(format!("surf-close-{plugin_id}-{active:?}"));
         bar = bar.child(close_btn);
     }
 
@@ -200,6 +216,9 @@ pub trait DesktopPlugin: Send + Sync {
     fn commands(&self) -> Vec<PluginCommand> {
         Vec::new()
     }
+
+    /// Apply a runtime enablement change without restarting the host.
+    fn enabled_changed(&self, _enabled: bool) {}
 
     /// Fold background work into UI state without blocking input.
     fn poll(&self, _s: &mut UiState, _tx: &mut Tx) -> bool {
@@ -377,34 +396,17 @@ impl DesktopPlugin for TerminalPlugin {
         } else {
             ColorScheme::Light
         };
-        let lang = ctx.s.cfg.general.language;
-        let body = terminal_panel::tile_body(ctx.s, ctx.k, scheme, ctx.scale, layer);
-        if matches!(ctx.surface, PluginSlot::Page | PluginSlot::Drawer) {
-            let header = row()
-                .w_full()
-                .h(36.0)
-                .px(12.0)
-                .gap(8.0)
-                .center_y()
-                .fill(ctx.k.alpha(ctx.k.c.layer_01, 0.45))
-                .child(icon(&terminal_panel::TERMINAL_WINDOW, 14.0).color(ctx.k.c.text_accent))
-                .child(
-                    text(tr_ref(lang, "Terminal"))
-                        .font(ctx.k.ty.ui_medium)
-                        .color(ctx.k.c.text_base),
-                )
-                .child(el().grow(1.0));
-            return Some(
-                col()
-                    .key(format!("term-plugin-{:?}-{}", ctx.surface, ctx.tile_id))
-                    .grow(1.0)
-                    .w_full()
-                    .min_h(0.0)
-                    .child(header)
-                    .child(body),
-            );
-        }
-        Some(body)
+        let controls = Some(surface_switcher(
+            ctx.s,
+            ctx.k,
+            ctx.s.cfg.general.language,
+            "terminal",
+            ctx.surface,
+            layer,
+        ));
+        Some(terminal_panel::tile_body_with_controls(
+            ctx.s, ctx.k, scheme, ctx.scale, layer, None, controls,
+        ))
     }
 
     fn commands(&self) -> Vec<PluginCommand> {

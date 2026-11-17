@@ -184,7 +184,15 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             1.0
         };
         let surface = super::terminal_panel::surface(s, k, scheme).alpha(alpha);
-        let view = super::terminal_panel::view(s, k, scheme, scale, layer);
+        let controls = crate::plugin::surface_switcher(
+            s,
+            k,
+            s.cfg.general.language,
+            "terminal",
+            crate::plugin::PluginSlot::Drawer,
+            layer,
+        );
+        let view = super::terminal_panel::view(s, k, scheme, scale, layer, controls);
         let ctx = crate::plugin::PluginViewContext::new(
             s,
             k,
@@ -193,7 +201,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             scale,
             crate::plugin::PluginSlot::Drawer,
         );
-        let view = crate::plugin::window::chrome("terminal", &ctx, view);
+        let view = crate::plugin::window::chrome("terminal", &ctx, view, layer);
         split = split.inspector(
             &s.term.pane,
             super::terminal_pane,
@@ -311,22 +319,6 @@ fn hide_card(chrome: &mut Kit) {
     chrome.c.border_muted = chrome.c.border_muted.alpha(0.0);
 }
 
-/// A split-view pane's floor, as the main card's would be: the colour to
-/// fill it with, and on a see-through window the page colour to lay over
-/// that (the window floor first, then the card's surface).
-pub fn card_floor_colors(k: &Kit, look: &Look) -> (rune::Color, Option<rune::Color>) {
-    if look.see_through {
-        (
-            k.c.bg_deep.alpha(SEE_THROUGH_CARD[usize::from(look.dark)]),
-            Some(k.c.bg_base.alpha(CARD_ALPHA)),
-        )
-    } else if look.glass {
-        (k.c.bg_base.alpha(CARD_ALPHA), None)
-    } else {
-        (k.c.bg_base, None)
-    }
-}
-
 /// The least of the window floor that returns under the sidebar's lists,
 /// so a picture there is felt rather than read (light, dark): a picture
 /// over a light floor reads louder.
@@ -404,7 +396,17 @@ fn sidebar_panel(s: &UiState, k: &Kit, wash: f32) -> El {
     } else {
         super::panes::SPRING
     };
-    panel_surface(k, "sidebar-panel", wash, s.look().dark)
+    let panel = panel_surface(k, "sidebar-panel", wash, s.look().dark);
+    let panel = if crate::platform::is_macos() && s.look().glass {
+        col()
+            .key("sidebar-panel")
+            .radius(k.radius.lg)
+            .fill(k.c.bg_base.alpha(0.85))
+            .system_material(rune::SystemMaterial::Glass)
+    } else {
+        panel
+    };
+    panel
         .pin(Some(frame), Some(frame), None, Some(frame))
         .w((s.sidebar.width() - frame * 2.0).max(0.0))
         .opacity(if open { 1.0 } else { 0.0 })
@@ -519,6 +521,10 @@ fn home_brand(s: &UiState, k: &Kit, look: &Look, lights: f32) -> El {
     // With no window controls at the leading edge the mark lines up with
     // the rows' icons below it; past traffic lights it keeps a small gap.
     let lead = if lights > 0.0 { 6.0 } else { 16.0 };
+    let width = rune::memo::layout_with("sidebar-frame", |r| r[2])
+        .unwrap_or_else(|| s.sidebar.shown_width());
+    let name_width = rune::text::measure(APP_NAME, &[], k.ty.ui_medium, None).0;
+    let show_name = width >= lights + lead + MARK + 8.0 + name_width + 48.0;
     row()
         .key("home-brand")
         .ml(lead)
@@ -528,7 +534,7 @@ fn home_brand(s: &UiState, k: &Kit, look: &Look, lights: f32) -> El {
         .role("button")
         .label(tr_ref(language, "Home"))
         .child(mark)
-        .child(
+        .children(show_name.then(|| {
             text(APP_NAME)
                 .key("home-name")
                 .font(k.ty.ui_medium.lh(MARK))
@@ -536,8 +542,8 @@ fn home_brand(s: &UiState, k: &Kit, look: &Look, lights: f32) -> El {
                     k.c.text_base
                 } else {
                     k.c.text_muted
-                }),
-        )
+                })
+        }))
         .on_press(|s: &mut UiState| s.go(Mode::Home))
 }
 
@@ -855,7 +861,10 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
                 .key("terminal-toggle"),
         );
     }
-    if s.mode == Mode::Session && !s.in_split() {
+    if s.mode == Mode::Session
+        && !s.in_split()
+        && crate::plugin::is_enabled("inspector", &s.cfg.plugins_disabled)
+    {
         let is_git_open = s.right_open && !s.term.open && s.inspector_tab == InspectorTab::Git;
         bar = bar.trailing(
             IconButton::new(&super::icons::BRANCH)
