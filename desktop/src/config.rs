@@ -595,6 +595,8 @@ pub struct UiPrefs {
     /// The terminal panel's width (`ui/terminal_panel.rs`).
     #[serde(default = "UiPrefs::terminal_default")]
     pub terminal_width: f32,
+    /// Initial placement for ordinary terminal entry points.
+    pub terminal_open_mode: TerminalOpenMode,
     /// Pins, hidden projects and names given to projects, by project root
     /// (`model/projects.rs`). Only projects with a choice are kept.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -615,6 +617,16 @@ pub struct UiPrefs {
     /// The sidebar's Running list is open (`ui/running.rs`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub running_open: bool,
+}
+
+/// Default placement only; opening an existing terminal never relocates it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalOpenMode {
+    #[default]
+    Docked,
+    Split,
+    Floating,
 }
 
 /// Omarchy 4.5 / Hyprland workspace layout modes for split tiles.
@@ -739,6 +751,7 @@ impl Default for UiPrefs {
             sidebar_width: Self::SIDEBAR_DEFAULT,
             right_width: Self::RIGHT_DEFAULT,
             terminal_width: Self::TERMINAL_DEFAULT,
+            terminal_open_mode: TerminalOpenMode::default(),
             projects: BTreeMap::new(),
             recent_commands: Vec::new(),
             tiles: Vec::new(),
@@ -759,6 +772,7 @@ pub enum ConfigEdit {
     SidebarWidth(f32),
     RightWidth(f32),
     TerminalWidth(f32),
+    TerminalOpenMode(TerminalOpenMode),
     /// The sessions open side by side and how they tile.
     Tiles {
         asids: Vec<String>,
@@ -863,6 +877,7 @@ impl DesktopConfig {
             ConfigEdit::SidebarWidth(width) => self.ui.sidebar_width = width,
             ConfigEdit::RightWidth(width) => self.ui.right_width = width,
             ConfigEdit::TerminalWidth(width) => self.ui.terminal_width = width,
+            ConfigEdit::TerminalOpenMode(mode) => self.ui.terminal_open_mode = mode,
             ConfigEdit::Tiles { asids, layout } => {
                 self.ui.tiles = asids;
                 self.ui.tile_layout = layout;

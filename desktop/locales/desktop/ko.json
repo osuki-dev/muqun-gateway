@@ -786,5 +786,8 @@
   "A .muqun-theme address someone shared.": "공유받은 .muqun-theme 주소입니다.",
   "A .muqun-theme package on this computer.": "이 컴퓨터의 .muqun-theme 패키지입니다.",
   "No theme matches the search.": "검색과 일치하는 테마 없음.",
-  "Every coding agent on this computer in one window: start sessions, watch several at once, answer approvals, and keep the history. Nothing leaves this machine unless an agent sends it.": "이 컴퓨터의 모든 코딩 에이전트를 한 창에서 관리합니다. 세션 시작, 여러 세션 동시 확인, 승인 응답 및 기록 보관이 가능합니다. 에이전트가 전송하지 않는 한 데이터는 이 컴퓨터를 떠나지 않습니다."
+  "Every coding agent on this computer in one window: start sessions, watch several at once, answer approvals, and keep the history. Nothing leaves this machine unless an agent sends it.": "이 컴퓨터의 모든 코딩 에이전트를 한 창에서 관리합니다. 세션 시작, 여러 세션 동시 확인, 승인 응답 및 기록 보관이 가능합니다. 에이전트가 전송하지 않는 한 데이터는 이 컴퓨터를 떠나지 않습니다.",
+  "Docked": "도킹",
+  "Default terminal placement": "터미널 기본 열기 방식",
+  "Applies when opening a terminal. Existing terminals stay where they are.": "터미널을 열 때 적용됩니다. 이미 열린 터미널의 위치는 유지됩니다."
 }

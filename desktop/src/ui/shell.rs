@@ -806,7 +806,7 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
                     } else if s.term.open {
                         s.close_terminal();
                     } else {
-                        s.open_terminal();
+                        s.open_terminal_default();
                     }
                 })
                 .build(k)

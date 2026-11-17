@@ -720,7 +720,7 @@ fn window_actions(s: &UiState, k: &Kit) -> El {
                 } else if s.term.open {
                     s.close_terminal();
                 } else {
-                    s.open_terminal();
+                    s.open_terminal_default();
                 }
             })
             .build(k)

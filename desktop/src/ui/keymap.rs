@@ -1597,7 +1597,7 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
         A::ToggleTerminal => s.toggle_terminal_tx(tx),
         A::ToggleFocus => s.toggle_focus_tx(tx),
         A::NewShell => {
-            s.open_terminal();
+            s.open_terminal_default();
             s.restart_terminal();
         }
         A::ToggleInspector => {

@@ -515,7 +515,7 @@ impl UiState {
             return;
         }
         if !self.term.open {
-            self.open_terminal();
+            self.open_terminal_default();
         } else if self.term.sink.focused {
             self.close_terminal();
         } else {
@@ -550,7 +550,7 @@ impl UiState {
             } else if self.term.open {
                 self.focus_terminal();
             } else {
-                self.open_terminal();
+                self.open_terminal_default();
             }
             return;
         }
@@ -564,7 +564,7 @@ impl UiState {
         } else if self.term.open {
             self.focus_terminal();
         } else {
-            self.open_terminal();
+            self.open_terminal_default();
         }
     }
 
@@ -605,6 +605,54 @@ impl UiState {
             let next = if cur < 800.0 { 960.0 } else { 560.0 };
             self.term.pane = self.term.pane.with_width(next);
             self.term.pane.set_open(true);
+        }
+    }
+
+    /// Ordinary entry points honour the preferred placement only on open.
+    /// Explicit docking/splitting and restoring a layout use their own paths.
+    pub fn open_terminal_default(&mut self) {
+        if let Some(i) = self.tile_of_terminal() {
+            self.focus_tile(i);
+            self.focus_terminal();
+            return;
+        }
+        if self.term.open {
+            self.focus_terminal();
+            return;
+        }
+        match self.cfg.ui.terminal_open_mode {
+            crate::config::TerminalOpenMode::Docked => self.open_terminal(),
+            crate::config::TerminalOpenMode::Split | crate::config::TerminalOpenMode::Floating => {
+                // Keep the home surface beside/behind the new terminal.
+                // open_terminal_tile normally reuses an empty tile instead.
+                if self.tiles.is_empty() && self.selected.is_none() {
+                    self.tiles.push(super::Tile::empty());
+                    self.tiles.push(super::Tile::empty());
+                    self.tiles[1].set_terminal_tab(self.term.active_tab);
+                    self.tile_tree = crate::config::TileNode::Split {
+                        across: true,
+                        ratio: 0.5,
+                        a: Box::new(crate::config::TileNode::Leaf(0)),
+                        b: Box::new(crate::config::TileNode::Leaf(1)),
+                    };
+                    self.mode = super::Mode::Session;
+                    self.focus_tile(1);
+                    self.start_terminal();
+                } else {
+                    self.open_terminal_tile();
+                }
+                if let Some(i) = self.tile_of_terminal() {
+                    if self.cfg.ui.terminal_open_mode == crate::config::TerminalOpenMode::Floating {
+                        self.tiles[i].popped = true;
+                        self.tiles[i].floating_rect =
+                            Some(Self::default_floating_rect(i, self.tile_grid));
+                    }
+                    self.right_open = false;
+                    self.right.set_open(false);
+                    self.focus_terminal();
+                    self.persist_tiles();
+                }
+            }
         }
     }
 
@@ -797,6 +845,28 @@ impl UiState {
         self.term_switch_tab(prev);
     }
 
+    /// Remove empty terminal surfaces through the normal tile lifecycle so
+    /// neighbouring sessions retain their state and the exit motion still runs.
+    fn close_empty_terminal_surfaces(&mut self) {
+        let terminal_tiles: Vec<_> = self
+            .tiles
+            .iter()
+            .enumerate()
+            .filter_map(|(i, tile)| tile.is_terminal().then_some(i))
+            .collect();
+        // close_tile hands focus to a neighbour before removing a pane. Mark
+        // every dead terminal first so that handoff cannot start a fresh PTY
+        // in another stale terminal tile while the last shell is being removed.
+        for &i in &terminal_tiles {
+            self.tiles[i].content = super::TileContent::Empty;
+            self.tiles[i].term_tab = None;
+        }
+        for i in terminal_tiles.into_iter().rev() {
+            self.close_tile(i);
+        }
+        self.close_terminal();
+    }
+
     pub fn term_close_tab(&mut self, index: usize) {
         if index >= self.term.tabs.len() {
             if self.term.tabs.is_empty() {
@@ -805,7 +875,7 @@ impl UiState {
                     session.send(Msg::Shutdown);
                 }
                 self.term.frame = None;
-                self.close_terminal();
+                self.close_empty_terminal_surfaces();
             }
             return;
         }
@@ -821,7 +891,7 @@ impl UiState {
                 }
             }
             self.term.frame = None;
-            self.close_terminal();
+            self.close_empty_terminal_surfaces();
             return;
         }
         if index == self.term.active_tab {
@@ -847,7 +917,7 @@ impl UiState {
             } else {
                 self.term.session = None;
                 self.term.frame = None;
-                self.close_terminal();
+                self.close_empty_terminal_surfaces();
             }
         } else {
             let tab = self.term.tabs.remove(index);
@@ -860,7 +930,6 @@ impl UiState {
             }
         }
         self.rebind_tiles_after_close(index);
-        self.focus_terminal();
     }
 
     /// Tab `index` is gone: shift the tabs tiles show, and give a tile that
@@ -906,9 +975,7 @@ impl UiState {
         }
         doomed.sort_unstable();
         for i in doomed.into_iter().rev() {
-            if self.tiles.iter().filter(|t| t.is_terminal()).count() > 1 {
-                self.close_tile(i);
-            }
+            self.close_tile(i);
         }
         if self.tiles.get(self.focus).is_some_and(|t| t.is_terminal()) {
             self.sync_tile_terminal_tab(self.focus);
@@ -1343,33 +1410,24 @@ impl UiState {
     /// panel and drop the session, so the next Ctrl+` starts a fresh shell.
     /// Ended otherwise, it stays with a notice and a Restart.
     fn settle_terminal(&mut self) -> bool {
-        let Some(session) = &self.term.session else {
-            return false;
+        let completed = |session: &Session| {
+            session
+                .ended()
+                .is_some_and(|ended| ended_well(ended, session.started.elapsed()))
         };
-        match session.ended() {
-            Some(ended) if ended_well(ended, session.started.elapsed()) => {
-                if self.term.tabs.len() > 1 {
-                    self.term_close_tab(self.term.active_tab);
-                    true
-                } else {
-                    if let Some(s) = self.term.session.take() {
-                        s.close_remote();
-                        s.send(Msg::Shutdown);
-                    }
-                    for tab in self.term.tabs.drain(..) {
-                        if let Some(s) = tab.session {
-                            s.close_remote();
-                            s.send(Msg::Shutdown);
-                        }
-                    }
-                    self.term.frame = None;
-                    if self.term.open {
-                        self.close_terminal();
-                    }
-                    true
-                }
-            }
-            _ => false,
+        let ended = if self.term.session.as_ref().is_some_and(completed) {
+            Some(self.term.active_tab)
+        } else {
+            self.term.tabs.iter().enumerate().find_map(|(i, tab)| {
+                (i != self.term.active_tab && tab.session.as_ref().is_some_and(completed))
+                    .then_some(i)
+            })
+        };
+        if let Some(index) = ended {
+            self.term_close_tab(index);
+            true
+        } else {
+            false
         }
     }
 
@@ -3300,6 +3358,134 @@ mod tests {
         assert!(s.settle_terminal());
         assert_eq!(s.term.tabs.len(), 0);
         assert!(!s.term.open);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_shell_exit_removes_its_tile_without_stealing_focus() {
+        let (tx, _) = commands::channel();
+        let mut state = UiState::new(tx);
+        state.mode = super::super::Mode::Session;
+        state.selected = Some("conversation".into());
+        state.draft = rune::TextEdit::new("keep this draft");
+        state.draft.focused = true;
+        state.tiles = vec![
+            super::super::Tile::session("conversation"),
+            super::super::Tile::empty(),
+            super::super::Tile::empty(),
+        ];
+        state.tiles[1].set_terminal_tab(0);
+        state.tiles[2].set_terminal_tab(1);
+        state.focus = 0;
+        let make = |script: &str| {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args(["-c", script]);
+            Session::start_command(
+                cmd,
+                grid_size(560.0, 340.0, Metrics { cw: 8.0, ch: 17.0 }, 1.0),
+                colors(&Kit::neutral(false), ColorScheme::Light),
+                std::sync::Arc::new(|| {}),
+            )
+            .unwrap()
+        };
+        let ended = make("exit 0");
+        let live = make("read line");
+        for (id, session) in [(1, ended.clone()), (2, live.clone())] {
+            state.term.tabs.push(TermTab {
+                id,
+                session: Some(session),
+                frame: None,
+                cwd: PathBuf::from("/tmp"),
+                title: None,
+                pending_command: None,
+            });
+        }
+        state.term.active_tab = 1;
+        state.term.session = Some(live.clone());
+        let wait = |session: &Session| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while session.ended().is_none() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "isolated shell did not exit"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        wait(&ended);
+        assert!(state.settle_terminal());
+        assert_eq!(state.term.tabs.len(), 1);
+        assert_eq!(state.term.tabs[0].id, 2);
+        assert_eq!(state.tiles.len(), 2);
+        assert_eq!(state.focus, 0);
+        assert_eq!(state.selected.as_deref(), Some("conversation"));
+        assert!(state.draft.focused && !state.term.sink.focused);
+        assert_eq!(state.draft.text, "keep this draft");
+        assert!(live.ended().is_none());
+        // The remaining shell exits while its terminal is a tile, not a dock.
+        live.send(Msg::Text("done\n".into()));
+        wait(&live);
+        assert!(state.settle_terminal());
+        assert!(!state.has_terminal_tile());
+        assert!(!state.term.open);
+        assert!(state.term.tabs.is_empty());
+        assert_eq!(state.selected.as_deref(), Some("conversation"));
+    }
+
+    #[test]
+    fn closing_last_shell_clears_all_stale_terminal_tiles() {
+        let (tx, _) = commands::channel();
+        let mut state = UiState::new(tx);
+        state.tiles = vec![super::super::Tile::empty(), super::super::Tile::empty()];
+        state.tiles[0].set_terminal_tab(0);
+        state.tiles[1].set_terminal_tab(0);
+        state.mode = super::super::Mode::Session;
+        state.term.sink.focused = true;
+        state.term_close_tab(0);
+        assert!(state.tiles.is_empty());
+        assert!(!state.term.open && !state.term.sink.focused);
+        assert!(state.term.session.is_none() && state.term.tabs.is_empty());
+        assert!(!state.term.mounted());
+    }
+
+    #[test]
+    fn terminal_preference_applies_on_open_without_relocating_existing_surfaces() {
+        use crate::config::{ConfigEdit, TerminalOpenMode};
+        for mode in [
+            TerminalOpenMode::Docked,
+            TerminalOpenMode::Split,
+            TerminalOpenMode::Floating,
+        ] {
+            let (tx, _) = commands::channel();
+            let mut state = UiState::new(tx);
+            // Old configurations without the new field retain docking.
+            state.cfg = serde_json::from_str("{}").unwrap();
+            state.toggle_terminal();
+            assert!(state.term.open && !state.has_terminal_tile());
+            state.close_terminal();
+            state.cfg.apply(ConfigEdit::TerminalOpenMode(mode));
+            let stored = serde_json::to_string(&state.cfg).unwrap();
+            state.cfg = serde_json::from_str(&stored).unwrap();
+            state.toggle_terminal();
+            match mode {
+                TerminalOpenMode::Docked => assert!(state.term.open && !state.has_terminal_tile()),
+                TerminalOpenMode::Split | TerminalOpenMode::Floating => {
+                    assert!(!state.term.open && state.in_split());
+                    let tile = &state.tiles[state.tile_of_terminal().unwrap()];
+                    assert_eq!(tile.popped, mode == TerminalOpenMode::Floating);
+                }
+            }
+            let tiles = state.tiles.len();
+            let popped = state.tiles.iter().filter(|t| t.popped).count();
+            let open = state.term.open;
+            state
+                .cfg
+                .apply(ConfigEdit::TerminalOpenMode(TerminalOpenMode::Floating));
+            state.open_terminal_default();
+            assert_eq!(state.tiles.len(), tiles);
+            assert_eq!(state.tiles.iter().filter(|t| t.popped).count(), popped);
+            assert_eq!(state.term.open, open);
+        }
     }
 
     #[test]

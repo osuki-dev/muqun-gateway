@@ -786,5 +786,8 @@
   "A .muqun-theme address someone shared.": "他人分享的 .muqun-theme 地址。",
   "A .muqun-theme package on this computer.": "本機上的 .muqun-theme 主題包。",
   "No theme matches the search.": "沒有匹配搜尋的主題。",
-  "Every coding agent on this computer in one window: start sessions, watch several at once, answer approvals, and keep the history. Nothing leaves this machine unless an agent sends it.": "在一個視窗中管理本機的所有程式設計代理：啟動工作階段、同時查看多個工作階段、處理核准並保留歷史。除非代理主動傳送，資料不會離開本機。"
+  "Every coding agent on this computer in one window: start sessions, watch several at once, answer approvals, and keep the history. Nothing leaves this machine unless an agent sends it.": "在一個視窗中管理本機的所有程式設計代理：啟動工作階段、同時查看多個工作階段、處理核准並保留歷史。除非代理主動傳送，資料不會離開本機。",
+  "Docked": "停靠",
+  "Default terminal placement": "終端機預設開啟方式",
+  "Applies when opening a terminal. Existing terminals stay where they are.": "開啟終端機時套用。已開啟的終端機維持目前位置。"
 }

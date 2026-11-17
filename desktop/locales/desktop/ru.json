@@ -786,5 +786,8 @@
   "A .muqun-theme address someone shared.": "Опубликованный адрес .muqun-theme.",
   "A .muqun-theme package on this computer.": "Пакет .muqun-theme на этом компьютере.",
   "No theme matches the search.": "Нет подходящих тем.",
-  "Every coding agent on this computer in one window: start sessions, watch several at once, answer approvals, and keep the history. Nothing leaves this machine unless an agent sends it.": "Все агенты программирования этого компьютера в одном окне: запускайте сеансы, следите за несколькими, отвечайте на запросы одобрения и храните историю. Данные не покидают компьютер, если агент их не отправляет."
+  "Every coding agent on this computer in one window: start sessions, watch several at once, answer approvals, and keep the history. Nothing leaves this machine unless an agent sends it.": "Все агенты программирования этого компьютера в одном окне: запускайте сеансы, следите за несколькими, отвечайте на запросы одобрения и храните историю. Данные не покидают компьютер, если агент их не отправляет.",
+  "Docked": "Закреплённый",
+  "Default terminal placement": "Расположение терминала по умолчанию",
+  "Applies when opening a terminal. Existing terminals stay where they are.": "Применяется при открытии терминала. Уже открытые терминалы остаются на своих местах."
 }

@@ -786,5 +786,8 @@
   "A .muqun-theme address someone shared.": "Dirección .muqun-theme compartida.",
   "A .muqun-theme package on this computer.": "Paquete .muqun-theme en este equipo.",
   "No theme matches the search.": "Ningún tema coincide.",
-  "Every coding agent on this computer in one window: start sessions, watch several at once, answer approvals, and keep the history. Nothing leaves this machine unless an agent sends it.": "Todos los agentes de programación de este equipo en una ventana: inicia sesiones, observa varias, responde aprobaciones y conserva el historial. Nada sale del equipo salvo que un agente lo envíe."
+  "Every coding agent on this computer in one window: start sessions, watch several at once, answer approvals, and keep the history. Nothing leaves this machine unless an agent sends it.": "Todos los agentes de programación de este equipo en una ventana: inicia sesiones, observa varias, responde aprobaciones y conserva el historial. Nada sale del equipo salvo que un agente lo envíe.",
+  "Docked": "Acoplado",
+  "Default terminal placement": "Ubicación predeterminada del terminal",
+  "Applies when opening a terminal. Existing terminals stay where they are.": "Se aplica al abrir un terminal. Los terminales ya abiertos permanecen en su ubicación."
 }

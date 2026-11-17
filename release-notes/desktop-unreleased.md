@@ -4,6 +4,8 @@ This is an early Desktop preview, published separately from Muqun Gateway. It do
 
 ## Changes
 
+- Terminal settings now offer docked, split, or floating placement for new opens. Normally exited shells remove their empty terminal tiles, including background tabs, without stealing focus from another conversation; failed startups retain their error view.
+
 - Delegated task details use readable line spacing and a bounded scroll area, so a single long instruction cannot expand across the whole conversation. Full instructions remain selectable and copyable.
 
 - Compact composer footers keep delivery controls on one line in narrow split panes; controls and bottom spacing remain consistent when focus changes. Icon-only controls use matching circular hit areas instead of narrow ovals.
