@@ -1,9 +1,11 @@
 # Muqun Desktop preview
 
-- Upgrade bundled SQLCipher to 4.20.0 / SQLite 3.54.1 through rusqlite 0.42, addressing RUSTSEC-2026-0502 (crafted database/WAL memory disclosure). Existing encryption remains enabled.
 This is an early Desktop preview, published separately from Muqun Gateway. It does not replace the stable Gateway release.
 
 ## Changes
+
+- Upgrade bundled SQLCipher to 4.20.0 / SQLite 3.54.1 through rusqlite 0.42, addressing RUSTSEC-2026-0502 (crafted database/WAL memory disclosure). Existing encryption remains enabled.
+- CI validation and Desktop builds use Rust 1.99.1 consistently; Rust 1.100 support remains pending an async-stream compatibility fix.
 
 - Split-pane composer controls keep their positions on hover. Returning from the timeline to the composer restores paste focus without an extra click. The default launch icon uses the full-resolution asset with rounded corners.
 
