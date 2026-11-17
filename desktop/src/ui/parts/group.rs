@@ -3,10 +3,10 @@
 //! call runs, the line names it beside a spinner.
 
 use muqun_gateway::agents::{AgentPart, TimelineItem};
-use rune::{col, icon, row, text, Cursor, El};
+use rune::{col, row, text, Cursor, El};
 use rune_kit::Spinner;
 
-use super::{glyphs, Tcx};
+use super::Tcx;
 use crate::model::activity::{self, Summary};
 use crate::model::tool_view as tv;
 use crate::ui::timeline::group_key;
@@ -103,11 +103,15 @@ pub fn view(cx: &Tcx, items: &[TimelineItem]) -> El {
         .radius(k.radius.md)
         .fill(k.c.bg_accent.alpha(0.07))
         .child(
-            icon(&glyphs::CHEVRON, 11.0)
-                .key("chevron")
-                .color(k.c.text_accent)
-                .rotate(turn)
-                .a11y_hidden(),
+            crate::ui::art::directional_arrow(
+                cx.s,
+                k,
+                11.0,
+                turn + std::f32::consts::FRAC_PI_2,
+                k.c.text_accent,
+            )
+            .key("chevron")
+            .a11y_hidden(),
         );
     let words = phrases(cx, &summary).join(" · ");
     // The counts hold their room; the running step gives way first.

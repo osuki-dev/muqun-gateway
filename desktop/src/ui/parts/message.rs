@@ -373,11 +373,15 @@ fn reasoning(cx: &Tcx, item: &TimelineItem, body: &str, duration_ms: Option<u64>
             -std::f32::consts::FRAC_PI_2
         };
         line = line.child(
-            icon(&glyphs::CHEVRON, 11.0)
-                .key("chevron")
-                .color(k.c.icon_faint)
-                .rotate(turn)
-                .a11y_hidden(),
+            crate::ui::art::directional_arrow(
+                cx.s,
+                k,
+                11.0,
+                turn + std::f32::consts::FRAC_PI_2,
+                k.c.icon_faint,
+            )
+            .key("chevron")
+            .a11y_hidden(),
         );
     }
     if cx.selected(id) {

@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use rune::{col, el, row, text, Color, Cx, El, SurfaceFit};
-use rune_kit::glyphs::TRIANGLE_DOWN;
 use rune_kit::shell::{SidebarToggle, SplitView, Toolbar, INSPECTOR};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, IconButton, IconButtonVariant,
@@ -671,16 +670,24 @@ fn session_more(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str, busy: boo
     let pinned = s.cfg.general.pinned.iter().any(|p| p == asid);
     Menu::new("session-more")
         .trigger(
-            IconButton::new(&TRIANGLE_DOWN)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(tr_ref(language, "More"))
-                .expanded(open)
-                .on_press(move |s: &mut UiState| {
-                    s.menu = (!open).then_some(OpenMenu::SessionMore);
-                })
-                .build(k)
-                .key("session-more-btn"),
+            super::art::direction_button(
+                s,
+                k,
+                tr_ref(language, "More"),
+                if open {
+                    -std::f32::consts::FRAC_PI_2
+                } else {
+                    std::f32::consts::FRAC_PI_2
+                },
+            )
+            .variant(ButtonVariant::GhostMuted)
+            .control_size(ControlSize::Small)
+            .expanded(open)
+            .on_press(move |s: &mut UiState| {
+                s.menu = (!open).then_some(OpenMenu::SessionMore);
+            })
+            .build(k)
+            .key("session-more-btn"),
         )
         .open(open)
         .on_close(|s: &mut UiState| s.menu = None)

@@ -3,6 +3,13 @@
 - Upgrade bundled SQLCipher to 4.20.0 / SQLite 3.54.1 through rusqlite 0.42, addressing RUSTSEC-2026-0502 (crafted database/WAL memory disclosure). Existing encryption remains enabled.
 ## Changes and fixes
 
+- **Desktop direction controls follow the selected theme.** Dropdowns, search
+  navigation and disclosure controls rotate the theme's declared `home.arrow`
+  image; missing assets or missing direction metadata keep the native fallback.
+  External plugins can use bounded package-relative PNG/JPEG/WebP icons in
+  Settings, split headers and the plugin picker. Restart Desktop after changing
+  a plugin icon. No Gateway, Herdr or App update is required.
+
 - **Desktop can recover pending approvals and questions on every paired computer.**
   The additive `agent_attention_v1` capability exposes authenticated request IDs
   without transcripts or question contents and without starting agents. Existing

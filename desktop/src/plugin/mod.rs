@@ -94,9 +94,28 @@ pub fn surface_switcher(
     let menu_id = format!("surface-{plugin_id}-{active:?}");
     let open = s.menu == Some(crate::ui::OpenMenu::WindowSurface(menu_id.clone()));
     let title = WindowKind::from_slot(active).map_or("Window", WindowKind::label);
+    let arrow = crate::ui::art::directional_arrow(
+        s,
+        k,
+        12.0,
+        if open {
+            -std::f32::consts::FRAC_PI_2
+        } else {
+            std::f32::consts::FRAC_PI_2
+        },
+        k.c.icon_muted,
+    );
+    let label = tr_ref(lang, title);
     let mut menu = rune_kit::Menu::new(menu_id.clone())
         .trigger(
-            Button::new(format!("{} ▾", tr_ref(lang, title)))
+            Button::new(label)
+                .label_with(move |font, ink| {
+                    row()
+                        .gap(7.0)
+                        .center_y()
+                        .child(text(label).font(font).color(ink))
+                        .child(arrow)
+                })
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Large)
                 .on_press(move |s: &mut UiState| {
@@ -172,6 +191,12 @@ pub trait DesktopPlugin: Send + Sync {
 
     /// Icon representing this plugin in toolbars and pickers.
     fn icon(&self) -> &'static Icon;
+
+    /// Draw a vector icon by default; external packages may supply a bounded image.
+    fn render_icon(&self, s: &UiState, size: f32, color: rune::Color) -> El {
+        let _ = s;
+        icon(self.icon(), size).color(color)
+    }
 
     /// Optional description of what this plugin provides.
     fn description(&self, lang: Language) -> Option<String> {

@@ -6,7 +6,7 @@
 
 mod agent_marks;
 mod agents;
-mod art;
+pub(crate) mod art;
 mod composer;
 mod composer_row;
 pub mod copy;

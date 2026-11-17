@@ -622,11 +622,15 @@ impl<'a> ToolCard<'a> {
                 -std::f32::consts::FRAC_PI_2
             };
             line = line.child(
-                icon(&glyphs::CHEVRON, 11.0)
-                    .key("chevron")
-                    .color(k.c.icon_faint)
-                    .rotate(turn)
-                    .a11y_hidden(),
+                crate::ui::art::directional_arrow(
+                    cx.s,
+                    k,
+                    11.0,
+                    turn + std::f32::consts::FRAC_PI_2,
+                    k.c.icon_faint,
+                )
+                .key("chevron")
+                .a11y_hidden(),
             );
         }
         if selected {
@@ -896,11 +900,15 @@ impl<'a> ToolCard<'a> {
             header = k
                 .interactive(
                     header.child(
-                        icon(&glyphs::CHEVRON, 12.0)
-                            .key("chevron")
-                            .color(k.c.icon_faint)
-                            .rotate(turn)
-                            .a11y_hidden(),
+                        crate::ui::art::directional_arrow(
+                            cx.s,
+                            k,
+                            12.0,
+                            turn + std::f32::consts::FRAC_PI_2,
+                            k.c.icon_faint,
+                        )
+                        .key("chevron")
+                        .a11y_hidden(),
                     ),
                 )
                 .cursor(Cursor::Pointer)

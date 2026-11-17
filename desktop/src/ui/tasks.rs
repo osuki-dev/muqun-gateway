@@ -527,11 +527,17 @@ fn filters(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                     .font(k.ty.ui_medium)
                     .color(k.c.text_base),
             )
-            .child(
-                rune::text(if open { "▴" } else { "▾" })
-                    .font(k.ty.small)
-                    .color(k.c.text_muted),
-            )
+            .child(super::art::directional_arrow(
+                s,
+                k,
+                12.0,
+                if open {
+                    -std::f32::consts::FRAC_PI_2
+                } else {
+                    std::f32::consts::FRAC_PI_2
+                },
+                k.c.icon_muted,
+            ))
             .on_press(|s: &mut UiState| {
                 let open = s.menu == Some(super::OpenMenu::TasksComputerPicker);
                 s.menu = (!open).then_some(super::OpenMenu::TasksComputerPicker);

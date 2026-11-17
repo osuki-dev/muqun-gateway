@@ -12,7 +12,7 @@
 //! `Primary+\` adds one, `Primary+W` removes the focused one.
 
 use rune::{col, el, row, text, Cursor, El, Key, Phase, Tx};
-use rune_kit::glyphs::{CLOSE, TRIANGLE_DOWN};
+use rune_kit::glyphs::CLOSE;
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem,
 };
@@ -412,13 +412,13 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
                 );
         }
         super::TileContent::Custom { title, kind, .. } => {
-            let icon = s
+            let plugin_icon = s
                 .plugins
                 .get(kind)
-                .map(|p| p.icon())
-                .unwrap_or(&super::icons::GRID);
+                .map(|p| p.render_icon(s, 14.0, k.c.text_accent))
+                .unwrap_or_else(|| rune::icon(&super::icons::GRID, 14.0).color(k.c.text_accent));
             head = head
-                .child(rune::icon(icon, 14.0).color(k.c.text_accent).a11y_hidden())
+                .child(plugin_icon.a11y_hidden())
                 .child(
                     text(title.clone())
                         .key("tile-title")
@@ -477,16 +477,24 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
     let mut menu = Menu::new(format!("tile-menu-{i}"))
         .min_width(320.0)
         .trigger(
-            IconButton::new(&TRIANGLE_DOWN)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Pane actions"))
-                .expanded(menu_open)
-                .on_press(move |s: &mut UiState| {
-                    s.menu = (!menu_open).then_some(OpenMenu::Tile(i));
-                })
-                .build(k)
-                .key(format!("tile-menu-btn-{i}")),
+            super::art::direction_button(
+                s,
+                k,
+                tr_ref(language, "Pane actions"),
+                if menu_open {
+                    -std::f32::consts::FRAC_PI_2
+                } else {
+                    std::f32::consts::FRAC_PI_2
+                },
+            )
+            .variant(ButtonVariant::GhostMuted)
+            .control_size(ControlSize::Small)
+            .expanded(menu_open)
+            .on_press(move |s: &mut UiState| {
+                s.menu = (!menu_open).then_some(OpenMenu::Tile(i));
+            })
+            .build(k)
+            .key(format!("tile-menu-btn-{i}")),
         )
         .open(menu_open)
         .on_close(|s: &mut UiState| s.menu = None);
@@ -977,18 +985,20 @@ fn picker(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
     for plugin in s.plugins.tile_plugins_enabled(&s.cfg.plugins_disabled) {
         let plugin_id = plugin.id();
         let plugin_title = plugin.title(language);
-        let plugin_icon = plugin.icon();
+        let plugin_icon = plugin.render_icon(s, 16.0, k.c.icon_muted);
         let pid = plugin_id.to_string();
         plugins = plugins.child(
-            IconButton::new(plugin_icon)
-                .variant(IconButtonVariant::GhostMuted)
+            Button::new(plugin_title.clone())
+                .label_with(move |_, _| plugin_icon)
+                .variant(ButtonVariant::GhostMuted)
                 .control_size(ControlSize::Regular)
-                .label(plugin_title.clone())
                 .help(plugin_title)
                 .on_press(move |s: &mut UiState| {
                     fill_plugin_tile(s, i, &pid);
                 })
                 .build(k)
+                .size(28.0, 28.0)
+                .px(4.0)
                 .key(format!("tile-plugin-{plugin_id}-{i}")),
         );
     }

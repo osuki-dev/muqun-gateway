@@ -176,3 +176,34 @@ fn tinted(g: &apply::Glyph, color: Color) -> Arc<[u8]> {
     cache.insert(key, bytes.clone());
     bytes
 }
+
+/// Theme directional artwork, normalized by its declared direction, then native fallback.
+pub fn directional_arrow(
+    s: &super::UiState,
+    k: &rune_kit::Kit,
+    size: f32,
+    toward: f32,
+    color: rune::Color,
+) -> El {
+    s.images
+        .as_ref()
+        .and_then(|images| glyph_toward(images, "home.arrow", size, color, Some(toward)))
+        .unwrap_or_else(|| {
+            rune::icon(k.glyph.caret_right, size)
+                .color(color)
+                .rotate(toward)
+        })
+        .key("direction-arrow")
+        .rotate_motion(s.look().focus_fade())
+}
+
+/// A directional button with the same native activation semantics as the other Kit buttons.
+pub fn direction_button(
+    s: &super::UiState,
+    k: &rune_kit::Kit,
+    label: impl Into<String>,
+    toward: f32,
+) -> rune_kit::Button {
+    let arrow = directional_arrow(s, k, 12.0, toward, k.c.icon_muted);
+    rune_kit::Button::new(label).label_with(move |_, _| arrow)
+}

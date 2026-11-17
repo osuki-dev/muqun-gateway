@@ -1,7 +1,7 @@
 //! Settings → Plugins: built-in and loaded plugins, plus Bun / Herdr runtimes.
 
 use muqun_gateway::platform::runtimes::{RuntimeKind, RuntimeSource};
-use rune::{col, icon, row as hrow, text, El};
+use rune::{col, row as hrow, text, El};
 use rune_kit::{Badge, BadgeVariant, ButtonVariant, Kit};
 
 use super::{flag_disabled, group, row, row_with};
@@ -27,6 +27,7 @@ fn surface_chip(k: &Kit, key: &str, label: &str) -> El {
 }
 
 fn plugin_label(
+    s: &UiState,
     k: &Kit,
     language: crate::config::Language,
     plugin: &dyn crate::plugin::DesktopPlugin,
@@ -66,7 +67,7 @@ fn plugin_label(
                 .key("title")
                 .gap(8.0)
                 .center_y()
-                .child(icon(plugin.icon(), 14.0).color(k.c.icon_muted))
+                .child(plugin.render_icon(s, 14.0, k.c.icon_muted))
                 .child(
                     text(title)
                         .font(k.ty.ui_medium)
@@ -130,7 +131,7 @@ fn plugin_row(s: &UiState, k: &Kit, plugin: &dyn crate::plugin::DesktopPlugin) -
     row_with(
         k,
         &format!("plugin-{id}"),
-        plugin_label(k, language, plugin),
+        plugin_label(s, k, language, plugin),
         controls.child(flag_disabled(
             k,
             &format!("plugin-{id}"),

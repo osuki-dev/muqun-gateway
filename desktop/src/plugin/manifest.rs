@@ -167,6 +167,7 @@ pub struct PluginManifest {
     #[serde(default = "default_category")]
     pub category: Option<PluginCategory>,
     #[serde(default)]
+    /// Built-in icon name, or a package-relative PNG/JPEG/WebP path.
     pub icon: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,

@@ -675,7 +675,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         let on = i == selected;
         let mark = match &entry.agent {
             Some(agent) => super::agents::mark(agent, 16.0, s.dark),
-            None => rune::icon(glyph(&entry.act), 16.0).color(k.c.icon_muted),
+            None => glyph(s, k, &entry.act),
         };
         let mut words = col().grow(1.0).shrink().min_w(0.0).gap(1.0).child(
             rich(entry.label.clone(), label_spans(k, &entry.label, hits))
@@ -790,8 +790,8 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
     );
 }
 
-fn glyph(act: &Act) -> &'static rune::Icon {
-    match act {
+fn glyph(s: &UiState, k: &Kit, act: &Act) -> El {
+    let glyph = match act {
         Act::Go(Mode::Inbox) => &super::icons::INBOX,
         Act::Go(Mode::Tasks) => &super::icons::TASK,
         Act::Dictation => &super::voice::MIC,
@@ -803,8 +803,9 @@ fn glyph(act: &Act) -> &'static rune::Icon {
         | Act::Key(Action::Settings) => &super::icons::SETTINGS,
         Act::Theme(_) | Act::ToggleScheme => &rune_kit::glyphs::SPARKLE,
         Act::PluginSurface { .. } | Act::PluginCommand { .. } => &super::icons::GRID,
-        _ => &rune_kit::glyphs::ARROW_RIGHT,
-    }
+        _ => return super::art::directional_arrow(s, k, 16.0, 0.0, k.c.icon_muted),
+    };
+    rune::icon(glyph, 16.0).color(k.c.icon_muted)
 }
 
 fn section(k: &Kit, label: String) -> El {

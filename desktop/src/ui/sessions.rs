@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use muqun_gateway::agents::{AgentProject, AgentSessionId};
 use rune::El;
 use rune::{el, TextEdit, Tx};
-use rune_kit::glyphs::{FOLDER, FOLDER_OPEN, SEARCH, TRIANGLE_DOWN};
+use rune_kit::glyphs::{FOLDER, FOLDER_OPEN, SEARCH};
 use rune_kit::shell::{Sidebar, SidebarRow};
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem,
@@ -139,7 +139,17 @@ fn scope(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         })
         .build(k)
         .key("sidebar-scope")
-        .child(rune::icon(&TRIANGLE_DOWN, 12.0).color(k.c.text_faint));
+        .child(super::art::directional_arrow(
+            s,
+            k,
+            12.0,
+            if open {
+                -std::f32::consts::FRAC_PI_2
+            } else {
+                std::f32::consts::FRAC_PI_2
+            },
+            k.c.text_faint,
+        ));
     let mut menu = Menu::new("sidebar-scope-menu")
         .trigger(trigger)
         .open(open)
@@ -316,6 +326,7 @@ fn project_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>, p: &Project) -> El {
     let t = |en: &'static str| super::copy::tr_ref(language, en);
     let mut menu = Menu::new(format!("pmenu-{id}"))
         .trigger(menu_button(
+            s,
             k,
             &format!("pbtn-{id}"),
             t("Project actions"),
@@ -367,20 +378,29 @@ fn project_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>, p: &Project) -> El {
 
 /// The small arrow that opens a row's menu.
 fn menu_button(
+    s: &UiState,
     k: &Kit,
     key: &str,
     label: &str,
     open: bool,
     press: impl Fn(&mut UiState) + 'static,
 ) -> El {
-    IconButton::new(&TRIANGLE_DOWN)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
-        .label(label.to_string())
-        .expanded(open)
-        .on_press(press)
-        .build(k)
-        .key(key.to_string())
+    super::art::direction_button(
+        s,
+        k,
+        label,
+        if open {
+            -std::f32::consts::FRAC_PI_2
+        } else {
+            std::f32::consts::FRAC_PI_2
+        },
+    )
+    .variant(ButtonVariant::GhostMuted)
+    .control_size(ControlSize::Small)
+    .expanded(open)
+    .on_press(press)
+    .build(k)
+    .key(key.to_string())
 }
 
 fn commit_rename(s: &mut UiState, _: &mut Tx) {
@@ -419,6 +439,7 @@ fn session_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
     let t = |en: &'static str| super::copy::tr_ref(language, en);
     let trigger = Menu::new(format!("smenu-{id}"))
         .trigger(menu_button(
+            s,
             k,
             &format!("sbtn-{id}"),
             t("Session actions"),
@@ -642,11 +663,17 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 })
                 .help(status_desc),
         )
-        .child(
-            rune::text(if open { "▴" } else { "▾" })
-                .font(k.ty.small)
-                .color(k.c.text_muted),
-        )
+        .child(super::art::directional_arrow(
+            s,
+            k,
+            12.0,
+            if open {
+                -std::f32::consts::FRAC_PI_2
+            } else {
+                std::f32::consts::FRAC_PI_2
+            },
+            k.c.icon_muted,
+        ))
         .on_press(|s: &mut UiState| {
             let open = s.menu == Some(OpenMenu::ComputerPicker);
             s.menu = (!open).then_some(OpenMenu::ComputerPicker);

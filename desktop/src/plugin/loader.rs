@@ -59,6 +59,7 @@ pub struct ExternalPlugin {
     manifest: PluginManifest,
     dir: PathBuf,
     commands: Vec<PluginCommand>,
+    image_icon: Option<Arc<[u8]>>,
     dynamic_markdown: Mutex<Option<String>>,
     script_job: Mutex<Option<mpsc::Receiver<Result<String, String>>>>,
     script_title: Mutex<String>,
@@ -96,11 +97,16 @@ impl ExternalPlugin {
             })
             .collect();
 
+        let image_icon = manifest
+            .icon
+            .as_deref()
+            .and_then(|path| load_image_icon(&dir, path));
         Self {
             id,
             manifest,
             dir,
             commands,
+            image_icon,
             dynamic_markdown: Mutex::new(None),
             script_cancel: Mutex::new(None),
             script_job: Mutex::new(None),
@@ -375,6 +381,16 @@ impl DesktopPlugin for ExternalPlugin {
 
     fn icon(&self) -> &'static Icon {
         resolve_icon(self.manifest.icon.as_deref())
+    }
+
+    fn render_icon(&self, s: &UiState, size: f32, color: rune::Color) -> El {
+        if let (Some(bytes), Some(images)) = (&self.image_icon, &s.images) {
+            let image = crate::ui::art::image(images, bytes);
+            return el()
+                .size(size, size)
+                .pixels_fit(image.pixels(), rune::SurfaceFit::Fit);
+        }
+        icon(self.icon(), size).color(color)
     }
 
     fn description(&self, _lang: Language) -> Option<String> {
@@ -889,6 +905,59 @@ fn run_script(mut command: ProcessCommand, cancel: Arc<AtomicBool>) -> Result<St
     }
 }
 
+/// Decode once at discovery. Names keep their vector meaning; image paths stay inside the package.
+fn load_image_icon(dir: &Path, value: &str) -> Option<Arc<[u8]>> {
+    let path = Path::new(value);
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp") {
+        return None;
+    }
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let root = dir.canonicalize().ok()?;
+    let path = root.join(path).canonicalize().ok()?;
+    if !path.starts_with(&root) {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > 1_048_576 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(1_048_577).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > 1_048_576 {
+        return None;
+    }
+    let dimensions = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    if dimensions.0 == 0 || dimensions.1 == 0 || dimensions.0 > 1024 || dimensions.1 > 1024 {
+        return None;
+    }
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(1024);
+    limits.max_image_height = Some(1024);
+    limits.max_alloc = Some(8 * 1024 * 1024);
+    reader.limits(limits);
+    let decoded = reader.decode().ok()?.thumbnail(256, 256);
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    decoded
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .ok()?;
+    Some(encoded.into_inner().into())
+}
+
 /// Resolve icon string from manifest to static Rune Icon.
 pub fn resolve_icon(name: Option<&str>) -> &'static Icon {
     match name.map(|s| s.to_ascii_lowercase()).as_deref() {
@@ -1010,6 +1079,56 @@ pub fn discover_plugins(plugin_dirs: &[PathBuf]) -> Vec<ExternalPlugin> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_icons_are_bounded_local_assets_and_cached_after_discovery() {
+        let root = std::env::temp_dir().join(format!("muqun-plugin-icon-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        let icon_path = root.join("assets/icon.png");
+        image::RgbaImage::from_pixel(512, 256, image::Rgba([30, 120, 220, 255]))
+            .save(&icon_path)
+            .unwrap();
+        let icon = load_image_icon(&root, "assets/icon.png").unwrap();
+        let decoded = image::load_from_memory(&icon).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (256, 128));
+        let manifest = PluginManifest::parse(r#"{"id":"image-icon","name":"Image","version":"1","description":"","icon":"assets/icon.png"}"#).unwrap();
+        let plugin = ExternalPlugin::new(manifest, root.clone());
+        std::fs::remove_file(&icon_path).unwrap();
+        assert!(
+            plugin.image_icon.is_some(),
+            "discovery must cache the image instead of reading files on UI frames"
+        );
+        assert!(load_image_icon(&root, "assets/icon.png").is_none());
+        assert!(load_image_icon(&root, "../outside.png").is_none());
+        assert!(load_image_icon(&root, &root.join("outside.png").to_string_lossy()).is_none());
+        std::fs::write(&icon_path, b"not an image").unwrap();
+        assert!(load_image_icon(&root, "assets/icon.png").is_none());
+        image::RgbaImage::new(2048, 1).save(&icon_path).unwrap();
+        assert!(
+            load_image_icon(&root, "assets/icon.png").is_none(),
+            "dimensions must be checked before decoding"
+        );
+        std::fs::write(&icon_path, vec![0; 1_048_577]).unwrap();
+        assert!(load_image_icon(&root, "assets/icon.png").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn an_image_icon_symlink_cannot_escape_the_plugin_directory() {
+        let root =
+            std::env::temp_dir().join(format!("muqun-plugin-icon-link-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("plugin/assets")).unwrap();
+        image::RgbaImage::new(16, 16)
+            .save(root.join("outside.png"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            root.join("outside.png"),
+            root.join("plugin/assets/icon.png"),
+        )
+        .unwrap();
+        assert!(load_image_icon(&root.join("plugin"), "assets/icon.png").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[cfg(unix)]
     #[test]

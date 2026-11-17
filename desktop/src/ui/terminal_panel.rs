@@ -2329,21 +2329,29 @@ fn terminal_search_bar(s: &UiState, k: &Kit) -> El {
 
     let counter = text(match_count).font(k.ty.small).color(k.c.text_faint);
 
-    let prev_btn = IconButton::new(&rune_kit::glyphs::CHEVRON_UP)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
-        .label(tr_ref(language, "Previous match"))
-        .on_press(|s: &mut UiState| s.term_search_prev())
-        .build(k)
-        .key("term-search-prev");
+    let prev_btn = super::art::direction_button(
+        s,
+        k,
+        tr_ref(language, "Previous match"),
+        -std::f32::consts::FRAC_PI_2,
+    )
+    .variant(rune_kit::ButtonVariant::GhostMuted)
+    .control_size(ControlSize::Small)
+    .on_press(|s: &mut UiState| s.term_search_prev())
+    .build(k)
+    .key("term-search-prev");
 
-    let next_btn = IconButton::new(&rune_kit::glyphs::CHEVRON_DOWN)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
-        .label(tr_ref(language, "Next match"))
-        .on_press(|s: &mut UiState| s.term_search_next())
-        .build(k)
-        .key("term-search-next");
+    let next_btn = super::art::direction_button(
+        s,
+        k,
+        tr_ref(language, "Next match"),
+        std::f32::consts::FRAC_PI_2,
+    )
+    .variant(rune_kit::ButtonVariant::GhostMuted)
+    .control_size(ControlSize::Small)
+    .on_press(|s: &mut UiState| s.term_search_next())
+    .build(k)
+    .key("term-search-next");
 
     let close_btn = IconButton::new(&rune_kit::glyphs::CLOSE)
         .variant(IconButtonVariant::GhostMuted)

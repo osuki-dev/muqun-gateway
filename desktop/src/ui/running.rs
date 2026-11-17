@@ -4,7 +4,6 @@
 
 use muqun_gateway::agents::AgentSessionInfo;
 use rune::{col, el, icon, row, El, ScrollSpec, Tx};
-use rune_kit::glyphs::CHEVRON_DOWN;
 use rune_kit::shell::SidebarRow;
 use rune_kit::Kit;
 
@@ -242,18 +241,17 @@ pub fn view(s: &UiState, k: &Kit) -> Option<El> {
     } else {
         icon(&super::icons::RUNNING, 14.0).color(k.c.text_accent)
     };
-    let chevron = icon(&CHEVRON_DOWN, 12.0)
-        .color(k.c.icon_muted)
-        .rotate(if open {
+    let chevron = super::art::directional_arrow(
+        s,
+        k,
+        12.0,
+        if open {
+            std::f32::consts::FRAC_PI_2
+        } else {
             0.0
-        } else {
-            -std::f32::consts::FRAC_PI_2
-        })
-        .rotate_motion(if look.motion {
-            rune::Anim::from(k.motion.control)
-        } else {
-            rune::Anim::INSTANT
-        });
+        },
+        k.c.icon_muted,
+    );
     let mut trailing = row().gap(8.0).center_y().a11y_hidden();
     if waiting > 0 {
         let warn = k.c.warning.icon;

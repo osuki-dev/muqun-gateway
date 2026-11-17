@@ -39,6 +39,25 @@ The left sidebar's **Plugins** entry opens the installed list. Each plugin expos
 buttons for its declared window types. External extensions appear before built-ins.
 The host applies the selected theme, window chrome and motion to their content.
 
+External manifests can set `"icon": "assets/icon.png"` (PNG, JPEG or WebP), or
+keep an existing built-in icon name. Images must resolve inside the plugin
+package, including symlink targets; absolute paths and parent traversal are
+rejected. Discovery accepts at most 1 MiB and 1024×1024 decoded pixels, caches a
+thumbnail up to 256×256, and uses it consistently in Settings, split headers and
+the plugin picker. Missing, malformed or oversized images fall back to a native
+vector icon. Restart Desktop after changing a package icon.
+
+Directional controls use the theme's `home.arrow` asset with its declared
+`iconDirections.home.arrow`, rotated to match the action. System themes and
+packs missing that asset or a declared direction retain the native arrow, so
+an older pack is never rotated by guesswork. Dropdown, search navigation and
+collapse controls share this path and honour Reduce Motion.
+
+For image-icon acceptance, set `MUQUN_SCENE_PLUGIN_DIR` to a temporary package
+and run `plugin-image-settings`, `plugin-image-tile` or `plugin-image-picker`.
+These scenes register the package only in their isolated process; they do not
+install it or alter the user's plugin directories.
+
 `desktop/examples/plugins/workbench-notes` is a minimal Markdown extension.
 Copy its directory under the platform config/data directory's
 `muqun-desktop/plugins/` and restart Desktop. Development also discovers

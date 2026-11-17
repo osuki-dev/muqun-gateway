@@ -184,16 +184,28 @@ fn agents(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let selected = super::agents::name(&s.start_agent, &s.agents);
     let agent_id = s.start_agent.clone();
     let dark = s.dark;
+    let arrow = super::art::directional_arrow(
+        s,
+        k,
+        12.0,
+        if open {
+            -std::f32::consts::FRAC_PI_2
+        } else {
+            std::f32::consts::FRAC_PI_2
+        },
+        k.c.icon_muted,
+    );
     let mut menu = rune_kit::Menu::new("start-agents")
         .placement(rune_kit::Placement::TopStart)
         .trigger(
-            Button::new(format!("{selected} ▾"))
+            Button::new(&selected)
                 .label_with(move |font, ink| {
                     row()
                         .gap(8.0)
                         .center_y()
                         .child(super::agents::mark(&agent_id, composer::AGENT_ICON, dark))
-                        .child(text(format!("{selected} ▾")).font(font).color(ink))
+                        .child(text(selected).font(font).color(ink))
+                        .child(arrow)
                 })
                 .variant(ButtonVariant::Neutral)
                 .control_size(ControlSize::Small)

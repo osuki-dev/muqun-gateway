@@ -694,21 +694,29 @@ fn timeline_search_bar(s: &UiState, k: &Kit, asid: &str) -> El {
 
     let counter = text(match_count).font(k.ty.small).color(k.c.text_faint);
 
-    let prev_btn = IconButton::new(&glyphs::CHEVRON_UP)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
-        .label(super::copy::t_ref(language, "Previous match"))
-        .on_press_tx(|s: &mut UiState, tx: &mut rune::Tx| s.timeline_search_prev(tx))
-        .build(k)
-        .key("timeline-search-prev");
+    let prev_btn = super::art::direction_button(
+        s,
+        k,
+        super::copy::t_ref(language, "Previous match"),
+        -std::f32::consts::FRAC_PI_2,
+    )
+    .variant(rune_kit::ButtonVariant::GhostMuted)
+    .control_size(ControlSize::Small)
+    .on_press_tx(|s: &mut UiState, tx: &mut rune::Tx| s.timeline_search_prev(tx))
+    .build(k)
+    .key("timeline-search-prev");
 
-    let next_btn = IconButton::new(&glyphs::CHEVRON_DOWN)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
-        .label(super::copy::t_ref(language, "Next match"))
-        .on_press_tx(|s: &mut UiState, tx: &mut rune::Tx| s.timeline_search_next(tx))
-        .build(k)
-        .key("timeline-search-next");
+    let next_btn = super::art::direction_button(
+        s,
+        k,
+        super::copy::t_ref(language, "Next match"),
+        std::f32::consts::FRAC_PI_2,
+    )
+    .variant(rune_kit::ButtonVariant::GhostMuted)
+    .control_size(ControlSize::Small)
+    .on_press_tx(|s: &mut UiState, tx: &mut rune::Tx| s.timeline_search_next(tx))
+    .build(k)
+    .key("timeline-search-next");
 
     let close_btn = IconButton::new(&glyphs::CLOSE)
         .variant(IconButtonVariant::GhostMuted)

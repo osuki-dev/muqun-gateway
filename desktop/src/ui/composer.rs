@@ -2178,19 +2178,25 @@ fn delivery_button(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El 
     };
     let menu = Menu::new(format!("composer-delivery-menu-{asid}"))
         .trigger(
-            rune_kit::IconButton::new(k.glyph.chevron_down)
-                .variant(rune_kit::IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Large)
-                .label(format!(
+            super::art::direction_button(
+                s,
+                k,
+                format!(
                     "{} / {}",
                     tr_ref(language, "Steer"),
                     tr_ref(language, "Queue")
-                ))
-                .on_press(move |s: &mut UiState| {
-                    s.menu = (!open).then_some(OpenMenu::ComposerDelivery)
-                })
-                .build(k)
-                .key("composer-delivery-options"),
+                ),
+                if open {
+                    -std::f32::consts::FRAC_PI_2
+                } else {
+                    std::f32::consts::FRAC_PI_2
+                },
+            )
+            .variant(rune_kit::ButtonVariant::GhostMuted)
+            .control_size(ControlSize::Large)
+            .on_press(move |s: &mut UiState| s.menu = (!open).then_some(OpenMenu::ComposerDelivery))
+            .build(k)
+            .key("composer-delivery-options"),
         )
         .open(open)
         .min_width(180.0)
