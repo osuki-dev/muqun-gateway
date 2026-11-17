@@ -891,8 +891,8 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         .items_center()
         .px(16.0)
         .pt(6.0)
-        .pb(14.0)
-        .gap(8.0)
+        .pb(8.0)
+        .gap(6.0)
         .child(
             composer::composer_card(k, look, card, false, running, false)
                 .w_full()
@@ -2054,6 +2054,66 @@ mod tests {
         }
         assert!(answered);
         assert!(rt.state.waiting_perms[&asid].is_empty());
+    }
+
+    #[test]
+    fn narrow_busy_split_keeps_delivery_on_the_footer_line() {
+        use rune::{Env, Runtime};
+        for width in [1100.0, 1280.0, 1440.0] {
+            let (tx, _) = crate::model::commands::channel();
+            let mut s = UiState::new(tx);
+            crate::ui::scenes::scenes()
+                .iter()
+                .find(|(name, _)| *name == "split2")
+                .unwrap()
+                .1(&mut s);
+            s.splash = None;
+            s.tile_tree = crate::config::TileNode::Split {
+                across: true,
+                ratio: 0.5,
+                a: Box::new(crate::config::TileNode::Leaf(0)),
+                b: Box::new(crate::config::TileNode::Leaf(1)),
+            };
+            s.cfg.general.language = crate::config::Language::ZhTw;
+            for session in &mut s.sessions {
+                session.status = muqun_gateway::agents::AgentSessionStatus::Busy;
+            }
+            let mut rt = Runtime::new(s, crate::ui::view, (width, 900.0), Env::new(true, 1.0));
+            for _ in 0..60 {
+                rt.frame(1.0 / 60.0);
+            }
+            let nodes = rt.elements();
+            let footers: Vec<_> = nodes
+                .iter()
+                .filter(|n| n.key.as_deref() == Some("composer-footer"))
+                .collect();
+            assert_eq!(footers.len(), 2);
+            for footer in footers {
+                assert!(
+                    footer.rect[3] <= 37.0,
+                    "footer wrapped at {width}: {:?}",
+                    footer.rect
+                );
+                let delivery = nodes
+                    .iter()
+                    .find(|n| {
+                        n.key.as_deref() == Some("composer-delivery")
+                            && n.rect[0] >= footer.rect[0]
+                            && n.rect[0] < footer.rect[0] + footer.rect[2]
+                    })
+                    .expect("busy session retains delivery control");
+                assert!(
+                    delivery.rect[0] + delivery.rect[2] <= footer.rect[0] + footer.rect[2] + 1.0,
+                    "delivery overflows at {width}"
+                );
+                assert!(
+                    (delivery.rect[1] - footer.rect[1]).abs() < 1.0,
+                    "delivery moved below footer at {width}: {:?} {:?}",
+                    footer.rect,
+                    delivery.rect
+                );
+            }
+        }
     }
 
     #[test]

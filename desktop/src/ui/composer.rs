@@ -2180,7 +2180,7 @@ fn delivery_button(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El 
         .trigger(
             rune_kit::IconButton::new(k.glyph.chevron_down)
                 .variant(rune_kit::IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::ExtraLarge)
+                .control_size(ControlSize::Large)
                 .label(format!(
                     "{} / {}",
                     tr_ref(language, "Steer"),
@@ -2221,7 +2221,7 @@ fn delivery_button(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El 
         );
     row()
         .key("composer-delivery")
-        .h(36.0)
+        .h(32.0)
         .center_y()
         .radius(k.radius.lg)
         .fill(k.c.layer_01)
@@ -2241,7 +2241,7 @@ fn delivery_button(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El 
                 })
                 .build(k)
                 .key("composer-deliver")
-                .h(36.0),
+                .h(32.0),
         )
         .child(el().w(1.0).h(16.0).fill(k.c.border_weak))
         .child(menu.build(k, layer))
@@ -2261,7 +2261,7 @@ pub(super) fn session_footer(
     let busy = asid.is_some_and(|id| s.session_busy(id));
     let inner = rune::memo::layout_with("composer-card", |r| r[2].round())
         .map_or(f32::INFINITY, |w| w - controls_row::CARD_PAD - 24.0);
-    let room = (inner - if busy { 340.0 } else { 180.0 }).max(200.0);
+    let room = (inner - if busy { 340.0 } else { 180.0 }).max(80.0);
     let own_line = asid
         .and_then(|id| controls_row::Controls::for_session(s, id, catalog))
         .map(|c| {
@@ -2273,12 +2273,11 @@ pub(super) fn session_footer(
         .key("composer-footer")
         .w_full()
         .min_w(0.0)
-        .min_h(36.0)
+        .min_h(32.0)
         .gap(8.0)
-        .center_y()
-        .flex_wrap();
+        .center_y();
     if let Some(controls) = own_line {
-        footer = footer.child(controls.w(0.0).grow(1.0).min_w(200.0));
+        footer = footer.child(controls.w(0.0).grow(1.0).min_w(80.0));
     }
     if let Some(asid) = asid {
         if crate::plugin::is_enabled("inspector", &s.cfg.plugins_disabled)
@@ -2499,7 +2498,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     // The messages' reading column: as wide and as centred as they are on
     // a wide window, the whole width on a narrow one.
     let column = super::timeline::FEED_MAX_W;
-    let mut deck = col().w_full().max_w(column).gap(8.0);
+    let mut deck = col().w_full().max_w(column).gap(6.0);
     if let Some(asid) = s.selected.as_deref() {
         let pending = super::parts::question::pending_forms(s, asid);
         let permissions = s
@@ -2560,7 +2559,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .items_center()
         .px(16.0)
         .pt(6.0)
-        .pb(14.0)
+        .pb(8.0)
         .child(deck)
 }
 
