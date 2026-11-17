@@ -45,9 +45,27 @@ jobs:
           echo "::add-mask::$password"
           printf '%s' "$CERT" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           printf '%s' "$API_KEY" > "$RUNNER_TEMP/notary.p8"
+          # Make the signing identity discoverable to codesign, not only to an
+          # explicit find-identity query. Preserve the runner's existing search
+          # list and restore it during cleanup (GitHub's Apple signing setup).
+          python3 - "$RUNNER_TEMP/signing-keychains.json" <<'PY_SAVE'
+          import json, pathlib, shlex, subprocess, sys
+          original = shlex.split(subprocess.check_output(
+              ["security", "list-keychains", "-d", "user"], text=True
+          ))
+          pathlib.Path(sys.argv[1]).write_text(json.dumps(original))
+          PY_SAVE
           security create-keychain -p "$password" "$keychain"
           security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$password" "$keychain"
+          python3 - "$RUNNER_TEMP/signing-keychains.json" "$keychain" <<'PY_SEARCH'
+          import json, pathlib, subprocess, sys
+          original = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          subprocess.run([
+              "security", "list-keychains", "-d", "user", "-s",
+              sys.argv[2], *[path for path in original if path != sys.argv[2]],
+          ], check=True)
+          PY_SEARCH
           security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$CERT_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
           cd candidate
@@ -91,6 +109,16 @@ jobs:
         run: |
           security delete-keychain "$RUNNER_TEMP/desktop-signing.keychain-db" || true
           rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/notary.p8"
+          python3 - "$RUNNER_TEMP/signing-keychains.json" <<'PY_RESTORE'
+          import json, pathlib, subprocess, sys
+          saved = pathlib.Path(sys.argv[1])
+          if saved.exists():
+              subprocess.run([
+                  "security", "list-keychains", "-d", "user", "-s",
+                  *json.loads(saved.read_text()),
+              ], check=True)
+              saved.unlink()
+          PY_RESTORE
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-preview-signed-macos
