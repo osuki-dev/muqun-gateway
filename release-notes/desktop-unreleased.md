@@ -1,5 +1,6 @@
 # Muqun Desktop preview
 
+- Upgrade bundled SQLCipher to 4.20.0 / SQLite 3.54.1 through rusqlite 0.42, addressing RUSTSEC-2026-0502 (crafted database/WAL memory disclosure). Existing encryption remains enabled.
 This is an early Desktop preview, published separately from Muqun Gateway. It does not replace the stable Gateway release.
 
 ## Changes

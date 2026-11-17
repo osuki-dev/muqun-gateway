@@ -11,6 +11,10 @@ on:
     paths: ["src/**", "build.rs", "desktop/**", "Cargo.toml", "Cargo.lock", ".github/workflows/desktop-ci.yml"]
   workflow_dispatch:
     inputs:
+      preview:
+        description: Stamp a Desktop preview version for installation testing
+        type: boolean
+        default: false
       notarize:
         description: Verify macOS signing and notarization without publishing
         type: boolean
@@ -61,7 +65,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Stamp Desktop preview
-        if: inputs.preview_version != ''
+        if: inputs.preview || inputs.preview_version != ''
         env:
           DESKTOP_PREVIEW_VERSION: ${{ inputs.preview_version }}
         run: python3 desktop/scripts/prepare-preview.py
