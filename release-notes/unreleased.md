@@ -3,6 +3,16 @@
 - Upgrade bundled SQLCipher to 4.20.0 / SQLite 3.54.1 through rusqlite 0.42, addressing RUSTSEC-2026-0502 (crafted database/WAL memory disclosure). Existing encryption remains enabled.
 ## Changes and fixes
 
+- **Legacy Office attachments work in Desktop and paired Apps.** Word `.doc`,
+  Excel `.xls` and PowerPoint `.ppt` are recognised from their compound-file
+  structure and document headers, alongside existing OOXML and OpenDocument
+  support. RTF and UTF-8 HTML exports keep their actual format even if named
+  `.doc`. Ordinary OLE containers, installer files and malformed documents are
+  not accepted as Office files. Document uploads retain the 25 MiB limit.
+  Update and restart Desktop for local attachments, and Gateway on the receiving
+  computer for App/remote uploads. Existing Apps and Herdr versions stay
+  compatible; no protocol change or migration is needed.
+
 - **Desktop direction controls follow the selected theme.** Dropdowns, search
   navigation and disclosure controls rotate the theme's declared `home.arrow`
   image; missing assets or missing direction metadata keep the native fallback.

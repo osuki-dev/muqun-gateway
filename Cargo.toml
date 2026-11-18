@@ -78,6 +78,8 @@ hex = "0.4"
 # tests drive a Router. Already in the tree through axum.
 tower = { version = "0.5", default-features = false, features = ["util"] }
 toml = "1.1.8"
+# Bounded metadata-only recognition of legacy Word/Excel/PowerPoint uploads.
+cfb = { version = "0.16.0", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1.53.3", features = ["test-util"] }
