@@ -3,6 +3,12 @@
 - Upgrade bundled SQLCipher to 4.20.0 / SQLite 3.54.1 through rusqlite 0.42, addressing RUSTSEC-2026-0502 (crafted database/WAL memory disclosure). Existing encryption remains enabled.
 ## Changes and fixes
 
+- **Sent messages no longer appear twice after an attachment or a steered prompt.**
+  Gateway reconciles device-origin presentation with the submitted message using
+  arrival order and the original prose, preserving attachments and intentional
+  repeated sends. Restart Gateway after active agent turns finish. Existing
+  Desktop, App and Herdr versions remain compatible; no migration is needed.
+
 - **Legacy Office attachments work in Desktop and paired Apps.** Word `.doc`,
   Excel `.xls` and PowerPoint `.ppt` are recognised from their compound-file
   structure and document headers, alongside existing OOXML and OpenDocument
