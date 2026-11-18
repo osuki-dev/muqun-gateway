@@ -553,9 +553,20 @@ impl MemoryMirror {
             if state.pending_origins.len() > MAX_PENDING_ORIGINS {
                 state.pending_origins.remove(0);
             }
+            // Place a still-unacknowledged presentation immediately after
+            // the current provider group, never in a separate UUID-sorted tail.
+            // `!` sorts before the characters used to extend provider keys.
+            let anchor = state
+                .timeline
+                .ordered()
+                .rev()
+                .find(|row| !row.id.starts_with("presented:"))
+                .map(|row| row.message_id.as_str())
+                .unwrap_or("");
+            let message_id = format!("{anchor}!presented:{:020}", state.current_seq + 1);
             TimelineItem {
                 id: id.clone(),
-                message_id: id,
+                message_id,
                 role: TimelineRole::User,
                 part: AgentPart::Text { text: text.into() },
                 seq: 0,
@@ -3553,7 +3564,6 @@ mod tests {
         };
         let presented = items[0].clone();
         assert!(presented.id.starts_with("presented:"));
-        assert_eq!(presented.message_id, presented.id);
         assert_eq!(presented.origin, Some(pixel()));
 
         // The agent repeats the text under its own id, a little differently
@@ -3599,6 +3609,47 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn pending_presentations_stay_between_provider_groups_in_send_order() {
+        let mirror = MemoryMirror::new();
+        let asid = AgentSessionId("ses-presentation-order".into());
+        mirror.update_session(info(&asid, "Order")).await;
+        for id in ["question-one", "question-two"] {
+            mirror
+                .add_form(FormRequest {
+                    id: id.into(),
+                    asid: asid.clone(),
+                    title: id.into(),
+                    fields: vec![],
+                    nonblocking: false,
+                })
+                .await;
+        }
+        let mut before = text_item("before", "00000000000000000001:turn", "before");
+        before.role = TimelineRole::Assistant;
+        mirror.record_timeline_upsert(&asid, vec![before]).await;
+        mirror.present_user_prompt(&asid, "first", pixel()).await;
+        mirror.present_user_prompt(&asid, "second", pixel()).await;
+        let mut after = text_item("after", "00000000000000000002:turn", "after");
+        after.role = TimelineRole::Assistant;
+        mirror.record_timeline_upsert(&asid, vec![after]).await;
+        let snapshot = mirror.get_snapshot(&asid).await.unwrap();
+        let texts: Vec<_> = snapshot
+            .timeline
+            .iter()
+            .filter_map(|row| match &row.part {
+                AgentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["before", "first", "second", "after"]);
+        assert_eq!(snapshot.forms.len(), 2);
+        mirror.resolve_form(&asid, "question-one").await;
+        let snapshot = mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(snapshot.forms.len(), 1);
+        assert_eq!(snapshot.forms[0].id, "question-two");
     }
 
     #[tokio::test]

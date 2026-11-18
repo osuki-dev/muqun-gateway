@@ -6,7 +6,8 @@
 - **Sent messages no longer appear twice after an attachment or a steered prompt.**
   Gateway reconciles device-origin presentation with the submitted message using
   arrival order and the original prose, preserving attachments and intentional
-  repeated sends. Restart Gateway after active agent turns finish. Existing
+  repeated sends. Pending source-labelled rows stay at their send position
+  instead of sorting after all subsequent agent output. Restart Gateway after active agent turns finish. Existing
   Desktop, App and Herdr versions remain compatible; no migration is needed.
 
 - **Legacy Office attachments work in Desktop and paired Apps.** Word `.doc`,
