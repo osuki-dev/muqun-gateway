@@ -82,7 +82,8 @@ pub fn stage_path(s: &mut UiState, path: PathBuf) {
     let target = (s.mode == super::Mode::Session)
         .then(|| s.selected.clone())
         .flatten();
-    s.pending_file_targets.insert(id, target);
+    s.pending_file_targets
+        .insert(id, (s.current_computer().to_owned(), target));
     s.next_token += 1;
     let name = path
         .file_name()
@@ -3028,7 +3029,12 @@ pub(super) fn restore_attachments(s: &mut UiState) {
         .deferred_attachments
         .remove(&(s.current_computer().to_owned(), target))
     {
-        s.staged.extend(files);
+        s.staged.extend(files.into_iter().filter(|file| {
+            file.draft_token.is_none_or(|id| match s.mode {
+                super::Mode::Home => has_image_pill(&s.start_draft, id),
+                _ => has_image_pill(&s.draft, id),
+            })
+        }));
     }
 }
 
@@ -3069,6 +3075,17 @@ pub(super) fn finish_staging(
             return;
         }
     };
+    if let Some((computer, slot)) = &target {
+        if computer != s.current_computer() {
+            file.draft_token = linked.then_some(id);
+            s.deferred_attachments
+                .entry((computer.clone(), slot.clone()))
+                .or_default()
+                .push(file);
+            return;
+        }
+    }
+    let target = target.map(|(_, slot)| slot);
     if !linked {
         match target {
             Some(Some(asid))

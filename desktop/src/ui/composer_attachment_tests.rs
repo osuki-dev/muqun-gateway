@@ -117,3 +117,38 @@ fn document_upload_waits_for_its_original_home_or_session() {
         assert!(s.deferred_attachments.is_empty());
     }
 }
+
+#[test]
+fn document_upload_never_targets_another_computer_even_with_same_session_id() {
+    for home in [false, true] {
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.cfg.current_computer = "local".into();
+        s.selected = Some("same-session".into());
+        s.mode = if home {
+            super::super::Mode::Home
+        } else {
+            super::super::Mode::Session
+        };
+        let id = s.next_token;
+        stage_path(&mut s, "/tmp/report.pdf".into());
+        s.switch_computer("mini".into());
+        s.selected = Some("same-session".into());
+        s.mode = if home {
+            super::super::Mode::Home
+        } else {
+            super::super::Mode::Session
+        };
+        let file = StagedFile {
+            image: false,
+            name: "report.pdf".into(),
+            path: "/uploads/report.pdf".into(),
+            ..uploaded()
+        };
+        finish_staging(&mut s, id, Ok(file.clone()));
+        assert!(s.staged.is_empty());
+        s.switch_computer("local".into());
+        assert_eq!(s.staged, vec![file]);
+        assert!(s.deferred_attachments.is_empty());
+    }
+}

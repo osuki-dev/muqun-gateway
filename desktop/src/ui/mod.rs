@@ -494,7 +494,7 @@ pub struct UiState {
     pub auto_approve: HashMap<String, bool>,
     pub next_token: u64,
     pub deferred_attachments: HashMap<(String, Option<String>), Vec<StagedFile>>,
-    pub pending_file_targets: HashMap<u64, Option<String>>,
+    pub pending_file_targets: HashMap<u64, (String, Option<String>)>,
     pub pending_image_uploads: std::collections::HashSet<u64>,
     pub pending_submit: Option<(u64, Slot)>,
     /// Prompts shown before the gateway's row for them arrives, by session
@@ -1332,6 +1332,7 @@ impl UiState {
             self.send(Command::SwitchComputer(id.clone()));
         }
         self.apply_updates(pending_receipts);
+        composer::restore_attachments(self);
         self.edit(ConfigEdit::CurrentComputer(id.clone()));
         self.agent_inputs.clear();
         self.agent_errors.clear();
