@@ -2022,6 +2022,25 @@ mod tests {
     }
 
     #[test]
+    fn standalone_plugin_keeps_its_window_when_returning_from_page() {
+        use rune::{Env, Runtime};
+        let mut s = state();
+        s.tiles.clear();
+        s.selected = None;
+        s.go(Mode::Home);
+        s.open_plugin_page("sysinfo");
+        s.switch_plugin_surface("sysinfo", crate::plugin::PluginSlot::Tile);
+        assert_eq!(s.tiles.len(), 1);
+        let mut rt = Runtime::new(s, super::super::view, (1200.0, 800.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        assert!(rt
+            .elements()
+            .iter()
+            .any(|e| e.key.as_deref() == Some("surf-menu-sysinfo-Tile")));
+        assert!(rt.state.active_plugin_page.is_none());
+    }
+
+    #[test]
     fn composer_keeps_workspace_shortcuts_after_taking_focus() {
         use rune::{Env, Key, Mods, Runtime};
         let mut s = state();

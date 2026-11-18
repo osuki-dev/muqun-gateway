@@ -2188,9 +2188,13 @@ impl UiState {
 
     // ---- split tiles ---------------------------------------------------------------
 
-    /// Several sessions share the pane.
+    /// Render the tile workspace, including a standalone plugin window.
     pub fn in_split(&self) -> bool {
         self.tiles.len() >= 2
+            || self
+                .tiles
+                .first()
+                .is_some_and(|tile| matches!(tile.content, TileContent::Custom { .. }))
     }
 
     pub fn tile_of(&self, asid: &str) -> Option<usize> {
