@@ -873,6 +873,16 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
     actions = actions.child(if running { submit } else { submit.w(36.0) });
     let card = col()
         .key("composer-card")
+        .on_drop_files(move |s: &mut UiState, files, _| {
+            s.focus_tile(i);
+            composer::attach_dropped_files(s, files);
+        })
+        .on_drop_hover(move |s: &mut UiState, over, _| {
+            if over {
+                s.focus_tile(i);
+            }
+            s.drop_hover = over;
+        })
         .on_background_press(move |s: &mut UiState| s.focus_tile(i))
         .w_full()
         .gap(4.0)
@@ -1196,7 +1206,19 @@ fn tile(
         }
         (super::TileContent::Session(asid), false) => {
             body = body
-                .child(timeline::session_view(s, k, asid))
+                .child(
+                    timeline::session_view(s, k, asid)
+                        .on_drop_files(move |s: &mut UiState, files, _| {
+                            s.focus_tile(i);
+                            composer::attach_dropped_files(s, files);
+                        })
+                        .on_drop_hover(move |s: &mut UiState, over, _| {
+                            if over {
+                                s.focus_tile(i);
+                            }
+                            s.drop_hover = over;
+                        }),
+                )
                 .child(parked_composer(s, k, look, i));
         }
     }
@@ -1782,6 +1804,84 @@ pub fn view(s: &UiState, k: &Kit, clear: f32, scale: f32, layer: &mut Vec<El>) -
 mod tests {
     use super::*;
     use crate::ui::Tile;
+
+    #[test]
+    fn native_file_drop_targets_inactive_composer_once_and_survives_focus_change() {
+        use crate::model::commands::Command;
+        use crate::model::compose::{ComposeCommand, StagedFile};
+        use rune::{Env, Runtime};
+        for hover in [false, true] {
+            let (tx, mut rx) = crate::model::commands::channel();
+            let mut s = UiState::new(tx);
+            crate::ui::scenes::scenes()
+                .iter()
+                .find(|(name, _)| *name == "split2")
+                .unwrap()
+                .1(&mut s);
+            s.splash = None;
+            s.focus_tile(0);
+            let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+            for _ in 0..60 {
+                rt.frame(1.0 / 60.0);
+            }
+            let mut cards: Vec<_> = rt
+                .elements()
+                .into_iter()
+                .filter(|n| n.key.as_deref() == Some("composer-card"))
+                .collect();
+            cards.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
+            let r = cards[1].rect;
+            let at = Some((r[0] + 20.0, r[1] + 20.0));
+            let files = vec![
+                std::path::PathBuf::from("/tmp/report.pdf"),
+                std::path::PathBuf::from("/tmp/photo.png"),
+            ];
+            // No ordinary pointer-move/click: OS drags have their own event route.
+            if hover {
+                rt.drag_files(files.clone(), at);
+                for _ in 0..3 {
+                    rt.frame(1.0 / 60.0);
+                }
+                assert_eq!(rt.state.focus, 1);
+                assert!(rt.state.drop_hover);
+            }
+            rt.drop_files(files, at);
+            rt.frame(1.0 / 60.0);
+            assert!(!rt.state.drop_hover);
+            let mut staged = Vec::new();
+            while let Ok(cmd) = rx.try_recv() {
+                if let Command::Compose(ComposeCommand::Stage { id, name, .. }) = cmd {
+                    staged.push((id, name));
+                }
+            }
+            assert_eq!(
+                staged.len(),
+                2,
+                "one OS drop must stage each file exactly once"
+            );
+            assert!(
+                rt.state.toasts.is_empty(),
+                "upload not completed: no success toast"
+            );
+            rt.state.focus_tile(0);
+            for (id, name) in staged {
+                composer::finish_staging(
+                    &mut rt.state,
+                    id,
+                    Ok(StagedFile {
+                        draft_token: None,
+                        path: format!("/uploads/{name}"),
+                        image: name.ends_with("png"),
+                        name,
+                        size: 16,
+                    }),
+                );
+            }
+            assert!(rt.state.staged.is_empty());
+            assert_eq!(rt.state.tiles[1].slot.staged.len(), 2);
+            assert!(rt.state.tiles[1].slot.draft.text.contains("[Image #1]"));
+        }
+    }
 
     #[test]
     fn hovering_composer_allows_paste_without_click_and_keeps_controls_still() {

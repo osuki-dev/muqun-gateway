@@ -79,6 +79,10 @@ pub fn stage_png(s: &mut UiState, png: Vec<u8>) {
 
 pub fn stage_path(s: &mut UiState, path: PathBuf) {
     let id = s.next_token;
+    let target = (s.mode == super::Mode::Session)
+        .then(|| s.selected.clone())
+        .flatten();
+    s.pending_file_targets.insert(id, target);
     s.next_token += 1;
     let name = path
         .file_name()
@@ -96,14 +100,12 @@ pub fn attach_dropped_files(s: &mut UiState, files: &[PathBuf]) {
     if files.is_empty() {
         return;
     }
-    let mut attached_images = 0;
     for path in files {
         let is_img = crate::model::compose::image_name(&path.to_string_lossy());
         let token = s.next_token;
         stage_path(s, path.clone());
         if is_img {
             s.pending_image_uploads.insert(token);
-            attached_images += 1;
             let draft = if s.mode == super::Mode::Session {
                 &mut s.draft
             } else {
@@ -112,22 +114,6 @@ pub fn attach_dropped_files(s: &mut UiState, files: &[PathBuf]) {
             insert_image_pill(draft, token);
         }
     }
-    let language = s.cfg.general.language;
-    let msg = if files.len() == 1 {
-        if attached_images > 0 {
-            crate::ui::copy::t(language, "Attached image")
-        } else {
-            crate::ui::copy::t(language, "Attached file")
-        }
-    } else {
-        format!(
-            "{} ({})",
-            crate::ui::copy::t(language, "Attached files"),
-            files.len()
-        )
-    };
-    s.status = msg.clone();
-    s.toast(msg, None);
 }
 
 /// Ctrl/Cmd+V into the draft: stage copied files or a clipboard image; leave
@@ -3031,6 +3017,21 @@ mod tests {
     }
 }
 
+/// Deliver completed uploads only when their original composer is visible again.
+pub(super) fn restore_attachments(s: &mut UiState) {
+    let target = match s.mode {
+        super::Mode::Home => None,
+        super::Mode::Session => s.selected.clone(),
+        _ => return,
+    };
+    if let Some(files) = s
+        .deferred_attachments
+        .remove(&(s.current_computer().to_owned(), target))
+    {
+        s.staged.extend(files);
+    }
+}
+
 fn has_image_pill(draft: &TextEdit, id: u64) -> bool {
     draft.pills().any(|(_, pill)| pill == format!("image:{id}"))
 }
@@ -3052,6 +3053,7 @@ pub(super) fn finish_staging(
     id: u64,
     result: Result<crate::model::compose::StagedFile, String>,
 ) {
+    let target = s.pending_file_targets.remove(&id);
     let linked = s.pending_image_uploads.remove(&id);
     let mut file = match result {
         Ok(file) => file,
@@ -3068,7 +3070,36 @@ pub(super) fn finish_staging(
         }
     };
     if !linked {
-        s.staged.push(file);
+        match target {
+            Some(Some(asid))
+                if s.mode != super::Mode::Session || s.selected.as_deref() != Some(&asid) =>
+            {
+                if s.selected.as_deref() == Some(&asid) {
+                    s.deferred_attachments
+                        .entry((s.current_computer().to_owned(), Some(asid)))
+                        .or_default()
+                        .push(file);
+                } else if let Some(tile) = s
+                    .tiles
+                    .iter_mut()
+                    .find(|tile| tile.asid.as_deref() == Some(&asid))
+                {
+                    tile.slot.staged.push(file);
+                } else {
+                    s.toast_error(
+                        "Attachment failed",
+                        Some("The destination session was closed.".into()),
+                    );
+                }
+            }
+            Some(None) if s.mode != super::Mode::Home => {
+                s.deferred_attachments
+                    .entry((s.current_computer().to_owned(), None))
+                    .or_default()
+                    .push(file);
+            }
+            _ => s.staged.push(file),
+        }
         return;
     }
     file.draft_token = Some(id);

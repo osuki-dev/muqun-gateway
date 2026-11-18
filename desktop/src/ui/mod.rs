@@ -493,6 +493,8 @@ pub struct UiState {
     pub draft_snap_caret: usize,
     pub auto_approve: HashMap<String, bool>,
     pub next_token: u64,
+    pub deferred_attachments: HashMap<(String, Option<String>), Vec<StagedFile>>,
+    pub pending_file_targets: HashMap<u64, Option<String>>,
     pub pending_image_uploads: std::collections::HashSet<u64>,
     pub pending_submit: Option<(u64, Slot)>,
     /// Prompts shown before the gateway's row for them arrives, by session
@@ -748,6 +750,8 @@ impl UiState {
             draft_snap_caret: 0,
             auto_approve: HashMap::new(),
             next_token: 1,
+            deferred_attachments: Default::default(),
+            pending_file_targets: Default::default(),
             pending_image_uploads: Default::default(),
             pending_submit: None,
             echoes: HashMap::new(),
@@ -1628,6 +1632,7 @@ impl UiState {
         self.send(Command::Compose(
             crate::model::compose::ComposeCommand::ListPeers,
         ));
+        composer::restore_attachments(self);
     }
 
     /// Toggle to the most recent previous session (Ctrl+Tab).
@@ -1958,6 +1963,7 @@ impl UiState {
         }
         self.active_plugin_page = None;
         self.mode = mode;
+        composer::restore_attachments(self);
         match mode {
             Mode::Tasks => self.send(Command::RefreshTasks),
             Mode::Home => {
@@ -2255,6 +2261,7 @@ impl UiState {
     pub fn focus_tile(&mut self, i: usize) {
         if i >= self.tiles.len() {
             self.mode = Mode::Session;
+            composer::restore_attachments(self);
             return;
         }
         if i == self.focus {
@@ -2280,6 +2287,7 @@ impl UiState {
                 }
                 _ => {}
             }
+            composer::restore_attachments(self);
             return;
         }
         let old = self.take_slot();
@@ -2324,6 +2332,7 @@ impl UiState {
             }
             _ => {}
         }
+        composer::restore_attachments(self);
     }
 
     /// Ensure `s.term.active_tab` matches the terminal tab bound to tile `i`.

@@ -78,3 +78,42 @@ fn image_upload_finishes_in_its_original_split_pane() {
         .iter()
         .any(|file| file.draft_token == Some(42)));
 }
+
+#[test]
+fn document_upload_waits_for_its_original_home_or_session() {
+    for from_home in [false, true] {
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.selected = Some("original-session".into());
+        s.mode = if from_home {
+            super::super::Mode::Home
+        } else {
+            super::super::Mode::Session
+        };
+        let id = s.next_token;
+        stage_path(&mut s, "/tmp/report.pdf".into());
+        s.go(if from_home {
+            super::super::Mode::Session
+        } else {
+            super::super::Mode::Home
+        });
+        let file = StagedFile {
+            image: false,
+            name: "report.pdf".into(),
+            path: "/uploads/report.pdf".into(),
+            ..uploaded()
+        };
+        finish_staging(&mut s, id, Ok(file.clone()));
+        assert!(
+            s.staged.is_empty(),
+            "the other composer must not receive this file"
+        );
+        s.go(if from_home {
+            super::super::Mode::Home
+        } else {
+            super::super::Mode::Session
+        });
+        assert_eq!(s.staged, vec![file]);
+        assert!(s.deferred_attachments.is_empty());
+    }
+}
