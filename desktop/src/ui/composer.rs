@@ -704,6 +704,20 @@ fn staged_chip(s: &UiState, k: &Kit, i: usize, file: &crate::model::compose::Sta
         })
         .build(k)
         .key(format!("staged-btn-{i}"));
+    let label = rune::text(super::timeline::clip(&file.name, 32))
+        .font(k.ty.small)
+        .color(k.c.text_base);
+    let preview = row().center_y().gap(6.0).child(lead).child(label);
+    let preview = if file.image && Path::new(&file.path).is_file() {
+        let path = PathBuf::from(&file.path);
+        k.interactive(preview)
+            .key(format!("staged-preview-{i}"))
+            .label(file.name.clone())
+            .cursor(Cursor::Pointer)
+            .on_press(move |s: &mut UiState| s.zoom = Some(path.clone()))
+    } else {
+        preview
+    };
     row()
         .key(format!("staged-{i}"))
         .h(32.0)
@@ -713,13 +727,7 @@ fn staged_chip(s: &UiState, k: &Kit, i: usize, file: &crate::model::compose::Sta
         .radius(k.radius.md)
         .fill(k.c.text_base.alpha(0.06))
         .help(file.path.clone())
-        .child(lead.a11y_hidden())
-        .child(
-            rune::text(super::timeline::clip(&file.name, 32))
-                .font(k.ty.small)
-                .color(k.c.text_base)
-                .a11y_hidden(),
-        )
+        .child(preview)
         .child(remove)
 }
 

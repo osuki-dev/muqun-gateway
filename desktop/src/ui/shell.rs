@@ -43,7 +43,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         let content = if pid == "terminal" {
             content
         } else {
-            look.panel(k, content, k.radius.lg)
+            content.fill(k.c.bg_base)
         };
         super::card_stage("plugin-page", content)
     } else {
@@ -242,7 +242,11 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     }
     let mut split = split
         .titlebar_inset(crate::platform::titlebar_inset(cx.titlebar_inset()))
-        .frame_inset(frame)
+        .frame_inset(if s.active_plugin_page.is_some() {
+            0.0
+        } else {
+            frame
+        })
         .pane_motion(super::panes::motion())
         .reduced_motion(!look.motion || cx.is_reduced_motion())
         .sidebar_toggle(
@@ -262,6 +266,10 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     // In split view the panes are the cards: the main card steps aside
     // and each pane lays its own floor (`tiles.rs`).
     let tiled = s.mode == Mode::Session && s.in_split();
+    if s.active_plugin_page.is_some() {
+        chrome.radius.lg = 0.0;
+        chrome.c.border_muted = chrome.c.border_muted.alpha(0.0);
+    }
     if look.see_through {
         // The desktop shows around the panels; each lays its own floor, the
         // main card with the theme's wallpaper in it.
@@ -279,7 +287,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
                 SEE_THROUGH_FLOOR[usize::from(look.dark)],
             ))
             .children(
-                (!tiled)
+                (!tiled && s.active_plugin_page.is_none())
                     .then(|| card_floor(s, k, &look, window, right_w))
                     .flatten(),
             )
