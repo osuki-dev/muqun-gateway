@@ -1131,9 +1131,7 @@ fn handle_leader_group(
                 let idx = (d as u8 - b'1') as usize;
                 if s.in_split() && idx < s.tiles.len() {
                     s.focus_tile(idx);
-                    if s.tiles.get(idx).is_some_and(|t| t.is_terminal()) {
-                        s.focus_terminal_tx(tx);
-                    }
+                    s.focus_pane_input(tx);
                 }
             }
             _ => {}
@@ -1237,9 +1235,7 @@ pub fn handle_leader_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         if s.in_split() {
             if let Some(j) = super::tiles::neighbour(s, &ev.key) {
                 s.focus_tile(j);
-                if s.tiles.get(s.focus).is_some_and(|t| t.is_terminal()) {
-                    s.focus_terminal_tx(tx);
-                }
+                s.focus_pane_input(tx);
             }
         } else {
             match ev.key {
@@ -1323,9 +1319,7 @@ pub fn handle_leader_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
             if s.in_split() {
                 if idx < s.tiles.len() {
                     s.focus_tile(idx);
-                    if s.tiles.get(idx).is_some_and(|t| t.is_terminal()) {
-                        s.focus_terminal_tx(tx);
-                    }
+                    s.focus_pane_input(tx);
                 }
             } else {
                 s.term_switch_tab(idx);
@@ -1669,9 +1663,7 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
                 return false;
             }
             s.focus_tile(n);
-            if s.tiles.get(n).is_some_and(|t| t.is_terminal()) {
-                s.focus_terminal_tx(tx);
-            }
+            s.focus_pane_input(tx);
         }
         A::FocusPaneToward | A::SwapPaneToward => {
             let was_term = s.term.sink.focused;
@@ -1679,8 +1671,8 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
                 s.term.sink.focused = false;
             }
             let handled = super::tiles::move_toward(s, &ev.key, action == A::SwapPaneToward);
-            if s.in_split() && s.tiles.get(s.focus).is_some_and(|t| t.is_terminal()) {
-                s.focus_terminal_tx(tx);
+            if handled && s.in_split() {
+                s.focus_pane_input(tx);
             } else if was_term && !handled {
                 s.term.sink.focused = true;
             }
@@ -2213,6 +2205,10 @@ mod tests {
         assert_eq!(rt.state.focus, 0);
         assert!(rt.state.draft.focused);
         assert!(!rt.state.term.sink.focused);
+
+        rt.key(key(Key::Text("typed".into()), false, false, false));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.draft.text.ends_with("typed"));
 
         // And from the session composer, `Ctrl+Alt+Right` moves focus back to the terminal tile!
         let mut right = key(Key::Right, !crate::platform::is_macos(), false, true);

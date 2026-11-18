@@ -2274,6 +2274,17 @@ impl UiState {
         self.saved_permissions = slot.saved_permissions;
     }
 
+    /// Route native keyboard focus after activating a split pane.
+    pub(super) fn focus_pane_input(&mut self, tx: &mut rune::Tx) {
+        match self.tiles.get(self.focus).map(|tile| &tile.content) {
+            Some(TileContent::Session(_)) if !self.timeline_search.active => {
+                tx.focus("draft", false)
+            }
+            Some(TileContent::Terminal) => self.focus_terminal_tx(tx),
+            _ => {}
+        }
+    }
+
     /// Give tile `i` the keyboard: its session or window becomes active,
     /// and the old focused tile keeps its state in its slot.
     pub fn focus_tile(&mut self, i: usize) {

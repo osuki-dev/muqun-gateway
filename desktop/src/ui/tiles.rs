@@ -1062,7 +1062,7 @@ struct Place {
 }
 
 /// Hover activation leaves modal interactions and composition with their owner.
-fn focus_hovered_tile(s: &mut UiState, i: usize) {
+fn focus_hovered_tile(s: &mut UiState, i: usize, tx: &mut rune::Tx) {
     if i == s.focus
         || i >= s.tiles.len()
         || s.mode != Mode::Session
@@ -1081,6 +1081,7 @@ fn focus_hovered_tile(s: &mut UiState, i: usize) {
         return;
     }
     s.focus_tile(i);
+    s.focus_pane_input(tx);
 }
 
 /// Pane `i` as its own card: a rounded floor like the sidebar's, a header
@@ -1136,9 +1137,9 @@ fn tile(
         } else {
             rune::Transition::none()
         })
-        .on_hover_change(move |s: &mut UiState, inside, _| {
+        .on_hover_change(move |s: &mut UiState, inside, tx| {
             if inside {
-                focus_hovered_tile(s, i);
+                focus_hovered_tile(s, i, tx);
             }
         })
         .on_background_press(move |s: &mut UiState| {
