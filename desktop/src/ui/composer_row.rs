@@ -510,12 +510,7 @@ fn agent_chip(c: &Controls, k: &Kit, f: Fold) -> El {
             .a11y_hidden(),
     );
     if c.busy {
-        chip = chip.child(
-            rune_kit::Spinner::new()
-                .size(8.0)
-                .color(k.c.bg_accent)
-                .build(k),
-        );
+        chip = chip.child(crate::ui::art::ActivityMark::Compact.build(k));
     }
     chip
 }

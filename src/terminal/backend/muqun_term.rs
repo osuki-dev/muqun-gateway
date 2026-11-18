@@ -907,19 +907,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::net::UnixListener;
 
-    fn temp_socket_path(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "muqun-term-test-{label}-{}.sock",
-            uuid::Uuid::new_v4()
-        ))
-    }
-
     async fn spawn_mock_daemon(
         requests: Arc<Mutex<Vec<Value>>>,
         read_unsupported: bool,
     ) -> (PathBuf, tokio::task::JoinHandle<()>) {
-        let socket_path = temp_socket_path("daemon");
-        let _ = std::fs::remove_file(&socket_path);
+        let socket_path = crate::short_test_socket("gw-term");
         let listener = UnixListener::bind(&socket_path).expect("bind mock term.sock");
         let handle = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {

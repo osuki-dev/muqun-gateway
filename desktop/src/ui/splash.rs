@@ -201,11 +201,8 @@ fn stage(
             if let Some(bytes) = crate::theme::apply::identity().logo {
                 art::picture(images, bytes, rune::SurfaceFit::Fit).size(width, height)
             } else {
-                // The packaged icon has an opaque square background. Mask only
-                // this built-in mark; theme logos retain their own silhouette.
                 art::picture(images, crate::branding::APP_ICON_PNG, rune::SurfaceFit::Fit)
                     .size(width, height)
-                    .clip_soft(width.min(height) * 0.22)
             }
         };
         el().key(key.to_string())

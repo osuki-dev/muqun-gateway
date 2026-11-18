@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use muqun_gateway::agents::message_images::resolve_host_media;
 use muqun_gateway::agents::{MessageImageAsset, TimelineItem, ToolCall};
 use rune::{col, el, icon, row, text, Cursor, El, SurfaceFit};
-use rune_kit::{Kit, Spinner};
+use rune_kit::Kit;
 
 use super::{glyphs, Tcx};
 use crate::ui::UiState;
@@ -297,7 +297,7 @@ pub fn zoom_overlay(s: &UiState, k: &Kit) -> Option<El> {
             .w_full()
             .grow(1.0)
             .center()
-            .child(Spinner::new().build(k))
+            .child(crate::ui::art::ActivityMark::Standalone.build(k))
     };
     let bar = row()
         .key("zoom-bar")

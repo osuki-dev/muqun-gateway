@@ -31,7 +31,7 @@ fn small(
 ) -> El {
     Button::new(label)
         .variant(variant)
-        .control_size(ControlSize::ExtraLarge)
+        .control_size(ControlSize::Small)
         .on_press(f)
         .build(k)
         .key(key)
@@ -311,10 +311,8 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
             out.push(
                 row().child(
                     Badge::new(cur_branch.clone())
-                        .variant(BadgeVariant::Accent)
-                        .build(k)
-                        .h(32.0)
-                        .px(12.0),
+                        .variant(BadgeVariant::Subtle)
+                        .build(k),
                 ),
             );
             if !b.local.is_empty() {
@@ -796,6 +794,14 @@ fn shells(s: &UiState, k: &Kit) -> Vec<El> {
 }
 
 pub fn view(s: &UiState, k: &Kit) -> El {
+    panel(s, k, false)
+}
+
+pub fn inline_view(s: &UiState, k: &Kit) -> El {
+    panel(s, k, true)
+}
+
+fn panel(s: &UiState, k: &Kit, inline: bool) -> El {
     let language = s.cfg.general.language;
     let asid = s.selected.clone().unwrap_or_default();
     let waiting = s.waiting_perms.get(&asid).map_or(0, Vec::len)
@@ -826,6 +832,17 @@ pub fn view(s: &UiState, k: &Kit) -> El {
             s.inspector_tab == tab,
         ));
     }
+    if inline {
+        strip = strip.child(el().grow(1.0)).child(
+            rune_kit::IconButton::new(k.glyph.close)
+                .variant(rune_kit::IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .label(tr_ref(language, "Close"))
+                .shortcut("Esc")
+                .on_press(UiState::close_inspector)
+                .build(k),
+        );
+    }
     let body = match s.inspector_tab {
         InspectorTab::Queue => queue(s, k),
         InspectorTab::Git => git(s, k),
@@ -842,6 +859,7 @@ pub fn view(s: &UiState, k: &Kit) -> El {
         .child(
             col()
                 .key("inspector-body")
+                .items_start()
                 .w_full()
                 .gap(8.0)
                 .px(12.0)

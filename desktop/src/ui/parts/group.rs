@@ -4,7 +4,6 @@
 
 use muqun_gateway::agents::{AgentPart, TimelineItem};
 use rune::{col, row, text, Cursor, El};
-use rune_kit::Spinner;
 
 use super::Tcx;
 use crate::model::activity::{self, Summary};
@@ -136,7 +135,7 @@ pub fn view(cx: &Tcx, items: &[TimelineItem]) -> El {
     if let Some(item) = running {
         line = line
             .child(text("·").font(k.ty.small).color(k.c.text_faint))
-            .child(Spinner::new().size(11.0).build(k).key("spin"))
+            .child(crate::ui::art::ActivityMark::Inline.build(k).key("spin"))
             .child(
                 text(step(cx, item))
                     .key("step")

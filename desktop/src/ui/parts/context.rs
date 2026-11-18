@@ -6,7 +6,7 @@
 
 use muqun_gateway::agents::AgentSessionInfo;
 use rune::{col, icon, row, text, Color, Cursor, El};
-use rune_kit::{Kit, Spinner};
+use rune_kit::Kit;
 use serde_json::Value;
 
 use super::glyphs;
@@ -257,7 +257,7 @@ pub fn limits_section(s: &UiState, k: &Kit, agent: &str) -> Option<El> {
         .gap(8.0)
         .child(heading(k, t("Account limits")));
     let Some(loaded) = s.account_limits.get(agent) else {
-        return Some(block.child(Spinner::new().size(14.0).build(k)));
+        return Some(block.child(crate::ui::art::ActivityMark::Compact.build(k)));
     };
     let Some(limits) = loaded.as_ref() else {
         return Some(block.child(crate::ui::muted(k, t("Could not read account limits"))));

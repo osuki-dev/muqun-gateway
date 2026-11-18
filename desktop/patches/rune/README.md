@@ -22,3 +22,5 @@ Validation used a real GTK file drag source and a native Rune window inside an
 isolated headless Wayland compositor: Copy was delivered once to the right drop
 zone, leaving the target cancelled the hover, and Move-only offers were rejected.
 This does not replace an installed Desktop multi-pane acceptance check.
+
+Patch `0005` handles copy-capable sources when Wayland sends its action before enter. Desktop pins the follow-up at `ceb8a14ec299552d9ec641cf6386f157547c69f3`.

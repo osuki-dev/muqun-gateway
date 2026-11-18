@@ -765,10 +765,7 @@ fn status_mark(
     let (mark, word) = match activity {
         Activity::Idle => return None,
         Activity::Working => (
-            rune_kit::Spinner::new()
-                .size(10.0)
-                .color(k.c.text_accent)
-                .build(k),
+            crate::ui::art::ActivityMark::Compact.build(k),
             tr(language, "Working"),
         ),
         Activity::NeedsYou => (
@@ -1237,11 +1234,7 @@ fn tile(
                 .child(parked_composer(s, k, look, i));
         }
     }
-    if focused && s.right_open && s.inspector_tab == super::InspectorTab::Git {
-        let close = |s: &mut UiState| {
-            s.right_open = false;
-            s.right.set_open(false);
-        };
+    if focused && s.inline_inspector_open() {
         body = body.child(
             col()
                 .key("tile-git-panel")
@@ -1249,15 +1242,8 @@ fn tile(
                 .fill(k.c.bg_base)
                 .radius(k.radius.lg)
                 .motion(look.focus_fade())
-                .child(
-                    row().w_full().justify_end().child(
-                        IconButton::new(k.glyph.close)
-                            .label(tr_ref(s.cfg.general.language, "Close"))
-                            .on_press(close)
-                            .build(k),
-                    ),
-                )
-                .child(super::inspector::view(s, k).grow(1.0).min_h(0.0)),
+                .border(1.0, k.c.border_muted)
+                .child(super::inspector::inline_view(s, k).grow(1.0).min_h(0.0)),
         );
     }
     // Focus is contrast: the other panes' content sits a step back under a

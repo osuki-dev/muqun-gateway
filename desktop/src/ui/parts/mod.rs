@@ -19,7 +19,7 @@ pub mod tool;
 
 use muqun_gateway::agents::{AgentPart, TimelineItem};
 use rune::{col, icon, row, text, Color, Cursor, El, Icon};
-use rune_kit::{Kit, Markdown, MarkdownStyle, Spinner};
+use rune_kit::{Kit, Markdown, MarkdownStyle};
 
 use super::copy::tr_ref;
 use super::timeline::SessionTimeline;
@@ -990,7 +990,7 @@ impl<'a> ToolCard<'a> {
 fn state_mark(cx: &Tcx, state: CardState) -> El {
     let k = cx.k;
     match state {
-        CardState::Running => Spinner::new().size(12.0).build(k).key("state"),
+        CardState::Running => crate::ui::art::ActivityMark::Inline.build(k).key("state"),
         CardState::Failed => icon(&glyphs::DISMISS, 13.0)
             .key("state")
             .color(k.c.danger.icon)

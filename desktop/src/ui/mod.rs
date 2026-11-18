@@ -2120,6 +2120,19 @@ impl UiState {
         }
     }
 
+    pub fn inline_inspector_open(&self) -> bool {
+        self.mode == Mode::Session
+            && self.in_split()
+            && self.right_open
+            && !self.term.open
+            && self.active_plugin_drawer.is_none()
+    }
+
+    pub fn close_inspector(&mut self) {
+        self.right_open = false;
+        self.right.set_open(false);
+    }
+
     pub fn toggle_inspector(&mut self) {
         if !crate::plugin::is_enabled("inspector", &self.cfg.plugins_disabled) {
             return;
@@ -3988,7 +4001,7 @@ pub fn activity_mark(
         Activity::Idle => (k.c.text_faint, tr(language, "Idle")),
     };
     let mark = match activity {
-        Activity::Working => rune_kit::Spinner::new().size(10.0).color(color).build(k),
+        Activity::Working => crate::ui::art::ActivityMark::Compact.build(k),
         Activity::NeedsYou => look.pulse(rune::el().size(7.0, 7.0).radius(3.5).fill(color)),
         _ => rune::el().size(7.0, 7.0).radius(3.5).fill(color),
     };

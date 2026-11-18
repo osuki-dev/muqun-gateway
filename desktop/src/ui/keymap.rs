@@ -1363,6 +1363,24 @@ pub fn intercept_global_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool
     if s.is_leader_armed() {
         return handle_leader_key(s, ev, tx);
     }
+    if ev.key == rune::Key::Escape
+        && !(ev.mods.shift || ev.mods.alt || ev.mods.ctrl || ev.mods.cmd || ev.mods.logo)
+        && s.inline_inspector_open()
+        && s.menu.is_none()
+        && s.row_menu.is_none()
+        && s.context_open.is_none()
+        && s.palette.is_none()
+        && s.keys_sheet.is_none()
+        && s.pairing_target.is_none()
+        && s.zoom.is_none()
+        && s.detail.is_none()
+        && !s.show_diff
+        && !s.timeline_search.active
+        && s.voice.is_none()
+    {
+        s.close_inspector();
+        return true;
+    }
     if is_leader_event(s, ev, tx) {
         s.arm_leader(tx);
         return true;
@@ -2239,6 +2257,29 @@ mod tests {
 
         // `+,` is normalized to `+comma`
         assert!(try_parse_keybind("ctrl+,").is_some());
+    }
+
+    #[test]
+    fn escape_closes_split_inspector_without_closing_session_or_losing_draft() {
+        use rune::{Env, Key, Runtime};
+        let mut s = state();
+        s.mode = Mode::Session;
+        s.tiles = vec![
+            crate::ui::Tile::session("one"),
+            crate::ui::Tile::session("two"),
+        ];
+        s.selected = Some("one".into());
+        s.open_git_inspector();
+        s.draft = rune::TextEdit::new("pending");
+        let mut rt = Runtime::new(s, super::super::view, (1440.0, 900.0), Env::new(true, 1.0));
+        rt.on_key = Some(super::super::on_key);
+        rt.frame(0.0);
+        assert!(rt.state.inline_inspector_open());
+        rt.key(Key::Escape.into());
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.right_open);
+        assert_eq!(rt.state.tiles.len(), 2);
+        assert_eq!(rt.state.draft.text, "pending");
     }
 
     #[test]

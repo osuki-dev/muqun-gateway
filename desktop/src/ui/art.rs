@@ -12,6 +12,83 @@ use rune::{el, Color, El, ImageCache, SurfaceFit};
 
 use crate::theme::apply::{self, Art};
 
+pub enum ActivityMark {
+    Compact,
+    Inline,
+    Standalone,
+}
+
+impl ActivityMark {
+    /// Animated folded ribbons in a fixed square. Reduced motion holds the two-tone silhouette.
+    pub fn build(self, k: &rune_kit::Kit) -> El {
+        let size = match self {
+            Self::Compact => 12.0,
+            Self::Inline => 16.0,
+            Self::Standalone => 20.0,
+        };
+        static LEFT: rune::Icon = rune::Icon {
+            name: "muqun-ribbon-left",
+            view: 32.0,
+            body: r#"<path fill="currentColor" d="M1 4Q1 2.5 2.3 3.4L22.3 18.6Q23.1 19.3 22.3 20.1L19.2 22.7Q18.6 23.2 17.8 22.6L6.2 13.2V24.7Q6.2 25.3 5.7 25.7L2.2 28.7Q1 29.5 1 28Z"/>"#,
+        };
+        static RIGHT: rune::Icon = rune::Icon {
+            name: "muqun-ribbon-right",
+            view: 32.0,
+            body: r#"<path fill="currentColor" d="M19.7 11.6L29.7 3.5Q31 2.5 31 4.2V28Q31 29.4 29.8 28.5L26 25.4Q25.6 25.1 25.6 24.5V13.2L20.4 17.2L19.7 16.7Z"/>"#,
+        };
+        let second = if k.c.icon_accent == k.c.info.icon {
+            k.c.text_base
+        } else {
+            k.c.info.icon
+        };
+        let accent = k.c.icon_accent;
+        let inset = size * 0.07;
+        let ribbon = size - 2.0 * inset;
+        let glow = el()
+            .absolute(0.0, 0.0)
+            .size(size, size)
+            .radial_gradient(
+                [0.5, 0.5],
+                size * 0.5,
+                [
+                    (0.0, second.alpha(0.28)),
+                    (0.55, accent.alpha(0.14)),
+                    (1.0, accent.alpha(0.0)),
+                ],
+            )
+            .looping(rune::LoopSpec::opacity(1.6, 0.0, 0.36, 1.0));
+        let mut mark = el()
+            .size(size, size)
+            .role("progressbar")
+            .label("Loading")
+            .child(glow);
+        for (face, phase) in [(&LEFT, 0.0), (&RIGHT, 0.5)] {
+            let layer = |color| {
+                rune::icon(face, ribbon)
+                    .absolute(inset, inset)
+                    .color(color)
+                    .a11y_hidden()
+            };
+            let flash = layer(second.mix(k.c.white, 0.22)).cycle(rune::Cycle {
+                period: 1.6,
+                phase,
+                stops: &[
+                    (0.0, 0.0),
+                    (0.18, 0.0),
+                    (0.46, 1.0),
+                    (0.66, 0.92),
+                    (0.95, 0.0),
+                    (1.0, 0.0),
+                ],
+                still: 2.0 * phase,
+                fps: 30.0,
+            });
+            mark = mark.child(layer(accent)).child(flash);
+        }
+        mark
+    }
+}
+
 /// Decode `bytes` through `images` into a fitted picture element.
 pub fn picture(images: &ImageCache, bytes: impl Into<Arc<[u8]>>, fit: SurfaceFit) -> El {
     let image = images.load(bytes);

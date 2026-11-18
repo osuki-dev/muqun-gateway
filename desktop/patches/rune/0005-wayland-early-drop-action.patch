@@ -1,0 +1,150 @@
+diff --git a/vendor/winit.patch b/vendor/winit.patch
+index fa601bc..7709725 100644
+--- a/vendor/winit.patch
++++ b/vendor/winit.patch
+@@ -391,10 +391,10 @@ index fef13f4..5150002 100644
+                  }
+ diff --git a/src/platform_impl/linux/wayland/file_drop.rs b/src/platform_impl/linux/wayland/file_drop.rs
+ new file mode 100644
+-index 0000000..4915b75
++index 0000000..f6e1adb
+ --- /dev/null
+ +++ b/src/platform_impl/linux/wayland/file_drop.rs
+-@@ -0,0 +1,403 @@
++@@ -0,0 +1,421 @@
+ +//! Native wl_data_device file drops. Clipboard selection remains owned by the application.
+ +use super::{state::WinitState, WindowId};
+ +use crate::{dpi::PhysicalPosition, event::WindowEvent};
+@@ -428,6 +428,15 @@ index 0000000..4915b75
+ +
+ +const MIME: &str = "text/uri-list";
+ +const MAX_BYTES: usize = 1024 * 1024;
+++// SCTK 0.19 retains source_actions but drops an action received before enter.
+++// Some compositors (including Hyprland) send it only in that order. We
+++// request only Copy and never acknowledge completion for an unknown action.
+++fn copy_drop(version: u32, selected: DndAction, offered: DndAction) -> bool {
+++    version < 3
+++        || selected == DndAction::Copy
+++        || (selected.is_empty() && offered.contains(DndAction::Copy))
+++}
+++
+ +struct Drag {
+ +    offer: DragOffer,
+ +    window: WindowId,
+@@ -690,7 +699,11 @@ index 0000000..4915b75
+ +                return;
+ +            }
+ +            drag.dropped = true;
+-+            if drag.offer.inner().version() >= 3 && drag.offer.selected_action != DndAction::Copy {
+++            if !copy_drop(
+++                drag.offer.inner().version(),
+++                drag.offer.selected_action,
+++                drag.offer.source_actions,
+++            ) {
+ +                self.cancel_file_drag(&device.id());
+ +            } else {
+ +                self.publish_file_drag(&device.id());
+@@ -704,8 +717,13 @@ index 0000000..4915b75
+ +        _: &Connection,
+ +        _: &QueueHandle<Self>,
+ +        offer: &mut DragOffer,
+-+        _: DndAction,
+++        actions: DndAction,
+ +    ) {
+++        for drag in self.file_drop.drags.values_mut() {
+++            if drag.offer.inner() == offer.inner() {
+++                drag.offer.source_actions = actions;
+++            }
+++        }
+ +        offer.set_actions(DndAction::Copy, DndAction::Copy);
+ +    }
+ +    fn selected_action(
+@@ -800,15 +818,23 @@ index 0000000..4915b75
+ +mod tests;
+ diff --git a/src/platform_impl/linux/wayland/file_drop_tests.rs b/src/platform_impl/linux/wayland/file_drop_tests.rs
+ new file mode 100644
+-index 0000000..24d1d76
++index 0000000..c5e17b5
+ --- /dev/null
+ +++ b/src/platform_impl/linux/wayland/file_drop_tests.rs
+-@@ -0,0 +1,5 @@
++@@ -0,0 +1,13 @@
+ +use super::*;
+ +#[test]
+ +fn uri_lists_accept_local_files_and_decode_each_line_once() {
+ +    assert_eq!(parse_uri_list(b"# comment\r\nfile:///tmp/a%20b.txt\r\nfile://localhost/tmp/a%20b.txt\nfile:///tmp/%E4%B8%AD%E6%96%87.pdf\nfile:///tmp/a%0Ab.txt\nfile://server/etc/passwd\nhttps://host/file\nfile:///bad%00name\nfile:///bad%xx\n"), vec![PathBuf::from("/tmp/a b.txt"), PathBuf::from("/tmp/中文.pdf"), PathBuf::from("/tmp/a\nb.txt")]);
+ +}
+++
+++#[test]
+++fn drop_with_an_early_action_requires_a_copy_capable_source() {
+++    let both = DndAction::Move | DndAction::Copy;
+++    assert!(copy_drop(3, DndAction::empty(), both));
+++    assert!(!copy_drop(3, DndAction::empty(), DndAction::Move));
+++    assert!(!copy_drop(3, DndAction::Move, both));
+++}
+ diff --git a/src/platform_impl/linux/wayland/mod.rs b/src/platform_impl/linux/wayland/mod.rs
+ index 63052b7..245d51b 100644
+ --- a/src/platform_impl/linux/wayland/mod.rs
+diff --git a/vendor/winit/src/platform_impl/linux/wayland/file_drop.rs b/vendor/winit/src/platform_impl/linux/wayland/file_drop.rs
+index 4915b75..f6e1adb 100644
+--- a/vendor/winit/src/platform_impl/linux/wayland/file_drop.rs
++++ b/vendor/winit/src/platform_impl/linux/wayland/file_drop.rs
+@@ -32,5 +32,14 @@ use std::{
+ const MIME: &str = "text/uri-list";
+ const MAX_BYTES: usize = 1024 * 1024;
++// SCTK 0.19 retains source_actions but drops an action received before enter.
++// Some compositors (including Hyprland) send it only in that order. We
++// request only Copy and never acknowledge completion for an unknown action.
++fn copy_drop(version: u32, selected: DndAction, offered: DndAction) -> bool {
++    version < 3
++        || selected == DndAction::Copy
++        || (selected.is_empty() && offered.contains(DndAction::Copy))
++}
++
+ struct Drag {
+     offer: DragOffer,
+     window: WindowId,
+@@ -293,7 +302,11 @@ impl DataDeviceHandler for WinitState {
+                 return;
+             }
+             drag.dropped = true;
+-            if drag.offer.inner().version() >= 3 && drag.offer.selected_action != DndAction::Copy {
++            if !copy_drop(
++                drag.offer.inner().version(),
++                drag.offer.selected_action,
++                drag.offer.source_actions,
++            ) {
+                 self.cancel_file_drag(&device.id());
+             } else {
+                 self.publish_file_drag(&device.id());
+@@ -307,8 +320,13 @@ impl DataOfferHandler for WinitState {
+         _: &Connection,
+         _: &QueueHandle<Self>,
+         offer: &mut DragOffer,
+-        _: DndAction,
++        actions: DndAction,
+     ) {
++        for drag in self.file_drop.drags.values_mut() {
++            if drag.offer.inner() == offer.inner() {
++                drag.offer.source_actions = actions;
++            }
++        }
+         offer.set_actions(DndAction::Copy, DndAction::Copy);
+     }
+     fn selected_action(
+diff --git a/vendor/winit/src/platform_impl/linux/wayland/file_drop_tests.rs b/vendor/winit/src/platform_impl/linux/wayland/file_drop_tests.rs
+index 24d1d76..c5e17b5 100644
+--- a/vendor/winit/src/platform_impl/linux/wayland/file_drop_tests.rs
++++ b/vendor/winit/src/platform_impl/linux/wayland/file_drop_tests.rs
+@@ -3,3 +3,11 @@ use super::*;
+ fn uri_lists_accept_local_files_and_decode_each_line_once() {
+     assert_eq!(parse_uri_list(b"# comment\r\nfile:///tmp/a%20b.txt\r\nfile://localhost/tmp/a%20b.txt\nfile:///tmp/%E4%B8%AD%E6%96%87.pdf\nfile:///tmp/a%0Ab.txt\nfile://server/etc/passwd\nhttps://host/file\nfile:///bad%00name\nfile:///bad%xx\n"), vec![PathBuf::from("/tmp/a b.txt"), PathBuf::from("/tmp/中文.pdf"), PathBuf::from("/tmp/a\nb.txt")]);
+ }
++
++#[test]
++fn drop_with_an_early_action_requires_a_copy_capable_source() {
++    let both = DndAction::Move | DndAction::Copy;
++    assert!(copy_drop(3, DndAction::empty(), both));
++    assert!(!copy_drop(3, DndAction::empty(), DndAction::Move));
++    assert!(!copy_drop(3, DndAction::Move, both));
++}

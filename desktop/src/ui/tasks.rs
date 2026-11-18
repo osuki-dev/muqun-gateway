@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use rune::{col, el, row, text, El, TextEdit, Tx};
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Keybind, Kit, Menu,
-    MenuItem, ScrollBar, SegmentedControl, Spinner, TextInput,
+    MenuItem, ScrollBar, SegmentedControl, TextInput,
 };
 
 use super::copy::{tr, tr_ref};
@@ -102,7 +102,7 @@ fn state_mark(k: &Kit, state: &str) -> El {
         _ => k.c.text_faint,
     };
     let mark = if state == "working" {
-        Spinner::new().size(10.0).color(color).build(k)
+        crate::ui::art::ActivityMark::Compact.build(k)
     } else {
         el().size(7.0, 7.0).radius(3.5).fill(color)
     };

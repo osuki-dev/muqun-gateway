@@ -234,10 +234,7 @@ pub fn view(s: &UiState, k: &Kit) -> Option<El> {
     // The lead turns while anything runs (still under reduce motion); a
     // dot in the warning colour says something waits on the owner.
     let lead = if look.motion {
-        rune_kit::Spinner::new()
-            .size(13.0)
-            .color(k.c.text_accent)
-            .build(k)
+        crate::ui::art::ActivityMark::Compact.build(k)
     } else {
         icon(&super::icons::RUNNING, 14.0).color(k.c.text_accent)
     };

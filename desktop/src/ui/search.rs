@@ -13,7 +13,7 @@
 use std::time::{Duration, Instant};
 
 use rune::{col, el, rich, row, text, El, Span, Tx};
-use rune_kit::{Button, ButtonVariant, ControlSize, Kit, Spinner};
+use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
 
 use super::copy::{tr, tr_ref};
 use super::{ago, now_ms, title_of, Mode, UiState};
@@ -539,7 +539,11 @@ pub fn group(s: &UiState, k: &Kit) -> Option<El> {
     }
     header = header.child(el().grow(1.0));
     if c.pending.is_some() {
-        header = header.child(Spinner::new().size(11.0).build(k).key("search-spin"));
+        header = header.child(
+            crate::ui::art::ActivityMark::Compact
+                .build(k)
+                .key("search-spin"),
+        );
     }
     out = out.child(header);
     if let Some(ix) = c.indexing {

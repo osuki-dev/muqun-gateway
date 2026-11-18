@@ -61,3 +61,6 @@ This is not a stable release. Windows packaging and a complete cross-platform vi
 - File drops now activate the destination split composer, including inactive panes. Documents and images stay with that draft if focus changes while uploading, and the UI no longer announces success before the upload completes. Restart Desktop; no Gateway or App update is required.
 
 - Fix native Wayland file-manager drops into Composer by receiving file URI offers and preserving target coordinates. Clipboard selection is unchanged; cancelled and unsupported transfers do not attach files. Restart Desktop after installing the update.
+
+- The launcher and splash use the transparent Muqun mark. Busy indicators use two theme-colored ribbons and respect reduced motion.
+- Escape dismisses the current pane's inspector. On Wayland, copy-capable file-manager drops also attach when the compositor announces the drag action before the pointer enters the window.

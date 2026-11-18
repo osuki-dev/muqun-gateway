@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use muqun_gateway::agents::ports::agent::prompt_display_body;
 use muqun_gateway::agents::{AgentPart, AgentSessionId, TimelineItem, TimelineRole};
 use rune::{col, row, text, El};
-use rune_kit::{Button, ButtonVariant, ControlSize, Spinner};
+use rune_kit::{Button, ButtonVariant, ControlSize};
 
 use super::parts::Tcx;
 use super::UiState;
@@ -450,7 +450,11 @@ pub fn view(cx: &Tcx, echo: &Echo) -> El {
             row()
                 .gap(6.0)
                 .center_y()
-                .child(Spinner::new().size(10.0).build(k).key("echo-spin"))
+                .child(
+                    crate::ui::art::ActivityMark::Compact
+                        .build(k)
+                        .key("echo-spin"),
+                )
                 .child(note(cx.t("Sending…"), k.c.text_faint)),
         ),
         EchoState::Sent if echo.inbox.is_some() || echo.steer => {

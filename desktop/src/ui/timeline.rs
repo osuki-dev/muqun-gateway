@@ -28,7 +28,7 @@ use rune::{col, el, icon, row, text, Cursor, El, GrowthSpec, ScrollSpec};
 use rune_kit::diff::{DiffMode, DiffState, DiffView, FileDiff, FileStatus};
 use rune_kit::{
     glyphs, Badge, BadgeVariant, Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant,
-    Kit, ScrollBar, Spinner, TextInput,
+    Kit, ScrollBar, TextInput,
 };
 
 use super::copy::tr_ref;
@@ -447,7 +447,7 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
             row()
                 .gap(8.0)
                 .center_y()
-                .child(Spinner::new().size(14.0).build(k))
+                .child(crate::ui::art::ActivityMark::Standalone.build(k))
                 .child(
                     text(tr_ref(language, "Opening the session…"))
                         .font(k.ty.ui)
@@ -772,7 +772,11 @@ fn top_row(cx: &Tcx) -> El {
     let mut line = row().key("tl-top").gap(8.0).center().py(6.0);
     if loading {
         line = line
-            .child(Spinner::new().size(12.0).build(cx.k).key("top-spin"))
+            .child(
+                crate::ui::art::ActivityMark::Inline
+                    .build(cx.k)
+                    .key("top-spin"),
+            )
             .child(
                 text(cx.t("Loading earlier messages…"))
                     .font(cx.k.ty.small)
@@ -803,7 +807,11 @@ fn working_row(cx: &Tcx) -> El {
         .gap(8.0)
         .center_y()
         .py(4.0)
-        .child(Spinner::new().size(12.0).build(cx.k).key("work-spin"))
+        .child(
+            crate::ui::art::ActivityMark::Inline
+                .build(cx.k)
+                .key("work-spin"),
+        )
         .child(
             text(cx.t("Working…"))
                 .font(cx.k.ty.small)
