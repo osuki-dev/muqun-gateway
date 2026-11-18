@@ -59,3 +59,5 @@ Close the Desktop application before replacing it, then reopen it. Do not delete
 This is not a stable release. Windows packaging and a complete cross-platform visual and interaction acceptance pass remain outside the current verified scope. Do not treat successful CI compilation as proof that every desktop workflow has been manually validated.
 
 - File drops now activate the destination split composer, including inactive panes. Documents and images stay with that draft if focus changes while uploading, and the UI no longer announces success before the upload completes. Restart Desktop; no Gateway or App update is required.
+
+- Fix native Wayland file-manager drops into Composer by receiving file URI offers and preserving target coordinates. Clipboard selection is unchanged; cancelled and unsupported transfers do not attach files. Restart Desktop after installing the update.

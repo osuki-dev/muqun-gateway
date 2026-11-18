@@ -106,8 +106,8 @@ opt-level = 3
 
 # Rune platform patches, pinned with the UI framework.
 [patch.crates-io]
-wgpu-hal = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de" }
-winit = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de" }
-parley_engine = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de" }
-accesskit_windows = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de" }
-accesskit_macos = { git = "https://github.com/ryuhzk/rune", rev = "9bb3e8e16d2b34d914d97a45081c05866ef324de" }
+wgpu-hal = { git = "https://github.com/ryuhzk/rune", rev = "b345658c61254c377e034a6a1d7c45c349abafb2" }
+winit = { git = "https://github.com/ryuhzk/rune", rev = "b345658c61254c377e034a6a1d7c45c349abafb2" }
+parley_engine = { git = "https://github.com/ryuhzk/rune", rev = "b345658c61254c377e034a6a1d7c45c349abafb2" }
+accesskit_windows = { git = "https://github.com/ryuhzk/rune", rev = "b345658c61254c377e034a6a1d7c45c349abafb2" }
+accesskit_macos = { git = "https://github.com/ryuhzk/rune", rev = "b345658c61254c377e034a6a1d7c45c349abafb2" }
