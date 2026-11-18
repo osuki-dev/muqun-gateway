@@ -4,6 +4,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 [[ $# == 0 ]] || { echo 'usage: build-release.sh' >&2; exit 1; }
 cd "$ROOT"
+# Keep local build artifacts and compiler scratch on the project filesystem,
+# rather than filling a memory-backed system temporary directory.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+mkdir -p "$CARGO_TARGET_DIR/tmp"
+export TMPDIR="$(cd "$CARGO_TARGET_DIR/tmp" && pwd)"
 # Ghostty pins Zig 0.15.2. Prefer an explicitly selected compatible binary,
 # then the existing mise installation; never download or change global tools.
 ZIG_VERSION="$(zig version 2>/dev/null || true)"
