@@ -44,7 +44,8 @@ pub fn render(
 }
 
 pub fn chrome(id: &str, ctx: &PluginViewContext<'_>, body: El, layer: &mut Vec<El>) -> El {
-    if id == "terminal" {
+    // Split tiles already have host chrome, including placement controls.
+    if id == "terminal" || ctx.surface == PluginSlot::Tile {
         return body;
     }
     let mut header = row()

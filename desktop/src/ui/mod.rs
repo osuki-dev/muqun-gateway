@@ -23,7 +23,7 @@ mod labels;
 pub mod pair_computer;
 pub(crate) mod palette;
 mod panes;
-mod parts;
+pub(crate) mod parts;
 mod running;
 pub mod scenes;
 mod search;

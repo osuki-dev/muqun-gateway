@@ -1989,6 +1989,39 @@ mod tests {
     }
 
     #[test]
+    fn window_leader_maximizes_and_restores_the_focused_plugin_tile() {
+        use rune::{Env, Key, Mods, Runtime};
+        let mut s = state();
+        s.cfg.keymap.leader = "ctrl+b".into();
+        s.open_plugin_tile("sysinfo");
+        let plugin = s.tile_of_plugin("sysinfo").unwrap();
+        let count = s.tiles.len();
+        assert!(s.in_split());
+        let mut rt = Runtime::new(s, super::super::view, (1440.0, 900.0), Env::new(true, 1.0));
+        rt.on_key = Some(super::super::on_key);
+        rt.frame(0.0);
+        for expected in [Some(plugin), None] {
+            rt.key(KeyEvent {
+                key: Key::Command('b'),
+                mods: Mods {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            });
+            for c in ['w', 'z'] {
+                rt.key(KeyEvent {
+                    key: Key::Text(c.to_string()),
+                    mods: Mods::default(),
+                });
+                rt.frame(1.0 / 60.0);
+            }
+            assert_eq!(rt.state.zoomed_tile, expected);
+            assert_eq!(rt.state.focus, plugin);
+            assert_eq!(rt.state.tiles.len(), count);
+        }
+    }
+
+    #[test]
     fn composer_keeps_workspace_shortcuts_after_taking_focus() {
         use rune::{Env, Key, Mods, Runtime};
         let mut s = state();

@@ -241,7 +241,7 @@ pub fn open_markdown_link(s: &mut UiState, url: &str, tx: &mut rune::Tx) {
 }
 
 /// Theme roles keep rich text readable in both palette variants.
-fn message_style(k: &Kit) -> MarkdownStyle {
+pub(crate) fn message_style(k: &Kit) -> MarkdownStyle {
     MarkdownStyle::from_kit(k)
         .body_font(k.ty.body.lh(k.ty.body.size * 1.65))
         .strong_weight(650.0)
@@ -263,7 +263,7 @@ fn message_style(k: &Kit) -> MarkdownStyle {
 }
 
 /// Accent structural emphasis without changing the source or copied text.
-fn prose_accents(
+pub(crate) fn prose_accents(
     body: &str,
     k: &Kit,
 ) -> Vec<(std::ops::Range<usize>, rune_kit::markdown::Highlight)> {

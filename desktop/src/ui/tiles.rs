@@ -653,6 +653,21 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
     } else {
         menu.group_opacity(0.0, 1.0)
     });
+    let plugin_id = match content {
+        super::TileContent::Custom { kind, .. } => Some(kind.as_str()),
+        super::TileContent::Diff(_) => Some("diff"),
+        _ => None,
+    };
+    if let Some(plugin_id) = plugin_id {
+        head = head.child(crate::plugin::surface_switcher(
+            s,
+            k,
+            language,
+            plugin_id,
+            crate::plugin::PluginSlot::Tile,
+            layer,
+        ));
+    }
     head = head.child(
         IconButton::new(&CLOSE)
             .variant(IconButtonVariant::GhostMuted)

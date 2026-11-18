@@ -40,6 +40,11 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             .get(pid)
             .and_then(|p| crate::plugin::window::render(p.as_ref(), &ctx, layer))
             .unwrap_or_else(|| el().key("empty-plugin-page"));
+        let content = if pid == "terminal" {
+            content
+        } else {
+            look.panel(k, content, k.radius.lg)
+        };
         super::card_stage("plugin-page", content)
     } else {
         match s.mode {
