@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use muqun_gateway::agents::message_images::resolve_host_media;
 use muqun_gateway::agents::{MessageImageAsset, TimelineItem, ToolCall};
 use rune::{col, el, icon, row, text, Cursor, El, SurfaceFit};
-use rune_kit::{Kit, Spinner};
+use rune_kit::Kit;
 
 use super::{glyphs, Tcx};
 use crate::ui::UiState;
@@ -217,8 +217,7 @@ fn thumbnail(k: &Kit, s: &UiState, path: &Path, key: String, height: f32) -> El 
             .shrink()
             .h(height)
             .radius(k.radius.md)
-            .clip_rounded(k.radius.md)
-            .border(1.0, k.c.border_weak),
+            .clip_rounded(k.radius.md),
     )
     .cursor(Cursor::Pointer)
     .label(label)
@@ -298,7 +297,7 @@ pub fn zoom_overlay(s: &UiState, k: &Kit) -> Option<El> {
             .w_full()
             .grow(1.0)
             .center()
-            .child(Spinner::new().build(k))
+            .child(crate::ui::art::ActivityMark::Standalone.build(k))
     };
     let bar = row()
         .key("zoom-bar")
@@ -320,7 +319,7 @@ pub fn zoom_overlay(s: &UiState, k: &Kit) -> Option<El> {
                     .key("zoom-close")
                     .size(32.0, 32.0)
                     .center()
-                    .radius(16.0)
+                    .radius(k.radius.lg)
                     .child(icon(&glyphs::CLOSE, 16.0).color(k.c.white)),
             )
             .cursor(Cursor::Pointer)

@@ -11,8 +11,8 @@
 //! `Primary+Alt+Shift+arrows` swap it with the one that way,
 //! `Primary+\` adds one, `Primary+W` removes the focused one.
 
-use rune::{col, el, row, text, Cursor, El, Key, KeyEvent, Phase, Tx};
-use rune_kit::glyphs::{CLOSE, TRIANGLE_DOWN};
+use rune::{col, el, row, text, Cursor, El, Key, Phase, Tx};
+use rune_kit::glyphs::CLOSE;
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem,
 };
@@ -42,7 +42,7 @@ pub struct TileCardDrag {
 /// panels.
 const GAP: f32 = super::panes::FRAME;
 /// A pane header's height.
-const HEAD_H: f32 = 36.0;
+const HEAD_H: f32 = rune_kit::shell::TOOLBAR_HEIGHT;
 /// How far an unfocused pane's content sits back: the alpha of the card
 /// colour laid over it (light, dark), about a tenth of its contrast either
 /// way (blending is in linear light, so dark needs more).
@@ -51,15 +51,15 @@ const UNFOCUSED_SCRIM: [f32; 2] = [0.12, 0.22];
 /// `Primary+Alt+arrow` in split view: focus the pane that way; with Shift,
 /// swap the focused pane's session with that pane's. Text fields pass it
 /// here first (their own word moves take the plain chord).
-pub fn arrow_key(s: &mut UiState, ev: &KeyEvent) -> bool {
-    if !s.in_split() || !ev.mods.primary() || !ev.mods.alt {
+pub fn move_toward(s: &mut UiState, key: &Key, swap: bool) -> bool {
+    if !s.in_split() {
         return false;
     }
-    let toward = neighbour(s, &ev.key);
+    let toward = neighbour(s, key);
     match toward {
         // The terminal lends its Ctrl chords with Shift added (Windows and
         // Linux), so from there the arrows only ever move focus.
-        Some(j) if ev.mods.shift && !s.term.sink.focused => {
+        Some(j) if swap => {
             let i = s.focus;
             s.swap_tiles(i, j);
             true
@@ -69,7 +69,7 @@ pub fn arrow_key(s: &mut UiState, ev: &KeyEvent) -> bool {
             true
         }
         // An arrow toward the edge is still ours: it must not move the caret.
-        None => matches!(ev.key, Key::Left | Key::Right | Key::Up | Key::Down),
+        None => matches!(key, Key::Left | Key::Right | Key::Up | Key::Down),
     }
 }
 /// One geometry source for rendering, directional focus and drag targets.
@@ -200,7 +200,19 @@ fn layout_motion(s: &UiState) -> rune::Spring {
     if s.cfg.appearance.reduced_motion || s.tile_card_drag.is_some() || s.tile_drag.is_some() {
         rune::Spring::NONE
     } else {
-        rune::Spring::new(0.38, 0.06)
+        rune::Spring::new(0.42, 0.14)
+    }
+}
+
+/// Apply this to structural containers too: closing a split removes its parent,
+/// so a transition on the leaf alone cannot keep the old subtree on screen.
+fn panel_transition(s: &UiState) -> rune::Transition {
+    if s.look().motion {
+        rune::Transition::opacity()
+            .combined(rune::Transition::scale(0.94))
+            .combined(rune::Transition::offset(0.0, 24.0))
+    } else {
+        rune::Transition::none()
     }
 }
 
@@ -319,7 +331,6 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
     let content = &s.tiles[i].content;
     let mut head = row()
         .key("tile-head")
-        .w_full()
         .h(HEAD_H)
         .pl(12.0 + place.clear)
         .motion(super::panes::SPRING)
@@ -376,40 +387,11 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
             }
         }
         super::TileContent::Terminal => {
-            let title = s.term_tile_title(i);
-            head = head
-                .child(
-                    rune::icon(&super::terminal_panel::TERMINAL_WINDOW, 14.0)
-                        .color(if focused {
-                            k.c.text_accent
-                        } else {
-                            k.c.icon_muted
-                        })
-                        .a11y_hidden(),
-                )
-                .child(
-                    text(title)
-                        .key("tile-title")
-                        .font(title_font)
-                        .color(if focused {
-                            k.c.text_base
-                        } else {
-                            k.c.text_muted
-                        })
-                        .motion(look.focus_fade())
-                        .truncate()
-                        .shrink()
-                        .min_w(48.0),
-                )
-                .child(
-                    text(tr(language, "Terminal"))
-                        .key("tile-agent")
-                        .font(k.ty.small)
-                        .color(k.c.text_faint)
-                        .truncate()
-                        .shrink()
-                        .min_w(0.0),
-                );
+            head = head.child(
+                rune::icon(&super::terminal_panel::TERMINAL_WINDOW, 16.0)
+                    .color(k.c.icon_muted)
+                    .help(tr_ref(language, "Drag to move")),
+            );
         }
         super::TileContent::Diff(path) => {
             head = head
@@ -430,13 +412,13 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
                 );
         }
         super::TileContent::Custom { title, kind, .. } => {
-            let icon = s
+            let plugin_icon = s
                 .plugins
                 .get(kind)
-                .map(|p| p.icon())
-                .unwrap_or(&super::icons::GRID);
+                .map(|p| p.render_icon(s, 14.0, k.c.text_accent))
+                .unwrap_or_else(|| rune::icon(&super::icons::GRID, 14.0).color(k.c.text_accent));
             head = head
-                .child(rune::icon(icon, 14.0).color(k.c.text_accent).a11y_hidden())
+                .child(plugin_icon.a11y_hidden())
                 .child(
                     text(title.clone())
                         .key("tile-title")
@@ -463,38 +445,56 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
             );
         }
     }
-    // The header's empty middle: drag to reorder/split panes, or move a
-    // floating/popped card. Outside split view it still moves the window.
-    head = head.child(if s.in_split() {
-        el().key("tile-spacer")
-            .grow(1.0)
-            .h_full()
-            .cursor(Cursor::Grab)
-            .on_drag(move |s: &mut UiState, d: &mut rune::Drag, _: &mut Tx| {
-                header_tile_drag(s, i, d);
-            })
-            .a11y_hidden()
+    // The complete title region is draggable, even when a long title leaves
+    // no blank spacer. Action buttons stay outside this drag target.
+    head = head.child(el().key("tile-spacer").grow(1.0).h_full().a11y_hidden());
+    let drag_area = head
+        .key(format!("tile-drag-region-{i}"))
+        .w(0.0)
+        .grow(1.0)
+        .min_w(0.0);
+    let drag_area = if s.in_split() {
+        drag_area.cursor(Cursor::Grab).on_drag(
+            move |s: &mut UiState, d: &mut rune::Drag, _: &mut Tx| header_tile_drag(s, i, d),
+        )
     } else {
-        el().key("tile-spacer")
-            .grow(1.0)
-            .h_full()
-            .window_drag()
-            .a11y_hidden()
-    });
+        drag_area.window_drag()
+    };
+    let mut head = row()
+        .key("tile-head")
+        .h(HEAD_H)
+        .pr(6.0)
+        .gap(4.0)
+        .center_y()
+        .hover_group();
+    head = if matches!(content, super::TileContent::Terminal) {
+        head.child(drag_area.w(28.0).grow(0.0).pl(4.0))
+    } else {
+        head.w_full().child(drag_area)
+    };
     // Move and close: visible under the pointer, always reachable by menu.
     let menu_open = s.menu == Some(OpenMenu::Tile(i));
     let mut menu = Menu::new(format!("tile-menu-{i}"))
+        .min_width(320.0)
         .trigger(
-            IconButton::new(&TRIANGLE_DOWN)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Pane actions"))
-                .expanded(menu_open)
-                .on_press(move |s: &mut UiState| {
-                    s.menu = (!menu_open).then_some(OpenMenu::Tile(i));
-                })
-                .build(k)
-                .key(format!("tile-menu-btn-{i}")),
+            super::art::direction_button(
+                s,
+                k,
+                tr_ref(language, "Pane actions"),
+                if menu_open {
+                    -std::f32::consts::FRAC_PI_2
+                } else {
+                    std::f32::consts::FRAC_PI_2
+                },
+            )
+            .variant(ButtonVariant::GhostMuted)
+            .control_size(ControlSize::Small)
+            .expanded(menu_open)
+            .on_press(move |s: &mut UiState| {
+                s.menu = (!menu_open).then_some(OpenMenu::Tile(i));
+            })
+            .build(k)
+            .key(format!("tile-menu-btn-{i}")),
         )
         .open(menu_open)
         .on_close(|s: &mut UiState| s.menu = None);
@@ -653,6 +653,21 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
     } else {
         menu.group_opacity(0.0, 1.0)
     });
+    let plugin_id = match content {
+        super::TileContent::Custom { kind, .. } => Some(kind.as_str()),
+        super::TileContent::Diff(_) => Some("diff"),
+        _ => None,
+    };
+    if let Some(plugin_id) = plugin_id {
+        head = head.child(crate::plugin::surface_switcher(
+            s,
+            k,
+            language,
+            plugin_id,
+            crate::plugin::PluginSlot::Tile,
+            layer,
+        ));
+    }
     head = head.child(
         IconButton::new(&CLOSE)
             .variant(IconButtonVariant::GhostMuted)
@@ -728,7 +743,7 @@ fn window_actions(s: &UiState, k: &Kit) -> El {
                 } else if s.term.open {
                     s.close_terminal();
                 } else {
-                    s.open_terminal();
+                    s.open_terminal_default();
                 }
             })
             .build(k)
@@ -750,10 +765,7 @@ fn status_mark(
     let (mark, word) = match activity {
         Activity::Idle => return None,
         Activity::Working => (
-            rune_kit::Spinner::new()
-                .size(10.0)
-                .color(k.c.text_accent)
-                .build(k),
+            crate::ui::art::ActivityMark::Compact.build(k),
             tr(language, "Working"),
         ),
         Activity::NeedsYou => (
@@ -781,82 +793,142 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
     let language = s.cfg.general.language;
     let asid = s.tiles[i].asid.as_deref().unwrap_or_default();
     let info = s.session_by_id(asid);
-    let agent_id = info.map(|x| x.agent_id.as_str()).unwrap_or("claude");
-    let agent_name = info
-        .map(|x| s.agent_name(&x.agent_id))
-        .unwrap_or_else(|| "Agent".to_string());
-    let activity = info.map(|x| s.activity(x)).unwrap_or(Activity::Idle);
-
-    let draft = s.tiles[i].slot.draft.text.trim().to_string();
-    let is_draft = !draft.is_empty();
-    let (line, ink) = if is_draft {
-        (draft, k.c.text_base)
-    } else {
-        (
-            tr(language, &format!("Message {agent_name}…")),
-            k.c.text_faint,
-        )
-    };
-    let queued = s.tiles[i].slot.queue.len();
-
-    let brand_c = super::agents::color(agent_id, s.dark);
-    let mark_box = el()
-        .key("parked-agent-mark")
-        .size(22.0, 22.0)
-        .radius(6.0)
-        .fill(brand_c.alpha(if s.dark { 0.16 } else { 0.10 }))
-        .border(0.5, brand_c.alpha(if s.dark { 0.32 } else { 0.22 }))
-        .center()
-        .child(super::agents::mark(agent_id, 12.0, s.dark).a11y_hidden());
-
-    let mut strip = row()
-        .key("tile-composer")
+    let mut parked_draft = s.tiles[i].slot.draft.clone();
+    parked_draft.focused = false;
+    let editor = rune_kit::TextArea::new(&parked_draft)
+        .placeholder(tr_ref(language, "Message…"))
+        .label(tr_ref(language, "Draft"))
+        .width(None)
+        .auto_grow(1, 12)
+        .build(&composer::bare_field(k))
+        .key("draft")
+        // This is a preview until its tile is active. Let the card receive the
+        // first click instead of focusing an editor that is replaced on activation.
+        .inert()
+        .w_full();
+    let mut actions = row()
+        .gap(super::composer_row::ACTION_GAP)
         .w_full()
-        .h(42.0)
-        .px(12.0)
-        .gap(8.0)
         .center_y()
-        .role("button")
-        .label(tr_ref(language, "Focus this pane"))
-        .cursor(Cursor::Text)
-        .on_press(move |s: &mut UiState| s.focus_tile(i))
-        .child(mark_box)
         .child(
-            text(line)
-                .font(k.ty.ui)
-                .color(ink)
-                .truncate()
-                .grow(1.0)
-                .shrink()
-                .min_w(0.0),
-        );
-
-    if is_draft {
-        strip = strip.child(
-            rune_kit::Badge::new(tr_ref(language, "Draft"))
-                .variant(rune_kit::BadgeVariant::Subtle)
+            IconButton::new(&super::parts::glyphs::ATTACH)
+                .label(tr_ref(language, "Attach"))
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::ExtraLarge)
+                .on_press(move |s: &mut UiState| {
+                    s.focus_tile(i);
+                    crate::platform::dialogs::attach_files(
+                        s.current()
+                            .and_then(|x| x.directory.as_ref())
+                            .map(std::path::PathBuf::from),
+                    );
+                })
                 .build(k),
+        )
+        .child(el().grow(1.0));
+    if s.cfg.voice.usable() {
+        actions = actions.child(
+            IconButton::new(&super::voice::MIC)
+                .label(tr_ref(language, "Dictate"))
+                .variant(IconButtonVariant::Ghost)
+                .control_size(ControlSize::ExtraLarge)
+                .on_press(move |s: &mut UiState| {
+                    s.focus_tile(i);
+                    s.toggle_voice();
+                })
+                .build(k)
+                .key("mic"),
         );
     }
-    if queued > 0 {
-        strip = strip.child(
-            rune_kit::Badge::new(format!("{queued} {}", tr_ref(language, "queued")))
-                .variant(rune_kit::BadgeVariant::Subtle)
-                .build(k),
-        );
-    }
-    if activity != Activity::Idle {
-        strip = strip.child(activity_pill(k, look, activity, language).key("parked-activity"));
-    }
-
-    let column = super::timeline::FEED_MAX_W;
+    let running = info.is_some_and(|x| {
+        matches!(
+            x.status,
+            muqun_gateway::agents::AgentSessionStatus::Busy
+                | muqun_gateway::agents::AgentSessionStatus::Retry
+        )
+    });
+    let submit = Button::new(tr_ref(language, if running { "Stop" } else { "Send" }))
+        .label_with(move |font, ink| {
+            if running {
+                text(tr_ref(language, "Stop")).font(font).color(ink)
+            } else {
+                rune::icon(&composer::SEND, composer::SEND_ICON).color(ink)
+            }
+        })
+        .control_size(ControlSize::Regular)
+        .variant(if running {
+            ButtonVariant::Danger
+        } else {
+            ButtonVariant::Submit
+        })
+        .disabled(
+            !running
+                && s.tiles[i].slot.draft.text.trim().is_empty()
+                && s.tiles[i].slot.staged.is_empty(),
+        )
+        .on_press(move |s: &mut UiState| {
+            s.focus_tile(i);
+            if running {
+                if let Some(asid) = s.selected.clone() {
+                    s.send(Command::Interrupt(muqun_gateway::agents::AgentSessionId(
+                        asid,
+                    )));
+                }
+            } else {
+                composer::submit_session(s);
+            }
+        })
+        .build(k)
+        .h(36.0)
+        .key(if running { "stop" } else { "send" })
+        .radius(k.radius.lg);
+    actions = actions.child(if running { submit } else { submit.w(36.0) });
+    let card = col()
+        .key("composer-card")
+        .on_drop_files(move |s: &mut UiState, files, _| {
+            s.focus_tile(i);
+            composer::attach_dropped_files(s, files);
+        })
+        .on_drop_hover(move |s: &mut UiState, over, _| {
+            if over {
+                s.focus_tile(i);
+            }
+            s.drop_hover = over;
+        })
+        .on_background_press(move |s: &mut UiState| s.focus_tile(i))
+        .w_full()
+        .gap(4.0)
+        .px(16.0)
+        .pt(8.0)
+        .pb(8.0)
+        .child(editor)
+        .child(actions);
+    let footer = composer::session_footer(
+        s,
+        k,
+        &mut Vec::new(),
+        Some(asid),
+        s.tiles[i].slot.catalog.as_deref(),
+        &s.tiles[i].slot.diff_stat,
+    );
+    let footer = col()
+        .w_full()
+        .on_background_press(move |s: &mut UiState| s.focus_tile(i))
+        .child(footer.inert());
     col()
         .key("tile-composer-pad")
         .w_full()
         .items_center()
         .px(16.0)
-        .pb(14.0)
-        .child(look.pressable(k, look.row_card(k, strip.w_full().max_w(column), 10.0)))
+        .pt(6.0)
+        .pb(8.0)
+        .gap(6.0)
+        .child(
+            composer::composer_card(k, look, card, false, running, false)
+                .w_full()
+                .max_w(super::timeline::FEED_MAX_W),
+        )
+        .child(footer.max_w(super::timeline::FEED_MAX_W))
 }
 
 /// An empty tile: pick a recent session or start a new one into it.
@@ -935,18 +1007,20 @@ fn picker(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
     for plugin in s.plugins.tile_plugins_enabled(&s.cfg.plugins_disabled) {
         let plugin_id = plugin.id();
         let plugin_title = plugin.title(language);
-        let plugin_icon = plugin.icon();
+        let plugin_icon = plugin.render_icon(s, 16.0, k.c.icon_muted);
         let pid = plugin_id.to_string();
         plugins = plugins.child(
-            IconButton::new(plugin_icon)
-                .variant(IconButtonVariant::GhostMuted)
+            Button::new(plugin_title.clone())
+                .label_with(move |_, _| plugin_icon)
+                .variant(ButtonVariant::GhostMuted)
                 .control_size(ControlSize::Regular)
-                .label(plugin_title.clone())
                 .help(plugin_title)
                 .on_press(move |s: &mut UiState| {
                     fill_plugin_tile(s, i, &pid);
                 })
                 .build(k)
+                .size(28.0, 28.0)
+                .px(4.0)
                 .key(format!("tile-plugin-{plugin_id}-{i}")),
         );
     }
@@ -987,6 +1061,29 @@ struct Place {
     corner: bool,
 }
 
+/// Hover activation leaves modal interactions and composition with their owner.
+fn focus_hovered_tile(s: &mut UiState, i: usize, tx: &mut rune::Tx) {
+    if i == s.focus
+        || i >= s.tiles.len()
+        || s.mode != Mode::Session
+        || s.menu.is_some()
+        || s.row_menu.is_some()
+        || s.context_open.is_some()
+        || s.zoom.is_some()
+        || s.detail.is_some()
+        || s.voice.is_some()
+        || s.draft.preedit().is_some()
+        || s.timeline_search.active
+        || s.tile_drag.is_some()
+        || s.tile_card_drag.is_some()
+        || s.drop_hover
+    {
+        return;
+    }
+    s.focus_tile(i);
+    s.focus_pane_input(tx);
+}
+
 /// Pane `i` as its own card: a rounded floor like the sidebar's, a header
 /// line, its timeline and composer.
 fn tile(
@@ -1014,7 +1111,6 @@ fn tile(
         super::TileContent::Empty => format!("tile-empty-{i}"),
     };
     let radius = k.radius.lg;
-    let (under, over) = super::shell::card_floor_colors(k, look);
     let mut body = col()
         .key(id.clone())
         .matched(id.clone())
@@ -1027,7 +1123,6 @@ fn tile(
         .min_h(0.0)
         .radius(radius)
         .clip_rounded(radius)
-        .fill(under)
         .border(
             1.0,
             if focused {
@@ -1042,22 +1137,26 @@ fn tile(
         } else {
             rune::Transition::none()
         })
-        .on_press(move |s: &mut UiState| s.focus_tile(i));
-    if let Some(over) = over {
-        body = body.child(
-            el().key("tile-floor")
-                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-                .fill(over)
+        .on_hover_change(move |s: &mut UiState, inside, tx| {
+            if inside {
+                focus_hovered_tile(s, i, tx);
+            }
+        })
+        .on_background_press(move |s: &mut UiState| {
+            if s.focus != i {
+                s.focus_tile(i);
+            }
+        });
+    body = look.panel(k, body, radius);
+    if !t.is_terminal() {
+        body = body.child(header(s, k, look, i, place, layer)).child(
+            el().key("tile-rule")
+                .w_full()
+                .h(1.0)
+                .fill(k.c.border_muted)
                 .a11y_hidden(),
         );
     }
-    body = body.child(header(s, k, look, i, place, layer)).child(
-        el().key("tile-rule")
-            .w_full()
-            .h(1.0)
-            .fill(k.c.border_muted)
-            .a11y_hidden(),
-    );
     match (&t.content, focused) {
         (super::TileContent::Empty, _) => body = body.child(picker(s, k, look, i)),
         (super::TileContent::Terminal, _) => {
@@ -1066,13 +1165,15 @@ fn tile(
             } else {
                 crate::theme::color_scheme::ColorScheme::Light
             };
-            body = body.child(super::terminal_panel::tile_body_for(
+            let controls = header(s, k, look, i, place, layer);
+            body = body.child(super::terminal_panel::tile_body_with_controls(
                 s,
                 k,
                 scheme,
                 scale,
                 layer,
                 Some(i),
+                Some(controls),
             ));
         }
         (super::TileContent::Custom { id, kind, .. }, _) => {
@@ -1118,9 +1219,33 @@ fn tile(
         }
         (super::TileContent::Session(asid), false) => {
             body = body
-                .child(timeline::session_view(s, k, asid))
+                .child(
+                    timeline::session_view(s, k, asid)
+                        .on_drop_files(move |s: &mut UiState, files, _| {
+                            s.focus_tile(i);
+                            composer::attach_dropped_files(s, files);
+                        })
+                        .on_drop_hover(move |s: &mut UiState, over, _| {
+                            if over {
+                                s.focus_tile(i);
+                            }
+                            s.drop_hover = over;
+                        }),
+                )
                 .child(parked_composer(s, k, look, i));
         }
+    }
+    if focused && s.inline_inspector_open() {
+        body = body.child(
+            col()
+                .key("tile-git-panel")
+                .pin(Some(8.0), Some(HEAD_H), Some(8.0), Some(8.0))
+                .fill(k.c.bg_base)
+                .radius(k.radius.lg)
+                .motion(look.focus_fade())
+                .border(1.0, k.c.border_muted)
+                .child(super::inspector::inline_view(s, k).grow(1.0).min_h(0.0)),
+        );
     }
     // Focus is contrast: the other panes' content sits a step back under a
     // scrim of the card's own colour (one quad, no layer, no blur) that
@@ -1206,6 +1331,8 @@ fn header_tile_drag(s: &mut UiState, i: usize, d: &mut rune::Drag) {
                     if let (Some(dst), Some(zone)) = (drag.over, drag.zone) {
                         s.drop_tile_on(drag.src, dst, zone);
                     }
+                } else {
+                    s.persist_tiles();
                 }
             }
         }
@@ -1316,11 +1443,30 @@ fn floating_card(
                 }
                 if d.phase == Phase::Up {
                     s.tile_card_drag = None;
+                    s.persist_tiles();
                 }
             }
         })
         .a11y_hidden();
     el().key(format!("tile-float-{i}"))
+        .transition(panel_transition(s))
+        .radius(k.radius.lg)
+        .box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 18.0,
+            blur: 48.0,
+            spread: 0.0,
+            color: k.c.black.alpha(if look.dark { 0.65 } else { 0.22 }),
+            inset: false,
+        })
+        .box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 2.0,
+            blur: 8.0,
+            spread: 1.0,
+            color: k.c.black.alpha(0.24),
+            inset: false,
+        })
         .paint_order(if i == s.focus { 2 } else { 1 })
         .motion(layout_motion(s))
         .absolute(x, y)
@@ -1418,6 +1564,8 @@ fn arrange(
             path.pop();
             let line = if *across { row() } else { col() };
             line.key(path_key("tile-split", path))
+                .motion(layout_motion(s))
+                .transition(panel_transition(s))
                 .grow(1.0)
                 .min_w(0.0)
                 .min_h(0.0)
@@ -1462,6 +1610,8 @@ pub fn view(s: &UiState, k: &Kit, clear: f32, scale: f32, layer: &mut Vec<El>) -
 
     let mut stage = el()
         .key("tiles-stage")
+        .motion(layout_motion(s))
+        .child_exit(panel_transition(s))
         .w_full()
         .h_full()
         .min_w(0.0)
@@ -1525,7 +1675,11 @@ pub fn view(s: &UiState, k: &Kit, clear: f32, scale: f32, layer: &mut Vec<El>) -
             );
         }
     }
-    stage = stage.child(backdrop);
+    // Tiled gaps reveal the same window backdrop as the sidebar gutter.
+    // Transparent windows keep the desktop visible even between floating panes.
+    if mode == crate::config::TileLayoutMode::Floating && !look.see_through {
+        stage = stage.child(backdrop);
+    }
 
     if let Some(z) = s.zoomed_tile.filter(|&i| i < s.tiles.len()) {
         stage = stage.child(tile(
@@ -1652,6 +1806,494 @@ pub fn view(s: &UiState, k: &Kit, clear: f32, scale: f32, layer: &mut Vec<El>) -
 mod tests {
     use super::*;
     use crate::ui::Tile;
+
+    #[test]
+    fn native_file_drop_targets_inactive_composer_once_and_survives_focus_change() {
+        use crate::model::commands::Command;
+        use crate::model::compose::{ComposeCommand, StagedFile};
+        use rune::{Env, Runtime};
+        for hover in [false, true] {
+            let (tx, mut rx) = crate::model::commands::channel();
+            let mut s = UiState::new(tx);
+            crate::ui::scenes::scenes()
+                .iter()
+                .find(|(name, _)| *name == "split2")
+                .unwrap()
+                .1(&mut s);
+            s.splash = None;
+            s.focus_tile(0);
+            let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+            for _ in 0..60 {
+                rt.frame(1.0 / 60.0);
+            }
+            let mut cards: Vec<_> = rt
+                .elements()
+                .into_iter()
+                .filter(|n| n.key.as_deref() == Some("composer-card"))
+                .collect();
+            cards.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
+            let r = cards[1].rect;
+            let at = Some((r[0] + 20.0, r[1] + 20.0));
+            let files = vec![
+                std::path::PathBuf::from("/tmp/report.pdf"),
+                std::path::PathBuf::from("/tmp/photo.png"),
+            ];
+            // No ordinary pointer-move/click: OS drags have their own event route.
+            if hover {
+                rt.drag_files(files.clone(), at);
+                for _ in 0..3 {
+                    rt.frame(1.0 / 60.0);
+                }
+                assert_eq!(rt.state.focus, 1);
+                assert!(rt.state.drop_hover);
+            }
+            rt.drop_files(files, at);
+            rt.frame(1.0 / 60.0);
+            assert!(!rt.state.drop_hover);
+            let mut staged = Vec::new();
+            while let Ok(cmd) = rx.try_recv() {
+                if let Command::Compose(ComposeCommand::Stage { id, name, .. }) = cmd {
+                    staged.push((id, name));
+                }
+            }
+            assert_eq!(
+                staged.len(),
+                2,
+                "one OS drop must stage each file exactly once"
+            );
+            assert!(
+                rt.state.toasts.is_empty(),
+                "upload not completed: no success toast"
+            );
+            rt.state.focus_tile(0);
+            for (id, name) in staged {
+                composer::finish_staging(
+                    &mut rt.state,
+                    id,
+                    Ok(StagedFile {
+                        draft_token: None,
+                        path: format!("/uploads/{name}"),
+                        image: name.ends_with("png"),
+                        name,
+                        size: 16,
+                    }),
+                );
+            }
+            assert!(rt.state.staged.is_empty());
+            assert_eq!(rt.state.tiles[1].slot.staged.len(), 2);
+            assert!(rt.state.tiles[1].slot.draft.text.contains("[Image #1]"));
+        }
+    }
+
+    #[test]
+    fn hovering_composer_allows_paste_without_click_and_keeps_controls_still() {
+        use rune::{Env, Runtime};
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        crate::ui::scenes::scenes()
+            .iter()
+            .find(|(name, _)| *name == "split2")
+            .unwrap()
+            .1(&mut s);
+        s.cfg.voice.url = "https://voice.example.test/transcribe".into();
+        for session in &mut s.sessions {
+            session.status = muqun_gateway::agents::AgentSessionStatus::Busy;
+        }
+        s.splash = None;
+        s.focus_tile(0);
+        let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+        for _ in 0..60 {
+            rt.frame(1.0 / 60.0);
+        }
+        for target in [1, 0, 1] {
+            let mut drafts: Vec<_> = rt
+                .elements()
+                .into_iter()
+                .filter(|n| n.key.as_deref() == Some("draft"))
+                .collect();
+            drafts.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
+            let rect = drafts[target].rect;
+            let controls = |rt: &Runtime<UiState>| {
+                let mut out: Vec<_> = rt
+                    .elements()
+                    .into_iter()
+                    .filter(|n| matches!(n.key.as_deref(), Some("mic" | "stop" | "send")))
+                    .map(|n| (n.key, n.rect))
+                    .collect();
+                out.sort_by(|a, b| a.1[0].total_cmp(&b.1[0]));
+                out
+            };
+            let before = controls(&rt);
+            rt.pointer_move(rect[0] + 20.0, rect[1] + 10.0);
+            for _ in 0..30 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert_eq!(rt.state.focus, target);
+            let old = rt.state.draft.text.clone();
+            rt.paste("hover-paste");
+            rt.frame(1.0 / 60.0);
+            assert_ne!(
+                rt.state.draft.text, old,
+                "hovered composer must accept paste without a click"
+            );
+            let after = controls(&rt);
+            assert_eq!(before.len(), after.len());
+            for (before, after) in before.iter().zip(&after) {
+                for axis in 0..4 {
+                    assert!(
+                        (before.1[axis] - after.1[axis]).abs() < 1.0,
+                        "control moved on hover: {before:?} -> {after:?}"
+                    );
+                }
+            }
+        }
+        let message = rt
+            .elements()
+            .into_iter()
+            .find(|n| {
+                n.text.as_deref().is_some_and(|t| t.starts_with("Reading")) && n.rect[0] > 600.0
+            })
+            .unwrap();
+        rt.pointer_move(message.rect[0] + 10.0, message.rect[1] + 10.0);
+        rt.pointer_down(message.rect[0] + 10.0, message.rect[1] + 10.0);
+        rt.pointer_up(message.rect[0] + 10.0, message.rect[1] + 10.0);
+        rt.frame(1.0 / 60.0);
+        let draft = rt
+            .elements()
+            .into_iter()
+            .find(|n| n.key.as_deref() == Some("draft") && n.rect[0] > 600.0)
+            .unwrap();
+        rt.pointer_move(draft.rect[0] + 20.0, draft.rect[1] + 10.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        let before = rt.state.draft.text.clone();
+        rt.paste("after-reading");
+        rt.frame(1.0 / 60.0);
+        assert_ne!(
+            rt.state.draft.text, before,
+            "returning from the timeline must restore composer paste focus"
+        );
+    }
+
+    #[test]
+    fn double_click_selects_message_words_in_split_pane() {
+        use rune::{Env, Runtime};
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        crate::ui::scenes::scenes()
+            .iter()
+            .find(|(name, _)| *name == "split2")
+            .unwrap()
+            .1(&mut s);
+        s.splash = None;
+        s.focus_tile(0);
+        let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+        for _ in 0..60 {
+            rt.frame(1.0 / 60.0);
+        }
+        let node = rt
+            .elements()
+            .into_iter()
+            .find(|n| {
+                n.text.as_deref().is_some_and(|t| t.starts_with("Reading")) && n.rect[0] > 600.0
+            })
+            .expect("message text visible");
+        let [x, y, _, h] = node.rect;
+        rt.pointer_move(x + 10.0, y + h.min(20.0) / 2.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.focus, 1);
+        for _ in 0..2 {
+            rt.pointer_down(x + 10.0, y + h.min(20.0) / 2.0);
+            rt.pointer_up(x + 10.0, y + h.min(20.0) / 2.0);
+            rt.frame(0.08);
+        }
+        assert_eq!(
+            rt.selection().map(|s| s.text().to_owned()).as_deref(),
+            Some("Reading")
+        );
+    }
+
+    #[test]
+    fn context_popup_is_anchored_to_its_own_split_and_closes_on_focus_change() {
+        use rune::{Env, Runtime};
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let (_, scene) = crate::ui::scenes::scenes()
+            .iter()
+            .find(|(name, _)| *name == "split2")
+            .unwrap();
+        scene(&mut s);
+        s.splash = None;
+        let catalog = std::sync::Arc::new(crate::hub::CatalogView {
+            catalog: serde_json::from_value(serde_json::json!({
+                "models": [{"id":"test-model", "name":"Test model", "provider_id":"test"}],
+                "modes": [], "mcp": []
+            }))
+            .unwrap(),
+        });
+        s.catalog = Some(catalog.clone());
+        s.tiles[1].slot.catalog = Some(catalog);
+        s.focus_tile(1);
+        let asid = s.selected.clone().unwrap();
+        let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+        for _ in 0..60 {
+            rt.frame(1.0 / 60.0);
+        }
+        let trigger_key = format!("session-context-{asid}-trigger");
+        let trigger = rt
+            .elements()
+            .into_iter()
+            .find(|n| n.key.as_deref() == Some(&trigger_key))
+            .unwrap();
+        let [x, y, w, h] = trigger.rect;
+        rt.pointer_down(x + w / 2.0, y + h / 2.0);
+        rt.pointer_up(x + w / 2.0, y + h / 2.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.context_open.as_deref(), Some(asid.as_str()));
+        let popup_key = format!("session-context-{asid}-content");
+        let popup = rt
+            .elements()
+            .into_iter()
+            .find(|n| n.key.as_deref() == Some(&popup_key))
+            .unwrap();
+        assert!(
+            popup.rect[0] > 720.0,
+            "right-hand context opened on the left: {:?}",
+            popup.rect
+        );
+        assert!(
+            popup.rect[1] + popup.rect[3] <= y + 1.0,
+            "popup must open above its button"
+        );
+        assert!(popup.rect[3] < 450.0, "context should size to its content");
+        rt.update(|s, _| s.focus_tile(0));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.context_open.is_none());
+        rt.update(|s, _| s.focus_tile(1));
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        let model_key = format!("model-{asid}-trigger");
+        let model = rt
+            .elements()
+            .into_iter()
+            .find(|n| n.key.as_deref() == Some(&model_key))
+            .unwrap();
+        let [x, y, w, h] = model.rect;
+        rt.pointer_down(x + w / 2.0, y + h / 2.0);
+        rt.pointer_up(x + w / 2.0, y + h / 2.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        let choice_key = format!("model-{asid}-item1");
+        let choice = rt
+            .elements()
+            .into_iter()
+            .find(|n| n.key.as_deref() == Some(&choice_key))
+            .unwrap_or_else(|| {
+                panic!(
+                    "rect {:?}, focus {}, menu {:?}, keys {:?}",
+                    [x, y, w, h],
+                    rt.state.focus,
+                    rt.state.menu,
+                    rt.elements()
+                        .iter()
+                        .filter_map(|n| n.key.clone())
+                        .filter(|k| k.contains("model") || k.contains("item"))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            choice.rect[0] > 720.0,
+            "model menu anchored to the other session: {:?}",
+            choice.rect
+        );
+        assert_eq!(rt.state.selected.as_deref(), Some(asid.as_str()));
+    }
+
+    #[test]
+    fn pending_permission_can_be_answered_without_opening_the_inspector() {
+        use muqun_gateway::agents::{PermissionDecision, PermissionRequest};
+        use rune::{Env, Runtime};
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let (_, scene) = crate::ui::scenes::scenes()
+            .iter()
+            .find(|(name, _)| *name == "split2")
+            .unwrap();
+        scene(&mut s);
+        s.splash = None;
+        let asid = s.selected.clone().unwrap();
+        let request: PermissionRequest = serde_json::from_value(serde_json::json!({
+            "id": "pending-shell", "asid": asid, "action": "shell",
+            "resources": [], "prompt": "Run a command", "source_tool_call_id": "folded-tool",
+            "options": [{"index": 0, "label": "No", "decision": "deny"}]
+        }))
+        .unwrap();
+        s.waiting_perms.insert(asid.clone(), vec![request]);
+        let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+        for _ in 0..60 {
+            rt.frame(1.0 / 60.0);
+        }
+        let button = rt
+            .elements()
+            .into_iter()
+            .find(|node| node.key.as_deref() == Some("perm-pending-shell-0"))
+            .expect("pending authorization must be reachable beside the composer");
+        let [x, y, w, h] = button.rect;
+        assert!(w > 0.0 && h > 0.0 && y >= 0.0 && y + h <= 900.0);
+        rt.pointer_down(x + w / 2.0, y + h / 2.0);
+        rt.pointer_up(x + w / 2.0, y + h / 2.0);
+        rt.frame(1.0 / 60.0);
+        let mut answered = false;
+        while let Ok(command) = rx.try_recv() {
+            if let crate::model::commands::Command::ReplyPermission {
+                asid: target,
+                id,
+                decision,
+            } = command
+            {
+                assert_eq!(target.0, asid);
+                assert_eq!(id, "pending-shell");
+                assert_eq!(decision, PermissionDecision::Deny);
+                answered = true;
+            }
+        }
+        assert!(answered);
+        assert!(rt.state.waiting_perms[&asid].is_empty());
+    }
+
+    #[test]
+    fn narrow_busy_split_keeps_delivery_on_the_footer_line() {
+        use rune::{Env, Runtime};
+        for width in [1100.0, 1280.0, 1440.0] {
+            let (tx, _) = crate::model::commands::channel();
+            let mut s = UiState::new(tx);
+            crate::ui::scenes::scenes()
+                .iter()
+                .find(|(name, _)| *name == "split2")
+                .unwrap()
+                .1(&mut s);
+            s.splash = None;
+            s.tile_tree = crate::config::TileNode::Split {
+                across: true,
+                ratio: 0.5,
+                a: Box::new(crate::config::TileNode::Leaf(0)),
+                b: Box::new(crate::config::TileNode::Leaf(1)),
+            };
+            s.cfg.general.language = crate::config::Language::ZhTw;
+            for session in &mut s.sessions {
+                session.status = muqun_gateway::agents::AgentSessionStatus::Busy;
+            }
+            let mut rt = Runtime::new(s, crate::ui::view, (width, 900.0), Env::new(true, 1.0));
+            for _ in 0..60 {
+                rt.frame(1.0 / 60.0);
+            }
+            let nodes = rt.elements();
+            let footers: Vec<_> = nodes
+                .iter()
+                .filter(|n| n.key.as_deref() == Some("composer-footer"))
+                .collect();
+            assert_eq!(footers.len(), 2);
+            for footer in footers {
+                assert!(
+                    footer.rect[3] <= 37.0,
+                    "footer wrapped at {width}: {:?}",
+                    footer.rect
+                );
+                let delivery = nodes
+                    .iter()
+                    .find(|n| {
+                        n.key.as_deref() == Some("composer-delivery")
+                            && n.rect[0] >= footer.rect[0]
+                            && n.rect[0] < footer.rect[0] + footer.rect[2]
+                    })
+                    .expect("busy session retains delivery control");
+                assert!(
+                    delivery.rect[0] + delivery.rect[2] <= footer.rect[0] + footer.rect[2] + 1.0,
+                    "delivery overflows at {width}"
+                );
+                assert!(
+                    (delivery.rect[1] - footer.rect[1]).abs() < 1.0,
+                    "delivery moved below footer at {width}: {:?} {:?}",
+                    footer.rect,
+                    delivery.rect
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clicking_parked_composer_focuses_it_and_keeps_drafts_separate() {
+        use rune::{Env, Runtime};
+
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let (_, scene) = crate::ui::scenes::scenes()
+            .iter()
+            .find(|(name, _)| *name == "split2")
+            .unwrap();
+        scene(&mut s);
+        s.splash = None;
+        s.draft = rune::TextEdit::new("first");
+        s.tiles[1].slot.draft = rune::TextEdit::new("second");
+        let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+        rt.on_key = Some(crate::ui::on_key);
+        for _ in 0..60 {
+            rt.frame(1.0 / 60.0);
+        }
+        let sizes = |rt: &Runtime<UiState>| {
+            let mut nodes: Vec<_> = rt
+                .elements()
+                .into_iter()
+                .filter(|node| {
+                    node.key.as_deref() == Some("composer-footer")
+                        || node.key.as_deref() == Some("composer-card")
+                })
+                .map(|node| (node.key.clone(), node.rect))
+                .collect();
+            nodes.sort_by(|a, b| a.1[0].total_cmp(&b.1[0]).then(a.0.cmp(&b.0)));
+            nodes
+        };
+        let before = sizes(&rt);
+        assert_eq!(before.len(), 4);
+        for target in [1, 0] {
+            let mut drafts: Vec<_> = rt
+                .elements()
+                .into_iter()
+                .filter(|node| node.key.as_deref() == Some("draft"))
+                .collect();
+            drafts.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
+            assert_eq!(drafts.len(), 2);
+            let rect = drafts[target].rect;
+            rt.pointer_down(rect[0] + 18.0, rect[1] + 16.0);
+            rt.pointer_up(rect[0] + 18.0, rect[1] + 16.0);
+            rt.frame(1.0 / 60.0);
+            assert_eq!(rt.state.focus, target);
+            assert!(rt.state.draft.focused);
+            rt.paste("!");
+            rt.frame(1.0 / 60.0);
+            assert_eq!(rt.state.draft.text.matches('!').count(), 1);
+            for _ in 0..30 {
+                rt.frame(1.0 / 60.0);
+            }
+            let after = sizes(&rt);
+            for (old, new) in before.iter().zip(&after) {
+                assert!(
+                    (old.1[3] - new.1[3]).abs() < 1.0,
+                    "focus changed composer height: {old:?} -> {new:?}"
+                );
+            }
+        }
+        assert_eq!(rt.state.draft.text.replace('!', ""), "first");
+        assert_eq!(rt.state.tiles[1].slot.draft.text.replace('!', ""), "second");
+        assert_eq!(rt.state.tiles[1].slot.draft.text.matches('!').count(), 1);
+    }
 
     #[test]
     fn scrolling_focus_reveals_readable_columns_and_uses_their_direction() {

@@ -6,10 +6,24 @@ name: Desktop CI
 on:
   push:
     branches: [main]
-    paths: ["desktop/**", "Cargo.toml", "Cargo.lock", ".github/workflows/desktop-ci.yml"]
+    paths: ["src/**", "build.rs", "desktop/**", "Cargo.toml", "Cargo.lock", ".github/workflows/desktop-ci.yml"]
   pull_request:
-    paths: ["desktop/**", "Cargo.toml", "Cargo.lock", ".github/workflows/desktop-ci.yml"]
+    paths: ["src/**", "build.rs", "desktop/**", "Cargo.toml", "Cargo.lock", ".github/workflows/desktop-ci.yml"]
   workflow_dispatch:
+    inputs:
+      preview:
+        description: Stamp a Desktop preview version for installation testing
+        type: boolean
+        default: false
+      notarize:
+        description: Verify macOS signing and notarization without publishing
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      preview_version:
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -50,6 +64,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Stamp Desktop preview
+        if: inputs.preview || inputs.preview_version != ''
+        env:
+          DESKTOP_PREVIEW_VERSION: ${{ inputs.preview_version }}
+        run: python3 desktop/scripts/prepare-preview.py
+
       # Package list covers winit/wgpu (wayland, xkbcommon, X11, vulkan, GL/EGL),
       # fontconfig, gtk/glib (rfd dialogs), and lavapipe for the smoke test.
       - name: Install Linux dependencies
@@ -63,8 +83,11 @@ jobs:
             libglib2.0-dev libatk1.0-dev libgtk-3-dev libdbus-1-dev libasound2-dev \
             xvfb
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Keep release candidates on the same compiler validated locally and on mini.
+      # Rust 1.100 changes never-type inference in async-stream 0.3.6.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.1
           components: rustfmt, clippy
       # The terminal panel's emulator (libghostty-vt-sys) builds Ghostty's
       # libghostty-vt from source: it clones Ghostty and runs `zig build`.
@@ -82,11 +105,15 @@ jobs:
       - name: test desktop
         run: cargo test -p muqun-desktop --locked
       - name: build release
-        run: cargo build --release --locked -p muqun-desktop
+        run: bash desktop/scripts/build-release.sh
 
       - name: Package Linux candidate
         if: runner.os == 'Linux'
         run: bash desktop/scripts/package-linux.sh --no-build
+
+      - name: Package macOS candidate
+        if: runner.os == 'macOS'
+        run: bash desktop/scripts/package-macos.sh --no-build
 
       - name: Collect binary
         run: |
@@ -95,6 +122,8 @@ jobs:
           rm -f out/*.d out/*.pdb
           if [ "$RUNNER_OS" = Linux ]; then
             cp target/desktop-package/*.tar.gz target/desktop-package/*.sha256 out/
+          elif [ "$RUNNER_OS" = macOS ]; then
+            cp target/desktop-package/*.zip target/desktop-package/*.sha256 out/
           fi
           ls -l out
       - uses: actions/upload-artifact@v4
@@ -103,7 +132,7 @@ jobs:
           path: out/*
           if-no-files-found: error
 
-  # Smoke: start the release binary, wait for the first UI frame (`build_ui` at
+  # Smoke: install the candidate archive and start its binary, wait for the first UI frame (`build_ui` at
   # debug from ui::view), then SIGTERM. Lavapipe on GHA can take >5 s to the
   # first frame, so the budget is 25 s. Success is judged by the log.
   smoke-x11:
@@ -111,6 +140,13 @@ jobs:
     needs: [build]
     runs-on: ubuntu-latest
     steps:
+      - name: Isolate smoke-test directories
+        run: |
+          echo "PREFIX=$RUNNER_TEMP/desktop-install" >> "$GITHUB_ENV"
+          echo "XDG_CONFIG_HOME=$RUNNER_TEMP/desktop-config" >> "$GITHUB_ENV"
+          echo "XDG_DATA_HOME=$RUNNER_TEMP/desktop-data" >> "$GITHUB_ENV"
+          echo "XDG_STATE_HOME=$RUNNER_TEMP/desktop-state" >> "$GITHUB_ENV"
+          echo "XDG_CACHE_HOME=$RUNNER_TEMP/desktop-cache" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           name: muqun-desktop-Linux
@@ -121,29 +157,48 @@ jobs:
           sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2
       - name: Run until first frame
         run: |
-          chmod +x muqun-desktop
-          export HOME="$RUNNER_TEMP/home" && mkdir -p "$HOME"
+          sha256sum -c muqun-desktop-linux-*.tar.gz.sha256
+          tar -xzf "muqun-desktop-linux-$(uname -m).tar.gz" -C "$RUNNER_TEMP"
+          bash "$RUNNER_TEMP/muqun-desktop-linux-$(uname -m)/desktop/scripts/install-local.sh" --no-build
+          test -x "$PREFIX/bin/muqun-desktop"
+          test -f "$PREFIX/share/applications/muqun-desktop.desktop"
+          test -f "$PREFIX/share/muqun-desktop/bundled-plugins/review-center/plugin.json"
+          mkdir -p "$XDG_CONFIG_HOME/muqun-desktop"
+          touch "$XDG_CONFIG_HOME/muqun-desktop/keep-on-uninstall"
           set +e
           RUST_LOG=info,muqun_desktop=debug WINIT_UNIX_BACKEND=x11 \
             xvfb-run -a -s "-screen 0 1280x800x24" \
-            timeout -s TERM 25 ./muqun-desktop > smoke.log 2>&1
+            timeout -s TERM 25 "$PREFIX/bin/muqun-desktop" > smoke.log 2>&1
           code=$?
           set -e
           cat smoke.log
           echo "exit code: $code (124 = still running at SIGTERM, 143 = killed by it)"
           grep -q "muqun-desktop starting" smoke.log
           grep -q "build_ui" smoke.log || { echo "::error::no first frame logged"; exit 1; }
-          ! grep -qi "panicked" smoke.log
+          if grep -qi "panicked" smoke.log; then echo "::error::application panicked"; exit 1; fi
           case "$code" in 0|124|143) ;; *) echo "::error::unexpected exit $code"; exit 1;; esac
+      - name: Verify uninstall preserves user settings
+        if: always()
+        run: |
+          bash "$RUNNER_TEMP/muqun-desktop-linux-$(uname -m)/desktop/scripts/uninstall-local.sh"
+          test ! -e "$PREFIX/bin/muqun-desktop"
+          test ! -e "$PREFIX/share/applications/muqun-desktop.desktop"
+          test ! -e "$PREFIX/share/muqun-desktop/bundled-plugins/review-center/plugin.json"
+          test -f "$XDG_CONFIG_HOME/muqun-desktop/keep-on-uninstall"
 
   smoke-wayland:
     name: Smoke (Linux, Wayland/weston)
     needs: [build]
     runs-on: ubuntu-latest
-    # Headless weston + lavapipe on hosted runners is unproven for wgpu's
-    # Wayland path; informational until it has been seen passing.
-    continue-on-error: true
+    # Native Wayland is a supported platform: a failed smoke blocks delivery.
     steps:
+      - name: Isolate smoke-test directories
+        run: |
+          echo "PREFIX=$RUNNER_TEMP/desktop-install" >> "$GITHUB_ENV"
+          echo "XDG_CONFIG_HOME=$RUNNER_TEMP/desktop-config" >> "$GITHUB_ENV"
+          echo "XDG_DATA_HOME=$RUNNER_TEMP/desktop-data" >> "$GITHUB_ENV"
+          echo "XDG_STATE_HOME=$RUNNER_TEMP/desktop-state" >> "$GITHUB_ENV"
+          echo "XDG_CACHE_HOME=$RUNNER_TEMP/desktop-cache" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           name: muqun-desktop-Linux
@@ -154,19 +209,46 @@ jobs:
           sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2
       - name: Run until first frame
         run: |
-          chmod +x muqun-desktop
-          export HOME="$RUNNER_TEMP/home" && mkdir -p "$HOME"
+          sha256sum -c muqun-desktop-linux-*.tar.gz.sha256
+          tar -xzf "muqun-desktop-linux-$(uname -m).tar.gz" -C "$RUNNER_TEMP"
+          bash "$RUNNER_TEMP/muqun-desktop-linux-$(uname -m)/desktop/scripts/install-local.sh" --no-build
+          test -x "$PREFIX/bin/muqun-desktop"
+          test -f "$PREFIX/share/applications/muqun-desktop.desktop"
+          test -f "$PREFIX/share/muqun-desktop/bundled-plugins/review-center/plugin.json"
+          mkdir -p "$XDG_CONFIG_HOME/muqun-desktop"
+          touch "$XDG_CONFIG_HOME/muqun-desktop/keep-on-uninstall"
           export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg" && mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
           weston --backend=headless --socket=wl-ci --width=1280 --height=800 > weston.log 2>&1 &
           wpid=$!
+          trap 'kill "$wpid" 2>/dev/null || true' EXIT
           for _ in $(seq 1 20); do [ -S "$XDG_RUNTIME_DIR/wl-ci" ] && break; sleep 0.5; done
+          if [ ! -S "$XDG_RUNTIME_DIR/wl-ci" ]; then
+            cat weston.log
+            echo "::error::Wayland compositor did not create its socket"
+            exit 1
+          fi
           set +e
           RUST_LOG=info,muqun_desktop=debug WAYLAND_DISPLAY=wl-ci WINIT_UNIX_BACKEND=wayland \
-            env -u DISPLAY timeout -s TERM 25 ./muqun-desktop > smoke.log 2>&1
+            env -u DISPLAY timeout -s TERM 25 "$PREFIX/bin/muqun-desktop" > smoke.log 2>&1
           code=$?
           set -e
-          kill "$wpid" || true
           cat smoke.log
           echo "exit code: $code"
+          grep -q "muqun-desktop starting" smoke.log
           grep -q "build_ui" smoke.log || { echo "::error::no first frame logged"; exit 1; }
-          ! grep -qi "panicked" smoke.log
+          if grep -qi "panicked" smoke.log; then echo "::error::application panicked"; exit 1; fi
+          case "$code" in 0|124|143) ;; *) echo "::error::unexpected exit $code"; exit 1;; esac
+      - name: Verify uninstall preserves user settings
+        if: always()
+        run: |
+          bash "$RUNNER_TEMP/muqun-desktop-linux-$(uname -m)/desktop/scripts/uninstall-local.sh"
+          test ! -e "$PREFIX/bin/muqun-desktop"
+          test ! -e "$PREFIX/share/applications/muqun-desktop.desktop"
+          test ! -e "$PREFIX/share/muqun-desktop/bundled-plugins/review-center/plugin.json"
+          test -f "$XDG_CONFIG_HOME/muqun-desktop/keep-on-uninstall"
+
+  verify-macos-signing:
+    if: github.event_name == 'workflow_dispatch' && inputs.notarize
+    needs: [build, smoke-x11, lint-platform-cfg]
+    uses: ./.github/workflows/desktop-notarize.yml
+    secrets: inherit

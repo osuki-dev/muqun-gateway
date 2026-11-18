@@ -3,7 +3,7 @@
 //! it found and how each stands, and one press to start (or skip). Seen
 //! once (`general.welcomed`); never again after a session exists.
 
-use rune::{col, el, row, text, El, SurfaceFit, Transition};
+use rune::{col, el, row, text, El, SurfaceFit};
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
 
 use super::agents::{by_standing, Standing};
@@ -11,7 +11,6 @@ use super::copy::{tr, tr_ref};
 use super::{Mode, UiState};
 use crate::branding::{APP_MARK_PNG, APP_NAME};
 use crate::config::ConfigEdit;
-use crate::theme::look::PANEL_RADIUS;
 
 impl UiState {
     /// Whether the welcome is due: never seen, discovery done, and nothing
@@ -55,7 +54,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
     let mut badge = el()
         .key("welcome-badge")
         .size(64.0, 64.0)
-        .radius(18.0)
+        .radius(k.radius.lg)
         .center()
         .fill(k.c.layer_02);
     if s.fx_on() {
@@ -71,8 +70,8 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                 SurfaceFit::Fill,
             )
             .size(38.0, 38.0)
-            .radius(10.0)
-            .clip_rounded(10.0),
+            .radius(k.radius.lg)
+            .clip_rounded(k.radius.lg),
         );
     }
     let badge = look.glow(badge, k.c.bg_accent, 0.7);
@@ -105,7 +104,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                 .px(10.0)
                 .gap(10.0)
                 .center_y()
-                .radius(8.0)
+                .radius(k.radius.md)
                 .fill(k.c.layer_01.alpha(0.6))
                 .child(super::agents::mark(&a.id, 16.0, s.dark).a11y_hidden())
                 .child(
@@ -225,14 +224,8 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                 ),
         );
     let card = look
-        .panel(k, card, PANEL_RADIUS)
-        .modal(true, |s: &mut UiState| s.dismiss_welcome(false))
-        .transition(
-            Transition::scale(0.94)
-                .combined(Transition::opacity())
-                .combined(Transition::offset(0.0, 18.0)),
-        )
-        .motion(crate::theme::look::ARRIVE);
+        .dialog_motion(look.panel(k, card, k.radius.xl))
+        .modal(true, |s: &mut UiState| s.dismiss_welcome(false));
     let card = look.glow(card, k.c.bg_accent, 0.35);
     layer.push(
         el().key("welcome-layer")

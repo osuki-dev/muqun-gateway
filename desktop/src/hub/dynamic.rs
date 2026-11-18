@@ -22,6 +22,44 @@ use super::{
 
 const EVENT_CAPACITY: usize = 4096;
 
+#[derive(Clone)]
+pub struct ConnectionContext {
+    pub computer: String,
+    pub generation: u64,
+    pub(crate) hub: Arc<dyn SessionHub>,
+}
+
+tokio::task_local! {
+    static CONNECTION: ConnectionContext;
+}
+
+impl ConnectionContext {
+    pub async fn scope<F: std::future::Future>(self, future: F) -> F::Output {
+        CONNECTION.scope(self, future).await
+    }
+}
+
+pub fn connection_origin() -> Option<(String, u64)> {
+    CONNECTION
+        .try_with(|c| (c.computer.clone(), c.generation))
+        .ok()
+}
+
+/// Child reads retain their connection even if the UI changes computers.
+pub fn spawn_connected<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let context = CONNECTION.try_with(Clone::clone).ok();
+    tokio::spawn(async move {
+        match context {
+            Some(context) => context.scope(future).await,
+            None => future.await,
+        }
+    })
+}
+
 pub struct DynamicHub {
     current: RwLock<Arc<dyn SessionHub>>,
     events: broadcast::Sender<AgentDomainEvent>,
@@ -33,6 +71,13 @@ pub struct DynamicHub {
 }
 
 impl DynamicHub {
+    pub fn connection(&self, computer: String, generation: u64) -> ConnectionContext {
+        ConnectionContext {
+            computer,
+            generation,
+            hub: self.current.read().unwrap().clone(),
+        }
+    }
     pub fn new(initial: Arc<dyn SessionHub>) -> Arc<Self> {
         let (events_tx, _) = broadcast::channel(EVENT_CAPACITY);
         let (task_events_tx, _) = broadcast::channel(EVENT_CAPACITY);
@@ -91,7 +136,9 @@ impl DynamicHub {
     }
 
     fn active(&self) -> Arc<dyn SessionHub> {
-        self.current.read().unwrap().clone()
+        CONNECTION
+            .try_with(|c| c.hub.clone())
+            .unwrap_or_else(|_| self.current.read().unwrap().clone())
     }
 }
 
@@ -141,6 +188,12 @@ async fn forward_tasks(
 }
 
 impl SessionHub for DynamicHub {
+    fn pending_attention(
+        &self,
+    ) -> HubFuture<'_, Option<Vec<muqun_gateway::agents::ports::AgentPendingSnapshot>>> {
+        let active = self.active();
+        Box::pin(async move { active.pending_attention().await })
+    }
     fn mode(&self) -> HubMode {
         self.active().mode()
     }
@@ -566,14 +619,23 @@ impl SessionHub for DynamicHub {
     }
 
     fn events(&self) -> broadcast::Receiver<AgentDomainEvent> {
+        if let Ok(events) = CONNECTION.try_with(|c| c.hub.events()) {
+            return events;
+        }
         self.events.subscribe()
     }
 
     fn link(&self) -> Option<tokio::sync::watch::Receiver<Option<String>>> {
+        if let Ok(link) = CONNECTION.try_with(|c| c.hub.link()) {
+            return link;
+        }
         Some(self.link.subscribe())
     }
 
     fn task_events(&self) -> Option<broadcast::Receiver<TaskHubEvent>> {
+        if let Ok(events) = CONNECTION.try_with(|c| c.hub.task_events()) {
+            return events;
+        }
         Some(self.task_events.subscribe())
     }
 }
@@ -581,6 +643,70 @@ impl SessionHub for DynamicHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn counting_gateway() -> (
+        Arc<dyn SessionHub>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = count.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8192];
+                let n = socket.read(&mut request).await.unwrap();
+                if String::from_utf8_lossy(&request[..n]).starts_with("GET /api/discovery ") {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{}").await;
+            }
+        });
+        let hub = super::super::remote::RemoteHub::start(super::super::remote::LocalGateway {
+            url,
+            token: "isolated-fixture".into(),
+            device_id: None,
+            transport_key: None,
+        })
+        .unwrap();
+        (hub, count, server)
+    }
+
+    #[tokio::test]
+    async fn commands_and_child_reads_keep_their_origin_after_switch() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (first, first_reads, first_server) = counting_gateway().await;
+            let (second, second_reads, second_server) = counting_gateway().await;
+            let hub = DynamicHub::new(first);
+            let connection = hub.connection("local".into(), 0);
+            let scoped = hub.clone();
+            connection
+                .scope(async move {
+                    scoped.agents().await.unwrap();
+                    scoped.switch(second);
+                    tokio::task::yield_now().await;
+                    let child = scoped.clone();
+                    spawn_connected(async move {
+                        child.agents().await.unwrap();
+                        assert_eq!(connection_origin(), Some(("local".into(), 0)));
+                    })
+                    .await
+                    .unwrap();
+                    scoped.agents().await.unwrap();
+                })
+                .await;
+            hub.agents().await.unwrap();
+            assert_eq!(first_reads.load(std::sync::atomic::Ordering::SeqCst), 3);
+            assert_eq!(second_reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+            first_server.abort();
+            second_server.abort();
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn lagged_agent_forwarder_resyncs_and_keeps_delivering() {

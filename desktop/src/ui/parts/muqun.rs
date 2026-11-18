@@ -4,6 +4,7 @@
 
 use muqun_gateway::agents::{TimelineItem, ToolCall};
 use rune::{col, icon, row, text, Cursor, El};
+use rune_kit::ScrollBar;
 
 use super::{caption, chip, fact, glyphs, mono, CardState, Tcx, ToolCard};
 use crate::model::tool_view::{self as tv, Muqun, MuqunOp, MuqunStatus};
@@ -112,6 +113,30 @@ fn file_row(cx: &Tcx, i: usize, file: &tv::PresentedFile) -> El {
     .on_press(move |s: &mut UiState| s.open_timeline_file(&path))
 }
 
+fn task_goal(k: &rune_kit::Kit, goal: &str) -> El {
+    col()
+        .key("task-goal-scroll")
+        .w_full()
+        .min_h(0.0)
+        .max_h(240.0)
+        .px(10.0)
+        .py(8.0)
+        .clip_soft(k.radius.md)
+        .fill(k.c.layer_01)
+        .scroll(rune::ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(
+            text(goal.to_string())
+                .font(k.ty.ui.lh(k.ty.ui.size * 1.5))
+                .color(k.c.text_base)
+                .wrap_anywhere()
+                .selectable(true)
+                .w_full(),
+        )
+        .scroll_bar(k)
+}
+
 pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall, m: &Muqun) -> El {
     let k = cx.k;
     let mut card = ToolCard::new(&item.id, glyph(m.op), op_word(cx, m.op));
@@ -124,7 +149,16 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall, m: &Muqun) -> El {
     card.caption = m
         .command
         .clone()
-        .or_else(|| m.goal.clone().map(|g| tv::first_line(&g).to_string()))
+        .or_else(|| {
+            m.goal.as_ref().map(|goal| {
+                let first = tv::first_line(goal);
+                let mut summary: String = first.chars().take(80).collect();
+                if first.chars().count() > 80 {
+                    summary.push('…');
+                }
+                summary
+            })
+        })
         .or_else(|| m.files.first().map(|f| f.name.clone()))
         .unwrap_or_default();
     let tone = match m.status {
@@ -190,13 +224,12 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall, m: &Muqun) -> El {
         any = true;
     }
     if let Some(goal) = &m.goal {
-        body = body.child(
-            text(super::cap_lines(goal, 4).0)
-                .font(k.ty.small)
-                .color(k.c.text_base)
-                .wrap()
-                .w_full(),
-        );
+        card.copy = Some(goal.clone());
+        // Bound rendered height rather than newline count: a delegated goal
+        // is often one long paragraph which wraps into dozens of visual lines.
+        body = body
+            .child(caption(k, cx.t("Task goal")))
+            .child(task_goal(k, goal));
         any = true;
     }
     if let Some(error) = &m.error {
@@ -291,4 +324,89 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall, m: &Muqun) -> El {
         card.body = Some(body);
     }
     card.build(cx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct State {
+        goal: String,
+    }
+
+    #[test]
+    fn long_task_goal_scrolls_inside_its_bounded_area() {
+        fn view(s: &State, _: &mut rune::Cx<State>) -> El {
+            let k = rune_kit::Kit::neutral(false);
+            col()
+                .w_full()
+                .child(task_goal(&k, &s.goal))
+                .child(text("Following message").key("following").h(30.0))
+        }
+        let goal = "Long delegated task with 中文 and a long unbroken instruction. ".repeat(100);
+        let mut rt = rune::Runtime::new(
+            State { goal: goal.clone() },
+            view,
+            (420.0, 600.0),
+            rune::Env::new(false, 1.0),
+        );
+        for _ in 0..10 {
+            rt.frame(1.0 / 60.0);
+        }
+        let nodes = rt.elements();
+        let before = nodes
+            .iter()
+            .find(|n| n.text.as_deref() == Some(goal.as_str()))
+            .unwrap()
+            .rect;
+        let following = nodes
+            .iter()
+            .find(|n| n.key.as_deref() == Some("following"))
+            .unwrap()
+            .rect;
+        assert!(
+            following[1] <= 241.0,
+            "long task pushed following message out of view"
+        );
+        let visible = nodes
+            .iter()
+            .find(|n| n.text.as_deref() == Some(goal.as_str()))
+            .unwrap()
+            .visible;
+        assert!(
+            visible[1] + visible[3] <= following[1] + 1.0,
+            "task text must be clipped before the following message"
+        );
+        rt.wheel(150.0, 100.0, -180.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        let nodes = rt.elements();
+        let after = nodes
+            .iter()
+            .find(|n| n.text.as_deref() == Some(goal.as_str()))
+            .unwrap()
+            .rect;
+        assert!(
+            after[1] < before[1] - 20.0,
+            "task content must be inside the scroll viewport"
+        );
+        let following_after = nodes
+            .iter()
+            .find(|n| n.key.as_deref() == Some("following"))
+            .unwrap()
+            .rect;
+        assert_eq!(
+            following, following_after,
+            "scrolling task must not move the following message"
+        );
+        let visible = nodes
+            .iter()
+            .find(|n| n.text.as_deref() == Some(goal.as_str()))
+            .unwrap()
+            .visible;
+        assert!(
+            visible[1] >= 0.0 && visible[1] + visible[3] <= following_after[1] + 1.0,
+            "scrolling must keep text clipped to the task area"
+        );
+    }
 }

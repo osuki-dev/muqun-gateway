@@ -845,6 +845,14 @@ fn latest_scene(s: &mut UiState) {
 }
 
 /// A scene name and the state it applies.
+fn image_plugin(s: &mut UiState) -> Option<String> {
+    let dir = std::env::var_os("MUQUN_SCENE_PLUGIN_DIR")?;
+    let plugin = crate::plugin::ExternalPlugin::from_dir(&std::path::PathBuf::from(dir)).ok()?;
+    let id = plugin.manifest().id.clone();
+    s.plugins.register(std::sync::Arc::new(plugin));
+    Some(id)
+}
+
 pub type Scene = (&'static str, fn(&mut UiState));
 
 pub fn scenes() -> &'static [Scene] {
@@ -860,6 +868,38 @@ pub fn scenes() -> &'static [Scene] {
 
 fn base_scenes() -> &'static [Scene] {
     &[
+        ("plugin-image-settings", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Plugins;
+            image_plugin(s);
+        }),
+        ("plugin-image-tile", |s| {
+            home(s);
+            s.tiles = vec![Tile::empty(), Tile::empty()];
+            s.tile_tree = crate::config::TileNode::Split {
+                across: true,
+                ratio: 0.5,
+                a: Box::new(crate::config::TileNode::Leaf(0)),
+                b: Box::new(crate::config::TileNode::Leaf(1)),
+            };
+            if let Some(id) = image_plugin(s) {
+                s.open_plugin_tile(&id);
+            }
+        }),
+        ("plugin-image-picker", |s| {
+            home(s);
+            image_plugin(s);
+            s.mode = Mode::Session;
+            s.selected = None;
+            s.tiles = vec![Tile::empty(), Tile::empty()];
+            s.focus = 0;
+            s.tile_tree = crate::config::TileNode::Split {
+                across: true,
+                ratio: 0.5,
+                a: Box::new(crate::config::TileNode::Leaf(0)),
+                b: Box::new(crate::config::TileNode::Leaf(1)),
+            };
+        }),
         ("home", home),
         ("home-busy", home_busy),
         ("home-crowd", home_crowd),
@@ -1375,9 +1415,11 @@ fn base_scenes() -> &'static [Scene] {
         }),
         ("terminal-ime", |s| {
             terminal_scene(s, shell_fixture);
-            s.term
-                .sink
-                .ime(&rune::Ime::Preedit("ni hao".into(), Some((6, 6))));
+            s.term.sink.ime(&rune::Ime::Preedit(
+                "ni hao".into(),
+                Some((6, 6)),
+                Vec::new(),
+            ));
         }),
         ("terminal-jade", |s| {
             with_pack(s, "jade-tempest");

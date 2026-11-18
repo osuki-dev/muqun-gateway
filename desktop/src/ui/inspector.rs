@@ -132,7 +132,7 @@ fn item(k: &Kit, key: String, title: String, detail: String, action: Option<El>)
         .center_y()
         .px(10.0)
         .py(6.0)
-        .radius(crate::theme::look::CARD_RADIUS)
+        .radius(k.radius.lg)
         .fill(k.c.layer_01.alpha(0.5))
         .border(1.0, k.c.border_muted)
         .child(copy);
@@ -200,7 +200,7 @@ fn queue(s: &UiState, k: &Kit) -> Vec<El> {
         let steer = q.steer;
         let (id2, a2) = (id.clone(), a.clone());
         let mut action = row().gap(4.0);
-        if q.files.is_empty() {
+        {
             let (edit_id, text) = (q.id.clone(), q.text.clone());
             action = action.child(small(
                 k,
@@ -309,9 +309,11 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
         Some(b) => {
             let cur_branch = b.current.clone().unwrap_or_else(|| "detached".into());
             out.push(
-                Badge::new(cur_branch.clone())
-                    .variant(BadgeVariant::Accent)
-                    .build(k),
+                row().child(
+                    Badge::new(cur_branch.clone())
+                        .variant(BadgeVariant::Subtle)
+                        .build(k),
+                ),
             );
             if !b.local.is_empty() {
                 out.push(muted(k, format!("{} local branch(es)", b.local.len())));
@@ -792,6 +794,14 @@ fn shells(s: &UiState, k: &Kit) -> Vec<El> {
 }
 
 pub fn view(s: &UiState, k: &Kit) -> El {
+    panel(s, k, false)
+}
+
+pub fn inline_view(s: &UiState, k: &Kit) -> El {
+    panel(s, k, true)
+}
+
+fn panel(s: &UiState, k: &Kit, inline: bool) -> El {
     let language = s.cfg.general.language;
     let asid = s.selected.clone().unwrap_or_default();
     let waiting = s.waiting_perms.get(&asid).map_or(0, Vec::len)
@@ -822,6 +832,17 @@ pub fn view(s: &UiState, k: &Kit) -> El {
             s.inspector_tab == tab,
         ));
     }
+    if inline {
+        strip = strip.child(el().grow(1.0)).child(
+            rune_kit::IconButton::new(k.glyph.close)
+                .variant(rune_kit::IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .label(tr_ref(language, "Close"))
+                .shortcut("Esc")
+                .on_press(UiState::close_inspector)
+                .build(k),
+        );
+    }
     let body = match s.inspector_tab {
         InspectorTab::Queue => queue(s, k),
         InspectorTab::Git => git(s, k),
@@ -838,6 +859,7 @@ pub fn view(s: &UiState, k: &Kit) -> El {
         .child(
             col()
                 .key("inspector-body")
+                .items_start()
                 .w_full()
                 .gap(8.0)
                 .px(12.0)

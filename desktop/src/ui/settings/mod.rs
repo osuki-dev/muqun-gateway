@@ -108,6 +108,7 @@ pub(super) fn open(s: &mut UiState, tab: SettingsTab) {
     s.settings_tab = tab;
     s.menu = None;
     match tab {
+        SettingsTab::Agents => s.refresh_account_limits(),
         SettingsTab::Themes => s.send(Command::ThemeRefresh),
         SettingsTab::Plugins => s.refresh_runtimes(),
         SettingsTab::Storage => s.send(Command::ScanStorage),
@@ -198,7 +199,7 @@ pub(super) fn label(k: &Kit, title: &str, detail: &str) -> El {
     let mut copy = col()
         .key("label")
         .w(LABEL_MIN_W)
-        .min_w(LABEL_MIN_W)
+        .min_w(LABEL_MIN_W.min(INNER_W.get()))
         .grow(1.0)
         .shrink()
         .gap(3.0)
@@ -358,6 +359,29 @@ pub(super) fn select(
     let menu = OpenMenu::Setting(key.to_string());
     let open = s.menu.as_ref() == Some(&menu);
     let owned: Vec<String> = labels.iter().map(|l| l.to_string()).collect();
+    // Select has no image-glyph slot. A local Kit reserves its native arrow space
+    // with an empty glyph; an absolute theme arrow fills that same slot, retaining
+    // the Select's listbox, focus, key handling and anchor identity.
+    static ARROW_SLOT: rune::Icon = rune::Icon {
+        name: "select-arrow-slot",
+        view: 16.0,
+        body: "",
+    };
+    let mut select_kit = k.clone();
+    select_kit.glyph.chevron_up = &ARROW_SLOT;
+    select_kit.glyph.chevron_down = &ARROW_SLOT;
+    let arrow = super::art::directional_arrow(
+        s,
+        k,
+        16.0,
+        if open {
+            -std::f32::consts::FRAC_PI_2
+        } else {
+            std::f32::consts::FRAC_PI_2
+        },
+        k.c.icon_muted,
+    )
+    .pin(None, Some(6.0), Some(8.0), None);
     Select::new(format!("sel-{key}"), labels)
         .appearance(SelectAppearance::Field)
         .width(control_w())
@@ -379,7 +403,8 @@ pub(super) fn select(
             }
         })
         // Keeps the kit's own key: the listbox anchors to its trigger by it.
-        .build(k, layer)
+        .build(&select_kit, layer)
+        .child(arrow)
 }
 
 /// A text field at the shared control width.
@@ -655,7 +680,11 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .px(PAD_X)
         .pt(14.0)
         .pb(56.0)
-        .gap(40.0);
+        .gap(if tab == SettingsTab::Agents {
+            16.0
+        } else {
+            40.0
+        });
     for (i, child) in body.into_iter().enumerate() {
         page = page.child(look.arrive(child, i.min(4)));
     }
@@ -715,4 +744,80 @@ pub(super) fn edit_of(s: &UiState, slot: &str, stored: impl FnOnce() -> String) 
         .get(slot)
         .cloned()
         .unwrap_or_else(|| TextEdit::new(stored()))
+}
+
+#[cfg(test)]
+mod directional_select_tests {
+    use super::*;
+    #[test]
+    fn the_theme_arrow_overlay_keeps_select_pointer_and_keyboard_behaviour() {
+        fn view(s: &UiState, _: &mut rune::Cx<UiState>) -> El {
+            let k = Kit::neutral(true);
+            let mut layer = Vec::new();
+            let field = select(
+                s,
+                &k,
+                &mut layer,
+                "qa",
+                &["One", "Two"],
+                usize::from(s.quick_notes_edit.text == "Two"),
+                |s, index| {
+                    s.quick_notes_edit = TextEdit::new(if index == 0 { "One" } else { "Two" })
+                },
+            );
+            rune_kit::root(col().w_full().h_full().child(field), layer)
+        }
+        let (commands, _) = crate::model::commands::channel();
+        let mut state = UiState::new(commands);
+        state.quick_notes_edit = TextEdit::new("One");
+        let mut rt = rune::Runtime::new(state, view, (500.0, 400.0), rune::Env::new(true, 1.0));
+        rt.frame(0.0);
+        let field = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("sel-qa-trigger"))
+            .unwrap();
+        // Click the overlaid arrow itself, not the label to its left.
+        rt.pointer_down(field.rect[0] + field.rect[2] - 12.0, field.rect[1] + 14.0);
+        rt.pointer_up(field.rect[0] + field.rect[2] - 12.0, field.rect[1] + 14.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.menu, Some(OpenMenu::Setting("qa".into())));
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Down,
+            mods: Default::default(),
+        });
+        rt.frame(0.02);
+        // A pointer-opened list first enters keyboard navigation on its current value.
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Down,
+            mods: Default::default(),
+        });
+        rt.frame(0.02);
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Enter,
+            mods: Default::default(),
+        });
+        rt.frame(0.02);
+        assert_eq!(rt.state.quick_notes_edit.text, "Two");
+        assert!(rt.state.menu.is_none());
+        assert!(rt
+            .elements()
+            .iter()
+            .any(|e| e.focused && e.key.as_deref() == Some("sel-qa-trigger")));
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Text(" ".into()),
+            mods: Default::default(),
+        });
+        rt.frame(0.02);
+        assert!(rt.state.menu.is_some());
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Escape,
+            mods: Default::default(),
+        });
+        rt.frame(0.02);
+        assert!(rt.state.menu.is_none());
+        assert_eq!(rt.state.quick_notes_edit.text, "Two");
+    }
 }

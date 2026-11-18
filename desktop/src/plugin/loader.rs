@@ -7,7 +7,10 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::{mpsc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
+};
 use std::time::{Duration, Instant};
 
 use muqun_gateway::platform::runtimes::{self, RuntimeKind};
@@ -56,9 +59,11 @@ pub struct ExternalPlugin {
     manifest: PluginManifest,
     dir: PathBuf,
     commands: Vec<PluginCommand>,
+    image_icon: Option<Arc<[u8]>>,
     dynamic_markdown: Mutex<Option<String>>,
     script_job: Mutex<Option<mpsc::Receiver<Result<String, String>>>>,
     script_title: Mutex<String>,
+    script_cancel: Mutex<Option<Arc<AtomicBool>>>,
     /// Optional override for the Bun binary resolution:
     /// - `None`: resolve via `muqun_gateway::platform::runtimes::resolve_binary(RuntimeKind::Bun, None)`
     /// - `Some(Some(path))`: resolve with `configured = Some(path)`
@@ -92,12 +97,18 @@ impl ExternalPlugin {
             })
             .collect();
 
+        let image_icon = manifest
+            .icon
+            .as_deref()
+            .and_then(|path| load_image_icon(&dir, path));
         Self {
             id,
             manifest,
             dir,
             commands,
+            image_icon,
             dynamic_markdown: Mutex::new(None),
+            script_cancel: Mutex::new(None),
             script_job: Mutex::new(None),
             script_title: Mutex::new(String::new()),
             bun_binary_override: Mutex::new(None),
@@ -244,8 +255,10 @@ impl ExternalPlugin {
         let (tx, rx) = mpsc::channel();
         *job = Some(rx);
         *self.script_title.lock().unwrap() = command_title.to_string();
+        let cancel = Arc::new(AtomicBool::new(false));
+        *self.script_cancel.lock().unwrap() = Some(cancel.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(run_script(command));
+            let _ = tx.send(run_script(command, cancel));
         });
         true
     }
@@ -368,6 +381,16 @@ impl DesktopPlugin for ExternalPlugin {
 
     fn icon(&self) -> &'static Icon {
         resolve_icon(self.manifest.icon.as_deref())
+    }
+
+    fn render_icon(&self, s: &UiState, size: f32, color: rune::Color) -> El {
+        if let (Some(bytes), Some(images)) = (&self.image_icon, &s.images) {
+            let image = crate::ui::art::image(images, bytes);
+            return el()
+                .size(size, size)
+                .pixels_fit(image.pixels(), rune::SurfaceFit::Fit);
+        }
+        icon(self.icon(), size).color(color)
     }
 
     fn description(&self, _lang: Language) -> Option<String> {
@@ -722,9 +745,18 @@ impl DesktopPlugin for ExternalPlugin {
         self.commands.clone()
     }
 
+    fn enabled_changed(&self, enabled: bool) {
+        if !enabled {
+            if let Some(cancel) = self.script_cancel.lock().unwrap().take() {
+                cancel.store(true, Ordering::Release);
+            }
+            self.script_job.lock().unwrap().take();
+        }
+    }
+
     fn poll(&self, s: &mut UiState, tx: &mut rune::Tx) -> bool {
         if !super::is_enabled(self.id, &s.cfg.plugins_disabled) {
-            self.script_job.lock().unwrap().take();
+            self.enabled_changed(false);
             return false;
         }
         let result = {
@@ -762,6 +794,9 @@ impl DesktopPlugin for ExternalPlugin {
     }
 
     fn on_command(&self, s: &mut UiState, command_id: &str) -> bool {
+        if !super::is_enabled(self.id, &s.cfg.plugins_disabled) {
+            return false;
+        }
         if command_id == "__run_entry__" {
             match self.manifest.render_kind() {
                 PluginRenderKind::BunScript { entry } => {
@@ -815,7 +850,7 @@ impl DesktopPlugin for ExternalPlugin {
 }
 
 /// Drain both pipes concurrently: a verbose child must never block on a full pipe.
-fn run_script(mut command: ProcessCommand) -> Result<String, String> {
+fn run_script(mut command: ProcessCommand, cancel: Arc<AtomicBool>) -> Result<String, String> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -836,7 +871,9 @@ fn run_script(mut command: ProcessCommand) -> Result<String, String> {
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) if !cancel.load(Ordering::Acquire) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
             result => {
                 #[cfg(unix)]
                 unsafe {
@@ -844,10 +881,13 @@ fn run_script(mut command: ProcessCommand) -> Result<String, String> {
                 }
                 let _ = child.kill();
                 let _ = child.wait();
-                break Err(result
-                    .err()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "Plugin command timed out".into()));
+                break Err(result.err().map(|e| e.to_string()).unwrap_or_else(|| {
+                    if cancel.load(Ordering::Acquire) {
+                        "Plugin command cancelled".into()
+                    } else {
+                        "Plugin command timed out".into()
+                    }
+                }));
             }
         }
     };
@@ -863,6 +903,59 @@ fn run_script(mut command: ProcessCommand) -> Result<String, String> {
     } else {
         Err(if stderr.is_empty() { stdout } else { stderr })
     }
+}
+
+/// Decode once at discovery. Names keep their vector meaning; image paths stay inside the package.
+fn load_image_icon(dir: &Path, value: &str) -> Option<Arc<[u8]>> {
+    let path = Path::new(value);
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp") {
+        return None;
+    }
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let root = dir.canonicalize().ok()?;
+    let path = root.join(path).canonicalize().ok()?;
+    if !path.starts_with(&root) {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > 1_048_576 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(1_048_577).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > 1_048_576 {
+        return None;
+    }
+    let dimensions = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    if dimensions.0 == 0 || dimensions.1 == 0 || dimensions.0 > 1024 || dimensions.1 > 1024 {
+        return None;
+    }
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(1024);
+    limits.max_image_height = Some(1024);
+    limits.max_alloc = Some(8 * 1024 * 1024);
+    reader.limits(limits);
+    let decoded = reader.decode().ok()?.thumbnail(256, 256);
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    decoded
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .ok()?;
+    Some(encoded.into_inner().into())
 }
 
 /// Resolve icon string from manifest to static Rune Icon.
@@ -987,14 +1080,118 @@ pub fn discover_plugins(plugin_dirs: &[PathBuf]) -> Vec<ExternalPlugin> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn image_icons_are_bounded_local_assets_and_cached_after_discovery() {
+        let root = std::env::temp_dir().join(format!("muqun-plugin-icon-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        let icon_path = root.join("assets/icon.png");
+        image::RgbaImage::from_pixel(512, 256, image::Rgba([30, 120, 220, 255]))
+            .save(&icon_path)
+            .unwrap();
+        let icon = load_image_icon(&root, "assets/icon.png").unwrap();
+        let decoded = image::load_from_memory(&icon).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (256, 128));
+        let manifest = PluginManifest::parse(r#"{"id":"image-icon","name":"Image","version":"1","description":"","icon":"assets/icon.png"}"#).unwrap();
+        let plugin = ExternalPlugin::new(manifest, root.clone());
+        std::fs::remove_file(&icon_path).unwrap();
+        assert!(
+            plugin.image_icon.is_some(),
+            "discovery must cache the image instead of reading files on UI frames"
+        );
+        assert!(load_image_icon(&root, "assets/icon.png").is_none());
+        assert!(load_image_icon(&root, "../outside.png").is_none());
+        assert!(load_image_icon(&root, &root.join("outside.png").to_string_lossy()).is_none());
+        std::fs::write(&icon_path, b"not an image").unwrap();
+        assert!(load_image_icon(&root, "assets/icon.png").is_none());
+        image::RgbaImage::new(2048, 1).save(&icon_path).unwrap();
+        assert!(
+            load_image_icon(&root, "assets/icon.png").is_none(),
+            "dimensions must be checked before decoding"
+        );
+        std::fs::write(&icon_path, vec![0; 1_048_577]).unwrap();
+        assert!(load_image_icon(&root, "assets/icon.png").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn an_image_icon_symlink_cannot_escape_the_plugin_directory() {
+        let root =
+            std::env::temp_dir().join(format!("muqun-plugin-icon-link-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("plugin/assets")).unwrap();
+        image::RgbaImage::new(16, 16)
+            .save(root.join("outside.png"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            root.join("outside.png"),
+            root.join("plugin/assets/icon.png"),
+        )
+        .unwrap();
+        assert!(load_image_icon(&root.join("plugin"), "assets/icon.png").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disabling_a_plugin_cancels_its_running_process() {
+        let dir =
+            std::env::temp_dir().join(format!("muqun-plugin-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let mut command = ProcessCommand::new("/bin/sh");
+        command
+            .args(["-c", "echo $$ > pid; exec sleep 30"])
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let manifest: PluginManifest = serde_json::from_str(
+            r#"{"id":"cancel-test","name":"Cancel","version":"1","description":""}"#,
+        )
+        .unwrap();
+        let plugin = Arc::new(ExternalPlugin::new(manifest, dir.clone()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        *plugin.script_cancel.lock().unwrap() = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        *plugin.script_job.lock().unwrap() = Some(receiver);
+        let worker = std::thread::spawn(move || {
+            let result = run_script(command, cancel);
+            let _ = sender.send(result.clone());
+            result
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !pid_file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let (tx, _) = crate::model::commands::channel();
+        let mut state = UiState::new(tx);
+        state.plugins.register(plugin.clone());
+        state.edit(crate::config::ConfigEdit::PluginEnabled {
+            plugin: "cancel-test".into(),
+            on: false,
+        });
+        assert_eq!(
+            worker.join().unwrap().unwrap_err(),
+            "Plugin command cancelled"
+        );
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert!(plugin.script_job.lock().unwrap().is_none());
+        assert!(!plugin.on_command(&mut state, "__run_entry__"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn verbose_scripts_drain_both_pipes_without_deadlocking() {
         let mut command = ProcessCommand::new("/bin/sh");
         command.args(["-c", "i=0; while [ $i -lt 9000 ]; do printf 0123456789; printf 0123456789 >&2; i=$((i+1)); done"])
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let output =
-            run_script(command).expect("a full stdout/stderr pipe must not stall the worker");
+        let output = run_script(command, Arc::new(AtomicBool::new(false)))
+            .expect("a full stdout/stderr pipe must not stall the worker");
         assert_eq!(output.len(), 64 * 1024);
     }
 

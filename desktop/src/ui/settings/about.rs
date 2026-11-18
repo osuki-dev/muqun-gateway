@@ -4,13 +4,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rune::{col, el, row as hrow, text, El, SurfaceFit};
-use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
+use rune_kit::Kit;
 
 use super::{group, link_button, row};
 use crate::branding::{APP_MARK_PNG, APP_NAME};
 use crate::config::Language;
-use crate::model::commands::Command;
-use crate::model::inbox::UpdateState;
 use crate::ui::copy::{tr, tr_ref};
 use crate::ui::UiState;
 
@@ -148,138 +146,18 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
         .map(|(name, _)| name)
         .unwrap_or_else(|| s.cfg.appearance.theme_id.clone());
     let repo = env!("CARGO_PKG_REPOSITORY");
-    let update_row = match &s.update_state {
-        UpdateState::Idle => {
-            let btn = Button::new(tr_ref(language, "Check for updates"))
-                .variant(ButtonVariant::Neutral)
-                .control_size(ControlSize::Small)
-                .on_press(|s: &mut UiState| {
-                    s.send(Command::CheckUpdate {
-                        include_preview: false,
-                    });
-                })
-                .build(k);
-            row(
-                k,
-                "update-check",
-                tr_ref(language, "Software updates"),
-                tr_ref(language, "Check official releases for updates."),
-                btn,
-            )
-        }
-        UpdateState::Checking => {
-            let btn = Button::new(tr_ref(language, "Checking…"))
-                .variant(ButtonVariant::Neutral)
-                .control_size(ControlSize::Small)
-                .disabled(true)
-                .build(k);
-            row(
-                k,
-                "update-check",
-                tr_ref(language, "Software updates"),
-                tr_ref(language, "Querying GitHub Releases…"),
-                btn,
-            )
-        }
-        UpdateState::UpToDate => {
-            let btn = Button::new(tr_ref(language, "Check again"))
-                .variant(ButtonVariant::Neutral)
-                .control_size(ControlSize::Small)
-                .on_press(|s: &mut UiState| {
-                    s.send(Command::CheckUpdate {
-                        include_preview: false,
-                    });
-                })
-                .build(k);
-            let detail = tr(language, "You are using the latest version.");
-            row(
-                k,
-                "update-check",
-                tr_ref(language, "Software updates"),
-                &detail,
-                hrow()
-                    .gap(8.0)
-                    .center_y()
-                    .child(
-                        text(tr_ref(language, "Up to date"))
-                            .font(k.ty.small)
-                            .color(k.c.success.icon),
-                    )
-                    .child(btn),
-            )
-        }
-        UpdateState::Available(info) => {
-            let latest = info.latest_version.clone();
-            let to_install = info.clone();
-            let btn = Button::new(format!("{} {}", tr_ref(language, "Update to"), latest))
-                .variant(ButtonVariant::Submit)
-                .control_size(ControlSize::Small)
-                .on_press(move |s: &mut UiState| {
-                    s.send(Command::InstallUpdate(to_install.clone()));
-                })
-                .build(k);
-            let detail = format!("{} {}", tr_ref(language, "New version available:"), latest);
-            row(
-                k,
-                "update-check",
-                tr_ref(language, "Software updates"),
-                &detail,
-                btn,
-            )
-        }
-        UpdateState::Downloading => {
-            let btn = Button::new(tr_ref(language, "Downloading…"))
-                .variant(ButtonVariant::Neutral)
-                .control_size(ControlSize::Small)
-                .disabled(true)
-                .build(k);
-            row(
-                k,
-                "update-check",
-                tr_ref(language, "Software updates"),
-                tr_ref(language, "Downloading and verifying update…"),
-                btn,
-            )
-        }
-        UpdateState::ReadyToRestart => {
-            let btn = Button::new(tr_ref(language, "Restart now"))
-                .variant(ButtonVariant::Submit)
-                .control_size(ControlSize::Small)
-                .on_press(|_: &mut UiState| {
-                    crate::platform::shutdown::leave(0);
-                })
-                .build(k);
-            row(
-                k,
-                "update-check",
-                tr_ref(language, "Software updates"),
-                tr_ref(
-                    language,
-                    "Update installed. Restart application to complete.",
-                ),
-                btn,
-            )
-        }
-        UpdateState::Failed(err) => {
-            let err_msg = err.clone();
-            let btn = Button::new(tr_ref(language, "Retry"))
-                .variant(ButtonVariant::Neutral)
-                .control_size(ControlSize::Small)
-                .on_press(|s: &mut UiState| {
-                    s.send(Command::CheckUpdate {
-                        include_preview: false,
-                    });
-                })
-                .build(k);
-            row(
-                k,
-                "update-check",
-                tr_ref(language, "Software updates"),
-                &format!("{}: {}", tr_ref(language, "Check failed"), err_msg),
-                btn,
-            )
-        }
-    };
+    let update_row = row(
+        k,
+        "update-manual",
+        tr_ref(language, "Software updates"),
+        tr_ref(language, "Download a Desktop package for your system from Releases and install it manually. Gateway packages do not update Desktop."),
+        link_button(
+            k,
+            "desktop-releases",
+            tr_ref(language, "View downloads"),
+            crate::platform::update::RELEASES_URL,
+        ),
+    );
     vec![
         hero(s, k),
         group(

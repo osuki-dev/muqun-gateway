@@ -38,8 +38,7 @@ dependencies = [
 [[package]]
 name = "accesskit_macos"
 version = "0.27.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "123828ceeec755b05255e3976cb0852993202de98a0626c97dd8d34246991f84"
+source = "git+https://github.com/ryuhzk/rune?rev=ceb8a14ec299552d9ec641cf6386f157547c69f3#ceb8a14ec299552d9ec641cf6386f157547c69f3"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -70,8 +69,7 @@ dependencies = [
 [[package]]
 name = "accesskit_windows"
 version = "0.35.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "498668b90da9995302a0055aaecad4756932333da2ddef6baee1c00844c430fc"
+source = "git+https://github.com/ryuhzk/rune?rev=ceb8a14ec299552d9ec641cf6386f157547c69f3#ceb8a14ec299552d9ec641cf6386f157547c69f3"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -848,6 +846,17 @@ name = "cesu8"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d43a04d8753f35258c91f8ec639f792891f748a1edbd759cf1dcea3382ad83c"
+
+[[package]]
+name = "cfb"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fef29b910ef2b9dbecc60168d1568d643c633b0518af970c17e83bd5f6e2c94f"
+dependencies = [
+ "fnv",
+ "uuid",
+ "web-time",
+]
 
 [[package]]
 name = "cfg-if"
@@ -2651,9 +2660,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.39.1"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
+checksum = "b06e69070b7e12262b0cd90832f0a7396f142a2b330181255562decf9f0c6215"
 dependencies = [
  "cc",
  "openssl-sys",
@@ -2858,6 +2867,7 @@ dependencies = [
  "libc",
  "libghostty-vt",
  "muqun-gateway",
+ "pulldown-cmark",
  "reqwest",
  "rfd",
  "rune",
@@ -2869,6 +2879,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-tungstenite 0.30.0",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "unicode-segmentation",
@@ -2888,6 +2899,7 @@ dependencies = [
  "async-stream",
  "axum",
  "base64 0.23.1",
+ "cfb",
  "clap",
  "crossterm",
  "dirs",
@@ -3544,7 +3556,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.45.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3615,8 +3627,7 @@ checksum = "9c4482d912d7671a7cd2089794f90ef3bb5f5f8c738230fb0fcd50fa020f0ed3"
 [[package]]
 name = "parley_engine"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b74c0d373e462e504ad4436710a39f099e18e848e1ee711f70cd2dcd5a69b290"
+source = "git+https://github.com/ryuhzk/rune?rev=ceb8a14ec299552d9ec641cf6386f157547c69f3#ceb8a14ec299552d9ec641cf6386f157547c69f3"
 dependencies = [
  "fontique",
  "harfrust",
@@ -4377,7 +4388,7 @@ dependencies = [
 [[package]]
 name = "rune"
 version = "0.0.1"
-source = "git+https://github.com/ryuhzk/rune?rev=5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3#5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3"
+source = "git+https://github.com/ryuhzk/rune?rev=ceb8a14ec299552d9ec641cf6386f157547c69f3#ceb8a14ec299552d9ec641cf6386f157547c69f3"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -4415,6 +4426,7 @@ dependencies = [
  "opuscule",
  "parking_lot",
  "parley",
+ "parley_engine",
  "png 0.18.1",
  "pollster 1.0.1",
  "portable-atomic",
@@ -4429,9 +4441,11 @@ dependencies = [
  "serde",
  "serde_json",
  "skrifa",
+ "spellbook",
  "swash",
  "symphonia",
  "taffy",
+ "tiny-skia-path 0.11.4 (git+https://github.com/ryuhzk/rune?rev=ceb8a14ec299552d9ec641cf6386f157547c69f3)",
  "tokio",
  "unicode-segmentation",
  "wasm-bindgen",
@@ -4459,7 +4473,7 @@ dependencies = [
 [[package]]
 name = "rune-fx"
 version = "0.0.1"
-source = "git+https://github.com/ryuhzk/rune?rev=5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3#5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3"
+source = "git+https://github.com/ryuhzk/rune?rev=ceb8a14ec299552d9ec641cf6386f157547c69f3#ceb8a14ec299552d9ec641cf6386f157547c69f3"
 dependencies = [
  "bytemuck",
  "rune-motion",
@@ -4470,7 +4484,7 @@ dependencies = [
 [[package]]
 name = "rune-highlights"
 version = "0.0.1"
-source = "git+https://github.com/ryuhzk/rune?rev=5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3#5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3"
+source = "git+https://github.com/ryuhzk/rune?rev=ceb8a14ec299552d9ec641cf6386f157547c69f3#ceb8a14ec299552d9ec641cf6386f157547c69f3"
 dependencies = [
  "unicode-ident",
  "wasmparser",
@@ -4479,7 +4493,7 @@ dependencies = [
 [[package]]
 name = "rune-i18n"
 version = "0.1.0"
-source = "git+https://github.com/ryuhzk/rune?rev=5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3#5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3"
+source = "git+https://github.com/ryuhzk/rune?rev=ceb8a14ec299552d9ec641cf6386f157547c69f3#ceb8a14ec299552d9ec641cf6386f157547c69f3"
 dependencies = [
  "fixed_decimal",
  "icu_decimal",
@@ -4498,7 +4512,7 @@ dependencies = [
 [[package]]
 name = "rune-kit"
 version = "0.0.1"
-source = "git+https://github.com/ryuhzk/rune?rev=5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3#5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3"
+source = "git+https://github.com/ryuhzk/rune?rev=ceb8a14ec299552d9ec641cf6386f157547c69f3#ceb8a14ec299552d9ec641cf6386f157547c69f3"
 dependencies = [
  "icu_normalizer",
  "pulldown-cmark",
@@ -4511,12 +4525,12 @@ dependencies = [
 [[package]]
 name = "rune-motion"
 version = "0.1.0"
-source = "git+https://github.com/ryuhzk/rune?rev=5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3#5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3"
+source = "git+https://github.com/ryuhzk/rune?rev=ceb8a14ec299552d9ec641cf6386f157547c69f3#ceb8a14ec299552d9ec641cf6386f157547c69f3"
 
 [[package]]
 name = "rune-staging"
 version = "0.0.1"
-source = "git+https://github.com/ryuhzk/rune?rev=5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3#5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3"
+source = "git+https://github.com/ryuhzk/rune?rev=ceb8a14ec299552d9ec641cf6386f157547c69f3#ceb8a14ec299552d9ec641cf6386f157547c69f3"
 dependencies = [
  "wgpu",
 ]
@@ -4524,16 +4538,16 @@ dependencies = [
 [[package]]
 name = "rune-taffy"
 version = "0.0.1"
-source = "git+https://github.com/ryuhzk/rune?rev=5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3#5c35ba45fbd44e4d16ebc438a5460b1c96a0a9f3"
+source = "git+https://github.com/ryuhzk/rune?rev=ceb8a14ec299552d9ec641cf6386f157547c69f3#ceb8a14ec299552d9ec641cf6386f157547c69f3"
 dependencies = [
  "taffy",
 ]
 
 [[package]]
 name = "rusqlite"
-version = "0.41.1"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
+checksum = "a4edff0039f148731aee2fd80f76dbfeb12d204ab3d1c544838d34e02151049b"
 dependencies = [
  "bitflags 2.13.2",
  "fallible-iterator",
@@ -5069,6 +5083,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "spellbook"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d204abcbdf8e88729306a8d0ca01a79d8a49969fe1f84696909d6dbc4321c1a"
+dependencies = [
+ "foldhash 0.2.0",
+ "hashbrown 0.17.1",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5085,18 +5109,19 @@ dependencies = [
 
 [[package]]
 name = "sqlcipher-src"
-version = "419.0.6+sqlcipher-4.19.0-sqlite-3.53.4-libtomcrypt-1.18.2"
+version = "420.0.0+sqlcipher-4.20.0-sqlite-3.54.1-libtomcrypt-1.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab732d48ebf2a1449e94d071b26544f99845834c75c3c210e927ace097b49aa4"
+checksum = "fd6b5280ed2593d07b2816ec531821c15c306903bcca224716f1fbcc2bbfedfe"
 
 [[package]]
 name = "sqlite-wasm-rs"
-version = "0.6.2"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36bd8e29bf08189a005b2df1df99823aa0861cabe9044e5f31ed54ca292ee618"
+checksum = "a6cd504cecbfe7eef649988840f9a6cb768d11085efec138f8e99f160632d867"
 dependencies = [
  "cc",
  "rsqlite-vfs",
+ "sqlcipher-src",
 ]
 
 [[package]]
@@ -5401,7 +5426,7 @@ dependencies = [
  "cfg-if",
  "log",
  "png 0.17.16",
- "tiny-skia-path",
+ "tiny-skia-path 0.11.4 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -5409,6 +5434,16 @@ name = "tiny-skia-path"
 version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c9e7fc0c2e86a30b117d0462aa261b72b7a99b7ebd7deb3a14ceda95c5bdc93"
+dependencies = [
+ "arrayref",
+ "bytemuck",
+ "strict-num",
+]
+
+[[package]]
+name = "tiny-skia-path"
+version = "0.11.4"
+source = "git+https://github.com/ryuhzk/rune?rev=ceb8a14ec299552d9ec641cf6386f157547c69f3#ceb8a14ec299552d9ec641cf6386f157547c69f3"
 dependencies = [
  "arrayref",
  "bytemuck",
@@ -5839,7 +5874,7 @@ dependencies = [
  "siphasher",
  "strict-num",
  "svgtypes",
- "tiny-skia-path",
+ "tiny-skia-path 0.11.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "xmlwriter",
 ]
 
@@ -6252,8 +6287,7 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "30.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6b7fb58561a792bc237628ba0792e332de418fefe145f13b5ed8201e6d52f58"
+source = "git+https://github.com/ryuhzk/rune?rev=ceb8a14ec299552d9ec641cf6386f157547c69f3#ceb8a14ec299552d9ec641cf6386f157547c69f3"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -6623,8 +6657,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "winit"
 version = "0.30.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6755fa58a9f8350bd1e472d4c3fcc25f824ec358933bba33306d0b63df5978d"
+source = "git+https://github.com/ryuhzk/rune?rev=ceb8a14ec299552d9ec641cf6386f157547c69f3#ceb8a14ec299552d9ec641cf6386f157547c69f3"
 dependencies = [
  "ahash",
  "android-activity",

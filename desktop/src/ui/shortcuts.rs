@@ -2,7 +2,7 @@
 //! rows Settings → Shortcuts lists: both read `ui/keymap.rs`, grouped, with
 //! each chord drawn as keycaps the way this platform writes it.
 
-use rune::{col, el, row, text, El, KeyPlatform, Spring, TextEdit, Transition};
+use rune::{col, el, row, text, El, KeyPlatform, TextEdit};
 use rune_kit::{Kit, ScrollBar, TextInput};
 
 use super::copy::{tr, tr_ref};
@@ -391,23 +391,14 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .child(foot);
     // Denser than the palette's glass: the sheet is text to read.
     let mut panel = look
-        .panel(k, panel, crate::theme::look::PANEL_RADIUS)
+        .panel(k, panel, k.radius.xl)
         .fill(k.c.surface_raised_base.alpha(0.97));
     for shadow in k.shadow_layers(&k.elevation.overlay) {
         panel = panel.box_shadow(shadow);
     }
-    let panel = if s.cfg.appearance.reduced_motion {
-        panel.transition(Transition::opacity())
-    } else {
-        panel
-            .transition(
-                Transition::opacity()
-                    .combined(Transition::offset(0.0, 10.0))
-                    .combined(Transition::scale(0.97)),
-            )
-            .motion(Spring::new(0.32, 0.16))
-    }
-    .modal(true, |s: &mut UiState| s.keys_sheet = None);
+    let panel = look
+        .dialog_motion(panel)
+        .modal(true, |s: &mut UiState| s.keys_sheet = None);
 
     layer.push(
         el().key("keys-scrim")
@@ -670,7 +661,7 @@ fn mount_which_key(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .child(grid);
 
     let mut card = look
-        .panel(k, card, crate::theme::look::PANEL_RADIUS)
+        .panel(k, card, k.radius.xl)
         .fill(k.c.surface_raised_base.alpha(0.97));
     for shadow in k.shadow_layers(&k.elevation.overlay) {
         card = card.box_shadow(shadow);

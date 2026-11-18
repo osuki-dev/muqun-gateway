@@ -440,29 +440,20 @@ pub fn row_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         );
     }
 
-    if is_user_text {
-        if let Some(f) = found {
-            let rollback_asid = muqun_gateway::agents::AgentSessionId(asid.clone());
-            let rollback_id = f.message_id.clone();
+    if is_user_text && s.can_fork_from_message(&asid) {
+        if let Some(f) = found.filter(|item| !item.message_id.is_empty()) {
             m = m.separator();
-            m = m.item(
-                MenuItem::new(t("Roll back to here")).on_select(move |s: &mut UiState| {
-                    s.row_menu = None;
-                    s.send(crate::model::commands::Command::StageRevert {
-                        asid: rollback_asid.clone(),
-                        message_id: rollback_id.clone(),
-                    });
-                }),
-            );
             let fork_asid = muqun_gateway::agents::AgentSessionId(asid.clone());
             let fork_id = f.message_id.clone();
             m = m.item(
                 MenuItem::new(t("Fork from here")).on_select(move |s: &mut UiState| {
                     s.row_menu = None;
-                    s.send(crate::model::commands::Command::ForkSession {
-                        asid: fork_asid.clone(),
-                        message_id: Some(fork_id.clone()),
-                    });
+                    if s.can_fork_from_message(&fork_asid.0) {
+                        s.send(crate::model::commands::Command::ForkSession {
+                            asid: fork_asid.clone(),
+                            message_id: Some(fork_id.clone()),
+                        });
+                    }
                 }),
             );
         }

@@ -19,7 +19,7 @@ pub mod tool;
 
 use muqun_gateway::agents::{AgentPart, TimelineItem};
 use rune::{col, icon, row, text, Color, Cursor, El, Icon};
-use rune_kit::{Kit, Markdown, MarkdownStyle, Spinner};
+use rune_kit::{Kit, Markdown, MarkdownStyle};
 
 use super::copy::tr_ref;
 use super::timeline::SessionTimeline;
@@ -27,6 +27,7 @@ use super::UiState;
 use crate::config::Language;
 
 /// What every part builder needs: the state, the kit, and whose timeline.
+#[derive(Clone, Copy)]
 pub struct Tcx<'a> {
     pub s: &'a UiState,
     pub k: &'a Kit,
@@ -35,6 +36,7 @@ pub struct Tcx<'a> {
     /// Drawing into the detail pane (everything a call has), not the
     /// timeline's dense rows.
     pub pane: bool,
+    pub item_id: Option<&'a str>,
     /// The timeline is a narrow column: rows drop their secondary words.
     pub narrow: bool,
 }
@@ -47,6 +49,7 @@ impl<'a> Tcx<'a> {
             asid,
             lang: s.cfg.general.language,
             pane: false,
+            item_id: None,
             narrow: false,
         }
     }
@@ -108,6 +111,10 @@ pub fn flip(asid: &str, id: &str) -> impl Fn(&mut UiState) + 'static {
 
 /// The body of one timeline item.
 pub fn part(cx: &Tcx, item: &TimelineItem) -> El {
+    let cx = &Tcx {
+        item_id: Some(&item.id),
+        ..*cx
+    };
     match &item.part {
         AgentPart::Tool(call) => tool::card(cx, item, call),
         AgentPart::Approval { request } => approval::permission_card(cx.s, cx.k, request),
@@ -152,7 +159,27 @@ pub fn mono(cx: &Tcx, key: &str, body: &str, max_lines: usize) -> El {
             .fill(cx.k.c.layer_01);
     }
     let mut block = block.child(
-        text(shown)
+        text(shown.clone())
+            .text_highlights(
+                rune_kit::search::Fold::default()
+                    .find(&shown, search_query(cx))
+                    .into_iter()
+                    .map(|range| {
+                        let mark = rune::TextHighlight::new(
+                            range,
+                            cx.k.c.bg_accent.alpha(if current_search_item(cx) {
+                                0.45
+                            } else {
+                                0.25
+                            }),
+                        );
+                        if current_search_item(cx) {
+                            mark.ring(cx.k.c.text_accent, 1.0)
+                        } else {
+                            mark
+                        }
+                    }),
+            )
             .font(cx.k.ty.mono)
             .color(cx.k.c.text_muted)
             .wrap_anywhere()
@@ -179,6 +206,7 @@ pub fn code(cx: &Tcx, key: &str, body: &str, language: Option<&str>, max_lines: 
     let mut block = col().key(key.to_string()).w_full().gap(4.0).child(
         // The card's body is the surface; the code draws no box of its own.
         Markdown::new(&src)
+            .highlights(search_highlights(cx, &src))
             .selectable(true)
             .style(MarkdownStyle::from_kit(cx.k).code_block(
                 cx.k.alpha(cx.k.c.layer_01, 0.0),
@@ -194,7 +222,7 @@ pub fn code(cx: &Tcx, key: &str, body: &str, language: Option<&str>, max_lines: 
 
 /// Open a URL or file path clicked from a Markdown link.
 /// - Web and mailto URLs (`http://`, `https://`, `mailto:`) open in the default external application.
-/// - Local file URLs (`file://...`) or workspace file paths open in the built-in file viewer.
+/// - Local files open in the built-in viewer; directories open in the system file manager.
 pub fn open_markdown_link(s: &mut UiState, url: &str, tx: &mut rune::Tx) {
     let url = url.trim();
     if url.is_empty() {
@@ -212,15 +240,114 @@ pub fn open_markdown_link(s: &mut UiState, url: &str, tx: &mut rune::Tx) {
     s.open_timeline_file(path);
 }
 
+/// Theme roles keep rich text readable in both palette variants.
+pub(crate) fn message_style(k: &Kit) -> MarkdownStyle {
+    MarkdownStyle::from_kit(k)
+        .body_font(k.ty.body.lh(k.ty.body.size * 1.65))
+        .strong_weight(650.0)
+        .link(k.c.text_accent)
+        .link_underline(k.c.bg_accent.alpha(0.35))
+        .inline_code_bg(k.c.bg_accent.alpha(0.10))
+        .quote(k.c.bg_accent.alpha(0.55), 2.0, 14.0, k.c.text_muted)
+        .rule(k.c.border_muted.alpha(0.6))
+        .list(24.0, 8.0)
+        .table(k.c.border_muted.alpha(0.45), k.c.bg_accent.alpha(0.08))
+        .table_header_text(k.c.text_base.mix(k.c.text_accent, 0.75))
+        .table_header_weight(650.0)
+        .table_header_rule(k.c.bg_accent.alpha(0.25))
+        .table_cell_padding(12.0, 9.0)
+        .table_margin(14.0, 18.0)
+        .code_block(k.c.layer_01, k.c.border_muted.alpha(0.45))
+        .code_block_padding(14.0, 12.0)
+        .code_margin(12.0, 12.0)
+}
+
+/// Accent structural emphasis without changing the source or copied text.
+pub(crate) fn prose_accents(
+    body: &str,
+    k: &Kit,
+) -> Vec<(std::ops::Range<usize>, rune_kit::markdown::Highlight)> {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+    let mut emphasis = 0_u32;
+    let mut heading = false;
+    let mut ranges = Vec::new();
+    for (event, range) in Parser::new_ext(body, Options::all()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Heading { .. }) => heading = true,
+            Event::End(TagEnd::Heading(_)) => heading = false,
+            Event::Start(Tag::Strong) => emphasis += 1,
+            Event::End(TagEnd::Strong) => emphasis = emphasis.saturating_sub(1),
+            Event::Text(_) if heading || emphasis > 0 => {
+                ranges.push((
+                    range,
+                    rune_kit::markdown::Highlight::new()
+                        .bg(k.c.bg_base.alpha(0.0))
+                        .fg(k
+                            .c
+                            .text_base
+                            .mix(k.c.text_accent, if heading { 0.85 } else { 0.65 })),
+                ));
+            }
+            _ => {}
+        }
+    }
+    ranges
+}
+
+fn search_query<'a>(cx: &'a Tcx) -> &'a str {
+    if cx.s.timeline_search.active && cx.s.selected.as_deref() == Some(cx.asid) {
+        cx.s.timeline_search.query.text.trim()
+    } else {
+        ""
+    }
+}
+
+fn current_search_item(cx: &Tcx) -> bool {
+    cx.item_id.is_some_and(|id| {
+        cx.s.timeline_search
+            .matches
+            .get(cx.s.timeline_search.active_index)
+            .is_some_and(|current| current == id)
+    })
+}
+
+fn search_highlights(
+    cx: &Tcx,
+    body: &str,
+) -> Vec<(Vec<std::ops::Range<usize>>, rune_kit::markdown::Highlight)> {
+    use rune_kit::markdown::{Case, Highlight};
+    let query = search_query(cx);
+    if query.is_empty() {
+        return Vec::new();
+    }
+    rune_kit::markdown::find(body, query, Case::Folded(Default::default()))
+        .into_iter()
+        .map(|ranges| {
+            (
+                ranges,
+                Highlight::new().current_match(current_search_item(cx)),
+            )
+        })
+        .collect()
+}
+
 /// Prose an agent wrote, as Markdown.
 pub fn prose(cx: &Tcx, key: &str, body: &str) -> El {
+    let mut highlights: Vec<_> = prose_accents(body, cx.k)
+        .into_iter()
+        .map(|(range, paint)| (vec![range], paint))
+        .collect();
+    highlights.extend(search_highlights(cx, body));
     Markdown::new(body)
+        .highlights(highlights)
+        .style(message_style(cx.k))
         .selectable(true)
         .on_link_tx(|s: &mut UiState, url: &str, tx: &mut rune::Tx| {
             open_markdown_link(s, url, tx);
         })
         .build(cx.k)
         .key(format!("md-{key}"))
+        .max_w(760.0)
 }
 
 pub fn more_lines(cx: &Tcx, hidden: usize) -> El {
@@ -378,17 +505,18 @@ impl<'a> ToolCard<'a> {
         let glyph_color = if failed {
             k.c.danger.icon
         } else {
-            self.accent.unwrap_or(k.c.icon_faint)
+            self.accent.unwrap_or(k.c.text_accent)
         };
         let selected = cx.selected(&id);
         let mut line = row()
             .key("line")
             .w_full()
-            .h(ROW_H)
+            .h(30.0)
             .px(6.0)
             .gap(8.0)
             .center_y()
-            .radius(k.radius.sm)
+            .radius(k.radius.md)
+            .fill(k.c.bg_accent.alpha(0.04))
             .child(icon(self.glyph, 13.0).color(glyph_color).a11y_hidden());
         if !self.verb.is_empty() {
             line = line.child(
@@ -398,7 +526,7 @@ impl<'a> ToolCard<'a> {
                     .color(if failed {
                         k.c.danger.fg
                     } else {
-                        k.c.text_muted
+                        k.c.text_accent
                     })
                     .single_line(),
             );
@@ -494,11 +622,15 @@ impl<'a> ToolCard<'a> {
                 -std::f32::consts::FRAC_PI_2
             };
             line = line.child(
-                icon(&glyphs::CHEVRON, 11.0)
-                    .key("chevron")
-                    .color(k.c.icon_faint)
-                    .rotate(turn)
-                    .a11y_hidden(),
+                crate::ui::art::directional_arrow(
+                    cx.s,
+                    k,
+                    11.0,
+                    turn + std::f32::consts::FRAC_PI_2,
+                    k.c.icon_faint,
+                )
+                .key("chevron")
+                .a11y_hidden(),
             );
         }
         if selected {
@@ -768,11 +900,15 @@ impl<'a> ToolCard<'a> {
             header = k
                 .interactive(
                     header.child(
-                        icon(&glyphs::CHEVRON, 12.0)
-                            .key("chevron")
-                            .color(k.c.icon_faint)
-                            .rotate(turn)
-                            .a11y_hidden(),
+                        crate::ui::art::directional_arrow(
+                            cx.s,
+                            k,
+                            12.0,
+                            turn + std::f32::consts::FRAC_PI_2,
+                            k.c.icon_faint,
+                        )
+                        .key("chevron")
+                        .a11y_hidden(),
                     ),
                 )
                 .cursor(Cursor::Pointer)
@@ -854,7 +990,7 @@ impl<'a> ToolCard<'a> {
 fn state_mark(cx: &Tcx, state: CardState) -> El {
     let k = cx.k;
     match state {
-        CardState::Running => Spinner::new().size(12.0).build(k).key("state"),
+        CardState::Running => crate::ui::art::ActivityMark::Inline.build(k).key("state"),
         CardState::Failed => icon(&glyphs::DISMISS, 13.0)
             .key("state")
             .color(k.c.danger.icon)
@@ -907,13 +1043,48 @@ pub fn plate(k: &Kit, key: String) -> El {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn file_urls_strip_scheme_and_fragments() {
-        let raw = "file:///path/to/file.rs#L10-L25";
-        let target = raw.strip_prefix("file://").unwrap_or(raw);
-        let path = target.split('#').next().unwrap_or(target);
-        assert_eq!(path, "/path/to/file.rs");
+    fn session_search_marks_rendered_text_and_clears_when_closed() {
+        use super::*;
+        use serde_json::json;
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.selected = Some("a".into());
+        s.timeline_search.active = true;
+        s.timeline_search.query = rune::TextEdit::new("中文 api");
+        let body = "中文 **API** and [link](https://hidden.example)";
+        let item: TimelineItem = serde_json::from_value(json!({
+            "id":"m", "message_id":"m", "role":"assistant", "seq":0,
+            "updated_ms":0, "ordinal":0, "part":{"type":"text", "text":body}
+        }))
+        .unwrap();
+        let mut timeline = SessionTimeline::default();
+        timeline.replace(vec![item]);
+        s.timelines.insert("a".into(), timeline);
+        s.update_timeline_search_matches("a");
+        assert_eq!(s.timeline_search.matches, ["m"]);
+        let k = Kit::neutral(true);
+        let cx = Tcx {
+            item_id: Some("m"),
+            ..Tcx::new(&s, &k, "a")
+        };
+        let marks = search_highlights(&cx, body);
+        assert_eq!(marks.len(), 1);
+        let visible: String = marks[0]
+            .0
+            .iter()
+            .map(|range| &body[range.clone()])
+            .collect();
+        assert_eq!(visible, "中文 API");
+        assert!(search_highlights(&Tcx::new(&s, &k, "other"), body).is_empty());
+        s.timeline_search.query = rune::TextEdit::new("hidden.example");
+        s.update_timeline_search_matches("a");
+        assert!(
+            s.timeline_search.matches.is_empty(),
+            "hidden link destinations are not visible matches"
+        );
+        s.close_timeline_search();
+        assert!(search_highlights(&Tcx::new(&s, &k, "a"), body).is_empty());
     }
-
     #[test]
     fn tool_stdout_with_git_diff_is_parsed_as_diff() {
         use muqun_gateway::agents::{AgentPart, TimelineItem, TimelineRole, ToolCall};

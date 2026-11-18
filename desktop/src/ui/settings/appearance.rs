@@ -20,7 +20,7 @@ fn banner(s: &UiState, k: &Kit) -> El {
     let line = line.unwrap_or_default();
     const H: f32 = 176.0;
     const ART_W: f32 = 460.0;
-    let radius = crate::theme::look::CARD_RADIUS;
+    let radius = k.radius.lg;
     let art = crate::theme::apply::home_artwork(scheme)
         .or_else(|| crate::theme::apply::backdrop(scheme, true));
     let mut banner = el()
@@ -88,14 +88,31 @@ fn banner(s: &UiState, k: &Kit) -> El {
                 .max_lines(2)
         }))
         .child(
-            hrow().pt(10.0).child(
-                Button::new(tr_ref(language, "Browse themes"))
-                    .variant(ButtonVariant::Neutral)
-                    .control_size(ControlSize::Small)
-                    .on_press(|s: &mut UiState| super::open(s, SettingsTab::Themes))
-                    .build(k)
-                    .key("goto-themes"),
-            ),
+            hrow()
+                .pt(10.0)
+                .gap(8.0)
+                .children(crate::theme::omarchy::available().then(|| {
+                    Button::new(tr_ref(language, "Follow Omarchy theme"))
+                        .variant(ButtonVariant::Neutral)
+                        .control_size(ControlSize::Small)
+                        .disabled(s.cfg.appearance.theme_id == crate::theme::omarchy::ID)
+                        .on_press(|s: &mut UiState| {
+                            s.send(crate::model::commands::Command::ThemeApply(
+                                crate::theme::omarchy::ID.into(),
+                                Scheme::System,
+                            ));
+                        })
+                        .build(k)
+                        .key("follow-omarchy-theme")
+                }))
+                .child(
+                    Button::new(tr_ref(language, "Browse themes"))
+                        .variant(ButtonVariant::Neutral)
+                        .control_size(ControlSize::Small)
+                        .on_press(|s: &mut UiState| super::open(s, SettingsTab::Themes))
+                        .build(k)
+                        .key("goto-themes"),
+                ),
         );
     banner.child(copy.pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)))
 }
@@ -124,17 +141,23 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                     "scheme",
                     tr_ref(language, "Color scheme"),
                     tr_ref(language, "Follow the system, or keep it light or dark."),
-                    choice(
-                        k,
-                        "scheme",
-                        &[
-                            tr_ref(language, "Light"),
-                            tr_ref(language, "Dark"),
-                            tr_ref(language, "System"),
-                        ],
-                        scheme,
-                        |s, i| s.set_scheme([Scheme::Light, Scheme::Dark, Scheme::System][i]),
-                    ),
+                    if ap.theme_id == crate::theme::omarchy::ID {
+                        text(tr_ref(language, "Controlled by Omarchy"))
+                            .font(k.ty.small)
+                            .color(k.c.text_muted)
+                    } else {
+                        choice(
+                            k,
+                            "scheme",
+                            &[
+                                tr_ref(language, "Light"),
+                                tr_ref(language, "Dark"),
+                                tr_ref(language, "System"),
+                            ],
+                            scheme,
+                            |s, i| s.set_scheme([Scheme::Light, Scheme::Dark, Scheme::System][i]),
+                        )
+                    },
                 ),
                 row(
                     k,

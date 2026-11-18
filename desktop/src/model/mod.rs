@@ -8,6 +8,7 @@ pub mod compact;
 pub mod compose;
 pub mod composer_mentions;
 pub mod composer_popup;
+pub mod fleet_attention;
 pub mod git_ops;
 pub mod inbox;
 pub mod media;

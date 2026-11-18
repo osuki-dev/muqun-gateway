@@ -38,11 +38,6 @@ pub struct Look {
 /// or a 1200×800 one at 2×; the owner's full-width 2542×1396 stays above it.
 pub const BLUR_PIXEL_BUDGET: f32 = 3_000_000.0;
 
-/// Corner radius of panels and tiles.
-pub const PANEL_RADIUS: f32 = 14.0;
-/// Corner radius of cards inside a panel.
-pub const CARD_RADIUS: f32 = 10.0;
-
 /// A soft, slightly bouncy spring for things that arrive.
 pub const ARRIVE: Spring = Spring::new(0.42, 0.18);
 /// A tight spring for things that move between places.
@@ -86,11 +81,11 @@ pub fn tune_kit(k: &mut Kit, appearance: &Appearance) {
     }
     let f = appearance.shape.factor();
     let r = &mut k.radius;
-    r.xs *= f;
-    r.sm *= f;
-    r.md *= f;
-    r.lg *= f;
-    r.xl *= f;
+    r.xs = 4.0 * f;
+    r.sm = 6.0 * f;
+    r.md = 8.0 * f;
+    r.lg = 12.0 * f;
+    r.xl = 16.0 * f;
 }
 
 /// The most opacity a picture of unknown content may have over `base` while
@@ -371,6 +366,21 @@ impl Look {
         )
         .motion(ARRIVE)
         .enter_delay(0.045 * i as f32)
+    }
+
+    /// Shared dialog entrance/exit: scale and rise, with the same spring for
+    /// command, shortcut and pairing surfaces. Reduced motion keeps a fade.
+    pub fn dialog_motion(&self, panel: El) -> El {
+        if !self.motion {
+            return panel.transition(Transition::opacity());
+        }
+        panel
+            .transition(
+                Transition::opacity()
+                    .combined(Transition::offset(0.0, 12.0))
+                    .combined(Transition::scale(0.96)),
+            )
+            .motion(Spring::new(0.32, 0.16))
     }
 
     /// A gentle breathing pulse on `e` (opacity 0.55..1 over 1.8 s); still

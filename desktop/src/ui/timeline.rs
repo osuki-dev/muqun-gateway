@@ -28,7 +28,7 @@ use rune::{col, el, icon, row, text, Cursor, El, GrowthSpec, ScrollSpec};
 use rune_kit::diff::{DiffMode, DiffState, DiffView, FileDiff, FileStatus};
 use rune_kit::{
     glyphs, Badge, BadgeVariant, Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant,
-    Kit, ScrollBar, Spinner, TextInput,
+    Kit, ScrollBar, TextInput,
 };
 
 use super::copy::tr_ref;
@@ -107,6 +107,10 @@ pub struct SessionTimeline {
     pub rev: u64,
     /// The list's rows: items, and runs of tool activity folded together.
     pub blocks: Vec<Block>,
+    /// Commands exposed while running keep their row until the turn ends.
+    /// Otherwise each completion merges adjacent groups and removes visible rows.
+    live_commands: HashSet<String>,
+    row_keys: Vec<String>,
     /// The row the keyboard is on (an item id, or a group's key).
     pub selected: Option<String>,
     /// The reader scrolled up off the bottom: the list stopped following it
@@ -129,6 +133,7 @@ impl SessionTimeline {
         let started = std::time::Instant::now();
         let keep: HashSet<&str> = items.iter().map(|i| i.id.as_str()).collect();
         self.diffs.retain(|id, _| keep.contains(id.as_str()));
+        self.live_commands.retain(|id| keep.contains(id.as_str()));
         for item in &items {
             self.ingest(item);
         }
@@ -182,12 +187,45 @@ impl SessionTimeline {
 
     /// Fold the rows again, after the list changed.
     fn regroup(&mut self) {
-        self.blocks = activity::blocks(&self.items);
-        self.rev += 1;
+        self.blocks = activity::blocks(&self.items, |id| self.live_commands.contains(id));
+        let same_keys = self.blocks.len() == self.row_keys.len()
+            && self
+                .blocks
+                .iter()
+                .zip(&self.row_keys)
+                .all(|(block, key)| match *block {
+                    Block::Item(i) => key == &self.items[i].id,
+                    Block::Group { start, .. } => {
+                        key.strip_prefix("grp-") == Some(self.items[start].id.as_str())
+                    }
+                });
+        // Rune's version caches keys, not row contents or measurements. Updating
+        // output must repaint the row without rescanning the whole list's keys.
+        if !same_keys {
+            self.row_keys = self
+                .blocks
+                .iter()
+                .map(|block| match *block {
+                    Block::Item(i) => self.items[i].id.clone(),
+                    Block::Group { start, .. } => group_key(&self.items[start]),
+                })
+                .collect();
+            self.rev += 1;
+        }
+    }
+
+    /// Once a turn settles, compact its activity once, and release its row pins.
+    pub fn settle_activity(&mut self) {
+        if self.live_commands.is_empty() {
+            return;
+        }
+        self.live_commands.clear();
+        self.regroup();
     }
 
     pub fn remove(&mut self, ids: &[String]) {
         self.items.retain(|t| !ids.contains(&t.id));
+        self.live_commands.retain(|id| !ids.contains(id));
         self.regroup();
         for id in ids {
             self.diffs.remove(id);
@@ -214,6 +252,9 @@ impl SessionTimeline {
 
     /// Parse the item's change (a diff part, an edit's files) once, for drawing.
     fn ingest(&mut self, item: &TimelineItem) {
+        if activity::running(item) && activity::family(item) == Some(activity::Family::Run) {
+            self.live_commands.insert(item.id.clone());
+        }
         match parts::files::diff_source(item) {
             None => {
                 self.diffs.remove(&item.id);
@@ -373,11 +414,40 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
     let Some(tl) = s.timelines.get(asid) else {
         // Opened, its history not read yet.
         let language = s.cfg.general.language;
+        if let Some(message) = s.session_open_errors.get(asid) {
+            let retry_asid = asid.to_string();
+            return col().key(key).w_full().grow(1.0).min_h(0.0).center().child(
+                col()
+                    .max_w(420.0)
+                    .gap(12.0)
+                    .items_center()
+                    .child(
+                        text(
+                            super::i18n::lookup(language, message)
+                                .unwrap_or(message)
+                                .to_string(),
+                        )
+                        .font(k.ty.ui)
+                        .color(k.c.text_muted)
+                        .wrap()
+                        .align(rune::Align::Center),
+                    )
+                    .child(
+                        Button::new(tr_ref(language, "Retry"))
+                            .control_size(ControlSize::Small)
+                            .variant(ButtonVariant::Neutral)
+                            .on_press(move |s: &mut UiState| {
+                                s.retry_open_session(&retry_asid);
+                            })
+                            .build(k),
+                    ),
+            );
+        }
         return col().key(key).w_full().grow(1.0).min_h(0.0).center().child(
             row()
                 .gap(8.0)
                 .center_y()
-                .child(Spinner::new().size(14.0).build(k))
+                .child(crate::ui::art::ActivityMark::Standalone.build(k))
                 .child(
                     text(tr_ref(language, "Opening the session…"))
                         .font(k.ty.ui)
@@ -538,7 +608,7 @@ fn latest_pill(s: &UiState, k: &Kit, asid: &str, unseen: usize) -> El {
         .px(12.0)
         .gap(6.0)
         .center_y()
-        .radius(14.0)
+        .radius(k.radius.lg)
         .fill(k.c.bg_base)
         .border(1.0, k.c.border_muted)
         .child(
@@ -546,7 +616,7 @@ fn latest_pill(s: &UiState, k: &Kit, asid: &str, unseen: usize) -> El {
                 .absolute(0.0, 0.0)
                 .w_full()
                 .h_full()
-                .radius(14.0)
+                .radius(k.radius.lg)
                 .fill(fill)
                 .a11y_hidden(),
         )
@@ -624,21 +694,29 @@ fn timeline_search_bar(s: &UiState, k: &Kit, asid: &str) -> El {
 
     let counter = text(match_count).font(k.ty.small).color(k.c.text_faint);
 
-    let prev_btn = IconButton::new(&glyphs::CHEVRON_UP)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
-        .label(super::copy::t_ref(language, "Previous match"))
-        .on_press_tx(|s: &mut UiState, tx: &mut rune::Tx| s.timeline_search_prev(tx))
-        .build(k)
-        .key("timeline-search-prev");
+    let prev_btn = super::art::direction_button(
+        s,
+        k,
+        super::copy::t_ref(language, "Previous match"),
+        -std::f32::consts::FRAC_PI_2,
+    )
+    .variant(rune_kit::ButtonVariant::GhostMuted)
+    .control_size(ControlSize::Small)
+    .on_press_tx(|s: &mut UiState, tx: &mut rune::Tx| s.timeline_search_prev(tx))
+    .build(k)
+    .key("timeline-search-prev");
 
-    let next_btn = IconButton::new(&glyphs::CHEVRON_DOWN)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
-        .label(super::copy::t_ref(language, "Next match"))
-        .on_press_tx(|s: &mut UiState, tx: &mut rune::Tx| s.timeline_search_next(tx))
-        .build(k)
-        .key("timeline-search-next");
+    let next_btn = super::art::direction_button(
+        s,
+        k,
+        super::copy::t_ref(language, "Next match"),
+        std::f32::consts::FRAC_PI_2,
+    )
+    .variant(rune_kit::ButtonVariant::GhostMuted)
+    .control_size(ControlSize::Small)
+    .on_press_tx(|s: &mut UiState, tx: &mut rune::Tx| s.timeline_search_next(tx))
+    .build(k)
+    .key("timeline-search-next");
 
     let close_btn = IconButton::new(&glyphs::CLOSE)
         .variant(IconButtonVariant::GhostMuted)
@@ -654,7 +732,7 @@ fn timeline_search_bar(s: &UiState, k: &Kit, asid: &str) -> El {
         .center_y()
         .px(10.0)
         .py(4.0)
-        .radius(crate::theme::look::CARD_RADIUS)
+        .radius(k.radius.lg)
         .fill(k.c.layer_01)
         .border(1.0, k.c.border_muted)
         .child(field)
@@ -694,7 +772,11 @@ fn top_row(cx: &Tcx) -> El {
     let mut line = row().key("tl-top").gap(8.0).center().py(6.0);
     if loading {
         line = line
-            .child(Spinner::new().size(12.0).build(cx.k).key("top-spin"))
+            .child(
+                crate::ui::art::ActivityMark::Inline
+                    .build(cx.k)
+                    .key("top-spin"),
+            )
             .child(
                 text(cx.t("Loading earlier messages…"))
                     .font(cx.k.ty.small)
@@ -725,7 +807,11 @@ fn working_row(cx: &Tcx) -> El {
         .gap(8.0)
         .center_y()
         .py(4.0)
-        .child(Spinner::new().size(12.0).build(cx.k).key("work-spin"))
+        .child(
+            crate::ui::art::ActivityMark::Inline
+                .build(cx.k)
+                .key("work-spin"),
+        )
         .child(
             text(cx.t("Working…"))
                 .font(cx.k.ty.small)
@@ -733,12 +819,11 @@ fn working_row(cx: &Tcx) -> El {
         )
 }
 
-/// Copy message text, roll back to here, and fork from here: small icon buttons on a raised chip,
+/// Copy message text and fork from here: small icon buttons on a raised chip,
 /// shown while the pointer is on the message. No hover tooltip popovers.
 fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
     let k = cx.k;
     let asid = AgentSessionId(cx.asid.to_string());
-    let (rollback_asid, rollback_id) = (asid.clone(), it.message_id.clone());
     let fork_id = it.message_id.clone();
     let text = match &it.part {
         AgentPart::Text { text } => {
@@ -776,38 +861,32 @@ fn message_actions(cx: &Tcx, it: &TimelineItem) -> El {
                 .build(k)
                 .key(format!("copy-{}", copy_id)),
         )
-        .child(
-            IconButton::new(&super::icons::UNDO)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(cx.t("Roll back to here"))
-                .on_press(move |s: &mut UiState| {
-                    s.send(Command::StageRevert {
-                        asid: rollback_asid.clone(),
-                        message_id: rollback_id.clone(),
+        .children(
+            (!fork_id.is_empty() && cx.s.can_fork_from_message(cx.asid)).then(|| {
+                IconButton::new(&super::icons::FORK)
+                    .variant(IconButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
+                    .label(cx.t("Fork from here"))
+                    .on_press(move |s: &mut UiState| {
+                        if s.can_fork_from_message(&asid.0) {
+                            s.send(Command::ForkSession {
+                                asid: asid.clone(),
+                                message_id: Some(fork_id.clone()),
+                            });
+                        }
                     })
-                })
-                .build(k)
-                .key(format!("rollback-{}", it.id)),
-        )
-        .child(
-            IconButton::new(&super::icons::FORK)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(cx.t("Fork from here"))
-                .on_press(move |s: &mut UiState| {
-                    s.send(Command::ForkSession {
-                        asid: asid.clone(),
-                        message_id: Some(fork_id.clone()),
-                    })
-                })
-                .build(k)
-                .key(format!("fork-{}", it.id)),
+                    .build(k)
+                    .key(format!("fork-{}", it.id))
+            }),
         );
     k.elevate(chip, &k.elevation.floating)
 }
 
 fn item_row(cx: &Tcx, it: &TimelineItem) -> El {
+    let cx = &Tcx {
+        item_id: Some(&it.id),
+        ..*cx
+    };
     let is_text = matches!(it.part, AgentPart::Text { .. });
     let user_text = it.role == TimelineRole::User && is_text;
     let mut wrap = col().key(format!("item-{}", it.id)).w_full().gap(4.0);
@@ -871,9 +950,7 @@ fn item_row(cx: &Tcx, it: &TimelineItem) -> El {
 /// What the timeline draws over the window: an opened picture, else a
 /// subagent's detail sheet, else the context sheet.
 pub fn overlay(s: &UiState, k: &Kit) -> Option<El> {
-    parts::images::zoom_overlay(s, k)
-        .or_else(|| parts::detail::sheet(s, k))
-        .or_else(|| parts::context::sheet(s, k))
+    parts::images::zoom_overlay(s, k).or_else(|| parts::detail::sheet(s, k))
 }
 
 /// The right-hand detail pane, while a row is open in it.
@@ -1382,6 +1459,92 @@ mod tests {
         tl.flip("c");
         tl.replace(vec![text_item("c")]);
         assert!(tl.is_open("c", false));
+    }
+
+    #[test]
+    fn streaming_command_keeps_its_row_until_the_turn_finishes() {
+        use crate::model::inbox::Update;
+        use muqun_gateway::agents::AgentDomainEvent;
+        use serde_json::json;
+
+        let tool = |id: &str, state: &str, output: &str| -> TimelineItem {
+            serde_json::from_value(json!({
+                "id": id, "message_id": id, "role": "assistant", "seq": 0,
+                "updated_ms": 0, "ordinal": 0,
+                "part": { "type": "tool", "id": id, "name": "bash",
+                    "input": {"command": "cargo check"}, "output": output,
+                    "state": state, "status": state }
+            }))
+            .unwrap()
+        };
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.sessions.push(
+            serde_json::from_value(json!({
+                "asid": "commands", "agent_id": "codex", "title": "",
+                "status": "busy", "updated_ms": 1u64
+            }))
+            .unwrap(),
+        );
+        let mut tl = SessionTimeline::default();
+        let mut rows = vec![
+            tool("before-1", "completed", ""),
+            tool("before-2", "completed", ""),
+            tool("live", "running", "checking"),
+            tool("after-1", "completed", ""),
+            tool("after-2", "completed", ""),
+        ];
+        tl.replace(rows.clone());
+        let blocks = tl.blocks.clone();
+        let rev = tl.rev;
+        tl.flip("live");
+        for state in ["running", "completed"] {
+            rows[2] = tool("live", state, "finished output");
+            tl.upsert(vec![rows[2].clone()]);
+            assert_eq!(
+                tl.blocks, blocks,
+                "streaming and completion preserve neighbouring groups"
+            );
+            assert_eq!(tl.rev, rev);
+            assert_eq!(tl.items[2], rows[2], "contents still update");
+        }
+        // A reconnect's snapshot must not undo that stability either.
+        tl.replace(rows);
+        assert_eq!(tl.blocks, blocks);
+        assert_eq!(tl.rev, rev);
+        assert!(tl.is_open("live", false));
+        s.timelines.insert("commands".into(), tl);
+        for status in [
+            AgentSessionStatus::Busy,
+            AgentSessionStatus::Unknown,
+            AgentSessionStatus::Retry,
+        ] {
+            s.apply_updates(vec![Update::event(AgentDomainEvent::StatusChanged {
+                asid: AgentSessionId("commands".into()),
+                status,
+                error: None,
+                seq: 1,
+            })]);
+            assert_eq!(s.timelines["commands"].blocks, blocks);
+            assert_eq!(s.timelines["commands"].rev, rev);
+        }
+        s.apply_updates(vec![Update::event(AgentDomainEvent::StatusChanged {
+            asid: AgentSessionId("commands".into()),
+            status: AgentSessionStatus::Idle,
+            error: None,
+            seq: 1,
+        })]);
+        let tl = &s.timelines["commands"];
+        assert_eq!(tl.blocks, [Block::Group { start: 0, end: 5 }]);
+        assert!(
+            tl.live_commands.is_empty(),
+            "pins are released after the turn"
+        );
+        assert!(tl.rev > rev);
+        assert!(
+            tl.is_open("live", false),
+            "the expanded call survives inside its group"
+        );
     }
 
     #[test]

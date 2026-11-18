@@ -87,12 +87,6 @@ pub static DISMISS: Icon = Icon {
     body: r#"<rect x="3" y="3" width="18" height="18" rx="6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="m8 8 8 8m0-8-8 8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
-pub static CHEVRON: Icon = Icon {
-    name: "tl-disclosure-down",
-    view: 24.0,
-    body: r#"<path d="m5 9 7 6 7-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-
 pub static TRUST_WARNING: Icon = Icon {
     name: "tl-trust-warning",
     view: 24.0,

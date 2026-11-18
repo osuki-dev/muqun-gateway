@@ -72,20 +72,23 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 # the tree through reqwest, so this adds no compiled crate.
 tokio-util = "0.7.20"
 rmcp = { version = "3.7.0", features = ["server", "transport-streamable-http-server", "macros"] }
-rusqlite = { version = "0.41.0", features = ["bundled-sqlcipher-vendored-openssl"] }
+rusqlite = { version = "0.42.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 hex = "0.4"
 # `ServiceExt::oneshot`: `/mcp` drives a per-request rmcp service with it, and
 # tests drive a Router. Already in the tree through axum.
 tower = { version = "0.5", default-features = false, features = ["util"] }
 toml = "1.1.8"
+# Bounded metadata-only recognition of legacy Word/Excel/PowerPoint uploads.
+cfb = { version = "0.16.0", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1.53.3", features = ["test-util"] }
 
 [profile.release]
-# The gateway ships as a single prebuilt binary per platform. Thin LTO and one
+# Gateway and Desktop ship as prebuilt binaries per platform. Thin LTO and one
 # codegen unit trade a slower release build for a smaller, faster artifact;
 # stripping drops the symbol tables nothing needs at runtime.
+opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
@@ -100,3 +103,11 @@ opt-level = 3
 # Optional local override (not required for CI): point at a sibling checkout
 # with `cargo --config 'patch."https://github.com/ryuhzk/rune".rune.path="../rune/crates/rune"'`
 # (and the matching rune-kit path) while iterating on Rune itself.
+
+# Rune platform patches, pinned with the UI framework.
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/ryuhzk/rune", rev = "ceb8a14ec299552d9ec641cf6386f157547c69f3" }
+winit = { git = "https://github.com/ryuhzk/rune", rev = "ceb8a14ec299552d9ec641cf6386f157547c69f3" }
+parley_engine = { git = "https://github.com/ryuhzk/rune", rev = "ceb8a14ec299552d9ec641cf6386f157547c69f3" }
+accesskit_windows = { git = "https://github.com/ryuhzk/rune", rev = "ceb8a14ec299552d9ec641cf6386f157547c69f3" }
+accesskit_macos = { git = "https://github.com/ryuhzk/rune", rev = "ceb8a14ec299552d9ec641cf6386f157547c69f3" }

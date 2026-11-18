@@ -236,6 +236,8 @@ pub enum Source {
 /// A stored attachment, as the prompt carries it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedFile {
+    /// Inline image pill linked to this staged upload, when present.
+    pub draft_token: Option<u64>,
     /// The host path inside the gateway's upload directory.
     pub path: String,
     pub name: String,
@@ -359,6 +361,7 @@ pub enum ComposerUpdate {
         hits: Vec<FileHit>,
     },
     Catalog {
+        asid: Option<AgentSessionId>,
         agent: String,
         directory: Option<String>,
         view: Arc<CatalogView>,
@@ -486,6 +489,7 @@ pub async fn run(
                     push(
                         &inbox,
                         ComposerUpdate::Catalog {
+                            asid,
                             agent,
                             directory,
                             view: Arc::new(view),
@@ -620,6 +624,7 @@ async fn stage(hub: &dyn SessionHub, name: &str, source: Source) -> Result<Stage
     .map_err(|err| err.to_string())?;
     match hub.store_attachment(&name, bytes).await {
         Ok(stored) => Ok(StagedFile {
+            draft_token: None,
             path: stored.path.to_string_lossy().into_owned(),
             name: stored.name,
             size: stored.size,

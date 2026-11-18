@@ -14,21 +14,17 @@
 //!   heading ("Approval needed"); the body names the agent and what happened,
 //!   never the agent's own words.
 //!
-//! The core runs [`watch`] next to the projection; the UI thread decides
+//! The fleet attention monitor feeds the gate; the UI thread decides
 //! whether the owner is looking at that session ([`compose`] is pure).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use muqun_gateway::agents::{AgentDomainEvent, AgentSessionInfo, AgentSessionStatus};
 use muqun_gateway::platform::i18n;
-use tokio::sync::broadcast;
 
 use crate::config::Language;
-use crate::hub::SessionHub;
-use crate::model::inbox::{Inbox, Update};
-use crate::platform::notify::{self, Notice};
+use crate::platform::notify::Notice;
 
 /// Idle this long after a turn before it counts as finished (gateway
 /// `COMPLETION_GRACE`).
@@ -64,6 +60,15 @@ pub struct Gate {
 }
 
 impl Gate {
+    pub(super) fn reconcile(&mut self, asid: &str, permissions: &[String], forms: &[String]) {
+        self.approvals.retain(|(s, _)| s != asid);
+        self.forms.retain(|(s, _)| s != asid);
+        self.approvals
+            .extend(permissions.iter().map(|p| (asid.to_owned(), p.clone())));
+        self.forms
+            .extend(forms.iter().map(|f| (asid.to_owned(), f.clone())));
+    }
+
     /// What `event` raises now, if anything.
     pub fn admit(&mut self, event: &AgentDomainEvent, now: Instant) -> Option<Attention> {
         use AgentDomainEvent as E;
@@ -142,41 +147,6 @@ fn first_sighting(open: &mut HashSet<(String, String)>, asid: &str, id: &str) ->
         open.clear();
     }
     open.insert((asid.to_string(), id.to_string()))
-}
-
-/// Feed every agent event through a [`Gate`] and hand what it raises to the
-/// UI as [`Update::Attention`]. An answered request takes its notification
-/// down. Runs for the life of the core.
-pub async fn watch(hub: Arc<dyn SessionHub>, inbox: Arc<Inbox>) {
-    let mut events = hub.events();
-    let mut gate = Gate::default();
-    // The turn-end grace is not marked by any event: look every two seconds,
-    // the gateway's own beat.
-    let mut tick = tokio::time::interval(Duration::from_secs(2));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            next = events.recv() => match next {
-                Ok(event) => {
-                    match &event {
-                        AgentDomainEvent::PermissionResolved { asid, .. }
-                        | AgentDomainEvent::FormResolved { asid, .. } => notify::withdraw(&asid.0),
-                        _ => {}
-                    }
-                    if let Some(attention) = gate.admit(&event, Instant::now()) {
-                        inbox.push(Update::Attention(attention));
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return,
-            },
-            _ = tick.tick() => {
-                for asid in gate.finished(Instant::now()) {
-                    inbox.push(Update::Attention(Attention { asid, kind: AttentionKind::Finished }));
-                }
-            }
-        }
-    }
 }
 
 /// Visible characters of a session title a notification shows.

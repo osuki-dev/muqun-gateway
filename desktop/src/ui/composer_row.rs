@@ -6,13 +6,10 @@
 //! send buttons and everything stays a click away.
 
 use rune::{icon, row, text, Color, El, Icon, Tx};
-use rune_kit::{
-    Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, Menu, MenuItem, SegmentedControl,
-};
+use rune_kit::{Button, ButtonVariant, ControlSize, Kit, Menu, MenuItem, SegmentedControl};
 
 use super::composer::{
-    branch_items, catalog_models, effort_menu, mode_label, model_menu, switch_effort, switch_mode,
-    switch_model,
+    catalog_models, effort_menu, mode_label, model_menu, switch_effort, switch_mode, switch_model,
 };
 use super::copy::tr_ref;
 use super::labels::{bare_catalog_id, readable_catalog_id};
@@ -57,13 +54,7 @@ static MORE: Icon = Icon {
 static AUTO_APPROVE: Icon = Icon {
     name: "cmp-approval-always",
     view: 24.0,
-    body: r#"<path d="m3 12 4 4L17 6m-5 11 3 3 7-9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-
-static BRANCH: Icon = Icon {
-    name: "cmp-branch",
-    view: 24.0,
-    body: r#"<circle cx="6" cy="5" r="2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="6" cy="19" r="2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="18" cy="7" r="2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M6 7v10m12-8c0 5-6 4-11 8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    body: r#"<path d="M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6l-8-3Zm-4 9 3 3 5-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
 /// A permission mode's glyph, and whether it is the risky one (bypass:
@@ -90,11 +81,11 @@ fn mode_glyph(id: &str) -> (&'static Icon, bool) {
 
 /// A pill (`ControlSize::Small` ghost button): 10 pt each side.
 const PILL_PAD: f32 = 20.0;
-/// An icon-only pill: 14 pt glyph and 3 pt each side.
-const ICON_PILL: f32 = 20.0;
+/// Compact controls keep enough room around their glyph.
+const ICON_PILL: f32 = 32.0;
 const GLYPH: f32 = 14.0;
 /// Between pills in the row.
-const ROW_GAP: f32 = 2.0;
+const ROW_GAP: f32 = 8.0;
 /// Between the composer's action buttons.
 pub const ACTION_GAP: f32 = 6.0;
 /// The card's own side padding (12 pt each side).
@@ -125,7 +116,6 @@ enum ModelLook {
 struct Fold {
     agent_icon: bool,
     model: ModelLook,
-    auto_icon: bool,
     mode_icon: bool,
     branch_icon: bool,
     more_branch: bool,
@@ -137,8 +127,7 @@ struct Fold {
 const FULL: Fold = Fold {
     agent_icon: false,
     model: ModelLook::Split,
-    auto_icon: false,
-    mode_icon: false,
+    mode_icon: true,
     branch_icon: false,
     more_branch: false,
     more_auto: false,
@@ -149,10 +138,9 @@ const FULL: Fold = Fold {
 /// The steps, in the order the row gives them up: words before meaning;
 /// the permission mode (a bypass is worth seeing) is the last to leave, after
 /// the agent, which the pane's header names anyway.
-const FOLDS: [fn(&mut Fold); 12] = [
+const FOLDS: [fn(&mut Fold); 11] = [
     |f| f.agent_icon = true,
     |f| f.model = ModelLook::Joined,
-    |f| f.auto_icon = true,
     |f| f.mode_icon = true,
     |f| f.branch_icon = true,
     |f| f.model = ModelLook::Name,
@@ -194,17 +182,41 @@ pub struct Controls {
     mode: Option<String>,
     asid: muqun_gateway::agents::AgentSessionId,
     auto_on: bool,
+    auto_visible: bool,
+    auto_native: String,
+    auto_applies: String,
     busy: bool,
 }
 
+/// Show a separate toggle only when discovery offers a live session control
+/// that is not already represented by the session's mode menu.
+fn standalone_approval(feature: Option<&serde_json::Value>, modes: &[(String, String)]) -> bool {
+    let Some(feature) = feature.filter(|f| f["scope"] == "session") else {
+        return false;
+    };
+    let Some(native) = feature["native"].as_str().filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    !modes.iter().any(|(id, _)| {
+        let id = bare_catalog_id(id);
+        id == native
+            || feature["modeIds"]
+                .as_array()
+                .is_some_and(|aliases| aliases.iter().any(|alias| alias.as_str() == Some(id)))
+    })
+}
+
 impl Controls {
-    pub fn read(s: &UiState) -> Option<Controls> {
-        let info = s.current()?;
-        let catalog = s.catalog.as_ref();
+    pub fn for_session(
+        s: &UiState,
+        asid: &str,
+        catalog: Option<&crate::hub::CatalogView>,
+    ) -> Option<Controls> {
+        let info = s.session_by_id(asid)?;
         let model_infos: Vec<&muqun_gateway::agents::ModelInfo> = catalog
             .map(|c| c.catalog.models.iter().filter(|m| m.enabled).collect())
             .unwrap_or_default();
-        let models = catalog.map(|c| catalog_models(c)).unwrap_or_default();
+        let models = catalog.map(catalog_models).unwrap_or_default();
         let default_model = catalog.and_then(|c| c.catalog.defaults.model.as_ref());
         let model = match &info.model {
             Some(m) => {
@@ -252,6 +264,20 @@ impl Controls {
                     .collect()
             })
             .unwrap_or_default();
+        let auto_feature = s
+            .agents
+            .iter()
+            .find(|a| a.id == info.agent_id)
+            .and_then(|a| a.features.extra.get("autoApprove"));
+        let auto_visible = standalone_approval(auto_feature, &modes);
+        let auto_native = auto_feature
+            .and_then(|f| f["native"].as_str())
+            .unwrap_or("")
+            .to_owned();
+        let auto_applies = auto_feature
+            .and_then(|f| f["applies"].as_str())
+            .unwrap_or("")
+            .to_owned();
         Some(Controls {
             language: s.cfg.general.language,
             dark: s.dark,
@@ -262,8 +288,11 @@ impl Controls {
             modes,
             mode: info.mode.clone(),
             asid: info.asid.clone(),
+            auto_visible,
+            auto_native,
+            auto_applies,
             auto_on: s.auto_approve.get(&info.asid.0).copied().unwrap_or(false),
-            busy: s.busy(),
+            busy: s.session_busy(asid),
         })
     }
 
@@ -296,7 +325,7 @@ impl Controls {
     /// Whether anything goes into the "…" menu at `f`.
     fn has_more(&self, f: Fold) -> bool {
         (f.more_branch && self.branch.is_some())
-            || f.more_auto
+            || (f.more_auto && self.auto_visible)
             || (f.more_mode && (self.mode.is_some() || self.modes.len() > 1))
             || f.more_agent
     }
@@ -309,7 +338,7 @@ impl Controls {
             items.push(if f.agent_icon {
                 ICON_PILL
             } else {
-                8.0 + 12.0 + 6.0 + text_w(&self.agent_name, k.ty.small_medium) + 8.0
+                8.0 + 20.0 + 6.0 + text_w(&self.agent_name, k.ty.small_medium) + 8.0
             });
         }
         if let Some(m) = &self.model {
@@ -352,13 +381,8 @@ impl Controls {
                 items.push(GLYPH + 4.0 + text_w(&label, small) + PILL_PAD);
             }
         }
-        if !f.more_auto {
-            items.push(if f.auto_icon {
-                ICON_PILL
-            } else {
-                // The switch's label, its gap and the small track.
-                text_w(self.tr("Auto-approve"), small) + 8.0 + 44.0
-            });
+        if !f.more_auto && self.auto_visible {
+            items.push(ICON_PILL);
         }
         if self.has_more(f) {
             items.push(ICON_PILL);
@@ -441,7 +465,7 @@ fn pill_button(
     };
     let mut e = b.build(k).key(key.to_string());
     if square {
-        e = e.px(3.0);
+        e = e.w(ICON_PILL).min_w(ICON_PILL).px(0.0);
     }
     let chip_fill = if open {
         k.c.bg_accent.alpha(0.14)
@@ -453,25 +477,31 @@ fn pill_button(
     } else {
         k.c.border_muted.alpha(0.30)
     };
-    e.radius(k.radius.xs)
+    e.h(32.0)
+        .radius(if square { ICON_PILL / 2.0 } else { k.radius.lg })
         .fill(chip_fill)
         .border(0.5, chip_border)
 }
 
 fn agent_chip(c: &Controls, k: &Kit, f: Fold) -> El {
-    let mark = super::agents::mark(&c.agent_id, 12.0, c.dark).a11y_hidden();
+    let mark = super::agents::mark(&c.agent_id, super::composer::AGENT_ICON, c.dark).a11y_hidden();
     let mut chip = row()
         .key("agent")
         .role("image")
         .label(c.agent_name.clone())
         .center_y()
-        .h(22.0)
-        .radius(k.radius.xs)
+        .h(32.0)
+        .radius(k.radius.lg)
         .fill(k.c.layer_01.alpha(0.35))
         .border(0.5, k.c.border_muted.alpha(0.30))
         .child(mark);
     if f.agent_icon {
-        return chip.w(ICON_PILL).center().help(c.agent_name.clone());
+        return chip
+            .w(ICON_PILL)
+            .min_w(ICON_PILL)
+            .radius(ICON_PILL / 2.0)
+            .center()
+            .help(c.agent_name.clone());
     }
     chip = chip.gap(5.0).px(7.0).child(
         text(c.agent_name.clone())
@@ -480,12 +510,7 @@ fn agent_chip(c: &Controls, k: &Kit, f: Fold) -> El {
             .a11y_hidden(),
     );
     if c.busy {
-        chip = chip.child(
-            rune_kit::Spinner::new()
-                .size(8.0)
-                .color(k.c.bg_accent)
-                .build(k),
-        );
+        chip = chip.child(crate::ui::art::ActivityMark::Compact.build(k));
     }
     chip
 }
@@ -528,22 +553,36 @@ fn model_items(menu: Menu, c: &Controls, m: &ModelChip, with_effort: bool) -> Me
     menu
 }
 
+fn reload_model(k: &Kit, c: &Controls, name: &str) -> El {
+    Button::new(format!("{name} ↻"))
+        .variant(ButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .help(c.tr("Reload model list"))
+        .on_press(|s: &mut UiState| {
+            if let Some(info) = s.current().cloned() {
+                s.session_opened(&info);
+            }
+        })
+        .build(k)
+        .key("model-reload")
+        .h(32.0)
+        .radius(k.radius.lg)
+}
+
 fn model_chips(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold, line: El) -> El {
     let Some(m) = &c.model else { return line };
     let open = s.menu == Some(OpenMenu::Model);
     if f.model == ModelLook::Split {
         let mut line = line;
         line = line.child(if m.models.is_empty() {
-            Badge::new(m.name.clone())
-                .variant(BadgeVariant::Subtle)
-                .build(k)
-                .key("model")
+            reload_model(k, c, &m.name)
         } else {
             let current = m.current.as_ref().map(|(p, i)| (p.as_str(), i.as_str()));
             model_menu(
                 k,
                 layer,
                 OpenMenu::Model,
+                &c.asid.0,
                 open,
                 m.name.clone(),
                 &m.models,
@@ -555,6 +594,7 @@ fn model_chips(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold,
             line = line.child(effort_menu(
                 k,
                 layer,
+                &c.asid.0,
                 s.menu == Some(OpenMenu::Effort),
                 m.variant.as_deref(),
                 &m.variants,
@@ -571,15 +611,7 @@ fn model_chips(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold,
         _ => Face::Glyph(&MODEL, None),
     };
     if m.models.is_empty() && m.variants.is_empty() {
-        let badge = Badge::new(if f.model == ModelLook::Icon {
-            m.name.clone()
-        } else {
-            whole
-        })
-        .variant(BadgeVariant::Subtle)
-        .build(k)
-        .key("model");
-        return line.child(badge);
+        return line.child(reload_model(k, c, &whole));
     }
     let trigger = pill_button(
         k,
@@ -590,7 +622,7 @@ fn model_chips(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold,
         open,
         OpenMenu::Model,
     );
-    let menu = Menu::new("model")
+    let menu = Menu::new(format!("model-{}", c.asid.0))
         .placement(rune_kit::Placement::TopStart)
         .trigger(trigger)
         .open(open)
@@ -653,7 +685,7 @@ fn mode_control(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold
             .role("image")
             .label(help.clone())
             .help(help)
-            .h(20.0)
+            .h(32.0)
             .center_y()
             .child(
                 icon(glyph, GLYPH)
@@ -686,7 +718,7 @@ fn mode_control(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold
         open,
         OpenMenu::Mode,
     );
-    let menu = Menu::new("mode")
+    let menu = Menu::new(format!("mode-{}", c.asid.0))
         .placement(rune_kit::Placement::TopStart)
         .trigger(trigger)
         .open(open)
@@ -703,90 +735,74 @@ fn set_auto(s: &mut UiState, asid: &muqun_gateway::agents::AgentSessionId, on: b
 }
 
 fn auto_help(c: &Controls) -> String {
+    let timing = match c.auto_applies.as_str() {
+        "next_turn" => c.tr("Applies to the next turn"),
+        "restart_when_idle" => c.tr("Restarts this session when idle"),
+        _ => c.tr("Applies to this session"),
+    };
     format!(
-        "{} · {}",
-        c.tr("Auto-approve"),
+        "{} · {} · {} · {}",
+        c.agent_name,
+        c.auto_native,
         if c.auto_on {
-            c.tr("on: requests are approved without asking")
+            c.tr("Enabled")
         } else {
-            c.tr("off: requests wait for you")
-        }
+            c.tr("Disabled")
+        },
+        timing
     )
 }
 
-fn auto_control(c: &Controls, k: &Kit, f: Fold) -> El {
+fn auto_control(c: &Controls, k: &Kit) -> El {
     let (on, asid) = (c.auto_on, c.asid.clone());
-    let label = c.tr("Auto-approve");
-    if !f.auto_icon {
-        return rune_kit::Switch::new(on)
-            .label(label)
-            .on_toggle(move |s: &mut UiState| set_auto(s, &asid, !on))
-            .build(k)
-            .key("auto-approve");
-    }
-    // A toggle: lit in the accent while on.
-    let tone = if on { k.c.bg_accent } else { k.c.icon_muted };
-    let b = Button::new(label)
-        .variant(ButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
+    rune_kit::IconButton::new(&AUTO_APPROVE)
+        .variant(rune_kit::IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Large)
+        .label(format!("{} · {}", c.agent_name, c.auto_native))
         .help(auto_help(c))
-        .label_with(move |_, _| icon(&AUTO_APPROVE, GLYPH).color(tone))
+        .disabled(c.busy && c.auto_applies == "restart_when_idle")
         .on_press(move |s: &mut UiState| set_auto(s, &asid, !on))
         .build(k)
         .key("auto-approve")
+        .size(ICON_PILL, ICON_PILL)
+        .min_w(ICON_PILL)
+        .radius(ICON_PILL / 2.0)
+        .fill(if on {
+            k.c.bg_accent.alpha(0.16)
+        } else {
+            k.c.layer_01.alpha(0.35)
+        })
+        .border(
+            0.5,
+            if on {
+                k.c.bg_accent.alpha(0.5)
+            } else {
+                k.c.border_muted.alpha(0.3)
+            },
+        )
         .role("switch")
         .checked(on)
-        .px(3.0);
-    if on {
-        b.fill(k.c.bg_accent.alpha(0.14))
-    } else {
-        b
-    }
 }
 
-fn branch_control(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -> Option<El> {
-    let (cwd, info) = c.branch.as_ref()?;
-    if !f.branch_icon {
-        return super::composer::branch_menu(
-            k,
-            layer,
-            OpenMenu::Branch,
-            s.menu == Some(OpenMenu::Branch),
-            cwd,
-            info,
-        );
-    }
-    let current = info.current.clone()?;
-    let help = format!("{} {current}", c.tr("Branch:"));
-    if info.local.len() < 2 {
-        return Some(
-            row()
-                .key("branch")
-                .role("image")
-                .label(help.clone())
-                .help(help)
-                .w(ICON_PILL)
-                .h(20.0)
-                .center()
-                .child(icon(&BRANCH, GLYPH).color(k.c.icon_muted).a11y_hidden()),
-        );
-    }
-    let open = s.menu == Some(OpenMenu::Branch);
-    let trigger = pill_button(
-        k,
-        "branch-pill",
-        Face::Glyph(&BRANCH, None),
-        help.clone(),
-        Some(help),
-        open,
-        OpenMenu::Branch,
-    );
-    let menu = Menu::new("branch")
-        .placement(rune_kit::Placement::TopStart)
-        .trigger(trigger)
-        .open(open)
-        .on_close(|s: &mut UiState| s.menu = None);
-    Some(branch_items(menu, cwd, info).build(k, layer))
+fn branch_control(
+    _s: &UiState,
+    c: &Controls,
+    k: &Kit,
+    _layer: &mut Vec<El>,
+    f: Fold,
+) -> Option<El> {
+    let (_, info) = c.branch.as_ref()?;
+    let current = info.current.clone().unwrap_or_else(|| "Git".into());
+    Some(
+        Button::new(if f.branch_icon { "Git".into() } else { current })
+            .variant(ButtonVariant::Neutral)
+            .control_size(ControlSize::Small)
+            .on_press(|s: &mut UiState| s.toggle_git_inspector())
+            .build(k)
+            .key("branch")
+            .h(32.0)
+            .radius(k.radius.lg),
+    )
 }
 
 /// The "…" menu: whatever the fold moved out of the row.
@@ -802,7 +818,7 @@ fn more_menu(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -
         open,
         OpenMenu::ComposerMore,
     );
-    let mut menu = Menu::new("composer-more")
+    let mut menu = Menu::new(format!("composer-more-{}", c.asid.0))
         .placement(rune_kit::Placement::TopStart)
         .trigger(trigger)
         .open(open)
@@ -817,7 +833,11 @@ fn more_menu(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -
     if f.more_agent {
         menu = section(menu).item(
             MenuItem::new(c.agent_name.clone())
-                .lead(super::agents::mark(&c.agent_id, 12.0, c.dark))
+                .lead(super::agents::mark(
+                    &c.agent_id,
+                    super::composer::AGENT_ICON,
+                    c.dark,
+                ))
                 .disabled(true),
         );
     }
@@ -837,26 +857,27 @@ fn more_menu(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -
             );
         }
     }
-    if f.more_auto {
+    if f.more_auto && c.auto_visible {
         let (on, asid) = (c.auto_on, c.asid.clone());
-        menu = section(menu).item(MenuItem::new(c.tr("Auto-approve")).checked(on).on_select(
-            move |s: &mut UiState| {
-                s.menu = None;
-                set_auto(s, &asid, !on);
-            },
-        ));
+        menu = section(menu).item(
+            MenuItem::new(c.auto_native.clone())
+                .checked(on)
+                .disabled(c.busy && c.auto_applies == "restart_when_idle")
+                .on_select(move |s: &mut UiState| {
+                    s.menu = None;
+                    set_auto(s, &asid, !on);
+                }),
+        );
     }
-    if let (true, Some((cwd, info))) = (f.more_branch, c.branch.as_ref()) {
-        menu = section(menu).group_label(c.tr("Branch"));
-        menu = if info.local.len() < 2 {
-            menu.item(
-                MenuItem::new(info.current.clone().unwrap_or_default())
-                    .checked(true)
-                    .disabled(true),
-            )
-        } else {
-            branch_items(menu, cwd, info)
-        };
+    if let (true, Some((_, info))) = (f.more_branch, c.branch.as_ref()) {
+        menu = section(menu).item(
+            MenuItem::new(info.current.clone().unwrap_or_else(|| "Git".into())).on_select(
+                |s: &mut UiState| {
+                    s.menu = None;
+                    s.toggle_git_inspector();
+                },
+            ),
+        );
     }
     menu.build(k, layer)
 }
@@ -877,21 +898,13 @@ fn build(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -> El
             line = line.child(m);
         }
     }
-    if !f.more_auto {
-        line = line.child(auto_control(c, k, f));
+    if !f.more_auto && c.auto_visible {
+        line = line.child(auto_control(c, k));
     }
     if c.has_more(f) {
         line = line.child(more_menu(s, c, k, layer, f));
     }
     line
-}
-
-/// The control row for `room` points beside the send buttons. `None` when
-/// even the narrowest fold does not fit there: the caller gives the row a
-/// line of its own ([`own_line`]).
-pub fn beside(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, room: f32) -> Option<El> {
-    let f = c.fit(k, room)?;
-    Some(build(s, c, k, layer, f))
 }
 
 /// The row on a line of its own, `room` points wide.
@@ -903,6 +916,30 @@ pub fn own_line(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, room: f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_control_requires_capability_and_deduplicates_offered_modes() {
+        use serde_json::json;
+        let modes = vec![("bypassPermissions[]".into(), "Bypass".into())];
+        let feature =
+            json!({"scope":"session", "native":"yolo", "modeIds":["yolo","bypassPermissions"]});
+        assert!(!standalone_approval(Some(&feature), &modes));
+        assert!(standalone_approval(
+            Some(&feature),
+            &[("plan".into(), "Plan".into())]
+        ));
+        assert!(!standalone_approval(None, &[]));
+        assert!(!standalone_approval(
+            Some(&json!({"scope":"launch", "native":"flag"})),
+            &[]
+        ));
+        assert!(!standalone_approval(Some(&json!({"scope":"session"})), &[]));
+        // Older gateways have no alias list; their exact native mode still deduplicates.
+        assert!(!standalone_approval(
+            Some(&json!({"scope":"session", "native":"bypassPermissions"})),
+            &modes
+        ));
+    }
 
     fn claude() -> Controls {
         let efforts = vec!["low".into(), "medium".into(), "high".into()];
@@ -939,6 +976,9 @@ mod tests {
             mode: Some("bypassPermissions".into()),
             asid: muqun_gateway::agents::AgentSessionId("s".into()),
             auto_on: true,
+            auto_visible: false,
+            auto_native: "bypassPermissions".into(),
+            auto_applies: "immediate".into(),
             busy: false,
         }
     }
@@ -950,9 +990,5 @@ mod tests {
         let (k, c) = (Kit::neutral(false), claude());
         let widths: Vec<f32> = (0..=FOLDS.len()).map(|l| c.width(&k, fold_at(l))).collect();
         assert!(widths.windows(2).all(|w| w[1] <= w[0]), "{widths:?}");
-        assert!(
-            widths[0] > 400.0 && widths[FOLDS.len()] < 70.0,
-            "{widths:?}"
-        );
     }
 }

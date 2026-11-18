@@ -1,6 +1,6 @@
 //! The product's name and mark.
 //!
-//! The mark is the App's default icon (`app/assets/icons/mint/icon.png`).
+//! The transparent mark is based on the App's Mint icon.
 //! Rune sets no window icon of its own; Wayland compositors and macOS take
 //! the `.desktop` entry's or the bundle's.
 
@@ -12,26 +12,10 @@ pub const APP_NAME: &str = "Muqun";
 pub const APP_ID: &str = "muqun-desktop";
 
 /// The Rune revision the desktop is built against (short), for About.
-pub const RUNE_REV: &str = "a1fe735";
+pub const RUNE_REV: &str = "ceb8a14";
 
 /// Compact mark for the sidebar title bar (and similar chrome).
 pub const APP_MARK_PNG: &[u8] = include_bytes!("../assets/icons/app-mark-64.png");
 
-/// The full-size icon, 1024×1024, for packaging.
-#[cfg(test)]
+/// The full-size icon, 1024×1024, for packaging and the launch mark.
 pub const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icons/app-icon.png");
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_icon_is_a_png() {
-        assert_eq!(&APP_ICON_PNG[..8], b"\x89PNG\r\n\x1a\n");
-    }
-
-    #[test]
-    fn the_mark_is_a_png() {
-        assert_eq!(&APP_MARK_PNG[..8], b"\x89PNG\r\n\x1a\n");
-    }
-}

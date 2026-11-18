@@ -527,7 +527,7 @@ fn judge(
     }
     // An Office package is probed whole; one too big to be a document is not
     // read at all.
-    if size > MAX_UPLOAD_BYTES as u64 && head.starts_with(super::uploads::ZIP_LOCAL_HEADER) {
+    if size > MAX_UPLOAD_BYTES as u64 && super::uploads::office_container(&head) {
         return Err(too_large(MAX_UPLOAD_BYTES as u64));
     }
     let Some(kind) = sniff_upload_file(partial, name) else {

@@ -1,6 +1,78 @@
 # Unreleased
 
+- Upgrade bundled SQLCipher to 4.20.0 / SQLite 3.54.1 through rusqlite 0.42, addressing RUSTSEC-2026-0502 (crafted database/WAL memory disclosure). Existing encryption remains enabled.
 ## Changes and fixes
+
+- **Sent messages no longer appear twice after an attachment or a steered prompt.**
+  Gateway reconciles device-origin presentation with the submitted message using
+  arrival order and the original prose, preserving attachments and intentional
+  repeated sends. Pending source-labelled rows stay at their send position
+  instead of sorting after all subsequent agent output. Restart Gateway after active agent turns finish. Existing
+  Desktop, App and Herdr versions remain compatible; no migration is needed.
+
+- **Legacy Office attachments work in Desktop and paired Apps.** Word `.doc`,
+  Excel `.xls` and PowerPoint `.ppt` are recognised from their compound-file
+  structure and document headers, alongside existing OOXML and OpenDocument
+  support. RTF and UTF-8 HTML exports keep their actual format even if named
+  `.doc`. Ordinary OLE containers, installer files and malformed documents are
+  not accepted as Office files. Document uploads retain the 25 MiB limit.
+  Update and restart Desktop for local attachments, and Gateway on the receiving
+  computer for App/remote uploads. Existing Apps and Herdr versions stay
+  compatible; no protocol change or migration is needed.
+
+- **Desktop direction controls follow the selected theme.** Dropdowns, search
+  navigation and disclosure controls rotate the theme's declared `home.arrow`
+  image; missing assets or missing direction metadata keep the native fallback.
+  External plugins can use bounded package-relative PNG/JPEG/WebP icons in
+  Settings, split headers and the plugin picker. Restart Desktop after changing
+  a plugin icon. No Gateway, Herdr or App update is required.
+
+- **Desktop can recover pending approvals and questions on every paired computer.**
+  The additive `agent_attention_v1` capability exposes authenticated request IDs
+  without transcripts or question contents and without starting agents. Existing
+  App endpoints remain compatible. Update and restart Gateway on each computer
+  for startup/reconnect recovery; older Gateways still deliver live requests.
+  Update and restart Desktop to enable fleet-wide reminders. No data migration
+  or Herdr update is required.
+
+- **Clicking an inactive split composer focuses it immediately.** The first
+  click activates that session’s editor, so typing goes into the selected pane
+  and each session retains its own draft. Restart Desktop to load the fix; no
+  Gateway or App update is required.
+
+- **Desktop terminal input no longer waits behind a blocked output socket.**
+  The persistent daemon reads input independently while a slow renderer or
+  reattachment is receiving output/history. A real PTY regression reproduces
+  blocked input before the fix and verifies delivery without draining output.
+  Existing terminal daemons keep running their old code across UI restarts:
+  finish and close persistent terminal sessions before restarting that daemon
+  to load the fix. Do not kill a daemon with work still running. No Gateway
+  or App protocol change is needed.
+
+- **Linux candidates include their review plugin and installation assets.**
+  Package-owned extensions are separate from user extensions; upgrade and
+  uninstall preserve user plugins, settings and session data. Candidate archives
+  include source identity and checksums. This does not enable automatic release
+  publication or add macOS/Windows installers.
+
+- **Desktop workspace motion and controls are clearer.** Scrolling layout keeps
+  readable columns and brings the focused pane into view. Floating panes rise on
+  focus, follow pointer drags directly, and keep their titlebar and resize handle
+  inside the workspace. Directional focus follows the selected layout. Composer
+  and terminal focus no longer swallow the Alt workspace layout/zoom chords.
+  Terminal tabs share a compact numbered design with an active underline and
+  separate fixed actions. The composer uses a quieter focus border and separates
+  model controls from send actions in narrow panes. Restart Desktop; no Gateway
+  or App protocol change is required.
+
+- **Desktop keeps the selected computer connected across switches and restarts.**
+  Connection warnings follow the active computer, missed event bursts request
+  catch-up instead of stopping updates, and initial connections recover reads
+  made before the subscription was ready. Switching away releases the previous
+  idle socket. Startup restores the saved remote computer's connection.
+  Existing Gateway endpoints remain unchanged; restart Desktop to load the fix.
+  Local validation and the remaining paired-App gate are recorded in
+  `docs/desktop-acceptance.md`.
 
 - **Timeline shows real photos the same way the App does — via gateway
   `image_assets`.** Live upserts and snapshots run the in-process enrich that
@@ -1004,3 +1076,18 @@ list request that could delay or prevent interruption.
   capturing a refresh revision, preventing the first native refresh from
   conflicting with its own recovery event. Concurrent live updates still fence
   stale refreshes; local queue pressure or cancellation never resends a prompt.
+
+### Desktop window and extension workflow
+
+- Unified plugin Tile, Page and right Dock controls; maximizing restores the
+  original tile geometry or dock, and docking preserves neighbouring tiles.
+- File previews now use the same draggable/resizable workspace window. Settings
+  can send text/code directly to the configured editor, including embedded nvim.
+- Added a sidebar Plugins entry, per-surface launch actions, a custom Markdown
+  example and a GitHub Pull Requests & Issues plugin using the existing gh login.
+- Moved Bun plugin commands off the UI thread, bounded output and execution time,
+  and fixed relative plugin script paths.
+- Agent settings now show reported session usage/cost with coverage and explicit
+  unknown states; these figures are not account-wide billing or quota totals.
+- Theme-driven workspace/composer accents and App-inspired native startup motion
+  follow the selected theme and reduced-motion preferences.

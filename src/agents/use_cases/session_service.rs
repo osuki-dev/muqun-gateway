@@ -24,6 +24,14 @@ pub struct SessionService {
 }
 
 impl SessionService {
+    /// Read retained request identities only. Does not prepare or wake a provider.
+    pub async fn pending_snapshots(&self) -> Vec<crate::agents::ports::AgentPendingSnapshot> {
+        match &self.memory {
+            Some(memory) => memory.pending_snapshots().await,
+            None => Vec::new(),
+        }
+    }
+
     pub fn new(agent: Arc<dyn AgentPort>, mirror: Arc<dyn SessionMirrorPort>) -> Self {
         Self {
             agent,
@@ -159,6 +167,19 @@ impl SessionService {
                 "Session preparation timed out; no prompt was submitted".into(),
             )
         })?
+    }
+
+    /// Read canonical history already retained by this service without waking
+    /// the agent. Session metadata and live deltas alone are not a history read;
+    /// callers must use `get_snapshot` when this returns `None`.
+    pub async fn retained_snapshot(&self, asid: &AgentSessionId) -> Option<AgentSessionSnapshot> {
+        let memory = self.memory.as_ref()?;
+        if !memory.history_initialized(asid).await {
+            return None;
+        }
+        let mut snapshot = self.mirror.get_snapshot(asid).await?;
+        self.observe_runtime(&mut snapshot.info).await;
+        Some(snapshot)
     }
 
     pub async fn get_snapshot(
@@ -546,6 +567,56 @@ pub(crate) mod tests {
     use crate::agents::domain::*;
     use crate::agents::ports::agent::AgentFuture;
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn retained_snapshot_requires_canonical_history_and_preserves_known_empty() {
+        let row = TimelineItem {
+            id: "answer".into(),
+            message_id: "answer".into(),
+            role: TimelineRole::Assistant,
+            part: AgentPart::Text {
+                text: "retained answer".into(),
+            },
+            seq: 1,
+            updated_ms: 1,
+            ordinal: 0,
+            attachments: None,
+            image_assets: None,
+            generation: None,
+            origin: None,
+        };
+        for history in [vec![row], vec![]] {
+            let preparation_log = Arc::new(Mutex::new(Vec::new()));
+            let mut agent = crate::test_support::FakeAgent::new("codex")
+                .with_sessions(&[("restored", 1)])
+                .with_timeline(history.clone());
+            agent.preparation_log = Some(preparation_log.clone());
+            let mirror =
+                Arc::new(crate::agents::adapters::memory_mirror::MemoryMirror::for_agent("codex"));
+            let asid = AgentSessionId("restored".into());
+            mirror
+                .update_session(crate::test_support::fake_session("restored", 1))
+                .await;
+            let service = SessionService::with_memory_mirror(Arc::new(agent), mirror);
+
+            // Metadata exists before opening, but must not truncate history.
+            assert!(service.retained_snapshot(&asid).await.is_none());
+            assert!(preparation_log.lock().unwrap().is_empty());
+            let loaded = service.get_snapshot(&asid).await.unwrap();
+            assert_eq!(loaded.timeline.len(), history.len());
+            assert_eq!(
+                loaded.timeline.first().map(|item| &item.part),
+                history.first().map(|item| &item.part)
+            );
+            preparation_log.lock().unwrap().clear();
+
+            // A genuinely empty canonical read is retained too, without
+            // activating another follower when the desktop peeks or refreshes.
+            let retained = service.retained_snapshot(&asid).await.unwrap();
+            assert_eq!(retained.timeline, loaded.timeline);
+            assert!(preparation_log.lock().unwrap().is_empty());
+        }
+    }
 
     /// A page-capable fake kept here so route tests exercise the same service.
     pub(crate) struct PageAgent {

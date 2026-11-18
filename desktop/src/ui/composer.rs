@@ -5,9 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use muqun_gateway::agents::{AgentSessionId, ModelRef};
-use rune::{
-    col, el, row, text, Cursor, El, ImageCache, Phase, PillStyle, SurfaceFit, TextEdit, Tx,
-};
+use rune::{col, el, row, text, Cursor, El, ImageCache, PillStyle, SurfaceFit, TextEdit, Tx};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, Menu, MenuItem, ScrollBar,
     TextArea,
@@ -33,6 +31,12 @@ pub(crate) fn fresh(text: impl Into<String>) -> TextEdit {
     edit.focused = true;
     edit
 }
+
+pub static SEND: rune::Icon = rune::Icon {
+    name: "composer-send",
+    view: 24.0,
+    body: r#"<path d="M6 18 18 6M6 6h12v12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
 
 pub static PHOTO: rune::Icon = rune::Icon {
     name: "composer-photo",
@@ -64,6 +68,7 @@ pub fn insert_image_pill(draft: &mut TextEdit, token: u64) -> usize {
 
 pub fn stage_png(s: &mut UiState, png: Vec<u8>) {
     let id = s.next_token;
+    s.pending_image_uploads.insert(id);
     s.next_token += 1;
     s.send(Command::Compose(ComposeCommand::Stage {
         id,
@@ -74,6 +79,11 @@ pub fn stage_png(s: &mut UiState, png: Vec<u8>) {
 
 pub fn stage_path(s: &mut UiState, path: PathBuf) {
     let id = s.next_token;
+    let target = (s.mode == super::Mode::Session)
+        .then(|| s.selected.clone())
+        .flatten();
+    s.pending_file_targets
+        .insert(id, (s.current_computer().to_owned(), target));
     s.next_token += 1;
     let name = path
         .file_name()
@@ -91,13 +101,12 @@ pub fn attach_dropped_files(s: &mut UiState, files: &[PathBuf]) {
     if files.is_empty() {
         return;
     }
-    let mut attached_images = 0;
     for path in files {
         let is_img = crate::model::compose::image_name(&path.to_string_lossy());
         let token = s.next_token;
         stage_path(s, path.clone());
         if is_img {
-            attached_images += 1;
+            s.pending_image_uploads.insert(token);
             let draft = if s.mode == super::Mode::Session {
                 &mut s.draft
             } else {
@@ -106,22 +115,6 @@ pub fn attach_dropped_files(s: &mut UiState, files: &[PathBuf]) {
             insert_image_pill(draft, token);
         }
     }
-    let language = s.cfg.general.language;
-    let msg = if files.len() == 1 {
-        if attached_images > 0 {
-            crate::ui::copy::t(language, "Attached image")
-        } else {
-            crate::ui::copy::t(language, "Attached file")
-        }
-    } else {
-        format!(
-            "{} ({})",
-            crate::ui::copy::t(language, "Attached files"),
-            files.len()
-        )
-    };
-    s.status = msg.clone();
-    s.toast(msg, None);
 }
 
 /// Ctrl/Cmd+V into the draft: stage copied files or a clipboard image; leave
@@ -232,9 +225,13 @@ pub(super) fn note_skill_args(s: &mut UiState, deliver: &Deliver) {
     );
 }
 
-/// Send the draft. While the agent works it steers the running turn, as on
-/// the App; [`queue_session`] (Alt+Enter) waits for the turn to end instead.
-/// A quiet composer surface with a visible focus border and shallow elevation.
+/// A compact floating capsule for the active project or session controls.
+pub fn context_capsule(k: &Kit, look: &crate::theme::look::Look, content: El) -> El {
+    look.panel(k, content.px(14.0).py(8.0), k.radius.xl)
+        .border(1.0, k.c.border_muted.alpha(0.45))
+}
+
+/// A single frosted surface with a soft, theme-aware rim.
 pub fn composer_card(
     k: &Kit,
     look: &crate::theme::look::Look,
@@ -243,36 +240,42 @@ pub fn composer_card(
     busy: bool,
     drop_hover: bool,
 ) -> El {
-    let active = focused || busy || drop_hover;
-    let accent = k.c.bg_accent;
-    let radius = k.radius.lg;
-    let card = card
-        .radius(radius)
-        .clip_rounded(radius)
-        .fill(k.c.surface_raised_base)
+    let active = focused || drop_hover;
+    let base = look.panel_fill(k);
+    let card = look
+        .panel(k, card, k.radius.xl)
         .linear_gradient(
-            0.35,
+            0.65,
             [
-                (
-                    0.0,
-                    k.c.surface_raised_base
-                        .mix(accent, if look.dark { 0.15 } else { 0.05 }),
-                ),
-                (0.55, k.c.surface_raised_base),
-                (
-                    1.0,
-                    k.c.surface_raised_base
-                        .mix(k.c.info.icon, if look.dark { 0.09 } else { 0.03 }),
-                ),
+                (0.0, base.mix(k.c.info.icon, 0.08)),
+                (0.55, base),
+                (1.0, base.mix(k.c.bg_accent, 0.10)),
             ],
         )
-        .child(
-            look.energy_line(k, "composer-energy", busy)
-                .pin(Some(14.0), Some(0.0), Some(14.0), None)
-                .opacity(if active { 1.0 } else { 0.35 }),
+        .border_gradient(
+            1.0,
+            k.c.info.icon.alpha(if active { 0.80 } else { 0.30 }),
+            k.c.bg_accent.alpha(if active { 0.65 } else { 0.25 }),
         )
+        .box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 16.0,
+            blur: 42.0,
+            spread: -8.0,
+            color: k.c.black.alpha(if look.dark { 0.45 } else { 0.12 }),
+            inset: false,
+        })
         .motion(look.focus_fade());
-    look.luminous(k, card, active)
+    if busy {
+        card.child(look.energy_line(k, "composer-energy", true).w(120.0).pin(
+            Some(28.0),
+            Some(0.0),
+            None,
+            None,
+        ))
+    } else {
+        card
+    }
 }
 
 /// A composer card (a [`Look::panel`](crate::theme::look::Look::panel))
@@ -458,6 +461,14 @@ pub(super) fn on_draft_change(s: &mut UiState, slot: Slot) {
         }
     }
 
+    let live: Vec<String> = draft_of(s, slot)
+        .pills()
+        .map(|(_, id)| id.to_owned())
+        .collect();
+    s.staged.retain(|file| {
+        file.draft_token
+            .is_none_or(|id| live.contains(&format!("image:{id}")))
+    });
     ensure_mention_pills(s, slot);
     s.persist_draft(slot);
 
@@ -561,13 +572,27 @@ fn apply_pick(
     s.persist_draft(slot);
 }
 
-/// Pull a queued prompt back into the draft (App parity). Attachments cannot
-/// follow, so those items stay cancel-only.
+/// Pull a queued prompt and its uploaded attachments back into the draft.
 pub(super) fn edit_queued(s: &mut UiState, id: &str, text: String) {
     s.menu = None;
     let Some(asid) = s.selected.clone() else {
         return;
     };
+    let Some(item) = s.queue.iter().find(|q| q.id == id).cloned() else {
+        return;
+    };
+    s.composer_queue_delivery = !item.steer;
+    for file in item.files {
+        if !s.staged.iter().any(|f| f.path == file.path) {
+            s.staged.push(crate::model::compose::StagedFile {
+                draft_token: None,
+                path: file.path,
+                name: file.name,
+                image: file.image,
+                size: 0,
+            });
+        }
+    }
     s.queue.retain(|q| q.id != id);
     s.send(Command::Compose(ComposeCommand::InboxCancel {
         asid: AgentSessionId(asid),
@@ -665,11 +690,34 @@ fn staged_chip(s: &UiState, k: &Kit, i: usize, file: &crate::model::compose::Sta
         .label(format!("{} {}", tr_ref(language, "Remove"), file.name))
         .on_press(move |s: &mut UiState| {
             if i < s.staged.len() {
-                s.staged.remove(i);
+                let file = s.staged.remove(i);
+                if let Some(id) = file.draft_token {
+                    let slot = if s.mode == super::Mode::Session {
+                        Slot::Session
+                    } else {
+                        Slot::Start
+                    };
+                    remove_image_pill(draft_of_mut(s, slot), id);
+                    on_draft_change(s, slot);
+                }
             }
         })
         .build(k)
         .key(format!("staged-btn-{i}"));
+    let label = rune::text(super::timeline::clip(&file.name, 32))
+        .font(k.ty.small)
+        .color(k.c.text_base);
+    let preview = row().center_y().gap(6.0).child(lead).child(label);
+    let preview = if file.image && Path::new(&file.path).is_file() {
+        let path = PathBuf::from(&file.path);
+        k.interactive(preview)
+            .key(format!("staged-preview-{i}"))
+            .label(file.name.clone())
+            .cursor(Cursor::Pointer)
+            .on_press(move |s: &mut UiState| s.zoom = Some(path.clone()))
+    } else {
+        preview
+    };
     row()
         .key(format!("staged-{i}"))
         .h(32.0)
@@ -679,13 +727,7 @@ fn staged_chip(s: &UiState, k: &Kit, i: usize, file: &crate::model::compose::Sta
         .radius(k.radius.md)
         .fill(k.c.text_base.alpha(0.06))
         .help(file.path.clone())
-        .child(lead.a11y_hidden())
-        .child(
-            rune::text(super::timeline::clip(&file.name, 32))
-                .font(k.ty.small)
-                .color(k.c.text_base)
-                .a11y_hidden(),
-        )
+        .child(preview)
         .child(remove)
 }
 
@@ -709,9 +751,18 @@ fn queued_chip(
     );
     let mut menu = Menu::new(format!("queued-{id}"))
         .trigger(
-            Button::new(label)
-                .variant(ButtonVariant::Outline)
-                .control_size(ControlSize::Small)
+            Button::new(label.clone())
+                .label_with(move |font, ink| {
+                    row().w_full().min_w(0.0).child(
+                        text(label.clone())
+                            .font(font)
+                            .color(ink)
+                            .truncate()
+                            .min_w(0.0),
+                    )
+                })
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Large)
                 .expanded(open)
                 .on_press({
                     let id = id.clone();
@@ -720,18 +771,13 @@ fn queued_chip(
                     }
                 })
                 .build(k)
-                .key(format!("queued-pill-{id}")),
+                .key(format!("queued-pill-{id}"))
+                .min_w(0.0)
+                .w_full(),
         )
         .open(open)
         .min_width(160.0)
         .on_close(|s: &mut UiState| s.menu = None);
-    if item.files.is_empty() {
-        let (edit_id, text) = (id.clone(), item.text.clone());
-        menu = menu.item(
-            MenuItem::new(tr_ref(language, "Edit"))
-                .on_select(move |s: &mut UiState| edit_queued(s, &edit_id, text.clone())),
-        );
-    }
     let (steer_id, next_steer) = (id.clone(), !item.steer);
     menu = menu.item(
         MenuItem::new(if item.steer {
@@ -741,21 +787,20 @@ fn queued_chip(
         })
         .on_select(move |s: &mut UiState| toggle_queued_steer(s, &steer_id, next_steer)),
     );
-    let cancel_id = id.clone();
-    let pill = menu
-        .item(
-            MenuItem::new(tr_ref(language, "Cancel"))
-                .danger(true)
-                .on_select(move |s: &mut UiState| cancel_queued(s, &cancel_id)),
-        )
-        .build(k, layer);
-    let mut chip_row = row()
+    let pill = menu.build(k, layer);
+    let chip_row = row()
         .key(format!("queued-row-{id}"))
-        .gap(4.0)
+        .matched(format!("queued-row-{id}"))
+        .w_full()
+        .min_w(0.0)
+        .gap(8.0)
+        .center_y();
+    let mut content = row()
+        .grow(1.0)
+        .min_w(0.0)
         .center_y()
         .px(4.0)
-        .py(2.0)
-        .radius(k.radius.md)
+        .radius(k.radius.xl)
         .fill(k.c.bg_base.alpha(0.65))
         .border(1.0, k.c.border_weak);
     let thumbs: Vec<&str> = item
@@ -765,29 +810,37 @@ fn queued_chip(
         .map(|f| f.path.as_str())
         .collect();
     if let Some(thumbs) = queue_thumbs(s, k, &format!("q-{id}"), &thumbs) {
-        chip_row = chip_row.child(thumbs);
+        content = content.child(thumbs);
     }
-    chip_row = chip_row.child(pill);
-    if item.files.is_empty() {
+    let mut chip_row = chip_row.child(content.child(pill.grow(1.0).min_w(0.0)));
+    {
         let (edit_id, text) = (id.clone(), item.text.clone());
         chip_row = chip_row.child(
-            Button::new(tr_ref(language, "Edit"))
-                .variant(ButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
+            rune_kit::IconButton::new(&super::parts::glyphs::EDIT_FILE)
+                .label(tr_ref(language, "Edit"))
+                .help(tr_ref(language, "Edit"))
+                .variant(rune_kit::IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Large)
                 .on_press(move |s: &mut UiState| edit_queued(s, &edit_id, text.clone()))
                 .build(k)
-                .key(format!("queued-edit-{id}")),
+                .key(format!("queued-edit-{id}"))
+                .radius(k.radius.xl)
+                .fill(k.c.bg_base.alpha(0.65))
+                .border(1.0, k.c.border_weak),
         );
     }
     let cancel_inline_id = id.clone();
     chip_row.child(
         rune_kit::IconButton::new(k.glyph.close)
             .variant(rune_kit::IconButtonVariant::GhostMuted)
-            .control_size(ControlSize::Small)
+            .control_size(ControlSize::Large)
             .label(tr_ref(language, "Cancel"))
             .on_press(move |s: &mut UiState| cancel_queued(s, &cancel_inline_id))
             .build(k)
-            .key(format!("queued-cancel-{id}")),
+            .key(format!("queued-cancel-{id}"))
+            .radius(k.radius.xl)
+            .fill(k.c.bg_base.alpha(0.65))
+            .border(1.0, k.c.border_weak),
     )
 }
 
@@ -797,12 +850,94 @@ pub(super) fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
     if s.staged.is_empty() && queue.is_empty() {
         return None;
     }
-    let mut line = row().key("chips").w_full().gap(6.0).flex_wrap().center_y();
-    for (i, file) in s.staged.iter().enumerate() {
-        line = line.child(staged_chip(s, k, i, file));
+    let look = s.look();
+    let mut line = col().key("chips").w_full().gap(8.0);
+    if !s.staged.is_empty() {
+        let mut files = row().w_full().gap(6.0).flex_wrap();
+        for (i, file) in s.staged.iter().enumerate() {
+            files = files.child(staged_chip(s, k, i, file));
+        }
+        line = line.child(files);
     }
-    for item in queue {
-        line = line.child(queued_chip(s, k, layer, item));
+    if !queue.is_empty() {
+        let page = s
+            .composer_queue_page
+            .as_ref()
+            .and_then(|id| queue.iter().position(|q| &q.id == id))
+            .unwrap_or(0);
+        let mut deck = col().key("queue-deck").w_full().max_w(600.0).gap(6.0);
+        if queue.len() > 1 {
+            let next = queue[(page + 1) % queue.len()].id.clone();
+            deck = deck.child(
+                row()
+                    .gap(6.0)
+                    .center_y()
+                    .child(
+                        Button::new(format!(
+                            "{} · {}/{}",
+                            tr_ref(s.cfg.general.language, "Queued:"),
+                            page + 1,
+                            queue.len()
+                        ))
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Large)
+                        .on_press(|s: &mut UiState| {
+                            s.composer_queue_expanded = !s.composer_queue_expanded
+                        })
+                        .build(k)
+                        .key("queue-deck-expand"),
+                    )
+                    .child(
+                        Button::new("›")
+                            .variant(ButtonVariant::GhostMuted)
+                            .control_size(ControlSize::Large)
+                            .help(tr_ref(s.cfg.general.language, "Next"))
+                            .on_press(move |s: &mut UiState| {
+                                s.composer_queue_page = Some(next.clone())
+                            })
+                            .build(k)
+                            .key("queue-deck-next"),
+                    ),
+            );
+        }
+        if s.composer_queue_expanded {
+            let mut pages = col().w_full().gap(6.0);
+            for item in &queue {
+                pages = pages.child(look.arrive(queued_chip(s, k, layer, item), 0));
+            }
+            deck = deck.child(
+                col()
+                    .w_full()
+                    .h((queue.len() as f32 * 44.0).min(220.0))
+                    .scroll(rune::ScrollSpec {
+                        stick_bottom: false,
+                    })
+                    .clip_soft(0.0)
+                    .child(pages)
+                    .scroll_bar(k),
+            );
+        } else {
+            let depth = (queue.len() - 1).min(2);
+            let mut stack = el().w_full().pb(depth as f32 * 5.0);
+            for n in (1..=depth).rev() {
+                stack = stack.child(
+                    el().key(format!("queue-page-{n}"))
+                        .pin(
+                            Some(n as f32 * 8.0),
+                            Some(n as f32 * 5.0),
+                            Some(80.0 + n as f32 * 8.0),
+                            Some(0.0),
+                        )
+                        .radius(k.radius.lg)
+                        .fill(k.c.layer_01)
+                        .border(1.0, k.c.border_weak)
+                        .a11y_hidden(),
+                );
+            }
+            stack = stack.child(look.arrive(queued_chip(s, k, layer, queue[page]), 0));
+            deck = deck.child(stack);
+        }
+        line = line.child(deck);
     }
     Some(line)
 }
@@ -821,7 +956,7 @@ pub fn drop_hint(
         .center()
         .gap(8.0)
         .py(6.0)
-        .radius(crate::theme::look::PANEL_RADIUS)
+        .radius(k.radius.xl)
         .fill(accent.alpha(if dark { 0.20 } else { 0.12 }))
         .border(1.0, accent.alpha(0.6))
         .child(rune::icon(&DROP_ICON, 14.0).color(accent))
@@ -1668,6 +1803,12 @@ pub fn pill(k: &Kit, key: &str, label: String, open: bool, menu: OpenMenu) -> El
         .on_press(move |s: &mut UiState| s.menu = (!open).then(|| menu.clone()))
         .build(k)
         .key(key.to_string())
+        .radius(k.radius.lg)
+        .h(32.0)
+        .px(12.0)
+        .py(0.0)
+        .fill(k.c.layer_01.alpha(0.35))
+        .border(1.0, k.c.border_muted.alpha(0.25))
 }
 
 /// The model menu: every enabled model of the agent's catalogue, by provider.
@@ -1677,6 +1818,7 @@ pub fn model_menu(
     k: &Kit,
     layer: &mut Vec<El>,
     kind: OpenMenu,
+    scope: &str,
     open: bool,
     label: String,
     models: &[(String, String, String)],
@@ -1687,8 +1829,9 @@ pub fn model_menu(
         OpenMenu::StartModel => "start-model",
         _ => "model",
     };
-    // Composers sit at the window's foot: their menus open upward.
-    let mut menu = Menu::new(key)
+    let key = format!("{key}-{scope}");
+    // Each split composer owns its anchor, including inactive previews.
+    let mut menu = Menu::new(&key)
         .placement(rune_kit::Placement::TopStart)
         .trigger(pill(k, &format!("{key}-pill"), label, open, kind))
         .open(open)
@@ -1728,10 +1871,17 @@ pub fn branch_menu(
     let label = format!("⎇ {current}");
     if info.local.len() < 2 {
         return Some(
-            Badge::new(label)
-                .variant(BadgeVariant::Neutral)
-                .build(k)
-                .key(key),
+            row()
+                .key(key)
+                .gap(6.0)
+                .center_y()
+                .child(rune::icon(&super::icons::BRANCH, 16.0).color(k.c.icon_muted))
+                .child(text(current).font(k.ty.small).color(k.c.text_muted))
+                .h(32.0)
+                .px(10.0)
+                .radius(k.radius.lg)
+                .fill(k.c.layer_01.alpha(0.35))
+                .border(0.5, k.c.border_muted.alpha(0.3)),
         );
     }
     let menu = Menu::new(key)
@@ -1803,6 +1953,7 @@ pub(super) fn mode_label(id: &str, catalog_name: Option<&str>) -> String {
 pub(super) fn effort_menu(
     k: &Kit,
     layer: &mut Vec<El>,
+    scope: &str,
     open: bool,
     current: Option<&str>,
     variants: &[String],
@@ -1810,7 +1961,8 @@ pub(super) fn effort_menu(
     let label = current
         .map(super::labels::readable_catalog_id)
         .unwrap_or_else(|| "Default".into());
-    let mut menu = Menu::new("effort")
+    let mut menu = Menu::new(format!("effort-{scope}"))
+        .placement(rune_kit::Placement::TopStart)
         .trigger(pill(k, "effort-pill", label, open, OpenMenu::Effort))
         .open(open)
         .min_width(160.0)
@@ -1831,6 +1983,345 @@ pub(super) fn effort_menu(
     menu.build(k, layer)
 }
 
+pub const AGENT_ICON: f32 = 16.0;
+pub const SEND_ICON: f32 = 18.0;
+
+pub fn body() -> El {
+    col().w_full().gap(12.0).px(24.0).pt(16.0).pb(14.0)
+}
+
+pub fn attachment_button(
+    k: &Kit,
+    language: crate::config::Language,
+    start: Option<PathBuf>,
+    enabled: bool,
+    key: &str,
+) -> El {
+    let attach_help = format!(
+        "{} · {}",
+        tr_ref(language, "Add files or an image"),
+        crate::platform::keys::label("Primary+V")
+    );
+    let attach_press = move |_: &mut UiState| {
+        crate::platform::dialogs::attach_files(start.clone());
+    };
+    rune_kit::IconButton::new(&super::parts::glyphs::ATTACH)
+        .control_size(ControlSize::ExtraLarge)
+        .variant(rune_kit::IconButtonVariant::GhostMuted)
+        .label(tr_ref(language, "Attach"))
+        .help(attach_help)
+        .disabled(!enabled)
+        .on_press(attach_press)
+        .build(k)
+        .key(key)
+}
+
+/// One editor, key handling and attachment paste path for both composer contexts.
+fn newline_key(s: &mut UiState, slot: Slot, ev: &rune::KeyEvent) -> bool {
+    if ev.key != rune::Key::Enter || ev.mods.ctrl || ev.mods.cmd || ev.mods.alt || ev.mods.shift {
+        return false;
+    }
+    let draft = draft_of_mut(s, slot);
+    if draft.key(ev, None).submit {
+        draft.insert("\n");
+    }
+    on_draft_change(s, slot);
+    true
+}
+
+pub fn editor(
+    s: &UiState,
+    k: &Kit,
+    slot: Slot,
+    placeholder: &str,
+    min_rows: usize,
+    max_rows: usize,
+) -> El {
+    let language = s.cfg.general.language;
+    let accent = k.c.bg_accent;
+    let info = k.c.info.icon;
+    TextArea::new(draft_of(s, slot))
+        .placeholder(placeholder)
+        .label(tr_ref(
+            language,
+            if slot == Slot::Start {
+                "First prompt"
+            } else {
+                "Draft"
+            },
+        ))
+        .width(None)
+        .auto_grow(min_rows, max_rows)
+        .pill_style(move |id| {
+            if id.starts_with("computer:") {
+                PillStyle::default().bg(accent.alpha(0.22)).fg(accent)
+            } else if id.starts_with("file:") {
+                PillStyle::default().bg(info.alpha(0.18)).fg(info)
+            } else if id.starts_with("image:") {
+                PillStyle::default()
+                    .bg(info.mix(accent, 0.4).alpha(0.22))
+                    .fg(accent)
+                    .icon(&PHOTO)
+            } else {
+                PillStyle::default()
+            }
+        })
+        .on_edit(move |s: &mut UiState| draft_of_mut(s, slot))
+        .on_change(move |s: &mut UiState, _: &mut Tx| on_draft_change(s, slot))
+        .on_key(move |s: &mut UiState, ev: &rune::KeyEvent, tx: &mut Tx| {
+            if super::keymap::intercept_global_key(s, ev, tx) {
+                return true;
+            }
+            if draft_of(s, slot).preedit().is_some() {
+                return false;
+            }
+            if popup_key(s, slot, ev) {
+                return true;
+            }
+            if super::keymap::bind_matches_cfg(
+                super::keymap::entry(super::keymap::Action::Send),
+                &s.cfg.keymap,
+                ev,
+                tx,
+            ) {
+                match slot {
+                    Slot::Start => super::home::submit_start(s),
+                    Slot::Session => submit_session(s),
+                }
+                return true;
+            }
+            if slot == Slot::Start {
+                if ev.key == rune::Key::Escape && s.error.is_some() {
+                    s.error = None;
+                    return true;
+                }
+                return newline_key(s, slot, ev) || super::keymap::field_key(s, ev, tx, false);
+            }
+            if newline_key(s, slot, ev) {
+                return true;
+            }
+            if ev.key == rune::Key::Escape && s.composer_history_open {
+                s.composer_history_open = false;
+                return true;
+            }
+            if ev.key == rune::Key::Up
+                && !ev.mods.cmd
+                && !ev.mods.alt
+                && (s.draft.text.is_empty() || s.prompt_history_cursor.is_some())
+                && s.prompt_history_prev()
+            {
+                return true;
+            }
+            if ev.key == rune::Key::Down
+                && !ev.mods.cmd
+                && !ev.mods.alt
+                && s.prompt_history_cursor.is_some()
+                && s.prompt_history_next()
+            {
+                return true;
+            }
+            if ev.key == rune::Key::Escape && s.prompt_history_cursor.is_some() {
+                s.reset_prompt_history_cursor();
+                return true;
+            }
+            if ev.key == rune::Key::Escape && s.error.is_some() {
+                s.error = None;
+                return true;
+            }
+            if ev.key == rune::Key::Escape && s.show_diff {
+                s.show_diff = false;
+                return true;
+            }
+            // Alt+Enter while the agent works: queue after this turn.
+            if super::keymap::bind_matches_cfg(
+                super::keymap::entry(super::keymap::Action::Queue),
+                &s.cfg.keymap,
+                ev,
+                tx,
+            ) && s.busy()
+            {
+                queue_session(s);
+                return true;
+            }
+            // Sidebar, pane, and composer keys, ahead of the field's caret moves.
+            let at_end = caret_at_end(&s.draft);
+            super::keymap::field_key(s, ev, tx, at_end)
+        })
+        .on_input_paste(|s: &mut UiState, content, _: &mut Tx| take_paste(s, content))
+        .build(&bare_field(k))
+        .motion(s.look().focus_fade())
+        .key(if slot == Slot::Start {
+            "start-draft"
+        } else {
+            "draft"
+        })
+        .w_full()
+}
+
+fn delivery_button(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
+    let language = s.cfg.general.language;
+    let queue = s.composer_queue_delivery;
+    let open = s.menu == Some(OpenMenu::ComposerDelivery);
+    let disabled = s.selected.is_none()
+        || (s.draft.text.trim().is_empty() && s.staged.is_empty())
+        || s.pending_submit.is_some();
+    let caption = tr_ref(language, if queue { "Queue" } else { "Steer" });
+    let action = if queue {
+        super::keymap::Action::Queue
+    } else {
+        super::keymap::Action::Send
+    };
+    let menu = Menu::new(format!("composer-delivery-menu-{asid}"))
+        .trigger(
+            super::art::direction_button(
+                s,
+                k,
+                format!(
+                    "{} / {}",
+                    tr_ref(language, "Steer"),
+                    tr_ref(language, "Queue")
+                ),
+                if open {
+                    -std::f32::consts::FRAC_PI_2
+                } else {
+                    std::f32::consts::FRAC_PI_2
+                },
+            )
+            .variant(rune_kit::ButtonVariant::GhostMuted)
+            .control_size(ControlSize::Large)
+            .on_press(move |s: &mut UiState| s.menu = (!open).then_some(OpenMenu::ComposerDelivery))
+            .build(k)
+            .key("composer-delivery-options"),
+        )
+        .open(open)
+        .min_width(180.0)
+        .on_close(|s: &mut UiState| s.menu = None)
+        .item(
+            MenuItem::new(tr_ref(language, "Steer"))
+                .checked(!queue)
+                .shortcut(super::keymap::label_with(
+                    super::keymap::Action::Send,
+                    Some(&s.cfg.keymap),
+                ))
+                .on_select(|s: &mut UiState| {
+                    s.composer_queue_delivery = false;
+                    s.menu = None;
+                }),
+        )
+        .item(
+            MenuItem::new(tr_ref(language, "Queue"))
+                .checked(queue)
+                .shortcut(super::keymap::label_with(
+                    super::keymap::Action::Queue,
+                    Some(&s.cfg.keymap),
+                ))
+                .on_select(|s: &mut UiState| {
+                    s.composer_queue_delivery = true;
+                    s.menu = None;
+                }),
+        );
+    row()
+        .key("composer-delivery")
+        .h(32.0)
+        .center_y()
+        .radius(k.radius.lg)
+        .fill(k.c.layer_01)
+        .border(1.0, k.c.border_weak)
+        .child(
+            Button::new(caption)
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Regular)
+                .disabled(disabled)
+                .shortcut(super::keymap::label_with(action, Some(&s.cfg.keymap)))
+                .on_press(|s: &mut UiState| {
+                    if s.composer_queue_delivery {
+                        queue_session(s);
+                    } else {
+                        submit_session(s);
+                    }
+                })
+                .build(k)
+                .key("composer-deliver")
+                .h(32.0),
+        )
+        .child(el().w(1.0).h(16.0).fill(k.c.border_weak))
+        .child(menu.build(k, layer))
+}
+
+/// The same controls and metrics for focused and parked session composers.
+pub(super) fn session_footer(
+    s: &UiState,
+    k: &Kit,
+    layer: &mut Vec<El>,
+    asid: Option<&str>,
+    catalog: Option<&crate::hub::CatalogView>,
+    diff_stat: &crate::model::types::DiffStat,
+) -> El {
+    use super::composer_row as controls_row;
+    let language = s.cfg.general.language;
+    let busy = asid.is_some_and(|id| s.session_busy(id));
+    let inner = rune::memo::layout_with("composer-card", |r| r[2].round())
+        .map_or(f32::INFINITY, |w| w - controls_row::CARD_PAD - 24.0);
+    let room = (inner - if busy { 340.0 } else { 180.0 }).max(80.0);
+    let own_line = asid
+        .and_then(|id| controls_row::Controls::for_session(s, id, catalog))
+        .map(|c| {
+            controls_row::own_line(s, &c, k, layer, room)
+                .key("composer-controls")
+                .w_full()
+        });
+    let mut footer = row()
+        .key("composer-footer")
+        .w_full()
+        .min_w(0.0)
+        .min_h(32.0)
+        .gap(8.0)
+        .center_y();
+    if let Some(controls) = own_line {
+        footer = footer.child(controls.w(0.0).grow(1.0).min_w(80.0));
+    }
+    if let Some(asid) = asid {
+        if crate::plugin::is_enabled("inspector", &s.cfg.plugins_disabled)
+            && s.session_by_id(asid)
+                .and_then(|info| info.directory.as_ref())
+                .and_then(|dir| s.branches.get(dir))
+                .and_then(|b| b.current.as_ref())
+                .is_none()
+        {
+            let label = if diff_stat.files > 0 {
+                format!("Git +{} −{}", diff_stat.added, diff_stat.removed)
+            } else {
+                "Git".into()
+            };
+            footer = footer.child(
+                Button::new(label)
+                    .variant(ButtonVariant::Neutral)
+                    .control_size(ControlSize::Small)
+                    .on_press(|s: &mut UiState| s.toggle_git_inspector())
+                    .build(k)
+                    .key("composer-git")
+                    .h(32.0)
+                    .radius(k.radius.lg),
+            );
+        }
+        let trigger = super::timeline::context_meter(s, k, asid).unwrap_or_else(|| {
+            let target = asid.to_string();
+            Button::new(tr_ref(language, "Context"))
+                .variant(ButtonVariant::Neutral)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut UiState| super::parts::context::open(s, &target))
+                .build(k)
+                .h(32.0)
+                .radius(k.radius.lg)
+        });
+        footer = footer.child(super::parts::context::popover(s, k, layer, asid, trigger));
+    }
+    if busy {
+        footer = footer.child(delivery_button(s, k, layer, asid.unwrap_or("none")));
+    }
+    footer
+}
+
 pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let look = s.look();
     let language = s.cfg.general.language;
@@ -1844,22 +2335,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
 
     // The row under the field: the session's controls on the left (see
     // `composer_row`), the actions on the right.
-    let attach_help = format!(
-        "{} · {}",
-        tr_ref(language, "Add files or an image"),
-        crate::platform::keys::label("Primary+V")
-    );
-    let attach_press = move |_: &mut UiState| {
-        crate::platform::dialogs::attach_files(start.clone());
-    };
-    let attach = rune_kit::IconButton::new(&super::parts::glyphs::ATTACH)
-        .variant(rune_kit::IconButtonVariant::GhostMuted)
-        .label(tr_ref(language, "Attach"))
-        .help(attach_help)
-        .disabled(!has_session)
-        .on_press(attach_press)
-        .build(k)
-        .key("attach");
+    let attach = attachment_button(k, language, start, has_session, "attach");
     let stop_label = tr_ref(language, "Stop");
     let send_label = if busy {
         tr_ref(language, "Steer")
@@ -1867,148 +2343,58 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         tr_ref(language, "Send")
     };
 
-    // The controls fold to fit beside the buttons, measured on the card
-    // itself (a split pane is narrower than the window); only when even
-    // their narrowest fold does not fit do they take a line of their own.
-    use super::composer_row::{self as controls_row, ACTION_GAP, CARD_PAD};
+    // Measure the actual card so controls also fold inside split panes.
+    use super::composer_row::{ACTION_GAP, CARD_PAD};
     let inner = rune::memo::layout_with("composer-card", |r| r[2].round())
-        .map_or(f32::INFINITY, |w| w - CARD_PAD);
-    let button_w = |label: &str| rune::text::measure(label, &[], k.ty.ui_medium, None).0 + 24.0;
-    // Mic, Attach, History, Expand (24 pt each), Send, Stop while working, the gaps.
-    let mut buttons = 4.0 * 24.0 + button_w(send_label) + 5.0 * ACTION_GAP;
-    if busy {
-        buttons += button_w(stop_label) + ACTION_GAP;
+        .map_or(f32::INFINITY, |w| w - CARD_PAD - 24.0);
+    let tools = row().gap(ACTION_GAP).center_y().child(attach);
+    let mut actions = row().key("composer-actions").gap(ACTION_GAP).center_y();
+    if s.cfg.voice.usable() || s.voice.is_some() {
+        actions = actions.child(
+            super::voice::controls(s, k, inner - 110.0)
+                .unwrap_or_else(|| super::voice::mic_button(s, k)),
+        );
     }
-    // Narrower still, Mic, Attach, History and Expand join the controls' line
-    // so Stop and Send keep their words.
-    let squeezed = inner < buttons;
-    let expand_icon = if s.composer_expanded || s.composer_rows.is_some() {
-        &super::icons::COLLAPSE
-    } else {
-        &super::icons::EXPAND
-    };
-    let expand_label = if s.composer_expanded || s.composer_rows.is_some() {
-        tr_ref(language, "Collapse")
-    } else {
-        tr_ref(language, "Expand")
-    };
-    let expand_help = if s.composer_expanded || s.composer_rows.is_some() {
-        super::keymap::tip(
-            tr_ref(language, "Collapse composer"),
-            super::keymap::Action::ExpandComposer,
-        )
-    } else {
-        super::keymap::tip(
-            tr_ref(language, "Expand composer"),
-            super::keymap::Action::ExpandComposer,
-        )
-    };
-    let expand_btn = rune_kit::IconButton::new(expand_icon)
-        .variant(rune_kit::IconButtonVariant::GhostMuted)
-        .label(expand_label)
-        .help(expand_help)
-        .on_press(|s: &mut UiState| {
-            if s.composer_expanded || s.composer_rows.is_some() {
-                s.composer_expanded = false;
-                s.composer_rows = None;
-            } else {
-                s.composer_expanded = true;
-                s.composer_rows = Some(14);
-            }
-        })
-        .build(k)
-        .key("composer-expand");
-
-    let history_btn = rune_kit::IconButton::new(&super::parts::glyphs::TIME)
-        .variant(if s.composer_history_open {
-            rune_kit::IconButtonVariant::Contrast
-        } else {
-            rune_kit::IconButtonVariant::GhostMuted
-        })
-        .label(tr_ref(language, "History"))
-        .help(super::keymap::tip(
-            tr_ref(language, "Prompt history"),
-            super::keymap::Action::PromptHistory,
-        ))
-        .on_press(|s: &mut UiState| {
-            s.composer_history_open = !s.composer_history_open;
-        })
-        .build(k)
-        .key("composer-history");
-
-    let mut tools = Some(
-        row()
-            .gap(ACTION_GAP)
-            .center_y()
-            .child(super::voice::mic_button(s, k))
-            .child(attach)
-            .child(history_btn)
-            .child(expand_btn),
-    );
-    let tools_w = 4.0 * 24.0 + 4.0 * ACTION_GAP;
-    let controls = controls_row::Controls::read(s);
-    // Keep a readable model/mode row in narrow panes instead of compressing
-    // it into a run of indistinguishable icons beside microphone and send.
-    let beside = controls
-        .as_ref()
-        .filter(|_| inner - buttons >= 220.0)
-        .and_then(|c| controls_row::beside(s, c, k, layer, inner - buttons));
-    let mut own_line = None;
-    if beside.is_none() {
-        let mut line = row()
-            .key("composer-controls")
-            .w_full()
-            .gap(ACTION_GAP)
-            .center_y();
-        let mut room = inner;
-        if squeezed {
-            line = line.children(tools.take());
-            room -= tools_w;
-        }
-        if let Some(c) = &controls {
-            line = line.child(controls_row::own_line(s, c, k, layer, room));
-        }
-        own_line = Some(line);
-    }
-    let mut actions = row()
-        .key("composer-actions")
-        .w_full()
-        .gap(ACTION_GAP)
-        .center_y();
-    if let Some(r) = beside {
-        actions = actions.child(r.shrink().min_w(0.0)).child(el().grow(1.0));
-    }
-    if let Some(tools) = tools {
-        actions = actions.child(tools);
-    }
-    if own_line.is_some() {
-        actions = actions.child(el().grow(1.0));
-    }
-    if busy {
+    if busy && s.voice.is_none() {
         if let Some(asid) = s.selected.clone() {
             actions = actions.child(
                 Button::new(stop_label)
                     .variant(ButtonVariant::Danger)
                     .control_size(ControlSize::Regular)
-                    .shortcut(super::keymap::label(super::keymap::Action::Stop))
+                    .shortcut(super::keymap::label_with(
+                        super::keymap::Action::Stop,
+                        Some(&s.cfg.keymap),
+                    ))
                     .on_press(move |s: &mut UiState| {
                         s.send(Command::Interrupt(AgentSessionId(asid.clone())))
                     })
                     .build(k)
-                    .key("stop"),
+                    .key("stop")
+                    .h(36.0)
+                    .radius(k.radius.lg),
             );
         }
     }
     let send = Button::new(send_label)
+        .label_with(move |font, ink| {
+            if busy {
+                text(send_label).font(font).color(ink)
+            } else {
+                rune::icon(&SEND, SEND_ICON).color(ink)
+            }
+        })
         .variant(ButtonVariant::Submit)
         .control_size(ControlSize::Regular)
         .disabled(!has_session || !has_text || s.pending_submit.is_some())
-        .shortcut("Primary+Enter")
+        .shortcut(super::keymap::label_with(
+            super::keymap::Action::Send,
+            Some(&s.cfg.keymap),
+        ))
         .help(if busy {
             format!(
                 "{} · {} {}",
                 tr_ref(language, "Steer the running turn"),
-                crate::platform::keys::label("Alt+Enter"),
+                super::keymap::label_with(super::keymap::Action::Queue, Some(&s.cfg.keymap)),
                 tr_ref(language, "queues it instead")
             )
         } else {
@@ -2017,201 +2403,457 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .on_press(submit_session)
         .build(k)
         .key("send");
-    actions = actions.child(look.glow(
+    let send = if busy {
+        send.h(36.0).radius(k.radius.lg)
+    } else {
+        send.size(36.0, 36.0).radius(k.radius.lg)
+    };
+    let send = look.glow(
         send,
         k.c.bg_accent,
         if has_text && has_session { 0.9 } else { 0.0 },
-    ));
+    );
+    if !busy && s.voice.is_none() {
+        actions = actions.child(send);
+    }
+
+    let actions = row()
+        .w_full()
+        .center_y()
+        .child(tools)
+        .child(el().grow(1.0))
+        .child(actions);
 
     popup(s, k, layer, Slot::Session);
     history_popup(s, k, layer, Slot::Session);
-    let mut card = col()
-        .key("composer-card")
-        .w_full()
-        .gap(8.0)
-        .px(12.0)
-        .pt(8.0)
-        .pb(10.0);
-
-    let resizer = row()
-        .key("composer-resizer")
-        .w_full()
-        .h(4.0)
-        .center()
-        .child(
-            el().key("composer-resizer-pill")
-                .w(36.0)
-                .h(4.0)
-                .radius(2.0)
-                .cursor(Cursor::ResizeRow)
-                .role("separator")
-                .label(tr_ref(language, "Resize composer"))
-                .fill(if s.composer_rows.is_some() {
-                    k.c.bg_accent.alpha(0.7)
-                } else {
-                    k.c.border_muted.alpha(0.5)
-                })
-                .hover(k.c.bg_accent)
-                .on_drag(
-                    |s: &mut UiState, d: &mut rune::Drag, _: &mut Tx| match d.phase {
-                        Phase::Down => {
-                            let cur =
-                                s.composer_rows
-                                    .unwrap_or(if s.composer_expanded { 12 } else { 3 });
-                            d.data = cur as f32;
-                        }
-                        Phase::Move => {
-                            let delta = (-d.dy / 18.0).round() as i32;
-                            let target = (d.data as i32 + delta).clamp(2, 24) as usize;
-                            s.composer_rows = Some(target);
-                        }
-                        _ => {}
-                    },
-                ),
-        );
-    card = card.child(resizer);
-    if let Some(chips) = chips(s, k, layer) {
-        card = card.child(chips);
+    let compact = s.in_split();
+    let mut card = if compact {
+        col().w_full().gap(4.0).px(16.0).pt(8.0).pb(8.0)
+    } else {
+        body()
     }
+    .key("composer-card");
+
     if s.drop_hover {
         card = card.child(drop_hint(k, &look, language));
     }
     let placeholder = if has_session {
-        let full = tr_ref(language, "Message…  (/ commands, $ skills, @ mentions)");
-        // A narrow card keeps the hint to one line.
-        if rune::text::measure(full, &[], k.ty.ui, None).0 + 24.0 <= inner {
-            full
-        } else {
-            tr_ref(language, "Message…  (/ $ @)")
-        }
+        tr_ref(language, "Message…")
     } else {
         tr_ref(language, "Pick a session first")
     };
-    let accent = k.c.bg_accent;
-    let info = k.c.info.icon;
-    let (min_rows, max_rows) = if let Some(r) = s.composer_rows {
-        (r, r.max(8))
-    } else if s.composer_expanded {
-        (10, 24)
-    } else {
-        (2, 8)
-    };
-    if let Some(dictation) = super::voice::strip(s, k) {
-        card = card.child(dictation);
-    }
-    card = card.child(
-        TextArea::new(&s.draft)
-            .placeholder(placeholder)
-            .label(tr_ref(language, "Draft"))
-            .width(None)
-            .auto_grow(min_rows, max_rows)
-            .pill_style(move |id| {
-                if id.starts_with("computer:") {
-                    PillStyle::default().bg(accent.alpha(0.22)).fg(accent)
-                } else if id.starts_with("file:") {
-                    PillStyle::default().bg(info.alpha(0.18)).fg(info)
-                } else if id.starts_with("image:") {
-                    PillStyle::default()
-                        .bg(info.mix(accent, 0.4).alpha(0.22))
-                        .fg(accent)
-                        .icon(&PHOTO)
-                } else {
-                    PillStyle::default()
-                }
-            })
-            .on_edit(|s: &mut UiState| &mut s.draft)
-            .on_change(|s: &mut UiState, _: &mut Tx| on_draft_change(s, Slot::Session))
-            .on_key(|s: &mut UiState, ev: &rune::KeyEvent, tx: &mut Tx| {
-                if super::keymap::intercept_global_key(s, ev, tx) {
-                    return true;
-                }
-                if popup_key(s, Slot::Session, ev) {
-                    return true;
-                }
-                if ev.key == rune::Key::Escape && s.composer_history_open {
-                    s.composer_history_open = false;
-                    return true;
-                }
-                if ev.key == rune::Key::Up
-                    && !ev.mods.cmd
-                    && !ev.mods.alt
-                    && (s.draft.text.is_empty() || s.prompt_history_cursor.is_some())
-                    && s.prompt_history_prev()
-                {
-                    return true;
-                }
-                if ev.key == rune::Key::Down
-                    && !ev.mods.cmd
-                    && !ev.mods.alt
-                    && s.prompt_history_cursor.is_some()
-                    && s.prompt_history_next()
-                {
-                    return true;
-                }
-                if ev.key == rune::Key::Escape && s.prompt_history_cursor.is_some() {
-                    s.reset_prompt_history_cursor();
-                    return true;
-                }
-                if ev.key == rune::Key::Escape && s.error.is_some() {
-                    s.error = None;
-                    return true;
-                }
-                if ev.key == rune::Key::Escape && s.show_diff {
-                    s.show_diff = false;
-                    return true;
-                }
-                // Alt+Enter while the agent works: queue after this turn.
-                if super::keymap::entry(super::keymap::Action::Queue)
-                    .keybind()
-                    .matches_tx(ev, tx)
-                    && s.busy()
-                {
-                    queue_session(s);
-                    return true;
-                }
-                // Sidebar, pane, and composer keys, ahead of the field's caret moves.
-                let at_end = caret_at_end(&s.draft);
-                super::keymap::field_key(s, ev, tx, at_end)
-            })
-            .on_submit(|s: &mut UiState, _: &mut Tx| submit_session(s))
-            .on_input_paste(|s: &mut UiState, content, _: &mut Tx| take_paste(s, content))
-            .build(&bare_field(k))
-            .key("draft")
-            .w_full(),
+    let draft_editor = editor(
+        s,
+        k,
+        Slot::Session,
+        placeholder,
+        if compact { 1 } else { 2 },
+        12,
     );
-    card = card.child(
-        el().key("composer-controls-rule")
-            .w_full()
-            .h(1.0)
-            .fill(k.c.border_muted)
-            .a11y_hidden(),
-    );
-    if let Some(line) = own_line {
-        card = card.child(line);
-    }
-    card = card.child(actions);
+    let draft_editor =
+        if let Some(voice) = s.voice.as_ref().filter(|v| !v.partial.trim().is_empty()) {
+            let mut preview = s.draft.text.clone();
+            if !preview.is_empty() && !preview.ends_with(char::is_whitespace) {
+                preview.push(' ');
+            }
+            preview.push_str(&voice.partial);
+            // The real draft determines height and stays untouched until final transcription.
+            el().key("voice-draft-preview")
+                .w_full()
+                .child(draft_editor.opacity(0.0))
+                .child(
+                    col()
+                        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                        .clip_soft(0.0)
+                        .scroll(rune::ScrollSpec { stick_bottom: true })
+                        .on_press(|_: &mut UiState| {})
+                        .child(text(preview).font(k.ty.body).color(k.c.text_base)),
+                )
+        } else {
+            draft_editor
+        };
+    card = card.child(draft_editor);
+    card = card.child(actions.w_full());
 
     // Keep focus visible without competing with the message content.
     let card = composer_card(k, &look, card, focused, busy, s.drop_hover)
+        .on_hover_change(|s: &mut UiState, inside, _| {
+            if inside
+                && s.menu.is_none()
+                && s.row_menu.is_none()
+                && s.context_open.is_none()
+                && s.zoom.is_none()
+                && s.detail.is_none()
+                && !s.timeline_search.active
+                && s.tile_drag.is_none()
+                && s.tile_card_drag.is_none()
+                && s.draft.preedit().is_none()
+            {
+                s.draft.focused = true;
+                s.term.sink.focused = false;
+            }
+        })
         .on_drop_files(|s: &mut UiState, files, _| attach_dropped_files(s, files))
         .on_drop_hover(|s: &mut UiState, over, _| s.drop_hover = over);
 
     // The messages' reading column: as wide and as centred as they are on
     // a wide window, the whole width on a narrow one.
     let column = super::timeline::FEED_MAX_W;
+    let mut deck = col().w_full().max_w(column).gap(6.0);
+    if let Some(asid) = s.selected.as_deref() {
+        let pending = super::parts::question::pending_forms(s, asid);
+        let permissions = s
+            .waiting_perms
+            .get(asid)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if !pending.is_empty() || !permissions.is_empty() {
+            let height = rune::memo::layout_with("main", |r| r[3] * 0.4)
+                .unwrap_or(320.0)
+                .clamp(140.0, 360.0);
+            deck = deck.child(
+                col()
+                    .key("pending-questions")
+                    .motion(look.focus_fade())
+                    .w_full()
+                    .max_h(height)
+                    .gap(8.0)
+                    .children(permissions.iter().map(|request| {
+                        super::parts::approval::permission_card(s, k, request)
+                            .key(format!("pending-permission-{}", request.id))
+                    }))
+                    .children(pending.into_iter().map(|form| {
+                        let card = super::parts::question::form_card(s, k, form)
+                            .key(format!("pending-question-{}", form.id));
+                        if look.motion {
+                            card.transition(
+                                rune::Transition::opacity()
+                                    .combined(rune::Transition::offset(0.0, 6.0)),
+                            )
+                            .motion(look.focus_fade())
+                        } else {
+                            card.motion(rune::Spring::NONE)
+                        }
+                    }))
+                    .scroll(rune::ScrollSpec {
+                        stick_bottom: false,
+                    })
+                    .scroll_bar(k),
+            );
+        }
+    }
+    if let Some(chips) = chips(s, k, layer) {
+        deck = deck.child(chips);
+    }
+    let footer = session_footer(
+        s,
+        k,
+        layer,
+        s.selected.as_deref(),
+        s.catalog.as_deref(),
+        &s.diff_stat,
+    );
+    deck = deck.child(card.w_full()).child(footer);
     col()
         .key("composer")
         .w_full()
         .items_center()
         .px(16.0)
         .pt(6.0)
-        .pb(14.0)
-        .child(card.w_full().max_w(column))
+        .pb(8.0)
+        .child(deck)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editing_a_steered_image_preserves_files_and_delivery_without_sending() {
+        use crate::model::compose::{InboxItem, QueuedFile};
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.selected = Some("session".into());
+        s.composer_queue_delivery = true;
+        s.queue.push(InboxItem {
+            id: "pending".into(),
+            text: "Look at this image".into(),
+            steer: true,
+            files: vec![QueuedFile {
+                path: "/uploads/image.png".into(),
+                name: "image.png".into(),
+                image: true,
+            }],
+        });
+        edit_queued(&mut s, "pending", "Look at this image".into());
+        assert_eq!(s.draft.text, "Look at this image");
+        assert!(!s.composer_queue_delivery);
+        assert_eq!(s.staged.len(), 1);
+        assert_eq!(s.staged[0].path, "/uploads/image.png");
+        assert!(s.staged[0].image);
+        assert!(s.queue.is_empty());
+        let mut cancelled = false;
+        while let Ok(command) = rx.try_recv() {
+            match command {
+                Command::Compose(ComposeCommand::InboxCancel { item, .. }) => {
+                    assert_eq!(item, "pending");
+                    cancelled = true;
+                }
+                Command::Compose(ComposeCommand::Submit { .. }) => {
+                    panic!("editing must not submit")
+                }
+                _ => {}
+            }
+        }
+        assert!(cancelled);
+    }
+
+    #[test]
+    fn composer_grows_and_shrinks_with_content_in_both_contexts() {
+        use rune::{Env, Runtime};
+        for scene_name in ["home", "session"] {
+            let (tx, _rx) = crate::ui::commands::channel();
+            let mut s = UiState::new(tx);
+            s.splash = None;
+            let (_, scene) = crate::ui::scenes::scenes()
+                .iter()
+                .find(|(name, _)| *name == scene_name)
+                .unwrap();
+            scene(&mut s);
+            let slot = if scene_name == "home" {
+                Slot::Start
+            } else {
+                Slot::Session
+            };
+            let key = if slot == Slot::Start {
+                "start-draft"
+            } else {
+                "draft"
+            };
+            *draft_of_mut(&mut s, slot) = fresh("");
+            let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+            for _ in 0..60 {
+                rt.frame(1.0 / 60.0);
+            }
+            let height = |rt: &Runtime<UiState>| {
+                rt.elements()
+                    .into_iter()
+                    .find(|n| n.key.as_deref() == Some(key))
+                    .unwrap()
+                    .rect[3]
+            };
+            let initial = height(&rt);
+            *draft_of_mut(&mut rt.state, slot) =
+                fresh("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+            rt.invalidate();
+            for _ in 0..60 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert!(height(&rt) > initial + 40.0, "{scene_name} did not grow");
+            *draft_of_mut(&mut rt.state, slot) = fresh("");
+            rt.invalidate();
+            for _ in 0..60 {
+                rt.frame(1.0 / 60.0);
+            }
+            assert!(
+                (height(&rt) - initial).abs() < 1.0,
+                "{scene_name} did not shrink"
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_picker_changes_mode_without_sending_until_pressed() {
+        use rune::{Env, Runtime};
+        for (item, expected) in [(1, "queue"), (0, "steer")] {
+            let (tx, mut rx) = crate::ui::commands::channel();
+            let mut state = UiState::new(tx);
+            state.splash = None;
+            let (_, scene) = crate::ui::scenes::scenes()
+                .iter()
+                .find(|(n, _)| *n == "session")
+                .unwrap();
+            scene(&mut state);
+            state.draft = fresh("Follow-up with chosen delivery");
+            let mut rt = Runtime::new(
+                state,
+                crate::ui::view,
+                (1440.0, 1000.0),
+                Env::new(true, 1.0),
+            );
+            for _ in 0..60 {
+                rt.frame(1.0 / 60.0);
+            }
+            while rx.try_recv().is_ok() {}
+            let click = |rt: &mut Runtime<UiState>, key: &str| {
+                let node = rt
+                    .elements()
+                    .into_iter()
+                    .find(|n| n.key.as_deref() == Some(key))
+                    .unwrap();
+                let (x, y) = (
+                    node.rect[0] + node.rect[2] / 2.0,
+                    node.rect[1] + node.rect[3] / 2.0,
+                );
+                rt.pointer_down(x, y);
+                rt.pointer_up(x, y);
+                for _ in 0..30 {
+                    rt.frame(1.0 / 60.0);
+                }
+            };
+            click(&mut rt, "composer-delivery-options");
+            let asid = rt.state.selected.clone().unwrap();
+            click(
+                &mut rt,
+                &format!("composer-delivery-menu-{asid}-item{item}"),
+            );
+            assert_eq!(rt.state.composer_queue_delivery, expected == "queue");
+            while let Ok(command) = rx.try_recv() {
+                assert!(!matches!(
+                    command,
+                    Command::Compose(ComposeCommand::Submit { .. })
+                ));
+            }
+            click(&mut rt, "composer-deliver");
+            let mut sent = Vec::new();
+            while let Ok(command) = rx.try_recv() {
+                if let Command::Compose(ComposeCommand::Submit { delivery, .. }) = command {
+                    sent.push(delivery);
+                }
+            }
+            assert_eq!(sent, vec![Some(expected.into())]);
+        }
+    }
+
+    #[test]
+    fn default_enter_send_keeps_shift_enter_for_newlines() {
+        use rune::{Env, Key, KeyEvent, Mods, Runtime};
+        for name in ["home", "session"] {
+            let (tx, mut rx) = crate::ui::commands::channel();
+            let mut state = UiState::new(tx);
+            state.splash = None;
+            let (_, scene) = crate::ui::scenes::scenes()
+                .iter()
+                .find(|(n, _)| *n == name)
+                .unwrap();
+            scene(&mut state);
+            let slot = if name == "home" {
+                Slot::Start
+            } else {
+                Slot::Session
+            };
+            *draft_of_mut(&mut state, slot) = fresh("Keyboard check");
+            let mut rt = Runtime::new(state, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+            rt.on_key = Some(crate::ui::on_key);
+            rt.frame(0.0);
+            rt.frame(0.02);
+            while rx.try_recv().is_ok() {}
+            rt.key(KeyEvent {
+                key: Key::Enter,
+                mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+            });
+            rt.frame(0.02);
+            assert!(draft_of(&rt.state, slot).text.contains('\n'));
+            while let Ok(command) = rx.try_recv() {
+                assert!(!matches!(
+                    command,
+                    Command::Compose(ComposeCommand::Submit { .. })
+                ));
+            }
+            rt.key(KeyEvent {
+                key: Key::Enter,
+                mods: Mods::default(),
+            });
+            rt.frame(0.02);
+            let mut submits = 0;
+            while let Ok(command) = rx.try_recv() {
+                if matches!(command, Command::Compose(ComposeCommand::Submit { .. })) {
+                    submits += 1;
+                }
+            }
+            assert_eq!(submits, 1, "configured Enter must send once on {name}");
+        }
+    }
+
+    #[test]
+    fn remapped_send_replaces_default_in_both_composers() {
+        use rune::{Env, Key, KeyEvent, Mods, Runtime};
+        for scene_name in ["home", "session"] {
+            let (tx, mut rx) = crate::ui::commands::channel();
+            let mut s = UiState::new(tx);
+            s.splash = None;
+            let (_, scene) = crate::ui::scenes::scenes()
+                .iter()
+                .find(|(name, _)| *name == scene_name)
+                .unwrap();
+            scene(&mut s);
+            s.cfg.keymap.bindings.insert("send".into(), "alt+s".into());
+            let slot = if scene_name == "home" {
+                Slot::Start
+            } else {
+                Slot::Session
+            };
+            *draft_of_mut(&mut s, slot) = fresh("Verify keyboard routing");
+            let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+            rt.on_key = Some(crate::ui::on_key);
+            rt.frame(0.0);
+            rt.frame(0.02);
+            while rx.try_recv().is_ok() {}
+            let before = draft_of(&rt.state, slot).text.clone();
+            rt.key(KeyEvent {
+                key: Key::Enter,
+                mods: Mods::default(),
+            });
+            rt.frame(0.02);
+            assert_eq!(
+                draft_of(&rt.state, slot).text.matches('\n').count(),
+                before.matches('\n').count() + 1,
+                "Enter must insert a newline on {scene_name}"
+            );
+            while let Ok(command) = rx.try_recv() {
+                assert!(!matches!(
+                    command,
+                    Command::Compose(ComposeCommand::Submit { .. })
+                ));
+            }
+            rt.key(KeyEvent {
+                key: Key::Enter,
+                mods: Mods {
+                    ctrl: !cfg!(target_os = "macos"),
+                    cmd: cfg!(target_os = "macos"),
+                    ..Default::default()
+                },
+            });
+            rt.frame(0.04);
+            while let Ok(command) = rx.try_recv() {
+                assert!(
+                    !matches!(command, Command::Compose(ComposeCommand::Submit { .. })),
+                    "old send chord still submits on {scene_name}"
+                );
+            }
+            rt.key(KeyEvent {
+                key: Key::Command('s'),
+                mods: Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+            });
+            rt.frame(0.06);
+            let mut submits = 0;
+            while let Ok(command) = rx.try_recv() {
+                if matches!(command, Command::Compose(ComposeCommand::Submit { .. })) {
+                    submits += 1;
+                }
+            }
+            assert_eq!(
+                submits, 1,
+                "custom send must submit exactly once on {scene_name}"
+            );
+        }
+    }
 
     #[test]
     fn inserting_multiple_images_paces_and_numbers_them() {
@@ -2289,41 +2931,6 @@ mod tests {
             }
         }
         assert_eq!(staged_names, vec!["test-screenshot.png", "app.log"]);
-    }
-
-    #[test]
-    fn composer_resize_expand_and_history_popup() {
-        let (tx, _rx) = crate::ui::commands::channel();
-        let mut s = UiState::new(tx);
-        assert_eq!(s.composer_rows, None);
-        assert!(!s.composer_expanded);
-        assert!(!s.composer_history_open);
-
-        // Record prompts into history
-        s.record_prompt_history("cargo check");
-        s.record_prompt_history("git diff --staged");
-        assert_eq!(s.prompt_history.len(), 2);
-
-        // Toggle history popup
-        s.composer_history_open = true;
-        assert!(s.composer_history_open);
-
-        let k = Kit::neutral(s.dark);
-        let mut layer = Vec::new();
-        history_popup(&s, &k, &mut layer, Slot::Session);
-        assert!(!layer.is_empty());
-
-        // Test expanding composer
-        s.composer_expanded = true;
-        assert!(s.composer_expanded);
-
-        // Test manual row resize override
-        s.composer_rows = Some(16);
-        assert_eq!(s.composer_rows, Some(16));
-
-        // Test view generation
-        let look = s.look();
-        let _card = composer_card(&k, &look, col(), false, false, false);
     }
 
     #[test]
@@ -2418,3 +3025,121 @@ mod tests {
         assert!(chips(&s, &k, &mut layer).is_some());
     }
 }
+
+/// Deliver completed uploads only when their original composer is visible again.
+pub(super) fn restore_attachments(s: &mut UiState) {
+    let target = match s.mode {
+        super::Mode::Home => None,
+        super::Mode::Session => s.selected.clone(),
+        _ => return,
+    };
+    if let Some(files) = s
+        .deferred_attachments
+        .remove(&(s.current_computer().to_owned(), target))
+    {
+        s.staged.extend(files.into_iter().filter(|file| {
+            file.draft_token.is_none_or(|id| match s.mode {
+                super::Mode::Home => has_image_pill(&s.start_draft, id),
+                _ => has_image_pill(&s.draft, id),
+            })
+        }));
+    }
+}
+
+fn has_image_pill(draft: &TextEdit, id: u64) -> bool {
+    draft.pills().any(|(_, pill)| pill == format!("image:{id}"))
+}
+
+fn remove_image_pill(draft: &mut TextEdit, id: u64) {
+    let ranges: Vec<_> = draft
+        .pills()
+        .filter(|(_, pill)| *pill == format!("image:{id}"))
+        .map(|(range, _)| range)
+        .collect();
+    for range in ranges.into_iter().rev() {
+        draft.set_selection(range.start, range.end);
+        draft.insert("");
+    }
+}
+
+pub(super) fn finish_staging(
+    s: &mut UiState,
+    id: u64,
+    result: Result<crate::model::compose::StagedFile, String>,
+) {
+    let target = s.pending_file_targets.remove(&id);
+    let linked = s.pending_image_uploads.remove(&id);
+    let mut file = match result {
+        Ok(file) => file,
+        Err(err) => {
+            if linked {
+                remove_image_pill(&mut s.draft, id);
+                remove_image_pill(&mut s.start_draft, id);
+                for tile in &mut s.tiles {
+                    remove_image_pill(&mut tile.slot.draft, id);
+                }
+            }
+            s.toast_error("Attachment failed", Some(err));
+            return;
+        }
+    };
+    if let Some((computer, slot)) = &target {
+        if computer != s.current_computer() {
+            file.draft_token = linked.then_some(id);
+            s.deferred_attachments
+                .entry((computer.clone(), slot.clone()))
+                .or_default()
+                .push(file);
+            return;
+        }
+    }
+    let target = target.map(|(_, slot)| slot);
+    if !linked {
+        match target {
+            Some(Some(asid))
+                if s.mode != super::Mode::Session || s.selected.as_deref() != Some(&asid) =>
+            {
+                if s.selected.as_deref() == Some(&asid) {
+                    s.deferred_attachments
+                        .entry((s.current_computer().to_owned(), Some(asid)))
+                        .or_default()
+                        .push(file);
+                } else if let Some(tile) = s
+                    .tiles
+                    .iter_mut()
+                    .find(|tile| tile.asid.as_deref() == Some(&asid))
+                {
+                    tile.slot.staged.push(file);
+                } else {
+                    s.toast_error(
+                        "Attachment failed",
+                        Some("The destination session was closed.".into()),
+                    );
+                }
+            }
+            Some(None) if s.mode != super::Mode::Home => {
+                s.deferred_attachments
+                    .entry((s.current_computer().to_owned(), None))
+                    .or_default()
+                    .push(file);
+            }
+            _ => s.staged.push(file),
+        }
+        return;
+    }
+    file.draft_token = Some(id);
+    if has_image_pill(&s.draft, id) || has_image_pill(&s.start_draft, id) {
+        s.staged.push(file);
+    } else if let Some(tile) = s
+        .tiles
+        .iter_mut()
+        .find(|tile| has_image_pill(&tile.slot.draft, id))
+    {
+        tile.slot.staged.push(file);
+    }
+    // A removed pill cancels staging even if the upload finishes later.
+}
+
+#[cfg(test)]
+#[path = "composer_attachment_tests.rs"]
+mod attachment_tests;

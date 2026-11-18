@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use rune::{col, el, rich, row, text, El, Span, Spring, TextEdit, Transition, Tx};
+use rune::{col, el, rich, row, text, El, Span, TextEdit, Tx};
 use rune_kit::{Kit, TextInput};
 
 use super::copy::{tr, tr_ref};
@@ -564,7 +564,10 @@ impl UiState {
                 plugin_id,
                 command_id,
             } => {
-                if let Some(plugin) = self.plugins.get(&plugin_id) {
+                if let Some(plugin) = self
+                    .plugins
+                    .get_enabled(&plugin_id, &self.cfg.plugins_disabled)
+                {
                     plugin.on_command(self, &command_id);
                 }
             }
@@ -672,7 +675,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         let on = i == selected;
         let mark = match &entry.agent {
             Some(agent) => super::agents::mark(agent, 16.0, s.dark),
-            None => rune::icon(glyph(&entry.act), 16.0).color(k.c.icon_muted),
+            None => glyph(s, k, &entry.act),
         };
         let mut words = col().grow(1.0).shrink().min_w(0.0).gap(1.0).child(
             rich(entry.label.clone(), label_spans(k, &entry.label, hits))
@@ -754,23 +757,14 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .child(list)
         .child(el().w_full().h(1.0).fill(k.c.border_muted))
         .child(foot);
-    let mut panel = look.panel(k, panel, crate::theme::look::PANEL_RADIUS);
+    let mut panel = look.panel(k, panel, k.radius.xl);
     for shadow in k.shadow_layers(&k.elevation.overlay) {
         panel = panel.box_shadow(shadow);
     }
-    // A spring drop-in from just above; a plain fade under reduce motion.
-    let panel = if s.cfg.appearance.reduced_motion {
-        panel.transition(Transition::opacity())
-    } else {
-        panel
-            .transition(
-                Transition::opacity()
-                    .combined(Transition::offset(0.0, -12.0))
-                    .combined(Transition::scale(0.97)),
-            )
-            .motion(Spring::new(0.32, 0.16))
-    }
-    .modal(true, |s: &mut UiState| s.palette = None);
+    // Shared dialog motion, including the reduced-motion fallback.
+    let panel = look
+        .dialog_motion(panel)
+        .modal(true, |s: &mut UiState| s.palette = None);
 
     layer.push(
         el().key("palette-scrim")
@@ -796,8 +790,8 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
     );
 }
 
-fn glyph(act: &Act) -> &'static rune::Icon {
-    match act {
+fn glyph(s: &UiState, k: &Kit, act: &Act) -> El {
+    let glyph = match act {
         Act::Go(Mode::Inbox) => &super::icons::INBOX,
         Act::Go(Mode::Tasks) => &super::icons::TASK,
         Act::Dictation => &super::voice::MIC,
@@ -809,8 +803,9 @@ fn glyph(act: &Act) -> &'static rune::Icon {
         | Act::Key(Action::Settings) => &super::icons::SETTINGS,
         Act::Theme(_) | Act::ToggleScheme => &rune_kit::glyphs::SPARKLE,
         Act::PluginSurface { .. } | Act::PluginCommand { .. } => &super::icons::GRID,
-        _ => &rune_kit::glyphs::ARROW_RIGHT,
-    }
+        _ => return super::art::directional_arrow(s, k, 16.0, 0.0, k.c.icon_muted),
+    };
+    rune::icon(glyph, 16.0).color(k.c.icon_muted)
 }
 
 fn section(k: &Kit, label: String) -> El {

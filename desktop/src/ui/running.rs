@@ -4,7 +4,6 @@
 
 use muqun_gateway::agents::AgentSessionInfo;
 use rune::{col, el, icon, row, El, ScrollSpec, Tx};
-use rune_kit::glyphs::CHEVRON_DOWN;
 use rune_kit::shell::SidebarRow;
 use rune_kit::Kit;
 
@@ -199,12 +198,15 @@ fn entry_row(s: &UiState, k: &Kit, e: &Entry<'_>, now: u64) -> El {
         .center()
         .child(mark)
         .child(look.pulse(dot).a11y_hidden());
+    let help = title.clone();
     let mut r = SidebarRow::new(title)
-        .depth(1)
+        .depth(0)
         .height(ENTRY_H)
         .avatar(avatar)
-        .subtitle(step)
-        .detail(elapsed(now.saturating_sub(e.since(s)), language))
+        .subtitle(format!(
+            "{step} · {}",
+            elapsed(now.saturating_sub(e.since(s)), language)
+        ))
         .selected(asid.is_some() && s.mode == Mode::Session && s.selected == asid);
     if waiting {
         r = r.subtitle_color(k.c.warning.fg);
@@ -216,6 +218,7 @@ fn entry_row(s: &UiState, k: &Kit, e: &Entry<'_>, now: u64) -> El {
     })
     .build(k)
     .key(format!("running-{key}"))
+    .help(help)
 }
 
 /// The Running row and, when open, its list. Nothing while nothing runs.
@@ -231,25 +234,21 @@ pub fn view(s: &UiState, k: &Kit) -> Option<El> {
     // The lead turns while anything runs (still under reduce motion); a
     // dot in the warning colour says something waits on the owner.
     let lead = if look.motion {
-        rune_kit::Spinner::new()
-            .size(13.0)
-            .color(k.c.text_accent)
-            .build(k)
+        crate::ui::art::ActivityMark::Compact.build(k)
     } else {
         icon(&super::icons::RUNNING, 14.0).color(k.c.text_accent)
     };
-    let chevron = icon(&CHEVRON_DOWN, 12.0)
-        .color(k.c.icon_muted)
-        .rotate(if open {
+    let chevron = super::art::directional_arrow(
+        s,
+        k,
+        12.0,
+        if open {
+            std::f32::consts::FRAC_PI_2
+        } else {
             0.0
-        } else {
-            -std::f32::consts::FRAC_PI_2
-        })
-        .rotate_motion(if look.motion {
-            rune::Anim::from(k.motion.control)
-        } else {
-            rune::Anim::INSTANT
-        });
+        },
+        k.c.icon_muted,
+    );
     let mut trailing = row().gap(8.0).center_y().a11y_hidden();
     if waiting > 0 {
         let warn = k.c.warning.icon;

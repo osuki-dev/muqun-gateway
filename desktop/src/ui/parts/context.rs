@@ -6,7 +6,7 @@
 
 use muqun_gateway::agents::AgentSessionInfo;
 use rune::{col, icon, row, text, Color, Cursor, El};
-use rune_kit::{Kit, Spinner};
+use rune_kit::Kit;
 use serde_json::Value;
 
 use super::glyphs;
@@ -51,6 +51,40 @@ fn tone(k: &Kit, fraction: f32) -> Color {
     }
 }
 
+/// A lit leading edge and a darker tail; only geometry changes animate.
+fn progress_fill(k: &Kit, color: Color, height: f32) -> El {
+    let tip = color.mix(k.c.white, 0.38);
+    col()
+        .key("progress-fill")
+        .h(height)
+        .radius(height / 2.0)
+        .linear_gradient(
+            1.57,
+            [
+                (0.0, color.mix(k.c.bg_base, 0.35)),
+                (0.65, color),
+                (1.0, tip),
+            ],
+        )
+        .shadow(0.0, height * 1.8, color.alpha(0.32))
+        .token_motion(k.motion.disclosure)
+        .child(
+            col()
+                .pin(Some(1.0), Some(0.0), Some(1.0), None)
+                .h(1.0)
+                .radius(0.5)
+                .fill(k.c.white.alpha(0.28)),
+        )
+        .child(
+            col()
+                .pin(None, Some(0.0), Some(0.0), None)
+                .size(1.0, height)
+                .radius(0.5)
+                .fill(tip)
+                .shadow(0.0, height, color.alpha(0.5)),
+        )
+}
+
 fn bar(k: &Kit, key: &str, fraction: f32, width: f32, height: f32) -> El {
     let fraction = fraction.clamp(0.0, 1.0);
     row()
@@ -58,14 +92,10 @@ fn bar(k: &Kit, key: &str, fraction: f32, width: f32, height: f32) -> El {
         .w(width)
         .h(height)
         .radius(height / 2.0)
-        .fill(k.alpha(k.c.text_base, 0.10))
-        .clip_rounded(height / 2.0)
-        .child(
-            col()
-                .w(width * fraction)
-                .h(height)
-                .radius(height / 2.0)
-                .fill(tone(k, fraction)),
+        .fill(k.alpha(k.c.text_base, 0.09))
+        .children(
+            (fraction > 0.0)
+                .then(|| progress_fill(k, tone(k, fraction), height).w(width * fraction)),
         )
 }
 
@@ -77,6 +107,11 @@ fn supports_limits(s: &UiState, agent: &str) -> bool {
 
 /// Open the sheet for `asid`, asking for its agent's limits once.
 pub fn open(s: &mut UiState, asid: &str) {
+    if s.context_open.as_deref() == Some(asid) {
+        s.context_open = None;
+        return;
+    }
+    s.menu = None;
     s.context_open = Some(asid.to_string());
     if let Some(agent) = s.session_by_id(asid).map(|i| i.agent_id.clone()) {
         if supports_limits(s, &agent) {
@@ -97,7 +132,9 @@ pub fn meter(s: &UiState, k: &Kit, asid: &str) -> Option<El> {
         .gap(6.0)
         .center_y()
         .px(8.0)
-        .h(26.0);
+        .h(32.0)
+        .fill(k.c.layer_01.alpha(0.7))
+        .border(0.5, k.c.border_muted.alpha(0.3));
     let help = match limit {
         Some(limit) => {
             let fraction = used as f32 / limit as f32;
@@ -135,7 +172,7 @@ pub fn meter(s: &UiState, k: &Kit, asid: &str) -> Option<El> {
     };
     let asid = asid.to_string();
     Some(
-        k.interactive(line.radius(k.radius.md))
+        k.interactive(line.radius(k.radius.lg))
             .cursor(Cursor::Pointer)
             .help(help)
             .label(tr_ref(language, "Context"))
@@ -192,7 +229,23 @@ fn until(language: Language, at_ms: u64) -> String {
     }
 }
 
-fn limits_section(s: &UiState, k: &Kit, agent: &str) -> Option<El> {
+fn remaining_fraction(window: &Value) -> Option<f32> {
+    let remaining = window
+        .get("remaining")?
+        .as_f64()
+        .filter(|n| n.is_finite())?;
+    let limit = if window.get("unit").and_then(Value::as_str) == Some("percent") {
+        100.0
+    } else {
+        window
+            .get("limit")?
+            .as_f64()
+            .filter(|n| n.is_finite() && *n > 0.0)?
+    };
+    Some((remaining / limit).clamp(0.0, 1.0) as f32)
+}
+
+pub fn limits_section(s: &UiState, k: &Kit, agent: &str) -> Option<El> {
     if !supports_limits(s, agent) {
         return None;
     }
@@ -204,7 +257,7 @@ fn limits_section(s: &UiState, k: &Kit, agent: &str) -> Option<El> {
         .gap(8.0)
         .child(heading(k, t("Account limits")));
     let Some(loaded) = s.account_limits.get(agent) else {
-        return Some(block.child(Spinner::new().size(14.0).build(k)));
+        return Some(block.child(crate::ui::art::ActivityMark::Compact.build(k)));
     };
     let Some(limits) = loaded.as_ref() else {
         return Some(block.child(crate::ui::muted(k, t("Could not read account limits"))));
@@ -296,11 +349,27 @@ fn limits_section(s: &UiState, k: &Kit, agent: &str) -> Option<El> {
             let mut row_block = col()
                 .key(format!("w{bi}-{wi}"))
                 .w_full()
-                .gap(4.0)
+                .gap(10.0)
+                .px(16.0)
+                .py(14.0)
+                .radius(k.radius.lg)
+                .fill(k.c.layer_01.alpha(0.45))
                 .child(fact(k, &label, value));
-            if let (Some(r), "percent") = (remaining, unit) {
-                // The bar shows what is used, filling toward the limit.
-                row_block = row_block.child(bar(k, "used", (100.0 - r as f32) / 100.0, 300.0, 4.0));
+            if let Some(fraction) = remaining_fraction(w) {
+                let color = tone(k, 1.0 - fraction);
+                row_block = row_block.child(
+                    row()
+                        .key("remaining-bar")
+                        .w_full()
+                        .h(8.0)
+                        .radius(k.radius.xs)
+                        .fill(k.c.text_base.alpha(0.09))
+                        .children(
+                            (fraction > 0.0)
+                                .then(|| progress_fill(k, color, 8.0).w(0.0).grow(fraction)),
+                        )
+                        .child(col().w(0.0).grow(1.0 - fraction).h(8.0)),
+                );
             }
             if let Some(at) = w.get("resets_at_ms").and_then(Value::as_u64) {
                 row_block = row_block.child(
@@ -318,19 +387,36 @@ fn limits_section(s: &UiState, k: &Kit, agent: &str) -> Option<El> {
     Some(block)
 }
 
-/// The sheet the meter opens, over the window's right side.
-pub fn sheet(s: &UiState, k: &Kit) -> Option<El> {
-    let asid = s.context_open.as_deref()?;
+/// Content-sized details, anchored to this session's own footer.
+pub fn popover(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str, trigger: El) -> El {
+    let open = s.context_open.as_deref() == Some(asid);
+    let mut popup = rune_kit::Popover::new(format!("session-context-{asid}"))
+        .trigger(trigger)
+        .placement(rune_kit::Placement::TopEnd)
+        .gutter(8.0)
+        .padding(0.0)
+        .label(tr_ref(s.cfg.general.language, "Context"))
+        .open(open)
+        .on_close(|s: &mut UiState| s.context_open = None);
+    if open {
+        if let Some(body) = content(s, k, asid) {
+            popup = popup.child(rune_kit::popover::fit_scroll(body).max_h(440.0));
+        }
+    }
+    popup.build(k, layer)
+}
+
+fn content(s: &UiState, k: &Kit, asid: &str) -> Option<El> {
     let info = s.session_by_id(asid)?;
     let language = s.cfg.general.language;
     let t = |en| tr_ref(language, en);
     let close = |s: &mut UiState| s.context_open = None;
     let mut body = col()
-        .key("context-body")
-        .w_full()
+        .key(format!("context-body-{asid}"))
+        .w(316.0)
         .gap(8.0)
-        .px(18.0)
-        .py(16.0);
+        .px(14.0)
+        .py(12.0);
     body = body.child(
         row()
             .w_full()
@@ -362,13 +448,13 @@ pub fn sheet(s: &UiState, k: &Kit) -> Option<El> {
                 .child(
                     text(format!("{:.0}%", (fraction * 100.0).min(100.0)))
                         .font(rune::TextStyle {
-                            size: 28.0,
-                            line_height: 34.0,
+                            size: 24.0,
+                            line_height: 30.0,
                             ..k.ty.ui_medium
                         })
                         .color(tone(k, fraction)),
                 )
-                .child(bar(k, "context-bar", fraction, 340.0, 6.0))
+                .child(bar(k, "context-bar", fraction, 288.0, 5.0))
                 .child(crate::ui::muted(
                     k,
                     match language {
@@ -437,35 +523,5 @@ pub fn sheet(s: &UiState, k: &Kit) -> Option<El> {
     if let Some(limits) = limits_section(s, k, &info.agent_id) {
         body = body.child(limits);
     }
-    let panel = k.elevate(
-        col()
-            .key("context-panel")
-            .w(380.0)
-            .h_full()
-            .fill(k.c.bg_base)
-            .border(1.0, k.c.border_weak)
-            .on_press(|_: &mut UiState| {})
-            .child(body)
-            .scroll(rune::ScrollSpec {
-                stick_bottom: false,
-            }),
-        &k.elevation.overlay,
-    );
-    let panel = if s.cfg.appearance.reduced_motion {
-        panel.transition(rune::Transition::opacity())
-    } else {
-        panel.transition(rune::Transition::offset(32.0, 0.0))
-    };
-    Some(
-        row()
-            .key("context-sheet")
-            .absolute(0.0, 0.0)
-            .w_full()
-            .h_full()
-            .justify_end()
-            .fill(k.alpha(k.c.black, 0.18))
-            .on_press(close)
-            .modal(true, close)
-            .child(panel),
-    )
+    Some(body)
 }

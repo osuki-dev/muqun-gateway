@@ -112,6 +112,10 @@ impl UiState {
     pub fn open_file(&mut self, target: impl Into<FileRef>) {
         let target = target.into();
         let path = target.resolve();
+        if let Some(folder) = path.as_deref().filter(|path| path.is_dir()) {
+            crate::platform::shell::open_folder(folder);
+            return;
+        }
         let name = path
             .as_deref()
             .and_then(Path::file_name)

@@ -90,6 +90,17 @@ impl LocalHub {
 }
 
 impl SessionHub for LocalHub {
+    fn pending_attention(
+        &self,
+    ) -> HubFuture<'_, Option<Vec<muqun_gateway::agents::ports::AgentPendingSnapshot>>> {
+        Box::pin(async {
+            let mut snapshots = Vec::new();
+            for manager in self.runtime.all_managers().await {
+                snapshots.extend(manager.sessions().pending_snapshots().await);
+            }
+            Ok(Some(snapshots))
+        })
+    }
     fn mode(&self) -> HubMode {
         HubMode::Standalone
     }
@@ -168,7 +179,7 @@ impl SessionHub for LocalHub {
             // Retained history paints immediately. Activating an ACP agent
             // (spawn + session/load + replay) can take many seconds; do that
             // in the background and let `acp_session_loaded` refresh.
-            if let Some(mut snapshot) = manager.mirror().get_snapshot(asid).await {
+            if let Some(mut snapshot) = manager.sessions().retained_snapshot(asid).await {
                 enrich_local_media(&mut snapshot);
                 let manager = Arc::clone(&manager);
                 let asid = asid.clone();
@@ -187,12 +198,14 @@ impl SessionHub for LocalHub {
             if let Err(err) = manager.sessions().prepare_session(asid).await {
                 tracing::debug!(asid = %asid.0, %err, "session preparation failed; reading history anyway");
             }
-            // Mirror first: `get_snapshot` may re-prepare an ACP follower.
-            let mut snapshot = if let Some(snapshot) = manager.mirror().get_snapshot(asid).await {
-                snapshot
-            } else {
-                manager.sessions().get_snapshot(asid).await?
-            };
+            // Only canonical retained history can skip the first history read.
+            // Metadata populated by preparation is not a complete snapshot.
+            let mut snapshot =
+                if let Some(snapshot) = manager.sessions().retained_snapshot(asid).await {
+                    snapshot
+                } else {
+                    manager.sessions().get_snapshot(asid).await?
+                };
             enrich_local_media(&mut snapshot);
             Ok(snapshot)
         })
@@ -209,7 +222,7 @@ impl SessionHub for LocalHub {
     fn peek<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Option<AgentSessionSnapshot>> {
         Box::pin(async move {
             let manager = self.manager_for_session(asid).await?;
-            let Some(mut snapshot) = manager.mirror().get_snapshot(asid).await else {
+            let Some(mut snapshot) = manager.sessions().retained_snapshot(asid).await else {
                 return Ok(None);
             };
             enrich_local_media(&mut snapshot);
@@ -224,11 +237,12 @@ impl SessionHub for LocalHub {
             // agent's `prepare_observed_session`, which for a terminal-held ACP
             // session that is not retained starts one more transcript
             // follower on every call (`acp/session.rs` `follow_terminal`).
-            let mut snapshot = if let Some(snapshot) = manager.mirror().get_snapshot(asid).await {
-                snapshot
-            } else {
-                manager.sessions().get_snapshot(asid).await?
-            };
+            let mut snapshot =
+                if let Some(snapshot) = manager.sessions().retained_snapshot(asid).await {
+                    snapshot
+                } else {
+                    manager.sessions().get_snapshot(asid).await?
+                };
             enrich_local_media(&mut snapshot);
             Ok(snapshot)
         })

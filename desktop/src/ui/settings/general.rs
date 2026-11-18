@@ -6,7 +6,7 @@ use rune::{El, TextEdit, Tx};
 use rune_kit::{Kit, TextInput};
 
 use super::{edit_of, field, flag, group, row, select};
-use crate::config::{ConfigEdit, Language};
+use crate::config::{ConfigEdit, Language, TerminalOpenMode};
 use crate::platform::editors::Editor;
 use crate::ui::copy::tr_ref;
 use crate::ui::UiState;
@@ -30,6 +30,24 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
             tr_ref(language, "Text and code use the editor below; images keep the built-in preview."),
             flag(k, "files-in-editor", s.cfg.general.files_in_editor, tr_ref(language, "Enabled"),
                 |s| s.edit(ConfigEdit::FilesInEditor(!s.cfg.general.files_in_editor))))]),
+        group(k, "general-terminal", tr_ref(language, "Terminal"), vec![row(
+            k, "terminal-open-mode",
+            tr_ref(language, "Default terminal placement"),
+            tr_ref(language, "Applies when opening a terminal. Existing terminals stay where they are."),
+            select(s, k, layer, "terminal-open-mode",
+                &[tr_ref(language, "Docked"), tr_ref(language, "Split"), tr_ref(language, "Floating")],
+                match s.cfg.ui.terminal_open_mode {
+                    TerminalOpenMode::Docked => 0,
+                    TerminalOpenMode::Split => 1,
+                    TerminalOpenMode::Floating => 2,
+                },
+                |s, i| s.edit(ConfigEdit::TerminalOpenMode(match i {
+                    1 => TerminalOpenMode::Split,
+                    2 => TerminalOpenMode::Floating,
+                    _ => TerminalOpenMode::Docked,
+                })),
+            ),
+        )]),
         group(
             k,
             "general-language",

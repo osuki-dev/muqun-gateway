@@ -147,13 +147,14 @@ pub enum Action {
     FocusPaneToward,
     SwapPaneToward,
     FocusComposer,
-    ExpandComposer,
     PromptHistory,
     Send,
     Queue,
     Stop,
     ModelPicker,
     Dictation,
+    FinishDictation,
+    CancelDictation,
     JumpLatest,
     NextRow,
     PrevRow,
@@ -214,13 +215,14 @@ impl Action {
             Self::FocusPaneToward => "focus_pane_toward",
             Self::SwapPaneToward => "swap_pane_toward",
             Self::FocusComposer => "focus_composer",
-            Self::ExpandComposer => "expand_composer",
             Self::PromptHistory => "prompt_history",
             Self::Send => "send",
             Self::Queue => "queue",
             Self::Stop => "stop",
             Self::ModelPicker => "model_picker",
             Self::Dictation => "dictation",
+            Self::FinishDictation => "finish_dictation",
+            Self::CancelDictation => "cancel_dictation",
             Self::JumpLatest => "jump_latest",
             Self::NextRow => "next_row",
             Self::PrevRow => "prev_row",
@@ -428,15 +430,6 @@ pub static ENTRIES: &[Entry] = &[
     ),
     owned(
         e(
-            A::ExpandComposer,
-            G::Session,
-            "mod+shift+e",
-            "Expand or collapse the composer",
-        ),
-        Owner::Composer,
-    ),
-    owned(
-        e(
             A::PromptHistory,
             G::Session,
             "alt+h, ctrl+r",
@@ -448,7 +441,7 @@ pub static ENTRIES: &[Entry] = &[
         e(
             A::Send,
             G::Session,
-            "mod+enter",
+            "enter",
             "Send (steer while the agent works)",
         ),
         Owner::Composer,
@@ -475,6 +468,8 @@ pub static ENTRIES: &[Entry] = &[
         "mod+shift+space",
         "Start or finish dictation",
     ),
+    e(A::FinishDictation, G::Session, "mod+shift+enter", "Finish dictation"),
+    e(A::CancelDictation, G::Session, "mod+shift+backspace", "Cancel dictation"),
     e(
         A::JumpLatest,
         G::Session,
@@ -612,7 +607,7 @@ pub static ENTRIES: &[Entry] = &[
         e(
             A::TermCycleTab,
             G::Terminal,
-            "alt+left, alt+right, ctrl+tab, ctrl+shift+tab",
+            "alt+left, alt+right, ctrl+tab, ctrl+shift+tab, ctrl+pageup, ctrl+pagedown, ctrl+shift+[, ctrl+shift+]",
             "Previous or next terminal tab",
         ),
         Owner::Terminal,
@@ -872,6 +867,12 @@ pub fn clashes_for(
     for (i, a) in rows.iter().enumerate() {
         let bind_a = a.keybind_for(cfg);
         for b in &rows[i + 1..] {
+            // Timeline navigation is inactive while the composer owns focus.
+            if (a.owner == Owner::Composer && b.group == Group::Timeline)
+                || (b.owner == Owner::Composer && a.group == Group::Timeline)
+            {
+                continue;
+            }
             let bind_b = b.keybind_for(cfg);
             for ca in bind_a.chords_on(platform) {
                 if bind_b
@@ -1130,9 +1131,7 @@ fn handle_leader_group(
                 let idx = (d as u8 - b'1') as usize;
                 if s.in_split() && idx < s.tiles.len() {
                     s.focus_tile(idx);
-                    if s.tiles.get(idx).is_some_and(|t| t.is_terminal()) {
-                        s.focus_terminal_tx(tx);
-                    }
+                    s.focus_pane_input(tx);
                 }
             }
             _ => {}
@@ -1236,9 +1235,7 @@ pub fn handle_leader_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         if s.in_split() {
             if let Some(j) = super::tiles::neighbour(s, &ev.key) {
                 s.focus_tile(j);
-                if s.tiles.get(s.focus).is_some_and(|t| t.is_terminal()) {
-                    s.focus_terminal_tx(tx);
-                }
+                s.focus_pane_input(tx);
             }
         } else {
             match ev.key {
@@ -1322,9 +1319,7 @@ pub fn handle_leader_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
             if s.in_split() {
                 if idx < s.tiles.len() {
                     s.focus_tile(idx);
-                    if s.tiles.get(idx).is_some_and(|t| t.is_terminal()) {
-                        s.focus_terminal_tx(tx);
-                    }
+                    s.focus_pane_input(tx);
                 }
             } else {
                 s.term_switch_tab(idx);
@@ -1361,6 +1356,24 @@ pub fn intercept_global_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool
     }
     if s.is_leader_armed() {
         return handle_leader_key(s, ev, tx);
+    }
+    if ev.key == rune::Key::Escape
+        && !(ev.mods.shift || ev.mods.alt || ev.mods.ctrl || ev.mods.cmd || ev.mods.logo)
+        && s.inline_inspector_open()
+        && s.menu.is_none()
+        && s.row_menu.is_none()
+        && s.context_open.is_none()
+        && s.palette.is_none()
+        && s.keys_sheet.is_none()
+        && s.pairing_target.is_none()
+        && s.zoom.is_none()
+        && s.detail.is_none()
+        && !s.show_diff
+        && !s.timeline_search.active
+        && s.voice.is_none()
+    {
+        s.close_inspector();
+        return true;
     }
     if is_leader_event(s, ev, tx) {
         s.arm_leader(tx);
@@ -1498,9 +1511,7 @@ pub fn dispatch_window(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
     }
     if let Some(found) = ENTRIES
         .iter()
-        .filter(|e| {
-            e.owner == Owner::Window || matches!(e.action, A::ExpandComposer | A::PromptHistory)
-        })
+        .filter(|e| e.owner == Owner::Window || e.action == A::PromptHistory)
         .find(|e| bind_matches_cfg(e, &s.cfg.keymap, ev, tx))
     {
         return run(s, found.action, ev, tx);
@@ -1524,6 +1535,9 @@ pub fn field_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx, at_end: bool) -> b
         return s.terminal_key(ev, tx);
     }
     for action in [
+        A::Dictation,
+        A::FinishDictation,
+        A::CancelDictation,
         A::PrevSession,
         A::NextSession,
         A::ToggleFocus,
@@ -1539,7 +1553,6 @@ pub fn field_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx, at_end: bool) -> b
         A::EqualizeTiles,
         A::SplitHorizontal,
         A::SplitVertical,
-        A::ExpandComposer,
         A::PromptHistory,
     ] {
         if bind_matches_cfg(entry(action), &s.cfg.keymap, ev, tx) {
@@ -1596,7 +1609,7 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
         A::ToggleTerminal => s.toggle_terminal_tx(tx),
         A::ToggleFocus => s.toggle_focus_tx(tx),
         A::NewShell => {
-            s.open_terminal();
+            s.open_terminal_default();
             s.restart_terminal();
         }
         A::ToggleInspector => {
@@ -1650,18 +1663,16 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
                 return false;
             }
             s.focus_tile(n);
-            if s.tiles.get(n).is_some_and(|t| t.is_terminal()) {
-                s.focus_terminal_tx(tx);
-            }
+            s.focus_pane_input(tx);
         }
         A::FocusPaneToward | A::SwapPaneToward => {
             let was_term = s.term.sink.focused;
             if was_term {
                 s.term.sink.focused = false;
             }
-            let handled = super::tiles::arrow_key(s, ev);
-            if s.in_split() && s.tiles.get(s.focus).is_some_and(|t| t.is_terminal()) {
-                s.focus_terminal_tx(tx);
+            let handled = super::tiles::move_toward(s, &ev.key, action == A::SwapPaneToward);
+            if handled && s.in_split() {
+                s.focus_pane_input(tx);
             } else if was_term && !handled {
                 s.term.sink.focused = true;
             }
@@ -1678,15 +1689,6 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
             }
             _ => return false,
         },
-        A::ExpandComposer if session => {
-            if s.composer_expanded || s.composer_rows.is_some() {
-                s.composer_expanded = false;
-                s.composer_rows = None;
-            } else {
-                s.composer_expanded = true;
-                s.composer_rows = Some(14);
-            }
-        }
         A::PromptHistory if session => {
             s.composer_history_open = !s.composer_history_open;
         }
@@ -1709,7 +1711,9 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
             }
             s.menu = (s.menu != Some(menu.clone())).then_some(menu);
         }
-        A::Dictation if session => s.toggle_voice(),
+        A::Dictation if session && (s.cfg.voice.usable() || s.voice.is_some()) => s.toggle_voice(),
+        A::FinishDictation if s.voice.is_some() => s.finish_voice(),
+        A::CancelDictation if s.voice.is_some() => s.cancel_voice(),
         A::JumpLatest if session => {
             let Some(asid) = s.selected.clone() else {
                 return false;
@@ -1995,6 +1999,58 @@ mod tests {
     }
 
     #[test]
+    fn window_leader_maximizes_and_restores_the_focused_plugin_tile() {
+        use rune::{Env, Key, Mods, Runtime};
+        let mut s = state();
+        s.cfg.keymap.leader = "ctrl+b".into();
+        s.open_plugin_tile("sysinfo");
+        let plugin = s.tile_of_plugin("sysinfo").unwrap();
+        let count = s.tiles.len();
+        assert!(s.in_split());
+        let mut rt = Runtime::new(s, super::super::view, (1440.0, 900.0), Env::new(true, 1.0));
+        rt.on_key = Some(super::super::on_key);
+        rt.frame(0.0);
+        for expected in [Some(plugin), None] {
+            rt.key(KeyEvent {
+                key: Key::Command('b'),
+                mods: Mods {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            });
+            for c in ['w', 'z'] {
+                rt.key(KeyEvent {
+                    key: Key::Text(c.to_string()),
+                    mods: Mods::default(),
+                });
+                rt.frame(1.0 / 60.0);
+            }
+            assert_eq!(rt.state.zoomed_tile, expected);
+            assert_eq!(rt.state.focus, plugin);
+            assert_eq!(rt.state.tiles.len(), count);
+        }
+    }
+
+    #[test]
+    fn standalone_plugin_keeps_its_window_when_returning_from_page() {
+        use rune::{Env, Runtime};
+        let mut s = state();
+        s.tiles.clear();
+        s.selected = None;
+        s.go(Mode::Home);
+        s.open_plugin_page("sysinfo");
+        s.switch_plugin_surface("sysinfo", crate::plugin::PluginSlot::Tile);
+        assert_eq!(s.tiles.len(), 1);
+        let mut rt = Runtime::new(s, super::super::view, (1200.0, 800.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        assert!(rt
+            .elements()
+            .iter()
+            .any(|e| e.key.as_deref() == Some("surf-menu-sysinfo-Tile")));
+        assert!(rt.state.active_plugin_page.is_none());
+    }
+
+    #[test]
     fn composer_keeps_workspace_shortcuts_after_taking_focus() {
         use rune::{Env, Key, Mods, Runtime};
         let mut s = state();
@@ -2107,7 +2163,7 @@ mod tests {
             key: k,
             mods: Mods {
                 shift,
-                cmd: ctrl,
+                cmd: ctrl && !crate::platform::is_macos(),
                 alt,
                 ctrl,
                 logo: false,
@@ -2141,14 +2197,24 @@ mod tests {
         assert!(rt.state.term.sink.focused);
         rt.frame(1.0 / 60.0);
 
-        rt.key(key(Key::Left, true, false, true));
+        let mut left = key(Key::Left, !crate::platform::is_macos(), false, true);
+        left.mods.cmd = true;
+        left.mods.logo = crate::platform::is_macos();
+        rt.key(left);
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.focus, 0);
         assert!(rt.state.draft.focused);
         assert!(!rt.state.term.sink.focused);
 
+        rt.key(key(Key::Text("typed".into()), false, false, false));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.draft.text.ends_with("typed"));
+
         // And from the session composer, `Ctrl+Alt+Right` moves focus back to the terminal tile!
-        rt.key(key(Key::Right, true, false, true));
+        let mut right = key(Key::Right, !crate::platform::is_macos(), false, true);
+        right.mods.cmd = true;
+        right.mods.logo = crate::platform::is_macos();
+        rt.key(right);
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.focus, 1);
         assert!(rt.state.term.sink.focused);
@@ -2187,6 +2253,76 @@ mod tests {
 
         // `+,` is normalized to `+comma`
         assert!(try_parse_keybind("ctrl+,").is_some());
+    }
+
+    #[test]
+    fn escape_closes_split_inspector_without_closing_session_or_losing_draft() {
+        use rune::{Env, Key, Runtime};
+        let mut s = state();
+        s.mode = Mode::Session;
+        s.tiles = vec![
+            crate::ui::Tile::session("one"),
+            crate::ui::Tile::session("two"),
+        ];
+        s.selected = Some("one".into());
+        s.open_git_inspector();
+        s.draft = rune::TextEdit::new("pending");
+        let mut rt = Runtime::new(s, super::super::view, (1440.0, 900.0), Env::new(true, 1.0));
+        rt.on_key = Some(super::super::on_key);
+        rt.frame(0.0);
+        assert!(rt.state.inline_inspector_open());
+        rt.key(Key::Escape.into());
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.right_open);
+        assert_eq!(rt.state.tiles.len(), 2);
+        assert_eq!(rt.state.draft.text, "pending");
+    }
+
+    #[test]
+    fn remapped_voice_controls_finish_and_cancel_without_sending_the_draft() {
+        use rune::{Env, Key, Mods, Runtime};
+        let mut s = state();
+        s.mode = Mode::Session;
+        s.draft = rune::TextEdit::new("keep this draft");
+        s.voice = Some(crate::ui::voice::Dictation::preview(
+            crate::config::VoiceMode::Realtime,
+            std::sync::Arc::new(crate::model::voice::Meter::default()),
+            "",
+        ));
+        s.cfg
+            .keymap
+            .bindings
+            .insert("finish_dictation".into(), "alt+f".into());
+        s.cfg
+            .keymap
+            .bindings
+            .insert("cancel_dictation".into(), "alt+x".into());
+        let mut rt = Runtime::new(s, super::super::view, (1440.0, 900.0), Env::new(true, 1.0));
+        rt.on_key = Some(super::super::on_key);
+        rt.frame(0.0);
+        rt.key(KeyEvent {
+            key: Key::Command('f'),
+            mods: Mods {
+                alt: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(
+            rt.state.voice.as_ref().unwrap().phase,
+            crate::ui::voice::Phase::Transcribing
+        );
+        assert_eq!(rt.state.draft.text, "keep this draft");
+        rt.key(KeyEvent {
+            key: Key::Command('x'),
+            mods: Mods {
+                alt: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.voice.is_none());
+        assert_eq!(rt.state.draft.text, "keep this draft");
     }
 
     #[test]
@@ -2320,7 +2456,7 @@ mod tests {
             key: Key::Command('b'),
             mods: Mods {
                 ctrl: true,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 ..Default::default()
             },
         };
@@ -2330,11 +2466,16 @@ mod tests {
         rt.key(leader);
         rt.frame(2.0 / 60.0);
         assert!(!rt.state.is_leader_armed());
-        let expected = "1b 5b 41 1b 5b 42 1b 5b 43 1b 5b 44 02";
-        while !session
+        let expected = [
+            0x1b, 0x5b, 0x41, 0x1b, 0x5b, 0x42, 0x1b, 0x5b, 0x43, 0x1b, 0x5b, 0x44, 0x02,
+        ];
+        while session
             .dump_plain_text()
             .unwrap_or_default()
-            .contains(expected)
+            .split_whitespace()
+            .filter_map(|word| u8::from_str_radix(word, 16).ok())
+            .collect::<Vec<_>>()
+            != expected
         {
             assert!(
                 Instant::now() < deadline,
@@ -2366,7 +2507,7 @@ mod tests {
             key: Key::Text(" ".into()),
             mods: Mods {
                 ctrl: true,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 ..Default::default()
             },
         };
@@ -2419,7 +2560,7 @@ mod tests {
             key: Key::Command('g'),
             mods: Mods {
                 ctrl: true,
-                cmd: true,
+                cmd: !crate::platform::is_macos(),
                 ..Default::default()
             },
         };

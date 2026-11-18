@@ -6,7 +6,7 @@
 
 mod agent_marks;
 mod agents;
-mod art;
+pub(crate) mod art;
 mod composer;
 mod composer_row;
 pub mod copy;
@@ -23,7 +23,7 @@ mod labels;
 pub mod pair_computer;
 pub(crate) mod palette;
 mod panes;
-mod parts;
+pub(crate) mod parts;
 mod running;
 pub mod scenes;
 mod search;
@@ -120,6 +120,7 @@ pub struct ToastItem {
     pub title: String,
     pub detail: Option<String>,
     pub created_at: std::time::Instant,
+    pub target: Option<String>,
 }
 
 const MAX_TOASTS: usize = 5;
@@ -166,6 +167,7 @@ pub enum OpenMenu {
     /// (what a narrow composer folds away).
     Mode,
     ComposerMore,
+    ComposerDelivery,
     /// The start page's model, mode and branch menus.
     StartModel,
     StartMode,
@@ -188,6 +190,9 @@ pub enum OpenMenu {
     Setting(String),
     /// The sidebar's computer picker.
     ComputerPicker,
+    /// The sidebar inventory scope. Search remains global.
+    SidebarScope,
+    WindowSurface(String),
     /// The tasks page's computer filter picker.
     TasksComputerPicker,
 }
@@ -370,6 +375,15 @@ pub fn seed_config(config: DesktopConfig) {
 /// Cached per-computer workspace state so switching machines is instant.
 #[derive(Default)]
 pub struct ComputerData {
+    focused_slot: Option<SessionSlot>,
+    start_draft: Option<TextEdit>,
+    form_inputs: HashMap<String, TextEdit>,
+    pub session_open_errors: HashMap<String, String>,
+    pub pending_receipts: Vec<Update>,
+    pub pending_submit: Option<(u64, Slot)>,
+    pub pending_start: Option<(String, u64)>,
+    pub echoes: HashMap<String, Vec<echo::Echo>>,
+    pub tile_tree: Option<crate::config::TileNode>,
     pub sessions: Vec<AgentSessionInfo>,
     pub directories: HashMap<String, DirInfo>,
     pub known_projects: HashMap<String, Vec<AgentProject>>,
@@ -396,6 +410,8 @@ pub struct TimelineSearch {
 
 /// Main-thread UI state owned by Rune.
 pub struct UiState {
+    pub session_open_errors: HashMap<String, String>,
+    computer_generations: HashMap<String, u64>,
     pub commands: CommandSender,
     /// A mirror of the owner's config: what the pages show, kept in step with
     /// every [`ConfigEdit`] sent to the core.
@@ -437,6 +453,7 @@ pub struct UiState {
     pub context_open: Option<String>,
     /// Account rate windows by agent, once asked for (`None`: it has none).
     pub account_limits: HashMap<String, Option<serde_json::Value>>,
+    pub agent_details: std::collections::HashSet<String>,
     pub status: String,
     pub hub_label: String,
     pub error: Option<UiError>,
@@ -476,6 +493,9 @@ pub struct UiState {
     pub draft_snap_caret: usize,
     pub auto_approve: HashMap<String, bool>,
     pub next_token: u64,
+    pub deferred_attachments: HashMap<(String, Option<String>), Vec<StagedFile>>,
+    pub pending_file_targets: HashMap<u64, (String, Option<String>)>,
+    pub pending_image_uploads: std::collections::HashSet<u64>,
     pub pending_submit: Option<(u64, Slot)>,
     /// Prompts shown before the gateway's row for them arrives, by session
     /// (`ui/echo.rs`).
@@ -502,6 +522,8 @@ pub struct UiState {
     pub worktrees: Vec<WorktreeRow>,
 
     pub search: TextEdit,
+    pub sidebar_all_sessions: bool,
+    pub sidebar_opened: HashMap<String, u64>,
     pub pairing_target: Option<String>,
     pub pairing_request_id: Option<String>,
     pub pairing_code_input: TextEdit,
@@ -535,6 +557,7 @@ pub struct UiState {
     pub waiting_forms: HashMap<String, Vec<FormRequest>>,
     /// The Inbox page's selection and when each prompt first arrived.
     pub inbox_view: inbox::InboxView,
+    pub fleet_pending: HashMap<String, Vec<crate::model::fleet_attention::Pending>>,
     /// The Tasks page's selection, filters and task histories.
     pub tasks_view: tasks::TasksView,
     /// Form answers, by `form id / field key`.
@@ -568,10 +591,9 @@ pub struct UiState {
     pub prompt_history_draft_stash: Option<String>,
     /// Whether the composer prompt history picker popup is open.
     pub composer_history_open: bool,
-    /// Manual height override for the composer textarea (number of rows).
-    pub composer_rows: Option<usize>,
-    /// Whether the composer textarea is toggled into expanded multiline mode.
-    pub composer_expanded: bool,
+    pub composer_queue_delivery: bool,
+    pub composer_queue_expanded: bool,
+    pub composer_queue_page: Option<String>,
     /// Timeline in-session search state (Ctrl+F in session mode).
     pub timeline_search: TimelineSearch,
     /// First agents discovery finished (empty list still counts).
@@ -598,8 +620,6 @@ pub struct UiState {
     pub closed_edit: TextEdit,
     /// Dictation in progress (`ui/voice.rs`).
     pub voice: Option<voice::Dictation>,
-    /// In-app self-update status.
-    pub update_state: crate::model::inbox::UpdateState,
     /// Settings → Voice's fields.
     pub voice_form: voice::VoiceForm,
     /// The file viewer overlay ([`UiState::open_file`]).
@@ -672,6 +692,8 @@ impl UiState {
         };
         let mut s = Self {
             commands,
+            session_open_errors: HashMap::new(),
+            computer_generations: HashMap::new(),
             dark,
             mode: Mode::Home,
             settings_tab: SettingsTab::Agents,
@@ -699,6 +721,7 @@ impl UiState {
             row_menu: None,
             context_open: None,
             account_limits: HashMap::new(),
+            agent_details: std::collections::HashSet::new(),
             status: "Starting…".into(),
             hub_label: String::new(),
             error: None,
@@ -727,6 +750,9 @@ impl UiState {
             draft_snap_caret: 0,
             auto_approve: HashMap::new(),
             next_token: 1,
+            deferred_attachments: Default::default(),
+            pending_file_targets: Default::default(),
+            pending_image_uploads: Default::default(),
             pending_submit: None,
             echoes: HashMap::new(),
             echo_rev: 0,
@@ -745,6 +771,8 @@ impl UiState {
             shells: Vec::new(),
             worktrees: Vec::new(),
             search: TextEdit::new(""),
+            sidebar_all_sessions: false,
+            sidebar_opened: HashMap::new(),
             pairing_target: None,
             pairing_request_id: None,
             pairing_code_input: TextEdit::new(""),
@@ -768,6 +796,7 @@ impl UiState {
             waiting_perms: HashMap::new(),
             waiting_forms: HashMap::new(),
             inbox_view: Default::default(),
+            fleet_pending: HashMap::new(),
             tasks_view: Default::default(),
             form_inputs: HashMap::new(),
             agent_inputs: HashMap::new(),
@@ -790,15 +819,15 @@ impl UiState {
             prompt_history_cursor: None,
             prompt_history_draft_stash: None,
             composer_history_open: false,
-            composer_rows: None,
-            composer_expanded: false,
+            composer_queue_delivery: false,
+            composer_queue_expanded: false,
+            composer_queue_page: None,
             timeline_search: TimelineSearch::default(),
             agents_seen: false,
             demo: false,
             storage: None,
             viewer: None,
             voice: None,
-            update_state: crate::model::inbox::UpdateState::Idle,
             palette: None,
             keys_sheet: None,
             leader_armed: None,
@@ -924,8 +953,14 @@ impl UiState {
     /// Fold a config edit into the mirror and tell the core.
     pub fn edit(&mut self, edit: ConfigEdit) {
         self.cfg.apply(edit.clone());
-        if let ConfigEdit::PluginEnabled { plugin, on: false } = &edit {
-            if !crate::plugin::is_enabled(plugin, &self.cfg.plugins_disabled) {
+        if let ConfigEdit::PluginEnabled { plugin, .. } = &edit {
+            let enabled = crate::plugin::is_enabled(plugin, &self.cfg.plugins_disabled);
+            if let Some(instance) = self.plugins.get(plugin) {
+                instance.enabled_changed(enabled);
+            }
+            if !enabled {
+                self.palette = None;
+                self.menu = None;
                 self.close_plugin_windows(plugin);
             }
         }
@@ -975,6 +1010,32 @@ impl UiState {
         self.sessions.iter().find(|s| s.asid.0 == asid)
     }
 
+    /// Whole-session forking does not imply a message cutoff is supported.
+    /// Unknown/older discoveries fail closed until an adapter explicitly advertises it.
+    pub(super) fn can_fork_from_message(&self, asid: &str) -> bool {
+        let Some(session) = self.session_by_id(asid) else {
+            return false;
+        };
+        if session.runtime.as_ref().is_some_and(|runtime| {
+            runtime.interaction != muqun_gateway::agents::RuntimeInteraction::Native
+        }) {
+            return false;
+        }
+        self.agents
+            .iter()
+            .find(|agent| agent.id == session.agent_id)
+            .is_some_and(|agent| {
+                ["sessionFork", "sessionForkFromMessage"].iter().all(|key| {
+                    agent
+                        .features
+                        .extra
+                        .get(*key)
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                })
+            })
+    }
+
     pub fn current(&self) -> Option<&AgentSessionInfo> {
         self.selected.as_deref().and_then(|a| self.session_by_id(a))
     }
@@ -993,7 +1054,7 @@ impl UiState {
     }
 
     pub fn current_computer(&self) -> &str {
-        if self.cfg.current_computer.is_empty() {
+        if self.cfg.current_computer.is_empty() || self.cfg.current_computer == "self" {
             "local"
         } else {
             &self.cfg.current_computer
@@ -1103,6 +1164,9 @@ impl UiState {
             return Some(curr.to_string());
         }
         for (cid, cdata) in &self.computer_data {
+            if cid == "all" {
+                continue;
+            }
             if cdata.sessions.iter().any(|s| s.asid.0 == asid) {
                 return Some(cid.clone());
             }
@@ -1111,6 +1175,32 @@ impl UiState {
             return Some("local".to_string());
         }
         None
+    }
+
+    fn route_session(&mut self, asid: &str) {
+        if let Some(computer) = self.computer_of_session(asid) {
+            if computer != self.current_computer() {
+                self.switch_computer(computer);
+            }
+        }
+    }
+
+    pub fn retry_open_session(&mut self, asid: &str) {
+        self.route_session(asid);
+        self.session_open_errors.remove(asid);
+        self.send(Command::OpenSession(AgentSessionId(asid.to_owned())));
+    }
+
+    fn rebuild_all_sessions(&mut self) {
+        self.sessions = self
+            .computer_data
+            .iter()
+            .filter(|(computer, _)| computer.as_str() != "all")
+            .flat_map(|(_, data)| data.sessions.iter().cloned())
+            .collect();
+        self.sessions
+            .sort_by_key(|session| std::cmp::Reverse(session.updated_ms));
+        self.sessions.dedup_by(|a, b| a.asid == b.asid);
     }
 
     pub fn open_pairing(&mut self, target_id: String) {
@@ -1138,9 +1228,28 @@ impl UiState {
     }
 
     pub fn switch_computer(&mut self, id: String) {
+        let id = if id == "self" || id.is_empty() {
+            "local".to_string()
+        } else {
+            id
+        };
         let prev = self.current_computer().to_string();
+        let mut pending_receipts = Vec::new();
         if prev != id {
+            self.waiting_perms.clear();
+            self.waiting_forms.clear();
+            self.persist_draft(Slot::Session);
+            let slot = self.take_slot();
             let data = ComputerData {
+                form_inputs: std::mem::take(&mut self.form_inputs),
+                focused_slot: Some(slot),
+                start_draft: Some(std::mem::replace(&mut self.start_draft, TextEdit::new(""))),
+                session_open_errors: std::mem::take(&mut self.session_open_errors),
+                pending_receipts: Vec::new(),
+                pending_submit: self.pending_submit.take(),
+                pending_start: self.pending_start.take(),
+                echoes: std::mem::take(&mut self.echoes),
+                tile_tree: Some(self.tile_tree.clone()),
                 sessions: std::mem::take(&mut self.sessions),
                 directories: std::mem::take(&mut self.directories),
                 known_projects: std::mem::take(&mut self.known_projects),
@@ -1155,7 +1264,9 @@ impl UiState {
                 focus: self.focus,
                 mode: self.mode,
             };
-            self.computer_data.insert(prev, data);
+            if prev != "all" {
+                self.computer_data.insert(prev, data);
+            }
 
             if id == "all" {
                 let mut all_sess = Vec::new();
@@ -1176,6 +1287,15 @@ impl UiState {
                 self.selected = None;
                 self.mode = Mode::Home;
             } else if let Some(restored) = self.computer_data.remove(&id) {
+                self.form_inputs = restored.form_inputs;
+                self.start_draft = restored.start_draft.unwrap_or_else(|| TextEdit::new(""));
+                self.session_open_errors = restored.session_open_errors;
+                self.pending_submit = restored.pending_submit;
+                self.pending_start = restored.pending_start;
+                self.echoes = restored.echoes;
+                self.tile_tree = restored
+                    .tile_tree
+                    .unwrap_or(crate::config::TileNode::Leaf(0));
                 self.sessions = restored.sessions;
                 self.directories = restored.directories;
                 self.known_projects = restored.known_projects;
@@ -1193,6 +1313,10 @@ impl UiState {
                 };
                 self.focus = restored.focus;
                 self.mode = restored.mode;
+                if let Some(slot) = restored.focused_slot {
+                    self.put_slot(slot);
+                }
+                pending_receipts = restored.pending_receipts;
             } else {
                 self.tiles = vec![Tile::default()];
                 self.focus = 0;
@@ -1202,6 +1326,13 @@ impl UiState {
         }
 
         self.cfg.current_computer = id.clone();
+        // Receipts can close an optimistic pane or issue follow-up reads.
+        // Establish the backend barrier before applying any of them.
+        if id != "all" {
+            self.send(Command::SwitchComputer(id.clone()));
+        }
+        self.apply_updates(pending_receipts);
+        composer::restore_attachments(self);
         self.edit(ConfigEdit::CurrentComputer(id.clone()));
         self.agent_inputs.clear();
         self.agent_errors.clear();
@@ -1225,8 +1356,20 @@ impl UiState {
         }
 
         if id != "all" {
-            self.send(Command::SwitchComputer(id.clone()));
             self.send(Command::Refresh);
+            let sessions: Vec<_> = self
+                .tiles
+                .iter()
+                .filter_map(|tile| tile.asid.clone())
+                .collect();
+            for asid in sessions {
+                self.session_open_errors.remove(&asid);
+                self.send(Command::OpenTile(AgentSessionId(asid)));
+            }
+            if let Some(asid) = self.selected.clone() {
+                self.send(Command::FocusSession(AgentSessionId(asid)));
+            }
+            self.sync_watch();
         }
     }
 
@@ -1244,7 +1387,7 @@ impl UiState {
         if let Some(existing) = self
             .toasts
             .iter_mut()
-            .find(|t| t.title == title && t.detail == detail)
+            .find(|t| t.target.is_none() && t.title == title && t.detail == detail)
         {
             existing.level = level;
             existing.created_at = now;
@@ -1258,6 +1401,7 @@ impl UiState {
             title,
             detail,
             created_at: now,
+            target: None,
         });
         while self.toasts.len() > MAX_TOASTS {
             self.toasts.remove(0);
@@ -1340,6 +1484,13 @@ impl UiState {
     }
 
     pub fn is_dark(&self, system: bool) -> bool {
+        if self.cfg.appearance.theme_id == crate::theme::omarchy::ID {
+            if let Some((id, scheme)) = crate::theme::apply::current_choice() {
+                if id == crate::theme::omarchy::ID {
+                    return scheme == Scheme::Dark;
+                }
+            }
+        }
         match self.cfg.appearance.scheme {
             Scheme::System => system,
             Scheme::Dark => true,
@@ -1357,16 +1508,76 @@ impl UiState {
         let perms: usize = self.waiting_perms.values().map(Vec::len).sum();
         let forms: usize = self.waiting_forms.values().map(Vec::len).sum();
         let tasks = self.tasks.iter().filter(|t| t.state == "waiting").count();
-        perms + forms + tasks
+        perms + forms + tasks + self.external_pending().len()
+    }
+
+    pub fn external_pending(&self) -> Vec<&crate::model::fleet_attention::Pending> {
+        self.fleet_pending
+            .values()
+            .flatten()
+            .filter(|p| {
+                if p.computer != self.current_computer() {
+                    return true;
+                }
+                if let Some(id) = p.request.strip_prefix("p:") {
+                    !self
+                        .waiting_perms
+                        .get(&p.asid)
+                        .is_some_and(|list| list.iter().any(|r| r.id == id))
+                } else if let Some(id) = p.request.strip_prefix("f:") {
+                    !self
+                        .waiting_forms
+                        .get(&p.asid)
+                        .is_some_and(|list| list.iter().any(|r| r.id == id))
+                } else {
+                    false
+                }
+            })
+            .collect()
     }
 
     /// Show session `asid`. In split view it joins as a new pane (or takes
     /// focus where it already is); otherwise it fills the main card.
     pub fn open_session(&mut self, asid: &str) {
+        self.route_session(asid);
+        self.open_session_current(asid);
+    }
+
+    pub fn open_session_on(&mut self, computer: &str, asid: &str) {
+        if self.current_computer() != computer {
+            self.switch_computer(computer.to_owned());
+        }
+        self.open_session_current(asid);
+    }
+
+    pub fn open_notification(&mut self, key: &str) {
+        if let Ok((computer, asid)) = serde_json::from_str::<(String, String)>(key) {
+            self.open_session_on(&computer, &asid);
+        }
+    }
+
+    fn open_session_current(&mut self, asid: &str) {
+        self.session_open_errors.remove(asid);
+        let key = format!("{}:{asid}", self.current_computer());
+        self.sidebar_opened.insert(key, now_ms());
+        if self.sidebar_opened.len() > 256 {
+            if let Some(oldest) = self
+                .sidebar_opened
+                .iter()
+                .min_by_key(|(_, time)| *time)
+                .map(|(id, _)| id.clone())
+            {
+                self.sidebar_opened.remove(&oldest);
+            }
+        }
+        self.sidebar_all_sessions = false;
         self.active_plugin_page = None;
         if self.in_split() && self.tile_of(asid).is_none() {
-            crate::platform::notify::withdraw(asid);
-            self.open_in_tile(asid);
+            crate::platform::notify::withdraw(&crate::model::fleet_attention::notice_key(
+                self.current_computer(),
+                asid,
+            ));
+            self.open_in_tile_current(asid);
             return;
         }
         self.open_here(asid);
@@ -1375,7 +1586,10 @@ impl UiState {
     /// Show session `asid` in the focused pane (the main card outside split
     /// view), in place of what it showed.
     fn open_here(&mut self, asid: &str) {
-        crate::platform::notify::withdraw(asid);
+        crate::platform::notify::withdraw(&crate::model::fleet_attention::notice_key(
+            self.current_computer(),
+            asid,
+        ));
         if let Some(i) = self.tile_of(asid) {
             if i != self.focus {
                 self.focus_tile(i);
@@ -1419,6 +1633,7 @@ impl UiState {
         self.send(Command::Compose(
             crate::model::compose::ComposeCommand::ListPeers,
         ));
+        composer::restore_attachments(self);
     }
 
     /// Toggle to the most recent previous session (Ctrl+Tab).
@@ -1628,7 +1843,16 @@ impl UiState {
 
     /// Update matching items in the current session for the timeline search query.
     pub fn update_timeline_search_matches(&mut self, asid: &str) {
-        let q = self.timeline_search.query.text.trim().to_lowercase();
+        let q = self.timeline_search.query.text.trim();
+        let contains = |text: &str| rune_kit::search::Fold::default().contains(text, q);
+        let prose_matches = |text: &str| {
+            !rune_kit::markdown::find(
+                text,
+                q,
+                rune_kit::markdown::Case::Folded(Default::default()),
+            )
+            .is_empty()
+        };
         self.timeline_search.matches.clear();
         self.timeline_search.active_index = 0;
         if q.is_empty() {
@@ -1637,41 +1861,29 @@ impl UiState {
         if let Some(tl) = self.timelines.get(asid) {
             for item in &tl.items {
                 let matches = match &item.part {
-                    muqun_gateway::agents::AgentPart::Text { text, .. } => {
-                        text.to_lowercase().contains(&q)
-                    }
-                    muqun_gateway::agents::AgentPart::Reasoning { text, .. } => {
-                        text.to_lowercase().contains(&q)
-                    }
+                    muqun_gateway::agents::AgentPart::Text { text, .. } => prose_matches(text),
+                    muqun_gateway::agents::AgentPart::Reasoning { text, .. } => prose_matches(text),
                     muqun_gateway::agents::AgentPart::Tool(tool) => {
-                        tool.name.to_lowercase().contains(&q)
-                            || tool
-                                .title
-                                .as_ref()
-                                .is_some_and(|t| t.to_lowercase().contains(&q))
-                            || tool.input.to_string().to_lowercase().contains(&q)
+                        contains(&tool.name)
+                            || tool.title.as_ref().is_some_and(|t| contains(t))
+                            || contains(&tool.input.to_string())
                             || tool
                                 .output
                                 .as_ref()
-                                .is_some_and(|o| o.to_string().to_lowercase().contains(&q))
+                                .is_some_and(|o| contains(&o.to_string()))
                     }
+                    muqun_gateway::agents::AgentPart::Shell {
+                        command, output, ..
+                    } => contains(command) || output.as_ref().is_some_and(|text| contains(text)),
                     muqun_gateway::agents::AgentPart::Diff { file, diff } => {
-                        file.to_lowercase().contains(&q) || diff.to_lowercase().contains(&q)
+                        contains(file) || contains(diff)
                     }
-                    muqun_gateway::agents::AgentPart::Status { text } => {
-                        text.to_lowercase().contains(&q)
-                    }
+                    muqun_gateway::agents::AgentPart::Status { text } => contains(text),
                     muqun_gateway::agents::AgentPart::Synthetic { text, description } => {
-                        text.to_lowercase().contains(&q)
-                            || description
-                                .as_ref()
-                                .is_some_and(|d| d.to_lowercase().contains(&q))
+                        contains(text) || description.as_ref().is_some_and(|d| contains(d))
                     }
                     muqun_gateway::agents::AgentPart::System { text, description } => {
-                        text.to_lowercase().contains(&q)
-                            || description
-                                .as_ref()
-                                .is_some_and(|d| d.to_lowercase().contains(&q))
+                        contains(text) || description.as_ref().is_some_and(|d| contains(d))
                     }
                     _ => false,
                 };
@@ -1692,10 +1904,17 @@ impl UiState {
         }
         let idx = self.timeline_search.active_index % self.timeline_search.matches.len();
         let key = self.timeline_search.matches[idx].clone();
-        tx.scroll_center_in(format!("feed-{asid}"), key.clone());
         if let Some(tl) = self.timelines.get_mut(&asid) {
-            tl.selected = Some(key.clone());
-            tl.flash = Some((key, std::time::Instant::now()));
+            let row_key = search::locate(tl, &key, "").unwrap_or_else(|| key.clone());
+            if row_key != key && !tl.is_open(&row_key, false) {
+                tl.flip(&row_key);
+            }
+            if !tl.is_open(&key, false) {
+                tl.flip(&key);
+            }
+            tx.scroll_center_in(format!("feed-{asid}"), row_key.clone());
+            tl.selected = Some(key);
+            tl.flash = Some((row_key, std::time::Instant::now()));
             tl.rev += 1;
         }
         tx.wake_after(std::time::Duration::from_millis(800));
@@ -1724,9 +1943,28 @@ impl UiState {
         self.timeline_search_jump_to_current(tx);
     }
 
+    pub fn refresh_account_limits(&self) {
+        for a in &self.agents {
+            if a.features.extra.get("accountLimits") == Some(&serde_json::Value::Bool(true)) {
+                self.send(Command::LoadAccountLimits {
+                    agent: a.id.clone(),
+                });
+            }
+        }
+    }
+
     pub fn go(&mut self, mode: Mode) {
+        let plugin = match mode {
+            Mode::Tasks => Some("tasks"),
+            Mode::Inbox => Some("inbox"),
+            _ => None,
+        };
+        if plugin.is_some_and(|id| !crate::plugin::is_enabled(id, &self.cfg.plugins_disabled)) {
+            return;
+        }
         self.active_plugin_page = None;
         self.mode = mode;
+        composer::restore_attachments(self);
         match mode {
             Mode::Tasks => self.send(Command::RefreshTasks),
             Mode::Home => {
@@ -1739,6 +1977,7 @@ impl UiState {
                 ));
             }
             Mode::Settings => {
+                self.refresh_account_limits();
                 self.send(Command::ThemeRefresh);
                 self.send(Command::ScanStorage);
             }
@@ -1770,7 +2009,18 @@ impl UiState {
     pub fn draft_key(&self, slot: Slot) -> Option<String> {
         match slot {
             Slot::Start => Some(crate::config::START_DRAFT.to_string()),
-            Slot::Session => self.selected.clone(),
+            Slot::Session => self
+                .selected
+                .as_deref()
+                .map(|asid| self.session_draft_key(asid)),
+        }
+    }
+
+    fn session_draft_key(&self, asid: &str) -> String {
+        if self.current_computer() == "local" {
+            asid.to_owned()
+        } else {
+            format!("computer:{}:{asid}", self.current_computer())
         }
     }
 
@@ -1796,7 +2046,7 @@ impl UiState {
             .cfg
             .general
             .drafts
-            .get(asid)
+            .get(&self.session_draft_key(asid))
             .cloned()
             .unwrap_or_default();
         self.draft = TextEdit::new(text).rich();
@@ -1870,7 +2120,23 @@ impl UiState {
         }
     }
 
+    pub fn inline_inspector_open(&self) -> bool {
+        self.mode == Mode::Session
+            && self.in_split()
+            && self.right_open
+            && !self.term.open
+            && self.active_plugin_drawer.is_none()
+    }
+
+    pub fn close_inspector(&mut self) {
+        self.right_open = false;
+        self.right.set_open(false);
+    }
+
     pub fn toggle_inspector(&mut self) {
+        if !crate::plugin::is_enabled("inspector", &self.cfg.plugins_disabled) {
+            return;
+        }
         self.active_plugin_drawer = None;
         if self.term.open {
             // One panel on the right at a time: the inspector takes it back.
@@ -1885,6 +2151,9 @@ impl UiState {
     }
 
     pub fn open_git_inspector(&mut self) {
+        if !crate::plugin::is_enabled("inspector", &self.cfg.plugins_disabled) {
+            return;
+        }
         self.active_plugin_drawer = None;
         if self.mode != Mode::Session && self.selected.is_some() {
             self.go(Mode::Session);
@@ -1932,9 +2201,13 @@ impl UiState {
 
     // ---- split tiles ---------------------------------------------------------------
 
-    /// Several sessions share the pane.
+    /// Render the tile workspace, including a standalone plugin window.
     pub fn in_split(&self) -> bool {
         self.tiles.len() >= 2
+            || self
+                .tiles
+                .first()
+                .is_some_and(|tile| matches!(tile.content, TileContent::Custom { .. }))
     }
 
     pub fn tile_of(&self, asid: &str) -> Option<usize> {
@@ -2001,11 +2274,23 @@ impl UiState {
         self.saved_permissions = slot.saved_permissions;
     }
 
+    /// Route native keyboard focus after activating a split pane.
+    pub(super) fn focus_pane_input(&mut self, tx: &mut rune::Tx) {
+        match self.tiles.get(self.focus).map(|tile| &tile.content) {
+            Some(TileContent::Session(_)) if !self.timeline_search.active => {
+                tx.focus("draft", false)
+            }
+            Some(TileContent::Terminal) => self.focus_terminal_tx(tx),
+            _ => {}
+        }
+    }
+
     /// Give tile `i` the keyboard: its session or window becomes active,
     /// and the old focused tile keeps its state in its slot.
     pub fn focus_tile(&mut self, i: usize) {
         if i >= self.tiles.len() {
             self.mode = Mode::Session;
+            composer::restore_attachments(self);
             return;
         }
         if i == self.focus {
@@ -2031,6 +2316,7 @@ impl UiState {
                 }
                 _ => {}
             }
+            composer::restore_attachments(self);
             return;
         }
         let old = self.take_slot();
@@ -2039,7 +2325,15 @@ impl UiState {
         self.put_slot(new);
         self.focus = i;
         self.selected = self.tiles[i].asid.clone();
+        if self.timeline_search.active {
+            if let Some(asid) = self.selected.clone() {
+                self.update_timeline_search_matches(&asid);
+            } else {
+                self.close_timeline_search();
+            }
+        }
         self.menu = None;
+        self.context_open = None;
         self.mode = Mode::Session;
 
         match &self.tiles[i].content {
@@ -2067,6 +2361,7 @@ impl UiState {
             }
             _ => {}
         }
+        composer::restore_attachments(self);
     }
 
     /// Ensure `s.term.active_tab` matches the terminal tab bound to tile `i`.
@@ -2116,6 +2411,12 @@ impl UiState {
     /// panes takes the focused pane's place. The pane it lands in takes
     /// focus; a session already in a pane just takes focus.
     pub fn open_in_tile(&mut self, asid: &str) {
+        self.route_session(asid);
+        self.open_in_tile_current(asid);
+    }
+
+    fn open_in_tile_current(&mut self, asid: &str) {
+        self.session_open_errors.remove(asid);
         if let Some(i) = self.tile_of(asid) {
             self.focus_tile(i);
             return;
@@ -2145,7 +2446,7 @@ impl UiState {
                 self.cfg
                     .general
                     .drafts
-                    .get(asid)
+                    .get(&self.session_draft_key(asid))
                     .cloned()
                     .unwrap_or_default(),
             )
@@ -2501,15 +2802,11 @@ impl UiState {
             }
         }
         if let Some(asid) = gone.asid {
+            let key = self.session_draft_key(&asid);
             let text = gone.slot.draft.text.clone();
-            let stored = self
-                .cfg
-                .general
-                .drafts
-                .get(&asid)
-                .map_or("", String::as_str);
+            let stored = self.cfg.general.drafts.get(&key).map_or("", String::as_str);
             if stored != text {
-                self.edit(ConfigEdit::Draft { key: asid, text });
+                self.edit(ConfigEdit::Draft { key, text });
             }
         }
         if self.tiles.len() <= 1 {
@@ -2653,6 +2950,13 @@ impl UiState {
         }
         if let Some(first_asid) = self.tiles.iter().find_map(|t| t.asid.clone()) {
             self.open_session(&first_asid);
+            // Watching only subscribes to future events. Every restored pane
+            // needs its initial snapshot, including panes nobody has clicked.
+            for asid in self.tiles.iter().filter_map(|tile| tile.asid.as_ref()) {
+                if asid != &first_asid && !asid.starts_with("new-") {
+                    self.send(Command::OpenTile(AgentSessionId(asid.clone())));
+                }
+            }
         }
         // The saved tiling, when every saved pane came back.
         if let Some(layout) = self.cfg.ui.tile_layout.clone() {
@@ -2678,6 +2982,52 @@ impl UiState {
         }
         for update in updates {
             match update {
+                Update::Computer {
+                    computer,
+                    generation,
+                    updates,
+                } => {
+                    let latest = self
+                        .computer_generations
+                        .entry(computer.clone())
+                        .or_default();
+                    let stale = generation < *latest;
+                    *latest = (*latest).max(generation);
+                    let active = self.current_computer() == computer;
+                    for update in updates {
+                        let receipt = matches!(&update, Update::SessionCreated(_))
+                            || matches!(&update, Update::Composer(composer)
+                                if matches!(**composer, ComposerUpdate::Submitted { .. }));
+                        if receipt {
+                            if active {
+                                self.apply_updates(vec![update]);
+                            } else {
+                                self.computer_data
+                                    .entry(computer.clone())
+                                    .or_default()
+                                    .pending_receipts
+                                    .push(update);
+                            }
+                            continue;
+                        }
+                        if stale {
+                            continue;
+                        }
+                        if active {
+                            self.apply_updates(vec![update]);
+                        } else if let Update::AgentSessions { agent, sessions } = update {
+                            let data = self.computer_data.entry(computer.clone()).or_default();
+                            data.sessions.retain(|s| s.agent_id != agent);
+                            data.sessions.extend(sessions);
+                            if self.current_computer() == "all" {
+                                self.rebuild_all_sessions();
+                            }
+                        }
+                    }
+                }
+                Update::SessionOpenFailed { asid, message } => {
+                    self.session_open_errors.insert(asid, message);
+                }
                 Update::Agents(agents) => {
                     self.on_agents(agents);
                     self.restore_tiles();
@@ -2744,33 +3094,15 @@ impl UiState {
                         }
                         self.restore_tiles();
                     } else {
-                        let local_data = self.computer_data.entry("local".to_string()).or_default();
-                        local_data.sessions.retain(|s| s.agent_id != agent);
-                        for s in sessions {
-                            if let Some(existing) =
-                                local_data.sessions.iter_mut().find(|x| x.asid == s.asid)
-                            {
-                                *existing = s;
-                            } else {
-                                local_data.sessions.push(s);
-                            }
-                        }
-                        let mut all_sess = Vec::new();
-                        for cdata in self.computer_data.values() {
-                            for sess in &cdata.sessions {
-                                if !all_sess
-                                    .iter()
-                                    .any(|x: &AgentSessionInfo| x.asid == sess.asid)
-                                {
-                                    all_sess.push(sess.clone());
-                                }
-                            }
-                        }
-                        all_sess.sort_by_key(|a| std::cmp::Reverse(a.updated_ms));
-                        self.sessions = all_sess;
+                        // Aggregate lists must carry their source computer; an
+                        // unscoped list cannot safely be assigned to local.
+                        self.rebuild_all_sessions();
                     }
                 }
-                Update::SessionCreated(info) => self.merge_sessions(vec![*info]),
+                Update::SessionCreated(info) => {
+                    self.adopt_created_session(&info.asid.0);
+                    self.merge_sessions(vec![*info]);
+                }
                 Update::SessionGone(asid) => {
                     self.sessions.retain(|s| s.asid.0 != asid);
                     self.waiting_perms.remove(&asid);
@@ -2881,9 +3213,11 @@ impl UiState {
                     generation,
                     outcome,
                 } => self.on_search(generation, outcome),
-                Update::Attention(attention) => self.on_attention(&attention),
+                Update::FleetAttention(change) => self.on_fleet_attention(*change),
+                Update::FleetAttentionUnavailable(computer) => {
+                    self.toast(format!("{} · {}", self.computer_name(&computer), copy::tr(self.cfg.general.language, "Gateway update required")), Some(copy::tr(self.cfg.general.language, "Update this computer’s Gateway to recover approvals and questions after reconnecting. Live requests still appear.")));
+                }
                 Update::Voice(event) => self.on_voice(event),
-                Update::UpdateState(state) => self.update_state = state,
                 Update::Runtimes(statuses) => {
                     self.runtime_statuses = statuses;
                 }
@@ -2921,29 +3255,77 @@ impl UiState {
         if LAYOUT_DIRTY.swap(false, Ordering::AcqRel) {
             self.persist_layout();
         }
+        // Keep streaming tool rows stable throughout a turn; fold them once
+        // after its final status, including snapshots and parked split panes.
+        for info in &self.sessions {
+            if matches!(
+                info.status,
+                AgentSessionStatus::Idle
+                    | AgentSessionStatus::Failed
+                    | AgentSessionStatus::Interrupted
+            ) {
+                if let Some(tl) = self.timelines.get_mut(&info.asid.0) {
+                    tl.settle_activity();
+                }
+            }
+        }
         self.note_busy();
         inbox::note_waiting(self);
         self.sync_tray();
     }
 
-    /// Raise a system notification unless the owner turned them off or is
-    /// looking at that session (`model/notify.rs` has the rules and words).
-    fn on_attention(&mut self, attention: &crate::model::notify::Attention) {
-        // On screen: the focused session, or any session in a split tile.
-        let on_screen = crate::platform::notify::window_focused()
-            && self.mode == Mode::Session
-            && (self.selected.as_deref() == Some(attention.asid.as_str())
-                || self.tile_of(&attention.asid).is_some());
-        if !self.cfg.notifications.enabled || on_screen {
-            return;
+    fn on_fleet_attention(&mut self, change: crate::model::fleet_attention::Change) {
+        use crate::model::fleet_attention::notice_key;
+        let computer = change.computer;
+        if let Some(previous) = self.fleet_pending.get(&computer) {
+            for prompt in previous {
+                if !change.pending.iter().any(|p| p.asid == prompt.asid) {
+                    let key = notice_key(&computer, &prompt.asid);
+                    crate::platform::notify::withdraw(&key);
+                    self.toasts
+                        .retain(|t| t.target.as_deref() != Some(key.as_str()));
+                }
+            }
         }
-        let info = self.session_by_id(&attention.asid);
-        let agent = info.map(|i| self.agent_name(&i.agent_id));
-        let language = self.cfg.general.language;
-        if let Some(notice) =
-            crate::model::notify::compose(attention, info, agent.as_deref(), language)
-        {
-            crate::platform::notify::show(notice);
+        self.fleet_pending.insert(computer.clone(), change.pending);
+        for attention in change.raised {
+            let on_screen = self.current_computer() == computer
+                && crate::platform::notify::window_focused()
+                && self.mode == Mode::Session
+                && (self.selected.as_deref() == Some(attention.asid.as_str())
+                    || self.tile_of(&attention.asid).is_some());
+            if !self.cfg.notifications.enabled || on_screen {
+                continue;
+            }
+            let info = change.info.get(&attention.asid);
+            let agent = info.map(|i| self.agent_name(&i.agent_id));
+            if let Some(mut notice) = crate::model::notify::compose(
+                &attention,
+                info,
+                agent.as_deref(),
+                self.cfg.general.language,
+            ) {
+                notice.key = notice_key(&computer, &attention.asid);
+                notice.title = format!("{} · {}", self.computer_name(&computer), notice.title);
+                if notice.waiting {
+                    self.toasts
+                        .retain(|t| t.target.as_deref() != Some(notice.key.as_str()));
+                    self.toast_seq += 1;
+                    self.toasts.push(ToastItem {
+                        id: self.toast_seq,
+                        level: ToastLevel::Warning,
+                        title: notice.title.clone(),
+                        detail: Some(notice.body.clone()),
+                        created_at: std::time::Instant::now(),
+                        target: Some(notice.key.clone()),
+                    });
+                    while self.toasts.len() > MAX_TOASTS {
+                        self.toasts.remove(0);
+                    }
+                    HAS_TOASTS.store(true, Ordering::Release);
+                }
+                crate::platform::notify::show(notice);
+            }
         }
     }
 
@@ -2965,6 +3347,15 @@ impl UiState {
                         theme_id: id.clone(),
                     });
                     self.send(Command::ThemeApply(id, scheme));
+                }
+            }
+            ThemeUpdate::SystemRefreshed(applied) => {
+                if self.cfg.appearance.theme_id == crate::theme::omarchy::ID {
+                    let scheme = applied.scheme;
+                    if crate::theme::apply::activate(applied).is_ok() {
+                        self.cfg.appearance.scheme = scheme;
+                        self.dark = scheme == Scheme::Dark;
+                    }
                 }
             }
             ThemeUpdate::Applied(applied) => {
@@ -3033,13 +3424,12 @@ impl UiState {
         self.sessions.truncate(SESSIONS_KEPT);
     }
 
-    fn on_snapshot(&mut self, snapshot: muqun_gateway::agents::ports::AgentSessionSnapshot) {
-        let asid = snapshot.info.asid.0.clone();
+    fn adopt_created_session(&mut self, asid: &str) {
         // Migrate optimistic pending session created from home composer if present.
         if let Some((pending_asid, _)) = self.pending_start.take() {
             self.sessions.retain(|s| s.asid.0 != pending_asid);
             if let Some(pending_echoes) = self.echoes.remove(&pending_asid) {
-                let list = self.echoes.entry(asid.clone()).or_default();
+                let list = self.echoes.entry(asid.to_owned()).or_default();
                 for echo in pending_echoes {
                     if !list.iter().any(|e| e.token == echo.token) {
                         list.push(echo);
@@ -3047,15 +3437,21 @@ impl UiState {
                 }
             }
             if self.selected.as_deref() == Some(pending_asid.as_str()) {
-                self.selected = Some(asid.clone());
+                self.selected = Some(asid.to_owned());
             }
             for tile in &mut self.tiles {
                 if tile.asid.as_deref() == Some(pending_asid.as_str()) {
-                    tile.asid = Some(asid.clone());
-                    tile.content = TileContent::Session(asid.clone());
+                    tile.asid = Some(asid.to_owned());
+                    tile.content = TileContent::Session(asid.to_owned());
                 }
             }
         }
+    }
+
+    fn on_snapshot(&mut self, snapshot: muqun_gateway::agents::ports::AgentSessionSnapshot) {
+        self.session_open_errors.remove(&snapshot.info.asid.0);
+        let asid = snapshot.info.asid.0.clone();
+        self.adopt_created_session(&asid);
         // A session opened into a tile that is not focused fills that tile.
         if let Some(i) = self.tile_of(&asid) {
             if i != self.focus {
@@ -3306,13 +3702,23 @@ impl UiState {
         match update {
             ComposerUpdate::Files { hits } => self.file_hits = hits,
             ComposerUpdate::Catalog {
+                asid,
                 agent,
                 directory,
                 view,
             } => {
-                let session = self
-                    .current()
-                    .is_some_and(|i| i.agent_id == agent && i.directory == directory);
+                if let Some(asid) = asid {
+                    if self.selected.as_deref() == Some(asid.0.as_str()) {
+                        self.catalog = Some(view);
+                    } else if let Some(tile) = self
+                        .tiles
+                        .iter_mut()
+                        .find(|t| t.asid.as_deref() == Some(asid.0.as_str()))
+                    {
+                        tile.slot.catalog = Some(view);
+                    }
+                    return;
+                }
                 let typed = self.start_cwd.text.trim();
                 let start = agent == self.start_agent
                     && (directory.as_deref().unwrap_or("").trim_end_matches('/')
@@ -3320,16 +3726,10 @@ impl UiState {
                         || directory.is_none()
                         || typed.is_empty());
                 if start {
-                    self.start_catalog = Some(view.clone());
-                }
-                if session || !start {
-                    self.catalog = Some(view);
+                    self.start_catalog = Some(view);
                 }
             }
-            ComposerUpdate::Staged { result, .. } => match result {
-                Ok(file) => self.staged.push(file),
-                Err(err) => self.toast_error("Attachment failed", Some(err)),
-            },
+            ComposerUpdate::Staged { id, result } => composer::finish_staging(self, id, result),
             ComposerUpdate::Submitted { token, ok } => {
                 if !ok
                     && self
@@ -3450,11 +3850,11 @@ pub enum Activity {
 
 impl UiState {
     pub fn look(&self) -> Look {
-        Look::of(&self.cfg.appearance, self.dark)
+        Look::of(&self.cfg.appearance, self.is_dark(self.dark))
     }
 
     pub fn scheme(&self) -> ColorScheme {
-        if self.dark {
+        if self.is_dark(self.dark) {
             ColorScheme::Dark
         } else {
             ColorScheme::Light
@@ -3612,7 +4012,7 @@ pub fn activity_mark(
         Activity::Idle => (k.c.text_faint, tr(language, "Idle")),
     };
     let mark = match activity {
-        Activity::Working => rune_kit::Spinner::new().size(10.0).color(color).build(k),
+        Activity::Working => crate::ui::art::ActivityMark::Compact.build(k),
         Activity::NeedsYou => look.pulse(rune::el().size(7.0, 7.0).radius(3.5).fill(color)),
         _ => rune::el().size(7.0, 7.0).radius(3.5).fill(color),
     };
@@ -3622,7 +4022,7 @@ pub fn activity_mark(
         .px(8.0)
         .gap(6.0)
         .center_y()
-        .radius(10.0)
+        .radius(k.radius.lg)
         .fill(color.alpha(if activity == Activity::Idle {
             0.08
         } else {
@@ -3749,6 +4149,18 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
             let mut toast = rune_kit::Toast::new(format!("toast-{id}"), t.title.clone())
                 .lead(dot)
                 .on_close(move |s: &mut UiState| s.toasts.retain(|t| t.id != id));
+            if let Some(target) = &t.target {
+                let target = target.clone();
+                toast = toast.action(
+                    &k,
+                    &copy::tr(s.cfg.general.language, "Open"),
+                    true,
+                    move |s: &mut UiState, _| {
+                        s.open_notification(&target);
+                        s.toasts.retain(|t| t.id != id);
+                    },
+                );
+            }
             if let Some(d) = &t.detail {
                 toast = toast.description(d.clone());
             }
@@ -3783,13 +4195,425 @@ pub fn spawn_inbox_pump(inbox: Arc<Inbox>, handle: rune::AppHandle<UiState>) {
                 }
                 continue;
             }
-            handle.update(move |s, _| s.apply_updates(batch));
+            handle.update(move |s, tx| {
+                let questions = |s: &UiState| -> Vec<String> {
+                    s.selected
+                        .as_deref()
+                        .map(|asid| {
+                            parts::question::pending_forms(s, asid)
+                                .into_iter()
+                                .map(|form| form.id.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                let before = questions(s);
+                s.apply_updates(batch);
+                if !s.cfg.appearance.reduced_motion && before != questions(s) {
+                    tx.animated();
+                }
+            });
         })
         .expect("inbox pump");
 }
 
 #[cfg(test)]
 mod tests {
+    fn session_fixture(id: &str) -> AgentSessionInfo {
+        serde_json::from_value(serde_json::json!({
+            "asid": id, "agent_id": "codex", "title": id,
+            "status": "idle", "directory": "/project", "updated_ms": 1
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn remote_attention_routes_to_its_owner_without_leaking_local_forms_or_answers() {
+        use crate::model::fleet_attention::{notice_key, Change, Pending};
+        use crate::model::notify::{Attention, AttentionKind};
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.cfg.current_computer = "local".into();
+        s.cfg.notifications.enabled = false;
+        s.sessions = vec![session_fixture("same")];
+        s.waiting_forms.insert(
+            "same".into(),
+            vec![serde_json::from_value(serde_json::json!({
+                "id":"question", "asid":"same", "title":"local", "fields":[]
+            }))
+            .unwrap()],
+        );
+        s.form_inputs.insert(
+            "question/answer".into(),
+            TextEdit::new("local private draft"),
+        );
+        let pending = Pending {
+            computer: "mini".into(),
+            asid: "same".into(),
+            request: "f:question".into(),
+            kind: AttentionKind::Question,
+            title: "remote".into(),
+        };
+        s.apply_updates(vec![Update::FleetAttention(Box::new(Change {
+            computer: "mini".into(),
+            pending: vec![pending.clone()],
+            raised: vec![Attention {
+                asid: "same".into(),
+                kind: AttentionKind::Question,
+            }],
+            info: HashMap::new(),
+        }))]);
+        assert_eq!(s.waiting_count(), 2);
+        assert_eq!(inbox::items(&s).len(), 2);
+        assert!(
+            s.toasts.is_empty(),
+            "disabled notifications leave the inbox available without interrupting"
+        );
+        s.open_notification(&notice_key("mini", "same"));
+        assert_eq!(s.current_computer(), "mini");
+        assert_eq!(s.selected.as_deref(), Some("same"));
+        assert!(s.waiting_forms.is_empty());
+        assert!(s.form_inputs.is_empty());
+        assert_eq!(
+            s.waiting_count(),
+            1,
+            "the pending summary remains visible until the full form loads"
+        );
+        s.apply_updates(vec![Update::FleetAttention(Box::new(Change {
+            computer: "mini".into(),
+            pending: vec![],
+            raised: vec![],
+            info: HashMap::new(),
+        }))]);
+        assert_eq!(s.waiting_count(), 0);
+        s.switch_computer("local".into());
+        assert_eq!(s.form_inputs["question/answer"].text, "local private draft");
+    }
+
+    #[test]
+    fn message_fork_requires_explicit_cutoff_support_for_that_sessions_agent() {
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let (_, scene) = crate::ui::scenes::scenes()
+            .iter()
+            .find(|(name, _)| *name == "split2")
+            .unwrap();
+        scene(&mut s);
+        let asid = s.selected.clone().unwrap();
+        let agent_id = s.session_by_id(&asid).unwrap().agent_id.clone();
+        let index = s
+            .agents
+            .iter()
+            .position(|agent| agent.id == agent_id)
+            .unwrap();
+        s.agents[index]
+            .features
+            .extra
+            .remove("sessionForkFromMessage");
+        s.agents[index]
+            .features
+            .extra
+            .insert("sessionFork".into(), serde_json::json!(true));
+        assert!(
+            !s.can_fork_from_message(&asid),
+            "whole-session support is insufficient"
+        );
+        s.agents[index]
+            .features
+            .extra
+            .insert("sessionForkFromMessage".into(), serde_json::json!(true));
+        assert!(s.can_fork_from_message(&asid));
+        assert!(!s.can_fork_from_message("missing-session"));
+        s.agents[index]
+            .features
+            .extra
+            .insert("sessionFork".into(), serde_json::json!(false));
+        assert!(!s.can_fork_from_message(&asid));
+    }
+
+    #[test]
+    fn event_only_question_is_available_and_clears_after_remote_answer() {
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let request: FormRequest = serde_json::from_value(serde_json::json!({
+            "id":"question", "asid":"session", "title":"Question", "nonblocking":true,
+            "fields":[{"type":"string", "key":"answer", "title":"Answer", "required":true}]
+        }))
+        .unwrap();
+        s.apply_updates(vec![Update::event(AgentDomainEvent::FormPending {
+            asid: AgentSessionId("session".into()),
+            request,
+            seq: 1,
+        })]);
+        assert_eq!(parts::question::pending_forms(&s, "session").len(), 1);
+        let mut next = s.waiting_forms["session"][0].clone();
+        next.id = "next-question".into();
+        s.apply_updates(vec![Update::event(AgentDomainEvent::FormPending {
+            asid: AgentSessionId("session".into()),
+            request: next,
+            seq: 2,
+        })]);
+        s.form_inputs
+            .insert("next-question/answer".into(), TextEdit::new("keep me"));
+        assert_eq!(parts::question::pending_forms(&s, "session").len(), 2);
+        assert!(parts::question::pending_forms(&s, "other").is_empty());
+        s.form_inputs
+            .insert("question/answer".into(), TextEdit::new("unfinished"));
+        s.apply_updates(vec![Update::event(AgentDomainEvent::FormResolved {
+            asid: AgentSessionId("session".into()),
+            form_id: "question".into(),
+            reason: None,
+            seq: 3,
+        })]);
+        let remaining = parts::question::pending_forms(&s, "session");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "next-question");
+        assert_eq!(s.form_inputs["next-question/answer"].text, "keep me");
+        assert!(!s.form_inputs.contains_key("question/answer"));
+    }
+
+    #[test]
+    fn delayed_catalog_returns_to_requesting_tile() {
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.selected = Some("focused".into());
+        s.tiles = vec![Tile::session("focused"), Tile::session("parked")];
+        let current = Arc::new(CatalogView {
+            catalog: Default::default(),
+        });
+        let arriving = Arc::new(CatalogView {
+            catalog: Default::default(),
+        });
+        s.catalog = Some(current.clone());
+        s.on_composer(ComposerUpdate::Catalog {
+            asid: Some(AgentSessionId("parked".into())),
+            agent: "codex".into(),
+            directory: None,
+            view: arriving.clone(),
+        });
+        assert!(Arc::ptr_eq(s.catalog.as_ref().unwrap(), &current));
+        assert!(Arc::ptr_eq(
+            s.tiles[1].slot.catalog.as_ref().unwrap(),
+            &arriving
+        ));
+        s.focus_tile(1);
+        assert!(Arc::ptr_eq(s.catalog.as_ref().unwrap(), &arriving));
+    }
+
+    #[test]
+    fn aggregate_click_routes_before_open_and_restores_local_draft() {
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.demo = false;
+        s.cfg.current_computer = "self".into();
+        s.sessions = vec![session_fixture("local-session")];
+        s.open_session("local-session");
+        s.draft = TextEdit::new("unfinished local draft");
+        s.computer_data.insert(
+            "mini".into(),
+            ComputerData {
+                sessions: vec![session_fixture("remote-session")],
+                ..Default::default()
+            },
+        );
+        s.switch_computer("all".into());
+        while rx.try_recv().is_ok() {}
+        s.open_session("remote-session");
+        assert_eq!(s.current_computer(), "mini");
+        let mut switched = false;
+        let mut opened = false;
+        while let Ok(command) = rx.try_recv() {
+            match command {
+                Command::SwitchComputer(computer) => {
+                    assert_eq!(computer, "mini");
+                    switched = true;
+                }
+                Command::OpenSession(asid) | Command::OpenTile(asid) => {
+                    assert!(switched, "must select the owning hub before opening");
+                    assert_eq!(asid.0, "remote-session");
+                    opened = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(opened);
+        s.switch_computer("all".into());
+        s.open_session("local-session");
+        assert_eq!(s.current_computer(), "local");
+        assert_eq!(s.draft.text, "unfinished local draft");
+        assert!(!s.computer_data.contains_key("all"));
+        assert!(!s.computer_data.contains_key("self"));
+    }
+
+    #[test]
+    fn background_computer_updates_do_not_cross_workspaces_and_delivery_settles_its_draft() {
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.demo = false;
+        s.cfg.current_computer = "local".into();
+        s.sessions = vec![session_fixture("same-id")];
+        s.open_session("same-id");
+        s.draft = TextEdit::new("local submitted draft");
+        let token = s.token(Slot::Session);
+        s.switch_computer("mini".into());
+        s.sessions = vec![session_fixture("same-id")];
+        s.open_session("same-id");
+        s.draft = TextEdit::new("remote unsent draft");
+        s.apply_updates(vec![Update::Computer {
+            computer: "local".into(),
+            generation: 0,
+            updates: vec![
+                Update::SessionOpenFailed {
+                    asid: "same-id".into(),
+                    message: "old error".into(),
+                },
+                Update::Composer(Box::new(ComposerUpdate::Submitted { token, ok: true })),
+            ],
+        }]);
+        assert!(s.session_open_errors.is_empty());
+        assert_eq!(s.draft.text, "remote unsent draft");
+        s.switch_computer("local".into());
+        assert!(s.pending_submit.is_none());
+        assert!(
+            s.draft.text.is_empty(),
+            "successful old delivery must settle the local draft"
+        );
+        s.switch_computer("mini".into());
+        assert_eq!(s.draft.text, "remote unsent draft");
+    }
+
+    #[test]
+    fn created_session_receipt_survives_leaving_its_computer() {
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.demo = false;
+        s.cfg.current_computer = "local".into();
+        s.sessions = vec![session_fixture("new-42")];
+        s.tiles = vec![Tile::session("new-42")];
+        s.selected = Some("new-42".into());
+        s.pending_start = Some(("new-42".into(), 42));
+        s.pending_submit = Some((42, Slot::Start));
+        s.start_draft = TextEdit::new("sent to local");
+        s.switch_computer("mini".into());
+        s.start_draft = TextEdit::new("keep remote draft");
+        s.apply_updates(vec![Update::Computer {
+            computer: "local".into(),
+            generation: 0,
+            updates: vec![
+                Update::SessionCreated(Box::new(session_fixture("created-local"))),
+                Update::Composer(Box::new(ComposerUpdate::Submitted {
+                    token: 42,
+                    ok: true,
+                })),
+            ],
+        }]);
+        assert_eq!(s.start_draft.text, "keep remote draft");
+        while rx.try_recv().is_ok() {}
+        s.switch_computer("local".into());
+        assert_eq!(s.selected.as_deref(), Some("created-local"));
+        assert!(s.pending_start.is_none());
+        assert!(s.pending_submit.is_none());
+        assert!(s.sessions.iter().all(|session| session.asid.0 != "new-42"));
+        assert!(s.start_draft.text.is_empty());
+        let mut reopened = false;
+        let mut switched = false;
+        while let Ok(command) = rx.try_recv() {
+            if matches!(&command, Command::SwitchComputer(computer) if computer == "local") {
+                switched = true;
+            }
+            if let Command::OpenTile(asid) = command {
+                assert!(
+                    switched,
+                    "receipt-triggered reads must follow the backend barrier"
+                );
+                assert_eq!(asid.0, "created-local");
+                reopened = true;
+            }
+        }
+        assert!(reopened);
+        s.switch_computer("mini".into());
+        assert_eq!(s.start_draft.text, "keep remote draft");
+    }
+
+    #[test]
+    fn aggregate_lists_keep_origin_and_retry_reopens_an_existing_tile() {
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.demo = false;
+        s.cfg.current_computer = "local".into();
+        s.sessions = vec![session_fixture("local-session")];
+        s.switch_computer("all".into());
+        s.apply_updates(vec![Update::Computer {
+            computer: "mini".into(),
+            generation: 4,
+            updates: vec![Update::AgentSessions {
+                agent: "codex".into(),
+                sessions: vec![session_fixture("remote-session")],
+            }],
+        }]);
+        assert_eq!(
+            s.computer_of_session("remote-session").as_deref(),
+            Some("mini")
+        );
+        assert_eq!(
+            s.computer_of_session("local-session").as_deref(),
+            Some("local")
+        );
+        s.open_session("remote-session");
+        s.apply_updates(vec![Update::SessionOpenFailed {
+            asid: "remote-session".into(),
+            message: "failed".into(),
+        }]);
+        assert!(s.session_open_errors.contains_key("remote-session"));
+        while rx.try_recv().is_ok() {}
+        s.retry_open_session("remote-session");
+        assert!(!s.session_open_errors.contains_key("remote-session"));
+        assert!(matches!(rx.try_recv(), Ok(Command::OpenSession(id)) if id.0 == "remote-session"));
+        s.apply_updates(vec![Update::Computer {
+            computer: "mini".into(),
+            generation: 3,
+            updates: vec![Update::SessionOpenFailed {
+                asid: "remote-session".into(),
+                message: "stale failure".into(),
+            }],
+        }]);
+        assert!(s.session_open_errors.is_empty());
+    }
+
+    #[test]
+    fn restored_split_loads_every_session_without_focus_clicks() {
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = super::UiState::new(tx);
+        s.demo = false;
+        s.tiles_restored = false;
+        s.cfg.ui.tiles = vec!["session:left".into(), "session:right".into()];
+        s.sessions = ["left", "right"]
+            .into_iter()
+            .map(|id| {
+                serde_json::from_value(serde_json::json!({
+                    "asid": id, "agent_id": "codex", "title": id,
+                    "status": "idle", "directory": "/project", "updated_ms": 1
+                }))
+                .unwrap()
+            })
+            .collect();
+        s.restore_tiles();
+        let mut opened = std::collections::HashSet::new();
+        while let Ok(command) = rx.try_recv() {
+            if let crate::model::commands::Command::OpenSession(id)
+            | crate::model::commands::Command::OpenTile(id) = command
+            {
+                opened.insert(id.0);
+            }
+        }
+        assert_eq!(
+            opened,
+            ["left".to_string(), "right".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(s.selected.as_deref(), Some("left"));
+    }
     use super::*;
 
     #[test]

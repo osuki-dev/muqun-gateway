@@ -24,7 +24,7 @@ use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 use muqun_gateway::platform::StoredUpload;
 use tokio::sync::broadcast;
 
-pub use dynamic::DynamicHub;
+pub use dynamic::{connection_origin, spawn_connected, ConnectionContext, DynamicHub};
 pub use local::LocalHub;
 pub use remote::{discover_local_gateway, LocalGateway, RemoteHub};
 
@@ -351,6 +351,12 @@ pub trait SessionHub: Send + Sync {
     fn agents(&self) -> HubFuture<'_, Vec<AgentDiscoveryInfo>>;
     /// The ids of the agents attached right now, most preferred first.
     fn attached(&self) -> HubFuture<'_, Vec<String>>;
+    /// Retained request metadata for reconnect reconciliation; None on older Gateways.
+    fn pending_attention(
+        &self,
+    ) -> HubFuture<'_, Option<Vec<muqun_gateway::agents::ports::AgentPendingSnapshot>>> {
+        Box::pin(async { Ok(None) })
+    }
     /// One agent's sessions, as its adapter lists them.
     fn sessions<'a>(
         &'a self,

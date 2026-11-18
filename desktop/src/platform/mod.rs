@@ -21,6 +21,19 @@ pub mod update;
 
 use std::path::PathBuf;
 
+/// Apply native window chrome without platform branches in the UI.
+pub fn configure_window<S: 'static>(app: rune::App<S>) -> rune::App<S> {
+    #[cfg(target_os = "macos")]
+    {
+        app.titlebar(rune::Titlebar::new(64.0))
+            .macos_window(rune::MacWindowOptions::default().shadow(false))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        app
+    }
+}
+
 /// The product's directory name. Deliberately not the gateway's: the gateway
 /// owns `muqun-gateway/` through its state lock, and a second owner there
 /// would push it off the phones it is serving (architecture §4).
@@ -44,11 +57,10 @@ pub fn directories() -> anyhow::Result<(PathBuf, PathBuf)> {
 /// Whether the window is made see-through, so the sidebar and the main card
 /// float on the desktop and the frame around them shows what is behind the
 /// window. Linux compositors draw that, Hyprland and KWin blurred, which
-/// costs the app nothing; macOS and Windows keep the opaque frame until it
-/// is checked there. Under reduce transparency the app paints the frame
-/// solid anyway.
+/// costs the app nothing; macOS uses native materials inside this transparent
+/// surface. Under reduce transparency the app paints the frame solid anyway.
 pub fn see_through_window() -> bool {
-    cfg!(target_os = "linux")
+    cfg!(any(target_os = "linux", target_os = "macos"))
 }
 
 /// Whether this build is running on macOS.
@@ -61,6 +73,8 @@ pub fn bundled_plugin_dirs() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Ok(executable) = std::env::current_exe() {
         if let Some(prefix) = executable.parent().and_then(std::path::Path::parent) {
+            #[cfg(target_os = "macos")]
+            paths.push(prefix.join("Resources/bundled-plugins"));
             paths.push(prefix.join("share/muqun-desktop/bundled-plugins"));
         }
     }

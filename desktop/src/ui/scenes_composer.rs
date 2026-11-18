@@ -76,6 +76,7 @@ fn echo_scene(s: &mut UiState, running: bool, words: &str, picture: bool) -> u64
     composer_session(s, running);
     let staged = if picture {
         vec![crate::model::compose::StagedFile {
+            draft_token: None,
             path: SCENE_PICTURE.into(),
             name: "screenshot.png".into(),
             size: 1,
@@ -162,9 +163,8 @@ fn composer_scenes() -> Vec<Scene> {
             s.record_prompt_history("Run cargo clippy and cargo test --locked");
             s.composer_history_open = true;
         }),
-        ("composer-expanded", |s| {
+        ("composer-multiline", |s| {
             composer_session(s, false);
-            s.composer_expanded = true;
             s.draft = rune::TextEdit::new("Here is an expanded multi-line prompt.\nIt provides extra vertical space for editing long instructions and code blocks comfortably.");
         }),
     ]

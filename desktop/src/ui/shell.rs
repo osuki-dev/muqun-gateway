@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use rune::{col, el, row, text, Color, Cx, El, SurfaceFit};
-use rune_kit::glyphs::TRIANGLE_DOWN;
 use rune_kit::shell::{SidebarToggle, SplitView, Toolbar, INSPECTOR};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, IconButton, IconButtonVariant,
@@ -16,7 +15,7 @@ use rune_kit::{
 use super::copy::{tr, tr_ref};
 use super::{
     art, composer, home, inbox, inspector, sessions, settings, tasks, tiles, timeline, title_of,
-    Activity, InspectorTab, OpenMenu,
+    Activity, OpenMenu,
 };
 use super::{Mode, UiState};
 use crate::branding::{APP_MARK_PNG, APP_NAME};
@@ -41,6 +40,11 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             .get(pid)
             .and_then(|p| crate::plugin::window::render(p.as_ref(), &ctx, layer))
             .unwrap_or_else(|| el().key("empty-plugin-page"));
+        let content = if pid == "terminal" {
+            content
+        } else {
+            content.fill(k.c.bg_base)
+        };
         super::card_stage("plugin-page", content)
     } else {
         match s.mode {
@@ -184,7 +188,15 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             1.0
         };
         let surface = super::terminal_panel::surface(s, k, scheme).alpha(alpha);
-        let view = super::terminal_panel::view(s, k, scheme, scale, layer);
+        let controls = crate::plugin::surface_switcher(
+            s,
+            k,
+            s.cfg.general.language,
+            "terminal",
+            crate::plugin::PluginSlot::Drawer,
+            layer,
+        );
+        let view = super::terminal_panel::view(s, k, scheme, scale, layer, controls);
         let ctx = crate::plugin::PluginViewContext::new(
             s,
             k,
@@ -193,7 +205,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             scale,
             crate::plugin::PluginSlot::Drawer,
         );
-        let view = crate::plugin::window::chrome("terminal", &ctx, view);
+        let view = crate::plugin::window::chrome("terminal", &ctx, view, layer);
         split = split.inspector(
             &s.term.pane,
             super::terminal_pane,
@@ -230,7 +242,11 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     }
     let mut split = split
         .titlebar_inset(crate::platform::titlebar_inset(cx.titlebar_inset()))
-        .frame_inset(frame)
+        .frame_inset(if s.active_plugin_page.is_some() {
+            0.0
+        } else {
+            frame
+        })
         .pane_motion(super::panes::motion())
         .reduced_motion(!look.motion || cx.is_reduced_motion())
         .sidebar_toggle(
@@ -250,6 +266,10 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     // In split view the panes are the cards: the main card steps aside
     // and each pane lays its own floor (`tiles.rs`).
     let tiled = s.mode == Mode::Session && s.in_split();
+    if s.active_plugin_page.is_some() {
+        chrome.radius.lg = 0.0;
+        chrome.c.border_muted = chrome.c.border_muted.alpha(0.0);
+    }
     if look.see_through {
         // The desktop shows around the panels; each lays its own floor, the
         // main card with the theme's wallpaper in it.
@@ -267,7 +287,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
                 SEE_THROUGH_FLOOR[usize::from(look.dark)],
             ))
             .children(
-                (!tiled)
+                (!tiled && s.active_plugin_page.is_none())
                     .then(|| card_floor(s, k, &look, window, right_w))
                     .flatten(),
             )
@@ -309,22 +329,6 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
 fn hide_card(chrome: &mut Kit) {
     chrome.c.bg_base = chrome.c.bg_base.alpha(0.0);
     chrome.c.border_muted = chrome.c.border_muted.alpha(0.0);
-}
-
-/// A split-view pane's floor, as the main card's would be: the colour to
-/// fill it with, and on a see-through window the page colour to lay over
-/// that (the window floor first, then the card's surface).
-pub fn card_floor_colors(k: &Kit, look: &Look) -> (rune::Color, Option<rune::Color>) {
-    if look.see_through {
-        (
-            k.c.bg_deep.alpha(SEE_THROUGH_CARD[usize::from(look.dark)]),
-            Some(k.c.bg_base.alpha(CARD_ALPHA)),
-        )
-    } else if look.glass {
-        (k.c.bg_base.alpha(CARD_ALPHA), None)
-    } else {
-        (k.c.bg_base, None)
-    }
 }
 
 /// The least of the window floor that returns under the sidebar's lists,
@@ -404,7 +408,27 @@ fn sidebar_panel(s: &UiState, k: &Kit, wash: f32) -> El {
     } else {
         super::panes::SPRING
     };
-    panel_surface(k, "sidebar-panel", wash, s.look().dark)
+    let panel = panel_surface(k, "sidebar-panel", wash, s.look().dark);
+    let panel = if crate::platform::is_macos() && s.look().glass {
+        col()
+            .key("sidebar-panel")
+            .radius(k.radius.lg)
+            .fill(k.c.bg_base.alpha(0.85))
+            .system_material(rune::SystemMaterial::Glass)
+            // Native material replaces this node's fill. A separate themed
+            // wash keeps the sidebar in the palette above the system glass.
+            .child(
+                el().key("sidebar-glass-tint")
+                    .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                    .radius(k.radius.lg)
+                    .continuous_corners()
+                    .fill(k.c.bg_base.alpha(SIDEBAR_TINT[usize::from(s.look().dark)]))
+                    .a11y_hidden(),
+            )
+    } else {
+        panel
+    };
+    panel
         .pin(Some(frame), Some(frame), None, Some(frame))
         .w((s.sidebar.width() - frame * 2.0).max(0.0))
         .opacity(if open { 1.0 } else { 0.0 })
@@ -519,6 +543,10 @@ fn home_brand(s: &UiState, k: &Kit, look: &Look, lights: f32) -> El {
     // With no window controls at the leading edge the mark lines up with
     // the rows' icons below it; past traffic lights it keeps a small gap.
     let lead = if lights > 0.0 { 6.0 } else { 16.0 };
+    let width = rune::memo::layout_with("sidebar-frame", |r| r[2])
+        .unwrap_or_else(|| s.sidebar.shown_width());
+    let name_width = rune::text::measure(APP_NAME, &[], k.ty.ui_medium, None).0;
+    let show_name = width >= lights + lead + MARK + 8.0 + name_width + 48.0;
     row()
         .key("home-brand")
         .ml(lead)
@@ -528,7 +556,7 @@ fn home_brand(s: &UiState, k: &Kit, look: &Look, lights: f32) -> El {
         .role("button")
         .label(tr_ref(language, "Home"))
         .child(mark)
-        .child(
+        .children(show_name.then(|| {
             text(APP_NAME)
                 .key("home-name")
                 .font(k.ty.ui_medium.lh(MARK))
@@ -536,8 +564,8 @@ fn home_brand(s: &UiState, k: &Kit, look: &Look, lights: f32) -> El {
                     k.c.text_base
                 } else {
                     k.c.text_muted
-                }),
-        )
+                })
+        }))
         .on_press(|s: &mut UiState| s.go(Mode::Home))
 }
 
@@ -592,11 +620,8 @@ fn session_identity(s: &UiState, k: &Kit, look: &Look) -> El {
             meta.push(name);
         }
     }
-    let branch = s.branch_of(info);
-    if branch.is_none() {
-        if let Some(folder) = UiState::folder_name(info) {
-            meta.push(folder);
-        }
+    if let Some(folder) = UiState::folder_name(info) {
+        meta.push(folder);
     }
 
     line = line
@@ -639,32 +664,6 @@ fn session_identity(s: &UiState, k: &Kit, look: &Look) -> El {
                             .color(k.c.text_faint)
                             .truncate(),
                     );
-                    if let Some(b) = branch {
-                        meta_row = meta_row.child(
-                            row()
-                                .key("session-branch-chip")
-                                .gap(3.0)
-                                .center_y()
-                                .px(4.0)
-                                .py(1.0)
-                                .fill(k.c.layer_01)
-                                .border(1.0, k.c.border_muted)
-                                .clip_rounded(3.0)
-                                .cursor(rune::Cursor::Pointer)
-                                .help(tr_ref(language, "Git"))
-                                .on_press(|s: &mut UiState| s.open_git_inspector())
-                                .child(
-                                    rune::icon(&super::icons::BRANCH, 10.0).color(k.c.icon_muted),
-                                )
-                                .child(
-                                    text(b)
-                                        .font(k.ty.caption().lh(13.0))
-                                        .color(k.c.text_muted)
-                                        .truncate()
-                                        .max_w(140.0),
-                                ),
-                        );
-                    }
                     meta_row
                 }),
         );
@@ -684,16 +683,24 @@ fn session_more(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str, busy: boo
     let pinned = s.cfg.general.pinned.iter().any(|p| p == asid);
     Menu::new("session-more")
         .trigger(
-            IconButton::new(&TRIANGLE_DOWN)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(tr_ref(language, "More"))
-                .expanded(open)
-                .on_press(move |s: &mut UiState| {
-                    s.menu = (!open).then_some(OpenMenu::SessionMore);
-                })
-                .build(k)
-                .key("session-more-btn"),
+            super::art::direction_button(
+                s,
+                k,
+                tr_ref(language, "More"),
+                if open {
+                    -std::f32::consts::FRAC_PI_2
+                } else {
+                    std::f32::consts::FRAC_PI_2
+                },
+            )
+            .variant(ButtonVariant::GhostMuted)
+            .control_size(ControlSize::Small)
+            .expanded(open)
+            .on_press(move |s: &mut UiState| {
+                s.menu = (!open).then_some(OpenMenu::SessionMore);
+            })
+            .build(k)
+            .key("session-more-btn"),
         )
         .open(open)
         .on_close(|s: &mut UiState| s.menu = None)
@@ -765,35 +772,6 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
             // A squeezed column keeps the title readable: Split folds away
             // (Ctrl+\\ still splits), then the change count.
             let fit = super::Fit::of("main");
-            if let Some(meter) = timeline::context_meter(s, k, &asid) {
-                bar = bar.trailing(meter);
-            }
-            if s.diff_stat.files > 0 && fit > super::Fit::Tight {
-                let label = format!("+{} −{}", s.diff_stat.added, s.diff_stat.removed);
-                bar = bar.trailing(
-                    Button::new(label)
-                        .variant(if s.show_diff {
-                            ButtonVariant::Contrast
-                        } else {
-                            ButtonVariant::Ghost
-                        })
-                        .control_size(ControlSize::Small)
-                        .help(format!(
-                            "{} {}",
-                            s.diff_stat.files,
-                            tr_ref(language, "changed file(s)")
-                        ))
-                        .on_press(|s: &mut UiState| match s.selected.clone() {
-                            Some(asid) => s.send(Command::OpenDiff {
-                                asid: muqun_gateway::agents::AgentSessionId(asid),
-                                file: None,
-                            }),
-                            None => s.show_diff = !s.show_diff,
-                        })
-                        .build(k)
-                        .key("changes"),
-                );
-            }
             if fit == super::Fit::Wide {
                 bar = bar.trailing(
                     Button::new(tr_ref(language, "Split view"))
@@ -848,31 +826,17 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
                     } else if s.term.open {
                         s.close_terminal();
                     } else {
-                        s.open_terminal();
+                        s.open_terminal_default();
                     }
                 })
                 .build(k)
                 .key("terminal-toggle"),
         );
     }
-    if s.mode == Mode::Session && !s.in_split() {
-        let is_git_open = s.right_open && !s.term.open && s.inspector_tab == InspectorTab::Git;
-        bar = bar.trailing(
-            IconButton::new(&super::icons::BRANCH)
-                .variant(if is_git_open {
-                    IconButtonVariant::Contrast
-                } else {
-                    IconButtonVariant::Ghost
-                })
-                .label(tr_ref(language, "Git"))
-                .help(super::keymap::tip(
-                    tr_ref(language, "Git"),
-                    super::keymap::Action::ToggleGit,
-                ))
-                .on_press(|s: &mut UiState| s.toggle_git_inspector())
-                .build(k)
-                .key("git-toggle"),
-        );
+    if s.mode == Mode::Session
+        && !s.in_split()
+        && crate::plugin::is_enabled("inspector", &s.cfg.plugins_disabled)
+    {
         bar = bar.trailing(
             IconButton::new(&INSPECTOR)
                 .variant(if s.right_open && !s.term.open {

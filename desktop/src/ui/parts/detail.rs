@@ -6,7 +6,7 @@
 use muqun_gateway::agents::ports::AgentSessionSnapshot;
 use muqun_gateway::agents::AgentSessionId;
 use rune::{col, icon, row, text, Cursor, El};
-use rune_kit::{Button, ButtonVariant, ControlSize, Kit, Spinner};
+use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
 
 use super::glyphs;
 use crate::model::commands::Command;
@@ -232,7 +232,7 @@ pub fn sheet(s: &UiState, k: &Kit) -> Option<El> {
             .w_full()
             .grow(1.0)
             .center()
-            .child(Spinner::new().build(k))
+            .child(crate::ui::art::ActivityMark::Standalone.build(k))
     };
     let panel = col()
         .key(format!("detail-panel-{asid}"))
