@@ -78,7 +78,7 @@ impl Field {
 pub fn fields(agent: &str) -> &'static [Field] {
     use Field::*;
     match agent {
-        "codex" => &[Binary],
+        "codex" | "copilot" => &[Binary],
         "opencode" => &[Autostart, Binary],
         // Autostart is not offered: the desktop only ever joins a harness that
         // is already running (architecture §4), whatever the file says.
@@ -151,6 +151,7 @@ impl AgentConfigs {
             "t3" => self.t3.wanted(),
             "fx" => self.fx.enabled,
             "qoder" => self.qoder.enabled,
+            "copilot" => self.copilot.enabled,
             "pi" => self.pi.enabled,
             "claude" => self.claude.enabled,
             "antigravity" => self.antigravity.enabled,
@@ -174,6 +175,7 @@ impl AgentConfigs {
             }
             "fx" => self.fx.enabled = on,
             "qoder" => self.qoder.enabled = on,
+            "copilot" => self.copilot.enabled = on,
             "pi" => self.pi.enabled = on,
             "claude" => self.claude.enabled = on,
             "antigravity" => self.antigravity.enabled = on,
@@ -202,6 +204,7 @@ impl AgentConfigs {
             ("fx", Field::IdleTimeout) => self.fx.idle_timeout_secs.to_string(),
             ("qoder", Field::Binary) => opt(&self.qoder.binary),
             ("qoder", Field::IdleTimeout) => self.qoder.idle_timeout_secs.to_string(),
+            ("copilot", Field::Binary) => opt(&self.copilot.binary),
             ("cursor", Field::Binary) => opt(&self.cursor.binary),
             ("cursor", Field::IdleTimeout) => self.cursor.idle_timeout_secs.to_string(),
             ("antigravity", Field::Binary) => opt(&self.antigravity.binary),
@@ -256,6 +259,7 @@ impl AgentConfigs {
             ("fx", Field::Binary) => self.fx.binary = binary(text)?,
             ("fx", Field::IdleTimeout) => self.fx.idle_timeout_secs = seconds(text)?,
             ("qoder", Field::Binary) => self.qoder.binary = binary(text)?,
+            ("copilot", Field::Binary) => self.copilot.binary = binary(text)?,
             ("qoder", Field::IdleTimeout) => self.qoder.idle_timeout_secs = seconds(text)?,
             ("cursor", Field::Binary) => self.cursor.binary = binary(text)?,
             ("cursor", Field::IdleTimeout) => self.cursor.idle_timeout_secs = seconds(text)?,

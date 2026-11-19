@@ -159,6 +159,9 @@ pub(crate) struct Config {
     /// Local Qoder CLI ACP support; private children start only on explicit session operations.
     #[serde(default, skip_serializing_if = "is_default_qoder")]
     pub(crate) qoder: agents::runtime::QoderConfig,
+    /// Opt-in GitHub Copilot CLI ACP support; never installs or signs in.
+    #[serde(default, skip_serializing_if = "is_default_copilot")]
+    pub(crate) copilot: agents::runtime::CopilotConfig,
     /// Claude Code native sessions through its official ACP adapter; on when
     /// `claude`, Node.js 22+ and the adapter or npx are found.
     #[serde(default, skip_serializing_if = "is_default_claude")]
@@ -375,6 +378,10 @@ pub(crate) fn is_default_cursor(config: &agents::runtime::CursorConfig) -> bool 
 
 pub(crate) fn is_default_qoder(config: &agents::runtime::QoderConfig) -> bool {
     *config == agents::runtime::QoderConfig::default()
+}
+
+pub(crate) fn is_default_copilot(config: &agents::runtime::CopilotConfig) -> bool {
+    *config == agents::runtime::CopilotConfig::default()
 }
 
 pub(crate) fn is_required_transport(mode: &TransportEncryptionMode) -> bool {

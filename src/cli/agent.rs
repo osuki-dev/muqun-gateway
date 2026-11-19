@@ -62,6 +62,8 @@ pub(crate) enum AgentCommand {
 
 #[derive(Subcommand)]
 pub(crate) enum SetupAgent {
+    /// Explain opt-in GitHub Copilot CLI setup without starting it.
+    Copilot,
     /// Give the gateway a T3 Code credential and enable T3.
     T3 {
         /// T3 server URL; defaults to `t3.url`, then http://127.0.0.1:3773.
@@ -122,6 +124,10 @@ pub(crate) async fn run_agent_command(
         AgentCommand::Hide { agent } => set_visibility(&agent, true)?,
         AgentCommand::Show { agent } => set_visibility(&agent, false)?,
         AgentCommand::Setup { agent } => match agent {
+            SetupAgent::Copilot => {
+                println!("GitHub Copilot CLI is opt-in. Install Copilot CLI and configure its authentication yourself, then set copilot.enabled=true in config.json. Gateway reuses the existing CLI configuration and starts a private `copilot --acp --stdio --no-auto-update` child only when an explicit session operation needs it.");
+                println!("copilot.binary may name an absolute executable. Discovery checks the installed version, not model authentication. Gateway does not install, sign in, grant permissions, change Copilot settings or restart itself. Copilot's saved permissions remain in effect; Plan is not a sandbox and Autopilot requires owner authorization.");
+            }
             SetupAgent::T3 {
                 url,
                 token,
@@ -556,6 +562,10 @@ pub(crate) fn next_step(id: &str, status: &AgentAvailability) -> Option<&'static
         (Unconfigured, "cursor") => "check cursor.binary in config.json",
         (Offline | Unsupported, "cursor") => "check that `agent --version` runs on this host",
         (Disabled, "qoder") => "set `qoder.enabled` to true in config.json",
+        (Disabled, "copilot") => "set `copilot.enabled` to true in config.json",
+        (NotInstalled, "copilot") => "install GitHub Copilot CLI yourself, or set copilot.binary to its existing executable",
+        (Unconfigured, "copilot") => "check copilot.binary in config.json; configure Copilot authentication on this host yourself",
+        (Offline | Unsupported, "copilot") => "check Copilot CLI ACP support; sign in on this host if needed; failed prompts are never retried automatically",
         (NotInstalled, "qoder") => "install Qoder CLI yourself, set qoder.binary, or disable qoder.enabled",
         (Unconfigured, "qoder") => "check qoder.binary and configure Qoder CLI authentication on this host yourself",
         (Offline | Unsupported, "qoder") => "check Qoder CLI ACP support; failed prompts are never automatically retried",

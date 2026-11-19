@@ -80,6 +80,8 @@ pub fn elevating_modes(kind: &str) -> &'static [&'static str] {
     match kind {
         "claude" => &["bypassPermissions", "auto"],
         "qoder" => &["yolo", "bypassPermissions", "auto"],
+        // Native Autopilot enables blanket permissions in addition to autonomy.
+        "copilot" => &["https://agentclientprotocol.com/protocol/session-modes#autopilot"],
         _ => &[],
     }
 }

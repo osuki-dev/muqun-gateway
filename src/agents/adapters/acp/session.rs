@@ -39,6 +39,8 @@ pub trait AcpProvider: Send + Sync + 'static {
     const KIND: &'static str;
     const LABEL: &'static str;
     const ARGS: &'static [&'static str];
+    /// Provider-specific launch policy; never persisted to the user's environment.
+    const ENV: &'static [(&'static str, &'static str)] = &[];
     const REQUIRE_MESSAGE_ID: bool;
     const MODEL_SELECTION: bool;
     const SESSION_NOTICES: bool = false;
@@ -1840,6 +1842,11 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
         }
         let mut launch = self.launch.lock().unwrap().clone().unwrap_or_default();
+        launch.env.extend(
+            P::ENV
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string())),
+        );
         let mut args: Vec<&str> = if launch.args.is_empty() {
             P::ARGS.to_vec()
         } else {

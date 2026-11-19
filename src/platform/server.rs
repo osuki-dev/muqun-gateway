@@ -341,6 +341,7 @@ async fn serve_until_shutdown(
     tokio::join!(
         runtime.shutdown_fx(),
         runtime.shutdown_qoder(),
+        runtime.shutdown_copilot(),
         runtime.shutdown_claude(),
         runtime.shutdown_antigravity(),
         runtime.shutdown_cursor(),

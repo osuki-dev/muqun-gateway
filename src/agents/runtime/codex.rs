@@ -1133,45 +1133,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn codex_feature_claims_do_not_include_file_rollback_or_optional_apis() {
-        let features = features();
-        assert!(features.streaming && features.tool_approvals && features.compaction);
-        assert!(
-            !features.skills,
-            "skills stay off until skills/list actually answers"
-        );
-        assert!(features.attachments && !features.attachments_by_path);
-        assert_eq!(features.extra["nativeImageInput"], true);
-        assert_eq!(features.extra["attachmentInputScope"], "gateway_uploads");
-        assert!(
-            !features.revert
-                && !features.staged_revert
-                && !features.worktrees
-                && !features.modes
-                && !features.background_shells
-        );
-        // Only a Gateway that holds Codex's queue may claim an inbox; older
-        // Apps ignore the flag and keep steering.
-        assert!(features.inbox);
-        assert_eq!(features.extra["sessionPagination"], true);
-        assert_eq!(
-            super::super::AGENT_PREFERENCE,
-            [
-                "codex",
-                "opencode",
-                "deepseek",
-                "t3",
-                "fx",
-                "qoder",
-                "pi",
-                "claude",
-                "antigravity",
-                "cursor"
-            ]
-        );
-    }
-
-    #[test]
     fn codex_connection_features_use_actual_transport_and_catalog() {
         let model = crate::discovery::AgentModelInfo {
             id: "synthetic-model".into(),

@@ -4603,6 +4603,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copilot_autopilot_requires_owner_consent_for_creation_and_mode_switches() {
+        let mut state = state_with(vec![FakeAgent::new("copilot")]).await;
+        state.config.allow_remote_auto_approve = false;
+        let body = |mode: Option<&str>| CreateAgentSessionBody {
+            directory: None,
+            model: None,
+            mode: mode.map(str::to_owned),
+            agent_id: Some("copilot".into()),
+        };
+        let asid = do_create_agent_session(&state, body(None), &device_headers())
+            .await
+            .unwrap()
+            .0["data"]["asid"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let autopilot = "https://agentclientprotocol.com/protocol/session-modes#autopilot";
+        let refusal = do_switch_mode(&state, &asid, autopilot, &device_headers())
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            do_create_agent_session(&state, body(Some(autopilot)), &device_headers())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        state.config.allow_remote_auto_approve = true;
+        let _ = do_switch_mode(&state, &asid, autopilot, &device_headers())
+            .await
+            .unwrap();
+        let _ = do_create_agent_session(&state, body(Some(autopilot)), &device_headers())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn account_limits_refuses_unsupported_and_never_falls_back() {
         let state = state_with(vec![FakeAgent::new("opencode")]).await;
         for (agent, status) in [
