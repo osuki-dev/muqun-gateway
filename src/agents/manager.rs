@@ -293,15 +293,7 @@ impl EventContext {
     }
 
     async fn emit_timeline_item(&self, asid: &AgentSessionId, item: TimelineItem) {
-        let seq = self
-            .mirror
-            .upsert_timeline_items(asid, vec![item.clone()])
-            .await;
-        self.emit(AgentDomainEvent::TimelineUpsert {
-            asid: asid.clone(),
-            items: vec![item],
-            seq,
-        });
+        self.emit(self.mirror.record_timeline_upsert(asid, vec![item]).await);
     }
 
     async fn delivered_without_message(&self, asid: &AgentSessionId, inbox_id: &str) -> bool {
@@ -372,12 +364,7 @@ impl EventContext {
             .await
         {
             Ok(items) if !items.is_empty() => {
-                let seq = self.mirror.upsert_timeline_items(asid, items.clone()).await;
-                self.emit(AgentDomainEvent::TimelineUpsert {
-                    asid: asid.clone(),
-                    items,
-                    seq,
-                });
+                self.emit(self.mirror.record_timeline_upsert(asid, items).await);
             }
             Ok(_) => {}
             Err(err) => {

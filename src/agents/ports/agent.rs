@@ -390,6 +390,23 @@ pub trait AgentPort: Send + Sync {
         self.send_prompt(session_id, text, attachments, delivery)
     }
 
+    /// Submit once and return the native message ID when the provider's receipt
+    /// identifies the future user text row (ordinal zero) in its timeline.
+    fn send_prompt_with_receipt<'a>(
+        &'a self,
+        session_id: &'a str,
+        text: &'a str,
+        display_text: &'a str,
+        attachments: &'a [String],
+        delivery: Option<&'a str>,
+    ) -> AgentFuture<'a, Option<String>> {
+        Box::pin(async move {
+            self.send_prompt_with_display(session_id, text, display_text, attachments, delivery)
+                .await?;
+            Ok(None)
+        })
+    }
+
     /// Whether the agent's service takes an MCP server at runtime
     /// ([`AgentPort::add_mcp_server`]).
     fn adds_mcp_servers(&self) -> bool {

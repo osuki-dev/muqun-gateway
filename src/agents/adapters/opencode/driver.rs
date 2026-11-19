@@ -624,16 +624,42 @@ impl AgentPort for OpencodeDriver {
         delivery: Option<&'a str>,
     ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            self.send_prompt_with_receipt(session_id, text, text, attachments, delivery)
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn send_prompt_with_receipt<'a>(
+        &'a self,
+        session_id: &'a str,
+        text: &'a str,
+        _display_text: &'a str,
+        attachments: &'a [String],
+        delivery: Option<&'a str>,
+    ) -> AgentFuture<'a, Option<String>> {
+        Box::pin(async move {
             // An attachment is a path into the gateway's upload directory,
             // which sits outside the session's own -- so the allowance goes on
             // before the prompt that will make the agent open it, never after.
             if !attachments.is_empty() {
                 self.prime_uploads_permission(session_id).await;
             }
-            self.client
+            let response = self
+                .client
                 .send_prompt(session_id, text, attachments, delivery)
                 .await?;
-            Ok(())
+            // OpenCode 2 responds with Session.Inbox.User. Older versions
+            // may acknowledge with no body. Both are successful submissions.
+            Ok(response
+                .get("data")
+                .filter(|receipt| {
+                    receipt.get("sessionID").and_then(Value::as_str) == Some(session_id)
+                        && receipt.get("type").and_then(Value::as_str) == Some("user")
+                })
+                .and_then(|receipt| receipt.get("id")?.as_str())
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned))
         })
     }
 

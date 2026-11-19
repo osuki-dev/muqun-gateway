@@ -1463,9 +1463,9 @@ async fn do_send_agent_prompt(
         body.text.clone()
     };
     let attachments = body.attachments.as_deref().unwrap_or(&[]);
-    manager
+    let native_message_id = manager
         .prompts()
-        .send_prompt_with_display(
+        .send_with_receipt(
             &AgentSessionId(asid.to_string()),
             &text,
             &body.text,
@@ -1488,7 +1488,12 @@ async fn do_send_agent_prompt(
     };
     manager
         .mirror()
-        .present_user_prompt(&AgentSessionId(asid.to_string()), &body.text, origin)
+        .present_user_prompt(
+            &AgentSessionId(asid.to_string()),
+            &body.text,
+            origin,
+            native_message_id.as_deref(),
+        )
         .await;
 
     let mut accepted = json!({ "submitted": true });

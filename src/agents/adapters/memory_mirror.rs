@@ -212,10 +212,29 @@ impl SessionState {
         }
     }
 
+    /// Providers without a native receipt can echo the row before the HTTP
+    /// acknowledgement. Message keys need not be in arrival order.
+    fn recent_user_echo(&self, digest: &str, now: u64) -> Option<&TimelineItem> {
+        self.timeline.values()
+            .filter(|row| row.role == TimelineRole::User && !row.id.starts_with("presented:"))
+            .max_by_key(|row| (row.seq, row.updated_ms))
+            .filter(|row| row.origin.is_none()
+                && now.saturating_sub(row.updated_ms) < ECHO_BEFORE_PRESENT_MS
+                && matches!(&row.part, AgentPart::Text { text } if prompt_digest(text) == digest))
+    }
+
     /// Give an echoed user prompt the origin of the presented row it repeats.
     /// The presented row is replaced by the echo, which carries the agent's
     /// own id and ordering; its id is returned so the caller can retract it.
     fn claim_presented_origin(&mut self, item: &mut TimelineItem, now: u64) -> Option<String> {
+        // A repeated native read of the same message is still the same send.
+        // Preserve its attribution and leave any later identical send pending.
+        if let Some(previous) = self.timeline.get(&item.id) {
+            if item.origin.is_none() {
+                item.origin.clone_from(&previous.origin);
+            }
+            return None;
+        }
         self.pending_origins
             .retain(|pending| now.saturating_sub(pending.at) < PENDING_ORIGIN_TTL_MS);
         if item.role != TimelineRole::User || self.pending_origins.is_empty() {
@@ -235,6 +254,49 @@ impl SessionState {
         }
         (item.id != pending.presented_id && self.timeline.remove(&pending.presented_id).is_some())
             .then_some(pending.presented_id)
+    }
+
+    fn reconcile_user_echoes(
+        &mut self,
+        asid: &AgentSessionId,
+        items: &mut [TimelineItem],
+    ) -> Option<AgentDomainEvent> {
+        let now = now_ms();
+        let ids: Vec<_> = items
+            .iter_mut()
+            .filter(|item| item.role == TimelineRole::User)
+            .filter_map(|item| self.claim_presented_origin(item, now))
+            .collect();
+        if ids.is_empty() {
+            return None;
+        }
+        // Provider history cannot contain a local presentation. Removing it
+        // must not fence another in-flight canonical inbox read.
+        Some(AgentDomainEvent::TimelineRemoved {
+            asid: asid.clone(),
+            ids,
+            seq: self.next_seq(),
+        })
+    }
+
+    fn timeline_upsert(
+        &mut self,
+        asid: &AgentSessionId,
+        mut items: Vec<TimelineItem>,
+    ) -> AgentDomainEvent {
+        let seq = self.next_seq();
+        for item in &mut items {
+            item.seq = seq;
+            if let AgentPart::Tool(ref mut call) = item.part {
+                truncate_tool_output(call);
+            }
+            self.insert_item(item.clone());
+        }
+        AgentDomainEvent::TimelineUpsert {
+            asid: asid.clone(),
+            items,
+            seq,
+        }
     }
 
     fn apply_history_order(
@@ -407,7 +469,7 @@ impl MemoryMirror {
         asid: &AgentSessionId,
         revision: &DeliveredInputRevision,
         inbox_id: &str,
-        items: Vec<TimelineItem>,
+        mut items: Vec<TimelineItem>,
         publish: impl FnOnce(&[AgentDomainEvent]),
     ) -> bool {
         let mut sessions = self.sessions.write().await;
@@ -422,21 +484,8 @@ impl MemoryMirror {
         }
         let mut events = Vec::new();
         if !items.is_empty() {
-            let seq = state.next_seq();
-            let mut updated = Vec::new();
-            for mut item in items {
-                item.seq = seq;
-                if let AgentPart::Tool(ref mut call) = item.part {
-                    truncate_tool_output(call);
-                }
-                state.insert_item(item.clone());
-                updated.push(item);
-            }
-            events.push(AgentDomainEvent::TimelineUpsert {
-                asid: asid.clone(),
-                items: updated,
-                seq,
-            });
+            events.extend(state.reconcile_user_echoes(asid, &mut items));
+            events.push(state.timeline_upsert(asid, items));
         }
         state
             .inbox
@@ -458,7 +507,7 @@ impl MemoryMirror {
     pub(crate) async fn record_timeline_upsert(
         &self,
         asid: &AgentSessionId,
-        items: Vec<TimelineItem>,
+        mut items: Vec<TimelineItem>,
     ) -> AgentDomainEvent {
         let mut sessions = self.sessions.write().await;
         let state = Self::entry(
@@ -467,40 +516,10 @@ impl MemoryMirror {
             asid,
             AgentSessionStatus::Idle,
         );
-        let now = now_ms();
-        let mut retracted = Vec::new();
-        let mut claimed = Vec::new();
-        for mut item in items {
-            retracted.extend(state.claim_presented_origin(&mut item, now));
-            claimed.push(item);
+        if let Some(removed) = state.reconcile_user_echoes(asid, &mut items) {
+            self.history_event(state, removed);
         }
-        if !retracted.is_empty() {
-            state.invalidate_history_reads();
-            let seq = state.next_seq();
-            self.history_event(
-                state,
-                AgentDomainEvent::TimelineRemoved {
-                    asid: asid.clone(),
-                    ids: retracted,
-                    seq,
-                },
-            );
-        }
-        let seq = state.next_seq();
-        let mut updated_items = Vec::new();
-        for mut item in claimed {
-            item.seq = seq;
-            if let AgentPart::Tool(ref mut call) = item.part {
-                truncate_tool_output(call);
-            }
-            state.insert_item(item.clone());
-            updated_items.push(item);
-        }
-        let event = AgentDomainEvent::TimelineUpsert {
-            asid: asid.clone(),
-            items: updated_items,
-            seq,
-        };
+        let event = state.timeline_upsert(asid, items);
         state.push_event(event.clone());
         event
     }
@@ -514,6 +533,7 @@ impl MemoryMirror {
         asid: &AgentSessionId,
         text: &str,
         origin: MessageOrigin,
+        native_message_id: Option<&str>,
     ) -> AgentDomainEvent {
         let now = now_ms();
         let digest = prompt_digest(text);
@@ -526,46 +546,49 @@ impl MemoryMirror {
             asid,
             AgentSessionStatus::Idle,
         );
-        // Provider message keys are not arrival order. In particular a
-        // `presented:` key sorts after ACP's numeric message keys forever.
-        let echoed = state
-            .timeline
-            .values()
-            .filter(|row| row.role == TimelineRole::User && !row.id.starts_with("presented:"))
-            .max_by_key(|row| (row.seq, row.updated_ms))
-            .filter(|row| {
-                row.origin.is_none()
-                    && now.saturating_sub(row.updated_ms) < ECHO_BEFORE_PRESENT_MS
-                    && matches!(&row.part, AgentPart::Text { text } if prompt_digest(text) == digest)
-            })
-            .cloned();
+        let echoed = if let Some(native) = native_message_id {
+            state
+                .timeline
+                .get(&crate::agents::domain::text_item_id(native, 0))
+        } else {
+            state.recent_user_echo(&digest, now)
+        }
+        .cloned();
         let mut item = if let Some(mut row) = echoed {
             row.origin = Some(origin);
             row
         } else {
-            let id = format!("presented:{}", uuid::Uuid::new_v4());
-            state.pending_origins.push(PendingOrigin {
-                origin: origin.clone(),
-                text_digest: digest,
-                presented_id: id.clone(),
-                at: now,
-            });
-            if state.pending_origins.len() > MAX_PENDING_ORIGINS {
-                state.pending_origins.remove(0);
-            }
-            // Place a still-unacknowledged presentation immediately after
-            // the current provider group, never in a separate UUID-sorted tail.
-            // `!` sorts before the characters used to extend provider keys.
-            let anchor = state
-                .timeline
-                .ordered()
-                .rev()
-                .find(|row| !row.id.starts_with("presented:"))
-                .map(|row| row.message_id.as_str())
-                .unwrap_or("");
-            let message_id = format!("{anchor}!presented:{:020}", state.current_seq + 1);
+            let (id, message_id) = if let Some(native) = native_message_id {
+                (
+                    crate::agents::domain::text_item_id(native, 0),
+                    native.to_owned(),
+                )
+            } else {
+                let id = format!("presented:{}", uuid::Uuid::new_v4());
+                state.pending_origins.push(PendingOrigin {
+                    origin: origin.clone(),
+                    text_digest: digest,
+                    presented_id: id.clone(),
+                    at: now,
+                });
+                if state.pending_origins.len() > MAX_PENDING_ORIGINS {
+                    state.pending_origins.remove(0);
+                }
+                // Place a still-unacknowledged presentation immediately after
+                // the current provider group, never in a separate UUID-sorted tail.
+                // `!` sorts before the characters used to extend provider keys.
+                let anchor = state
+                    .timeline
+                    .ordered()
+                    .rev()
+                    .find(|row| !row.id.starts_with("presented:"))
+                    .map(|row| row.message_id.as_str())
+                    .unwrap_or("");
+                let message_id = format!("{anchor}!presented:{:020}", state.current_seq + 1);
+                (id, message_id)
+            };
             TimelineItem {
-                id: id.clone(),
+                id,
                 message_id,
                 role: TimelineRole::User,
                 part: AgentPart::Text { text: text.into() },
@@ -922,22 +945,11 @@ impl MemoryMirror {
                 .filter(|item| !replaced.contains(&item.id)),
         );
         if !accepted.is_empty() {
-            let seq = state.next_seq();
-            for item in &mut accepted {
-                item.seq = seq;
-                if let AgentPart::Tool(call) = &mut item.part {
-                    truncate_tool_output(call);
-                }
-                state.insert_item(item.clone());
+            if let Some(removed) = state.reconcile_user_echoes(asid, &mut accepted) {
+                self.history_event(state, removed);
             }
-            self.history_event(
-                state,
-                AgentDomainEvent::TimelineUpsert {
-                    asid: asid.clone(),
-                    items: accepted,
-                    seq,
-                },
-            );
+            let upsert = state.timeline_upsert(asid, accepted);
+            self.history_event(state, upsert);
         }
         self.history_permissions(state, asid, permissions);
         state.initialize_history();
@@ -2075,6 +2087,9 @@ impl MemoryMirror {
         state.placeholder = false;
         state.initialize_history();
         state.history_frontier = None;
+        if let Some(removed) = state.reconcile_user_echoes(&asid, &mut snapshot.timeline) {
+            self.history_event(state, removed);
+        }
         if preserve_history {
             // The old path rebased retained rows after combining them with the
             // fresh page. Do the same in place before fresh IDs replace them.
@@ -3557,7 +3572,7 @@ mod tests {
         mirror.update_session(info(&asid, "Origin")).await;
 
         let AgentDomainEvent::TimelineUpsert { items, .. } = mirror
-            .present_user_prompt(&asid, "run the tests", pixel())
+            .present_user_prompt(&asid, "run the tests", pixel(), None)
             .await
         else {
             panic!("expected timeline event")
@@ -3594,7 +3609,7 @@ mod tests {
         let asid = AgentSessionId("ses-origin-other".to_string());
         mirror.update_session(info(&asid, "Origin")).await;
         mirror
-            .present_user_prompt(&asid, "from the phone", pixel())
+            .present_user_prompt(&asid, "from the phone", pixel(), None)
             .await;
         mirror
             .record_timeline_upsert(&asid, vec![text_item("msg-1:t0", "msg-1", "from the pane")])
@@ -3630,8 +3645,12 @@ mod tests {
         let mut before = text_item("before", "00000000000000000001:turn", "before");
         before.role = TimelineRole::Assistant;
         mirror.record_timeline_upsert(&asid, vec![before]).await;
-        mirror.present_user_prompt(&asid, "first", pixel()).await;
-        mirror.present_user_prompt(&asid, "second", pixel()).await;
+        mirror
+            .present_user_prompt(&asid, "first", pixel(), None)
+            .await;
+        mirror
+            .present_user_prompt(&asid, "second", pixel(), None)
+            .await;
         let mut after = text_item("after", "00000000000000000002:turn", "after");
         after.role = TimelineRole::Assistant;
         mirror.record_timeline_upsert(&asid, vec![after]).await;
@@ -3660,7 +3679,7 @@ mod tests {
         // An unrelated presentation must not mask subsequent ACP rows simply
         // because its message key sorts after their numeric keys.
         mirror
-            .present_user_prompt(&asid, "still queued", pixel())
+            .present_user_prompt(&asid, "still queued", pixel(), None)
             .await;
         let file = "/home/test/.local/share/muqun-gateway/uploads/7069c1ad-7691-4221-a7e3-0c0c3f02e737.jpg";
         let mut submitted = text_item(
@@ -3672,7 +3691,7 @@ mod tests {
         submitted.attachments = Some(vec![file.into()]);
         mirror.record_timeline_upsert(&asid, vec![submitted]).await;
         mirror
-            .present_user_prompt(&asid, "[Image #1] fix this", pixel())
+            .present_user_prompt(&asid, "[Image #1] fix this", pixel(), None)
             .await;
         // Two intentional submissions of identical prose remain two rows.
         for i in 2..=3 {
@@ -3684,7 +3703,7 @@ mod tests {
             row.updated_ms = now_ms();
             mirror.record_timeline_upsert(&asid, vec![row]).await;
             mirror
-                .present_user_prompt(&asid, "check 903", pixel())
+                .present_user_prompt(&asid, "check 903", pixel(), None)
                 .await;
         }
         let snapshot = mirror.get_snapshot(&asid).await.unwrap();
@@ -3715,7 +3734,9 @@ mod tests {
         echo.updated_ms = now_ms();
         mirror.record_timeline_upsert(&asid, vec![echo]).await;
 
-        mirror.present_user_prompt(&asid, "hello", pixel()).await;
+        mirror
+            .present_user_prompt(&asid, "hello", pixel(), None)
+            .await;
         let snapshot = mirror.get_snapshot(&asid).await.unwrap();
         assert_eq!(snapshot.timeline.len(), 1);
         assert_eq!(snapshot.timeline[0].id, "msg-1:t0");
