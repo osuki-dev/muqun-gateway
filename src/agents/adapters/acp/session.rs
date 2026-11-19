@@ -35,6 +35,13 @@ pub struct LaunchBypass {
     pub env: &'static [(&'static str, &'static str)],
 }
 
+/// The agent's independent select-valued permission control.
+pub struct ConfigBypass {
+    pub id: &'static str,
+    pub enabled: &'static str,
+    pub disabled: &'static str,
+}
+
 pub trait AcpProvider: Send + Sync + 'static {
     const KIND: &'static str;
     const LABEL: &'static str;
@@ -61,6 +68,10 @@ pub trait AcpProvider: Send + Sync + 'static {
     /// auto-approve switch selects the first one the live session offers
     /// (`session/set_mode`); empty where the agent has no such mode.
     const BYPASS_MODES: &'static [&'static str] = &[];
+    /// An independent session permission selector, separate from autonomy modes.
+    const BYPASS_CONFIG: Option<ConfigBypass> = None;
+    /// Advertised informational commands whose reply repeats prior turn usage.
+    const NON_INFERENCE_COMMANDS: &'static [&'static str] = &[];
     /// The agent's bypass is a launch flag, not a session mode: the App's
     /// switch relaunches that session's child with the flag added or removed
     /// and loads the same session again.
@@ -348,6 +359,7 @@ struct SessionState {
     config: Value,
     owned_mutations: bool,
     usage: mapper::SessionUsage,
+    ignore_turn_usage: bool,
     projection: Projection,
     permissions: HashMap<String, Permission>,
     last_activity: tokio::time::Instant,
@@ -2783,6 +2795,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         let mut catalog = mapper::catalog_for(&value, P::KIND);
         if P::SESSION_MODES {
             (catalog.modes, catalog.defaults.mode) = mapper::session_modes(&value);
+            info.mode.clone_from(&catalog.defaults.mode);
         }
         if new_session {
             self.owned.lock().unwrap().mark(&id);
@@ -2795,6 +2808,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             config: value.clone(),
             owned_mutations: self.owns(&id),
             usage: mapper::SessionUsage::new(new_session),
+            ignore_turn_usage: false,
             projection,
             permissions: HashMap::new(),
             last_activity: tokio::time::Instant::now(),
@@ -3503,6 +3517,9 @@ impl<P: AcpProvider> AcpDriver<P> {
         tx: &broadcast::Sender<AgentDomainEvent>,
         response: Option<&Value>,
     ) {
+        if session.state.lock().await.ignore_turn_usage {
+            return;
+        }
         let recorded = Self::transcript_tokens(session).await;
         let total = {
             let mut state = session.state.lock().await;
@@ -3808,6 +3825,15 @@ impl<P: AcpProvider> AcpDriver<P> {
         let mut state = session.state.lock().await;
         state.recovery = None;
         state.hidden_command = false;
+        state.ignore_turn_usage = !prompt.attachments
+            && P::NON_INFERENCE_COMMANDS.iter().any(|command| {
+                prepared.transcript == format!("/{command}")
+                    && state
+                        .catalog
+                        .commands
+                        .iter()
+                        .any(|offered| offered.name == *command)
+            });
         state.prompt_checkpoint = checkpoint;
         state.prompt_user_digest = Some(recovery::text_digest(&prepared.transcript));
         state.turn_had_output = false;
@@ -4979,8 +5005,9 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                         catalog.defaults.mode = None;
                         return Ok(catalog);
                     }
-                    self.observed_snapshot(id).await?;
-                    return self.available_catalog(directory).await;
+                    if self.observed_snapshot(id).await?.is_some() {
+                        return self.available_catalog(directory).await;
+                    }
                 }
                 let session = self.retained(id).ok_or_else(|| {
                     AgentError::NotAvailable(
@@ -5278,6 +5305,20 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
     }
     fn set_auto_approve<'a>(&'a self, id: &'a str, enabled: bool) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            if let Some(config) = P::BYPASS_CONFIG {
+                let session = self.ensure_loaded(id).await?;
+                return self
+                    .select_config(
+                        &session,
+                        config.id,
+                        if enabled {
+                            config.enabled
+                        } else {
+                            config.disabled
+                        },
+                    )
+                    .await;
+            }
             if P::LAUNCH_BYPASS.is_some() {
                 return self.set_launch_bypass(id, enabled).await;
             }
@@ -5313,6 +5354,20 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
     }
     fn auto_approve<'a>(&'a self, id: &'a str) -> AgentFuture<'a, Option<bool>> {
         Box::pin(async move {
+            if let Some(config) = P::BYPASS_CONFIG {
+                let session = self.ensure_loaded(id).await?;
+                let state = session.state.lock().await;
+                let current = mapper::config_option(&state.config, config.id)
+                    .and_then(|option| option["currentValue"].as_str());
+                return match current {
+                    Some(value) if value == config.enabled => Ok(Some(true)),
+                    Some(value) if value == config.disabled => Ok(Some(false)),
+                    _ => Err(AgentError::Unsupported(format!(
+                        "{} did not report its session permission setting",
+                        P::LABEL
+                    ))),
+                };
+            }
             if P::LAUNCH_BYPASS.is_some() {
                 return Ok(Some(self.launch_bypassed(id)));
             }

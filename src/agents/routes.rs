@@ -1268,8 +1268,8 @@ async fn do_switch_mode(
     Ok(Json(content_envelope(json!({ "ok": true }))))
 }
 
-/// `{enabled, native}`: whether the session runs in the agent's own bypass
-/// mode, and that mode's native name. A bypass is never remembered as a
+/// `{enabled, native}`: the agent's own session permission bypass setting
+/// and its native name. A bypass is never remembered as a
 /// session default (`session_defaults::ELEVATING_MODES`).
 async fn auto_approve_state(
     manager: &super::manager::AgentManager,
@@ -4620,6 +4620,20 @@ mod tests {
             .unwrap()
             .to_owned();
         let autopilot = "https://agentclientprotocol.com/protocol/session-modes#autopilot";
+        assert_eq!(
+            do_set_auto_approve(&state, &asid, true, &device_headers())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_ne!(
+            do_set_auto_approve(&state, &asid, false, &device_headers())
+                .await
+                .err()
+                .map(|refusal| refusal.0),
+            Some(StatusCode::FORBIDDEN)
+        );
         let refusal = do_switch_mode(&state, &asid, autopilot, &device_headers())
             .await
             .unwrap_err();

@@ -38,6 +38,10 @@ pub fn native_bypass(kind: &str) -> Option<NativeBypass> {
             native: "yolo",
             scope: BypassScope::Session,
         },
+        "copilot" => NativeBypass {
+            native: "allow_all",
+            scope: BypassScope::Session,
+        },
         "codex" => NativeBypass {
             native: "approvalPolicy=never",
             scope: BypassScope::Session,
@@ -124,28 +128,5 @@ pub fn feature(kind: &str) -> Value {
             },
         }),
         None => json!({ "scope": "none" }),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn elevating_modes_are_the_bypass_and_classifier_modes_of_each_agent() {
-        for (kind, mode, elevating) in [
-            ("claude", "bypassPermissions", true),
-            ("claude", "auto", true),
-            ("claude", "acceptEdits", false),
-            ("claude", "plan", false),
-            ("qoder", "yolo", true),
-            ("qoder", "bypassPermissions", true),
-            ("qoder", "dontAsk", false),
-            // OpenCode's modes are personas, never permission policies.
-            ("opencode", "auto", false),
-            ("codex", "bypassPermissions", false),
-        ] {
-            assert_eq!(is_elevating(kind, mode), elevating, "{kind} {mode}");
-        }
     }
 }

@@ -135,8 +135,11 @@ feature metadata; other providers' contracts are unchanged.
 The installed CLI advertised Agent, Plan and Autopilot using full ACP mode
 URIs. Autopilot also enables broad permissions, so selecting its URI requires
 `allow_remote_auto_approve` and it is never remembered as the default for a new
-session. The separate `allow_all` configuration is not exposed as the App's
-auto-approve switch. Agent and Plan do not promise that every operation asks:
+session. The independent native `allow_all` on/off selector backs the App's
+session auto-approve switch, also behind `allow_remote_auto_approve` when
+enabling it. A setting change must be offered and confirmed by the live native
+configuration; it never selects Autopilot or answers a pending approval. Agent
+and Plan do not promise that every operation asks:
 saved CLI permission policy still applies. Gateway forwards offered ACP
 permission choices through its existing approval flow without granting them.
 
@@ -163,3 +166,33 @@ of Autopilot from remembered session defaults. The existing ACP driver retains
 its protocol, cancellation, replay and permission coverage. Formatting, strict
 clippy and the full locked Gateway test suite passed (2,283 library tests,
 16 lifecycle tests, one update test; 55 existing ignored tests).
+
+### Selection and usage verification
+
+A second isolated session verified a model change through native
+`session/set_config_option`: the same session loaded in a fresh process retained
+that model, while `allow_all` remained off. Reasoning options are model-specific:
+selecting a model without effort support removes that selector from the native
+configuration. App catalog reads must include the selected session identity and
+refresh after its foreground preparation.
+
+Live `usage_update` reports context occupancy as exact `used` and `size` values;
+these map to `session.context_usage.total_tokens` and `limit.context`. Copilot
+1.0.114 did not replay this update on `session/load`, so a reopened session may
+have unavailable occupancy until its next turn. `/context` produces rounded
+human text, which Gateway does not parse into invented exact metrics.
+
+Prompt replies include cache tokens within input and thought tokens within
+output. Gateway subtracts those overlapping counters before publishing disjoint
+usage parts. The advertised informational `/context` and `/usage` commands can
+repeat the previous prompt's usage; Gateway retains the existing total for
+these exact commands instead of counting a second inference. Unadvertised
+commands retain normal prompt accounting because Copilot may send them to the
+model. Cumulative totals after loading historical sessions remain unknown when
+the native protocol supplies no complete history; context occupancy is separate.
+
+The paired App also selected an offered model, received an exact assistant
+response, and displayed native context occupancy (22,347/128,000) with the
+independent auto-approve control off. Restarting only the isolated Gateway
+preserved the selected model in its native session catalog. Loaded-history
+session totals and cost remained unavailable rather than being inferred.
