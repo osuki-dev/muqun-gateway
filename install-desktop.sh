@@ -16,7 +16,16 @@ USAGE
     [ "$#" -eq 1 ] || { echo '--gateway-only takes no other arguments' >&2; exit 2; }
     # An explicitly configured, stopped or externally managed instance keeps its owner.
     existing() {
-      [ -n "${MUQUN_LOCAL_GATEWAY:-}${MUQUN_GATEWAY_CONFIG_DIR:-}${MUQUN_GATEWAY_STATE_DIR:-}${HERDR_PLUGIN_CONFIG_DIR:-}${HERDR_PLUGIN_STATE_DIR:-}" ] && return 0
+      if [ -n "${MUQUN_LOCAL_GATEWAY:-}" ] && [ -f "$MUQUN_LOCAL_GATEWAY" ]; then return 0; fi
+      has_gateway_state() {
+        for item in config.json local-client.json pairing.json gateway.lock; do
+          [ ! -e "$1/$item" ] || return 0
+        done
+        return 1
+      }
+      for dir in "${MUQUN_GATEWAY_CONFIG_DIR:-}" "${MUQUN_GATEWAY_STATE_DIR:-}" "${HERDR_PLUGIN_CONFIG_DIR:-}" "${HERDR_PLUGIN_STATE_DIR:-}"; do
+        if [ -n "$dir" ] && has_gateway_state "$dir"; then return 0; fi
+      done
       for binary in muqun-gateway herdr-gateway; do
         command -v "$binary" >/dev/null 2>&1 && return 0
       done
@@ -30,9 +39,7 @@ USAGE
       done
       for base in "$config" "$data" "$support"; do
         for name in muqun-gateway herdr-gateway herdr/plugins/config/herdr.gateway herdr/plugins/herdr.gateway; do
-          for item in config.json local-client.json pairing.json gateway.lock; do
-            [ ! -e "$base/$name/$item" ] || return 0
-          done
+          if has_gateway_state "$base/$name"; then return 0; fi
         done
       done
       if command -v pgrep >/dev/null && pgrep -u "$(id -u)" -x "muqun-gateway|herdr-gateway" >/dev/null 2>&1; then return 0; fi

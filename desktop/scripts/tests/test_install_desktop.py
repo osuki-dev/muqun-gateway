@@ -283,6 +283,19 @@ cp "$FIXTURES/$name" "$out"''',
         self.assertEqual(executable.read_text(), "1.0.2")
         self.assertTrue(blocker.is_dir())
 
+    def test_custom_gateway_directories_require_installation_evidence(self):
+        self.fixture(STABLE)
+        self.run_installer()
+        custom = self.home / "gateway config"
+        custom.mkdir()
+        self.env["MUQUN_GATEWAY_CONFIG_DIR"] = str(custom)
+        self.confirm_gateway_setup()
+        log = self.home / "gateway-invocations"
+        self.assertEqual(len(log.read_text().splitlines()), 1)
+        (custom / "config.json").write_text("{}")
+        self.confirm_gateway_setup()
+        self.assertEqual(len(log.read_text().splitlines()), 1)
+
     def test_external_gateway_service_without_path_binary_is_reused(self):
         self.fixture(STABLE)
         unit = self.home / ".config/systemd/user/dev.osuki.muqun-gateway.service"
