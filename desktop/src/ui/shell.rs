@@ -276,7 +276,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     if look.see_through {
         // The desktop shows around the panels; each lays its own floor, the
         // main card with the theme's wallpaper in it.
-        chrome.c.bg_base = k.c.bg_base.alpha(if home { 0.0 } else { CARD_ALPHA });
+        chrome.c.bg_base = k.c.bg_base.alpha(0.0);
         if tiled {
             hide_card(&mut chrome);
         }
@@ -347,9 +347,8 @@ const CARD_ALPHA: f32 = 0.9;
 /// over the (compositor-blurred) desktop before its own surface (light,
 /// dark): enough that its words read over any desktop.
 const SEE_THROUGH_FLOOR: [f32; 2] = [0.82, 0.78];
-/// The main card's floor there: denser, so the theme's world in it is the
-/// theme's and not the desktop's.
-const SEE_THROUGH_CARD: [f32; 2] = [0.93, 0.9];
+/// A single tint for the main card leaves the desktop visible through it.
+const SEE_THROUGH_CARD: [f32; 2] = [0.86, 0.82];
 
 /// The main card's floor on a see-through window: the window floor, and the
 /// theme's wallpaper on it placed for the card, rounded as the card is.
@@ -370,12 +369,12 @@ fn card_floor(
     };
     let right = if right_w > 0.0 { right_w } else { frame };
     let (cw, ch) = ((w - left - right).max(0.0), (h - frame * 2.0).max(0.0));
-    let mut floor = el()
+    let floor = el()
         .key("card-floor")
         .pin(Some(left), Some(frame), Some(right), Some(frame))
         .radius(k.radius.lg)
         .clip_rounded(k.radius.lg)
-        .fill(k.c.bg_deep.alpha(SEE_THROUGH_CARD[usize::from(look.dark)]))
+        .fill(k.c.bg_base.alpha(SEE_THROUGH_CARD[usize::from(look.dark)]))
         .motion(super::panes::SPRING)
         .a11y_hidden();
     let wall = s.images.as_ref().and_then(|images| {
@@ -387,12 +386,7 @@ fn card_floor(
                 .opacity_motion(crate::theme::look::MOVE)
         })
     });
-    match wall {
-        Some(wall) => floor = floor.child(wall),
-        // No wallpaper: the card is the page colour through and through.
-        None => floor = floor.fill(k.c.bg_deep),
-    }
-    Some(floor)
+    Some(floor.children(wall))
 }
 
 /// How much of the page colour the sidebar's panel lays over the window
