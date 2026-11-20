@@ -928,5 +928,7 @@
   "Set up Muqun Gateway": "Muqun Gateway の設定",
   "Desktop needs Gateway on this computer to open your workspace.": "ワークスペースを開くには、このパソコンに Gateway をインストールしてください。",
   "Checking for a local Gateway…": "ローカルの Gateway を確認中…",
-  "Gateway setup failed or timed out. Retry to continue.": "Gateway のセットアップに失敗したか、タイムアウトしました。再試行してください。"
+  "Gateway setup failed or timed out. Retry to continue.": "Gateway のセットアップに失敗したか、タイムアウトしました。再試行してください。",
+  "Search models": "モデルを検索",
+  "No matching models": "一致するモデルがありません"
 }

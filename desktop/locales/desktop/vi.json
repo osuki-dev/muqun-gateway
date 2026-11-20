@@ -928,5 +928,7 @@
   "Set up Muqun Gateway": "Thiết lập Muqun Gateway",
   "Desktop needs Gateway on this computer to open your workspace.": "Desktop cần Gateway trên máy tính này để mở không gian làm việc.",
   "Checking for a local Gateway…": "Đang kiểm tra Gateway trên máy này…",
-  "Gateway setup failed or timed out. Retry to continue.": "Thiết lập Gateway không thành công hoặc hết thời gian chờ. Hãy thử lại để tiếp tục."
+  "Gateway setup failed or timed out. Retry to continue.": "Thiết lập Gateway không thành công hoặc hết thời gian chờ. Hãy thử lại để tiếp tục.",
+  "Search models": "Tìm mô hình",
+  "No matching models": "Không có mô hình phù hợp"
 }

@@ -928,5 +928,7 @@
   "Set up Muqun Gateway": "設定 Muqun Gateway",
   "Desktop needs Gateway on this computer to open your workspace.": "在這台電腦上安裝 Gateway 後即可開啟工作區。",
   "Checking for a local Gateway…": "正在檢查本機 Gateway…",
-  "Gateway setup failed or timed out. Retry to continue.": "Gateway 安裝失敗或逾時。請重試以繼續。"
+  "Gateway setup failed or timed out. Retry to continue.": "Gateway 安裝失敗或逾時。請重試以繼續。",
+  "Search models": "搜尋模型",
+  "No matching models": "沒有相符的模型"
 }

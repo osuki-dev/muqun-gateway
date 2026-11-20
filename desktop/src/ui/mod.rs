@@ -23,6 +23,7 @@ pub(crate) mod inbox;
 pub(crate) mod inspector;
 pub mod keymap;
 mod labels;
+mod model_picker;
 mod notifications;
 mod package_activity;
 pub mod pair_computer;
@@ -570,6 +571,7 @@ pub struct UiState {
     pub busy_since: HashMap<String, u64>,
     /// The start card's folder picker filter (`ui/home.rs`).
     pub folder_query: TextEdit,
+    pub model_query: TextEdit,
     pub full_projects: HashSet<String>,
 
     /// Pending prompts per session, from snapshots and events.
@@ -840,6 +842,7 @@ impl UiState {
             open_projects: HashMap::new(),
             busy_since: HashMap::new(),
             folder_query: TextEdit::new(""),
+            model_query: TextEdit::new(""),
             full_projects: HashSet::new(),
             waiting_perms: HashMap::new(),
             waiting_forms: HashMap::new(),
@@ -4253,6 +4256,7 @@ impl UiState {
             &self.start_draft,
             &self.search,
             &self.folder_query,
+            &self.model_query,
             &self.task_goal,
             &self.theme_url,
             &self.plugin_source,

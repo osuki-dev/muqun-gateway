@@ -928,5 +928,7 @@
   "Set up Muqun Gateway": "Configurar o Muqun Gateway",
   "Desktop needs Gateway on this computer to open your workspace.": "O Desktop precisa do Gateway neste computador para abrir seu espaço de trabalho.",
   "Checking for a local Gateway…": "Procurando um Gateway local…",
-  "Gateway setup failed or timed out. Retry to continue.": "A instalação do Gateway falhou ou excedeu o tempo limite. Tente novamente para continuar."
+  "Gateway setup failed or timed out. Retry to continue.": "A instalação do Gateway falhou ou excedeu o tempo limite. Tente novamente para continuar.",
+  "Search models": "Buscar modelos",
+  "No matching models": "Nenhum modelo encontrado"
 }

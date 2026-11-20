@@ -928,5 +928,7 @@
   "Set up Muqun Gateway": "Muqun Gateway 설정",
   "Desktop needs Gateway on this computer to open your workspace.": "작업 공간을 열려면 이 컴퓨터에 Gateway를 설치해야 합니다.",
   "Checking for a local Gateway…": "로컬 Gateway 확인 중…",
-  "Gateway setup failed or timed out. Retry to continue.": "Gateway 설정에 실패했거나 시간이 초과되었습니다. 다시 시도하세요."
+  "Gateway setup failed or timed out. Retry to continue.": "Gateway 설정에 실패했거나 시간이 초과되었습니다. 다시 시도하세요.",
+  "Search models": "모델 검색",
+  "No matching models": "일치하는 모델 없음"
 }
