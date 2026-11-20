@@ -254,10 +254,11 @@ fn main() -> anyhow::Result<()> {
     // A failed start or a panic leaves through the same door: unwinding out
     // of `main` would run the libraries' exit handlers under the core's
     // threads (OpenSSL's cleanup under a SQLite open crashed that way).
+    // Rune normally exits from its event loop, before try_run returns.
+    rune::fast_exit(finish_normal_exit);
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.try_run()));
     platform::shutdown::deadline();
     platform::gateway_bootstrap::shutdown();
-    instance::release();
     store.flush();
     let code = match ran {
         Ok(Ok(())) => 0,
@@ -270,11 +271,18 @@ fn main() -> anyhow::Result<()> {
     tracing::info!(code, "muqun-desktop stopped");
     diagnostics::flush();
     if code == 0 {
-        if let Err(error) = platform::update::relaunch_if_requested() {
-            tracing::error!(%error,"could not restart updated Desktop");
-        }
+        finish_normal_exit();
+    } else {
+        instance::release();
     }
     platform::shutdown::leave(code)
+}
+
+fn finish_normal_exit() {
+    instance::release();
+    if let Err(error) = platform::update::relaunch_if_requested() {
+        tracing::error!(%error, "could not restart updated Desktop");
+    }
 }
 
 fn init_tracing() {
