@@ -2,6 +2,8 @@
 
 ## Changes and fixes
 
+- Installed Desktop now checks its own release channel on startup and every six hours while running. A notification opens the update page. You choose when to download and restart. To get this update from preview.27, open Settings → About.
+
 - Search the model picker on Home and in sessions by model name, ID, or provider. Model and reasoning effort selections stay visible, including when working in split panes.
 - The sidebar now uses the active theme's surface and artwork. On macOS the main workspace lets the desktop show through, and Reduce transparency restores an opaque background.
 - Installing Bun or Herdr gives a newly downloaded binary time for its first startup. Herdr now downloads from its official release location.
