@@ -2,28 +2,6 @@
 use super::*;
 use crate::ui::{Mode, TileContent};
 
-pub(crate) fn webview_helper() -> Option<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let path = match std::env::var_os("MUQUN_WEBVIEW_HELPER") {
-            Some(path) => PathBuf::from(path),
-            None => std::env::current_exe()
-                .ok()?
-                .with_file_name("muqun-wry-embedded"),
-        };
-        (path.is_absolute()
-            && path
-                .metadata()
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
-        .then_some(path)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
-}
-
 pub(super) fn local_panel_url(address: &str) -> bool {
     reqwest::Url::parse(address).is_ok_and(|url| {
         url.scheme() == "http"

@@ -10,7 +10,7 @@ mod native_view;
 mod notifications;
 mod panel;
 mod web_surface;
-pub(crate) use web_surface::webview_helper;
+pub(crate) use crate::platform::plugin_webview::webview_helper;
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -334,7 +334,7 @@ impl ExternalPlugin {
 
         let media_dir = view.and_then(|_| native_media::invocation_dir().ok());
         let mut context = serde_json::json!(super::context::web_context(s, true));
-        context["capabilities"] = serde_json::json!({"webviewEntry":cfg!(target_os = "linux") && web_surface::webview_helper().is_some(), "nativeLayout":true, "nativePresentation":true, "nativeImages":media_dir.is_some(), "fillLayout":true, "markdownAnchors":true,"nativeSelect":true});
+        context["capabilities"] = serde_json::json!({"webviewEntry":webview_helper().is_some(), "nativeLayout":true, "nativePresentation":true, "nativeImages":media_dir.is_some(), "fillLayout":true, "markdownAnchors":true,"nativeSelect":true});
         if let Some((instance, action)) = view {
             if let Some(fields) = s
                 .plugin_fields

@@ -18,6 +18,7 @@ pub mod pairing;
 pub mod pairing_invite;
 #[cfg(target_os = "linux")]
 mod plugin_picker_linux;
+pub(crate) mod plugin_webview;
 pub mod pty;
 pub mod secrets;
 pub mod shell;

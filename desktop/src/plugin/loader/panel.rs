@@ -1,7 +1,7 @@
 //! A plugin-owned HTTP service lives exactly as long as its native view instance.
 use super::*;
+use crate::platform::plugin_webview::{running, stop};
 use std::io::{BufRead, BufReader};
-use std::process::Child;
 
 const START_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -60,42 +60,6 @@ fn read_endpoint(pipe: impl Read) -> Result<String, String> {
         return Err("WebView service must return a loopback HTTP endpoint".into());
     }
     Ok(raw.to_string())
-}
-
-// Keep the Unix group leader reserved until its children have been signalled.
-// Reaping the leader with try_wait first would allow the kernel to reuse its PID.
-#[cfg(target_os = "linux")]
-fn running(child: &mut Child) -> bool {
-    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-    unsafe {
-        libc::waitid(
-            libc::P_PID,
-            child.id(),
-            info.as_mut_ptr(),
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        ) == 0
-            && info.assume_init().si_pid() == 0
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn running(child: &mut Child) -> bool {
-    matches!(child.try_wait(), Ok(None))
-}
-
-fn stop(mut child: Child) {
-    // The service contract uses EOF for orderly shutdown of its own backend.
-    drop(child.stdin.take());
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while running(&mut child) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    #[cfg(target_os = "linux")]
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 impl Panel {
@@ -201,7 +165,7 @@ impl ExternalPlugin {
         entry: &str,
         draft_target: Option<crate::plugin::draft::Target>,
     ) -> Result<(), String> {
-        if super::web_surface::webview_helper().is_none() {
+        if super::webview_helper().is_none() {
             return Err("The embedded WebView helper is unavailable".into());
         }
         let entry = panel_entry(&self.dir, entry)?;
