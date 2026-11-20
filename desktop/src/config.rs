@@ -313,8 +313,6 @@ pub struct General {
     pub close_to_tray: bool,
     /// The first-run welcome was seen (or skipped).
     pub welcomed: bool,
-    /// Use Desktop without automatically provisioning a local Gateway.
-    pub gateway_local_only: bool,
 }
 
 /// The draft key of the start page.
@@ -813,7 +811,6 @@ pub enum ConfigEdit {
     Shape(Shape),
     /// The first-run welcome was dismissed.
     Welcomed,
-    GatewayLocalOnly(bool),
     ReducedMotion(bool),
     ReducedTransparency(bool),
     Notifications(bool),
@@ -922,7 +919,6 @@ impl DesktopConfig {
             ConfigEdit::TextScale(scale) => self.appearance.text_scale = scale,
             ConfigEdit::Shape(shape) => self.appearance.shape = shape,
             ConfigEdit::Welcomed => self.general.welcomed = true,
-            ConfigEdit::GatewayLocalOnly(on) => self.general.gateway_local_only = on,
             ConfigEdit::ReducedMotion(on) => self.appearance.reduced_motion = on,
             ConfigEdit::ReducedTransparency(on) => self.appearance.reduced_transparency = on,
             ConfigEdit::Notifications(on) => self.notifications.enabled = on,

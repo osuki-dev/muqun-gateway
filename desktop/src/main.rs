@@ -131,14 +131,7 @@ fn main() -> anyhow::Result<()> {
         });
     } else {
         theme::omarchy::watch(inbox.clone(), store.clone());
-        if !tooling {
-            platform::gateway_bootstrap::initialize(
-                &config,
-                config_dir.clone(),
-                state_dir.clone(),
-                inbox.clone(),
-            );
-        }
+        platform::gateway_bootstrap::initialize(state_dir.clone(), inbox.clone());
         start_core(
             settings,
             state_dir.clone(),
@@ -263,6 +256,7 @@ fn main() -> anyhow::Result<()> {
     // threads (OpenSSL's cleanup under a SQLite open crashed that way).
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.try_run()));
     platform::shutdown::deadline();
+    platform::gateway_bootstrap::shutdown();
     instance::release();
     store.flush();
     let code = match ran {
@@ -328,6 +322,7 @@ fn start_core(
     std::thread::Builder::new()
         .name("muqun-core-main".into())
         .spawn(move || {
+            platform::gateway_bootstrap::wait_for_setup();
             runtime.block_on(async move {
                 let (hub, connected) = select_hub(settings, &state_dir, &store.get()).await;
                 let dynamic_hub = hub::DynamicHub::new(hub);

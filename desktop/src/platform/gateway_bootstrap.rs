@@ -1,9 +1,6 @@
 //! First-launch Gateway provisioning delegates to the packaged distribution
 //! installer. It never downloads binaries or repairs an existing installation.
-use crate::{
-    config::DesktopConfig,
-    model::inbox::{Inbox, UiAction, Update},
-};
+use crate::model::inbox::{Inbox, UiAction, Update};
 use std::{
     fs::{self, OpenOptions},
     io::{Read, Write},
@@ -12,12 +9,11 @@ use std::{
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
     },
     time::{Duration, Instant},
 };
 
-pub const OPT_OUT: &str = "gateway-auto-install.disabled";
 const ATTEMPT: &str = "gateway-bootstrap.attempt";
 const DEADLINE: Duration = Duration::from_secs(480);
 static CONTEXT: OnceLock<Arc<Context>> = OnceLock::new();
@@ -25,11 +21,9 @@ static CONTEXT: OnceLock<Arc<Context>> = OnceLock::new();
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Unavailable,
-    Disabled,
+    Checking,
     Existing,
-    Remote,
     NeedsConsent,
-    Deferred,
     Installing,
     Downloading { received: u64, total: u64 },
     Verifying,
@@ -44,35 +38,28 @@ impl Status {
     pub fn message(&self) -> &'static str {
         match self {
             Self::Unavailable => "Gateway setup is available in packaged Desktop installations.",
-            Self::Disabled => "Local-only mode: automatic Gateway installation is disabled.",
+            Self::Checking => "Checking for a local Gateway…",
             Self::Existing => "An existing Gateway installation was left unchanged.",
-            Self::Remote => "Remote computer selected; local Gateway setup was skipped.",
             Self::NeedsConsent => "Install Gateway to connect your devices to this computer.",
-            Self::Deferred => "Gateway setup is available when you are ready.",
             Self::Installing => "Preparing Gateway setup…",
             Self::Downloading { .. } => "Downloading Gateway…",
             Self::Verifying => "Verifying the Gateway download…",
             Self::Activating => "Installing Gateway…",
             Self::Starting => "Starting Gateway…",
             Self::Ready => "Local Gateway is ready. Connect when your current work is finished.",
-            Self::Failed => {
-                "Gateway setup failed or timed out. Local mode remains available; retry when ready."
-            }
+            Self::Failed => "Gateway setup failed or timed out. Retry to continue.",
             Self::Interrupted => {
                 "A previous Gateway setup did not finish. It will only run again when you retry."
             }
         }
     }
     pub fn retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::NeedsConsent | Self::Deferred | Self::Failed | Self::Interrupted | Self::Disabled
-        )
+        matches!(self, Self::NeedsConsent | Self::Failed | Self::Interrupted)
     }
 }
 
 struct Context {
-    config: PathBuf,
+    changed: Condvar,
     state: PathBuf,
     installer: Option<PathBuf>,
     inbox: Arc<Inbox>,
@@ -97,79 +84,67 @@ fn packaged_installer(executable: &Path) -> Option<PathBuf> {
     .find(|path| path.is_file() && path.with_file_name("install.sh").is_file())
 }
 
-fn local(computer: &str) -> bool {
-    matches!(computer, "" | "local" | "self")
-}
-
-pub fn initialize(
-    config: &DesktopConfig,
-    config_dir: PathBuf,
-    state_dir: PathBuf,
-    inbox: Arc<Inbox>,
-) {
-    let installer = std::env::current_exe()
-        .ok()
-        .and_then(|path| packaged_installer(&path));
+pub fn initialize(state_dir: PathBuf, inbox: Arc<Inbox>) {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let installer = packaged_installer(&executable);
+    // An unpackaged Cargo build runs directly from its build profile directory.
+    // A damaged installed package still has to pass the Gateway check.
+    if installer.is_none()
+        && !executable
+            .parent()
+            .is_some_and(|dir| dir.ends_with("bin") || dir.ends_with("Contents/MacOS"))
+    {
+        return;
+    }
     let context = Arc::new(Context {
-        config: config_dir,
+        changed: Condvar::new(),
         state: state_dir,
         installer,
         inbox,
         running: AtomicBool::new(false),
         cancel: AtomicBool::new(false),
-        status: Mutex::new(Status::Unavailable),
+        status: Mutex::new(Status::Checking),
     });
-    if CONTEXT.set(context.clone()).is_err() {
-        return;
-    }
-    if config.general.gateway_local_only || context.config.join(OPT_OUT).exists() {
-        *context.status.lock().unwrap() = Status::Disabled;
-    } else if !local(&config.current_computer) {
-        *context.status.lock().unwrap() = Status::Remote;
-    } else {
+    if CONTEXT.set(context.clone()).is_ok() {
         begin(context, false);
     }
 }
 
-/// Dismiss the first-launch invitation for this run. Settings can reopen setup.
-pub fn defer() {
+/// Keep core startup on its own worker until the local Gateway is available.
+/// The main event loop and the installer continue independently.
+pub fn wait_for_setup() {
     if let Some(context) = CONTEXT.get() {
-        let mut status = context.status.lock().unwrap();
-        if *status == Status::NeedsConsent {
-            *status = Status::Deferred;
+        drop(
             context
-                .inbox
-                .push(Update::Ui(UiAction::LocalGatewayStatus(Status::Deferred)));
-        }
+                .changed
+                .wait_while(context.status.lock().unwrap(), |status| {
+                    !matches!(status, Status::Ready | Status::Existing)
+                })
+                .unwrap(),
+        );
     }
 }
 
-pub fn set_local_only(disabled: bool) {
-    let Some(context) = CONTEXT.get() else {
-        return;
-    };
-    if disabled {
-        context.cancel.store(true, Ordering::Release);
-        if fs::create_dir_all(&context.config).is_ok() {
-            let _ = private_file(&context.config.join(OPT_OUT));
-        }
-        *context.status.lock().unwrap() = Status::Disabled;
-    } else {
-        let _ = fs::remove_file(context.config.join(OPT_OUT));
-        if !context.running.load(Ordering::Acquire) {
-            *context.status.lock().unwrap() = Status::Interrupted;
-        }
-    }
-}
-
-pub fn retry(config: &DesktopConfig) {
-    if config.general.gateway_local_only || !local(&config.current_computer) {
-        return;
-    }
+pub fn shutdown() {
     if let Some(context) = CONTEXT.get() {
-        if context.config.join(OPT_OUT).exists() {
-            return;
-        }
+        context.cancel.store(true, Ordering::Release);
+        drop(
+            context
+                .changed
+                .wait_timeout_while(
+                    context.status.lock().unwrap(),
+                    Duration::from_secs(1),
+                    |_| context.running.load(Ordering::Acquire),
+                )
+                .unwrap(),
+        );
+    }
+}
+
+pub fn retry() {
+    if let Some(context) = CONTEXT.get() {
         begin(context.clone(), true);
     }
 }
@@ -181,8 +156,12 @@ fn begin(context: Arc<Context>, consent: bool) {
     context.cancel.store(false, Ordering::Release);
     std::thread::spawn(move || {
         let result = provision(&context, consent, DEADLINE);
-        *context.status.lock().unwrap() = result.clone();
-        context.running.store(false, Ordering::Release);
+        {
+            let mut status = context.status.lock().unwrap();
+            *status = result.clone();
+            context.running.store(false, Ordering::Release);
+            context.changed.notify_all();
+        }
         context
             .inbox
             .push(Update::Ui(UiAction::LocalGatewayStatus(result.clone())));
@@ -290,8 +269,8 @@ fn private_file(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 fn provision(context: &Context, consent: bool, deadline: Duration) -> Status {
-    if context.cancel.load(Ordering::Acquire) || context.config.join(OPT_OUT).exists() {
-        return Status::Disabled;
+    if context.cancel.load(Ordering::Acquire) {
+        return Status::Interrupted;
     }
     if [
         "MUQUN_LOCAL_GATEWAY",
@@ -322,7 +301,7 @@ fn provision(context: &Context, consent: bool, deadline: Duration) -> Status {
         None => return Status::Failed,
     }
     let Some(installer) = &context.installer else {
-        return Status::Unavailable;
+        return Status::Failed;
     };
     install_once(context, installer, &paths, consent, deadline, || {
         tokio::runtime::Builder::new_current_thread()
@@ -368,8 +347,8 @@ fn install_once(
     deadline: Duration,
     ready: impl FnOnce() -> bool,
 ) -> Status {
-    if context.cancel.load(Ordering::Acquire) || context.config.join(OPT_OUT).exists() {
-        return Status::Disabled;
+    if context.cancel.load(Ordering::Acquire) {
+        return Status::Interrupted;
     }
     if !consent {
         return if context.state.join(ATTEMPT).exists() {
@@ -449,7 +428,7 @@ fn run_installer(
     progress: impl Fn(Status),
 ) -> Status {
     if cancel.load(Ordering::Acquire) {
-        return Status::Disabled;
+        return Status::Interrupted;
     }
     let Ok((mut events, output)) = UnixStream::pair() else {
         return Status::Failed;
@@ -523,7 +502,7 @@ fn run_installer(
             let _ = child.kill();
             let _ = child.wait();
             return if cancel.load(Ordering::Acquire) {
-                Status::Disabled
+                Status::Interrupted
             } else {
                 Status::Failed
             };
@@ -559,7 +538,7 @@ printf 'attempt\n' >> "${{0%/*}}/attempts"
             )
             .unwrap();
             let context = Context {
-                config: root.join("config"),
+                changed: Condvar::new(),
                 state: root.join("state"),
                 installer: Some(installer),
                 inbox: Arc::new(Inbox::new()),
@@ -708,23 +687,13 @@ printf ' 100\nMUQUN_PROGRESS download 100 100\nMUQUN_PROGRESS verify\nMUQUN_PROG
                 Duration::from_secs(2),
                 |_| {}
             ),
-            Status::Disabled
+            Status::Interrupted
         );
         assert_eq!(
             fixture.count(),
             1,
             "cancellation before launch must not execute an installer"
         );
-    }
-
-    #[test]
-    fn local_only_marker_prevents_first_attempt_without_creating_state() {
-        let fixture = Fixture::new("exit 0");
-        fs::create_dir_all(&fixture.context.config).unwrap();
-        fs::write(fixture.context.config.join(OPT_OUT), "").unwrap();
-        assert_eq!(fixture.attempt(false), Status::Disabled);
-        assert_eq!(fixture.count(), 0);
-        assert!(!fixture.context.state.join(ATTEMPT).exists());
     }
 
     #[test]
@@ -761,9 +730,6 @@ printf ' 100\nMUQUN_PROGRESS download 100 100\nMUQUN_PROGRESS verify\nMUQUN_PROG
             Some(&config),
             Some(&data)
         ));
-        assert!(!local("remote-computer"));
-        assert!(!local("all"));
-        assert!(local("local"));
     }
 
     #[test]
