@@ -562,6 +562,41 @@ pub(crate) async fn attach_to_items(
     directory: Option<&str>,
     items: &mut [TimelineItem],
 ) {
+    attach_rows(
+        state,
+        asid,
+        directory.map_or(ImageDirectory::Discover, |dir| {
+            ImageDirectory::Snapshot(Some(dir))
+        }),
+        items,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ImageDirectory<'a> {
+    Discover,
+    Snapshot(Option<&'a str>),
+}
+
+/// A snapshot already carries the provider's directory. A retained read must
+/// also handle a missing directory without asking the provider to discover it.
+pub(crate) async fn attach_window(
+    state: &AppState,
+    asid: &str,
+    snapshot: &mut super::ports::mirror::AgentSessionSnapshot,
+) {
+    let directory = ImageDirectory::Snapshot(snapshot.info.directory.as_deref());
+    attach_rows(state, asid, directory, &mut snapshot.timeline).await;
+    attach_inbox_files(state, asid, directory, &mut snapshot.inbox).await;
+}
+
+async fn attach_rows(
+    state: &AppState,
+    asid: &str,
+    directory: ImageDirectory<'_>,
+    items: &mut [TimelineItem],
+) {
     // Same client-side recovery the App runs in `parseTimelineItem`, so HTTP
     // and Desktop both attach originals for ByPath handoffs.
     promote_uploaded_attachment_suffix(items);
@@ -573,22 +608,16 @@ pub(crate) async fn attach_to_items(
         return;
     }
     let root = match directory {
-        Some(directory) => state.message_images.remember_root(asid, Some(directory)),
-        None => None,
+        ImageDirectory::Discover => session_root(state, asid).await,
+        ImageDirectory::Snapshot(dir) => state
+            .message_images
+            .remember_root(asid, dir)
+            .or_else(|| state.message_images.root_for(asid)),
     };
-    let root = match root {
-        Some(root) => root,
-        None => match session_root(state, asid).await {
-            Some(root) => root,
-            None => {
-                // Inline originals do not need a workspace. Host paths do.
-                originals::attach(state, asid, None, items).await;
-                return;
-            }
-        },
-    };
-    originals::attach(state, asid, Some(root.clone()), items).await;
-    state.message_images.attach(&root, items);
+    originals::attach(state, asid, root.clone(), items).await;
+    if let Some(root) = root {
+        state.message_images.attach(&root, items);
+    }
 }
 
 /// Give queued prompts the fields a transcript user row carries for its files,
@@ -597,6 +626,15 @@ pub(crate) async fn attach_to_items(
 /// and `image_assets`, keyed by those sources. Read from `payload.files[].uri`
 /// for OpenCode and Codex alike; `payload` stays exactly as the agent sent it.
 pub(crate) async fn attach_to_inbox(state: &AppState, asid: &str, items: &mut [serde_json::Value]) {
+    attach_inbox_files(state, asid, ImageDirectory::Discover, items).await
+}
+
+async fn attach_inbox_files(
+    state: &AppState,
+    asid: &str,
+    directory: ImageDirectory<'_>,
+    items: &mut [serde_json::Value],
+) {
     let mut rows = Vec::new();
     for (index, item) in items.iter().enumerate() {
         let Some(files) = item
@@ -640,7 +678,7 @@ pub(crate) async fn attach_to_inbox(state: &AppState, asid: &str, items: &mut [s
         return;
     }
     let (indexes, mut rows): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
-    attach_to_items(state, asid, None, &mut rows).await;
+    attach_rows(state, asid, directory, &mut rows).await;
     for (index, row) in indexes.into_iter().zip(rows) {
         let Some(item) = items[index].as_object_mut() else {
             continue;

@@ -35,13 +35,23 @@ pub struct LaunchBypass {
     pub env: &'static [(&'static str, &'static str)],
 }
 
+/// The agent's independent select-valued permission control.
+pub struct ConfigBypass {
+    pub id: &'static str,
+    pub enabled: &'static str,
+    pub disabled: &'static str,
+}
+
 pub trait AcpProvider: Send + Sync + 'static {
     const KIND: &'static str;
     const LABEL: &'static str;
     const ARGS: &'static [&'static str];
+    /// Provider-specific launch policy; never persisted to the user's environment.
+    const ENV: &'static [(&'static str, &'static str)] = &[];
     const REQUIRE_MESSAGE_ID: bool;
     const MODEL_SELECTION: bool;
     const SESSION_NOTICES: bool = false;
+    const TRANSCRIPT_USAGE: bool = false;
     const IDLE_RETIREMENT: bool = false;
     /// How long a child stays warm after its last turn or explicit open
     /// before idle retirement is considered, unless the agent's
@@ -59,6 +69,10 @@ pub trait AcpProvider: Send + Sync + 'static {
     /// auto-approve switch selects the first one the live session offers
     /// (`session/set_mode`); empty where the agent has no such mode.
     const BYPASS_MODES: &'static [&'static str] = &[];
+    /// An independent session permission selector, separate from autonomy modes.
+    const BYPASS_CONFIG: Option<ConfigBypass> = None;
+    /// Advertised informational commands whose reply repeats prior turn usage.
+    const NON_INFERENCE_COMMANDS: &'static [&'static str] = &[];
     /// The agent's bypass is a launch flag, not a session mode: the App's
     /// switch relaunches that session's child with the flag added or removed
     /// and loads the same session again.
@@ -346,6 +360,7 @@ struct SessionState {
     config: Value,
     owned_mutations: bool,
     usage: mapper::SessionUsage,
+    ignore_turn_usage: bool,
     projection: Projection,
     permissions: HashMap<String, Permission>,
     last_activity: tokio::time::Instant,
@@ -540,6 +555,7 @@ struct Session {
     prompt_capabilities: PromptCapabilities,
     finished: CancellationToken,
     retirement: Mutex<()>,
+    usage_read: Mutex<()>,
     /// Prompts sent while a turn runs, handed over when it ends normally.
     inbox: StdMutex<Inbox<QueuedPrompt>>,
     /// Serializes queueing against a turn's end and a queued delivery, so
@@ -1840,6 +1856,11 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
         }
         let mut launch = self.launch.lock().unwrap().clone().unwrap_or_default();
+        launch.env.extend(
+            P::ENV
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string())),
+        );
         let mut args: Vec<&str> = if launch.args.is_empty() {
             P::ARGS.to_vec()
         } else {
@@ -2544,8 +2565,18 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
             self.dormant.lock().unwrap().remove(id);
         }
-        if let Some(tokens) = Self::transcript_tokens(&session).await {
-            Self::publish_tokens(&session, &self.mirror, &self.tx, Some(tokens)).await;
+        if P::TRANSCRIPT_USAGE {
+            // Restoring the conversation must not wait for a lifetime usage
+            // scan. Publish its result through the ordinary session event.
+            let (session, mirror, tx) = (session.clone(), self.mirror.clone(), self.tx.clone());
+            tokio::spawn(async move {
+                let _read = session.usage_read.lock().await;
+                if let Some(tokens) = Self::transcript_tokens(&session).await {
+                    if session.connected.load(Ordering::Acquire) {
+                        Self::publish_tokens(&session, &mirror, &tx, Some(tokens)).await;
+                    }
+                }
+            });
         }
         Ok(session)
     }
@@ -2776,6 +2807,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         let mut catalog = mapper::catalog_for(&value, P::KIND);
         if P::SESSION_MODES {
             (catalog.modes, catalog.defaults.mode) = mapper::session_modes(&value);
+            info.mode.clone_from(&catalog.defaults.mode);
         }
         if new_session {
             self.owned.lock().unwrap().mark(&id);
@@ -2788,6 +2820,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             config: value.clone(),
             owned_mutations: self.owns(&id),
             usage: mapper::SessionUsage::new(new_session),
+            ignore_turn_usage: false,
             projection,
             permissions: HashMap::new(),
             last_activity: tokio::time::Instant::now(),
@@ -2906,6 +2939,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             commands_observed: self.commands_observed.clone(),
             finished: CancellationToken::new(),
             retirement: Mutex::new(()),
+            usage_read: Mutex::new(()),
             inbox: StdMutex::new(Inbox::default()),
             turn_gate: Arc::new(Mutex::new(())),
         });
@@ -3496,6 +3530,10 @@ impl<P: AcpProvider> AcpDriver<P> {
         tx: &broadcast::Sender<AgentDomainEvent>,
         response: Option<&Value>,
     ) {
+        if session.state.lock().await.ignore_turn_usage {
+            return;
+        }
+        let _read = session.usage_read.lock().await;
         let recorded = Self::transcript_tokens(session).await;
         let total = {
             let mut state = session.state.lock().await;
@@ -3801,6 +3839,15 @@ impl<P: AcpProvider> AcpDriver<P> {
         let mut state = session.state.lock().await;
         state.recovery = None;
         state.hidden_command = false;
+        state.ignore_turn_usage = !prompt.attachments
+            && P::NON_INFERENCE_COMMANDS.iter().any(|command| {
+                prepared.transcript == format!("/{command}")
+                    && state
+                        .catalog
+                        .commands
+                        .iter()
+                        .any(|offered| offered.name == *command)
+            });
         state.prompt_checkpoint = checkpoint;
         state.prompt_user_digest = Some(recovery::text_digest(&prepared.transcript));
         state.turn_had_output = false;
@@ -4146,7 +4193,7 @@ impl<P: AcpProvider> AcpDriver<P> {
 
     fn snapshot_matches_projection(snapshot: &NativeSnapshot, projection: &Projection) -> bool {
         if projection.is_empty() {
-            return snapshot.entries.is_empty();
+            return snapshot.is_empty();
         }
         snapshot.last_user.as_deref() == projection.latest_text(TimelineRole::User)
             && snapshot.last_assistant.as_deref().is_some_and(|text| {
@@ -4972,8 +5019,9 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                         catalog.defaults.mode = None;
                         return Ok(catalog);
                     }
-                    self.observed_snapshot(id).await?;
-                    return self.available_catalog(directory).await;
+                    if self.observed_snapshot(id).await?.is_some() {
+                        return self.available_catalog(directory).await;
+                    }
                 }
                 let session = self.retained(id).ok_or_else(|| {
                     AgentError::NotAvailable(
@@ -5271,6 +5319,20 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
     }
     fn set_auto_approve<'a>(&'a self, id: &'a str, enabled: bool) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            if let Some(config) = P::BYPASS_CONFIG {
+                let session = self.ensure_loaded(id).await?;
+                return self
+                    .select_config(
+                        &session,
+                        config.id,
+                        if enabled {
+                            config.enabled
+                        } else {
+                            config.disabled
+                        },
+                    )
+                    .await;
+            }
             if P::LAUNCH_BYPASS.is_some() {
                 return self.set_launch_bypass(id, enabled).await;
             }
@@ -5306,6 +5368,20 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
     }
     fn auto_approve<'a>(&'a self, id: &'a str) -> AgentFuture<'a, Option<bool>> {
         Box::pin(async move {
+            if let Some(config) = P::BYPASS_CONFIG {
+                let session = self.ensure_loaded(id).await?;
+                let state = session.state.lock().await;
+                let current = mapper::config_option(&state.config, config.id)
+                    .and_then(|option| option["currentValue"].as_str());
+                return match current {
+                    Some(value) if value == config.enabled => Ok(Some(true)),
+                    Some(value) if value == config.disabled => Ok(Some(false)),
+                    _ => Err(AgentError::Unsupported(format!(
+                        "{} did not report its session permission setting",
+                        P::LABEL
+                    ))),
+                };
+            }
             if P::LAUNCH_BYPASS.is_some() {
                 return Ok(Some(self.launch_bypassed(id)));
             }

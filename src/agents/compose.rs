@@ -28,6 +28,7 @@ impl RuntimeSettings {
             deepseek: config.deepseek.clone(),
             t3: config.t3.clone(),
             local: LocalAgentConfigs {
+                copilot: config.copilot.clone(),
                 codex: config.codex.clone(),
                 fx: config.fx.clone(),
                 qoder: config.qoder.clone(),

@@ -72,6 +72,7 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 # the tree through reqwest, so this adds no compiled crate.
 tokio-util = "0.7.20"
 rmcp = { version = "3.7.0", features = ["server", "transport-streamable-http-server", "macros"] }
+tempfile = "3.27"
 rusqlite = { version = "0.42.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 hex = "0.4"
 # `ServiceExt::oneshot`: `/mcp` drives a per-request rmcp service with it, and

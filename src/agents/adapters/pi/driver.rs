@@ -24,7 +24,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -177,52 +176,26 @@ impl Live {
         }) else {
             return Ok(Vec::new());
         };
-        let Ok(mut file) = sessions::open_regular(&path).await else {
+        let Ok(file) = sessions::open_regular(&path).await else {
             return Ok(Vec::new());
         };
-        if file.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
-            return Ok(Vec::new());
-        }
-        let mut bytes = Vec::new();
-        if let Err(error) = file
-            .take((sessions::MAX_SESSION_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .await
-        {
-            tracing::debug!(%error, "pi session tail unreadable");
-            return Ok(Vec::new());
-        }
-        if bytes.len() > sessions::MAX_SESSION_BYTES {
-            return Err(AgentError::Protocol(
-                "pi session tail exceeds byte limit".into(),
-            ));
-        }
-        if bytes
-            .split(|b| *b == b'\n')
-            .any(|line| line.len() > super::rpc::MAX_LINE_BYTES)
-        {
-            return Err(AgentError::Protocol(
-                "pi session entry exceeds record limit".into(),
-            ));
-        }
-        let Some(end) = bytes.iter().rposition(|b| *b == b'\n') else {
-            return Ok(Vec::new());
-        };
+        let file = file.into_std().await;
+        let (end, messages) =
+            tokio::task::spawn_blocking(move || super::history::appended_messages(file, offset))
+                .await
+                .map_err(|e| AgentError::Protocol(e.to_string()))?
+                .map_err(|e| AgentError::Protocol(e.to_string()))?;
         if self.with(asid, |s| {
-            if s.generation != generation {
+            if s.generation != generation || s.offset != offset {
                 return false;
             }
-            s.offset = offset + end as u64 + 1;
+            s.offset = end;
             true
         }) != Some(true)
         {
             return Ok(Vec::new());
         }
-        Ok(bytes[..end]
-            .split(|b| *b == b'\n')
-            .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
-            .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("message"))
-            .collect())
+        Ok(messages)
     }
 }
 
@@ -244,6 +217,7 @@ pub struct PiDriver {
     probed: Mutex<Option<(Instant, bool)>>,
     failed: std::sync::atomic::AtomicBool,
     history: Mutex<HashMap<String, HistoryCursor>>,
+    indexed_files: super::history::Histories,
     stop: CancellationToken,
 }
 
@@ -295,6 +269,7 @@ impl PiDriver {
             probed: Mutex::new(None),
             failed: std::sync::atomic::AtomicBool::new(false),
             history: Mutex::new(HashMap::new()),
+            indexed_files: Default::default(),
             stop: CancellationToken::new(),
         }
     }
@@ -584,12 +559,8 @@ impl PiDriver {
         if !cwd.is_dir() {
             return Err(AgentError::WorkspaceMissing(file.cwd.clone()));
         }
-        let entries = self.store.read_entries(&file).await?;
-        let history_len = mapper::timeline_from_entries(&sessions::active_branch(&entries)).len();
-        let offset = tokio::fs::metadata(&file.path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let (_, index, offset) = self.indexed_files.open(&file.path).await?;
+        let history_len = index.len();
         let child =
             Arc::new(PiChild::spawn(&self.cmd, &self.launch(Some(file.path.clone()), &cwd)).await?);
         if let Err(error) = self.ensure_open() {
@@ -612,9 +583,7 @@ impl PiDriver {
         }
         let asid = AgentSessionId(file.id.clone());
         let mut session = LiveSession::new(&asid, Some(file.path.clone()), file.cwd, history_len);
-        session.folder = session
-            .folder
-            .with_history_usage(&sessions::active_branch(&entries));
+        session.folder = session.folder.with_history_usage(index.usage.clone());
         session.offset = offset;
         session.created_ms = file.created_ms;
         self.adopt(&asid, child.clone(), session);
@@ -718,6 +687,38 @@ impl PiDriver {
             ));
         }
         Ok(())
+    }
+
+    async fn history_page(
+        &self,
+        session_id: &str,
+        limit: usize,
+        before: Option<String>,
+        retained: Option<String>,
+    ) -> Result<(Vec<TimelineItem>, Option<String>), AgentError> {
+        let (file, index) = match self.store.find(session_id).await {
+            Ok(file) => {
+                let (file, index, _) = self.indexed_files.open(&file.path).await?;
+                (Some(file), index)
+            }
+            Err(AgentError::SessionNotFound(_)) if self.live.status(session_id).is_some() => {
+                (None, Arc::default())
+            }
+            Err(error) => return Err(error),
+        };
+        let live = self
+            .live
+            .with(session_id, |s| {
+                s.rows.retain(|r| !index.contains(&r.id));
+                s.rows.clone()
+            })
+            .unwrap_or_default();
+        let retained = retained.filter(|id| index.contains(id) || live.iter().any(|r| r.id == *id));
+        let rows =
+            tokio::task::spawn_blocking(move || index.page(file, live, before.as_deref(), limit))
+                .await
+                .map_err(|e| AgentError::Protocol(e.to_string()))??;
+        Ok((rows, retained))
     }
 
     fn prepare_history<'a>(
@@ -1739,32 +1740,7 @@ impl AgentPort for PiDriver {
         session_id: &'a str,
         limit: usize,
     ) -> AgentFuture<'a, Vec<TimelineItem>> {
-        Box::pin(async move {
-            let mut items = match self.store.find(session_id).await {
-                Ok(file) => {
-                    let entries = self.store.read_entries(&file).await?;
-                    mapper::timeline_from_entries(&sessions::active_branch(&entries))
-                }
-                Err(AgentError::SessionNotFound(_)) if self.live.status(session_id).is_some() => {
-                    Vec::new()
-                }
-                Err(error) => return Err(error),
-            };
-            // Rows the file already holds came from it; the rest are still
-            // streaming (or not yet re-keyed) and only the fold has them.
-            let live = self
-                .live
-                .with(session_id, |s| {
-                    s.rows
-                        .retain(|row| !items.iter().any(|item| item.id == row.id));
-                    s.rows.clone()
-                })
-                .unwrap_or_default();
-            items.extend(live);
-            items.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
-            let skip = items.len().saturating_sub(limit);
-            Ok(items.split_off(skip))
-        })
+        Box::pin(async move { Ok(self.history_page(session_id, limit, None, None).await?.0) })
     }
 
     fn prepare_timeline<'a>(
@@ -1779,14 +1755,8 @@ impl AgentPort for PiDriver {
                 .map_err(|_| AgentError::HistoryCursorLost)?
                 .get(session_id)
                 .cloned();
-            let mut items = self.get_timeline(session_id, usize::MAX).await?;
-            let retained = previous
-                .as_ref()
-                .and_then(|c| c.oldest.as_ref())
-                .filter(|id| items.iter().any(|r| &r.id == *id))
-                .cloned();
-            let start = items.len().saturating_sub(limit);
-            let tail = items.split_off(start);
+            let retained = previous.as_ref().and_then(|c| c.oldest.clone());
+            let (tail, retained) = self.history_page(session_id, limit, None, retained).await?;
             let oldest = retained.or_else(|| tail.first().map(|r| r.id.clone()));
             Ok(self.prepare_history(session_id, tail, previous, oldest))
         })
@@ -1805,17 +1775,12 @@ impl AgentPort for PiDriver {
                 .get(session_id)
                 .cloned()
                 .ok_or(AgentError::HistoryCursorLost)?;
-            let items = self.get_timeline(session_id, usize::MAX).await?;
-            let end = match &previous.oldest {
-                Some(id) => items
-                    .iter()
-                    .position(|r| &r.id == id)
-                    .ok_or(AgentError::HistoryCursorLost)?,
-                None if items.is_empty() => 0,
-                None => return Err(AgentError::HistoryCursorLost),
-            };
-            let start = end.saturating_sub(limit);
-            let page = items[start..end].to_vec();
+            let (page, _) = self
+                .history_page(session_id, limit, previous.oldest.clone(), None)
+                .await?;
+            if previous.oldest.is_none() && !page.is_empty() {
+                return Err(AgentError::HistoryCursorLost);
+            }
             let oldest = page
                 .first()
                 .map(|r| r.id.clone())
@@ -2753,6 +2718,79 @@ for raw in sys.stdin.buffer:
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "native-entry");
         driver.shutdown_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn oversized_native_records_preserve_branch_rows_tool_results_and_fork_payloads() {
+        use std::io::Write;
+        let Some((driver, dir)) = fake_driver(Duration::from_secs(60)) else {
+            return;
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = dir
+            .join("sessions")
+            .join(format!("2026-10-14T06-51-18-225Z_{id}.jsonl"));
+        let stamp = "2026-10-14T06:51:18.225Z";
+        let image = "X".repeat(super::super::rpc::MAX_LINE_BYTES + 1024);
+        let rows = [
+            json!({"type":"session","id":id,"cwd":dir,"timestamp":stamp,"version":3}),
+            json!({"type":"message","id":"first","timestamp":stamp,"message":{"role":"user","timestamp":1,"content":[{"type":"text","text":"Please inspect"},{"type":"image","data":image,"mimeType":"image/png"}]}}),
+            json!({"type":"message","id":"other","parentId":"first","message":{"role":"user","timestamp":2,"content":"not on active branch"}}),
+            json!({"type":"message","id":"answer","parentId":"first","message":{"role":"assistant","timestamp":3,"content":[{"type":"text","text":"Reading"},{"type":"toolCall","id":"read-tool","name":"read","arguments":{"path":"demo.png"}}],"usage":{"input":20,"output":2,"totalTokens":22}}}),
+            json!({"type":"message","id":"entry","timestamp":stamp,"parentId":"answer","message":{"role":"toolResult","toolCallId":"read-tool","isError":false,"content":[{"type":"text","text":"Done"},{"type":"image","data":image,"mimeType":"image/png"}],"details":{"size":123}}}),
+        ];
+        let mut out = std::fs::File::create(&path).unwrap();
+        for row in &rows {
+            serde_json::to_writer(&mut out, row).unwrap();
+            writeln!(out).unwrap();
+        }
+        drop(out);
+        assert!(std::fs::metadata(&path).unwrap().len() > 16 * 1024 * 1024);
+        let mut latest = driver.prepare_timeline(&id, 1).await.unwrap();
+        assert_eq!(latest.items[0].id, "answer:1");
+        let crate::agents::domain::AgentPart::Tool(tool) = &latest.items[0].part else {
+            panic!("tool row missing")
+        };
+        assert_eq!(tool.id, "read-tool");
+        assert_eq!(tool.output, Some(json!("Done\n[Large Pi image omitted]")));
+        assert_eq!(tool.metadata, Some(json!({"size":123})));
+        assert_eq!(
+            tool.content.as_ref().unwrap()[1]["text"],
+            "[Large Pi image omitted]"
+        );
+        latest.commit.take().unwrap()().unwrap();
+        assert_eq!(
+            driver
+                .load_earlier_timeline(&id, 10)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "answer:0"]
+        );
+        let source_digest = std::fs::read(&path).unwrap();
+        let cloned = driver.fork_session(&id, None).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), source_digest);
+        let clone = driver.store.find(&cloned.asid.0).await.unwrap();
+        let copy = std::fs::read_to_string(&clone.path).unwrap();
+        let copied: Vec<Value> = copy
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            copied[1]["message"]["content"][1]["data"].as_str().unwrap(),
+            image
+        );
+        assert_eq!(
+            copied[4]["message"]["content"][1]["data"].as_str().unwrap(),
+            image
+        );
+        assert_eq!(copied[0]["parentSession"], json!(path));
+        let lease = driver.child_for(&id).await.unwrap();
+        drop(lease);
+        driver.host.shutdown_all().await;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

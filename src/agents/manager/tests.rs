@@ -725,41 +725,41 @@ async fn delivered_user_enters_timeline_without_blocking_assistant_or_waiting_fo
         device_id: "phone-id".into(),
         name: "Phone".into(),
     };
-    let AgentDomainEvent::TimelineUpsert { items, .. } = ctx
+    let boundary = ctx.mirror.held_prompt_boundary(&asid, Some("steer")).await;
+    assert!(ctx
         .mirror
-        .present_user_prompt(&asid, "Continue in parallel.", origin.clone(), None)
+        .present_user_prompt(
+            &asid,
+            "Continue in parallel.",
+            origin.clone(),
+            Some("msg-10"),
+            boundary
+        )
         .await
-    else {
-        panic!("expected the immediate phone presentation");
-    };
-    let presented_id = items[0].id.clone();
+        .is_none());
+    assert!(ctx
+        .mirror
+        .get_snapshot(&asid)
+        .await
+        .unwrap()
+        .timeline
+        .iter()
+        .all(|r| r.role != TimelineRole::User));
     release.add_permits(1);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let AgentDomainEvent::TimelineRemoved { ids, seq, .. } = out.recv().await.unwrap() {
-                assert_eq!(ids.as_slice(), std::slice::from_ref(&presented_id));
-                let AgentDomainEvent::TimelineUpsert {
-                    items,
-                    seq: canonical_seq,
-                    ..
-                } = out.recv().await.unwrap()
-                else {
-                    panic!("expected the canonical user message after retraction");
-                };
-                assert!(canonical_seq > seq);
-                assert_eq!(items.len(), 1);
-                assert_eq!(items[0].seq, canonical_seq);
-                assert_eq!(items[0].origin.as_ref(), Some(&origin));
-                assert_eq!(items[0].id, "msg-10:t0");
-                assert_eq!(
-                    items[0].part,
-                    AgentPart::Text {
-                        text: "Continue in parallel.".into()
-                    }
-                );
-                break;
+        let AgentDomainEvent::TimelineUpsert { items, seq, .. } = out.recv().await.unwrap() else {
+            panic!("expected the canonical user message");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].seq, seq);
+        assert_eq!(items[0].origin.as_ref(), Some(&origin));
+        assert_eq!(items[0].id, "msg-10:t0");
+        assert_eq!(
+            items[0].part,
+            AgentPart::Text {
+                text: "Continue in parallel.".into()
             }
-        }
+        );
         let AgentDomainEvent::InboxChanged { items, .. } = out.recv().await.unwrap() else {
             panic!("the queue receipt leaves only after the canonical row is published");
         };
@@ -773,7 +773,6 @@ async fn delivered_user_enters_timeline_without_blocking_assistant_or_waiting_fo
         .upsert_timeline_items(&asid, mapper::map_message(&native, &asid))
         .await;
     let snapshot = ctx.mirror.get_snapshot(&asid).await.unwrap();
-    assert!(snapshot.timeline.iter().all(|row| row.id != presented_id));
     assert_eq!(snapshot.timeline[0].origin.as_ref(), Some(&origin));
     assert_eq!(snapshot.timeline.len(), 2);
     assert_eq!(snapshot.timeline[0].role, TimelineRole::User);
@@ -815,6 +814,7 @@ async fn opencode_receipts_track_identical_sends_even_when_native_delivery_is_re
                     device_id: device.into(),
                 },
                 receipt.as_deref(),
+                None,
             )
             .await;
     }
