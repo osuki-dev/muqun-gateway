@@ -4,6 +4,8 @@
 
 Gateway now resolves the stable and preview channels on muqun.dev. Each version has a manifest for all four Linux and macOS binaries. The installer and self-updater verify the download against its SHA-256 before running it and display the verified digest. Use `muqun-gateway update --channel preview --check` to check for a preview, and omit `--check` to install it. Installation retains the existing protection against downgrades.
 
+On a fresh computer with Muqun Desktop, Gateway can pair before Desktop opens and discover the bundled terminal when it starts. Existing tmux and Herdr configurations are preserved.
+
 ## Agents, messages and history
 
 - GitHub Copilot CLI is available as an opt-in local ACP agent. It uses the CLI's existing sign-in and exposes the session modes, models, permissions and usage supported by that CLI. Selecting Autopilot requires the owner's consent.
