@@ -600,6 +600,7 @@ pub struct UiState {
     pub agents_seen: bool,
     /// A screenshot scene is showing: live core updates are ignored.
     pub demo: bool,
+    pub desktop_update: crate::platform::update::Status,
     /// What the desktop keeps on disk (Settings → Storage), once scanned.
     pub storage: Option<crate::model::storage::StorageReport>,
     /// The terminal panel on the right (`ui/terminal_panel.rs`).
@@ -825,6 +826,7 @@ impl UiState {
             timeline_search: TimelineSearch::default(),
             agents_seen: false,
             demo: false,
+            desktop_update: Default::default(),
             storage: None,
             viewer: None,
             voice: None,
@@ -3640,6 +3642,7 @@ impl UiState {
 
     fn on_action(&mut self, action: UiAction) {
         match action {
+            UiAction::DesktopUpdate(status) => self.desktop_update = status,
             UiAction::Open(asid) => self.open_session(&asid),
             UiAction::Toast { title, detail } => self.toast(title, detail),
             UiAction::ToggleDiffPanel => self.show_diff = !self.show_diff,

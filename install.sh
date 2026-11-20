@@ -241,77 +241,30 @@ download() (
   [ "$(wc -c < "$output")" -le "$max_bytes" ]
 )
 
-# Preview JSON parsing is an explicit prerequisite only for a fresh preview install.
-if [ "$channel" = preview ]; then
-  command -v python3 >/dev/null 2>&1 || die "Python 3 is required to resolve preview releases safely; nothing installed."
-  page=1
-  while :; do
-    download "https://api.github.com/repos/$REPO/releases?per_page=100&page=$page" "$staging/releases-$page.json" 1048576 || die "Cannot fetch preview metadata; nothing installed."
-    count="$(python3 -I -c 'import json,sys; a=json.load(open(sys.argv[1])); sys.exit("Invalid preview page") if not isinstance(a,list) or len(a)>100 else print(len(a))' "$staging/releases-$page.json")" || die "Invalid preview metadata."
-    [ "$count" -eq 100 ] || break
-    [ "$page" -lt 10 ] || die "Preview listing exceeds the 1000-release search bound; nothing installed."
-    page=$((page + 1))
-  done
-  tag="$(python3 -I - "$staging" "$REPO" <<'PY'
-import glob, json, re, sys
-targets = ['aarch64-apple-darwin', 'x86_64-apple-darwin',
-           'x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl']
-pattern = re.compile(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-preview\.(0|[1-9][0-9]*)', re.ASCII)
-candidates = []
-for path in glob.glob(sys.argv[1] + '/releases-*.json'):
-    for release in json.load(open(path)):
-        if not isinstance(release, dict):
-            sys.exit('Invalid release metadata')
-        tag = release.get('tag_name', '')
-        match = pattern.fullmatch(tag) if isinstance(tag, str) else None
-        if not match or release.get('draft') is not False or release.get('prerelease') is not True:
-            continue
-        version = tuple(map(int, match.groups()))
-        if any(n > 18446744073709551615 for n in version):
-            continue
-        assets = release.get('assets', [])
-        if not isinstance(assets, list) or not all(isinstance(a, dict) for a in assets):
-            continue
-        valid = True
-        for target in targets:
-            name = 'muqun-gateway-' + target
-            for asset_name, limit in [(name, 268435456), (name + '.sha256', 1024)]:
-                found = [a for a in assets if a.get('name') == asset_name]
-                if len(found) != 1:
-                    valid = False
-                    continue
-                asset = found[0]
-                size = asset.get('size')
-                expected = 'https://github.com/' + sys.argv[2] + '/releases/download/' + tag + '/' + asset_name
-                if (type(size) is not int or not 0 < size <= limit or
-                    asset.get('state') != 'uploaded' or asset.get('browser_download_url') != expected):
-                    valid = False
-        if valid:
-            candidates.append((version, tag))
-if not candidates:
-    sys.exit('No complete official preview release found')
-print(max(candidates)[1])
-PY
-  )" || die "Cannot resolve a complete preview release; nothing installed."
-else
-# Resolve latest once by its HTTPS redirect, then pin both assets to that tag.
-# HEAD avoids downloading the release page or needing a JSON parser dependency.
-release_url="$(curl -fsSLI --proto '=https' --proto-redir '=https' \
-  --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
-  -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest")" || die "Cannot resolve the latest stable release."
-tag="${release_url#https://github.com/$REPO/releases/tag/}"
-case "$tag" in
-  *[!v0-9.]*) die "Latest release did not resolve to a stable vX.Y.Z tag." ;;
-esac
-if [ "$tag" = "$release_url" ] ||
-   ! printf '%s\n' "$tag" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
-  die "Latest release did not resolve to a stable vX.Y.Z tag."
-fi
-fi
+# Resolve once, then fetch both objects from this immutable version. The
+# text endpoint exposes the same channel pointer as the JSON update API.
+api="https://muqun.dev/api/releases/gateway"
+download "$api/$channel/version" "$staging/channel-version" 256 || die "Cannot resolve the $channel Gateway release; nothing installed."
+version="$(LC_ALL=C awk -v channel="$channel" '
+  NR == 1 {
+    version = $0
+    number = "(0|[1-9][0-9]*)"
+    pattern = "^" number "[.]" number "[.]" number
+    if (channel == "preview") pattern = pattern "-preview[.][1-9][0-9]*"
+    if ($0 !~ (pattern "$")) exit 1
+    count = split($0, parts, /[.]|-preview[.]/)
+    for (i = 1; i <= count; i++) {
+      if (length(parts[i]) > 20 ||
+          (length(parts[i]) == 20 && ("v" parts[i]) > "v18446744073709551615")) exit 1
+    }
+  }
+  END { if (NR != 1) exit 1; print version }
+' "$staging/channel-version")" || die "Invalid $channel Gateway version; nothing installed."
+tag="v$version"
 stage_ok
 stage "Download binary and checksum"
 asset="muqun-gateway-$target"
-download_url="https://github.com/$REPO/releases/download/$tag/$asset"
+download_url="$api/$tag/$asset"
 download "$download_url" "$staging/$asset" 268435456 || die "Binary download failed; nothing installed."
 download "$download_url.sha256" "$staging/checksum" 1024 || die "Checksum download failed; nothing installed."
 stage_ok
@@ -330,7 +283,8 @@ else
   actual_hash="$(shasum -a 256 "$staging/$asset")" || die "Cannot hash downloaded binary."
 fi
 actual_hash="${actual_hash%% *}"
-[ "$actual_hash" = "$expected_hash" ] || die "SHA256 mismatch; nothing installed."
+[ "$actual_hash" = "$expected_hash" ] || die "$tag $asset SHA-256 mismatch (expected $expected_hash, got $actual_hash); nothing installed."
+info "$tag  $asset  SHA-256 verified: $actual_hash"
 # Mirror platform/update.rs: only native 64-bit little-endian ELF/Mach-O with
 # the expected CPU may reach --version. Read exactly the bounded header, not
 # file(1)'s descriptive output or an executable shell script.

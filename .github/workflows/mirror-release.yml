@@ -1,0 +1,58 @@
+name: Mirror published release
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published Gateway v… or Desktop desktop-v… tag
+        type: string
+        required: true
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+    secrets:
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+      R2_ACCESS_KEY_ID:
+        required: true
+      R2_SECRET_ACCESS_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    if: startsWith(inputs.tag || github.event.release.tag_name, 'desktop-v') || startsWith(inputs.tag || github.event.release.tag_name, 'v')
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
+    steps:
+      # Historical tags can predate the mirror. Use the maintained publisher.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.repository.default_branch || github.sha }}
+          persist-credentials: false
+      - name: Read published release metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release view "$TAG" --json tagName,isDraft,isPrerelease,assets > release.json
+          PYTHONPATH=scripts python3 -c 'import json,os; from mirror_release import release_assets; release_assets(json.load(open("release.json")), os.environ["TAG"])'
+          gh release download "$TAG" --dir packages
+      - name: Install S3 client
+        run: python3 -m pip install boto3==1.38.46
+      - name: Mirror and verify before advancing channel
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          AWS_EC2_METADATA_DISABLED: 'true'
+        run: |
+          set -eu
+          : "${AWS_ACCESS_KEY_ID:?Missing R2_ACCESS_KEY_ID}" "${AWS_SECRET_ACCESS_KEY:?Missing R2_SECRET_ACCESS_KEY}" "${CLOUDFLARE_ACCOUNT_ID:?Missing CLOUDFLARE_ACCOUNT_ID}"
+          python3 scripts/mirror_release.py "$TAG" release.json packages

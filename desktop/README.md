@@ -9,7 +9,15 @@ When a Muqun gateway service runs on this computer the desktop attaches to it (t
 `local-client.json`), so the phone and the desktop see the same sessions. Without one it runs the
 gateway's agents plane in-process — no HTTP server, nothing listening.
 
-## Install (Linux)
+## Install a published Desktop package
+
+```sh
+curl -fsSL https://muqun.dev/desktop.sh | sh
+```
+
+The installer selects the Linux x86_64 or macOS arm64 package, verifies its SHA-256 and provisions a missing local Gateway. Settings → About checks the installed channel for newer versions. See the [deployment guide](../docs/desktop-deployment.md) for previews, pinned versions and installing Desktop alone.
+
+## Local development install (Linux)
 
 ```sh
 desktop/scripts/install-local.sh          # builds --release, installs for this user (no sudo)
@@ -270,4 +278,4 @@ The UI never runs on the tokio thread: the core pushes `Update`s into the inbox
   clients; size is saved).
 * System notifications are Linux-only so far (macOS and Windows build with a no-op), and single
   instance is Unix-only (on Windows every launch is its own).
-* No status icon on macOS yet; no installer for macOS or Windows, no code signing.
+* macOS releases use a signed and notarized app ZIP. The macOS status icon and Windows installer are still pending.

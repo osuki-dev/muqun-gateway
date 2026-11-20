@@ -15,8 +15,10 @@ trap 'rm -rf -- "$STAGE"' EXIT
 APP="$STAGE/Muqun Desktop.app"
 RES="$APP/Contents/Resources"
 mkdir -p "$APP/Contents/MacOS" "$RES/bundled-plugins/review-center" "$STAGE/AppIcon.iconset"
+mkdir -p "$RES/installers"
+cp "$ROOT/install-desktop.sh" "$ROOT/install.sh" "$RES/installers/"
 cp "$TARGET/release/muqun-desktop" "$APP/Contents/MacOS/"
-cp "$ROOT/LICENSE" "$ROOT/LICENSE-MIT" "$RES/"
+cp "$ROOT/LICENSE" "$ROOT/LICENSE-MIT" "$ROOT/desktop/assets/glyphs/LICENSE-octicons" "$RES/"
 for file in plugin.json review.ts README.md; do
   cp "$ROOT/desktop/assets/plugins/review-center/$file" "$RES/bundled-plugins/review-center/"
 done

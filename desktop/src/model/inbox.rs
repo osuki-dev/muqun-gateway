@@ -51,6 +51,7 @@ pub fn clean_error_message(msg: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)] // Several arms wait on platform hooks not yet re-wired on Rune.
 pub enum UiAction {
+    DesktopUpdate(crate::platform::update::Status),
     SubmitComposer,
     /// The composer's text or caret may have changed (posted from its key
     /// handlers, run once the keystroke has reached the text area).
