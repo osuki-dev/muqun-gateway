@@ -6,7 +6,7 @@ Use the official installer on Linux x86_64 or Apple silicon macOS. It reads the 
 
 ```sh
 curl -fsSL https://muqun.dev/desktop.sh | sh  # Stable Desktop and a missing local Gateway
-sh install-desktop.sh --channel preview       # Desktop preview; Gateway remains stable
+sh install-desktop.sh --channel preview       # Desktop preview and a missing preview Gateway
 sh install-desktop.sh --tag desktop-vX.Y.Z    # Pin a published Desktop release
 sh install-desktop.sh --without-gateway       # In-process agents or a paired remote computer
 ```
@@ -18,7 +18,7 @@ Choose an actual published version for `--tag`. If the requested channel has no 
 | Desktop | `desktop-vX.Y.Z` or `desktop-vX.Y.Z-preview.N` | Linux x86_64 tarball, macOS arm64 notarized app ZIP |
 | Gateway | `vX.Y.Z` or `vX.Y.Z-preview.N` | Linux x86_64/arm64 and macOS x86_64/arm64 binaries |
 
-A stable Desktop release starts when a maintainer pushes a reviewed `desktop-vX.Y.Z` tag matching the Desktop crate version and its committed `release-notes/desktop-vX.Y.Z.md`. CI builds both packages, runs the Linux smoke tests, notarizes the macOS app, verifies the package versions and checksums, and publishes and mirrors the release. Desktop preview publication requires explicit dispatch. [Stable workflow](../.github/workflows/desktop-release.yml) · [Preview workflow](../.github/workflows/desktop-preview.yml)
+A stable Desktop release starts when a maintainer pushes a reviewed `desktop-vX.Y.Z` tag matching the Desktop crate version and its committed `release-notes/desktop-vX.Y.Z.md`. CI builds both packages, runs the Linux smoke tests, notarizes the macOS app, verifies the package versions and checksums, and publishes and mirrors the release. To build a Desktop preview, manually run **preview** with product **desktop**. Set **publish_desktop** to publish the signed candidate. [Stable workflow](../.github/workflows/desktop-release.yml) · [Preview workflow](../.github/workflows/preview.yml)
 
 ## Where the files go
 
@@ -28,7 +28,7 @@ Rerun the installer to update Desktop. It stages the package on the destination 
 
 ## Gateway provisioning and startup
 
-The installer reuses an existing Gateway installation or service, including a stopped or externally managed installation. On a fresh computer it invokes the bundled official Gateway installer. Gateway selects and checks its own stable release. Setup requires an existing tmux or Herdr installation. Any persistent startup registration follows Gateway's own prompts and uses a user systemd unit on Linux or a LaunchAgent on macOS. Gateway setup errors leave the installed Desktop available. Resolve the reported prerequisite or installation error and retry. [Gateway installer](../install.sh) · [Standalone setup](../README.md)
+The installer reuses an existing Gateway installation or service, including a stopped or externally managed installation. On a fresh computer it invokes the bundled official Gateway installer. A stable Desktop package provisions a stable Gateway. A preview Desktop package provisions a preview Gateway. Each Gateway binary is independently verified before setup. Setup requires an existing tmux or Herdr installation. Any persistent startup registration follows Gateway's own prompts and uses a user systemd unit on Linux or a LaunchAgent on macOS. Gateway setup errors leave the installed Desktop available. Resolve the reported prerequisite or installation error and retry. [Gateway installer](../install.sh) · [Standalone setup](../README.md)
 
 The same Gateway-only entry point is bundled for direct app downloads. Desktop restores the selected paired computer first. On this computer it probes the Gateway's `local-client.json` and authenticated `GET /api/meta`. When the service is unavailable, the in-process backend supports local work without opening a network listener. For a fresh packaged install Desktop can provision the missing service in the background. Diagnostics shows its status, retry and connection actions. A running session can finish before the switch. `--without-gateway` persists the local-only preference in Desktop's config directory. An offline remote computer stays selected. [Desktop startup and preferences](../desktop/README.md)
 

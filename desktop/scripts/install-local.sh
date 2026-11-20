@@ -78,6 +78,11 @@ done
 installers="$PREFIX/share/$APP_ID/installers"
 mkdir -p "$installers"
 install -m 755 "$ROOT/install-desktop.sh" "$ROOT/install.sh" "$installers/"
+if [[ -f "$ROOT/VERSION" ]]; then
+  install -m 644 "$ROOT/VERSION" "$installers/VERSION"
+elif [[ -f "$ROOT/desktop/Cargo.toml" ]]; then
+  sed -n 's/^version = "\([^"]*\)"$/\1/p' "$ROOT/desktop/Cargo.toml" > "$installers/VERSION"
+fi
 install -m 755 "$ROOT/desktop/scripts/uninstall-local.sh" "$installers/"
 
 # Package files never overwrite the separate user plugins/ directory.

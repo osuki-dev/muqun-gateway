@@ -22,7 +22,7 @@ remove() {
   fi
 }
 
-for name in install-desktop.sh install.sh uninstall-local.sh; do
+for name in install-desktop.sh install.sh uninstall-local.sh VERSION; do
   remove "$PREFIX/share/$APP_ID/installers/$name"
 done
 

@@ -29,6 +29,7 @@ for size in 16 32 128 256 512; do
 done
 iconutil -c icns "$STAGE/AppIcon.iconset" -o "$RES/AppIcon.icns"
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT/desktop/Cargo.toml" | head -1)"
+printf '%s\n' "$VERSION" > "$RES/installers/VERSION"
 BUNDLE_VERSION="${VERSION%%-*}"
 BUILD_NUMBER="${VERSION##*-preview.}"
 if [[ "$VERSION" != *-preview.* ]]; then BUILD_NUMBER="$BUNDLE_VERSION"; fi

@@ -91,6 +91,7 @@ cp "$FIXTURES/$name" "$out"''',
                     app + "/Contents/Info.plist", plistlib.dumps({"CFBundleIdentifier": "com.muqun.desktop"})
                 )
                 z.writestr(app + "/Contents/Resources/installers/install.sh", self.helper)
+                z.writestr(app + "/Contents/Resources/installers/VERSION", v + "\n")
                 z.write(
                     ROOT / "install-desktop.sh", app + "/Contents/Resources/installers/install-desktop.sh"
                 )
@@ -114,6 +115,7 @@ cp "$FIXTURES/$name" "$out"''',
             )
             shutil.copy2(ROOT / "install-desktop.sh", linux)
             (linux / "install.sh").write_bytes(self.helper)
+            (linux / "VERSION").write_text(v + "\n")
             with tarfile.open(self.files / name, "w:gz") as tar:
                 tar.add(linux, arcname=linux.name)
         sha = hashlib.sha256((self.files / name).read_bytes()).hexdigest()
@@ -164,6 +166,11 @@ cp "$FIXTURES/$name" "$out"''',
         (self.files / asset).write_bytes(b"damaged")
         self.assertIn("Checksum", self.run_installer("--tag", PREVIEW, success=False).stderr)
         self.assertEqual((Path(self.env["PREFIX"]) / "bin/muqun-desktop").read_text(), "1.0.3-preview.12")
+
+    def test_first_preview_install_provisions_preview_gateway(self):
+        self.fixture(PREVIEW)
+        self.run_installer("--channel", "preview")
+        self.assertEqual((self.home / "gateway-invocations").read_text(), "--channel preview\n")
 
     def test_rejects_mismatched_channel_and_release_identity_before_install(self):
         self.fixture(STABLE)

@@ -55,8 +55,13 @@ USAGE
     [ -f "$0" ] || { echo "Run --gateway-only from the installed Desktop package." >&2; exit 1; }
     helper=$(dirname "$0")/install.sh
     [ -f "$helper" ] || { echo 'Gateway installer missing; use https://muqun.dev/gateway.sh' >&2; exit 1; }
-    echo 'Installing stable Gateway using its official installer.'
-    exec sh "$helper" --channel stable ;;
+    channel=stable
+    if [ -f "$(dirname "$helper")/VERSION" ]; then
+      IFS= read -r version < "$(dirname "$helper")/VERSION"
+      case "$version" in *-preview.*) channel=preview ;; esac
+    fi
+    echo "Installing $channel Gateway using its official installer."
+    exec sh "$helper" --channel "$channel" ;;
 esac
 command -v python3 >/dev/null || { echo 'Python 3 is required to read release metadata.' >&2; exit 1; }
 exec python3 -I - "$0" "$@" <<'PY'
