@@ -175,6 +175,26 @@ func activate(dest, txn, payload string, paths []string, system string) error {
 	return os.Remove(journal)
 }
 
+func verifyVersion(system, directory, version string) error {
+	marker := "share/muqun-desktop/installers/VERSION"
+	if system == "Darwin" {
+		marker = filepath.Join(macApp, "Contents/Resources/installers/VERSION")
+	}
+	f, err := os.Open(filepath.Join(directory, marker))
+	if err != nil {
+		return err
+	}
+	data, err := io.ReadAll(io.LimitReader(f, int64(len(version)+2)))
+	f.Close()
+	if err != nil {
+		return err
+	}
+	if string(data) != version+"\n" {
+		return fmt.Errorf("expected Desktop version %s", version)
+	}
+	return nil
+}
+
 func install(system, archive, dest, version string) (result error) {
 	full, err := filepath.Abs(dest)
 	if err != nil {
@@ -199,6 +219,11 @@ func install(system, archive, dest, version string) (result error) {
 	if err = recoverInstall(dest, txn); err != nil {
 		return err
 	}
+	if current := os.Getenv("MUQUN_DESKTOP_REPLACE_VERSION"); current != "" {
+		if err := verifyVersion(system, dest, current); err != nil {
+			return fmt.Errorf("Desktop installation changed since this update started: %w", err)
+		}
+	}
 	if err = os.Mkdir(txn, 0700); err != nil {
 		return err
 	}
@@ -211,21 +236,8 @@ func install(system, archive, dest, version string) (result error) {
 	if err != nil {
 		return err
 	}
-	marker := "share/muqun-desktop/installers/VERSION"
-	if system == "Darwin" {
-		marker = filepath.Join(macApp, "Contents/Resources/installers/VERSION")
-	}
-	f, err := os.Open(filepath.Join(payload, marker))
-	if err != nil {
-		return err
-	}
-	data, err := io.ReadAll(io.LimitReader(f, int64(len(version)+2)))
-	f.Close()
-	if err != nil {
-		return err
-	}
-	if string(data) != version+"\n" {
-		return errors.New("staged Desktop version differs from requested release")
+	if err := verifyVersion(system, payload, version); err != nil {
+		return fmt.Errorf("staged Desktop version differs from requested release: %w", err)
 	}
 	return activate(dest, txn, payload, paths, system)
 }

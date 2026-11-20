@@ -218,6 +218,16 @@ cp "$FIXTURES/$name" "$out"''',
         self.assertEqual(records[-1], "verify")
         self.assertNotIn("install", records)
 
+    def test_old_running_app_cannot_overwrite_a_newer_update(self):
+        self.fixture(STABLE)
+        self.run_installer("--tag", STABLE)
+        self.fixture(PREVIEW)
+        self.env["MUQUN_DESKTOP_REPLACE_VERSION"] = "1.0.2"
+        self.run_installer("--tag", PREVIEW)
+        result = self.run_installer("--tag", STABLE, success=False)
+        self.assertIn("installation changed", result.stderr)
+        self.assertEqual((Path(self.env["PREFIX"]) / "bin/muqun-desktop").read_text(), "1.0.3-preview.12")
+
     def test_mislabeled_verified_update_preserves_installed_version(self):
         self.fixture(STABLE)
         self.run_installer("--tag", STABLE)
