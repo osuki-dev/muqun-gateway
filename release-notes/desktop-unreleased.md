@@ -12,7 +12,7 @@
 
 ## Compatibility and installation
 
-Linux x86_64 and Apple Silicon macOS are supported. The Linux embedded browser needs WebKitGTK 4.1. The macOS archive contains a Developer ID signed, notarized and stapled application. Existing users can install the verified preview with:
+Linux x86_64 packages target the Ubuntu 24.04 glibc 2.39 baseline. macOS packages target Apple Silicon. The Linux embedded browser needs WebKitGTK 4.1. The macOS archive contains a Developer ID signed, notarized and stapled application. Existing users can install the verified preview with:
 
 ```sh
 curl -fsSL https://muqun.dev/desktop.sh | sh -s -- --channel preview
