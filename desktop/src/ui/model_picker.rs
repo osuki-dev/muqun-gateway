@@ -110,7 +110,7 @@ pub(super) fn popup(
     .map(|(p, id, _)| (p.clone(), id.clone()));
     let first_key = matches
         .peek()
-        .map(|(provider, id, _)| format!("model-option-{provider}-{id}"));
+        .map(|(provider, id, _)| format!("{key}-option-{provider}-{id}"));
     let select = move |s: &mut UiState, provider: String, id: String| {
         close(s);
         on_pick(s, provider, id);
@@ -165,7 +165,7 @@ pub(super) fn popup(
         let (provider, model, pick) = (p.clone(), id.clone(), select.clone());
         list = list.child(choice(
             k,
-            format!("model-option-{p}-{id}"),
+            format!("{key}-option-{p}-{id}"),
             name,
             on,
             move |s| pick(s, provider.clone(), model.clone()),
@@ -189,7 +189,7 @@ pub(super) fn popup(
             let value = level.cloned();
             list = list.child(choice(
                 k,
-                format!("model-effort-{}", level.map(String::as_str).unwrap_or("")),
+                format!("{key}-effort-{}", level.map(String::as_str).unwrap_or("")),
                 &label,
                 selected,
                 move |s| super::composer::switch_effort(s, super::Slot::Session, value.clone()),
@@ -256,8 +256,8 @@ mod tests {
         });
         rt.frame(0.4);
         assert_eq!(rt.state.model_query.text, "OTHER al");
-        assert!(rt.find("model-option-a-same").is_none());
-        assert!(rt.find("model-option-other-same").is_some());
+        assert!(rt.find("start-model-home-option-a-same").is_none());
+        assert!(rt.find("start-model-home-option-other-same").is_some());
         rt.key(KeyEvent {
             key: Key::Enter,
             mods: Mods::default(),
@@ -268,6 +268,6 @@ mod tests {
         rt.state.toggle_composer_menu(OpenMenu::StartModel);
         rt.invalidate();
         rt.frame(0.6);
-        assert!(rt.find("model-option-a-same").is_some());
+        assert!(rt.find("start-model-home-option-a-same").is_some());
     }
 }
