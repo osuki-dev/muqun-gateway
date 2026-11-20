@@ -170,10 +170,6 @@ fn begin(context: Arc<Context>, consent: bool) {
     });
 }
 
-fn path_present(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok() || path.try_exists().is_err()
-}
-
 pub(super) fn search_path() -> Vec<PathBuf> {
     let mut paths: Vec<_> = std::env::var_os("PATH")
         .map(|value| std::env::split_paths(&value).collect())
@@ -193,17 +189,30 @@ fn existing_evidence(
     home: Option<&Path>,
     config: Option<&Path>,
     data: Option<&Path>,
-) -> bool {
-    if paths.iter().any(|path| {
-        ["muqun-gateway", "herdr-gateway"]
-            .iter()
-            .any(|name| path_present(&path.join(name)))
-    }) {
-        return true;
-    }
+) -> std::io::Result<bool> {
     let mut evidence = Vec::new();
+    for path in paths {
+        evidence.extend([path.join("muqun-gateway"), path.join("herdr-gateway")]);
+    }
+    let mut configuration = Vec::new();
     for root in [config, data].into_iter().flatten() {
-        evidence.extend([root.join("muqun-gateway"), root.join("herdr-gateway")]);
+        configuration.extend([root.join("muqun-gateway"), root.join("herdr-gateway")]);
+    }
+    for name in [
+        "MUQUN_GATEWAY_CONFIG_DIR",
+        "MUQUN_GATEWAY_STATE_DIR",
+        "HERDR_PLUGIN_CONFIG_DIR",
+        "HERDR_PLUGIN_STATE_DIR",
+    ] {
+        if let Some(path) = std::env::var_os(name).filter(|value| !value.is_empty()) {
+            configuration.push(path.into());
+        }
+    }
+    for root in configuration {
+        evidence.extend([root.join("config.json"), root.join("local-client.json")]);
+    }
+    if let Some(path) = std::env::var_os("MUQUN_LOCAL_GATEWAY").filter(|value| !value.is_empty()) {
+        evidence.push(path.into());
     }
     if let Some(root) = config {
         evidence.push(root.join("systemd/user/dev.osuki.muqun-gateway.service"));
@@ -215,7 +224,15 @@ fn existing_evidence(
         PathBuf::from("/etc/systemd/system/dev.osuki.muqun-gateway.service"),
         PathBuf::from("/usr/lib/systemd/user/dev.osuki.muqun-gateway.service"),
     ]);
-    evidence.iter().any(|path| path_present(path))
+    for path in evidence {
+        match fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
 }
 
 fn running_gateway_named(pattern: &str) -> Option<bool> {
@@ -271,28 +288,27 @@ fn provision(context: &Context, consent: bool, deadline: Duration) -> Status {
     if context.cancel.load(Ordering::Acquire) {
         return Status::Interrupted;
     }
-    if [
-        "MUQUN_LOCAL_GATEWAY",
-        "MUQUN_GATEWAY_CONFIG_DIR",
-        "MUQUN_GATEWAY_STATE_DIR",
-        "MUQUN_GATEWAY_INSTALL_DIR",
-        "HERDR_PLUGIN_CONFIG_DIR",
-        "HERDR_PLUGIN_STATE_DIR",
-    ]
-    .iter()
-    .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+    let mut paths = search_path();
+    if let Some(bin) =
+        std::env::var_os("MUQUN_GATEWAY_INSTALL_DIR").filter(|value| !value.is_empty())
     {
-        return Status::Existing;
+        paths.push(bin.into());
     }
-    let paths = search_path();
-    if existing_evidence(
+    match existing_evidence(
         &paths,
         dirs::home_dir().as_deref(),
         dirs::config_dir().as_deref(),
         dirs::data_dir().as_deref(),
-    ) || super::coexist::detect(&super::coexist::gateway_state_dirs()).blocks_autostart()
-    {
-        return Status::Existing;
+    ) {
+        Ok(true) => return Status::Existing,
+        Err(_) => return Status::Failed,
+        Ok(false) => {}
+    }
+    use super::coexist::{self, GatewayPresence};
+    match coexist::detect(&coexist::gateway_state_dirs()) {
+        GatewayPresence::Running { .. } => return Status::Existing,
+        GatewayPresence::Unknown { .. } => return Status::Failed,
+        GatewayPresence::NotRunning => {}
     }
     match running_gateway_named("muqun-gateway|herdr-gateway") {
         Some(false) => {}
@@ -621,12 +637,14 @@ printf ' 100\nMUQUN_PROGRESS download 100 100\nMUQUN_PROGRESS verify\nMUQUN_PROG
         let config = fixture.root.join("config");
         let data = fixture.root.join("data");
         fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(data.join("muqun-gateway")).unwrap();
         assert!(!existing_evidence(
             std::slice::from_ref(&bin),
             Some(&fixture.root),
             Some(&config),
             Some(&data)
-        ));
+        )
+        .unwrap());
         let binary = bin.join("muqun-gateway");
         fs::write(&binary, "old or custom install").unwrap();
         assert!(existing_evidence(
@@ -634,7 +652,8 @@ printf ' 100\nMUQUN_PROGRESS download 100 100\nMUQUN_PROGRESS verify\nMUQUN_PROG
             Some(&fixture.root),
             Some(&config),
             Some(&data)
-        ));
+        )
+        .unwrap());
         fs::remove_file(binary).unwrap();
         fs::create_dir_all(config.join("systemd/user")).unwrap();
         fs::write(
@@ -647,7 +666,8 @@ printf ' 100\nMUQUN_PROGRESS download 100 100\nMUQUN_PROGRESS verify\nMUQUN_PROG
             Some(&fixture.root),
             Some(&config),
             Some(&data)
-        ));
+        )
+        .unwrap());
     }
 
     #[test]
