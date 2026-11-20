@@ -16,6 +16,22 @@ use rune_kit::{Button, ButtonVariant, Kit};
 
 impl UiState {
     pub(super) fn receive_desktop_update(&mut self, status: Status) {
+        if let Status::Available(version) = &status {
+            if self.cfg.general.announced_desktop_update.as_ref() != Some(version) {
+                self.edit(crate::config::ConfigEdit::AnnouncedDesktopUpdate(
+                    version.clone(),
+                ));
+                self.add_toast(
+                    ToastLevel::Info,
+                    format!(
+                        "{} {version}",
+                        tr_ref(self.cfg.general.language, "New version available:")
+                    ),
+                    Some("Muqun Desktop".to_owned()),
+                    Some("desktop-update".to_owned()),
+                );
+            }
+        }
         if !self.desktop_update_panel {
             let notice = match &status {
                 Status::Ready { .. } => {
@@ -201,4 +217,36 @@ pub(super) fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         }),
     }
     .mount(s, k, layer, UiState::hide_desktop_update);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{commands, inbox::UiAction};
+    use crate::ui::{Mode, SettingsTab};
+
+    #[test]
+    fn scheduled_checks_coalesce_and_announce_each_release_once() {
+        let (sender, mut commands) = commands::channel();
+        let mut ui = UiState::new(sender);
+        while commands.try_recv().is_ok() {}
+        ui.on_action(UiAction::CheckDesktopUpdateIfIdle);
+        ui.on_action(UiAction::CheckDesktopUpdateIfIdle);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::CheckDesktopUpdate)
+        ));
+        assert!(commands.try_recv().is_err());
+        ui.receive_desktop_update(Status::Available("1.1.0".into()));
+        assert_eq!(ui.mode, Mode::Home);
+        let first = ui.toasts.pop().unwrap().target.unwrap();
+        ui.receive_desktop_update(Status::Available("1.1.0".into()));
+        assert!(ui.toasts.is_empty());
+        ui.open_notification(&first);
+        assert_eq!(ui.mode, Mode::Settings);
+        assert_eq!(ui.settings_tab, SettingsTab::About);
+        ui.start_desktop_update();
+        ui.on_action(UiAction::CheckDesktopUpdateIfIdle);
+        assert!(matches!(ui.desktop_update, Status::Installing { .. }));
+    }
 }

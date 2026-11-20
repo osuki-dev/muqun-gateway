@@ -313,6 +313,8 @@ pub struct General {
     pub close_to_tray: bool,
     /// The first-run welcome was seen (or skipped).
     pub welcomed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub announced_desktop_update: Option<String>,
 }
 
 /// The draft key of the start page.
@@ -811,6 +813,7 @@ pub enum ConfigEdit {
     Shape(Shape),
     /// The first-run welcome was dismissed.
     Welcomed,
+    AnnouncedDesktopUpdate(String),
     ReducedMotion(bool),
     ReducedTransparency(bool),
     Notifications(bool),
@@ -918,6 +921,9 @@ impl DesktopConfig {
             ConfigEdit::Density(density) => self.appearance.density = density,
             ConfigEdit::TextScale(scale) => self.appearance.text_scale = scale,
             ConfigEdit::Shape(shape) => self.appearance.shape = shape,
+            ConfigEdit::AnnouncedDesktopUpdate(version) => {
+                self.general.announced_desktop_update = Some(version);
+            }
             ConfigEdit::Welcomed => self.general.welcomed = true,
             ConfigEdit::ReducedMotion(on) => self.appearance.reduced_motion = on,
             ConfigEdit::ReducedTransparency(on) => self.appearance.reduced_transparency = on,

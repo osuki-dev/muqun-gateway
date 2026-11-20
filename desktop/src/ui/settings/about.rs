@@ -14,7 +14,7 @@ use crate::ui::copy::{tr, tr_ref};
 use crate::ui::UiState;
 
 impl UiState {
-    pub(super) fn check_desktop_update(&mut self) {
+    pub(in crate::ui) fn check_desktop_update(&mut self) {
         if !matches!(
             self.desktop_update,
             Status::Checking | Status::Ready { .. } | Status::Installing { .. }

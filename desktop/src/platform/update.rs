@@ -39,6 +39,10 @@ pub fn is_preview_build() -> bool {
     INSTALLED.contains("-preview.")
 }
 
+pub fn installed_package() -> bool {
+    Package::current().is_ok()
+}
+
 pub async fn check() -> Status {
     match check_endpoint(RELEASE_API, INSTALLED).await {
         Ok(Status::Available(version)) if Package::current().is_err() => Status::Manual(version),

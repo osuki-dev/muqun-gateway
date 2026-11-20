@@ -1714,6 +1714,11 @@ impl UiState {
     }
 
     pub fn open_notification(&mut self, key: &str) {
+        if key == "desktop-update" {
+            self.go(Mode::Settings);
+            settings::open(self, SettingsTab::About);
+            return;
+        }
         if let Some(target) = key.strip_prefix("plugin:") {
             if let Ok((id, action)) = serde_json::from_str::<(String, String)>(target) {
                 if let Some(plugin) = self.plugins.get_enabled(&id, &self.cfg.plugins_disabled) {
@@ -3991,6 +3996,14 @@ impl UiState {
             UiAction::LocalPairingRevoked { id, result } => self.finish_local_revoke(id, result),
             UiAction::LocalInvite(id, result) => self.receive_local_invite(id, result),
             UiAction::DesktopRestartCheckpoint(saved) => self.restart_checkpoint_completed(saved),
+            UiAction::CheckDesktopUpdateIfIdle => {
+                if !matches!(
+                    self.desktop_update,
+                    crate::platform::update::Status::InstallFailed(_)
+                ) {
+                    self.check_desktop_update();
+                }
+            }
             UiAction::DesktopUpdate(status) => self.receive_desktop_update(status),
             UiAction::LocalPairings(devices) => {
                 self.local_revoke.cancel_confirmation();
