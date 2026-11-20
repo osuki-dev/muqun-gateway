@@ -775,7 +775,7 @@ impl Manifest {
         self.cover_asset(dark)
     }
 
-    fn cover_asset(&self, dark: bool) -> Option<&str> {
+    pub fn cover_asset(&self, dark: bool) -> Option<&str> {
         let artwork_hidden = self
             .home_identity
             .as_ref()
