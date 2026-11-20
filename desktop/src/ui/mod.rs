@@ -861,7 +861,7 @@ impl UiState {
             plugin_fields: HashMap::new(),
             diagnostic_filter: Default::default(),
             local_invite: None,
-            gateway_setup: None,
+            gateway_setup: gateway_setup::required(crate::platform::gateway_bootstrap::status()),
             desktop_update_panel: false,
             restart_checkpoint_pending: false,
             restart_on_frame: false,
@@ -1139,7 +1139,6 @@ impl UiState {
             && self.pending_start.is_none()
             && self.start_draft.text.trim().is_empty()
             && !self.term.open
-            && !self.cfg.general.gateway_local_only
     }
 
     pub fn computer_name(&self, id: &str) -> String {
@@ -4422,6 +4421,9 @@ pub fn activity_mark(
 use copy::tr;
 
 pub fn on_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if s.gateway_setup.is_some() {
+        return false;
+    }
     if keymap::dispatch(s, ev, tx) {
         return true;
     }
@@ -4466,6 +4468,18 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
         cx.reduced_motion(true);
     }
     let mut layer: Vec<El> = Vec::new();
+    if s.gateway_setup.is_some() {
+        gateway_setup::mount(s, &k, &mut layer);
+        let background = rune::el().w_full().h_full().linear_gradient(
+            0.8,
+            [
+                (0.0, k.c.bg_base),
+                (0.55, k.c.bg_base.mix(k.c.icon_accent, 0.035)),
+                (1.0, k.c.bg_base),
+            ],
+        );
+        return rune_kit::root(background, layer);
+    }
     let body = shell::view(s, cx, &k, &mut layer);
     viewer::image_overlay(s, &k, cx.env().scale, &mut layer);
     if let Some(selection) = s.row_menu.as_ref().and_then(|m| m.selection.as_ref()) {
@@ -4478,9 +4492,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
         );
     }
     parts::pane::row_menu(s, &k, &mut layer);
-    if s.gateway_setup.is_none() {
-        welcome::mount(s, &k, &mut layer);
-    }
+    welcome::mount(s, &k, &mut layer);
     if let (Some(splash), Some(images)) = (s.splash.as_ref(), s.images.as_ref()) {
         if let Some(stage) = splash.view(images, &k, &s.look(), scheme) {
             layer.push(stage);
@@ -4489,11 +4501,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     palette::mount(s, &k, &mut layer);
     shortcuts::mount(s, &k, &mut layer);
     pair_computer::mount(s, &k, &mut layer);
-    if s.gateway_setup.is_some() {
-        gateway_setup::mount(s, &k, &mut layer);
-    } else {
-        desktop_update::mount(s, &k, &mut layer);
-    }
+    desktop_update::mount(s, &k, &mut layer);
     if s.error.is_some() || !s.toasts.is_empty() {
         layer.push(notifications::region(s, &k));
     }
@@ -5214,7 +5222,6 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut s = UiState::new(tx);
         s.cfg.current_computer = "local".into();
-        s.cfg.general.gateway_local_only = false;
         s.selected = None;
         s.tiles.clear();
         s.busy_since.clear();

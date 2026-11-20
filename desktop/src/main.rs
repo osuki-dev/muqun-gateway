@@ -189,7 +189,7 @@ fn main() -> anyhow::Result<()> {
     // icon is up to come back through; otherwise it quits as before.
     .keep_running()
     .on_close(|s, tx| {
-        if !(s.cfg.general.close_to_tray && platform::tray::active()) {
+        if s.gateway_setup.is_some() || !(s.cfg.general.close_to_tray && platform::tray::active()) {
             tx.quit();
         }
     });
