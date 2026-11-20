@@ -18,6 +18,15 @@ PREVIEW = "desktop-v1.0.3-preview.12"
 
 
 class DesktopInstaller(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        directory = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(directory.cleanup)
+        cls.native = Path(directory.name) / "muqun-desktop-install"
+        subprocess.run(["go", "build", "-trimpath", "-ldflags=-s -w", "-o", cls.native,
+                        *sorted((ROOT / "desktop/installer").glob("*.go"))], check=True,
+                       env={**os.environ, "CGO_ENABLED": "0"})
+
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -43,7 +52,7 @@ class DesktopInstaller(unittest.TestCase):
             "sh",
             "id",
             "tar",
-            "python3",
+            "awk", "wc", "mktemp", "rm", "sha256sum", "unzip", "touch",
             "gzip",
             "cp",
             "mkdir",
@@ -60,20 +69,21 @@ class DesktopInstaller(unittest.TestCase):
             self.bin.joinpath(name).symlink_to(shutil.which(name))
         self.bin.joinpath("pgrep").unlink()
         self.command("pgrep", "exit 1")
+        self.command("tmux", "exit 0")
         self.command("uname", 'case "$1" in -s) echo "$TEST_OS";; -m) echo "$TEST_ARCH";; esac')
         self.command(
             "curl",
             '''while [ "$1" != "-o" ]; do shift; done
 out=$2; url=$3
 case "$url" in
- https://muqun.dev/api/releases/desktop/*/manifest.json) dir=${url%/*}; name=${dir##*/}.json;;
+ https://muqun.dev/api/releases/desktop/*/version) dir=${url%/*}; name=${dir##*/};;
  https://muqun.dev/api/releases/desktop/*) name=${url##*/};;
  *) exit 1;;
 esac
 cp "$FIXTURES/$name" "$out"''',
         )
         for channel in ("stable", "preview"):
-            (self.files / channel).write_text(json.dumps({"channel": channel, "version": None}))
+            (self.files / channel).write_text("")
         self.helper = b'echo "$*" >> "$HOME/gateway-invocations"\nexit "${GATEWAY_EXIT:-0}"\n'
 
     def command(self, name, body):
@@ -81,7 +91,7 @@ cp "$FIXTURES/$name" "$out"''',
         path.write_text("#!/bin/sh\n" + body + "\n")
         path.chmod(0o755)
 
-    def fixture(self, tag, mac=False):
+    def fixture(self, tag, mac=False, desktop_executable=None):
         v = tag.removeprefix("desktop-v")
         app = "Muqun Desktop.app"
         if mac:
@@ -91,6 +101,7 @@ cp "$FIXTURES/$name" "$out"''',
                     app + "/Contents/Info.plist", plistlib.dumps({"CFBundleIdentifier": "com.muqun.desktop"})
                 )
                 z.writestr(app + "/Contents/Resources/installers/install.sh", self.helper)
+                z.write(self.native, app + "/Contents/Helpers/muqun-desktop-install")
                 z.writestr(app + "/Contents/Resources/installers/VERSION", v + "\n")
                 z.write(
                     ROOT / "install-desktop.sh", app + "/Contents/Resources/installers/install-desktop.sh"
@@ -101,9 +112,10 @@ cp "$FIXTURES/$name" "$out"''',
             build = self.root / ("package-" + v)
             linux = build / "muqun-desktop-linux-x86_64"
             (linux / "bin").mkdir(parents=True)
+            shutil.copy2(self.native, linux / "bin/muqun-desktop-install")
             for exe in ["muqun-desktop", "muqun-wry-embedded"]:
                 file = linux / "bin" / exe
-                file.write_text(v)
+                file.write_text(desktop_executable if exe == "muqun-desktop" and desktop_executable else v)
                 file.chmod(0o755)
             for folder in ["desktop/scripts", "desktop/packaging", "desktop/assets/plugins"]:
                 (linux / folder).mkdir(parents=True)
@@ -121,18 +133,21 @@ cp "$FIXTURES/$name" "$out"''',
         sha = hashlib.sha256((self.files / name).read_bytes()).hexdigest()
         (self.files / (name + ".sha256")).write_text(f"{sha}  {name}\n")
         channel = "preview" if "-preview." in tag else "stable"
-        assets = []
+        self.write_metadata(name)
+        (self.files / channel).write_text(v + "\n")
+        return name
+
+    def write_metadata(self, name):
+        fields = []
         for filename in (name, name + ".sha256"):
             data = (self.files / filename).read_bytes()
-            assets.append({"name": filename, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
-        manifest = {"channel": channel, "version": v, "tag": tag, "assets": assets}
-        (self.files / (tag + ".json")).write_text(json.dumps(manifest))
-        (self.files / channel).write_text(json.dumps({"channel": channel, "version": v}))
-        return name
+            fields.extend([str(len(data)), hashlib.sha256(data).hexdigest()])
+        (self.files / (name + ".metadata")).write_text(" ".join(fields) + "\n")
 
     def run_installer(self, *flags, success=True):
         result = subprocess.run(
-            ["/bin/sh", ROOT / "install-desktop.sh", *flags],
+            ["/bin/sh", "-s", "--", *flags],
+            input=(ROOT / "install-desktop.sh").read_text(),
             env=self.env,
             capture_output=True,
             text=True,
@@ -149,10 +164,10 @@ cp "$FIXTURES/$name" "$out"''',
         self.assertIn(
             str(dest / "bin/muqun-desktop"), (dest / "share/applications/muqun-desktop.desktop").read_text()
         )
-        self.assertEqual((self.home / "gateway-invocations").read_text(), "--channel stable\n")
+        self.assertEqual((self.home / "gateway-invocations").read_text(), "--channel stable --desktop-terminal\n")
         self.command("muqun-gateway", "exit 99")
         self.run_installer("--tag", STABLE)
-        self.assertEqual((self.home / "gateway-invocations").read_text(), "--channel stable\n")
+        self.assertEqual((self.home / "gateway-invocations").read_text(), "--channel stable --desktop-terminal\n")
 
     def test_channel_opt_out_and_integrity(self):
         asset = self.fixture(PREVIEW)
@@ -168,31 +183,40 @@ cp "$FIXTURES/$name" "$out"''',
         self.assertEqual((Path(self.env["PREFIX"]) / "bin/muqun-desktop").read_text(), "1.0.3-preview.12")
 
     def test_first_preview_install_provisions_preview_gateway(self):
-        self.fixture(PREVIEW)
+        (self.bin / "tmux").unlink()
+        self.fixture(PREVIEW, desktop_executable='#!/bin/sh\necho "$1" >> "$HOME/desktop-starts"\n')
         self.run_installer("--channel", "preview")
-        self.assertEqual((self.home / "gateway-invocations").read_text(), "--channel preview\n")
+        self.assertEqual((self.home / "desktop-starts").read_text(), "--ensure-term-daemon\n")
+        self.assertEqual((self.home / "gateway-invocations").read_text(), "--channel preview --desktop-terminal\n")
+        self.command("muqun-gateway", "exit 99")
+        self.run_installer("--tag", PREVIEW)
+        self.assertEqual((self.home / "desktop-starts").read_text(), "--ensure-term-daemon\n")
 
-    def test_rejects_mismatched_channel_and_release_identity_before_install(self):
-        self.fixture(STABLE)
-        (self.files / "stable").write_text(json.dumps({"channel": "preview", "version": "1.0.2"}))
+    def test_archive_with_external_link_fails_before_install(self):
+        name = self.fixture(STABLE)
+        root = self.root / "package-1.0.2" / "muqun-desktop-linux-x86_64"
+        (root / "outside").symlink_to(self.home)
+        archive = self.files / name
+        with tarfile.open(archive, "w:gz") as tar:
+            tar.add(root, arcname=root.name)
+        (self.files / (name + ".sha256")).write_text(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {name}\n")
+        self.write_metadata(name)
+        self.assertIn("unexpected Linux archive entry", self.run_installer(success=False).stderr)
+        self.assertFalse((Path(self.env["PREFIX"]) / "bin/muqun-desktop").exists())
+
+    def test_rejects_mismatched_channel_and_invalid_metadata_before_install(self):
+        name = self.fixture(STABLE)
+        (self.files / "stable").write_text("1.0.3-preview.12\n")
         self.run_installer(success=False)
-        path = self.files / (STABLE + ".json")
-        manifest = json.loads(path.read_bytes())
-        manifest["tag"] = PREVIEW
-        path.write_text(json.dumps(manifest))
+        (self.files / (name + ".metadata")).write_text("missing digest\n")
         self.run_installer("--tag", STABLE, success=False)
         self.assertFalse((Path(self.env["PREFIX"]) / "bin/muqun-desktop").exists())
 
     def test_rejects_sidecar_disagreeing_with_hash_in_version_manifest(self):
         name = self.fixture(STABLE)
-        path = self.files / (STABLE + ".json")
-        manifest = json.loads(path.read_bytes())
         side = self.files / (name + ".sha256")
         side.write_text("0" * 64 + "  " + name + "\n")
-        for asset in manifest["assets"]:
-            if asset["name"] == side.name:
-                asset["sha256"] = hashlib.sha256(side.read_bytes()).hexdigest()
-        path.write_text(json.dumps(manifest))
+        self.write_metadata(name)
         self.assertIn("Checksum", self.run_installer("--tag", STABLE, success=False).stderr)
         self.assertFalse((Path(self.env["PREFIX"]) / "bin/muqun-desktop").exists())
 
@@ -227,13 +251,14 @@ cp "$FIXTURES/$name" "$out"''',
     def test_macos_verifies_bundle_before_replacing(self):
         self.env.update(TEST_OS="Darwin", TEST_ARCH="arm64")
         self.fixture(STABLE, mac=True)
-        self.command("ditto", 'python3 -m zipfile -e "$3" "$4"')
+        self.command("ditto", 'unzip -q "$3" -d "$4"')
+        self.command("plutil", "echo com.muqun.desktop")
         self.command("codesign", 'echo verify >> "$HOME/mac-checks"')
         self.command("spctl", 'echo assess >> "$HOME/mac-checks"; exit "${ASSESS_EXIT:-0}"')
         self.run_installer()
         app = self.home / "Applications/Muqun Desktop.app"
         self.assertEqual((self.home / "mac-checks").read_text(), "verify\nassess\n")
-        self.assertEqual((self.home / "gateway-invocations").read_text(), "--channel stable\n")
+        self.assertEqual((self.home / "gateway-invocations").read_text(), "--channel stable --desktop-terminal\n")
         self.fixture(PREVIEW, mac=True)
         self.env["ASSESS_EXIT"] = "1"
         self.run_installer("--tag", PREVIEW, success=False)
@@ -244,10 +269,9 @@ cp "$FIXTURES/$name" "$out"''',
         directory.mkdir()
         shutil.copy2(ROOT / "install-desktop.sh", directory)
         (directory / "install.sh").write_bytes(self.helper)
-        self.bin.joinpath("python3").unlink()
         subprocess.run(["sh", directory / "install-desktop.sh", "--gateway-only"], env=self.env,
                        check=True, capture_output=True)
-        self.assertEqual((self.home / "gateway-invocations").read_text(), "--channel stable\n")
+        self.assertEqual((self.home / "gateway-invocations").read_text(), "--channel stable --desktop-terminal\n")
 
     def test_incomplete_gateway_keeps_desktop_and_allows_manual_retry(self):
         self.fixture(STABLE)

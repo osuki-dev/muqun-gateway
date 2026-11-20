@@ -8,8 +8,8 @@ Usage: sh install-desktop.sh [--channel stable|preview] [--tag desktop-vVERSION]
        sh /path/to/packaged/install-desktop.sh --gateway-only
 
 Install a released Linux x86_64 or macOS arm64 Desktop package. The default
-channel is stable. A release download requires Python 3 and curl. Gateway
-provisioning alone uses the packaged shell installer and requires Herdr or tmux.
+channel is stable. A release download uses curl and the system archive and checksum tools. Gateway
+provisioning uses the packaged shell installer and the Desktop terminal backend.
 USAGE
     exit 0 ;;
   --gateway-only)
@@ -55,291 +55,119 @@ USAGE
     [ -f "$0" ] || { echo "Run --gateway-only from the installed Desktop package." >&2; exit 1; }
     helper=$(dirname "$0")/install.sh
     [ -f "$helper" ] || { echo 'Gateway installer missing; use https://muqun.dev/gateway.sh' >&2; exit 1; }
+    if ! command -v tmux >/dev/null 2>&1 && ! command -v herdr >/dev/null 2>&1; then
+      installers=$(dirname "$helper")
+      case "$(uname -s)" in
+        Linux)
+          desktop="$installers/../../../bin/muqun-desktop"
+          [ ! -x "$installers/bin/muqun-desktop" ] || desktop="$installers/bin/muqun-desktop" ;;
+        Darwin) desktop="$installers/../../MacOS/muqun-desktop" ;;
+      esac
+      "$desktop" --ensure-term-daemon
+    fi
     channel=stable
     if [ -f "$(dirname "$helper")/VERSION" ]; then
       IFS= read -r version < "$(dirname "$helper")/VERSION"
       case "$version" in *-preview.*) channel=preview ;; esac
     fi
     echo "Installing $channel Gateway using its official installer."
-    exec sh "$helper" --channel "$channel" ;;
+    exec sh "$helper" --channel "$channel" --desktop-terminal ;;
 esac
-command -v python3 >/dev/null || { echo 'Python 3 is required to read release metadata.' >&2; exit 1; }
-exec python3 -I - "$0" "$@" <<'PY'
-import argparse, fcntl, hashlib, json, os, plistlib, re, subprocess, sys, tarfile, tempfile, zipfile
-from pathlib import Path, PurePosixPath
-
-api = "https://muqun.dev/api/releases/desktop"
-pattern = re.compile(
-    r"desktop-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-preview\.([1-9][0-9]*))?"
-)
-parser = argparse.ArgumentParser(prog="install-desktop.sh")
-parser.add_argument("--channel", choices=["stable", "preview"], help="Desktop channel (default: stable)")
-parser.add_argument("--tag", help="Exact Desktop release tag")
-parser.add_argument(
-    "--without-gateway", action="store_true", help="Keep this computer local-only or use a remote Gateway"
-)
-args = parser.parse_args(sys.argv[2:])
-home = Path.home()
-system = subprocess.check_output(["uname", "-s"], text=True).strip()
-
-
-def envpath(key, default):
-    return Path(os.environ.get(key) or default)
-
-
-def fetch(url, path, limit):
-    subprocess.run(
-        [
-            "curl",
-            "-fsSL",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--retry",
-            "2",
-            "--connect-timeout",
-            "15",
-            "--max-time",
-            "300",
-            "--max-filesize",
-            str(limit),
-            "-o",
-            str(path),
-            url,
-        ],
-        check=True,
-    )
-    if path.stat().st_size > limit:
-        raise ValueError("Download exceeds its expected size")
-
-
-def release(temp):
-    channel = args.channel or "stable"
-    if args.tag:
-        m = pattern.fullmatch(args.tag)
-        if not m:
-            raise ValueError("Expected a desktop-vX.Y.Z or desktop-vX.Y.Z-preview.N tag")
-        channel = "preview" if m[4] else "stable"
-        if args.channel and args.channel != channel:
-            raise ValueError("Tag and channel disagree")
-    meta = temp / "metadata"
-    tag = args.tag
-    if not tag:
-        fetch(f"{api}/{channel}", meta, 64 * 1024)
-        latest = json.loads(meta.read_bytes())
-        if latest.get("channel") != channel or "version" not in latest:
-            raise ValueError("Unexpected Desktop channel metadata")
-        if latest["version"] is None:
-            raise ValueError(f"No published {channel} Desktop release")
-        tag = "desktop-v" + latest["version"]
-    version = pattern.fullmatch(tag)
-    if not version or bool(version[4]) != (channel == "preview"):
-        raise ValueError("Desktop version and channel disagree")
-    fetch(f"{api}/{tag}/manifest.json", meta, 64 * 1024)
-    manifest = json.loads(meta.read_bytes())
-    if (manifest.get("tag"), manifest.get("channel"), manifest.get("version")) != (tag, channel, tag[9:]):
-        raise ValueError("Desktop release manifest does not match requested version")
-    name = (
-        "muqun-desktop-linux-x86_64.tar.gz"
-        if system == "Linux"
-        else f"muqun-desktop-{tag[9:]}-macos-arm64.zip"
-    )
-    for filename in (name, name + ".sha256"):
-        entries = [a for a in manifest["assets"] if a.get("name") == filename]
-        if len(entries) != 1:
-            raise ValueError(f"{tag} must list exactly one {filename}")
-        asset = entries[0]
-        size = asset.get("size")
-        sha = asset.get("sha256")
-        limit = 512 * 1024**2 if filename == name else 1024
-        if type(size) is not int or not 0 < size <= limit or not isinstance(sha, str) or not re.fullmatch(r"[a-f0-9]{64}", sha):
-            raise ValueError(f"Invalid size or SHA-256 for {filename}")
-        path = temp / filename
-        fetch(f"{api}/{tag}/{filename}", path, size)
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-        actual = digest.hexdigest()
-        if path.stat().st_size != size or actual != sha:
-            raise ValueError(f"Checksum or size verification failed for {filename}")
-        if filename == name:
-            archive_hash = actual
-    expected = re.fullmatch(
-        r"([0-9a-fA-F]{64}) [ *]" + re.escape(name) + r"\n?", (temp / (name + ".sha256")).read_text("ascii")
-    )
-    if not expected or expected[1].lower() != archive_hash:
-        raise ValueError(f"Checksum verification failed for {name}")
-    print(f"{tag}  {name}  SHA-256 verified: {archive_hash}", flush=True)
-    return tag, temp / name
-
-
-def validate(names, roots):
-    for name in names:
-        path = PurePosixPath(name)
-        if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] not in roots:
-            raise ValueError(f"Unexpected package path: {name!r}")
-
-
-def stage(temp, archive, payload, dest):
-    if system == "Linux":
-        package = "muqun-desktop-linux-x86_64"
-        with tarfile.open(archive, "r:gz") as stream:
-            members = stream.getmembers()
-            validate((m.name for m in members), [package])
-            if any(not (m.isfile() or m.isdir()) for m in members):
-                raise ValueError("Unexpected Linux archive entry type")
-        subprocess.run(["tar", "-xzf", str(archive), "-C", str(temp)], check=True)
-        subprocess.run(
-            ["bash", str(temp / package / "desktop/scripts/install-local.sh"), "--no-build"],
-            check=True,
-            env={**os.environ, "PREFIX": str(payload), "MUQUN_DESKTOP_LAUNCH_PREFIX": str(dest)},
-        )
-        if not (payload / "bin/muqun-desktop").is_file():
-            raise ValueError("Packaged installer did not install Desktop")
-        launcher = payload / "share/applications/muqun-desktop.desktop"
-        if str(payload) in launcher.read_text():
-            raise ValueError(
-                "This Linux package predates staged installation. Use its included install-local.sh --no-build."
-            )
-        return [
-            p.relative_to(payload)
-            for p in payload.rglob("*")
-            if p.is_file() and p.name not in ("mimeinfo.cache", "icon-theme.cache")
-        ]
-    app = Path("Muqun Desktop.app")
-    with zipfile.ZipFile(archive) as z:
-        validate(z.namelist(), [str(app), "__MACOSX"])
-        if any((m.external_attr >> 16) & 0o170000 == 0o120000 for m in z.infolist()):
-            raise ValueError("Unexpected symbolic link in app ZIP")
-    subprocess.run(["ditto", "-x", "-k", str(archive), str(payload)], check=True)
-    for bundle in (payload / app, dest / app):
-        if bundle == dest / app and not os.path.lexists(bundle):
-            continue
-        with (bundle / "Contents/Info.plist").open("rb") as f:
-            if bundle.is_symlink() or plistlib.load(f).get("CFBundleIdentifier") != "com.muqun.desktop":
-                raise ValueError(f"Unexpected app identity at {bundle}")
-    subprocess.run(["codesign", "--verify", "--deep", "--strict", str(payload / app)], check=True)
-    subprocess.run(["spctl", "--assess", "--type", "execute", str(payload / app)], check=True)
-    return [app]
-
-
-def retire(path):
-    # Move an installer-owned object aside before deleting its temporary container.
-    with tempfile.TemporaryDirectory(prefix=".muqun-clean-", dir=path.parent) as garbage:
-        path.rename(Path(garbage) / "discard")
-
-
-def recover(dest, txn):
-    journal = txn / "journal.json"
-    if not txn.exists():
-        return
-    if txn.is_symlink() or not txn.is_dir():
-        raise ValueError(f"Unexpected staging path: {txn}")
-    if journal.exists():
-        for rel, existed in reversed(json.loads(journal.read_bytes())):
-            relative = Path(rel)
-            if relative.is_absolute() or ".." in relative.parts or not relative.parts:
-                raise ValueError("Invalid recovery journal")
-            old, current = txn / "old" / rel, dest / rel
-            if os.path.lexists(old):
-                if os.path.lexists(current):
-                    retire(current)
-                old.rename(current)
-            elif not existed and os.path.lexists(current):
-                retire(current)
-    if txn.exists():
-        retire(txn)
-
-
-def install(temp, archive, dest):
-    dest.mkdir(parents=True, exist_ok=True)
-    txn = dest / ".muqun-desktop-install"
-    with (dest / ".muqun-desktop-install.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        recover(dest, txn)
-        txn.mkdir(mode=0o700)
-        payload = txn / "payload"
-        payload.mkdir()
-        try:
-            entries = stage(temp, archive, payload, dest)
-            for rel in entries:
-                target = dest / rel
-                if os.path.commonpath((dest.resolve(), target.parent.resolve())) != str(dest.resolve()):
-                    raise ValueError(f"Package destination points outside the installation: {target}")
-                if target.is_dir() and not (system == "Darwin" and rel == Path("Muqun Desktop.app")):
-                    raise ValueError(f"Expected a file at {target}")
-            plan = [(str(rel), os.path.lexists(dest / rel)) for rel in entries]
-            pending = txn / "journal.tmp"
-            with pending.open("w") as file:
-                json.dump(plan, file)
-                file.flush()
-                os.fsync(file.fileno())
-            pending.rename(txn / "journal.json")
-            for rel, existed in plan:
-                current = dest / rel
-                current.parent.mkdir(parents=True, exist_ok=True)
-                if existed:
-                    old = txn / "old" / rel
-                    old.parent.mkdir(parents=True, exist_ok=True)
-                    current.rename(old)
-                (payload / rel).rename(current)
-            (txn / "journal.json").unlink()
-        finally:
-            recover(dest, txn)
-
-
-def main():
-    if system not in ("Linux", "Darwin"):
-        raise ValueError(f"Unsupported OS: {system}")
-    arch = subprocess.check_output(["uname", "-m"], text=True).strip()
-    if (system, arch) not in [("Linux", "x86_64"), ("Darwin", "arm64")]:
-        raise ValueError(f"No Desktop release target for {system} {arch}")
-    if system == "Linux":
-        dest = envpath("PREFIX", home / ".local").absolute()
-        helper = dest / "share/muqun-desktop/installers/install-desktop.sh"
-        config = envpath("XDG_CONFIG_HOME", home / ".config")
-    else:
-        existing = Path("/Applications/Muqun Desktop.app")
-        dest = envpath(
-            "MUQUN_DESKTOP_APPLICATIONS_DIR", existing.parent if existing.exists() else home / "Applications"
-        ).absolute()
-        helper = dest / "Muqun Desktop.app/Contents/Resources/installers/install-desktop.sh"
-        config = home / "Library/Application Support"
-    with tempfile.TemporaryDirectory(prefix="muqun-desktop-") as tmp:
-        temp = Path(tmp)
-        tag, archive = release(temp)
-        install(temp, archive, dest)
-        print(f"Installed Muqun Desktop {tag} under {dest}.", flush=True)
-        if args.without_gateway:
-            marker = config / "muqun-desktop/gateway-auto-install.disabled"
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.touch(mode=0o600)
-        elif (config / "muqun-desktop/gateway-auto-install.disabled").exists():
-            print("Keeping your local-only Gateway preference.")
-        else:
-            try:
-                if not helper.is_file():
-                    raise ValueError("Packaged Gateway installer missing; use https://muqun.dev/gateway.sh")
-                subprocess.run(["sh", str(helper), "--gateway-only"], check=True)
-            except (OSError, ValueError, subprocess.SubprocessError) as error:
-                raise ValueError(
-                    "Desktop is installed. Fix the reported Gateway prerequisite, then retry --gateway-only. "
-                    "If setup already installed the Gateway binary, finish with muqun-gateway setup and "
-                    f"muqun-gateway start. {error}"
-                ) from error
-
-
-try:
-    main()
-except (
-    OSError,
-    KeyError,
-    ValueError,
-    subprocess.SubprocessError,
-    tarfile.TarError,
-    zipfile.BadZipFile,
-) as error:
-    sys.exit(f"Muqun installer: {error}")
-PY
+die() { printf 'Muqun installer: %s\n' "$*" >&2; exit 1; }
+api=https://muqun.dev/api/releases/desktop
+channel=
+tag=
+without_gateway=false
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --channel) [ "$#" -ge 2 ] || die 'Expected a channel'; channel=$2; shift 2
+      case "$channel" in stable|preview) ;; *) die 'Expected stable or preview';; esac ;;
+    --tag) [ "$#" -ge 2 ] || die 'Expected a Desktop tag'; tag=$2; shift 2
+      [ -n "$tag" ] || die 'Expected a Desktop tag' ;;
+    --without-gateway) without_gateway=true; shift ;;
+    *) die "Unknown argument: $1" ;;
+  esac
+done
+system=$(uname -s)
+case "$system/$(uname -m)" in
+  Linux/x86_64) dest=${PREFIX:-"$HOME/.local"}; config=${XDG_CONFIG_HOME:-"$HOME/.config"}
+    helper="$dest/share/muqun-desktop/installers/install-desktop.sh" ;;
+  Darwin/arm64) dest="$HOME/Applications"
+    [ ! -e '/Applications/Muqun Desktop.app' ] || dest=/Applications
+    dest=${MUQUN_DESKTOP_APPLICATIONS_DIR:-"$dest"}; config="$HOME/Library/Application Support"
+    helper="$dest/Muqun Desktop.app/Contents/Resources/installers/install-desktop.sh" ;;
+  *) die "Unsupported Desktop platform: $system $(uname -m)" ;;
+esac
+umask 077
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/muqun-desktop.XXXXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 1' HUP INT TERM
+fetch() {
+  curl -fsSL --proto '=https' --proto-redir '=https' --retry 2 --connect-timeout 15 \
+    --max-time 300 --max-filesize "$3" -o "$2" "$1" || die "Cannot download $1"
+  [ "$(wc -c < "$2")" -le "$3" ] || die "Download exceeds size limit: $1"
+}
+if [ -z "$tag" ]; then
+  channel=${channel:-stable}
+  fetch "$api/$channel/version" "$tmp/version" 256
+  tag="desktop-v$(cat "$tmp/version")"
+fi
+# Only a concrete, normalized tag reaches the download URL.
+if ! LC_ALL=C awk -v tag="$tag" 'BEGIN {
+  n="(0|[1-9][0-9]*)"; exit !(tag ~ ("^desktop-v" n "[.]" n "[.]" n "(-preview[.][1-9][0-9]*)?$"))
+}'; then die 'Invalid Desktop version'; fi
+case "$tag" in *-preview.*) lane=preview ;; *) lane=stable ;; esac
+[ "${channel:-$lane}" = "$lane" ] || die 'Tag and channel disagree'
+case "$system" in
+  Linux) archive=muqun-desktop-linux-x86_64.tar.gz ;;
+  Darwin) archive="muqun-desktop-${tag#desktop-v}-macos-arm64.zip" ;;
+esac
+base="$api/$tag"
+fetch "$base/$archive.metadata" "$tmp/metadata" 512
+# The Worker projects these fields from the tagged manifest. Validate its
+# fixed grammar before passing sizes to curl or comparing the two digests.
+LC_ALL=C awk '
+  NR != 1 || NF != 4 || $1 !~ /^[1-9][0-9]*$/ || $1 > 536870912 ||
+    $3 !~ /^[1-9][0-9]*$/ || $3 > 1024 ||
+    $2 !~ /^[a-f0-9]+$/ || length($2) != 64 ||
+    $4 !~ /^[a-f0-9]+$/ || length($4) != 64 {bad=1}
+  END {exit !(NR == 1 && !bad)}' "$tmp/metadata" || die 'Invalid Desktop release metadata'
+IFS=' ' read -r bytes digest checksum_bytes checksum_digest < "$tmp/metadata"
+if command -v sha256sum >/dev/null 2>&1; then
+  hash() { sha256sum < "$1"; }
+else
+  hash() { shasum -a 256 < "$1"; }
+fi
+verify() {
+  size=$(wc -c < "$1")
+  measured=$(hash "$1") || die "Checksum tool failed for $1"
+  measured=${measured%% *}
+  [ "$size" -eq "$2" ] && [ "$measured" = "$3" ] || die "Checksum or size verification failed for $1"
+}
+fetch "$base/$archive.sha256" "$tmp/checksum" "$checksum_bytes"
+verify "$tmp/checksum" "$checksum_bytes" "$checksum_digest"
+LC_ALL=C awk -v digest="$digest" -v file="$archive" '
+  NR != 1 || NF != 2 || tolower($1) != digest || ($2 != file && $2 != "*" file) {bad=1}
+  END {exit !(NR == 1 && !bad)}' "$tmp/checksum" || die "Checksum verification failed for $archive"
+fetch "$base/$archive" "$tmp/$archive" "$bytes"
+verify "$tmp/$archive" "$bytes" "$digest"
+printf '%s  %s  SHA-256 verified: %s\n' "$tag" "$archive" "$measured"
+# Extract only the installer executable to a private file. The verified
+# executable validates all archive members before staging the package.
+if [ "$system" = Linux ]; then
+  tar -xzOf "$tmp/$archive" muqun-desktop-linux-x86_64/bin/muqun-desktop-install > "$tmp/install"
+else
+  unzip -p "$tmp/$archive" 'Muqun Desktop.app/Contents/Helpers/muqun-desktop-install' > "$tmp/install"
+fi
+chmod 700 "$tmp/install"
+"$tmp/install" "$system" "$tmp/$archive" "$dest"
+printf 'Installed Muqun Desktop %s under %s.\n' "$tag" "$dest"
+marker="$config/muqun-desktop/gateway-auto-install.disabled"
+if [ "$without_gateway" = true ]; then
+  mkdir -p "$(dirname "$marker")"
+  touch "$marker"
+elif [ -f "$marker" ]; then
+  echo 'Keeping your local-only Gateway preference.'
+elif ! sh "$helper" --gateway-only; then
+  die 'Desktop is installed. Fix the reported Gateway prerequisite, then retry --gateway-only.'
+fi

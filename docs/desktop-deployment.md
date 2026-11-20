@@ -2,7 +2,7 @@
 
 ## Install a published Desktop package
 
-Use the official installer on Linux x86_64 or Apple silicon macOS. It reads the release manifest from muqun.dev and verifies the package size, SHA-256 digest and companion checksum before installation. macOS also verifies the app's code signature and Gatekeeper assessment. The full installer needs Python 3 and curl. The bundled Gateway-only entry point uses the system shell.
+Use the official installer on Linux x86_64 or Apple silicon macOS. It reads the release manifest from muqun.dev and verifies the package size, SHA-256 digest and companion checksum before installation. macOS also verifies the app's code signature and Gatekeeper assessment. The installer uses curl and the platform archive and SHA-256 tools. Each package includes its native installer helper for staging, locking and rollback.
 
 ```sh
 curl -fsSL https://muqun.dev/desktop.sh | sh  # Stable Desktop and a missing local Gateway
@@ -28,7 +28,7 @@ Rerun the installer to update Desktop. It stages the package on the destination 
 
 ## Gateway provisioning and startup
 
-The installer reuses an existing Gateway installation or service, including a stopped or externally managed installation. On a fresh computer it invokes the bundled official Gateway installer. A stable Desktop package provisions a stable Gateway. A preview Desktop package provisions a preview Gateway. Each Gateway binary is independently verified before setup. Setup requires an existing tmux or Herdr installation. Any persistent startup registration follows Gateway's own prompts and uses a user systemd unit on Linux or a LaunchAgent on macOS. Gateway setup errors leave the installed Desktop available. Resolve the reported prerequisite or installation error and retry. [Gateway installer](../install.sh) · [Standalone setup](../README.md)
+The installer reuses an existing Gateway installation or service, including a stopped or externally managed installation. On a fresh computer it invokes the bundled official Gateway installer. A stable Desktop package provisions a stable Gateway. A preview Desktop package provisions a preview Gateway. Each Gateway binary is independently verified before setup. On a fresh computer Gateway can use the built-in Desktop terminal. Any persistent startup registration follows Gateway's own prompts and uses a user systemd unit on Linux or a LaunchAgent on macOS. Gateway setup errors leave the installed Desktop available. Resolve the reported prerequisite or installation error and retry. [Gateway installer](../install.sh) · [Standalone setup](../README.md)
 
 The same Gateway-only entry point is bundled for direct app downloads. Desktop restores the selected paired computer first. On this computer it probes the Gateway's `local-client.json` and authenticated `GET /api/meta`. When the service is unavailable, the in-process backend supports local work without opening a network listener. For a fresh packaged install Desktop can provision the missing service in the background. Diagnostics shows its status, retry and connection actions. A running session can finish before the switch. `--without-gateway` persists the local-only preference in Desktop's config directory. An offline remote computer stays selected. [Desktop startup and preferences](../desktop/README.md)
 
