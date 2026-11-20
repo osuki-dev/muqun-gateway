@@ -768,8 +768,14 @@ impl Manifest {
     /// The Home hero for `scheme`: the pack's `home.artwork` (unless its
     /// author turned it off with `homeIdentity.artwork: hidden`), else its
     /// `home.wallpaper`, else its gallery preview.
-    #[allow(dead_code)]
-    pub fn cover_asset(&self, dark: bool) -> Option<&str> {
+    pub fn sidebar_cover_asset(&self, dark: bool) -> Option<&str> {
+        if self.desktop.as_ref()?.cover != Some(CoverUse::Sidebar) {
+            return None;
+        }
+        self.cover_asset(dark)
+    }
+
+    fn cover_asset(&self, dark: bool) -> Option<&str> {
         let artwork_hidden = self
             .home_identity
             .as_ref()

@@ -288,6 +288,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
                 s,
                 k,
                 SEE_THROUGH_FLOOR[usize::from(look.dark)],
+                window,
             ))
             .children(
                 (!tiled && s.active_plugin_page.is_none())
@@ -321,7 +322,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         hide_card(&mut chrome);
     }
     let root = stage
-        .child(sidebar_panel(s, k, panel_wash))
+        .child(sidebar_panel(s, k, panel_wash, window))
         .child(split.build(&chrome));
     // The window's width bounds the right-hand panes (`UiState::fit_panes`).
     root.on_layout(|s: &mut UiState, r| s.fits.window = r[2])
@@ -403,7 +404,7 @@ const SIDEBAR_TINT: [f32; 2] = [0.62, 0.5];
 /// the window's edges and a frame's width from the main card, with the
 /// card's radius and hairline. `wash` lays the floor back first, over a
 /// wallpaper. It follows the pane open and shut on the panes' spring.
-fn sidebar_panel(s: &UiState, k: &Kit, wash: f32) -> El {
+fn sidebar_panel(s: &UiState, k: &Kit, wash: f32, window: Option<[f32; 2]>) -> El {
     let frame = super::panes::FRAME;
     let open = s.sidebar.is_open();
     let motion = if s.sidebar.is_resizing() {
@@ -411,29 +412,53 @@ fn sidebar_panel(s: &UiState, k: &Kit, wash: f32) -> El {
     } else {
         super::panes::SPRING
     };
-    let panel = panel_surface(k, "sidebar-panel", wash, s.look().dark);
-    let panel = if crate::platform::is_macos() && s.look().glass {
-        col()
-            .key("sidebar-panel")
-            .radius(k.radius.lg)
-            .fill(k.c.bg_base.alpha(0.85))
-            .system_material(rune::SystemMaterial::Glass)
-            // Native material replaces this node's fill. A separate themed
-            // wash keeps the sidebar in the palette above the system glass.
-            .child(
-                el().key("sidebar-glass-tint")
-                    .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-                    .radius(k.radius.lg)
-                    .continuous_corners()
-                    .fill(k.c.bg_base.alpha(SIDEBAR_TINT[usize::from(s.look().dark)]))
-                    .a11y_hidden(),
-            )
-    } else {
-        panel
-    };
+    let look = s.look();
+    let width = (s.sidebar.width() - frame * 2.0).max(0.0);
+    // Composite the theme surface in the same layer as the workspace so the
+    // sidebar also picks up palette changes when the OS appearance stays put.
+    let mut panel = col()
+        .key("sidebar-panel")
+        .fill(k.c.layer_01.alpha(if !look.glass {
+            1.0
+        } else if look.see_through {
+            SIDEBAR_TINT[usize::from(look.dark)]
+        } else {
+            (wash + (1.0 - wash) * SIDEBAR_TINT[usize::from(look.dark)]).min(1.0)
+        }))
+        .radius(k.radius.lg)
+        .clip_rounded(k.radius.lg)
+        .border(1.0, k.c.border_muted);
+    if let (true, Some(images), Some([_, h])) = (open && look.glass, s.images.as_ref(), window) {
+        // In see-through mode the window wallpaper only covers the main card.
+        let cover = crate::theme::apply::sidebar_cover(s.scheme()).or_else(|| {
+            look.see_through
+                .then(|| crate::theme::apply::backdrop(s.scheme(), s.mode == Mode::Home))
+                .flatten()
+        });
+        if let Some(cover) = cover {
+            let opacity = crate::theme::look::safe_art_opacity(
+                k.c.layer_01,
+                &[(k.c.text_base, 4.5), (k.c.text_muted, 4.5)],
+                cover.look.opacity,
+            );
+            if opacity > 0.01 {
+                panel = panel.child(
+                    art::cover(
+                        images,
+                        &cover,
+                        "sidebar-art",
+                        width,
+                        (h - frame * 2.0).max(0.0),
+                    )
+                    .absolute(0.0, 0.0)
+                    .opacity(opacity),
+                );
+            }
+        }
+    }
     panel
         .pin(Some(frame), Some(frame), None, Some(frame))
-        .w((s.sidebar.width() - frame * 2.0).max(0.0))
+        .w(width)
         .opacity(if open { 1.0 } else { 0.0 })
         .opacity_motion(super::panes::SPRING)
         .motion(motion)
