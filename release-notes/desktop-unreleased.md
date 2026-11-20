@@ -17,4 +17,4 @@ Linux x86_64 and Apple Silicon macOS are supported. The Linux embedded browser n
 curl -fsSL https://muqun.dev/desktop.sh | sh -s -- --channel preview
 ```
 
-Close Desktop before replacing it and reopen it afterward. Existing settings, pairing and conversations are retained. Installing the Desktop preview does not require a mobile App update. Terminal sessions can use tmux or Herdr protocol 17. Remote features depend on the paired Gateway and agent capabilities. A separately updated Gateway requires its own restart; active agent work should finish first.
+Close Desktop before replacing it and reopen it afterward. Existing settings, pairing and conversations are retained. Installing the Desktop preview does not require a mobile App update. On a fresh computer, setup starts the built-in terminal in the background and connects Gateway to it. Existing tmux and Herdr installations remain supported, including Herdr protocol 17. Remote features depend on the paired Gateway and agent capabilities. A separately updated Gateway requires its own restart; active agent work should finish first.
