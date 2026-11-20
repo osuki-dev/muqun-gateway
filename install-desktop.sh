@@ -4,7 +4,7 @@ set -eu
 case "${1:-}" in
   --help|-h)
     cat <<'USAGE'
-Usage: sh install-desktop.sh [--channel stable|preview] [--tag desktop-vVERSION] [--without-gateway]
+Usage: sh install-desktop.sh [--channel stable|preview] [--tag desktop-vVERSION]
        sh /path/to/packaged/install-desktop.sh --gateway-only
 
 Install a released Linux x86_64 or macOS arm64 Desktop package. The default
@@ -77,23 +77,22 @@ die() { printf 'Muqun installer: %s\n' "$*" >&2; exit 1; }
 api=https://muqun.dev/api/releases/desktop
 channel=
 tag=
-without_gateway=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --channel) [ "$#" -ge 2 ] || die 'Expected a channel'; channel=$2; shift 2
       case "$channel" in stable|preview) ;; *) die 'Expected stable or preview';; esac ;;
     --tag) [ "$#" -ge 2 ] || die 'Expected a Desktop tag'; tag=$2; shift 2
       [ -n "$tag" ] || die 'Expected a Desktop tag' ;;
-    --without-gateway) without_gateway=true; shift ;;
+    --without-gateway) shift ;; # Older CLI spelling; every installation is Desktop-only.
     *) die "Unknown argument: $1" ;;
   esac
 done
 system=$(uname -s)
 case "$system/$(uname -m)" in
-  Linux/x86_64) dest=${PREFIX:-"$HOME/.local"}; config=${XDG_CONFIG_HOME:-"$HOME/.config"} ;;
+  Linux/x86_64) dest=${PREFIX:-"$HOME/.local"} ;;
   Darwin/arm64) dest="$HOME/Applications"
     [ ! -e '/Applications/Muqun Desktop.app' ] || dest=/Applications
-    dest=${MUQUN_DESKTOP_APPLICATIONS_DIR:-"$dest"}; config="$HOME/Library/Application Support" ;;
+    dest=${MUQUN_DESKTOP_APPLICATIONS_DIR:-"$dest"} ;;
   *) die "Unsupported Desktop platform: $system $(uname -m)" ;;
 esac
 umask 077
@@ -203,8 +202,3 @@ fi
 chmod 700 "$tmp/install"
 "$tmp/install" "$system" "$tmp/$archive" "$dest" "${tag#desktop-v}"
 printf 'Installed Muqun Desktop %s under %s.\n' "$tag" "$dest"
-marker="$config/muqun-desktop/gateway-auto-install.disabled"
-if [ "$without_gateway" = true ]; then
-  mkdir -p "$(dirname "$marker")"
-  touch "$marker"
-fi

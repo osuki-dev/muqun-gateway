@@ -10,29 +10,18 @@ When a Muqun gateway service runs on this computer the desktop attaches to it (t
 `local-client.json`), so the phone and the desktop see the same sessions. Without one it runs the
 gateway's agents plane in-process — no HTTP server, nothing listening.
 
-On the first normal launch of a packaged Linux installation or a standalone
-macOS app, Desktop checks for a missing local Gateway and runs the packaged
-distribution installer in the background. Local mode remains immediately usable.
-It leaves existing binaries, configurations, services, custom Gateway overrides,
-and remote-computer selections unchanged. The official Gateway installer still
-requires tmux or Herdr; Desktop explains a missing backend without installing it.
-
-**Settings → Diagnostics** shows setup progress, an explicit retry after
-failure, and **Local-only mode** to disable or cancel automatic provisioning.
-`general.gateway_local_only: true` in Desktop's config has the same effect.
-Installing with `--without-gateway` leaves `gateway-auto-install.disabled` in
-Desktop's config directory. An interrupted attempt is never retried on reopen.
-The shared installer verifies the Gateway release; Desktop does not implement a
-second downloader. Optional backend startup and persistent service activation
-keep the official installer's noninteractive defaults. A ready Gateway connects
-automatically only while the local view has no active or unfinished work;
-otherwise use **Connect local Gateway** in diagnostics after finishing it.
+On first launch with a missing local Gateway, packaged Desktop shows a setup
+screen. Choose the install action to download and verify the Gateway from
+Desktop's release channel. A new installation can use the built-in Desktop
+terminal. The workspace opens after setup succeeds. If setup fails, retry or
+exit and return to setup on the next launch. Existing Gateway installations and
+remote-computer selections are preserved.
 
 For released packages, startup behavior and the local Gateway setup flow, see the [Desktop deployment guide](../docs/desktop-deployment.md).
 
 ## Install a published Desktop package
 
-Use the official `install-desktop.sh` for Linux x86_64 or macOS arm64. Stable is the default. Use `--channel preview` for a published Desktop preview, or `--without-gateway` to use an existing remote computer or stay local-only. The installer downloads prebuilt packages and provisions a missing local Gateway. [Installation options](../docs/desktop-deployment.md)
+Use the official `install-desktop.sh` for Linux x86_64 or macOS arm64. Stable is the default. Use `--channel preview` for a published Desktop preview. The installer installs only the Desktop package. Open Desktop to complete Gateway setup. [Installation options](../docs/desktop-deployment.md)
 
 ## Local development install (Linux)
 

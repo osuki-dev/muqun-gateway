@@ -175,13 +175,13 @@ cp "$FIXTURES/$name" "$out"''',
         self.confirm_gateway_setup()
         self.assertFalse((self.home / "gateway-invocations").exists())
 
-    def test_channel_opt_out_and_integrity(self):
+    def test_preview_channel_compatibility_and_integrity(self):
         asset = self.fixture(PREVIEW)
         self.run_installer(success=False)
         self.assertFalse((self.home / "gateway-invocations").exists())
         self.run_installer("--channel", "preview", "--without-gateway")
         marker = self.home / ".config/muqun-desktop/gateway-auto-install.disabled"
-        self.assertTrue(marker.exists())
+        self.assertFalse(marker.exists())
         self.run_installer("--tag", PREVIEW)
         self.assertFalse((self.home / "gateway-invocations").exists())
         (self.files / asset).write_bytes(b"damaged")

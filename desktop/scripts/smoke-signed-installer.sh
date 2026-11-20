@@ -28,8 +28,8 @@ cp "$RELEASE_FIXTURE_DIR/${3##*/}" "$2"
 CURL
 chmod +x "$bin/curl"
 unzip -p "$zip" 'Muqun Desktop.app/Contents/Resources/installers/install-desktop.sh' |
-  PATH="$bin" sh -s -- --tag "desktop-v$version" --without-gateway
+  PATH="$bin" sh -s -- --tag "desktop-v$version"
 app="$MUQUN_DESKTOP_APPLICATIONS_DIR/Muqun Desktop.app"
-test -f "$HOME/Library/Application Support/muqun-desktop/gateway-auto-install.disabled"
+test ! -e "$HOME/Library/Application Support/muqun-desktop/gateway-auto-install.disabled"
 codesign --verify --strict "$app/Contents/Helpers/muqun-desktop-install"
 spctl --assess --type execute "$app"

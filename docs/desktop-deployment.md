@@ -8,7 +8,6 @@ Use the official installer on Linux x86_64 or Apple silicon macOS. It reads the 
 curl -fsSL https://muqun.dev/desktop.sh | sh  # Install stable Desktop
 sh install-desktop.sh --channel preview       # Install Desktop preview
 sh install-desktop.sh --tag desktop-vX.Y.Z    # Pin a published Desktop release
-sh install-desktop.sh --without-gateway       # In-process agents or a paired remote computer
 ```
 
 Choose an actual published version for `--tag`. If the requested channel has no Desktop release, installation stops before changing any installed package. Desktop and Gateway share a GitHub repository and have independent release identities.
@@ -28,9 +27,9 @@ Rerun the installer to update Desktop. It stages the package on the destination 
 
 ## Gateway provisioning and startup
 
-The public installer finishes after installing Desktop. Open Desktop to choose whether to download a missing local Gateway. Confirming in the app invokes the bundled Gateway installer. Desktop reuses an existing installation or service, including a stopped or externally managed one. A stable Desktop package provisions a stable Gateway. A preview Desktop package provisions a preview Gateway. Each Gateway binary is independently verified before setup. On a fresh computer Gateway can use the built-in Desktop terminal. Any persistent startup registration follows Gateway's own prompts and uses a user systemd unit on Linux or a LaunchAgent on macOS. Gateway setup errors leave the installed Desktop available. Resolve the reported prerequisite or installation error and retry. [Gateway installer](../install.sh) · [Standalone setup](../README.md)
+The public installer finishes after installing Desktop. When the local Gateway is missing, opening Desktop shows the required setup screen. Choose the install action to download Gateway before entering the workspace. Desktop reuses an existing installation or service, including a stopped or externally managed one. A stable Desktop package provisions a stable Gateway. A preview Desktop package provisions a preview Gateway. Each Gateway binary is independently verified before setup. On a fresh computer Gateway can use the built-in Desktop terminal. Any persistent startup registration follows Gateway's own prompts and uses a user systemd unit on Linux or a LaunchAgent on macOS. If setup fails, retry from that screen or exit and resume setup on the next launch. [Gateway installer](../install.sh) · [Standalone setup](../README.md)
 
-The same Gateway-only entry point is bundled for direct app downloads. Desktop restores the selected paired computer first. On this computer it probes the Gateway's `local-client.json` and authenticated `GET /api/meta`. When the service is unavailable, the in-process backend supports local work without opening a network listener. After you approve Gateway setup, Desktop downloads it in the background and shows its progress. Diagnostics shows its status, retry and connection actions. A running session can finish before the switch. `--without-gateway` persists the local-only preference in Desktop's config directory. An offline remote computer stays selected. [Desktop startup and preferences](../desktop/README.md)
+The same Gateway-only entry point is bundled for direct app downloads. Desktop restores the selected paired computer first. On this computer it probes the Gateway's `local-client.json` and authenticated `GET /api/meta`. Gateway setup displays download progress and verifies the release before starting the service. An offline remote computer stays selected. [Desktop startup and preferences](../desktop/README.md)
 
 ## Updating or removing Gateway
 
