@@ -851,7 +851,7 @@ impl Core {
                     })
                 })
                 .await
-                .unwrap_or_else(|_| crate::platform::update::Status::InstallFailed(target));
+                .unwrap_or(crate::platform::update::Status::InstallFailed(target));
                 self.inbox
                     .push(Update::Ui(super::inbox::UiAction::DesktopUpdate(status)));
             }

@@ -390,3 +390,60 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
         ),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        model::commands::{self, Command},
+        platform::installer::Phase,
+    };
+
+    #[test]
+    fn about_download_can_be_backgrounded_and_ready_never_restarts_by_itself() {
+        fn view(s: &UiState, _: &mut rune::Cx<UiState>) -> El {
+            let kit = Kit::neutral(true);
+            let mut layer = Vec::new();
+            crate::ui::desktop_update::mount(s, &kit, &mut layer);
+            rune_kit::root(col().w_full().children(page(s, &kit)), layer)
+        }
+        let (sender, mut receiver) = commands::channel();
+        let mut s = UiState::new(sender);
+        s.splash = None;
+        s.desktop_update = Status::Available("1.2.0".into());
+        while receiver.try_recv().is_ok() {} // Ignore startup discovery and keychain reads.
+        let mut rt = rune::Runtime::new(s, view, (1100.0, 900.0), rune::Env::new(true, 1.0));
+        let mut time = 0.0;
+        let mut click = |rt: &mut rune::Runtime<UiState>, key: &str| {
+            for _ in 0..25 {
+                time += 1.0 / 60.0;
+                rt.frame(time);
+            }
+            let (x, y) = rt.find(key).unwrap();
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+        };
+        click(&mut rt, "desktop-update-action");
+        assert!(
+            matches!(receiver.try_recv(),Ok(Command::InstallDesktopUpdate(version)) if version=="1.2.0")
+        );
+        rt.state.desktop_update = Status::Installing {
+            version: "1.2.0".into(),
+            phase: Some(Phase::Downloading {
+                received: 12,
+                total: 20,
+            }),
+        };
+        click(&mut rt, "desktop-update-hide");
+        assert!(!rt.state.desktop_update_panel);
+        click(&mut rt, "desktop-update-action");
+        assert!(rt.state.desktop_update_panel);
+        rt.state.desktop_update = Status::Ready {
+            version: "1.2.0".into(),
+            executable: "/fixture/unused".into(),
+        };
+        click(&mut rt, "desktop-update-hide");
+        assert!(receiver.try_recv().is_err());
+        assert!(!rt.state.restart_on_frame);
+    }
+}

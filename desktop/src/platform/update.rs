@@ -111,9 +111,11 @@ impl Package {
     }
 
     fn at(executable: PathBuf, version: &str) -> anyhow::Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
         let path = &executable;
+        let metadata = path.metadata()?;
         ensure!(
-            path.is_absolute() && path.is_file(),
+            path.is_absolute() && metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
             "Desktop executable unavailable"
         );
         #[cfg(target_os = "macos")]
@@ -280,7 +282,9 @@ mod tests {
         std::fs::create_dir_all(&helpers).unwrap();
         std::fs::create_dir_all(prefix.join("bin")).unwrap();
         let executable = prefix.join("bin/muqun-desktop");
+        use std::os::unix::fs::PermissionsExt;
         std::fs::write(&executable, b"old fixture").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(helpers.join("VERSION"), "1.0.0").unwrap();
         std::fs::write(
             helpers.join("install-desktop.sh"),

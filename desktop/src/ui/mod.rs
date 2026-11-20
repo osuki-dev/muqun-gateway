@@ -3988,7 +3988,7 @@ impl UiState {
             UiAction::LocalPairingRevoked { id, result } => self.finish_local_revoke(id, result),
             UiAction::LocalInvite(id, result) => self.receive_local_invite(id, result),
             UiAction::DesktopRestartCheckpoint(saved) => self.restart_checkpoint_completed(saved),
-            UiAction::DesktopUpdate(status) => self.desktop_update = status,
+            UiAction::DesktopUpdate(status) => self.receive_desktop_update(status),
             UiAction::LocalPairings(devices) => {
                 self.local_revoke.cancel_confirmation();
                 self.local_pairings = devices;

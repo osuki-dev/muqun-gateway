@@ -15,6 +15,26 @@ use rune::El;
 use rune_kit::{Button, ButtonVariant, Kit};
 
 impl UiState {
+    pub(super) fn receive_desktop_update(&mut self, status: Status) {
+        if !self.desktop_update_panel {
+            let notice = match &status {
+                Status::Ready { .. } => {
+                    Some((ToastLevel::Info, "Restart to use the installed update."))
+                }
+                Status::InstallFailed(_) => Some((ToastLevel::Error, "Desktop update failed")),
+                _ => None,
+            };
+            if let Some((level, message)) = notice {
+                self.notify(
+                    level,
+                    "Muqun Desktop",
+                    Some(tr_ref(self.cfg.general.language, message).to_owned()),
+                );
+            }
+        }
+        self.desktop_update = status;
+    }
+
     pub(super) fn start_desktop_update(&mut self) {
         let (Status::Available(version) | Status::InstallFailed(version)) = &self.desktop_update
         else {
