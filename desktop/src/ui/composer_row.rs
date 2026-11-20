@@ -9,7 +9,7 @@ use rune::{icon, row, text, Color, El, Icon};
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit, Menu, MenuItem};
 
 use super::composer::{
-    catalog_models, effort_menu, mode_label, model_menu, switch_effort, switch_mode, switch_model,
+    catalog_models, effort_menu, mode_label, model_menu, switch_mode, switch_model,
 };
 use super::copy::tr_ref;
 use super::labels::{bare_catalog_id, readable_catalog_id};
@@ -418,7 +418,7 @@ fn pill_button(
         .variant(ButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
         .expanded(open)
-        .on_press(move |s: &mut UiState| s.menu = (!open).then(|| menu.clone()));
+        .on_press(move |s: &mut UiState| s.toggle_composer_menu(menu.clone()));
     if let Some(help) = help {
         b = b.help(help);
     }
@@ -488,46 +488,6 @@ fn agent_chip(c: &Controls, k: &Kit, f: Fold) -> El {
     chip
 }
 
-/// Model choices, then (when the model has them) its effort levels.
-fn model_items(menu: Menu, c: &Controls, m: &ModelChip, with_effort: bool) -> Menu {
-    let mut menu = menu;
-    let mut last: Option<&str> = None;
-    for (provider, id, name) in &m.models {
-        if last != Some(provider.as_str()) {
-            menu = menu.group_label(provider.clone());
-            last = Some(provider.as_str());
-        }
-        let on = m.current.as_ref() == Some(&(provider.clone(), id.clone()));
-        let (p, id) = (provider.clone(), id.clone());
-        menu = menu.item(
-            MenuItem::new(name.clone())
-                .checked(on)
-                .on_select(move |s: &mut UiState| switch_model(s, p.clone(), id.clone())),
-        );
-    }
-    if with_effort && !m.variants.is_empty() {
-        if !m.models.is_empty() {
-            menu = menu.separator();
-        }
-        menu = menu.group_label(c.tr("Effort")).item(
-            MenuItem::new(c.tr("Default"))
-                .checked(m.variant.is_none())
-                .on_select(|s: &mut UiState| switch_effort(s, super::Slot::Session, None)),
-        );
-        for v in &m.variants {
-            let name = v.clone();
-            menu = menu.item(
-                MenuItem::new(readable_catalog_id(v))
-                    .checked(m.variant.as_deref() == Some(v.as_str()))
-                    .on_select(move |s: &mut UiState| {
-                        switch_effort(s, super::Slot::Session, Some(name.clone()))
-                    }),
-            );
-        }
-    }
-    menu
-}
-
 fn reload_model(k: &Kit, c: &Controls, name: &str) -> El {
     Button::new(format!("{name} ↻"))
         .variant(ButtonVariant::GhostMuted)
@@ -554,6 +514,7 @@ fn model_chips(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold,
         } else {
             let current = m.current.as_ref().map(|(p, i)| (p.as_str(), i.as_str()));
             model_menu(
+                s,
                 k,
                 layer,
                 OpenMenu::Model,
@@ -598,13 +559,18 @@ fn model_chips(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold,
         open,
         OpenMenu::Model,
     );
-    let menu = Menu::new(format!("model-{}", c.asid.0))
-        .placement(rune_kit::Placement::TopStart)
-        .trigger(trigger)
-        .open(open)
-        .min_width(220.0)
-        .on_close(|s: &mut UiState| s.menu = None);
-    line.child(model_items(menu, c, m, true).build(k, layer))
+    line.child(super::model_picker::popup(
+        s,
+        k,
+        layer,
+        &format!("model-{}", c.asid.0),
+        trigger,
+        open,
+        &m.models,
+        m.current.as_ref().map(|(p, id)| (p.as_str(), id.as_str())),
+        Some((&m.variants, m.variant.as_deref())),
+        switch_model,
+    ))
 }
 
 fn mode_items(menu: Menu, c: &Controls, k: &Kit) -> Menu {

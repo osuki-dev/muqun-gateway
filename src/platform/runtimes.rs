@@ -26,6 +26,9 @@ pub const MAX_RUNTIME_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 /// Bounded timeout for `probe_version` (`<binary> --version`).
 pub const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+// A freshly downloaded binary can take longer to start on its first run.
+const INSTALL_VERSION_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Maximum number of bytes read from `--version` stdout/stderr.
 pub const VERSION_PROBE_MAX_BYTES: u64 = 1024;
 
@@ -102,16 +105,16 @@ impl RuntimeKind {
             }
             Self::Herdr => {
                 let target = match (std::env::consts::OS, std::env::consts::ARCH) {
-                    ("macos", "aarch64") => "aarch64-apple-darwin",
-                    ("macos", "x86_64") => "x86_64-apple-darwin",
-                    ("linux", "x86_64") => "x86_64-unknown-linux-musl",
-                    ("linux", "aarch64") => "aarch64-unknown-linux-musl",
+                    ("macos", "aarch64") => "macos-aarch64",
+                    ("macos", "x86_64") => "macos-x86_64",
+                    ("linux", "x86_64") => "linux-x86_64",
+                    ("linux", "aarch64") => "linux-aarch64",
                     (os, arch) => {
                         anyhow::bail!("no official Herdr release binary for {os}/{arch}")
                     }
                 };
                 Ok(format!(
-                    "https://github.com/osuki-dev/herdr/releases/latest/download/herdr-{target}"
+                    "https://github.com/herdrdev/herdr/releases/latest/download/herdr-{target}"
                 ))
             }
         }
@@ -390,7 +393,13 @@ impl RuntimeManager {
                 .ok()
                 .is_some_and(|v| !v.trim().is_empty());
         let payload = fetch_release_payload(&url, has_override).await?;
-        self.stage_and_activate(kind, &payload, expected_sha256)
+        let manager = self.clone();
+        let expected_sha256 = expected_sha256.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            manager.stage_and_activate(kind, &payload, expected_sha256.as_deref())
+        })
+        .await
+        .context("runtime installation worker failed")?
     }
 
     /// Verify optional SHA-256 checksum, extract or write `payload` into a staging directory
@@ -444,12 +453,13 @@ impl RuntimeManager {
             }
         }
 
-        let version = probe_version_strict(&staged_binary).with_context(|| {
-            format!(
-                "staged {} binary failed `--version` verification",
-                kind.display_name()
-            )
-        })?;
+        let version =
+            run_version_probe(&staged_binary, INSTALL_VERSION_TIMEOUT).with_context(|| {
+                format!(
+                    "staged {} binary failed `--version` verification",
+                    kind.display_name()
+                )
+            })?;
 
         activate_staged_directory(&managed_root, &staging_dir, install_id)?;
         staging_guard.disarm();
@@ -585,6 +595,10 @@ pub fn probe_version(binary_path: &Path) -> Option<String> {
 
 /// Probe `<binary> --version` with a bounded timeout and output cap, returning an error on failure.
 pub fn probe_version_strict(binary_path: &Path) -> Result<String> {
+    run_version_probe(binary_path, VERSION_PROBE_TIMEOUT)
+}
+
+fn run_version_probe(binary_path: &Path, timeout: Duration) -> Result<String> {
     let mut command = Command::new(binary_path);
     command
         .arg("--version")
@@ -614,7 +628,7 @@ pub fn probe_version_strict(binary_path: &Path) -> Result<String> {
         }
     };
 
-    let deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -627,7 +641,7 @@ pub fn probe_version_strict(binary_path: &Path) -> Result<String> {
                 anyhow::bail!(
                     "version probe for `{}` timed out after {:?}",
                     binary_path.display(),
-                    VERSION_PROBE_TIMEOUT
+                    timeout
                 );
             }
             Err(err) => {
@@ -1306,6 +1320,35 @@ mod tests {
         let empty_script = temp.path().join("empty-runtime");
         write_mock_executable(&empty_script, "printf '\\n'");
         assert_eq!(probe_version(&empty_script), None);
+    }
+
+    #[tokio::test]
+    async fn slow_first_start_is_verified_before_activation_and_quick_probes_stay_bounded() {
+        let temp = TempDir::new("slow-runtime");
+        let manager = RuntimeManager::with_state_dir(temp.path().join("state"));
+        let binary = temp.path().join("download");
+        write_mock_executable(&binary, "sleep 3; echo '1.2.3'");
+        let url = binary.to_str().unwrap();
+        let installed = manager
+            .install_managed(RuntimeKind::Bun, Some(url), None)
+            .await
+            .unwrap();
+        assert_eq!(installed.version.as_deref(), Some("1.2.3"));
+        assert!(probe_version_strict(&binary)
+            .unwrap_err()
+            .to_string()
+            .contains("timed out"));
+
+        let verified_payload = fs::read(&binary).unwrap();
+        write_mock_executable(&binary, "exit 1");
+        assert!(manager
+            .install_managed(RuntimeKind::Bun, Some(url), None)
+            .await
+            .is_err());
+        assert_eq!(
+            fs::read(installed.binary_path.unwrap()).unwrap(),
+            verified_payload
+        );
     }
 
     #[test]

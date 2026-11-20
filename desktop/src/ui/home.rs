@@ -557,6 +557,7 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
             })
             .unwrap_or_else(|| tr(language, "Model"));
         line = line.child(model_menu(
+            s,
             k,
             layer,
             OpenMenu::StartModel,

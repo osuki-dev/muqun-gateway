@@ -23,6 +23,7 @@ pub(crate) mod inbox;
 pub(crate) mod inspector;
 pub mod keymap;
 mod labels;
+mod model_picker;
 mod notifications;
 mod package_activity;
 pub mod pair_computer;
@@ -570,6 +571,7 @@ pub struct UiState {
     pub busy_since: HashMap<String, u64>,
     /// The start card's folder picker filter (`ui/home.rs`).
     pub folder_query: TextEdit,
+    pub model_query: TextEdit,
     pub full_projects: HashSet<String>,
 
     /// Pending prompts per session, from snapshots and events.
@@ -840,6 +842,7 @@ impl UiState {
             open_projects: HashMap::new(),
             busy_since: HashMap::new(),
             folder_query: TextEdit::new(""),
+            model_query: TextEdit::new(""),
             full_projects: HashSet::new(),
             waiting_perms: HashMap::new(),
             waiting_forms: HashMap::new(),
@@ -1711,6 +1714,11 @@ impl UiState {
     }
 
     pub fn open_notification(&mut self, key: &str) {
+        if key == "desktop-update" {
+            self.go(Mode::Settings);
+            settings::open(self, SettingsTab::About);
+            return;
+        }
         if let Some(target) = key.strip_prefix("plugin:") {
             if let Ok((id, action)) = serde_json::from_str::<(String, String)>(target) {
                 if let Some(plugin) = self.plugins.get_enabled(&id, &self.cfg.plugins_disabled) {
@@ -3988,6 +3996,14 @@ impl UiState {
             UiAction::LocalPairingRevoked { id, result } => self.finish_local_revoke(id, result),
             UiAction::LocalInvite(id, result) => self.receive_local_invite(id, result),
             UiAction::DesktopRestartCheckpoint(saved) => self.restart_checkpoint_completed(saved),
+            UiAction::CheckDesktopUpdateIfIdle => {
+                if !matches!(
+                    self.desktop_update,
+                    crate::platform::update::Status::InstallFailed(_)
+                ) {
+                    self.check_desktop_update();
+                }
+            }
             UiAction::DesktopUpdate(status) => self.receive_desktop_update(status),
             UiAction::LocalPairings(devices) => {
                 self.local_revoke.cancel_confirmation();
@@ -4253,6 +4269,7 @@ impl UiState {
             &self.start_draft,
             &self.search,
             &self.folder_query,
+            &self.model_query,
             &self.task_goal,
             &self.theme_url,
             &self.plugin_source,

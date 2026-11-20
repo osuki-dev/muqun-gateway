@@ -928,5 +928,7 @@
   "Set up Muqun Gateway": "Настройка Muqun Gateway",
   "Desktop needs Gateway on this computer to open your workspace.": "Чтобы открыть рабочую область, установите Gateway на этом компьютере.",
   "Checking for a local Gateway…": "Проверка локального Gateway…",
-  "Gateway setup failed or timed out. Retry to continue.": "Не удалось настроить Gateway или истекло время ожидания. Попробуйте ещё раз."
+  "Gateway setup failed or timed out. Retry to continue.": "Не удалось настроить Gateway или истекло время ожидания. Попробуйте ещё раз.",
+  "Search models": "Поиск моделей",
+  "No matching models": "Подходящих моделей нет"
 }

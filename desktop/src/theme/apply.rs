@@ -187,6 +187,20 @@ pub fn backdrop(scheme: ColorScheme, home: bool) -> Option<Art> {
     })
 }
 
+/// The optional desktop cover explicitly assigned to the sidebar.
+pub fn sidebar_cover(scheme: ColorScheme) -> Option<Art> {
+    read(|c| {
+        let dark = scheme == ColorScheme::Dark;
+        let id = c.manifest.sidebar_cover_asset(dark)?;
+        let [w, h] = *c.sizes.get(id)?;
+        Some(Art {
+            bytes: c.images.get(id)?.clone(),
+            size: [w as f32, h as f32],
+            look: SlotLook::default(),
+        })
+    })
+}
+
 /// Startup art: `launch.artwork`, else the Home foreground.
 pub fn launch(scheme: ColorScheme) -> Option<Art> {
     read(|c| {

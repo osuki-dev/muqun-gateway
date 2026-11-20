@@ -928,5 +928,7 @@
   "Set up Muqun Gateway": "ตั้งค่า Muqun Gateway",
   "Desktop needs Gateway on this computer to open your workspace.": "ต้องติดตั้ง Gateway บนคอมพิวเตอร์เครื่องนี้เพื่อเปิดพื้นที่ทำงาน",
   "Checking for a local Gateway…": "กำลังตรวจสอบ Gateway ในเครื่อง…",
-  "Gateway setup failed or timed out. Retry to continue.": "การตั้งค่า Gateway ล้มเหลวหรือหมดเวลา โปรดลองใหม่เพื่อดำเนินการต่อ"
+  "Gateway setup failed or timed out. Retry to continue.": "การตั้งค่า Gateway ล้มเหลวหรือหมดเวลา โปรดลองใหม่เพื่อดำเนินการต่อ",
+  "Search models": "ค้นหาโมเดล",
+  "No matching models": "ไม่พบโมเดลที่ตรงกัน"
 }

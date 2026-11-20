@@ -1715,7 +1715,7 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
             if models.is_none_or(|c| super::composer::catalog_models(c).is_empty()) {
                 return false;
             }
-            s.menu = (s.menu != Some(menu.clone())).then_some(menu);
+            s.toggle_composer_menu(menu);
         }
         A::Dictation if session && (s.cfg.voice.usable() || s.voice.is_some()) => s.toggle_voice(),
         A::FinishDictation if s.voice.is_some() => s.finish_voice(),

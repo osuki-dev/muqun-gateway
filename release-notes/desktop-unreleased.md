@@ -2,13 +2,11 @@
 
 ## Changes and fixes
 
-- Desktop Settings → Computers lists paired computers and connected devices. Pair another Gateway by address or display this computer’s QR and pending verification code. Desktop keeps a selected remote computer when it is offline.
-- Home starts a session in the chosen project and immediately shows its first message. Late session updates retain the active conversation. The composer keeps attachments with their draft, separates queued input from delivered messages, and keeps Send in the input while Stop sits beside the delivery mode.
-- Conversation and file images open in Desktop’s viewer with wheel zoom and drag to pan. Plugin images can use the same viewer. Sub-agent details open in a shared window and stay out of recent top-level sessions.
-- Terminal, browser and plugin panes share window controls. Linux browser tabs show the page title and favicon, support closing a tab, and use the packaged WebKitGTK helper for page rendering and common selection actions.
-- Plugin settings show searchable cards with descriptions, keywords and source links from the package metadata. Bun resolves plugin sources and updates display progress. The host and SDK provide native content, notifications, image previews and selection actions to installed plugins. The distribution includes the existing Review Center plugin. Fizzy remains independently installed and updated.
-- Desktop checks its stable or preview channel from Settings → About. Choose Download & install to fetch the package, verify it and install it in the existing location. Restart when ready.
-- The one-line installer displays the verified SHA-256 and installs Desktop. On first launch, install a missing local Gateway from the matching channel to enter the workspace. Desktop shows download progress and supports retrying failed installations.
+- Installed Desktop now checks its own release channel on startup and every six hours while running. A notification opens the update page. You choose when to download and restart. To get this update from preview.27, open Settings → About.
+
+- Search the model picker on Home and in sessions by model name, ID, or provider. Model and reasoning effort selections stay visible, including when working in split panes.
+- The sidebar now uses the active theme's surface and artwork. On macOS the main workspace lets the desktop show through, and Reduce transparency restores an opaque background.
+- Installing Bun or Herdr gives a newly downloaded binary time for its first startup. Herdr now downloads from its official release location.
 
 ## Compatibility and installation
 

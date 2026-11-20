@@ -264,6 +264,18 @@ pub fn spawn(
         &config,
     );
     tokio::spawn(fleet.clone().maintain(config.clone(), inbox.clone()));
+    if crate::platform::update::installed_package() {
+        let inbox = inbox.clone();
+        tokio::spawn(async move {
+            // The first tick runs immediately. Skip missed ticks after sleep.
+            let mut checks = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+            checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                checks.tick().await;
+                inbox.push(Update::Ui(super::inbox::UiAction::CheckDesktopUpdateIfIdle));
+            }
+        });
+    }
     let core = Arc::new(Core {
         fleet,
         local_state_dir: Some(local_state_dir),
