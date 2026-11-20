@@ -15,7 +15,10 @@ use crate::ui::UiState;
 
 impl UiState {
     pub(super) fn check_desktop_update(&mut self) {
-        if self.desktop_update != Status::Checking {
+        if !matches!(
+            self.desktop_update,
+            Status::Checking | Status::Ready { .. } | Status::Installing { .. }
+        ) {
             self.desktop_update = Status::Checking;
             self.send(crate::model::commands::Command::CheckDesktopUpdate);
         }
@@ -169,10 +172,18 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
         Status::Checking => tr(language, "Checking…"),
         Status::Current => tr(language, "Up to date"),
         Status::NoRelease => tr(language, "No published version in this channel"),
-        Status::Available(version) => {
+        Status::Available(version) | Status::Manual(version) => {
             format!("{} {version}", tr_ref(language, "New version available:"))
         }
         Status::Failed => tr(language, "Check failed"),
+        Status::InstallFailed(_) => tr(language, "Desktop update failed"),
+        Status::Installing { phase, .. } => {
+            tr(language, crate::ui::desktop_update::phase_label(*phase))
+        }
+        Status::Ready { version, .. } => format!(
+            "{} · {version}",
+            tr_ref(language, "Restart to use the installed update.")
+        ),
     };
     let update_row = row(
         k,
@@ -185,18 +196,32 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
             .center_y()
             .flex_wrap()
             .child(
-                button(tr_ref(
-                    language,
-                    if matches!(s.desktop_update, Status::Idle | Status::Checking) {
-                        "Check for updates"
-                    } else {
-                        "Check again"
-                    },
-                ))
-                .disabled(s.desktop_update == Status::Checking)
-                .on_press(UiState::check_desktop_update)
+                match &s.desktop_update {
+                    Status::Available(_) | Status::InstallFailed(_) => button(tr_ref(
+                        language,
+                        if matches!(s.desktop_update, Status::InstallFailed(_)) {
+                            "Retry"
+                        } else {
+                            "Download & install"
+                        },
+                    ))
+                    .on_press(UiState::start_desktop_update),
+                    Status::Installing { .. } | Status::Ready { .. } => {
+                        button(tr_ref(language, "Details")).on_press(UiState::show_desktop_update)
+                    }
+                    other => button(tr_ref(
+                        language,
+                        if matches!(other, Status::Idle | Status::Checking) {
+                            "Check for updates"
+                        } else {
+                            "Check again"
+                        },
+                    ))
+                    .disabled(*other == Status::Checking)
+                    .on_press(UiState::check_desktop_update),
+                }
                 .build(k)
-                .key("check-desktop-update"),
+                .key("desktop-update-action"),
             )
             .child(link_button(
                 k,

@@ -269,6 +269,11 @@ fn main() -> anyhow::Result<()> {
     };
     tracing::info!(code, "muqun-desktop stopped");
     diagnostics::flush();
+    if code == 0 {
+        if let Err(error) = platform::update::relaunch_if_requested() {
+            tracing::error!(%error,"could not restart updated Desktop");
+        }
+    }
     platform::shutdown::leave(code)
 }
 

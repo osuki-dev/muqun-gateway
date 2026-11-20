@@ -3,8 +3,7 @@
 use crate::model::inbox::{Inbox, UiAction, Update};
 use std::{
     fs::{self, OpenOptions},
-    io::{Read, Write},
-    os::{fd::OwnedFd, unix::net::UnixStream},
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -402,24 +401,6 @@ fn install_once(
     }
 }
 
-fn parse_progress(line: &[u8]) -> Option<Status> {
-    let mut words = std::str::from_utf8(line).ok()?.split_ascii_whitespace();
-    if words.next()? != "MUQUN_PROGRESS" {
-        return None;
-    }
-    let status = match words.next()? {
-        "download" => Status::Downloading {
-            received: words.next()?.parse().ok()?,
-            total: words.next()?.parse().ok()?,
-        },
-        "verify" => Status::Verifying,
-        "install" => Status::Activating,
-        "start" => Status::Starting,
-        _ => return None,
-    };
-    words.next().is_none().then_some(status)
-}
-
 fn run_installer(
     installer: &Path,
     paths: &[PathBuf],
@@ -427,87 +408,24 @@ fn run_installer(
     deadline: Duration,
     progress: impl Fn(Status),
 ) -> Status {
-    if cancel.load(Ordering::Acquire) {
-        return Status::Interrupted;
-    }
-    let Ok((mut events, output)) = UnixStream::pair() else {
-        return Status::Failed;
-    };
-    if events.set_nonblocking(true).is_err() {
-        return Status::Failed;
-    }
+    use super::installer::{self, Phase};
     let mut command = Command::new("/bin/sh");
-    command
-        .arg(installer)
-        .arg("--gateway-only")
-        .env("MUQUN_INSTALL_PROGRESS", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(OwnedFd::from(output)));
+    command.arg(installer).arg("--gateway-only");
     if let Ok(path) = std::env::join_paths(paths) {
         command.env("PATH", path);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: setsid is the only post-fork operation; no allocation or
-        // locking. Optional installer prompts must not read Desktop's TTY.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() < 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            });
-        }
-    }
-    let Ok(mut child) = command.spawn() else {
-        return Status::Failed;
-    };
-    drop(command);
-    let started = Instant::now();
-    let mut buffer = [0u8; 4096];
-    let mut line = Vec::new();
-    loop {
-        let exit = child.try_wait();
-        // Drain before returning a completed child so short phase transitions
-        // reach the UI. Never wait on a descriptor inherited by a service.
-        while let Ok(count @ 1..) = events.read(&mut buffer) {
-            for byte in &buffer[..count] {
-                if *byte == b'\n' {
-                    if line.len() <= 128 {
-                        if let Some(status) = parse_progress(&line) {
-                            progress(status);
-                        }
-                    }
-                    line.clear();
-                } else if line.len() <= 128 {
-                    line.push(*byte);
-                }
-            }
-        }
-        if let Ok(Some(exit)) = exit {
-            return if exit.success() {
-                Status::Ready
-            } else {
-                Status::Failed
-            };
-        }
-        if cancel.load(Ordering::Acquire) || started.elapsed() >= deadline {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-            return if cancel.load(Ordering::Acquire) {
-                Status::Interrupted
-            } else {
-                Status::Failed
-            };
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    let result = installer::run(command, cancel, Some(deadline), |phase| {
+        progress(match phase {
+            Phase::Downloading { received, total } => Status::Downloading { received, total },
+            Phase::Verifying => Status::Verifying,
+            Phase::Installing => Status::Activating,
+            Phase::Starting => Status::Starting,
+        })
+    });
+    match result {
+        Ok(()) => Status::Ready,
+        Err(_) if cancel.load(Ordering::Acquire) => Status::Interrupted,
+        Err(_) => Status::Failed,
     }
 }
 

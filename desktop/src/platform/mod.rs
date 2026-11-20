@@ -7,6 +7,7 @@ pub mod editors;
 pub mod filesearch;
 pub mod fonts;
 pub mod gateway_bootstrap;
+pub mod installer;
 pub mod instance;
 pub mod keys;
 pub mod media;

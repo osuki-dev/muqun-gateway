@@ -10,6 +10,7 @@ pub(crate) mod art;
 mod composer;
 mod composer_row;
 pub mod copy;
+mod desktop_update;
 mod download_panel;
 mod dwindle;
 mod echo;
@@ -602,6 +603,9 @@ pub struct UiState {
     pub local_revoke: settings::revoke_device::State,
     pub(crate) local_invite: Option<settings::local_devices::InvitePanel>,
     pub gateway_setup: Option<crate::platform::gateway_bootstrap::Status>,
+    desktop_update_panel: bool,
+    restart_checkpoint_pending: bool,
+    restart_on_frame: bool,
     pub desktop_update: crate::platform::update::Status,
     pub local_pairings: crate::platform::paired_devices::List,
     pub(crate) plugin_packages: package_activity::PackageActivity,
@@ -858,6 +862,9 @@ impl UiState {
             diagnostic_filter: Default::default(),
             local_invite: None,
             gateway_setup: None,
+            desktop_update_panel: false,
+            restart_checkpoint_pending: false,
+            restart_on_frame: false,
             desktop_update: Default::default(),
             local_pairings: Default::default(),
             local_revoke: Default::default(),
@@ -971,6 +978,10 @@ impl UiState {
     /// Keep the window waking while the splash is animating.
     /// Every frame Rune asks: the splash and a recording's waveform animate.
     pub fn poll_frame(&mut self, t: f64, tx: &mut Tx) -> bool {
+        if std::mem::take(&mut self.restart_on_frame) {
+            tx.quit();
+            return true;
+        }
         let mut plugins = false;
         for plugin in self.plugins.all() {
             plugins |= plugin.poll(self, tx);
@@ -3977,6 +3988,7 @@ impl UiState {
             } => self.finish_computer_unpair(computer, request, result),
             UiAction::LocalPairingRevoked { id, result } => self.finish_local_revoke(id, result),
             UiAction::LocalInvite(id, result) => self.receive_local_invite(id, result),
+            UiAction::DesktopRestartCheckpoint(saved) => self.restart_checkpoint_completed(saved),
             UiAction::DesktopUpdate(status) => self.desktop_update = status,
             UiAction::LocalPairings(devices) => {
                 self.local_revoke.cancel_confirmation();
@@ -4477,7 +4489,11 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     palette::mount(s, &k, &mut layer);
     shortcuts::mount(s, &k, &mut layer);
     pair_computer::mount(s, &k, &mut layer);
-    gateway_setup::mount(s, &k, &mut layer);
+    if s.gateway_setup.is_some() {
+        gateway_setup::mount(s, &k, &mut layer);
+    } else {
+        desktop_update::mount(s, &k, &mut layer);
+    }
     if s.error.is_some() || !s.toasts.is_empty() {
         layer.push(notifications::region(s, &k));
     }

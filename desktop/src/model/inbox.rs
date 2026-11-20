@@ -104,6 +104,7 @@ pub enum UiAction {
     /// A background installer completed and authenticated local discovery succeeded.
     LocalInvite(u64, Option<crate::platform::pairing_invite::Invite>),
     DesktopUpdate(crate::platform::update::Status),
+    DesktopRestartCheckpoint(bool),
     LocalPairings(crate::platform::paired_devices::List),
     LocalPairingRevoked {
         id: String,
