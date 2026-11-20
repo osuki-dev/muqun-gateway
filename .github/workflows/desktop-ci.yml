@@ -46,6 +46,15 @@ jobs:
             echo "::error::cfg(target_os) is only allowed under desktop/src/platform/"
             exit 1
           fi
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.5
+      - name: Check the embedded plugin SDK
+        working-directory: desktop/sdk
+        run: |
+          bun install --frozen-lockfile
+          bun run typecheck
+          bun test
       - name: Verify the end-user installer with offline release fixtures
         run: python3 -m unittest discover -s desktop/scripts/tests -p test_install_desktop.py
       - name: No colour literals outside the theme
