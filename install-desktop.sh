@@ -201,7 +201,7 @@ else
   unzip -p "$tmp/$archive" 'Muqun Desktop.app/Contents/Helpers/muqun-desktop-install' > "$tmp/install"
 fi
 chmod 700 "$tmp/install"
-"$tmp/install" "$system" "$tmp/$archive" "$dest"
+"$tmp/install" "$system" "$tmp/$archive" "$dest" "${tag#desktop-v}"
 printf 'Installed Muqun Desktop %s under %s.\n' "$tag" "$dest"
 marker="$config/muqun-desktop/gateway-auto-install.disabled"
 if [ "$without_gateway" = true ]; then

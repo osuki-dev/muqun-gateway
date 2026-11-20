@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -174,7 +175,7 @@ func activate(dest, txn, payload string, paths []string, system string) error {
 	return os.Remove(journal)
 }
 
-func install(system, archive, dest string) (result error) {
+func install(system, archive, dest, version string) (result error) {
 	full, err := filepath.Abs(dest)
 	if err != nil {
 		return err
@@ -210,15 +211,31 @@ func install(system, archive, dest string) (result error) {
 	if err != nil {
 		return err
 	}
+	marker := "share/muqun-desktop/installers/VERSION"
+	if system == "Darwin" {
+		marker = filepath.Join(macApp, "Contents/Resources/installers/VERSION")
+	}
+	f, err := os.Open(filepath.Join(payload, marker))
+	if err != nil {
+		return err
+	}
+	data, err := io.ReadAll(io.LimitReader(f, int64(len(version)+2)))
+	f.Close()
+	if err != nil {
+		return err
+	}
+	if string(data) != version+"\n" {
+		return errors.New("staged Desktop version differs from requested release")
+	}
 	return activate(dest, txn, payload, paths, system)
 }
 
 func main() {
-	if len(os.Args) != 4 {
-		fmt.Fprintln(os.Stderr, "usage: muqun-desktop-install OS ARCHIVE DEST")
+	if len(os.Args) != 5 {
+		fmt.Fprintln(os.Stderr, "usage: muqun-desktop-install OS ARCHIVE DEST VERSION")
 		os.Exit(2)
 	}
-	if err := install(os.Args[1], os.Args[2], os.Args[3]); err != nil {
+	if err := install(os.Args[1], os.Args[2], os.Args[3], os.Args[4]); err != nil {
 		fmt.Fprintln(os.Stderr, "Muqun installer:", err)
 		os.Exit(1)
 	}

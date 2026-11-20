@@ -91,7 +91,7 @@ cp "$FIXTURES/$name" "$out"''',
         path.write_text("#!/bin/sh\n" + body + "\n")
         path.chmod(0o755)
 
-    def fixture(self, tag, mac=False, desktop_executable=None):
+    def fixture(self, tag, mac=False, desktop_executable=None, packaged_version=None):
         v = tag.removeprefix("desktop-v")
         app = "Muqun Desktop.app"
         if mac:
@@ -127,7 +127,7 @@ cp "$FIXTURES/$name" "$out"''',
             )
             shutil.copy2(ROOT / "install-desktop.sh", linux)
             (linux / "install.sh").write_bytes(self.helper)
-            (linux / "VERSION").write_text(v + "\n")
+            (linux / "VERSION").write_text((packaged_version or v) + "\n")
             with tarfile.open(self.files / name, "w:gz") as tar:
                 tar.add(linux, arcname=linux.name)
         sha = hashlib.sha256((self.files / name).read_bytes()).hexdigest()
@@ -217,6 +217,14 @@ cp "$FIXTURES/$name" "$out"''',
         records = events(self.run_installer("--tag", PREVIEW, success=False))
         self.assertEqual(records[-1], "verify")
         self.assertNotIn("install", records)
+
+    def test_mislabeled_verified_update_preserves_installed_version(self):
+        self.fixture(STABLE)
+        self.run_installer("--tag", STABLE)
+        self.fixture(PREVIEW, packaged_version="1.0.4")
+        error = self.run_installer("--tag", PREVIEW, success=False)
+        self.assertIn("staged Desktop version differs", error.stderr)
+        self.assertEqual((Path(self.env["PREFIX"]) / "bin/muqun-desktop").read_text(), "1.0.2")
 
     def test_archive_with_external_link_fails_before_install(self):
         name = self.fixture(STABLE)
