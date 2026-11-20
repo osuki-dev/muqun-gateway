@@ -6,7 +6,8 @@ use crate::{
 };
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
+    os::{fd::OwnedFd, unix::net::UnixStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -27,7 +28,13 @@ pub enum Status {
     Disabled,
     Existing,
     Remote,
+    NeedsConsent,
+    Deferred,
     Installing,
+    Downloading { received: u64, total: u64 },
+    Verifying,
+    Activating,
+    Starting,
     Ready,
     Failed,
     Interrupted,
@@ -40,9 +47,13 @@ impl Status {
             Self::Disabled => "Local-only mode: automatic Gateway installation is disabled.",
             Self::Existing => "An existing Gateway installation was left unchanged.",
             Self::Remote => "Remote computer selected; local Gateway setup was skipped.",
-            Self::Installing => {
-                "Installing local Gateway in the background. Local mode remains available."
-            }
+            Self::NeedsConsent => "Install Gateway to connect your devices to this computer.",
+            Self::Deferred => "Gateway setup is available when you are ready.",
+            Self::Installing => "Preparing Gateway setup…",
+            Self::Downloading { .. } => "Downloading Gateway…",
+            Self::Verifying => "Verifying the Gateway download…",
+            Self::Activating => "Installing Gateway…",
+            Self::Starting => "Starting Gateway…",
             Self::Ready => "Local Gateway is ready. Connect when your current work is finished.",
             Self::Failed => {
                 "Gateway setup failed or timed out. Local mode remains available; retry when ready."
@@ -53,7 +64,10 @@ impl Status {
         }
     }
     pub fn retryable(&self) -> bool {
-        matches!(self, Self::Failed | Self::Interrupted | Self::Disabled)
+        matches!(
+            self,
+            Self::NeedsConsent | Self::Deferred | Self::Failed | Self::Interrupted | Self::Disabled
+        )
     }
 }
 
@@ -117,6 +131,19 @@ pub fn initialize(
     }
 }
 
+/// Dismiss the first-launch invitation for this run. Settings can reopen setup.
+pub fn defer() {
+    if let Some(context) = CONTEXT.get() {
+        let mut status = context.status.lock().unwrap();
+        if *status == Status::NeedsConsent {
+            *status = Status::Deferred;
+            context
+                .inbox
+                .push(Update::Ui(UiAction::LocalGatewayStatus(Status::Deferred)));
+        }
+    }
+}
+
 pub fn set_local_only(disabled: bool) {
     let Some(context) = CONTEXT.get() else {
         return;
@@ -124,7 +151,7 @@ pub fn set_local_only(disabled: bool) {
     if disabled {
         context.cancel.store(true, Ordering::Release);
         if fs::create_dir_all(&context.config).is_ok() {
-            let _ = private_file(&context.config.join(OPT_OUT), false);
+            let _ = private_file(&context.config.join(OPT_OUT));
         }
         *context.status.lock().unwrap() = Status::Disabled;
     } else {
@@ -147,13 +174,13 @@ pub fn retry(config: &DesktopConfig) {
     }
 }
 
-fn begin(context: Arc<Context>, retry: bool) {
+fn begin(context: Arc<Context>, consent: bool) {
     if context.running.swap(true, Ordering::AcqRel) {
         return;
     }
     context.cancel.store(false, Ordering::Release);
     std::thread::spawn(move || {
-        let result = provision(&context, retry, DEADLINE);
+        let result = provision(&context, consent, DEADLINE);
         *context.status.lock().unwrap() = result.clone();
         context.running.store(false, Ordering::Release);
         context
@@ -251,14 +278,9 @@ fn running_gateway_named(pattern: &str) -> Option<bool> {
     }
 }
 
-fn private_file(path: &Path, exclusive: bool) -> std::io::Result<std::fs::File> {
+fn private_file(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = OpenOptions::new();
-    options.write(true);
-    if exclusive {
-        options.create_new(true);
-    } else {
-        options.create(true).truncate(true);
-    }
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -267,7 +289,7 @@ fn private_file(path: &Path, exclusive: bool) -> std::io::Result<std::fs::File> 
     options.open(path)
 }
 
-fn provision(context: &Context, retry: bool, deadline: Duration) -> Status {
+fn provision(context: &Context, consent: bool, deadline: Duration) -> Status {
     if context.cancel.load(Ordering::Acquire) || context.config.join(OPT_OUT).exists() {
         return Status::Disabled;
     }
@@ -302,7 +324,7 @@ fn provision(context: &Context, retry: bool, deadline: Duration) -> Status {
     let Some(installer) = &context.installer else {
         return Status::Unavailable;
     };
-    install_once(context, installer, &paths, retry, deadline, || {
+    install_once(context, installer, &paths, consent, deadline, || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -342,17 +364,24 @@ fn install_once(
     context: &Context,
     installer: &Path,
     paths: &[PathBuf],
-    retry: bool,
+    consent: bool,
     deadline: Duration,
     ready: impl FnOnce() -> bool,
 ) -> Status {
     if context.cancel.load(Ordering::Acquire) || context.config.join(OPT_OUT).exists() {
         return Status::Disabled;
     }
+    if !consent {
+        return if context.state.join(ATTEMPT).exists() {
+            Status::Interrupted
+        } else {
+            Status::NeedsConsent
+        };
+    }
     if fs::create_dir_all(&context.state).is_err() {
         return Status::Failed;
     }
-    let Ok(owner) = private_file(&context.state.join("gateway-bootstrap.lock"), false) else {
+    let Ok(owner) = private_file(&context.state.join("gateway-bootstrap.lock")) else {
         return Status::Failed;
     };
     #[cfg(unix)]
@@ -363,12 +392,8 @@ fn install_once(
     let attempt = context.state.join(ATTEMPT);
     // Persist before execution. Even an interrupted app or ambiguous install
     // result requires an explicit retry on the next launch.
-    let mut record = match private_file(&attempt, !retry) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Status::Interrupted
-        }
-        Err(_) => return Status::Failed,
+    let Ok(mut record) = private_file(&attempt) else {
+        return Status::Failed;
     };
     if record
         .write_all(b"started\n")
@@ -377,11 +402,17 @@ fn install_once(
     {
         return Status::Failed;
     }
-    *context.status.lock().unwrap() = Status::Installing;
-    context
-        .inbox
-        .push(Update::Ui(UiAction::LocalGatewayStatus(Status::Installing)));
-    let outcome = run_installer(installer, paths, &context.cancel, deadline);
+    let progress = |status: Status| {
+        let mut current = context.status.lock().unwrap();
+        if *current != status && !context.cancel.load(Ordering::Acquire) {
+            *current = status.clone();
+            context
+                .inbox
+                .push(Update::Ui(UiAction::LocalGatewayStatus(status)));
+        }
+    };
+    progress(Status::Installing);
+    let outcome = run_installer(installer, paths, &context.cancel, deadline, progress);
     if outcome != Status::Ready {
         return outcome;
     }
@@ -392,22 +423,48 @@ fn install_once(
     }
 }
 
+fn parse_progress(line: &[u8]) -> Option<Status> {
+    let mut words = std::str::from_utf8(line).ok()?.split_ascii_whitespace();
+    if words.next()? != "MUQUN_PROGRESS" {
+        return None;
+    }
+    let status = match words.next()? {
+        "download" => Status::Downloading {
+            received: words.next()?.parse().ok()?,
+            total: words.next()?.parse().ok()?,
+        },
+        "verify" => Status::Verifying,
+        "install" => Status::Activating,
+        "start" => Status::Starting,
+        _ => return None,
+    };
+    words.next().is_none().then_some(status)
+}
+
 fn run_installer(
     installer: &Path,
     paths: &[PathBuf],
     cancel: &AtomicBool,
     deadline: Duration,
+    progress: impl Fn(Status),
 ) -> Status {
     if cancel.load(Ordering::Acquire) {
         return Status::Disabled;
     }
-    let mut command = Command::new("/bin/bash");
+    let Ok((mut events, output)) = UnixStream::pair() else {
+        return Status::Failed;
+    };
+    if events.set_nonblocking(true).is_err() {
+        return Status::Failed;
+    }
+    let mut command = Command::new("/bin/sh");
     command
         .arg(installer)
         .arg("--gateway-only")
+        .env("MUQUN_INSTALL_PROGRESS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::from(OwnedFd::from(output)));
     if let Ok(path) = std::env::join_paths(paths) {
         command.env("PATH", path);
     }
@@ -429,9 +486,29 @@ fn run_installer(
     let Ok(mut child) = command.spawn() else {
         return Status::Failed;
     };
+    drop(command);
     let started = Instant::now();
+    let mut buffer = [0u8; 4096];
+    let mut line = Vec::new();
     loop {
-        if let Ok(Some(exit)) = child.try_wait() {
+        let exit = child.try_wait();
+        // Drain before returning a completed child so short phase transitions
+        // reach the UI. Never wait on a descriptor inherited by a service.
+        while let Ok(count @ 1..) = events.read(&mut buffer) {
+            for byte in &buffer[..count] {
+                if *byte == b'\n' {
+                    if line.len() <= 128 {
+                        if let Some(status) = parse_progress(&line) {
+                            progress(status);
+                        }
+                    }
+                    line.clear();
+                } else if line.len() <= 128 {
+                    line.push(*byte);
+                }
+            }
+        }
+        if let Ok(Some(exit)) = exit {
             return if exit.success() {
                 Status::Ready
             } else {
@@ -518,7 +595,9 @@ printf 'attempt\n' >> "${{0%/*}}/attempts"
     #[test]
     fn first_launch_is_once_and_failure_requires_explicit_retry_without_a_terminal() {
         let fixture = Fixture::new("exit 9");
-        assert_eq!(fixture.attempt(false), Status::Failed);
+        assert_eq!(fixture.attempt(false), Status::NeedsConsent);
+        assert_eq!(fixture.count(), 0);
+        assert_eq!(fixture.attempt(true), Status::Failed);
         assert_eq!(fixture.count(), 1);
         assert_eq!(fixture.attempt(false), Status::Interrupted);
         assert_eq!(fixture.count(), 1);
@@ -538,10 +617,52 @@ printf 'attempt\n' >> "${0%/*}/attempts"
     }
 
     #[test]
+    fn consented_install_streams_actual_download_bytes_and_activation_stages() {
+        let fixture = Fixture::new(
+            r#"
+[ "$MUQUN_INSTALL_PROGRESS" = 1 ]
+printf 'ordinary installer output\nMUQUN_PROGRESS download 20' >&2
+sleep 0.15
+printf ' 100\nMUQUN_PROGRESS download 100 100\nMUQUN_PROGRESS verify\nMUQUN_PROGRESS install\nMUQUN_PROGRESS start\n' >&2
+"#,
+        );
+        assert_eq!(fixture.attempt(false), Status::NeedsConsent);
+        assert!(!fixture.context.state.exists());
+        assert_eq!(fixture.attempt(true), Status::Ready);
+        let statuses: Vec<_> = fixture
+            .context
+            .inbox
+            .take()
+            .into_iter()
+            .filter_map(|update| match update {
+                Update::Ui(UiAction::LocalGatewayStatus(status)) => Some(status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                Status::Installing,
+                Status::Downloading {
+                    received: 20,
+                    total: 100
+                },
+                Status::Downloading {
+                    received: 100,
+                    total: 100
+                },
+                Status::Verifying,
+                Status::Activating,
+                Status::Starting
+            ]
+        );
+    }
+
+    #[test]
     fn inherited_lock_descriptor_cannot_extend_a_finished_install_attempt() {
         let fixture = Fixture::new("exit 0");
         let path = fixture.root.join("gateway-bootstrap.lock");
-        let file = private_file(&path, false).unwrap();
+        let file = private_file(&path).unwrap();
         let inherited = file.try_clone().unwrap();
         let owner = AttemptLock::acquire(file).unwrap();
         // The child keeps the same open file description as a pre-exec fork.
@@ -552,7 +673,7 @@ printf 'attempt\n' >> "${0%/*}/attempts"
             .stdout(inherited)
             .spawn()
             .unwrap();
-        let acquire = || AttemptLock::acquire(private_file(&path, false).unwrap());
+        let acquire = || AttemptLock::acquire(private_file(&path).unwrap());
         assert!(matches!(acquire(), Err(Status::Installing)));
         drop(owner);
         assert!(child.try_wait().unwrap().is_none());
@@ -572,7 +693,8 @@ printf 'attempt\n' >> "${0%/*}/attempts"
                 fixture.context.installer.as_deref().unwrap(),
                 &paths,
                 &fixture.context.cancel,
-                Duration::from_millis(100)
+                Duration::from_millis(100),
+                |_| {}
             ),
             Status::Failed
         );
@@ -583,7 +705,8 @@ printf 'attempt\n' >> "${0%/*}/attempts"
                 fixture.context.installer.as_deref().unwrap(),
                 &paths,
                 &fixture.context.cancel,
-                Duration::from_secs(2)
+                Duration::from_secs(2),
+                |_| {}
             ),
             Status::Disabled
         );
