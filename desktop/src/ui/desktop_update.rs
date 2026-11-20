@@ -143,6 +143,7 @@ pub(super) fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                     received: *received,
                     total: *total,
                 },
+                Some(Phase::Verifying) => DownloadProgress::Verifying,
                 _ => DownloadProgress::Busy,
             };
             (
@@ -170,7 +171,7 @@ pub(super) fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
             (
                 version,
                 message,
-                None,
+                Some(DownloadProgress::Complete),
                 "Later",
                 Some(
                     Button::new(tr("Restart now"))
