@@ -95,6 +95,7 @@ fn run_installer(
 
 #[derive(Default)]
 struct DownloadCase {
+    desktop_terminal: bool,
     preview: bool,
     existing: Option<&'static str>,
     fault: Option<&'static str>,
@@ -308,7 +309,7 @@ esac
         &script,
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "$MOCK_LOG"
-if [ "${1:-}" = setup ]; then
+if [ "${1:-}" = setup ] && [ "${2:-}" != --help ]; then
   printf '%s\000' "$@" > "$MOCK_SETUP_LOG"
   [ "$MOCK_FAULT" != setup ] || exit 1
 fi
@@ -325,6 +326,8 @@ case "$*" in
     hung-version) exec sleep 30;;
     *) printf 'muqun-gateway %s\n' "$MOCK_VERSION";;
   esac;;
+'setup --help')
+  [ "$MOCK_FAULT" = pre-desktop ] || echo '  --desktop-terminal';;
 'update --help')
   case "$MOCK_EXISTING" in
     channel*) printf '%s\n' 'Check or manually install a newer stable official release (never downgrades).' 'Usage: muqun-gateway update [OPTIONS]' '  --check' '  --channel';;
@@ -400,6 +403,9 @@ esac
     } else {
         let mut cmd = Command::new("/bin/sh");
         cmd.arg(&installer);
+        if case.desktop_terminal {
+            cmd.arg("--desktop-terminal");
+        }
         if case.preview {
             cmd.args(["--channel", "preview"]);
         }
@@ -606,7 +612,7 @@ esac
     } else if !status.success() && !calls.contains("setup --backend") {
         assert!(!destination.exists(), "unverified binary was installed");
         assert!(
-            calls.is_empty() || calls == "--version\n",
+            calls.is_empty() || calls == "--version\n" || calls == "--version\nsetup --help\n",
             "unverified binary was executed: {calls}"
         );
     }
@@ -640,7 +646,11 @@ esac
     // Unlike the human-readable call log, NUL boundaries prove argv remains
     // intact when a path contains whitespace or shell metacharacters.
     let arguments = fs::read(&setup_log).unwrap();
-    let mut expected = vec!["setup", "--backend", if tmux { "tmux" } else { "herdr" }];
+    let mut expected = if case.desktop_terminal && !tmux && !herdr {
+        vec!["setup", "--desktop-terminal"]
+    } else {
+        vec!["setup", "--backend", if tmux { "tmux" } else { "herdr" }]
+    };
     if let Some(port) = port {
         expected.extend(["--port", port]);
     }
@@ -660,6 +670,48 @@ esac
         "installer changed setup argument boundaries"
     );
     Ok(if case.transcript { transcript } else { calls })
+}
+
+#[test]
+fn desktop_install_without_external_terminals_starts_the_gateway() {
+    for darwin in [false, true] {
+        let calls = run_installer_case(
+            false,
+            false,
+            None,
+            false,
+            None,
+            None,
+            "running",
+            DownloadCase {
+                desktop_terminal: true,
+                darwin,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(calls.contains("setup --desktop-terminal\n"));
+        assert!(calls.contains("\nstart\n"));
+        assert!(!calls.contains("autostart "));
+    }
+    let incompatible = run_installer_case(
+        false,
+        false,
+        None,
+        false,
+        None,
+        None,
+        "running",
+        DownloadCase {
+            desktop_terminal: true,
+            fault: Some("pre-desktop"),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(incompatible.contains("predates built-in Desktop terminal support"));
+    let standalone = run_installer(false, false, None, false, None, None, "running").unwrap_err();
+    assert!(standalone.contains("Neither Herdr"));
 }
 
 #[test]

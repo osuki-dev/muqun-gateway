@@ -467,6 +467,26 @@ pub(crate) struct SessionConfig {
     pub(crate) backend: BackendKind,
 }
 
+impl SessionConfig {
+    pub(crate) const DESKTOP_ID: &'static str = "desktop-terminal";
+
+    // Keep the existing Herdr-compatible wire representation, with a distinct
+    // identity for the native adapter even when its socket has a custom name.
+    pub(crate) fn is_desktop_terminal(&self) -> bool {
+        self.backend == BackendKind::Herdr
+            && self.id == Self::DESKTOP_ID
+            && self.label == crate::backend::muqun_term::MUQUN_WORKSPACE_LABEL
+    }
+
+    pub(crate) fn backend_display_name(&self) -> &'static str {
+        if self.is_desktop_terminal() {
+            "muqun-terminal"
+        } else {
+            self.backend.as_str()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PairingPayload {
     pub(crate) kind: String,

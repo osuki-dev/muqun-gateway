@@ -23,12 +23,14 @@ set -eu
 REPO="osuki-dev/muqun-gateway"
 channel=stable
 bootstrap=0
-case "$#" in
-  0) ;;
-  2) [ "$1" = --channel ] || { echo 'Usage: install.sh [--channel stable|preview]' >&2; exit 1; }
-     channel="$2" ;;
-  *) echo 'Usage: install.sh [--channel stable|preview]' >&2; exit 1 ;;
-esac
+desktop_terminal=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --channel) [ "$#" -ge 2 ] || { echo 'Missing channel.' >&2; exit 1; }; channel="$2"; shift 2 ;;
+    --desktop-terminal) desktop_terminal=1; shift ;;
+    *) echo 'Usage: install.sh [--channel stable|preview] [--desktop-terminal]' >&2; exit 1 ;;
+  esac
+done
 case "$channel" in stable|preview) ;; *) echo 'Channel must be stable or preview.' >&2; exit 1 ;; esac
 MIN_HERDR_VERSION="0.7.5"
 # Where the standalone (non-Herdr) binary lands. Overridable for anyone who
@@ -119,14 +121,16 @@ command -v herdr >/dev/null 2>&1 && have_herdr=1
 have_tmux=0
 command -v tmux >/dev/null 2>&1 && have_tmux=1
 
-if [ "$have_herdr" = 0 ] && [ "$have_tmux" = 0 ]; then
+if [ "$have_herdr" = 0 ] && [ "$have_tmux" = 0 ] && [ "$desktop_terminal" = 0 ]; then
   die "Neither Herdr (https://herdr.dev) nor tmux was found. Install one of them, then retry."
 fi
 
 # All detected backends use one standalone gateway, including Herdr-only hosts.
 # A plugin-owned gateway cannot start Herdr after reboot: it depends on Herdr
 # already running. Existing plugin pairings are imported below.
-if [ "$have_tmux" = 1 ]; then
+if [ "$have_herdr" = 0 ] && [ "$have_tmux" = 0 ]; then
+  setup_backend=desktop
+elif [ "$have_tmux" = 1 ]; then
   setup_backend=tmux
 else
   setup_backend=herdr
@@ -307,9 +311,10 @@ chmod 755 "$staging/$asset"
 # Only this staged native image is probed, with no input, bounded output and
 # a five-second wall deadline. Reap both the probe and its watchdog on every
 # exit; never print untrusted version output or fall back to publication.
+probe_blocks=1
 probe_staged() {
 (
-  ulimit -c 0 && ulimit -f 1 || exit 1
+  ulimit -c 0 && ulimit -f "$probe_blocks" || exit 1
   exec "$staging/$asset" "$@"
 ) </dev/null > "$staging/version" 2>/dev/null &
 probe_pid=$!
@@ -334,6 +339,12 @@ awk -v expected="muqun-gateway ${tag#v}" '
   NR != 1 || $0 != expected { bad = 1 }
   END { exit (NR != 1 || bad) }
 ' "$staging/version" || die "Staged binary version does not match $tag; nothing installed."
+if [ "$setup_backend" = desktop ] && [ "$bootstrap" = 0 ]; then
+  probe_blocks=16
+  probe_staged setup --help &&
+    grep -Eq '^[[:space:]]*--desktop-terminal([[:space:]]|$)' "$staging/version" ||
+    die "Gateway $tag predates built-in Desktop terminal support. Install a newer Gateway release; nothing installed."
+fi
 stage_ok
 if [ "$bootstrap" = 1 ]; then
   stage "Run protected preview bootstrap"
@@ -419,7 +430,11 @@ fi
 info "Configuring the $setup_backend backend..."
 # POSIX positional parameters preserve exact argument boundaries. Never build a
 # shell command string: socket paths may contain spaces, quotes or glob syntax.
-set -- setup --backend "$setup_backend"
+if [ "$setup_backend" = desktop ]; then
+  set -- setup --desktop-terminal
+else
+  set -- setup --backend "$setup_backend"
+fi
 if [ -n "${MUQUN_GATEWAY_PORT:-}" ]; then
   set -- "$@" --port "$MUQUN_GATEWAY_PORT"
 fi
@@ -454,33 +469,37 @@ elif [ "$have_tmux" = 1 ]; then
   [ -n "$tmux_id" ] && "$binary" backend default "$tmux_id" >/dev/null
 fi
 
-# Backend startup is separate from registering the gateway with the OS. An
-# empty answer or a noninteractive install preserves the existing preference.
-echo
-echo "Start configured terminal backends when the gateway starts?"
-echo "  Existing tmux/Herdr sessions are reused, never replaced."
-echo "  If stopped, tmux opens a detached shell and Herdr starts headless."
-echo "  Herdr may restore its saved workspace; no agent prompts or trust"
-echo "  approvals are submitted by the gateway."
-echo "  Default: keep your current settings (new installs: off)."
-if (exec 3< /dev/tty) 2>/dev/null; then
-  printf "Enable backend startup? [y/N] "
-  backend_answer=n
-  if read -r backend_answer < /dev/tty 2>/dev/null; then :; else backend_answer=n; fi
-  case "$backend_answer" in
-    y|Y|yes|YES|Yes)
-      "$binary" backend list | cut -f1 | while IFS= read -r backend_id; do
-        if ! "$binary" backend autostart "$backend_id" on; then
-          warn "Could not enable startup for $backend_id; it will need manual startup."
-        fi
-      done
-      ;;
-    *) info "Backend startup settings unchanged." ;;
-  esac
+if [ "$setup_backend" = desktop ]; then
+  info "Muqun Desktop starts its built-in terminal daemon. Gateway pairing and agent sessions are available independently."
 else
-  info "No terminal to ask on; backend startup settings unchanged."
+  # Backend startup is separate from registering the gateway with the OS. An
+  # empty answer or a noninteractive install preserves the existing preference.
+  echo
+  echo "Start configured terminal backends when the gateway starts?"
+  echo "  Existing tmux/Herdr sessions are reused, never replaced."
+  echo "  If stopped, tmux opens a detached shell and Herdr starts headless."
+  echo "  Herdr may restore its saved workspace; no agent prompts or trust"
+  echo "  approvals are submitted by the gateway."
+  echo "  Default: keep your current settings (new installs: off)."
+  if (exec 3< /dev/tty) 2>/dev/null; then
+    printf "Enable backend startup? [y/N] "
+    backend_answer=n
+    if read -r backend_answer < /dev/tty 2>/dev/null; then :; else backend_answer=n; fi
+    case "$backend_answer" in
+      y|Y|yes|YES|Yes)
+        "$binary" backend list | cut -f1 | while IFS= read -r backend_id; do
+          if ! "$binary" backend autostart "$backend_id" on; then
+            warn "Could not enable startup for $backend_id; it will need manual startup."
+          fi
+        done
+        ;;
+      *) info "Backend startup settings unchanged." ;;
+    esac
+  else
+    info "No terminal to ask on; backend startup settings unchanged."
+  fi
+  echo "  Change later: $binary backend autostart <backend-id> on|off"
 fi
-echo "  Change later: $binary backend autostart <backend-id> on|off"
 
 stage_ok
 stage "Start Gateway and ask autostart"
@@ -608,9 +627,13 @@ if [ "$gateway_state" = running ]; then
 else
   echo "Gateway readiness: unconfirmed; check service status."
 fi
-echo "Backends configured:"
-"$binary" backend list | awk -F'\t' '{ printf "  %s %s (%s)\n", (NR == 1 ? "*" : " "), $1, $2 }'
-echo "(* default)"
+if [ "$setup_backend" = desktop ]; then
+  echo "Terminal backend: Muqun Terminal (provided by Desktop)."
+else
+  echo "Backends configured:"
+  "$binary" backend list | awk -F'\t' '{ printf "  %s %s (%s)\n", (NR == 1 ? "*" : " "), $1, $2 }'
+  echo "(* default)"
+fi
 echo
 echo "Open the pairing QR any time with:"
 echo "  $binary manage"
