@@ -225,6 +225,35 @@ fi
 umask 077
 staging="$(mktemp -d "$INSTALL_DIR/.muqun-gateway-install.XXXXXX")" || die "Cannot create private staging directory."
 
+# GUI bootstrap reads these fixed records from stderr; stage labels and
+# diagnostics on the normal CLI remain independent of the machine protocol.
+gui_progress() {
+  if [ "${MUQUN_INSTALL_PROGRESS:-}" = 1 ]; then
+    printf 'MUQUN_PROGRESS %s\n' "$1" >&2
+  fi
+}
+
+download_sample() {
+  received=0
+  if [ -f "$output" ]; then received=$(wc -c < "$output"); fi
+  # curl may follow redirects. Only the final successful response can name
+  # the download size. Missing/chunked lengths are reported as zero.
+  total=$(LC_ALL=C awk -v cap="$max_bytes" '
+    /^HTTP\// {ok=($2 == 200); size=0; chunked=0}
+    ok && tolower($1) == "content-length:" {
+      sub(/\r$/, "", $2)
+      if ($2 ~ /^[0-9]+$/ && $2+0 <= cap) size=$2+0
+    }
+    ok && tolower($1) == "transfer-encoding:" && tolower($0) ~ /chunked/ {chunked=1}
+    END {printf "%.0f", chunked ? 0 : size+0}
+  ' "$headers")
+  sample="download $((received + 0)) $total"
+  if [ "$sample" != "$last_sample" ]; then
+    gui_progress "$sample"
+    last_sample=$sample
+  fi
+}
+
 download() (
   # curl versions before 8.4 only enforce --max-filesize for known lengths.
   # The file-size limit also bounds chunked writes. Its unit is the shell's:
@@ -234,14 +263,33 @@ download() (
   ulimit -c 0 || exit 1
   ulimit -f "$((($3 + 511) / 512))" || exit 1
   url="$1" output="$2" max_bytes="$3"
+  report=${4:-}
   set -- -fsSL
   if [ "$color" = 1 ] && [ -t 2 ]; then
     # curl reports measured bytes/known Content-Length, never a simulated %.
     # Let curl size its own progress display to the terminal.
     set -- -fSL --progress-bar
   fi
-  curl "$@" --proto '=https' --proto-redir '=https' --connect-timeout 10 \
-    --max-time 120 --max-filesize "$max_bytes" "$url" -o "$output" || exit 1
+  set -- "$@" --proto '=https' --proto-redir '=https' --connect-timeout 10 \
+    --max-time 120 --max-filesize "$max_bytes" "$url" -o "$output"
+  if [ "$report" = binary ] && [ "${MUQUN_INSTALL_PROGRESS:-}" = 1 ]; then
+    headers="$staging/download-headers"
+    : > "$headers"
+    last_sample=
+    download_sample
+    curl --dump-header "$headers" "$@" &
+    transfer=$!
+    trap 'kill "$transfer" 2>/dev/null || :; wait "$transfer" 2>/dev/null || :; exit 1' HUP INT TERM
+    while kill -0 "$transfer" 2>/dev/null; do
+      download_sample
+      sleep 0.25
+    done
+    wait "$transfer" || exit 1
+    trap - HUP INT TERM
+    download_sample
+  else
+    curl "$@" || exit 1
+  fi
   [ "$(wc -c < "$output")" -le "$max_bytes" ]
 )
 
@@ -269,7 +317,8 @@ stage_ok
 stage "Download binary and checksum"
 asset="muqun-gateway-$target"
 download_url="$api/$tag/$asset"
-download "$download_url" "$staging/$asset" 268435456 || die "Binary download failed; nothing installed."
+download "$download_url" "$staging/$asset" 268435456 binary || die "Binary download failed; nothing installed."
+gui_progress verify
 download "$download_url.sha256" "$staging/checksum" 1024 || die "Checksum download failed; nothing installed."
 stage_ok
 stage "Verify release identity"
@@ -360,6 +409,7 @@ if [ "$bootstrap" = 1 ]; then
   exit 0
 fi
 stage "Publish verified binary"
+gui_progress install
 # A concurrent installer must not clobber an image published since our check.
 # Hard-link publication refuses existing files; also refuse directory/symlink
 # destinations rather than letting ln interpret them as a target directory.
@@ -503,6 +553,7 @@ fi
 
 stage_ok
 stage "Start Gateway and ask autostart"
+gui_progress start
 if [ "$already_installed" = 1 ]; then
   # Refresh the unit as well as the binary, including child-process lifetime
   # rules that keep persistent terminals alive across gateway restarts.
