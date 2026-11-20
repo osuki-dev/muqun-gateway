@@ -22,8 +22,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::platform::pty::{self, Child, Exit, Pty, WinSize};
 
-/// Default socket filename placed in the user configuration directory.
-pub const DEFAULT_SOCKET_NAME: &str = "term.sock";
+pub use muqun_gateway::desktop_terminal_socket as default_socket_path;
 
 /// Default scrollback buffer capacity per session (1 MiB).
 pub const DEFAULT_SCROLLBACK_CAPACITY: usize = 1024 * 1024;
@@ -40,22 +39,6 @@ fn default_cols() -> u16 {
 
 fn default_rows() -> u16 {
     DEFAULT_ROWS
-}
-
-/// Returns the platform default socket path:
-/// `~/.config/muqun-desktop/term.sock` on Linux.
-pub fn default_socket_path() -> PathBuf {
-    if let Some(config_dir) = dirs::config_dir() {
-        config_dir
-            .join(crate::platform::DIR_NAME)
-            .join(DEFAULT_SOCKET_NAME)
-    } else {
-        std::env::temp_dir().join(format!(
-            "{}-{}",
-            crate::platform::DIR_NAME,
-            DEFAULT_SOCKET_NAME
-        ))
-    }
 }
 
 // ============================================================================

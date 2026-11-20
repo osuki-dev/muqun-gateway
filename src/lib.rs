@@ -52,6 +52,7 @@ pub(crate) use platform::store::*;
 pub(crate) use platform::uploads::*;
 pub(crate) use platform::{discovery, git, i18n, parts, state_lock};
 pub use tasks::service::{home_relative, untitled_placeholder};
+pub use terminal::backend::muqun_term::default_socket_path as desktop_terminal_socket;
 pub(crate) use terminal::factory::*;
 pub(crate) use terminal::routes::*;
 pub(crate) use terminal::{
