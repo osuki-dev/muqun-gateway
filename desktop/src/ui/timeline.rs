@@ -7,8 +7,6 @@
 //!   space it is given (any width; tiles down to ~480 pt). Call it once per
 //!   visible session.
 //! - [`view`]`(s, k)`: the selected session's, for the single-session page.
-//! - [`overlay`]`(s, k)`: the image zoom, when one is open; push it onto the
-//!   root layer.
 //! - Split tiles (`ui::tiles`) open sessions beside the focused one; every
 //!   open session's timeline is kept in `UiState::timelines`.
 //!
@@ -111,6 +109,9 @@ pub struct SessionTimeline {
     /// Otherwise each completion merges adjacent groups and removes visible rows.
     live_commands: HashSet<String>,
     row_keys: Vec<String>,
+    pub(super) sent_images: HashMap<String, Vec<String>>,
+    inbox_ids: HashSet<String>,
+    inbox_seq: u64,
     /// The row the keyboard is on (an item id, or a group's key).
     pub selected: Option<String>,
     /// The reader scrolled up off the bottom: the list stopped following it
@@ -129,9 +130,13 @@ pub fn group_key(first: &TimelineItem) -> String {
 
 impl SessionTimeline {
     /// A snapshot: the whole list, as of now. Reader state stays.
-    pub fn replace(&mut self, items: Vec<TimelineItem>) {
+    pub fn replace(&mut self, mut items: Vec<TimelineItem>) {
+        for item in &mut items {
+            self.restore_sent_images(item);
+        }
         let started = std::time::Instant::now();
         let keep: HashSet<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        self.sent_images.retain(|id, _| keep.contains(id.as_str()));
         self.diffs.retain(|id, _| keep.contains(id.as_str()));
         self.live_commands.retain(|id| keep.contains(id.as_str()));
         for item in &items {
@@ -149,7 +154,8 @@ impl SessionTimeline {
     /// Live rows: replace by id, else append.
     pub fn upsert(&mut self, items: Vec<TimelineItem>) {
         let mut regroup = false;
-        for item in items {
+        for mut item in items {
+            self.restore_sent_images(&mut item);
             self.ingest(&item);
             // New and updated rows are nearly always at the tail.
             match self.items.iter().rposition(|t| t.id == item.id) {
@@ -185,9 +191,45 @@ impl SessionTimeline {
         self.away = !at;
     }
 
+    /// A provider may expose a user row before it removes the matching inbox
+    /// receipt. Keep the row for replay but present it only after delivery.
+    pub fn apply_inbox(&mut self, items: &[crate::model::compose::InboxItem], seq: u64) -> bool {
+        if seq < self.inbox_seq {
+            return false;
+        }
+        self.inbox_seq = seq;
+        let ids = items.iter().map(|i| i.id.clone()).collect();
+        if self.inbox_ids != ids {
+            self.inbox_ids = ids;
+            self.regroup();
+        }
+        true
+    }
+
+    pub(super) fn holds_inbox(&self, id: &str) -> bool {
+        self.inbox_ids.contains(id)
+    }
+
+    fn restore_sent_images(&self, item: &mut TimelineItem) {
+        if item.role == TimelineRole::User && item.attachments.as_ref().is_none_or(Vec::is_empty) {
+            if let Some(paths) = self.sent_images.get(&item.id) {
+                item.attachments = Some(paths.clone());
+            }
+        }
+    }
+
     /// Fold the rows again, after the list changed.
-    fn regroup(&mut self) {
+    pub(super) fn regroup(&mut self) {
         self.blocks = activity::blocks(&self.items, |id| self.live_commands.contains(id));
+        if !self.inbox_ids.is_empty() {
+            self.blocks.retain(|block| match *block {
+                Block::Item(i) => {
+                    let row = &self.items[i];
+                    row.role != TimelineRole::User || !self.inbox_ids.contains(&row.message_id)
+                }
+                Block::Group { .. } => true,
+            });
+        }
         let same_keys = self.blocks.len() == self.row_keys.len()
             && self
                 .blocks
@@ -228,6 +270,7 @@ impl SessionTimeline {
         self.live_commands.retain(|id| !ids.contains(id));
         self.regroup();
         for id in ids {
+            self.sent_images.remove(id);
             self.diffs.remove(id);
         }
     }
@@ -393,7 +436,7 @@ fn row_at<'a>(s: &'a UiState, asid: &str, i: usize) -> Option<Row<'a>> {
     match tl.blocks.get(i - 1) {
         Some(Block::Item(at)) => tl.items.get(*at).map(Row::Item),
         Some(Block::Group { start, end }) => tl.items.get(*start..*end).map(Row::Group),
-        None => match s.echoes_of(asid).get(i - 1 - tl.blocks.len()) {
+        None => match s.timeline_echoes(asid).nth(i - 1 - tl.blocks.len()) {
             Some(echo) => Some(Row::Echo(echo)),
             None => Some(Row::Working),
         },
@@ -402,7 +445,7 @@ fn row_at<'a>(s: &'a UiState, asid: &str, i: usize) -> Option<Row<'a>> {
 
 fn row_count(s: &UiState, asid: &str) -> usize {
     let n = s.timelines.get(asid).map_or(0, |t| t.blocks.len());
-    1 + n + s.echoes_of(asid).len() + usize::from(s.session_busy(asid))
+    1 + n + s.timeline_echoes(asid).count() + usize::from(s.session_busy(asid))
 }
 
 /// One session's timeline: a virtualised list that only builds the rows
@@ -455,7 +498,7 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
                 ),
         );
     };
-    if tl.items.is_empty() && tl.earlier_exhausted {
+    if tl.items.is_empty() && tl.earlier_exhausted && s.echoes_of(asid).is_empty() {
         return empty(s, k, &key);
     }
     let count = row_count(s, asid);
@@ -554,16 +597,7 @@ pub fn session_view(s: &UiState, k: &Kit, asid: &str) -> El {
         })
         .on_secondary_press(move |s: &mut UiState, press, tx: &mut rune::Tx| {
             if s.row_menu.is_none() {
-                let selection = tx
-                    .text_selection()
-                    .map(|ts| ts.text().to_string())
-                    .filter(|s| !s.is_empty());
-                s.row_menu = Some(crate::ui::RowMenu {
-                    asid: feed_asid.clone(),
-                    id: String::new(),
-                    point: press,
-                    selection,
-                });
+                s.row_menu = Some(crate::ui::RowMenu::at(&feed_asid, "", press, tx));
             }
         })
         .scroll_bar(k);
@@ -934,23 +968,8 @@ fn item_row(cx: &Tcx, it: &TimelineItem) -> El {
     let asid = cx.asid.to_string();
     let item_id = it.id.clone();
     wrap.on_secondary_press(move |s: &mut UiState, press, tx: &mut rune::Tx| {
-        let selection = tx
-            .text_selection()
-            .map(|ts| ts.text().to_string())
-            .filter(|s| !s.is_empty());
-        s.row_menu = Some(crate::ui::RowMenu {
-            asid: asid.clone(),
-            id: item_id.clone(),
-            point: press,
-            selection,
-        });
+        s.row_menu = Some(crate::ui::RowMenu::at(&asid, &item_id, press, tx));
     })
-}
-
-/// What the timeline draws over the window: an opened picture, else a
-/// subagent's detail sheet, else the context sheet.
-pub fn overlay(s: &UiState, k: &Kit) -> Option<El> {
-    parts::images::zoom_overlay(s, k).or_else(|| parts::detail::sheet(s, k))
 }
 
 /// The right-hand detail pane, while a row is open in it.
@@ -1674,7 +1693,7 @@ mod tests {
     }
 
     #[test]
-    fn right_click_on_timeline_opens_row_menu() {
+    fn right_click_copies_only_the_highlighted_part_of_a_timeline_row() {
         use rune::{Env, Runtime};
         let (tx, _rx) = crate::model::commands::channel();
         let mut s = UiState::new(tx);
@@ -1686,7 +1705,9 @@ mod tests {
                 "updated_ms": 1u64,
             }))
             .unwrap();
-        let item = text_item("msg-1");
+        let full = "Review these exact changes today";
+        let mut item = text_item("msg-1");
+        item.part = AgentPart::Text { text: full.into() };
         s.open_session("s1");
         s.apply_updates(vec![crate::model::inbox::Update::Snapshot(Box::new(
             muqun_gateway::agents::ports::AgentSessionSnapshot {
@@ -1700,66 +1721,55 @@ mod tests {
         ))]);
 
         let mut rt = Runtime::new(s, crate::ui::view, (1000.0, 800.0), Env::new(true, 1.0));
+        let clipboard = rune::clipboard::memory();
+        rt.use_clipboard(&clipboard);
         rt.frame(0.0);
-        let elements = rt.elements();
-        let msg = elements
+        let [x, y, w, h] = rt
+            .elements()
             .iter()
-            .find(|e| e.key.as_deref() == Some("item-msg-1"));
-        assert!(msg.is_some(), "item-msg-1 must be present in elements");
-        let rect = msg.unwrap().rect;
-        let glyphs: Vec<(f32, f32)> = rt
-            .instances
-            .iter()
-            .filter(|i| i.params[1] == rune::render::KIND_GLYPH)
-            .map(|i| {
-                (
-                    (i.rect[0] + i.rect[2] / 2.0) / 1.0,
-                    (i.rect[1] + i.rect[3] / 2.0) / 1.0,
-                )
-            })
-            .collect();
-        println!("glyphs count: {}", glyphs.len());
-        println!("first 5 glyphs: {:?}", &glyphs[..5.min(glyphs.len())]);
-        println!("msg rect: {:?}", rect);
-        let msg_glyphs: Vec<(f32, f32)> = glyphs
-            .into_iter()
-            .filter(|&(x, y)| {
-                x >= rect[0] && x <= rect[0] + rect[2] && y >= rect[1] && y <= rect[1] + rect[3]
-            })
-            .collect();
-        println!("msg_glyphs count: {}", msg_glyphs.len());
-        if msg_glyphs.len() >= 2 {
-            let (g0, g1) = (msg_glyphs[0], msg_glyphs[msg_glyphs.len() - 1]);
-            println!("dragging from {:?} to {:?}", g0, g1);
-            rt.pointer_move(g0.0 - 5.0, g0.1);
-            rt.pointer_down(g0.0 - 5.0, g0.1);
-            rt.frame(1.0 / 60.0);
-            for k in 1..=6 {
-                let f = k as f32 / 6.0;
-                rt.pointer_move(g0.0 + (g1.0 - g0.0) * f, g0.1 + (g1.1 - g0.1) * f);
-                rt.frame(1.0 / 60.0);
-            }
-            rt.pointer_up(g1.0 + 5.0, g1.1);
-            rt.frame(1.0 / 60.0);
+            .find(|e| e.text.as_deref() == Some(full))
+            .unwrap()
+            .rect;
+        let y = y + h / 2.0;
+        // Drag partway into the sentence, then right-click inside the range.
+        let start = x + 4.0;
+        let end = x + w.min(80.0);
+        rt.pointer_move(start, y);
+        rt.pointer_down(start, y);
+        rt.frame(0.016);
+        rt.pointer_move(end, y);
+        rt.frame(0.016);
+        rt.pointer_up(end, y);
+        rt.frame(0.016);
+        let selected = rt.selection().unwrap();
+        assert!(full.contains(selected.text()));
+        assert!(!selected.text().is_empty() && selected.text() != full);
+        rt.secondary_down((start + end) * 0.5, y);
+        rt.secondary_up((start + end) * 0.5, y);
+        rt.frame(0.016);
+        let snapshot = rt
+            .state
+            .row_menu
+            .as_ref()
+            .and_then(|m| m.selection.as_ref())
+            .unwrap();
+        assert_eq!(snapshot.as_ref(), &selected);
+        for _ in 0..20 {
+            rt.frame(0.016);
         }
-
-        println!(
-            "runtime selection: {:?}",
-            rt.selection().map(|s| s.text().to_string())
-        );
-        let at = (rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0);
-        rt.secondary_down(at.0, at.1);
-        rt.secondary_up(at.0, at.1);
-        rt.frame(1.0 / 60.0);
-        assert!(
-            rt.state.row_menu.is_some(),
-            "row_menu must be set after right-click with selection"
-        );
-        let menu = rt.state.row_menu.as_ref().unwrap();
-        println!("menu selection: {:?}", menu.selection);
-        assert!(
-            menu.selection.is_some(),
-            "menu.selection must contain selected text"
+        let pos = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("row-menu-item0"))
+            .unwrap()
+            .rect;
+        rt.pointer_down(pos[0] + pos[2] / 2.0, pos[1] + pos[3] / 2.0);
+        rt.pointer_up(pos[0] + pos[2] / 2.0, pos[1] + pos[3] / 2.0);
+        rt.frame(0.016);
+        assert!(rt.state.row_menu.is_none());
+        assert_eq!(
+            clipboard.text().as_deref().map(String::as_str),
+            Some(selected.text())
         );
     }
 }

@@ -3,6 +3,7 @@
 mod agent_fields;
 mod branding;
 mod config;
+mod diagnostics;
 mod hub;
 mod model;
 mod platform;
@@ -49,6 +50,13 @@ fn tune_allocator() {}
 
 fn main() -> anyhow::Result<()> {
     tune_allocator();
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--plugin-pick-path")) {
+        return platform::dialogs::plugin_pick_path(std::env::args_os().skip(2));
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--ensure-term-daemon")) {
+        println!("{}", term::daemon::ensure_daemon_running()?.display());
+        return Ok(());
+    }
     if let Some(pos) = std::env::args().position(|a| a == "--term-daemon") {
         let socket_path = std::env::args()
             .nth(pos + 1)
@@ -96,6 +104,11 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    if instance.is_some() {
+        diagnostics::initialize(state_dir.join("diagnostics"));
+        diagnostics::Attempt::new(diagnostics::EventKind::DesktopStart, "Desktop", None)
+            .finish(diagnostics::Outcome::Completed);
+    }
     let config_path = config_dir.join(CONFIG_FILE);
     let config = load_config(&config_path);
     let store = ConfigStore::new(config_path, config.clone());
@@ -118,6 +131,7 @@ fn main() -> anyhow::Result<()> {
         });
     } else {
         theme::omarchy::watch(inbox.clone(), store.clone());
+        platform::gateway_bootstrap::initialize(state_dir.clone(), inbox.clone());
         start_core(
             settings,
             state_dir.clone(),
@@ -157,12 +171,25 @@ fn main() -> anyhow::Result<()> {
         ..rune::WindowOptions::default()
     })
     .compositor(ui::fx::Fx::default())
-    .on_focus(|_, focused, _| platform::notify::set_window_focused(focused))
+    .on_focus(|s, focused, tx| {
+        platform::notify::set_window_focused(focused);
+        if focused
+            && s.mode == ui::Mode::Session
+            && s.selected.is_some()
+            && tx.focused().is_none()
+            && !s.term.sink.focused
+            && s.menu.is_none()
+            && !s.timeline_search.active
+            && s.zoom.is_none()
+        {
+            tx.focus("draft", false);
+        }
+    })
     // Closing keeps the app only when the owner asked for the tray and an
     // icon is up to come back through; otherwise it quits as before.
     .keep_running()
     .on_close(|s, tx| {
-        if !(s.cfg.general.close_to_tray && platform::tray::active()) {
+        if s.gateway_setup.is_some() || !(s.cfg.general.close_to_tray && platform::tray::active()) {
             tx.quit();
         }
     });
@@ -229,6 +256,7 @@ fn main() -> anyhow::Result<()> {
     // threads (OpenSSL's cleanup under a SQLite open crashed that way).
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.try_run()));
     platform::shutdown::deadline();
+    platform::gateway_bootstrap::shutdown();
     instance::release();
     store.flush();
     let code = match ran {
@@ -240,15 +268,23 @@ fn main() -> anyhow::Result<()> {
         Err(_) => 101,
     };
     tracing::info!(code, "muqun-desktop stopped");
+    diagnostics::flush();
+    if code == 0 {
+        if let Err(error) = platform::update::relaunch_if_requested() {
+            tracing::error!(%error,"could not restart updated Desktop");
+        }
+    }
     platform::shutdown::leave(code)
 }
 
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
+    use tracing_subscriber::prelude::*;
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(diagnostics::DesktopReports)
         .try_init();
 }
 
@@ -291,10 +327,11 @@ fn start_core(
     std::thread::Builder::new()
         .name("muqun-core-main".into())
         .spawn(move || {
+            platform::gateway_bootstrap::wait_for_setup();
             runtime.block_on(async move {
                 let (hub, connected) = select_hub(settings, &state_dir, &store.get()).await;
                 let dynamic_hub = hub::DynamicHub::new(hub);
-                projection::spawn(dynamic_hub, inbox, store, commands, connected);
+                projection::spawn(dynamic_hub, inbox, store, commands, connected, state_dir);
                 std::future::pending::<()>().await;
             });
         })?;
@@ -325,13 +362,20 @@ async fn select_hub(
             Err(err) => tracing::warn!("local gateway found but unusable: {err:#}"),
         }
     }
+    (standalone_hub(settings, state_dir).await, connected)
+}
+
+async fn standalone_hub(
+    settings: RuntimeSettings,
+    state_dir: &std::path::Path,
+) -> Arc<dyn hub::SessionHub> {
     tracing::info!("hub: in-process");
     let agents = build_runtime(settings, true, Some(state_dir.to_path_buf()));
     if let Err(err) = attach_store(&agents, state_dir, StoreEncryption::Off).await {
         tracing::warn!("the session store is unavailable, routes are not kept: {err:#}");
     }
     agents.spawn_supervisor();
-    (Arc::new(hub::LocalHub::new(agents)), connected)
+    Arc::new(hub::LocalHub::new(agents))
 }
 
 fn configured_remote_hub(

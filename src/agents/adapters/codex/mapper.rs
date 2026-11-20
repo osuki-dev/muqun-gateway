@@ -62,7 +62,23 @@ pub fn session(thread: &Value) -> Result<AgentSessionInfo, AgentError> {
             .or_else(|| thread["preview"].as_str())
             .unwrap_or("")
             .into(),
-        mode: None,
+        mode: ["source", "threadSource"]
+            .into_iter()
+            .any(|key| {
+                matches!(
+                    thread[key].as_str(),
+                    Some(
+                        "subAgent"
+                            | "subAgentReview"
+                            | "subAgentCompact"
+                            | "subAgentThreadSpawn"
+                            | "subAgentOther"
+                    )
+                ) || thread[key]
+                    .as_object()
+                    .is_some_and(|source| source.contains_key("subAgent"))
+            })
+            .then(|| "subagent".into()),
         model,
         status: status(&thread["status"]),
         directory: thread["cwd"].as_str().map(str::to_owned),

@@ -2,13 +2,12 @@
 
 ## Install a published Desktop package
 
-Use the official installer on Linux x86_64 or Apple silicon macOS. It reads the release manifest from muqun.dev and verifies the package size, SHA-256 digest and companion checksum before installation. macOS also verifies the app's code signature and Gatekeeper assessment. The full installer needs Python 3 and curl. The bundled Gateway-only entry point uses the system shell.
+Use the official installer on Linux x86_64 or Apple silicon macOS. It reads the release manifest from muqun.dev and verifies the package size, SHA-256 digest and companion checksum before installation. macOS also verifies the app's code signature and Gatekeeper assessment. The installer uses curl and the platform archive and SHA-256 tools. Each package includes its native installer helper for staging, locking and rollback.
 
 ```sh
-curl -fsSL https://muqun.dev/desktop.sh | sh  # Stable Desktop and a missing local Gateway
-sh install-desktop.sh --channel preview       # Desktop preview; Gateway remains stable
+curl -fsSL https://muqun.dev/desktop.sh | sh  # Install stable Desktop
+sh install-desktop.sh --channel preview       # Install Desktop preview
 sh install-desktop.sh --tag desktop-vX.Y.Z    # Pin a published Desktop release
-sh install-desktop.sh --without-gateway       # In-process agents or a paired remote computer
 ```
 
 Choose an actual published version for `--tag`. If the requested channel has no Desktop release, installation stops before changing any installed package. Desktop and Gateway share a GitHub repository and have independent release identities.
@@ -18,7 +17,7 @@ Choose an actual published version for `--tag`. If the requested channel has no 
 | Desktop | `desktop-vX.Y.Z` or `desktop-vX.Y.Z-preview.N` | Linux x86_64 tarball, macOS arm64 notarized app ZIP |
 | Gateway | `vX.Y.Z` or `vX.Y.Z-preview.N` | Linux x86_64/arm64 and macOS x86_64/arm64 binaries |
 
-A stable Desktop release starts when a maintainer pushes a reviewed `desktop-vX.Y.Z` tag matching the Desktop crate version and its committed `release-notes/desktop-vX.Y.Z.md`. CI builds both packages, runs the Linux smoke tests, notarizes the macOS app, verifies the package versions and checksums, and publishes and mirrors the release. Desktop preview publication requires explicit dispatch. [Stable workflow](../.github/workflows/desktop-release.yml) · [Preview workflow](../.github/workflows/desktop-preview.yml)
+A stable Desktop release starts when a maintainer pushes a reviewed `desktop-vX.Y.Z` tag matching the Desktop crate version and its committed `release-notes/desktop-vX.Y.Z.md`. CI builds both packages, runs the Linux smoke tests, notarizes the macOS app, verifies the package versions and checksums, and publishes and mirrors the release. To build a Desktop preview, manually run **preview** with product **desktop**. Set **publish_desktop** to publish the signed candidate. [Stable workflow](../.github/workflows/desktop-release.yml) · [Preview workflow](../.github/workflows/preview.yml)
 
 ## Where the files go
 
@@ -28,9 +27,9 @@ Rerun the installer to update Desktop. It stages the package on the destination 
 
 ## Gateway provisioning and startup
 
-The installer reuses an existing Gateway installation or service, including a stopped or externally managed installation. On a fresh computer it invokes the bundled official Gateway installer. Gateway selects and checks its own stable release. Setup requires an existing tmux or Herdr installation. Any persistent startup registration follows Gateway's own prompts and uses a user systemd unit on Linux or a LaunchAgent on macOS. Gateway setup errors leave the installed Desktop available. Resolve the reported prerequisite or installation error and retry. [Gateway installer](../install.sh) · [Standalone setup](../README.md)
+The public installer finishes after installing Desktop. When the local Gateway is missing, opening Desktop shows the required setup screen. Choose the install action to download Gateway before entering the workspace. Desktop reuses an existing installation or service, including a stopped or externally managed one. A stable Desktop package provisions a stable Gateway. A preview Desktop package provisions a preview Gateway. Each Gateway binary is independently verified before setup. On a fresh computer Gateway can use the built-in Desktop terminal. Any persistent startup registration follows Gateway's own prompts and uses a user systemd unit on Linux or a LaunchAgent on macOS. If setup fails, retry from that screen or exit and resume setup on the next launch. [Gateway installer](../install.sh) · [Standalone setup](../README.md)
 
-The packaged installer includes a Gateway-only entry point. The Desktop app can also use local in-process agents or connect to a paired remote Gateway.
+The same Gateway-only entry point is bundled for direct app downloads. Desktop restores the selected paired computer first. On this computer it probes the Gateway's `local-client.json` and authenticated `GET /api/meta`. Gateway setup displays download progress and verifies the release before starting the service. An offline remote computer stays selected. [Desktop startup and preferences](../desktop/README.md)
 
 ## Updating or removing Gateway
 

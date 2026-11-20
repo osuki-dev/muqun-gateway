@@ -57,7 +57,7 @@ pub(crate) fn status() -> anyhow::Result<()> {
         println!(
             "session {}: backend={} endpoint={endpoint} {}",
             session.id,
-            session.backend.as_str(),
+            session.backend_display_name(),
             backend_program_state(&session, service_path.as_deref())
         );
     }
@@ -540,7 +540,11 @@ pub(crate) fn confirm_remove_backend(session: &SessionConfig) -> anyhow::Result<
     confirm_action(
         "Remove terminal backend?",
         &[
-            format!("Selected: {} ({})", session.label, session.backend.as_str()),
+            format!(
+                "Selected: {} ({})",
+                session.label,
+                session.backend_display_name()
+            ),
             String::from("Only this Gateway's backend configuration is removed."),
             String::from("Terminal servers, sessions, and running tasks stay running."),
             String::from("Restart Gateway after this change."),
@@ -2039,6 +2043,9 @@ fn print_manage_screen(
                 &std::env::var("PATH").unwrap_or_default(),
                 service_path.as_deref(),
             ),
+            BackendKind::Herdr if session.is_desktop_terminal() => {
+                String::from("Muqun Desktop terminal configured")
+            }
             BackendKind::Herdr => String::from("Herdr socket configured"),
         })
         .collect::<Vec<_>>();
@@ -3265,6 +3272,174 @@ pub(crate) fn push_wrapped_field(lines: &mut Vec<String>, label: &str, value: &s
     if first {
         lines.push(prefix.to_owned());
     }
+}
+
+/// A code requested by a client and displayed only to the computer's owner.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PairingCode {
+    pub name: String,
+    pub code: String,
+    pub expires_ms: u64,
+}
+
+impl std::fmt::Debug for PairingCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairingCode").finish_non_exhaustive()
+    }
+}
+
+/// The invite payload may contain the transport bootstrap key. Only the
+/// pixels are exposed to the host UI. The admin credential never leaves here.
+pub struct PairingInvitation {
+    pub address: String,
+    pub pending: Option<PairingCode>,
+    offer: String,
+}
+
+impl PairingInvitation {
+    pub fn fingerprint(&self) -> String {
+        hash_token(&self.offer)
+    }
+
+    /// White quiet zone of four modules on each edge, with integer-sized
+    /// pixels per module to preserve contrast at the native display size.
+    pub fn qr_rgba(&self) -> anyhow::Result<(u32, Vec<u8>)> {
+        let qr = QrCode::with_error_correction_level(self.offer.as_bytes(), EcLevel::L)?;
+        let modules = qr.width() + 8;
+        let scale = (244 / modules).max(1);
+        let side = modules * scale;
+        let mut rgba = vec![255; side * side * 4];
+        for y in 0..qr.width() {
+            for x in 0..qr.width() {
+                if qr[(x, y)] == qrcode::Color::Dark {
+                    for dy in 0..scale {
+                        let start = (((y + 4) * scale + dy) * side + (x + 4) * scale) * 4;
+                        for pixel in rgba[start..start + scale * 4].as_chunks_mut::<4>().0 {
+                            pixel[..3].fill(0);
+                        }
+                    }
+                }
+            }
+        }
+        Ok((side as u32, rgba))
+    }
+}
+
+/// Credential file used for every Desktop connection to this computer.
+pub fn local_gateway_client_file() -> anyhow::Result<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("MUQUN_LOCAL_GATEWAY").filter(|v| !v.is_empty()) {
+        return Ok(path.into());
+    }
+    Ok(super::local_client::file_in(
+        &super::store::service_state_dir()?,
+    ))
+}
+
+/// Read an independently running Gateway, even when this library is embedded
+/// in a host with its own pinned configuration and state directories.
+pub async fn local_pairing_invitation() -> anyhow::Result<PairingInvitation> {
+    let config_dir = super::store::service_config_dir()?;
+    let state_dir = super::store::service_state_dir()?;
+    let config: crate::Config =
+        serde_json::from_slice(&std::fs::read(config_dir.join(CONFIG_FILE))?)?;
+    let pairing: crate::PairingFile =
+        serde_json::from_slice(&std::fs::read(config_dir.join(PAIRING_FILE))?)?;
+    anyhow::ensure!(
+        crate::authority::authenticates_admin(&config.token_hash, &pairing.payload.token)
+            && pairing.payload.server_id == config.server_id,
+        "inconsistent local Gateway identity"
+    );
+    let address = validate_public_url(&config.public_url)?;
+    let required = config.transport_encryption == TransportEncryptionMode::Required;
+    if required {
+        anyhow::ensure!(
+            crate::transport::decode_key(&pairing.payload.transport_key)?.len() == 32,
+            "invalid pairing transport key"
+        );
+    }
+    #[derive(serde::Deserialize)]
+    struct Endpoint {
+        url: String,
+        token: String,
+    }
+    let service_file = super::local_client::file_in(&state_dir);
+    let client_file = local_gateway_client_file()?;
+    let endpoint: Endpoint = serde_json::from_slice(&std::fs::read(&client_file)?)?;
+    if client_file != service_file {
+        let service: Endpoint = serde_json::from_slice(&std::fs::read(service_file)?)?;
+        anyhow::ensure!(
+            service.url == endpoint.url
+                && crate::authority::authenticates_admin(
+                    &hash_token(&service.token),
+                    &endpoint.token
+                ),
+            "the selected local client belongs to a different Gateway"
+        );
+    }
+    let addr: SocketAddr = endpoint
+        .url
+        .strip_prefix("http://")
+        .context("invalid local Gateway endpoint")?
+        .parse()?;
+    anyhow::ensure!(
+        addr.ip().is_loopback(),
+        "expected loopback Gateway endpoint"
+    );
+    // Older services and installations with MCP off still support the local
+    // administrator API. When the service publishes its identity, verify it
+    // before presenting the bearer; a failed proof must never fall back.
+    let identity = match std::fs::read_to_string(crate::mcp::identity_file_in(&state_dir)) {
+        Ok(identity) => Some(identity),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(identity) = identity {
+        tokio::task::spawn_blocking(move || {
+            crate::mcp::verify_identity(&format!("http://{addr}/mcp"), identity.trim())
+        })
+        .await?
+        .map_err(anyhow::Error::msg)?;
+    }
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(3))
+        .build()?;
+    let response = client
+        .get(format!("http://{addr}/api/pair/pending"))
+        .bearer_auth(&pairing.payload.token)
+        .send()
+        .await?
+        .error_for_status()?;
+    let value = response.json::<Value>().await?;
+    let pending = match value["pending"]
+        .as_bool()
+        .context("invalid pending response")?
+    {
+        true => Some(PairingCode {
+            name: value["device_name"]
+                .as_str()
+                .context("missing device name")?
+                .into(),
+            code: value["code"]
+                .as_str()
+                .context("missing verification code")?
+                .into(),
+            expires_ms: value["expires_unix_ms"]
+                .as_u64()
+                .context("missing verification expiry")?,
+        }),
+        false => None,
+    };
+    Ok(PairingInvitation {
+        offer: pairing_qr_offer(
+            &address,
+            &config.server_id,
+            required.then_some(&pairing.payload.transport_key),
+        ),
+        address,
+        pending,
+    })
 }
 
 pub(crate) fn fetch_pending_pairing() -> anyhow::Result<Option<PendingPairing>> {

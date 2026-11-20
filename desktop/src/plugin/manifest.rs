@@ -1,8 +1,8 @@
 //! Manifest schema and definitions for desktop plugins.
 //!
-//! External plugins define a `plugin.json` file complying with [`PluginManifest`].
-//! This enables declarative discovery, command contribution, and custom tile
-//! rendering without modifying or recompiling core Rust code.
+//! Directory plugins use `plugin.json`; Bun packages use standard `package.json`
+//! metadata with a `muqun` discovery marker. Both normalize to [`PluginManifest`]
+//! without executing the plugin or recompiling the host.
 
 use serde::{Deserialize, Serialize};
 
@@ -115,6 +115,17 @@ pub enum PluginCategory {
 }
 
 impl PluginCategory {
+    pub const ALL: [Self; 4] = [Self::Core, Self::Tools, Self::Diagnostics, Self::Extensions];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::Tools => "tools",
+            Self::Diagnostics => "diagnostics",
+            Self::Extensions => "extensions",
+        }
+    }
+
     pub fn label(self, lang: Language) -> &'static str {
         match self {
             Self::Core => tr_ref(lang, "Core"),
@@ -127,6 +138,114 @@ impl PluginCategory {
 
 fn default_category() -> Option<PluginCategory> {
     Some(PluginCategory::Extensions)
+}
+
+/// A browser-safe repository from standard package metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PluginRepository {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directory: Option<String>,
+}
+
+impl PluginRepository {
+    /// Open the package directory on GitHub; other forges keep their repository URL.
+    pub fn source_url(&self) -> String {
+        let Some(directory) = &self.directory else {
+            return self.url.clone();
+        };
+        let Ok(mut url) = reqwest::Url::parse(&self.url) else {
+            return self.url.clone();
+        };
+        if url.host_str() == Some("github.com") {
+            if let Ok(mut path) = url.path_segments_mut() {
+                path.pop_if_empty().extend(["tree", "HEAD"]);
+                path.extend(directory.split('/'));
+            }
+        }
+        url.into()
+    }
+}
+
+fn deserialize_keywords<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|keyword| !keyword.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+fn deserialize_category<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PluginCategory>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
+fn deserialize_repository<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PluginRepository>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let raw = value.as_str().or_else(|| value.get("url")?.as_str());
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(None);
+    };
+    let shorthand = raw.strip_prefix("github:").unwrap_or(raw);
+    let source = if !shorthand.contains(':') && !shorthand.starts_with('/') {
+        let parts: Vec<_> = shorthand.split('/').collect();
+        if parts.len() != 2
+            || parts.iter().any(|part| {
+                part.is_empty()
+                    || matches!(*part, "." | "..")
+                    || !part
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            })
+        {
+            return Ok(None);
+        }
+        format!("https://github.com/{shorthand}")
+    } else {
+        raw.strip_prefix("git+").unwrap_or(raw).to_string()
+    };
+    let Ok(mut url) = reqwest::Url::parse(&source) else {
+        return Ok(None);
+    };
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Ok(None);
+    }
+    url.set_fragment(None);
+    let path = url.path().trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path).to_string();
+    url.set_path(&path);
+    let directory = value
+        .get("directory")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|directory| {
+            !directory.is_empty()
+                && !directory.contains('\\')
+                && !directory.chars().any(char::is_control)
+                && directory
+                    .split('/')
+                    .all(|part| !matches!(part, "" | "." | ".."))
+        })
+        .map(str::to_owned);
+    Ok(Some(PluginRepository {
+        url: url.into(),
+        directory,
+    }))
 }
 
 /// Declarative command contributed by a plugin.
@@ -155,7 +274,7 @@ pub struct PluginTileManifest {
     pub cwd: Option<String>,
 }
 
-/// The declarative manifest read from `plugin.json`.
+/// Host metadata shared by legacy directory plugins and Bun packages.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PluginManifest {
     pub id: String,
@@ -166,6 +285,18 @@ pub struct PluginManifest {
     pub author: Option<String>,
     #[serde(default = "default_category")]
     pub category: Option<PluginCategory>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_keywords",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub keywords: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_repository",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub repository: Option<PluginRepository>,
     #[serde(default)]
     /// Built-in icon name, or a package-relative PNG/JPEG/WebP path.
     pub icon: Option<String>,
@@ -175,6 +306,10 @@ pub struct PluginManifest {
     pub entry: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub surfaces: Vec<PluginSlot>,
+    #[serde(skip)]
+    pub composer_draft: bool,
+    #[serde(skip)]
+    pub notification_entry: Option<String>,
     #[serde(default)]
     pub commands: Vec<PluginCommandManifest>,
     #[serde(default)]
@@ -182,6 +317,94 @@ pub struct PluginManifest {
 }
 
 impl PluginManifest {
+    /// Read a Bun native-view package that opts into Desktop discovery.
+    pub fn from_package(value: serde_json::Value) -> anyhow::Result<Option<Self>> {
+        if value.get("muqun").is_none() {
+            return Ok(None);
+        }
+        #[derive(Deserialize)]
+        struct Package {
+            name: String,
+            version: String,
+            main: String,
+            #[serde(default)]
+            description: String,
+            #[serde(default, deserialize_with = "deserialize_keywords")]
+            keywords: Vec<String>,
+            #[serde(default, deserialize_with = "deserialize_repository")]
+            repository: Option<PluginRepository>,
+            muqun: NativeView,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct NativeView {
+            #[serde(default)]
+            requires: Vec<String>,
+            #[serde(default)]
+            permissions: Vec<String>,
+            display_name: Option<String>,
+            notification_entry: Option<String>,
+            icon: Option<String>,
+            #[serde(default, deserialize_with = "deserialize_category")]
+            category: Option<PluginCategory>,
+            #[serde(default)]
+            surfaces: Vec<PluginSlot>,
+        }
+        let package: Package = serde_json::from_value(value)?;
+        anyhow::ensure!(
+            !package.version.trim().is_empty(),
+            "Missing package version"
+        );
+        anyhow::ensure!(!package.main.trim().is_empty(), "Missing package entry");
+        if let Some(path) = &package.muqun.notification_entry {
+            anyhow::ensure!(
+                !path.is_empty()
+                    && std::path::Path::new(path)
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_))),
+                "Notification entry must be a package-relative path"
+            );
+        }
+        for capability in &package.muqun.requires {
+            anyhow::ensure!(
+                matches!(
+                    capability.as_str(),
+                    "native-view" | "forms" | "terminal-entry"
+                ) || (cfg!(target_os = "linux") && capability == "webview-entry"),
+                "This plugin requires a newer Desktop capability: {capability}"
+            );
+        }
+        let title = package
+            .muqun
+            .display_name
+            .unwrap_or_else(|| package.name.clone());
+        Ok(Some(Self {
+            notification_entry: package.muqun.notification_entry,
+            composer_draft: package
+                .muqun
+                .permissions
+                .iter()
+                .any(|p| p == "composer.draft.append"),
+            id: package.name,
+            name: title.clone(),
+            version: package.version,
+            description: package.description,
+            keywords: package.keywords,
+            repository: package.repository,
+            entry: Some(package.main),
+            runtime: Some("bun".into()),
+            surfaces: package.muqun.surfaces,
+            icon: package.muqun.icon,
+            category: package.muqun.category.or_else(default_category),
+            tile: Some(PluginTileManifest {
+                title,
+                kind: "native-view".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
+
     /// Parse a plugin manifest from a JSON string.
     pub fn parse(json_str: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json_str)
@@ -297,6 +520,89 @@ impl PluginManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_repository_links_normalize_standard_forms_and_keep_monorepo_directory() {
+        for (repository, url, directory) in [
+            (
+                serde_json::json!("npm/cli"),
+                "https://github.com/npm/cli",
+                None,
+            ),
+            (
+                serde_json::json!("github:npm/cli"),
+                "https://github.com/npm/cli",
+                None,
+            ),
+            (
+                serde_json::json!("git+https://github.com/npm/cli.git"),
+                "https://github.com/npm/cli",
+                None,
+            ),
+            (
+                serde_json::json!({"type":"git","url":"https://git.example.org/team/project.git","directory":"packages/desktop-plugin"}),
+                "https://git.example.org/team/project",
+                Some("packages/desktop-plugin"),
+            ),
+            (
+                serde_json::json!({"url":"https://gitlab.example.org/team/project.git","directory":"../outside"}),
+                "https://gitlab.example.org/team/project",
+                None,
+            ),
+        ] {
+            let manifest = PluginManifest::from_package(serde_json::json!({
+                "name":"plugin", "version":"1", "main":"main.ts", "muqun":{},
+                "repository":repository,
+            }))
+            .unwrap()
+            .unwrap();
+            let source = manifest.repository.unwrap();
+            assert_eq!(source.url, url);
+            assert_eq!(source.directory.as_deref(), directory);
+            assert_eq!(source.source_url(), url);
+        }
+        let manifest = PluginManifest::from_package(serde_json::json!({
+            "name":"monorepo-plugin", "version":"1", "main":"main.ts", "muqun":{},
+            "repository":{"url":"git+https://github.com/npm/cli.git","directory":"packages/my plugin#1"},
+        })).unwrap().unwrap();
+        assert_eq!(
+            manifest.repository.unwrap().source_url(),
+            "https://github.com/npm/cli/tree/HEAD/packages/my%20plugin%231"
+        );
+    }
+
+    #[test]
+    fn unsafe_optional_metadata_never_becomes_a_source_action_or_breaks_old_plugins() {
+        for repository in [
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!({"url":false}),
+            serde_json::json!("javascript:alert(1)"),
+            serde_json::json!("file:///etc/passwd"),
+            serde_json::json!("git+ssh://git@github.com/team/project.git"),
+            serde_json::json!("https://token@git.example.org/team/project"),
+            serde_json::json!("../../local"),
+        ] {
+            let manifest = PluginManifest::from_package(serde_json::json!({
+                "name":"old-plugin", "version":"1", "main":"main.ts",
+                "muqun":{"category":"future-category"},
+                "keywords":[" boards ", 42, ""], "repository":repository,
+            }))
+            .unwrap()
+            .unwrap();
+            assert!(manifest.repository.is_none());
+            assert_eq!(manifest.category(), PluginCategory::Extensions);
+            assert_eq!(manifest.keywords, ["boards"]);
+            assert_eq!(manifest.entry.as_deref(), Some("main.ts"));
+        }
+        let legacy = PluginManifest::parse(
+            r#"{"id":"legacy","name":"Legacy","version":"1","description":""}"#,
+        )
+        .unwrap();
+        assert!(legacy.repository.is_none());
+        assert!(legacy.keywords.is_empty());
+        assert_eq!(legacy.category(), PluginCategory::Extensions);
+    }
 
     #[test]
     fn parse_full_manifest() {
@@ -416,10 +722,14 @@ mod tests {
             description: "Testing roundtrip serialization".to_string(),
             author: Some("Bob".to_string()),
             category: Some(PluginCategory::Diagnostics),
+            keywords: vec![],
+            repository: None,
             icon: Some("settings".to_string()),
             runtime: None,
             entry: None,
             surfaces: vec![PluginSlot::Tile, PluginSlot::Page],
+            composer_draft: false,
+            notification_entry: None,
             commands: vec![PluginCommandManifest {
                 id: "rt.cmd".to_string(),
                 title: "RT Command".to_string(),

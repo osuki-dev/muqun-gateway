@@ -390,6 +390,23 @@ pub trait AgentPort: Send + Sync {
         self.send_prompt(session_id, text, attachments, delivery)
     }
 
+    /// Submit once and return the native message ID when the provider's receipt
+    /// identifies the future user text row (ordinal zero) in its timeline.
+    fn send_prompt_with_receipt<'a>(
+        &'a self,
+        session_id: &'a str,
+        text: &'a str,
+        display_text: &'a str,
+        attachments: &'a [String],
+        delivery: Option<&'a str>,
+    ) -> AgentFuture<'a, Option<String>> {
+        Box::pin(async move {
+            self.send_prompt_with_display(session_id, text, display_text, attachments, delivery)
+                .await?;
+            Ok(None)
+        })
+    }
+
     /// Whether the agent's service takes an MCP server at runtime
     /// ([`AgentPort::add_mcp_server`]).
     fn adds_mcp_servers(&self) -> bool {
@@ -486,9 +503,9 @@ pub trait AgentPort: Send + Sync {
     /// Switch session active agent mode
     fn switch_mode<'a>(&'a self, session_id: &'a str, mode: &'a str) -> AgentFuture<'a, ()>;
 
-    /// Put the session into the agent's own bypass mode (`enabled`), or
-    /// back to the mode it had before. Only an agent whose bypass is a
-    /// session-scoped control implements this
+    /// Set the agent's own permission bypass for this session. Disabling
+    /// returns its native selector to off, or restores its previous mode.
+    /// Only an agent whose bypass is a session-scoped control implements this
     /// (`crate::agents::auto_approve`); the rest answer `Unsupported`.
     fn set_auto_approve<'a>(&'a self, _session_id: &'a str, _enabled: bool) -> AgentFuture<'a, ()> {
         Box::pin(async { Err(AgentError::Unsupported("session auto-approve".into())) })

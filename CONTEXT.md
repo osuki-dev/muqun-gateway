@@ -42,7 +42,10 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
     and capability differences. Their drivers own session children and domain
     events; other service event streams are folded under `manager/`
     (`deepseek.rs`, `t3.rs`, `codex.rs`, `pi.rs`). See `docs/fx-protocol.md` and
-    `docs/qoder-protocol.md` for their separate upstream contracts.
+    `docs/qoder-protocol.md` for their separate upstream contracts. Copilot
+    (`adapters/copilot/`) also uses this private ACP driver, behind an opt-in
+    `copilot` config block; see `docs/copilot-protocol.md` for discovery, existing
+    authentication, advertised modes and permission boundaries.
   - `manager.rs`, `runtime.rs`, `use_cases/`: agent supervision and the
     session/prompt/interaction services. `runtime/t3.rs` holds T3's config
     block, its pairing-token-to-bearer credential (persisted by

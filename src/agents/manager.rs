@@ -146,7 +146,7 @@ impl Drop for AgentManager {
         // external manager must cancel them. Adopted services stay untouched.
         if matches!(
             self.agent.kind(),
-            "codex" | "fx" | "qoder" | "pi" | "claude" | "antigravity" | "cursor"
+            "codex" | "fx" | "qoder" | "pi" | "claude" | "antigravity" | "cursor" | "copilot"
         ) {
             (self.shutdown_handle)();
         }
@@ -293,15 +293,7 @@ impl EventContext {
     }
 
     async fn emit_timeline_item(&self, asid: &AgentSessionId, item: TimelineItem) {
-        let seq = self
-            .mirror
-            .upsert_timeline_items(asid, vec![item.clone()])
-            .await;
-        self.emit(AgentDomainEvent::TimelineUpsert {
-            asid: asid.clone(),
-            items: vec![item],
-            seq,
-        });
+        self.emit(self.mirror.record_timeline_upsert(asid, vec![item]).await);
     }
 
     async fn delivered_without_message(&self, asid: &AgentSessionId, inbox_id: &str) -> bool {
@@ -372,12 +364,7 @@ impl EventContext {
             .await
         {
             Ok(items) if !items.is_empty() => {
-                let seq = self.mirror.upsert_timeline_items(asid, items.clone()).await;
-                self.emit(AgentDomainEvent::TimelineUpsert {
-                    asid: asid.clone(),
-                    items,
-                    seq,
-                });
+                self.emit(self.mirror.record_timeline_upsert(asid, items).await);
             }
             Ok(_) => {}
             Err(err) => {
@@ -542,6 +529,34 @@ impl AgentManager {
             mirror,
             events_tx,
             "stdio://qoder-acp".into(),
+            version,
+            Arc::new(move || connected.has_live_stream()),
+            Arc::new(move || shutdown.stop()),
+        );
+        (manager, driver)
+    }
+
+    /// Assemble the lazy ACP adapter; each Copilot session owns its own child.
+    pub fn connect_copilot(
+        binary: String,
+        directory: String,
+        version: Option<String>,
+        events_tx: broadcast::Sender<AgentDomainEvent>,
+    ) -> (Self, Arc<crate::agents::adapters::copilot::CopilotDriver>) {
+        let mirror = Arc::new(MemoryMirror::for_agent("copilot"));
+        let driver = crate::agents::adapters::copilot::CopilotDriver::new(
+            binary,
+            directory,
+            mirror.clone(),
+            events_tx.clone(),
+        );
+        let connected = driver.clone();
+        let shutdown = driver.clone();
+        let manager = Self::assemble(
+            driver.clone(),
+            mirror,
+            events_tx,
+            "stdio://copilot-acp".into(),
             version,
             Arc::new(move || connected.has_live_stream()),
             Arc::new(move || shutdown.stop()),

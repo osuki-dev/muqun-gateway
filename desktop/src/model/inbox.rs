@@ -51,7 +51,6 @@ pub fn clean_error_message(msg: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)] // Several arms wait on platform hooks not yet re-wired on Rune.
 pub enum UiAction {
-    DesktopUpdate(crate::platform::update::Status),
     SubmitComposer,
     /// The composer's text or caret may have changed (posted from its key
     /// handlers, run once the keystroke has reached the text area).
@@ -72,6 +71,7 @@ pub enum UiAction {
     ImagePasted(Vec<u8>),
     /// A `.muqun-theme` file came back from Settings → Themes → Import file.
     ThemeFilePicked(std::path::PathBuf),
+    PluginFilePicked(std::path::PathBuf),
     /// Files came back from the attach dialog.
     FilesPicked(Vec<std::path::PathBuf>),
     /// Folders were dropped on the window: their paths go into the draft.
@@ -101,6 +101,22 @@ pub enum UiAction {
         title: String,
         detail: Option<String>,
     },
+    /// A background installer completed and authenticated local discovery succeeded.
+    LocalInvite(u64, Option<crate::platform::pairing_invite::Invite>),
+    DesktopUpdate(crate::platform::update::Status),
+    DesktopRestartCheckpoint(bool),
+    LocalPairings(crate::platform::paired_devices::List),
+    LocalPairingRevoked {
+        id: String,
+        result: Result<(), String>,
+    },
+    ComputerUnpaired {
+        computer: String,
+        request: uuid::Uuid,
+        result: Result<(), String>,
+    },
+    LocalGatewayReady,
+    LocalGatewayStatus(crate::platform::gateway_bootstrap::Status),
 }
 
 /// What a content search came back with.
@@ -129,7 +145,7 @@ pub enum Update {
         agent: String,
         sessions: Vec<AgentSessionInfo>,
     },
-    SessionCreated(Box<AgentSessionInfo>),
+    SessionCreated(Box<AgentSessionInfo>, Option<u64>),
     /// The session was deleted locally; drop it from the list and clear if open.
     SessionGone(String),
     Snapshot(Box<AgentSessionSnapshot>),
@@ -146,20 +162,14 @@ pub enum Update {
     Ui(UiAction),
     /// A computer pairing request response.
     ComputerPairingRequested {
-        #[allow(dead_code)]
-        server_id: String,
-        request_id: String,
-        #[allow(dead_code)]
-        expires_in_ms: u64,
-        transport_required: bool,
+        attempt: u64,
+        url: String,
+        result: Result<crate::platform::pairing::PairingOffer, String>,
     },
-    /// An attempt to claim or verify a computer token succeeded or failed.
     ComputerPairingOutcome {
-        server_id: String,
-        token: Option<String>,
-        device_id: Option<String>,
-        transport_key: Option<String>,
-        error: Option<String>,
+        attempt: u64,
+        url: String,
+        result: Result<crate::platform::pairing::ClaimedToken, String>,
     },
     /// A read-only snapshot for a detail sheet (`Command::ReadDetail`), or
     /// why it could not be read.
@@ -241,8 +251,11 @@ pub enum Update {
     Voice(super::voice::VoiceEvent),
     /// Probed status of external runtimes (`bun`, `herdr`).
     Runtimes(Vec<muqun_gateway::platform::runtimes::RuntimeStatus>),
+    PluginPackageProgress(uuid::Uuid, crate::plugin::packages::PackageStage),
+    PluginPackage(uuid::Uuid, uuid::Uuid, Result<String, String>),
     /// Outcome of installing or updating a managed runtime.
     RuntimeInstalled {
+        event: uuid::Uuid,
         kind: muqun_gateway::platform::runtimes::RuntimeKind,
         result: Result<muqun_gateway::platform::runtimes::RuntimeStatus, String>,
     },
@@ -278,7 +291,7 @@ impl ComputerUpdates {
         // A delivery already sent to an old connection must still settle its
         // parked draft. Other old reads cannot update the new workspace.
         if origin.1 < self.generation
-            && !matches!(&update, Update::SessionCreated(_))
+            && !matches!(&update, Update::SessionCreated(..))
             && !matches!(&update,
             Update::Composer(value) if matches!(**value, super::compose::ComposerUpdate::Submitted { .. }))
         {
@@ -325,6 +338,8 @@ impl Inbox {
                 | Update::Voice(_)
                 | Update::Storage(_)
                 | Update::Runtimes(_)
+                | Update::PluginPackageProgress(..)
+                | Update::PluginPackage(..)
                 | Update::RuntimeInstalled { .. }
                 | Update::ComputerPairingRequested { .. }
                 | Update::ComputerPairingOutcome { .. }
@@ -497,7 +512,7 @@ mod tests {
         .unwrap();
         assert!(updates.accept(
             ("mini".into(), 0),
-            Update::SessionCreated(Box::new(created))
+            Update::SessionCreated(Box::new(created), Some(42))
         ));
         assert!(updates.accept(
             ("mini".into(), 0),
@@ -510,7 +525,7 @@ mod tests {
         let pending = inbox.take();
         assert!(
             matches!(&pending[..], [Update::Computer { generation: 0, updates, .. }]
-            if matches!(&updates[..], [Update::SessionCreated(_), Update::Composer(value)] if matches!(**value,
+            if matches!(&updates[..], [Update::SessionCreated(..), Update::Composer(value)] if matches!(**value,
                 super::super::compose::ComposerUpdate::Submitted { token: 42, ok: true })))
         );
         assert_eq!(inbox.computers.lock().unwrap().states.len(), 1);

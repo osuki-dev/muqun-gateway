@@ -721,22 +721,45 @@ async fn delivered_user_enters_timeline_without_blocking_assistant_or_waiting_fo
         1,
         "retain the receipt until its row exists"
     );
+    let origin = crate::agents::domain::MessageOrigin {
+        device_id: "phone-id".into(),
+        name: "Phone".into(),
+    };
+    let boundary = ctx.mirror.held_prompt_boundary(&asid, Some("steer")).await;
+    assert!(ctx
+        .mirror
+        .present_user_prompt(
+            &asid,
+            "Continue in parallel.",
+            origin.clone(),
+            Some("msg-10"),
+            boundary
+        )
+        .await
+        .is_none());
+    assert!(ctx
+        .mirror
+        .get_snapshot(&asid)
+        .await
+        .unwrap()
+        .timeline
+        .iter()
+        .all(|r| r.role != TimelineRole::User));
     release.add_permits(1);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let AgentDomainEvent::TimelineUpsert { items, .. } = out.recv().await.unwrap() {
-                if items[0].role == TimelineRole::User {
-                    assert_eq!(items[0].id, "msg-10:t0");
-                    assert_eq!(
-                        items[0].part,
-                        AgentPart::Text {
-                            text: "Continue in parallel.".into()
-                        }
-                    );
-                    break;
-                }
+        let AgentDomainEvent::TimelineUpsert { items, seq, .. } = out.recv().await.unwrap() else {
+            panic!("expected the canonical user message");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].seq, seq);
+        assert_eq!(items[0].origin.as_ref(), Some(&origin));
+        assert_eq!(items[0].id, "msg-10:t0");
+        assert_eq!(
+            items[0].part,
+            AgentPart::Text {
+                text: "Continue in parallel.".into()
             }
-        }
+        );
         let AgentDomainEvent::InboxChanged { items, .. } = out.recv().await.unwrap() else {
             panic!("the queue receipt leaves only after the canonical row is published");
         };
@@ -750,11 +773,69 @@ async fn delivered_user_enters_timeline_without_blocking_assistant_or_waiting_fo
         .upsert_timeline_items(&asid, mapper::map_message(&native, &asid))
         .await;
     let snapshot = ctx.mirror.get_snapshot(&asid).await.unwrap();
+    assert_eq!(snapshot.timeline[0].origin.as_ref(), Some(&origin));
     assert_eq!(snapshot.timeline.len(), 2);
     assert_eq!(snapshot.timeline[0].role, TimelineRole::User);
     assert_eq!(snapshot.timeline[1].role, TimelineRole::Assistant);
     ctx.cancel.cancel();
     pump.await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn opencode_receipts_track_identical_sends_even_when_native_delivery_is_reversed() {
+    use axum::{extract::Path, routing::post, Json, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let (ctx, server) = upstream_context(Router::new().route(
+        "/api/session/{sid}/prompt",
+        post(move |Path(sid): Path<String>| {
+            let index = counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Json(json!({"data":{"type":"user","sessionID":sid,"id":format!("msg-{index}")}}))
+            }
+        }),
+    ))
+    .await;
+    let asid = AgentSessionId("ses-receipts".into());
+    for device in ["phone", "desktop"] {
+        let receipt = ctx
+            .driver
+            .send_prompt_with_receipt(&asid.0, "repeat", "repeat", &[], None)
+            .await
+            .unwrap();
+        ctx.mirror
+            .present_user_prompt(
+                &asid,
+                "repeat",
+                crate::agents::domain::MessageOrigin {
+                    name: device.into(),
+                    device_id: device.into(),
+                },
+                receipt.as_deref(),
+                None,
+            )
+            .await;
+    }
+    for id in ["msg-1", "msg-0"] {
+        // A provider may echo normalized/expanded wire text much later.
+        let native = json!({"id":id, "type":"user", "text":"expanded", "time":{"created":100}});
+        let revision = ctx.mirror.delivered_input_revision(&asid).await.unwrap();
+        ctx.finish_delivered_read(asid.clone(), id, revision, Ok(native))
+            .await;
+    }
+    let rows = ctx.mirror.get_snapshot(&asid).await.unwrap().timeline;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(rows.len(), 2);
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(row.id, format!("msg-{index}:t0"));
+        assert_eq!(
+            row.origin.as_ref().unwrap().device_id,
+            ["phone", "desktop"][index]
+        );
+        assert!(matches!(&row.part, AgentPart::Text {text} if text == "expanded"));
+    }
     server.abort();
 }
 

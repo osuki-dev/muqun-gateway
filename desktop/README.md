@@ -1,7 +1,8 @@
 # Muqun Desktop
 
 A native desktop client for the coding agents on this computer, written in Rust on
-[Rune](https://github.com/ryuhzk/rune) (our fork; GPU-drawn UI, no webview, no Chromium). Every
+[Rune](https://github.com/ryuhzk/rune). Rune draws the native UI. On Linux, browser
+tabs and plugins with web content can embed a Wry surface in the same window. Every
 agent's sessions in one window: Codex, OpenCode, Claude Code, Cursor, Qoder, Pi, FX, Antigravity,
 DeepSeek and T3.
 
@@ -9,13 +10,18 @@ When a Muqun gateway service runs on this computer the desktop attaches to it (t
 `local-client.json`), so the phone and the desktop see the same sessions. Without one it runs the
 gateway's agents plane in-process — no HTTP server, nothing listening.
 
+On first launch with a missing local Gateway, packaged Desktop shows a setup
+screen. Choose the install action to download and verify the Gateway from
+Desktop's release channel. A new installation can use the built-in Desktop
+terminal. The workspace opens after setup succeeds. If setup fails, retry or
+exit and return to setup on the next launch. Existing Gateway installations and
+remote-computer selections are preserved.
+
+For released packages, startup behavior and the local Gateway setup flow, see the [Desktop deployment guide](../docs/desktop-deployment.md).
+
 ## Install a published Desktop package
 
-```sh
-curl -fsSL https://muqun.dev/desktop.sh | sh
-```
-
-The installer selects the Linux x86_64 or macOS arm64 package, verifies its SHA-256 and provisions a missing local Gateway. Settings → About checks the installed channel for newer versions. See the [deployment guide](../docs/desktop-deployment.md) for previews, pinned versions and installing Desktop alone.
+Use the official `install-desktop.sh` for Linux x86_64 or macOS arm64. Stable is the default. Use `--channel preview` for a published Desktop preview. The installer installs only the Desktop package. Open Desktop to complete Gateway setup. [Installation options](../docs/desktop-deployment.md)
 
 ## Local development install (Linux)
 
@@ -66,9 +72,9 @@ requires notarization and stapling.
 Manually run **Desktop CI** with `notarize=true` to validate signing and
 notarization of its macOS artifact without publishing a release.
 
-The **Desktop preview** workflow builds, checks, signs and notarizes candidates.
-Its `publish` input defaults to false, so validation does not create a tag or
-release. Only an explicitly requested publication should set `publish=true`;
+Run the **preview** workflow with product **desktop** to build, check, sign and notarize a candidate.
+Its `publish_desktop` input defaults to false, so validation does not create a tag or
+release. Only an explicitly requested publication should set `publish_desktop=true`;
 it creates a separate Desktop prerelease and leaves Gateway's stable release alone.
 
 Linux needs a GPU stack wgpu can use (Vulkan, or GL through Mesa) and a session D-Bus for
@@ -76,6 +82,12 @@ notifications, file dialogs and "Reveal in folder". For the fonts the UI looks f
 and JetBrains Mono Nerd Font (`src/platform/fonts.rs`) — missing ones fall back to the system's.
 
 ## Release build
+
+Linux builds include a sibling executable, `muqun-wry-embedded`, for embedded browser
+and plugin tabs. It uses the system WebKitGTK 4.1 library. Building the helper requires
+the GTK 3 and WebKitGTK 4.1 development packages. For a local debug build, run
+`cargo build --locked --manifest-path desktop/webview-helper/Cargo.toml` alongside the
+Desktop build. Both executables must be in the same directory.
 
 Desktop candidate CI uses Rust 1.99.1, matching the validated Linux and macOS
 builds. Rust 1.100 currently fails to compile the locked async-stream activity
@@ -278,4 +290,4 @@ The UI never runs on the tokio thread: the core pushes `Update`s into the inbox
   clients; size is saved).
 * System notifications are Linux-only so far (macOS and Windows build with a no-op), and single
   instance is Unix-only (on Windows every launch is its own).
-* macOS releases use a signed and notarized app ZIP. The macOS status icon and Windows installer are still pending.
+* macOS preview distribution uses a signed and notarized app ZIP. The macOS status icon and Windows installer are still pending.

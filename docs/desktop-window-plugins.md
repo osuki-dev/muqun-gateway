@@ -1,5 +1,8 @@
 # Desktop windows and plugins
 
+Bun native-view plugins use a root `package.json` with a `muqun` object. Desktop reads the plugin version from the top-level `version`. See the [Desktop SDK guide](../desktop/sdk/README.md) for a working example. Existing standalone `plugin.json` manifests remain supported.
+
+
 Desktop owns window placement, chrome, focus and lifecycle. Plugins supply content
 and declare supported surfaces. `plugin/window.rs` defines `WindowKind`; the
 host's transitions live in `ui/windows.rs`.
@@ -33,7 +36,15 @@ Native plugins can provide alternate file-view/edit content using `DesktopPlugin
 File-extension association with arbitrary external plugin IDs is not implemented
 by this change; the configurable direct-open route currently targets editors.
 
+## Dock tabs
+
+Opening a plugin in the right dock selects its tab. The dock keeps one tab per plugin and shows a horizontally scrollable tab strip when two or more are open. Each shell appears alongside plugin tabs in the same header. Placement and close controls stay at its trailing edge. Closing the selected dock tab selects a neighbour. Disabling a plugin removes its tab. These tabs belong to the current Desktop run. A plugin opts in by declaring the `drawer` surface.
+
 ## External plugins
+
+The [native plugin v1 architecture](desktop-native-plugin-v1.md) defines the next
+Bun-based SDK, its theme contract and its package lifecycle. The directory
+plugins described below are the interface available in the current release.
 
 The left sidebar's **Plugins** entry opens the installed list. Each plugin exposes
 buttons for its declared window types. External extensions appear before built-ins.

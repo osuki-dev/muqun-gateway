@@ -159,6 +159,9 @@ pub(crate) struct Config {
     /// Local Qoder CLI ACP support; private children start only on explicit session operations.
     #[serde(default, skip_serializing_if = "is_default_qoder")]
     pub(crate) qoder: agents::runtime::QoderConfig,
+    /// Opt-in GitHub Copilot CLI ACP support; never installs or signs in.
+    #[serde(default, skip_serializing_if = "is_default_copilot")]
+    pub(crate) copilot: agents::runtime::CopilotConfig,
     /// Claude Code native sessions through its official ACP adapter; on when
     /// `claude`, Node.js 22+ and the adapter or npx are found.
     #[serde(default, skip_serializing_if = "is_default_claude")]
@@ -377,6 +380,10 @@ pub(crate) fn is_default_qoder(config: &agents::runtime::QoderConfig) -> bool {
     *config == agents::runtime::QoderConfig::default()
 }
 
+pub(crate) fn is_default_copilot(config: &agents::runtime::CopilotConfig) -> bool {
+    *config == agents::runtime::CopilotConfig::default()
+}
+
 pub(crate) fn is_required_transport(mode: &TransportEncryptionMode) -> bool {
     *mode == TransportEncryptionMode::Required
 }
@@ -458,6 +465,26 @@ pub(crate) struct SessionConfig {
     /// Omitted for every existing config, where Herdr remains the default.
     #[serde(default, skip_serializing_if = "BackendKind::is_herdr")]
     pub(crate) backend: BackendKind,
+}
+
+impl SessionConfig {
+    pub(crate) const DESKTOP_ID: &'static str = "desktop-terminal";
+
+    // Keep the existing Herdr-compatible wire representation, with a distinct
+    // identity for the native adapter even when its socket has a custom name.
+    pub(crate) fn is_desktop_terminal(&self) -> bool {
+        self.backend == BackendKind::Herdr
+            && self.id == Self::DESKTOP_ID
+            && self.label == crate::backend::muqun_term::MUQUN_WORKSPACE_LABEL
+    }
+
+    pub(crate) fn backend_display_name(&self) -> &'static str {
+        if self.is_desktop_terminal() {
+            "muqun-terminal"
+        } else {
+            self.backend.as_str()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

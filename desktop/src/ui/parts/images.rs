@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 
 use muqun_gateway::agents::message_images::resolve_host_media;
 use muqun_gateway::agents::{MessageImageAsset, TimelineItem, ToolCall};
-use rune::{col, el, icon, row, text, Cursor, El, SurfaceFit};
+use rune::{col, el, icon, row, Cursor, El, SurfaceFit};
 use rune_kit::Kit;
 
-use super::{glyphs, Tcx};
+use super::Tcx;
 use crate::ui::UiState;
 
 const MAX_W: f32 = 480.0;
@@ -109,7 +109,11 @@ pub fn item_image_paths(s: &UiState, asid: &str, item: &TimelineItem) -> Vec<Pat
     let mut paths = Vec::new();
     let assets = item.image_assets.as_deref();
     for src in item.attachments.iter().flatten() {
-        if let Some(asset) = message_image_for_source(assets, src) {
+        if let Some(path) = crate::model::media::cached_upload(s.current_computer(), src) {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        } else if let Some(asset) = message_image_for_source(assets, src) {
             push_asset(&mut paths, asset, directory);
         } else if looks_like_image_uri(src) || src.starts_with("/api/") {
             push_hosted(&mut paths, src, directory);
@@ -188,6 +192,11 @@ fn dimensions(path: &Path) -> Option<[u32; 2]> {
     })
 }
 
+/// Keep one cache entry for a file across staged, timeline and full-size views.
+pub(crate) fn picture_file(images: &rune::ImageCache, path: &Path) -> rune::Image {
+    images.file(path, THUMB_H, 2.0)
+}
+
 /// One picture at `height`, as wide as its shape asks (within reason): a
 /// button that opens it full size.
 fn thumbnail(k: &Kit, s: &UiState, path: &Path, key: String, height: f32) -> El {
@@ -195,7 +204,7 @@ fn thumbnail(k: &Kit, s: &UiState, path: &Path, key: String, height: f32) -> El 
         return placeholder(k, key, height);
     };
     // `ImageCache::file` keeps a strong handle via Pixels::keep while drawn.
-    let image = images.file(path, THUMB_H, 2.0);
+    let image = picture_file(images, path);
     // The picture's own shape: a wide one gets shorter, never cropped.
     let (width, height) = match image.size().or_else(|| dimensions(path)) {
         Some([w, h]) if w > 0 && h > 0 => {
@@ -221,7 +230,7 @@ fn thumbnail(k: &Kit, s: &UiState, path: &Path, key: String, height: f32) -> El 
     )
     .cursor(Cursor::Pointer)
     .label(label)
-    .on_press(move |s: &mut UiState| s.zoom = Some(open.clone()))
+    .on_press(move |s: &mut UiState| s.open_attachment_image(&open))
 }
 
 /// Where a picture on its way will be.
@@ -269,80 +278,4 @@ pub fn gallery_sized(
         gallery = gallery.child(placeholder(cx.k, format!("img-{id}-p{i}"), height));
     }
     Some(gallery)
-}
-
-/// The open picture over the whole window: fitted, on a scrim; a click
-/// outside it, the close button or Escape closes it.
-pub fn zoom_overlay(s: &UiState, k: &Kit) -> Option<El> {
-    let path = s.zoom.as_ref()?;
-    let images = s.images.as_ref()?;
-    let language = s.cfg.general.language;
-    let close = |s: &mut UiState| s.zoom = None;
-    // Raster files decode whole whatever the size asked for, so the
-    // thumbnail's handle is already the full picture.
-    let image = images.file(path, THUMB_H, 2.0);
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let picture = if image.is_ready() {
-        el().key("zoom-picture")
-            .pixels_fit(image.pixels(), SurfaceFit::Fit)
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-    } else {
-        col()
-            .key("zoom-picture")
-            .w_full()
-            .grow(1.0)
-            .center()
-            .child(crate::ui::art::ActivityMark::Standalone.build(k))
-    };
-    let bar = row()
-        .key("zoom-bar")
-        .w_full()
-        .gap(12.0)
-        .center_y()
-        .child(
-            text(name)
-                .font(k.ty.ui_medium)
-                .color(k.c.white)
-                .single_line()
-                .truncate_middle()
-                .shrink()
-                .grow(1.0),
-        )
-        .child(
-            k.interactive(
-                row()
-                    .key("zoom-close")
-                    .size(32.0, 32.0)
-                    .center()
-                    .radius(k.radius.lg)
-                    .child(icon(&glyphs::CLOSE, 16.0).color(k.c.white)),
-            )
-            .cursor(Cursor::Pointer)
-            .label(crate::ui::copy::tr_ref(language, "Close"))
-            .on_press(close),
-        );
-    let mut stage = col()
-        .key("timeline-zoom")
-        .absolute(0.0, 0.0)
-        .w_full()
-        .h_full()
-        .px(40.0)
-        .py(28.0)
-        .gap(14.0)
-        .fill(k.alpha(k.c.black, 0.88))
-        .on_press(close)
-        .modal(true, close)
-        .child(bar)
-        .child(picture);
-    stage = if s.cfg.appearance.reduced_motion {
-        stage.transition(rune::Transition::opacity())
-    } else {
-        stage.transition(rune::Transition::scale(0.97))
-    };
-    Some(stage)
 }

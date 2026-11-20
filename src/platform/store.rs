@@ -89,6 +89,11 @@ pub(crate) fn config_dir() -> anyhow::Result<std::path::PathBuf> {
     if let Some(path) = CONFIG_DIR_OVERRIDE.get() {
         return Ok(path.clone());
     }
+    service_config_dir()
+}
+
+/// Locate the service independently of an embedding Desktop process.
+pub(crate) fn service_config_dir() -> anyhow::Result<PathBuf> {
     if let Some(path) = std::env::var_os("MUQUN_GATEWAY_CONFIG_DIR") {
         return Ok(path.into());
     }
@@ -150,6 +155,10 @@ pub(crate) fn state_dir() -> anyhow::Result<std::path::PathBuf> {
     if let Some(path) = STATE_DIR_OVERRIDE.get() {
         return Ok(path.clone());
     }
+    service_state_dir()
+}
+
+pub(crate) fn service_state_dir() -> anyhow::Result<PathBuf> {
     if let Some(path) = std::env::var_os("MUQUN_GATEWAY_STATE_DIR") {
         return Ok(path.into());
     }

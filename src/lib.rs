@@ -36,7 +36,10 @@ pub use platform::update::Version as ReleaseVersion;
 // Small pure helpers an embedding host shows the same way the gateway does:
 // a "3m ago", a folder named from `~`, and whether a title is only an
 // adapter's placeholder for an unnamed session.
-pub use platform::manage::relative_since;
+pub use platform::manage::{
+    local_gateway_client_file, local_pairing_invitation, relative_since, PairingCode,
+    PairingInvitation,
+};
 /// Workspace `@` file search: the same bounded walk the terminal pane uses.
 /// Desktop falls back here when the agent has no `find_files` (ACP/Cursor).
 pub mod filesearch {
@@ -49,6 +52,7 @@ pub(crate) use platform::store::*;
 pub(crate) use platform::uploads::*;
 pub(crate) use platform::{discovery, git, i18n, parts, state_lock};
 pub use tasks::service::{home_relative, untitled_placeholder};
+pub use terminal::backend::muqun_term::default_socket_path as desktop_terminal_socket;
 pub(crate) use terminal::factory::*;
 pub(crate) use terminal::routes::*;
 pub(crate) use terminal::{

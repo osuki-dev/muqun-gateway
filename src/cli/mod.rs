@@ -50,6 +50,9 @@ pub(crate) enum Command {
         /// nothing configured yet defaults to tmux.
         #[arg(long, value_enum)]
         backend: Option<SetupBackend>,
+        /// Connect to Muqun Desktop's built-in terminal daemon.
+        #[arg(long, conflicts_with_all = ["backend", "socket_path"])]
+        desktop_terminal: bool,
         /// Application transport encryption for newly paired devices.
         #[arg(long, value_enum)]
         transport_encryption: Option<TransportEncryptionMode>,
@@ -222,12 +225,14 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             port,
             socket_path,
             backend,
+            desktop_terminal,
             transport_encryption,
         } => setup(
             public_url,
             port,
             socket_path,
             backend.map(Into::into),
+            desktop_terminal,
             transport_encryption,
         )?,
         Command::Run { config } => run(config).await?,

@@ -9,7 +9,7 @@ use crate::agents::{
     ports::{agent::AgentError, mirror::AgentSessionSnapshot},
 };
 
-const WINDOW_ROWS: usize = 100;
+pub(crate) const WINDOW_ROWS: usize = 100;
 const PAGE_ROWS: usize = 80;
 
 #[derive(Serialize)]
@@ -17,6 +17,8 @@ pub(crate) struct HistoryWindow {
     #[serde(flatten)]
     pub snapshot: AgentSessionSnapshot,
     pub history_cursor: Option<String>,
+    #[serde(skip)]
+    pub unchanged: bool,
 }
 
 #[derive(Serialize)]
@@ -33,21 +35,28 @@ struct Cursor {
     epoch: String,
     generation: u64,
     anchor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_revision: Option<u64>,
 }
 
 impl SessionState {
     fn cursor(&self, item: &TimelineItem) -> String {
+        self.encode_cursor(item, None)
+    }
+
+    fn encode_cursor(&self, item: &TimelineItem, snapshot_revision: Option<u64>) -> String {
         let cursor = Cursor {
             session: self.info.asid.0.clone(),
             epoch: self.history_epoch.clone(),
             generation: self.history_removal_generation,
             anchor: item.id.clone(),
+            snapshot_revision,
         };
         // This concrete struct contains only strings and an integer.
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cursor).expect("history cursor is serializable"))
     }
 
-    fn anchor(&self, encoded: &str) -> Result<&TimelineItem, AgentError> {
+    fn decode_cursor(&self, encoded: &str) -> Result<Cursor, AgentError> {
         if encoded.len() > 4096 {
             return Err(AgentError::HistoryCursorLost);
         }
@@ -62,6 +71,10 @@ impl SessionState {
         {
             return Err(AgentError::HistoryCursorLost);
         }
+        Ok(cursor)
+    }
+
+    fn anchor(&self, cursor: &Cursor) -> Result<&TimelineItem, AgentError> {
         self.timeline
             .get(&cursor.anchor)
             .or_else(|| {
@@ -78,10 +91,16 @@ impl MemoryMirror {
         &self,
         asid: &AgentSessionId,
         cursor: Option<&str>,
+        limit: usize,
+        if_seq: Option<u64>,
     ) -> Result<HistoryWindow, AgentError> {
         let sessions = self.sessions.read().await;
         let state = sessions.get(asid).ok_or(AgentError::HistoryCursorLost)?;
-        let rows: Vec<_> = match cursor {
+        let decoded = cursor.map(|value| state.decode_cursor(value)).transpose()?;
+        // Older-page backfills may change rows without a public event sequence.
+        let unchanged = if_seq == Some(state.current_seq)
+            && decoded.as_ref().and_then(|c| c.snapshot_revision) == Some(state.snapshot_state_seq);
+        let rows: Vec<_> = match decoded.as_ref() {
             Some(cursor) => {
                 let anchor = state.anchor(cursor)?;
                 // A retained frontier permits paging, but cannot reconstruct a
@@ -89,16 +108,26 @@ impl MemoryMirror {
                 if !state.timeline.contains_key(&anchor.id) {
                     return Err(AgentError::HistoryCursorLost);
                 }
-                state.timeline.from(anchor).collect()
+                if unchanged {
+                    Vec::new()
+                } else {
+                    state.timeline.from(anchor).collect()
+                }
             }
             None => {
-                let mut rows: Vec<_> = state.timeline.ordered().rev().take(WINDOW_ROWS).collect();
+                let mut rows: Vec<_> = state.timeline.ordered().rev().take(limit).collect();
                 rows.reverse();
                 rows
             }
         };
         Ok(HistoryWindow {
-            history_cursor: rows.first().map(|row| state.cursor(row)),
+            unchanged,
+            history_cursor: if unchanged {
+                cursor.map(str::to_owned)
+            } else {
+                rows.first()
+                    .map(|row| state.encode_cursor(row, Some(state.snapshot_state_seq)))
+            },
             snapshot: AgentSessionSnapshot {
                 info: state.info.clone(),
                 timeline: rows.iter().map(|row| (*row).clone()).collect(),
@@ -117,11 +146,8 @@ impl MemoryMirror {
         cursor: &str,
     ) -> Result<TimelineItem, AgentError> {
         let sessions = self.sessions.read().await;
-        Ok(sessions
-            .get(asid)
-            .ok_or(AgentError::HistoryCursorLost)?
-            .anchor(cursor)?
-            .clone())
+        let state = sessions.get(asid).ok_or(AgentError::HistoryCursorLost)?;
+        Ok(state.anchor(&state.decode_cursor(cursor)?)?.clone())
     }
 
     /// A provider may backfill a newly discovered row on either side of the
@@ -138,7 +164,7 @@ impl MemoryMirror {
     ) -> Result<HistoryPage, AgentError> {
         let sessions = self.sessions.read().await;
         let state = sessions.get(asid).ok_or(AgentError::HistoryCursorLost)?;
-        if state.cursor(boundary) != cursor {
+        if state.decode_cursor(cursor)?.anchor != boundary.id {
             return Err(AgentError::HistoryCursorLost);
         }
         let boundary = state.timeline.get(&boundary.id).unwrap_or(boundary);
@@ -169,7 +195,7 @@ impl MemoryMirror {
         let state = sessions.get(asid).ok_or(AgentError::HistoryCursorLost)?;
         // A fetch can advance the retained frontier. Check the epoch/removal
         // boundary against a token for the old row without requiring retention.
-        if state.cursor(boundary) != cursor {
+        if state.decode_cursor(cursor)?.anchor != boundary.id {
             return Err(AgentError::HistoryCursorLost);
         }
         let boundary = state.timeline.get(&boundary.id).unwrap_or(boundary);
@@ -240,7 +266,10 @@ mod tests {
     #[tokio::test]
     async fn warm_entry_and_independent_readers_page_without_gaps_or_duplicates() {
         let (mirror, id) = fixture(1683).await;
-        let entry = mirror.history_window(&id, None).await.unwrap();
+        let entry = mirror
+            .history_window(&id, None, WINDOW_ROWS, None)
+            .await
+            .unwrap();
         assert_eq!(entry.snapshot.timeline.len(), 100);
         assert_eq!(entry.snapshot.timeline[0].id, row(1583).id);
         let first_cursor = entry.history_cursor.unwrap();
@@ -276,14 +305,14 @@ mod tests {
         assert_eq!(second.items[0].id, row(1503).id);
         mirror.upsert_timeline_items(&id, vec![row(1683)]).await;
         let resync = mirror
-            .history_window(&id, second.history_cursor.as_deref())
+            .history_window(&id, second.history_cursor.as_deref(), WINDOW_ROWS, None)
             .await
             .unwrap();
         assert_eq!(resync.snapshot.timeline.first().unwrap().id, row(1503).id);
         assert_eq!(resync.snapshot.timeline.last().unwrap().id, row(1683).id);
         assert_eq!(
             mirror
-                .history_window(&id, None)
+                .history_window(&id, None, WINDOW_ROWS, None)
                 .await
                 .unwrap()
                 .snapshot
@@ -297,7 +326,7 @@ mod tests {
     async fn cursors_reject_cross_session_gateway_recreation_removal_and_malformed_input() {
         let (mirror, id) = fixture(200).await;
         let cursor = mirror
-            .history_window(&id, None)
+            .history_window(&id, None, WINDOW_ROWS, None)
             .await
             .unwrap()
             .history_cursor
@@ -392,11 +421,31 @@ mod tests {
     #[tokio::test]
     async fn provider_backfill_after_the_boundary_is_not_lost_on_first_traversal() {
         let (mirror, id) = fixture(200).await;
-        let entry = mirror.history_window(&id, None).await.unwrap();
+        let entry = mirror
+            .history_window(&id, None, WINDOW_ROWS, None)
+            .await
+            .unwrap();
         let cursor = entry.history_cursor.unwrap();
         let boundary = mirror.history_boundary(&id, &cursor).await.unwrap();
         let mut discovered = row(150);
         discovered.id = "newly-discovered-canonical-row".into();
+        let gate = mirror.history_gate(&id).await;
+        let revision = mirror.history_read_revision(&id).await.unwrap();
+        mirror
+            .accept_earlier_window_history(&id, &gate, revision, vec![discovered.clone()], None)
+            .await
+            .unwrap();
+        let caught_up = mirror
+            .history_window(&id, Some(&cursor), 40, Some(entry.snapshot.seq))
+            .await
+            .unwrap();
+        assert_eq!(caught_up.snapshot.seq, entry.snapshot.seq);
+        assert!(!caught_up.unchanged);
+        assert!(caught_up
+            .snapshot
+            .timeline
+            .iter()
+            .any(|r| r.id == discovered.id));
         let page = mirror
             .fetched_history_page(
                 &id,
@@ -425,7 +474,10 @@ mod tests {
     ) {
         use crate::agents::ports::agent::HistoryCommit;
         let (mirror, id) = fixture(1000).await;
-        let initial = mirror.history_window(&id, None).await.unwrap();
+        let initial = mirror
+            .history_window(&id, None, WINDOW_ROWS, None)
+            .await
+            .unwrap();
         let revision = mirror.snapshot_read_revision(&id).await;
         let mut fresh = row(950);
         fresh.part = AgentPart::Text {
@@ -472,7 +524,7 @@ mod tests {
             &fresh
         );
         let resynced = mirror
-            .history_window(&id, initial.history_cursor.as_deref())
+            .history_window(&id, initial.history_cursor.as_deref(), WINDOW_ROWS, None)
             .await
             .unwrap();
         assert!(resynced

@@ -1,7 +1,7 @@
 name: Desktop preview
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       publish:
         description: Publish the verified preview as a GitHub prerelease

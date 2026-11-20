@@ -533,15 +533,14 @@ impl UiState {
                     self.start_agent = agent;
                 }
                 if let Some(cwd) = cwd {
-                    self.start_cwd = TextEdit::new(cwd.display().to_string());
-                    self.completions.clear();
+                    super::home::pick_folder_path(self, cwd.display().to_string());
                 }
                 self.go(Mode::Home);
             }
             Act::Go(mode) => self.go(mode),
             Act::Settings(tab) => {
                 self.go(Mode::Settings);
-                self.settings_tab = tab;
+                super::settings::open(self, tab);
             }
             Act::Split => self.split(),
             Act::Unsplit => self.unsplit(),

@@ -10,7 +10,8 @@ use super::tokens::{hsl_to_rgb, rgb_to_hsl};
 
 /// Id and base colour (sRGB hex). `other` is the neutral for an id this
 /// build does not know.
-const BRAND: [(&str, u32); 11] = [
+const BRAND: [(&str, u32); 12] = [
+    ("copilot", 0x59636E),
     ("codex", 0x10A37F),
     ("opencode", 0xF97316),
     ("deepseek", 0x4F6BFE),

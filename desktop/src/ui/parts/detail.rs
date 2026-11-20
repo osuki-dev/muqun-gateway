@@ -1,14 +1,40 @@
-//! A subagent's session in a sheet over its parent (App
-//! `agent-subagent-detail-sheet`): a read-only snapshot of the child's
-//! timeline, drawn with the same cards, with Refresh, Open session, and
-//! Back through nested subagents to the parent.
-
 use muqun_gateway::agents::ports::AgentSessionSnapshot;
 use muqun_gateway::agents::AgentSessionId;
-use rune::{col, icon, row, text, Cursor, El};
-use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
+use rune::{col, row, text, El};
+use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit};
 
-use super::glyphs;
+use crate::config::Language;
+use crate::plugin::{DesktopPlugin, PluginViewContext};
+pub(crate) const ID: &str = "subagent-detail";
+
+pub(crate) struct SubagentWindow;
+
+impl DesktopPlugin for SubagentWindow {
+    fn id(&self) -> &'static str {
+        ID
+    }
+    fn title(&self, lang: Language) -> String {
+        tr_ref(lang, "Subagent").to_owned()
+    }
+    fn icon(&self) -> &'static rune::Icon {
+        &crate::ui::icons::AGENT
+    }
+    fn window_title(&self, s: &UiState) -> Option<String> {
+        let asid = s.detail.as_ref()?.shown()?;
+        Some(title(s, asid))
+    }
+    fn window_actions(&self, s: &UiState, k: &Kit) -> Option<El> {
+        let detail = s.detail.as_ref()?;
+        Some(actions(s, k, detail, detail.shown()?))
+    }
+    fn can_move_view(&self, _: &str) -> bool {
+        true
+    }
+    fn render_tile(&self, ctx: &PluginViewContext<'_>, _: &mut Vec<El>) -> Option<El> {
+        body(ctx.s, ctx.k)
+    }
+}
+
 use crate::model::commands::Command;
 use crate::ui::copy::tr_ref;
 use crate::ui::timeline::session_view;
@@ -29,32 +55,58 @@ impl DetailSheet {
 }
 
 impl UiState {
-    /// Show `asid` (a subagent's session) in the sheet, over whatever it
-    /// shows now; Back returns there.
-    pub fn open_detail(&mut self, asid: &str) {
+    pub(crate) fn open_detail(&mut self, parent: &str, asid: &str) {
+        self.remember_subagent_context(asid, Some(parent));
         let sheet = self.detail.get_or_insert_with(DetailSheet::default);
         if sheet.shown() != Some(asid) {
-            sheet.stack.push(asid.to_string());
+            if sheet.shown() != Some(parent) {
+                sheet.stack.clear();
+            }
+            if let Some(index) = sheet.stack.iter().position(|id| id == asid) {
+                sheet.stack.truncate(index + 1);
+            } else {
+                sheet.stack.push(asid.to_owned());
+            }
         }
-        sheet.error = None;
-        self.send(Command::ReadDetail(AgentSessionId(asid.to_string())));
+        self.refresh_detail(asid);
+        if self.active_plugin_page.as_deref() == Some(ID) {
+            return;
+        }
+        if let Some(i) = self.tile_of_plugin(ID) {
+            self.focus_tile(i);
+        } else {
+            self.open_plugin_drawer(ID);
+        }
+        self.retain_timelines();
     }
 
-    /// One step back toward the parent; the last step closes the sheet.
-    pub fn detail_back(&mut self) {
-        if let Some(sheet) = self.detail.as_mut() {
-            sheet.stack.pop();
-            sheet.error = None;
-            if sheet.stack.is_empty() {
-                self.detail = None;
+    fn refresh_detail(&mut self, asid: &str) {
+        if let Some(detail) = &mut self.detail {
+            detail.error = None;
+        }
+        self.send(Command::ReadDetail(AgentSessionId(asid.to_owned())));
+    }
+
+    fn detail_back(&mut self) {
+        if let Some(detail) = &mut self.detail {
+            detail.stack.pop();
+            if let Some(asid) = detail.shown().map(str::to_owned) {
+                self.refresh_detail(&asid);
             }
         }
         self.retain_timelines();
     }
 
-    pub fn close_detail(&mut self) {
+    pub(crate) fn close_detail(&mut self) {
+        self.close_plugin_windows(ID);
         self.detail = None;
         self.retain_timelines();
+    }
+
+    pub(crate) fn detail_window_focused(&self) -> bool {
+        self.detail.is_some()
+            && (self.active_plugin_page.as_deref() == Some(ID)
+                || self.tile_of_plugin(ID) == Some(self.focus) && self.active_plugin_page.is_none())
     }
 
     /// The core's read of a sheet's session.
@@ -74,6 +126,7 @@ impl UiState {
                 sheet.error = None;
                 let snapshot = *snapshot;
                 self.merge_sessions(vec![snapshot.info.clone()]);
+                self.remember_timeline_lineage(&snapshot.info.asid.0, &snapshot.timeline);
                 self.timelines
                     .entry(asid)
                     .or_default()
@@ -92,42 +145,24 @@ impl UiState {
     }
 }
 
-fn header(s: &UiState, k: &Kit, sheet: &DetailSheet, asid: &str) -> El {
-    let language = s.cfg.general.language;
-    let t = |en| tr_ref(language, en);
+fn title(s: &UiState, asid: &str) -> String {
     let info = s.session_by_id(asid);
-    let title = info
-        .map(|i| i.title.trim().to_string())
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| t("Subagent").to_string());
-    let mut facts = vec![t("Subagent").to_string()];
-    if let Some(i) = info {
-        if let Some(role) = i.agent_role.as_ref().or(i.agent_name.as_ref()) {
-            facts.push(role.clone());
-        }
-        if let Some(model) = &i.model {
-            facts.push(crate::ui::labels::format_model_name(
-                model,
-                &model.model_id,
-                None,
-            ));
-        }
-        if let Some(tokens) = i
-            .context_usage
-            .as_ref()
-            .map(|c| c.total_tokens)
-            .filter(|t| *t > 0)
-        {
-            facts.push(super::context::tokens_label(language, tokens));
-        }
-    }
-    let mut bar = row()
-        .key("detail-head")
-        .w_full()
-        .gap(8.0)
-        .px(14.0)
-        .py(10.0)
-        .center_y();
+    info.and_then(|i| {
+        i.agent_name
+            .as_deref()
+            .filter(|n| !n.trim().is_empty())
+            .or_else(|| {
+                (!i.title.trim().is_empty() && !i.title.eq_ignore_ascii_case("subagent"))
+                    .then_some(i.title.as_str())
+            })
+    })
+    .unwrap_or_else(|| tr_ref(s.cfg.general.language, "Subagent"))
+    .to_owned()
+}
+
+fn actions(s: &UiState, k: &Kit, sheet: &DetailSheet, asid: &str) -> El {
+    let t = |en| tr_ref(s.cfg.general.language, en);
+    let mut bar = row().center_y().gap(2.0);
     if sheet.stack.len() > 1 {
         bar = bar.child(
             Button::new(t("Back"))
@@ -138,38 +173,22 @@ fn header(s: &UiState, k: &Kit, sheet: &DetailSheet, asid: &str) -> El {
                 .key("detail-back"),
         );
     }
-    bar = bar.child(
-        col()
-            .gap(1.0)
-            .shrink()
-            .grow(1.0)
-            .child(
-                text(title)
-                    .font(k.ty.ui_medium)
-                    .color(k.c.text_base)
-                    .single_line()
-                    .truncate(),
-            )
-            .child(
-                text(facts.join(" · "))
-                    .font(k.ty.small)
-                    .color(k.c.text_faint)
-                    .single_line()
-                    .truncate(),
-            ),
-    );
     let (refresh, open) = (asid.to_string(), asid.to_string());
     bar.child(
-        Button::new(t("Refresh"))
-            .variant(ButtonVariant::Ghost)
+        IconButton::new(&crate::ui::icons::REFRESH)
+            .variant(IconButtonVariant::Ghost)
+            .label(t("Refresh"))
+            .help(t("Refresh"))
             .control_size(ControlSize::Small)
-            .on_press(move |s: &mut UiState| s.open_detail(&refresh))
+            .on_press(move |s: &mut UiState| s.refresh_detail(&refresh))
             .build(k)
             .key("detail-refresh"),
     )
     .child(
-        Button::new(t("Open session"))
-            .variant(ButtonVariant::Outline)
+        IconButton::new(&crate::ui::icons::OPEN_EXTERNAL)
+            .label(t("Open session"))
+            .help(t("Open session"))
+            .variant(IconButtonVariant::Ghost)
             .control_size(ControlSize::Small)
             .build(k)
             .key("detail-open")
@@ -183,26 +202,14 @@ fn header(s: &UiState, k: &Kit, sheet: &DetailSheet, asid: &str) -> El {
                 }
             }),
     )
-    .child(
-        k.interactive(
-            row()
-                .key("detail-close")
-                .size(28.0, 28.0)
-                .center()
-                .radius(k.radius.md)
-                .child(icon(&glyphs::CLOSE, 14.0).color(k.c.icon_muted)),
-        )
-        .cursor(Cursor::Pointer)
-        .label(t("Close"))
-        .on_press(|s: &mut UiState| s.close_detail()),
-    )
 }
 
-/// The sheet over the window's right side, when one is open.
-pub fn sheet(s: &UiState, k: &Kit) -> Option<El> {
+fn body(s: &UiState, k: &Kit) -> Option<El> {
     let sheet = s.detail.as_ref()?;
     let asid = sheet.shown()?;
     let language = s.cfg.general.language;
+    let timeline = s.timelines.get(asid);
+    let has_echoes = s.timeline_echoes(asid).next().is_some();
     let body = if let Some(err) = &sheet.error {
         let retry = asid.to_string();
         col()
@@ -221,11 +228,32 @@ pub fn sheet(s: &UiState, k: &Kit) -> Option<El> {
                 Button::new(tr_ref(language, "Try again"))
                     .variant(ButtonVariant::Outline)
                     .control_size(ControlSize::Small)
-                    .on_press(move |s: &mut UiState| s.open_detail(&retry))
+                    .on_press(move |s: &mut UiState| s.refresh_detail(&retry))
                     .build(k),
             )
-    } else if s.timelines.contains_key(asid) {
+    } else if timeline.is_some_and(|tl| !tl.items.is_empty()) || has_echoes {
         session_view(s, k, asid)
+    } else if timeline.is_some() {
+        let busy = s.session_busy(asid);
+        col()
+            .key("detail-empty")
+            .w_full()
+            .grow(1.0)
+            .center()
+            .gap(10.0)
+            .children(busy.then(|| crate::ui::art::ActivityMark::Standalone.build(k)))
+            .child(
+                text(tr_ref(
+                    language,
+                    if busy {
+                        "Working…"
+                    } else {
+                        "No messages yet."
+                    },
+                ))
+                .font(k.ty.ui)
+                .color(k.c.text_base),
+            )
     } else {
         col()
             .key("detail-loading")
@@ -234,34 +262,85 @@ pub fn sheet(s: &UiState, k: &Kit) -> Option<El> {
             .center()
             .child(crate::ui::art::ActivityMark::Standalone.build(k))
     };
-    let panel = col()
-        .key(format!("detail-panel-{asid}"))
-        .w_frac(0.56)
-        .min_w(420.0)
-        .max_w(760.0)
-        .h_full()
-        .fill(k.c.bg_base)
-        .border(1.0, k.c.border_weak)
-        .on_press(|_: &mut UiState| {})
-        .child(header(s, k, sheet, asid))
-        .child(col().h(1.0).w_full().fill(k.c.border_weak))
-        .child(body);
-    let panel = k.elevate(panel, &k.elevation.overlay);
-    let panel = if s.cfg.appearance.reduced_motion {
-        panel.transition(rune::Transition::opacity())
-    } else {
-        panel.transition(rune::Transition::offset(48.0, 0.0))
-    };
+    let mut facts = Vec::new();
+    if let Some(info) = s.session_by_id(asid) {
+        if let Some(role) = info.agent_role.as_deref().filter(|r| !r.is_empty()) {
+            facts.push(role.to_owned());
+        }
+        if let Some(model) = &info.model {
+            facts.push(crate::ui::labels::format_model_name(
+                model,
+                &model.model_id,
+                None,
+            ));
+        }
+        if let Some(tokens) = info
+            .context_usage
+            .as_ref()
+            .map(|c| c.total_tokens)
+            .filter(|t| *t > 0)
+        {
+            facts.push(super::context::tokens_label(language, tokens));
+        }
+    }
     Some(
-        row()
-            .key("timeline-detail")
-            .absolute(0.0, 0.0)
+        col()
+            .key(format!("detail-panel-{asid}"))
             .w_full()
-            .h_full()
-            .justify_end()
-            .fill(k.alpha(k.c.black, 0.28))
-            .on_press(|s: &mut UiState| s.close_detail())
-            .modal(true, |s: &mut UiState| s.close_detail())
-            .child(panel),
+            .grow(1.0)
+            .min_h(0.0)
+            .children((!facts.is_empty()).then(|| {
+                text(facts.join(" · "))
+                    .px(12.0)
+                    .py(4.0)
+                    .font(k.ty.small)
+                    .color(k.c.text_muted)
+                    .single_line()
+                    .truncate()
+            }))
+            .child(body),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin::PluginSlot;
+
+    #[test]
+    fn siblings_nested_targets_and_placement_keep_the_correct_conversation() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.mode = crate::ui::Mode::Session;
+        s.selected = Some("parent".into());
+        s.open_plugin_drawer("quicknotes");
+        s.open_detail("parent", "first");
+        assert_eq!(s.selected_dock_tab(), Some(ID));
+        s.open_detail("parent", "second");
+        s.on_detail("first".into(), Err("stale response".into()));
+        assert_eq!(s.detail_asids(), ["second"]);
+        assert!(s.detail.as_ref().unwrap().error.is_none());
+        s.open_detail("second", "nested");
+        assert_eq!(s.detail_asids(), ["second", "nested"]);
+        s.detail_back();
+        assert_eq!(s.detail_asids(), ["second"]);
+        s.switch_plugin_surface(ID, PluginSlot::Page);
+        assert_eq!(s.active_plugin_page.as_deref(), Some(ID));
+        assert_eq!(s.detail_asids(), ["second"]);
+        s.close_plugin_page();
+        assert_eq!(s.selected_dock_tab(), Some(ID));
+        s.switch_plugin_surface(ID, PluginSlot::Tile);
+        let i = s.tile_of_plugin(ID).unwrap();
+        s.toggle_tile_pop_at(i);
+        assert!(s.tiles[i].popped);
+        assert_eq!(s.detail_asids(), ["second"]);
+        s.close_tile(i);
+        assert!(s.detail.is_none());
+        assert_eq!(s.selected.as_deref(), Some("parent"));
+        s.open_plugin_drawer("quicknotes");
+        s.open_detail("parent", "third");
+        s.close_plugin_drawer();
+        assert_eq!(s.selected_dock_tab(), Some("quicknotes"));
+        assert!(s.detail.is_none());
+    }
 }

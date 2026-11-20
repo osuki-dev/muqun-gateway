@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use muqun_gateway::agents::compose::RuntimeSettings;
 use muqun_gateway::agents::runtime::LocalAgentConfigs;
 use muqun_gateway::agents::{
-    AntigravityConfig, ClaudeConfig, CodexConfig, CursorConfig, DeepseekConfig, FxConfig,
-    OpencodeConfig, PiConfig, QoderConfig, T3Config,
+    AntigravityConfig, ClaudeConfig, CodexConfig, CopilotConfig, CursorConfig, DeepseekConfig,
+    FxConfig, OpencodeConfig, PiConfig, QoderConfig, T3Config,
 };
 use serde::{Deserialize, Serialize};
 
@@ -249,6 +249,7 @@ pub struct AgentConfigs {
     pub t3: T3Config,
     pub fx: FxConfig,
     pub qoder: QoderConfig,
+    pub copilot: CopilotConfig,
     pub pi: PiConfig,
     pub claude: ClaudeConfig,
     pub antigravity: AntigravityConfig,
@@ -263,6 +264,7 @@ impl AgentConfigs {
             deepseek: self.deepseek.clone(),
             t3: self.t3.clone(),
             local: LocalAgentConfigs {
+                copilot: self.copilot.clone(),
                 codex: self.codex.clone(),
                 fx: self.fx.clone(),
                 qoder: self.qoder.clone(),
@@ -317,7 +319,7 @@ pub struct General {
 pub const START_DRAFT: &str = "start";
 /// The most drafts kept; the oldest-written are not tracked, so past this the
 /// session drafts of a few arbitrary sessions go (the start page's never).
-const MAX_DRAFTS: usize = 64;
+pub(crate) const MAX_DRAFTS: usize = 64;
 
 /// What "an agent in a folder" is called in [`General::last_model`] and
 /// [`General::last_mode`].
@@ -582,6 +584,16 @@ pub enum Scheme {
     System,
 }
 
+/// Minimal lineage evidence for a session visited from its parent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentContext {
+    pub computer: String,
+    pub agent: String,
+    pub asid: String,
+    /// An observed ancestor, not a guessed parent reconstructed from a title or id.
+    pub ancestor: Option<String>,
+}
+
 /// Window furniture the owner arranged and expects back.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -604,6 +616,10 @@ pub struct UiPrefs {
     /// The command palette's recent commands, newest first.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recent_commands: Vec<String>,
+    /// Bounded lineage evidence for sessions opened through a parent. This keeps
+    /// incomplete metadata after reconnect from promoting a child to a root row.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subagent_contexts: Vec<SubagentContext>,
     /// Sessions open side by side when the window closed, in tile order
     /// (`ui/tiles.rs`); empty when one session filled the pane.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -754,6 +770,7 @@ impl Default for UiPrefs {
             terminal_open_mode: TerminalOpenMode::default(),
             projects: BTreeMap::new(),
             recent_commands: Vec::new(),
+            subagent_contexts: Vec::new(),
             tiles: Vec::new(),
             tile_layout: None,
             tile_mode: TileLayoutMode::Dwindle,
@@ -800,6 +817,7 @@ pub enum ConfigEdit {
     CloseToTray(bool),
     /// The command palette's recent commands, newest first.
     RecentCommands(Vec<String>),
+    RememberSubagent(SubagentContext),
     Voice(VoiceConfig),
     EditorCommand(Option<String>),
     FilesInEditor(bool),
@@ -845,9 +863,12 @@ pub enum ConfigEdit {
         computer: String,
         accent: String,
     },
+    /// Remove this login, keeping the owner's computer preferences.
+    ForgetComputer(String),
     /// Configure a computer's URL and token.
     ComputerToken {
         computer: String,
+        label: String,
         url: String,
         token: String,
         device_id: Option<String>,
@@ -903,6 +924,16 @@ impl DesktopConfig {
             ConfigEdit::Notifications(on) => self.notifications.enabled = on,
             ConfigEdit::CloseToTray(on) => self.general.close_to_tray = on,
             ConfigEdit::RecentCommands(list) => self.ui.recent_commands = list,
+            ConfigEdit::RememberSubagent(context) => {
+                self.ui.subagent_contexts.retain(|old| {
+                    old.computer != context.computer
+                        || (old.agent != context.agent && !old.agent.is_empty())
+                        || old.asid != context.asid
+                });
+                self.ui.subagent_contexts.push(context);
+                let excess = self.ui.subagent_contexts.len().saturating_sub(256);
+                self.ui.subagent_contexts.drain(..excess);
+            }
             ConfigEdit::Voice(voice) => self.voice = voice,
             ConfigEdit::EditorCommand(command) => {
                 self.general.editor_command = command.filter(|c| !c.trim().is_empty());
@@ -965,22 +996,30 @@ impl DesktopConfig {
                 let p = self.computers.entry(computer).or_default();
                 p.accent = Some(accent);
             }
+            ConfigEdit::ForgetComputer(computer) => {
+                if let Some(p) = self.computers.get_mut(&computer) {
+                    p.url = None;
+                    p.token = None;
+                    p.device_id = None;
+                    p.transport_key = None;
+                }
+            }
             ConfigEdit::ComputerToken {
                 computer,
+                label,
                 url,
                 token,
                 device_id,
                 transport_key,
             } => {
                 let p = self.computers.entry(computer).or_default();
+                if p.name.is_empty() {
+                    p.name = label;
+                }
                 p.url = Some(url);
                 p.token = Some(token);
-                if device_id.is_some() {
-                    p.device_id = device_id;
-                }
-                if transport_key.is_some() {
-                    p.transport_key = transport_key;
-                }
+                p.device_id = device_id;
+                p.transport_key = transport_key;
             }
             ConfigEdit::AgentEnabled { agent, on } => {
                 let target = self.current_computer.clone();
@@ -1092,22 +1131,15 @@ impl DesktopConfig {
         std::fs::create_dir_all(dir)?;
         let mut json = serde_json::to_vec_pretty(self)?;
         json.push(b'\n');
-        let tmp = dir.join(format!(
-            ".{}.{}.tmp",
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("config"),
-            std::process::id()
-        ));
         let result = (|| -> std::io::Result<()> {
-            let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(&json)?;
-            file.sync_all()?;
-            std::fs::rename(&tmp, path)
+            // Profiles include bearer tokens and device transport keys. A fresh
+            // NamedTempFile is owner-only on Unix, including after the rename.
+            let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+            tmp.write_all(&json)?;
+            tmp.as_file().sync_all()?;
+            tmp.persist(path)?;
+            Ok(())
         })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
         result.map_err(|err| anyhow::anyhow!("cannot write {}: {err}", path.display()))
     }
 }

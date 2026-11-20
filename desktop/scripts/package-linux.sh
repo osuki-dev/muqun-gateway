@@ -18,6 +18,7 @@ PKG="$STAGE/$NAME"
 mkdir -p "$PKG/bin" "$PKG/desktop/scripts" "$PKG/desktop/packaging" "$PKG/desktop/assets/plugins/review-center"
 cp "$ROOT/install-desktop.sh" "$ROOT/install.sh" "$PKG/"
 cp "$BIN" "$PKG/bin/muqun-desktop"
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$PKG/bin/muqun-desktop-install" "$ROOT"/desktop/installer/*.go
 cp "$(dirname "$BIN")/muqun-wry-embedded" "$PKG/bin/"
 cp "$ROOT/desktop/scripts/install-local.sh" "$ROOT/desktop/scripts/uninstall-local.sh" "$PKG/desktop/scripts/"
 cp -R "$ROOT/desktop/packaging/linux" "$PKG/desktop/packaging/"

@@ -22,15 +22,20 @@ use crate::ui::icons;
 use crate::ui::terminal_panel;
 use crate::ui::{Mode, ToastLevel, UiState};
 
+pub(crate) mod browser;
+pub(crate) mod context;
+pub(crate) mod draft;
 pub mod loader;
 pub mod manifest;
+pub mod packages;
+pub(crate) mod webview_preview;
 pub mod window;
 pub use window::WindowKind;
 
 pub use loader::{discover_plugins, BunScriptResponse, BunToastResponse, ExternalPlugin};
 pub use manifest::{
-    PluginCategory, PluginCommandManifest, PluginManifest, PluginRenderKind, PluginSlot,
-    PluginSurface, PluginTileManifest,
+    PluginCategory, PluginCommandManifest, PluginManifest, PluginRenderKind, PluginRepository,
+    PluginSlot, PluginSurface, PluginTileManifest,
 };
 
 /// Built-in plugins that stay on; their Settings toggle is disabled.
@@ -93,31 +98,18 @@ pub fn surface_switcher(
 ) -> El {
     let menu_id = format!("surface-{plugin_id}-{active:?}");
     let open = s.menu == Some(crate::ui::OpenMenu::WindowSurface(menu_id.clone()));
-    let title = WindowKind::from_slot(active).map_or("Window", WindowKind::label);
-    let arrow = crate::ui::art::directional_arrow(
-        s,
-        k,
-        12.0,
-        if open {
-            -std::f32::consts::FRAC_PI_2
-        } else {
-            std::f32::consts::FRAC_PI_2
-        },
-        k.c.icon_muted,
+    let Some(kind) = WindowKind::from_slot(active) else {
+        return el();
+    };
+    let label = format!(
+        "{} · {}",
+        tr_ref(lang, "Window"),
+        tr_ref(lang, kind.label())
     );
-    let label = tr_ref(lang, title);
     let mut menu = rune_kit::Menu::new(menu_id.clone())
         .trigger(
-            Button::new(label)
-                .label_with(move |font, ink| {
-                    row()
-                        .gap(7.0)
-                        .center_y()
-                        .child(text(label).font(font).color(ink))
-                        .child(arrow)
-                })
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Large)
+            crate::ui::icons::header_button(kind.glyph(), label)
+                .expanded(open)
                 .on_press(move |s: &mut UiState| {
                     s.menu = (!open).then(|| crate::ui::OpenMenu::WindowSurface(menu_id.clone()));
                 })
@@ -189,6 +181,14 @@ pub trait DesktopPlugin: Send + Sync {
     /// Human-readable title in the specified language.
     fn title(&self, lang: Language) -> String;
 
+    /// Optional title and contextual actions in the host window header.
+    fn window_title(&self, _s: &UiState) -> Option<String> {
+        None
+    }
+    fn window_actions(&self, _s: &UiState, _k: &Kit) -> Option<El> {
+        None
+    }
+
     /// Icon representing this plugin in toolbars and pickers.
     fn icon(&self) -> &'static Icon;
 
@@ -207,6 +207,16 @@ pub trait DesktopPlugin: Send + Sync {
     /// Category for grouping in plugin lists and pickers.
     fn category(&self) -> PluginCategory {
         PluginCategory::Tools
+    }
+
+    /// Standard package keywords shown as tags and included in plugin search.
+    fn keywords(&self) -> &[String] {
+        &[]
+    }
+
+    /// Author-declared source repository; absent when missing or unsafe.
+    fn repository(&self) -> Option<&PluginRepository> {
+        None
     }
 
     /// Display surfaces supported by this plugin.
@@ -245,8 +255,26 @@ pub trait DesktopPlugin: Send + Sync {
     /// Apply a runtime enablement change without restarting the host.
     fn enabled_changed(&self, _enabled: bool) {}
 
+    fn on_notification_action(&self, _s: &mut UiState, _action: &str) {}
+
+    fn close_view(&self, _instance: &str) {}
+
+    /// Move a mounted view without recreating its renderer or restarting its worker.
+    fn can_move_view(&self, _instance: &str) -> bool {
+        false
+    }
+
+    fn move_view(&self, _from: &str, _to: &str) {}
+
+    fn open_terminal_entry(&self, _s: &mut UiState, _entry: &str) {}
+
     /// Fold background work into UI state without blocking input.
     fn poll(&self, _s: &mut UiState, _tx: &mut Tx) -> bool {
+        false
+    }
+
+    /// Deliver a native component action to its owning surface.
+    fn on_view_action(&self, _s: &mut UiState, _instance: &str, _action: &str) -> bool {
         false
     }
 
@@ -262,6 +290,7 @@ pub trait DesktopPlugin: Send + Sync {
 pub struct PluginRegistry {
     plugins: HashMap<String, Arc<dyn DesktopPlugin>>,
     order: Vec<String>,
+    pub managed_versions: HashMap<String, String>,
 }
 
 impl PluginRegistry {
@@ -274,6 +303,9 @@ impl PluginRegistry {
     pub fn default_registry() -> Self {
         let mut r = Self::new();
         r.register(Arc::new(TerminalPlugin));
+        if loader::webview_helper().is_some() {
+            r.register(Arc::new(browser::BrowserPlugin));
+        }
         r.register(Arc::new(FilePlugin));
         r.register(Arc::new(DiffPlugin));
         r.register(Arc::new(InspectorPlugin));
@@ -283,12 +315,43 @@ impl PluginRegistry {
         r.register(Arc::new(SysInfoPlugin));
         r.register(Arc::new(QuickNotesPlugin));
 
+        let detail = crate::ui::parts::detail::SubagentWindow;
+        // Contextual window opened by a conversation row, outside the plugin catalog.
+        r.plugins.insert(detail.id().to_owned(), Arc::new(detail));
+
         let dirs = loader::default_plugin_dirs();
         for plugin in loader::discover_plugins(&dirs) {
             r.register(Arc::new(plugin));
         }
 
+        if let Ok(entries) = packages::entries() {
+            for (id, path) in entries {
+                if r.get(&id).is_none() {
+                    if let Ok(plugin) = ExternalPlugin::from_dir(&path) {
+                        r.managed_versions
+                            .insert(id, plugin.manifest().version.clone());
+                        r.register(Arc::new(plugin));
+                    }
+                }
+            }
+        }
         r
+    }
+
+    pub fn reload_package(&mut self, id: &str) {
+        if self.managed_versions.remove(id).is_some() {
+            self.plugins.remove(id);
+            self.order.retain(|old| old != id);
+        }
+        if let Ok(entries) = packages::entries() {
+            if let Some((_, path)) = entries.into_iter().find(|(name, _)| name == id) {
+                if let Ok(plugin) = ExternalPlugin::from_dir(&path) {
+                    self.managed_versions
+                        .insert(id.to_owned(), plugin.manifest().version.clone());
+                    self.register(Arc::new(plugin));
+                }
+            }
+        }
     }
 
     /// Register a plugin instance.
@@ -1592,8 +1655,8 @@ impl DesktopPlugin for FilePlugin {
     fn category(&self) -> PluginCategory {
         PluginCategory::Core
     }
-    fn render_tile(&self, ctx: &PluginViewContext<'_>, _: &mut Vec<El>) -> Option<El> {
-        Some(crate::ui::viewer::content(ctx.s, ctx.k, ctx.scale))
+    fn render_tile(&self, ctx: &PluginViewContext<'_>, layer: &mut Vec<El>) -> Option<El> {
+        Some(crate::ui::viewer::content(ctx.s, ctx.k, ctx.scale, layer))
     }
 }
 
@@ -1743,6 +1806,28 @@ mod tests {
     }
 
     #[test]
+    fn plugin_install_waits_for_an_explicit_runtime_install() {
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        while let Ok(startup) = rx.try_recv() {
+            assert!(!matches!(
+                startup,
+                Command::InstallManagedRuntime(_) | Command::PluginPackage(..)
+            ));
+        }
+        s.change_plugin_package(packages::Operation::Install("example".into()));
+        assert!(!s.plugin_packages.busy());
+        assert!(rx.try_recv().is_err());
+        s.install_managed_runtime(RuntimeKind::Bun);
+        s.install_managed_runtime(RuntimeKind::Bun);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Command::InstallManagedRuntime(RuntimeKind::Bun))
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn sysinfo_plugin_displays_runtime_probing_and_handles_managed_install() {
         let (tx, mut rx) = crate::model::commands::channel();
         let mut s = UiState::new(tx);
@@ -1797,6 +1882,7 @@ mod tests {
             managed_dir: PathBuf::from("/tmp/muqun/runtimes/herdr"),
         };
         s.apply_updates(vec![Update::RuntimeInstalled {
+            event: uuid::Uuid::new_v4(),
             kind: RuntimeKind::Herdr,
             result: Ok(installed_status),
         }]);
@@ -1862,10 +1948,14 @@ mod tests {
             description: "Tests keymap and palette integration".to_string(),
             author: None,
             category: Some(PluginCategory::Tools),
+            keywords: vec![],
+            repository: None,
             icon: Some("keyboard".to_string()),
             runtime: None,
             entry: None,
             surfaces: vec![PluginSlot::Page, PluginSlot::Tile, PluginSlot::Drawer],
+            composer_draft: false,
+            notification_entry: None,
             commands: vec![PluginCommandManifest {
                 id: "shortcut.trigger".to_string(),
                 title: "Trigger Shortcut Action".to_string(),

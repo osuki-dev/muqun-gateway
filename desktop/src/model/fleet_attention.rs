@@ -206,7 +206,7 @@ impl Fleet {
             ))
         });
         let task = tokio::spawn(watch(computer.clone(), hub.clone(), inbox));
-        self.entries.lock().unwrap().insert(
+        let previous = self.entries.lock().unwrap().insert(
             computer,
             Entry {
                 hub,
@@ -214,7 +214,17 @@ impl Fleet {
                 credentials,
             },
         );
+        if let Some(previous) = previous {
+            previous.task.abort();
+        }
     }
+
+    pub fn invalidate(&self, computer: &str) {
+        if let Some(stale) = self.entries.lock().unwrap().remove(computer) {
+            stale.task.abort();
+        }
+    }
+
     pub fn hub(&self, computer: &str) -> Option<Arc<dyn SessionHub>> {
         self.entries
             .lock()
@@ -226,7 +236,6 @@ impl Fleet {
         let mut tick = tokio::time::interval(Duration::from_secs(3));
         loop {
             tick.tick().await;
-            let profiles = config.computer_profiles();
             if self.hub("local").is_none() {
                 if let Some(gateway) = crate::hub::discover_local_gateway().await {
                     if let Ok(hub) = RemoteHub::start(gateway) {
@@ -235,6 +244,7 @@ impl Fleet {
                 }
             }
             let mut entries = self.entries.lock().unwrap();
+            let profiles = config.computer_profiles();
             entries.retain(|id, entry| {
                 if id == "local"
                     || profiles.get(id).is_some_and(|p| {

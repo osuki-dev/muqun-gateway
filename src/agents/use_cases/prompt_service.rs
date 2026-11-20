@@ -20,8 +20,9 @@ impl PromptService {
         attachments: &[String],
         delivery: Option<&str>,
     ) -> Result<(), AgentError> {
-        self.send_presented(asid, text, None, attachments, delivery)
+        self.send_with_receipt(asid, text, text, attachments, delivery)
             .await
+            .map(|_| ())
     }
 
     pub async fn send_prompt_with_display(
@@ -32,30 +33,25 @@ impl PromptService {
         attachments: &[String],
         delivery: Option<&str>,
     ) -> Result<(), AgentError> {
-        self.send_presented(asid, text, Some(display_text), attachments, delivery)
+        self.send_with_receipt(asid, text, display_text, attachments, delivery)
             .await
+            .map(|_| ())
     }
 
-    async fn send_presented(
+    pub(crate) async fn send_with_receipt(
         &self,
         asid: &AgentSessionId,
         text: &str,
-        display: Option<&str>,
+        display: &str,
         attachments: &[String],
         delivery: Option<&str>,
-    ) -> Result<(), AgentError> {
+    ) -> Result<Option<String>, AgentError> {
         // All adapters receive the same intent. Providers with a native inbox
         // own their queue; Codex implements that contract in its adapter.
         if attachments.is_empty() {
             return self
                 .agent
-                .send_prompt_with_display(
-                    &asid.0,
-                    text,
-                    display.unwrap_or(text),
-                    attachments,
-                    delivery,
-                )
+                .send_prompt_with_receipt(&asid.0, text, display, attachments, delivery)
                 .await;
         }
         let uploads = crate::uploads_dir()
@@ -65,25 +61,13 @@ impl PromptService {
         if mode != AttachmentMode::ByPath {
             return self
                 .agent
-                .send_prompt_with_display(
-                    &asid.0,
-                    text,
-                    display.unwrap_or(text),
-                    &checked,
-                    delivery,
-                )
+                .send_prompt_with_receipt(&asid.0, text, display, &checked, delivery)
                 .await;
         }
         let text = append_attachment_paths(text, &checked);
-        let visible = display.map(|text| append_attachment_paths(text, &checked));
+        let visible = append_attachment_paths(display, &checked);
         self.agent
-            .send_prompt_with_display(
-                &asid.0,
-                &text,
-                visible.as_deref().unwrap_or(&text),
-                &[],
-                delivery,
-            )
+            .send_prompt_with_receipt(&asid.0, &text, &visible, &[], delivery)
             .await
     }
 

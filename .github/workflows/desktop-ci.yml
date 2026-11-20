@@ -38,6 +38,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.4'
+          cache: false
       - name: Grep
         run: |
           hits="$(grep -rn --include='*.rs' 'cfg(target_os' desktop/src | grep -v '^desktop/src/platform/' || true)"
@@ -46,6 +50,15 @@ jobs:
             echo "::error::cfg(target_os) is only allowed under desktop/src/platform/"
             exit 1
           fi
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.5
+      - name: Check the embedded plugin SDK
+        working-directory: desktop/sdk
+        run: |
+          bun install --frozen-lockfile
+          bun run typecheck
+          bun test
       - name: Verify the end-user installer with offline release fixtures
         run: python3 -m unittest discover -s desktop/scripts/tests -p test_install_desktop.py
       - name: No colour literals outside the theme
@@ -59,12 +72,16 @@ jobs:
       matrix:
         # Gateway release matrix is macOS + Linux only; Windows desktop needs a
         # separate OpenSSL/sqlcipher story (vendored openssl-sys fails on GHA).
-        os: [ubuntu-latest, macos-15]
+        os: [ubuntu-24.04, macos-15]
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.4'
+          cache: false
 
       - name: Stamp Desktop preview
         if: inputs.preview || inputs.preview_version != ''
@@ -97,6 +114,9 @@ jobs:
         with:
           version: 0.15.2
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Object files from a newer Linux image can import newer glibc symbols.
+          key: ${{ runner.os == 'Linux' && 'ubuntu-24.04-glibc-2.39' || '' }}
 
       - name: fmt
         run: cargo fmt --all -- --check
@@ -114,6 +134,19 @@ jobs:
           cargo test --manifest-path desktop/webview-helper/Cargo.toml --locked
       - name: build release
         run: bash desktop/scripts/build-release.sh
+
+      - name: Check Linux glibc compatibility
+        if: runner.os == 'Linux'
+        run: |
+          for executable in target/release/muqun-desktop target/release/muqun-wry-embedded; do
+            required=$(readelf --wide --version-info "$executable" |
+              sed -nE 's/.*Name: GLIBC_([0-9]+(\.[0-9]+)+).*/\1/p' | sort -Vu | tail -1)
+            if [[ -z "$required" ]] || ! dpkg --compare-versions "$required" le 2.39; then
+              echo "::error::$executable requires glibc ${required:-unknown}; supported baseline is 2.39"
+              exit 1
+            fi
+            echo "$executable requires glibc $required"
+          done
 
       - name: Package Linux candidate
         if: runner.os == 'Linux'
@@ -146,7 +179,7 @@ jobs:
   smoke-x11:
     name: Smoke (Linux, X11/xvfb)
     needs: [build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Isolate smoke-test directories
         run: |
@@ -197,7 +230,7 @@ jobs:
   smoke-wayland:
     name: Smoke (Linux, Wayland/weston)
     needs: [build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Native Wayland is a supported platform: a failed smoke blocks delivery.
     steps:
       - name: Isolate smoke-test directories

@@ -759,7 +759,10 @@ pub fn row_selected(s: &UiState, asid: &str) -> bool {
     match &s.content.cursor {
         Some(Cursor::Session(at)) if !s.search.text.trim().is_empty() => at == asid,
         Some(Cursor::Hit(_)) if !s.search.text.trim().is_empty() => false,
-        _ => s.mode == Mode::Session && s.selected.as_deref() == Some(asid),
+        _ => {
+            s.mode == Mode::Session
+                && s.selected.as_deref().and_then(|id| s.sidebar_root(id)) == Some(asid)
+        }
     }
 }
 
