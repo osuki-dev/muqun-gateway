@@ -38,6 +38,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.4'
+          cache: false
       - name: Grep
         run: |
           hits="$(grep -rn --include='*.rs' 'cfg(target_os' desktop/src | grep -v '^desktop/src/platform/' || true)"
@@ -74,6 +78,10 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.4'
+          cache: false
 
       - name: Stamp Desktop preview
         if: inputs.preview || inputs.preview_version != ''
