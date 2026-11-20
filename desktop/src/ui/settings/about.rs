@@ -422,6 +422,8 @@ mod tests {
             let (x, y) = rt.find(key).unwrap();
             rt.pointer_down(x, y);
             rt.pointer_up(x, y);
+            time += 1.0 / 60.0;
+            rt.frame(time);
         };
         click(&mut rt, "desktop-update-action");
         assert!(
