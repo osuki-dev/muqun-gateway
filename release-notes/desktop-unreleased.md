@@ -7,7 +7,7 @@
 - Conversation and file images open in Desktop’s viewer with wheel zoom and drag to pan. Plugin images can use the same viewer. Sub-agent details open in a shared window and stay out of recent top-level sessions.
 - Terminal, browser and plugin panes share window controls. Linux browser tabs show the page title and favicon, support closing a tab, and use the packaged WebKitGTK helper for page rendering and common selection actions.
 - Plugin settings show searchable cards with descriptions, keywords and source links from the package metadata. Bun resolves plugin sources and updates display progress. The host and SDK provide native content, notifications, image previews and selection actions to installed plugins. The distribution includes the existing Review Center plugin. Fizzy remains independently installed and updated.
-- Desktop checks its own stable or preview channel from Settings → About. The installer displays the verified SHA-256, installs the platform package and provisions a missing local Gateway from the matching stable or preview channel. Packaged Desktop can recover missing Gateway setup from Diagnostics or run local-only.
+- Desktop checks its own stable or preview channel from Settings → About. The installer displays the verified SHA-256 and installs Desktop. On first launch, you can download a missing local Gateway from the matching channel or keep working locally. Desktop shows download progress after you confirm.
 
 ## Compatibility and installation
 
@@ -17,4 +17,4 @@ Linux x86_64 and Apple Silicon macOS are supported. The Linux embedded browser n
 curl -fsSL https://muqun.dev/desktop.sh | sh -s -- --channel preview
 ```
 
-Close Desktop before replacing it and reopen it afterward. Existing settings, pairing and conversations are retained. Installing the Desktop preview does not require a mobile App update. On a fresh computer, setup starts the built-in terminal in the background and connects Gateway to it. Existing tmux and Herdr installations remain supported, including Herdr protocol 17. Remote features depend on the paired Gateway and agent capabilities. A separately updated Gateway requires its own restart; active agent work should finish first.
+Close Desktop before replacing it and reopen it afterward. Existing settings, pairing and conversations are retained. Installing the Desktop preview does not require a mobile App update. When you approve Gateway setup on a fresh computer, Desktop starts its built-in terminal in the background and connects Gateway to it. Existing tmux and Herdr installations remain supported, including Herdr protocol 17. Remote features depend on the paired Gateway and agent capabilities. A separately updated Gateway requires its own restart; active agent work should finish first.

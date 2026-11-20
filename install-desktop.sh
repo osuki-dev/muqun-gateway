@@ -90,12 +90,10 @@ while [ "$#" -gt 0 ]; do
 done
 system=$(uname -s)
 case "$system/$(uname -m)" in
-  Linux/x86_64) dest=${PREFIX:-"$HOME/.local"}; config=${XDG_CONFIG_HOME:-"$HOME/.config"}
-    helper="$dest/share/muqun-desktop/installers/install-desktop.sh" ;;
+  Linux/x86_64) dest=${PREFIX:-"$HOME/.local"}; config=${XDG_CONFIG_HOME:-"$HOME/.config"} ;;
   Darwin/arm64) dest="$HOME/Applications"
     [ ! -e '/Applications/Muqun Desktop.app' ] || dest=/Applications
-    dest=${MUQUN_DESKTOP_APPLICATIONS_DIR:-"$dest"}; config="$HOME/Library/Application Support"
-    helper="$dest/Muqun Desktop.app/Contents/Resources/installers/install-desktop.sh" ;;
+    dest=${MUQUN_DESKTOP_APPLICATIONS_DIR:-"$dest"}; config="$HOME/Library/Application Support" ;;
   *) die "Unsupported Desktop platform: $system $(uname -m)" ;;
 esac
 umask 077
@@ -103,7 +101,9 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/muqun-desktop.XXXXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 trap 'exit 1' HUP INT TERM
 fetch() {
-  curl -fsSL --proto '=https' --proto-redir '=https' --retry 2 --connect-timeout 15 \
+  meter=--silent
+  if [ -t 2 ] && [ "${4:-}" = package ]; then meter=--progress-bar; fi
+  curl -fSL "$meter" --proto '=https' --proto-redir '=https' --retry 2 --connect-timeout 15 \
     --max-time 300 --max-filesize "$3" -o "$2" "$1" || die "Cannot download $1"
   [ "$(wc -c < "$2")" -le "$3" ] || die "Download exceeds size limit: $1"
 }
@@ -149,7 +149,8 @@ verify "$tmp/checksum" "$checksum_bytes" "$checksum_digest"
 LC_ALL=C awk -v digest="$digest" -v file="$archive" '
   NR != 1 || NF != 2 || tolower($1) != digest || ($2 != file && $2 != "*" file) {bad=1}
   END {exit !(NR == 1 && !bad)}' "$tmp/checksum" || die "Checksum verification failed for $archive"
-fetch "$base/$archive" "$tmp/$archive" "$bytes"
+printf 'Downloading %s (%s bytes)\n' "$archive" "$bytes"
+fetch "$base/$archive" "$tmp/$archive" "$bytes" package
 verify "$tmp/$archive" "$bytes" "$digest"
 printf '%s  %s  SHA-256 verified: %s\n' "$tag" "$archive" "$measured"
 # Extract only the installer executable to a private file. The verified
@@ -166,8 +167,4 @@ marker="$config/muqun-desktop/gateway-auto-install.disabled"
 if [ "$without_gateway" = true ]; then
   mkdir -p "$(dirname "$marker")"
   touch "$marker"
-elif [ -f "$marker" ]; then
-  echo 'Keeping your local-only Gateway preference.'
-elif ! sh "$helper" --gateway-only; then
-  die 'Desktop is installed. Fix the reported Gateway prerequisite, then retry --gateway-only.'
 fi

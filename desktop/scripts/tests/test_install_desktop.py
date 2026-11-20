@@ -156,6 +156,11 @@ cp "$FIXTURES/$name" "$out"''',
         self.assertEqual(result.returncode == 0, success, result.stderr + result.stdout)
         return result
 
+    def confirm_gateway_setup(self, success=True):
+        helper = Path(self.env["PREFIX"]) / "share/muqun-desktop/installers/install-desktop.sh"
+        result = subprocess.run(["sh", helper, "--gateway-only"], env=self.env, capture_output=True)
+        self.assertEqual(result.returncode == 0, success, result.stderr)
+
     def test_linux_stable_install_and_existing_gateway(self):
         self.fixture(STABLE)
         self.run_installer()
@@ -164,10 +169,11 @@ cp "$FIXTURES/$name" "$out"''',
         self.assertIn(
             str(dest / "bin/muqun-desktop"), (dest / "share/applications/muqun-desktop.desktop").read_text()
         )
-        self.assertEqual((self.home / "gateway-invocations").read_text(), "--channel stable --desktop-terminal\n")
+        self.assertFalse((self.home / "gateway-invocations").exists())
         self.command("muqun-gateway", "exit 99")
         self.run_installer("--tag", STABLE)
-        self.assertEqual((self.home / "gateway-invocations").read_text(), "--channel stable --desktop-terminal\n")
+        self.confirm_gateway_setup()
+        self.assertFalse((self.home / "gateway-invocations").exists())
 
     def test_channel_opt_out_and_integrity(self):
         asset = self.fixture(PREVIEW)
@@ -182,14 +188,18 @@ cp "$FIXTURES/$name" "$out"''',
         self.assertIn("Checksum", self.run_installer("--tag", PREVIEW, success=False).stderr)
         self.assertEqual((Path(self.env["PREFIX"]) / "bin/muqun-desktop").read_text(), "1.0.3-preview.12")
 
-    def test_first_preview_install_provisions_preview_gateway(self):
+    def test_fresh_preview_waits_for_separate_gateway_setup(self):
         (self.bin / "tmux").unlink()
         self.fixture(PREVIEW, desktop_executable='#!/bin/sh\necho "$1" >> "$HOME/desktop-starts"\n')
         self.run_installer("--channel", "preview")
+        self.assertFalse((self.home / "desktop-starts").exists())
+        self.assertFalse((self.home / "gateway-invocations").exists())
+        self.confirm_gateway_setup()
         self.assertEqual((self.home / "desktop-starts").read_text(), "--ensure-term-daemon\n")
         self.assertEqual((self.home / "gateway-invocations").read_text(), "--channel preview --desktop-terminal\n")
         self.command("muqun-gateway", "exit 99")
         self.run_installer("--tag", PREVIEW)
+        self.confirm_gateway_setup()
         self.assertEqual((self.home / "desktop-starts").read_text(), "--ensure-term-daemon\n")
 
     def test_archive_with_external_link_fails_before_install(self):
@@ -245,6 +255,7 @@ cp "$FIXTURES/$name" "$out"''',
         unit.parent.mkdir(parents=True)
         unit.write_text("existing external service")
         self.run_installer()
+        self.confirm_gateway_setup()
         self.assertFalse((self.home / "gateway-invocations").exists())
         self.assertEqual(unit.read_text(), "existing external service")
 
@@ -258,7 +269,7 @@ cp "$FIXTURES/$name" "$out"''',
         self.run_installer()
         app = self.home / "Applications/Muqun Desktop.app"
         self.assertEqual((self.home / "mac-checks").read_text(), "verify\nassess\n")
-        self.assertEqual((self.home / "gateway-invocations").read_text(), "--channel stable --desktop-terminal\n")
+        self.assertFalse((self.home / "gateway-invocations").exists())
         self.fixture(PREVIEW, mac=True)
         self.env["ASSESS_EXIT"] = "1"
         self.run_installer("--tag", PREVIEW, success=False)
@@ -276,10 +287,10 @@ cp "$FIXTURES/$name" "$out"''',
     def test_incomplete_gateway_keeps_desktop_and_allows_manual_retry(self):
         self.fixture(STABLE)
         self.env["GATEWAY_EXIT"] = "1"
-        self.assertIn("Desktop is installed", self.run_installer(success=False).stderr)
+        self.run_installer()
+        self.confirm_gateway_setup(success=False)
         self.env["GATEWAY_EXIT"] = "0"
-        helper = Path(self.env["PREFIX"]) / "share/muqun-desktop/installers/install-desktop.sh"
-        subprocess.run(["sh", helper, "--gateway-only"], env=self.env, check=True, capture_output=True)
+        self.confirm_gateway_setup()
         self.assertEqual((self.home / "gateway-invocations").read_text().count("--channel stable"), 2)
 
 
