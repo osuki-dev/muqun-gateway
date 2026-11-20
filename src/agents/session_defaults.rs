@@ -148,7 +148,12 @@ async fn choices(db: &SqliteStore, agent_id: &str, folder: Option<String>) -> Ve
 /// session gets one only when it asks and its own live mode list offers it
 /// (ACP `create_session`), never as a remembered default: before a session
 /// exists, the list it will offer is unknown.
-pub(crate) const ELEVATING_MODES: [&str; 3] = ["bypassPermissions", "auto", "yolo"];
+pub(crate) const ELEVATING_MODES: [&str; 4] = [
+    "bypassPermissions",
+    "auto",
+    "yolo",
+    "https://agentclientprotocol.com/protocol/session-modes#autopilot",
+];
 
 /// The catalog's defaults with the remembered choice in front: this folder's
 /// last, then this computer's last, then what the agent itself reported. A
@@ -496,13 +501,18 @@ mod tests {
         let mut offered = catalog();
         offered.modes = serde_json::from_value(serde_json::json!([
             {"id": "default", "name": "Manual"}, {"id": "plan", "name": "Plan"},
-            {"id": "auto", "name": "Auto"}, {"id": "bypassPermissions", "name": "Bypass"}
+            {"id": "auto", "name": "Auto"}, {"id": "bypassPermissions", "name": "Bypass"},
+            {"id": "https://agentclientprotocol.com/protocol/session-modes#autopilot", "name": "Autopilot"}
         ]))
         .unwrap();
         offered.defaults.mode = Some("default".into());
         for (remembered, want) in [
             (vec!["bypassPermissions"], "default"),
             (vec!["auto"], "default"),
+            (
+                vec!["https://agentclientprotocol.com/protocol/session-modes#autopilot"],
+                "default",
+            ),
             // The folder's elevating choice is passed over for the computer's.
             (vec!["bypassPermissions", "plan"], "plan"),
             (vec!["plan"], "plan"),

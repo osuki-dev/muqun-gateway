@@ -349,6 +349,8 @@ impl SessionService {
         asid: &AgentSessionId,
         cursor: Option<&str>,
         refresh: bool,
+        limit: usize,
+        if_seq: Option<u64>,
     ) -> Result<crate::agents::adapters::memory_mirror::history_window::HistoryWindow, AgentError>
     {
         let memory = self
@@ -362,7 +364,7 @@ impl SessionService {
         } else {
             self.agent.prepare_observed_session(&asid.0).await?;
         }
-        let mut window = memory.history_window(asid, cursor).await?;
+        let mut window = memory.history_window(asid, cursor, limit, if_seq).await?;
         self.observe_runtime(&mut window.snapshot.info).await;
         Ok(window)
     }
@@ -373,6 +375,8 @@ impl SessionService {
         &self,
         asid: &AgentSessionId,
         cursor: Option<&str>,
+        limit: usize,
+        if_seq: Option<u64>,
     ) -> Result<
         Option<crate::agents::adapters::memory_mirror::history_window::HistoryWindow>,
         AgentError,
@@ -383,7 +387,7 @@ impl SessionService {
         if !memory.history_initialized(asid).await {
             return Ok(None);
         }
-        match memory.history_window(asid, cursor).await {
+        match memory.history_window(asid, cursor, limit, if_seq).await {
             Ok(window) => Ok(Some(window)),
             // Evicted between the check and the read.
             Err(AgentError::HistoryCursorLost) if cursor.is_none() => Ok(None),

@@ -146,6 +146,7 @@ pub(crate) fn setup(
             codex: agents::runtime::CodexConfig::default(),
             fx: agents::runtime::FxConfig::default(),
             qoder: agents::runtime::QoderConfig::default(),
+            copilot: agents::runtime::CopilotConfig::default(),
             claude: agents::runtime::ClaudeConfig::default(),
             antigravity: agents::runtime::AntigravityConfig::default(),
             cursor: agents::runtime::CursorConfig::default(),

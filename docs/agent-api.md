@@ -718,6 +718,21 @@ range, including its oldest boundary. Omit it when reopening at the latest page.
 Providers without older paging retain their existing full snapshot and omit the
 cursor, so cached history does not become inaccessible.
 
+With `agent_history_window_options_v1`, HTTP window queries and WebSocket
+`history_request` operations named `window` accept `limit` (1–100) and
+`retained`. A reader can open with `limit=40&retained=true` and retry without
+`retained` on `404 not_retained`. Limits apply to the initial page. Passing an
+existing cursor still restores the entire loaded range. Providers without
+earlier paging retain the full snapshot.
+
+After foreground preparation, a reader can pass its window's `cursor` and
+`if_seq` together. If the cursor still belongs to the session and the revision
+matches, the response omits `timeline` and includes `unchanged: true` alongside
+the current `info`, `permissions`, `forms`, `inbox`, `seq` and `history_cursor`.
+A changed revision returns the ordinary window. On a lost cursor, reopen at
+the latest window. For an empty window with no cursor, use an unconditional
+read. Use legacy request shapes when the capability is absent.
+
 `GET .../timeline/window?retained=true` is a non-waking peek: it answers only from
 history the Gateway's mirror already holds, never prepares, reads or starts the
 agent, and returns `404 not_retained` when there is none (open the session

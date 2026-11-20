@@ -979,18 +979,29 @@ async fn socket_read_agent_session(
 /// exact HTTP projection, including hidden internal rows and image attachment.
 pub(crate) async fn socket_history(
     state: &AppState,
-    asid: &str,
-    operation: &str,
-    refresh: bool,
-    after: u64,
-    cursor: Option<&str>,
+    request: &super::ws_routes::HistoryRequest,
 ) -> ApiResult<Json<Value>> {
-    match operation {
-        "window" => socket_history_window(state, asid, cursor, refresh).await,
+    let asid = &request.asid;
+    let cursor = request.cursor.as_deref();
+    match request.operation.as_str() {
+        "window" => {
+            read_history_window(
+                state,
+                asid,
+                HistoryWindowQuery {
+                    cursor: request.cursor.clone(),
+                    refresh: request.refresh,
+                    retained: request.retained,
+                    limit: request.limit,
+                    if_seq: request.if_seq,
+                },
+            )
+            .await
+        }
         "page" => socket_history_page(state, asid, cursor).await,
-        "snapshot" => socket_read_agent_session(state, asid, refresh).await,
+        "snapshot" => socket_read_agent_session(state, asid, request.refresh).await,
         "earlier" => socket_load_earlier_timeline(state, asid).await,
-        "delta" => socket_get_agent_session_timeline(state, asid, after).await,
+        "delta" => socket_get_agent_session_timeline(state, asid, request.after).await,
         _ => Err(api_error(
             StatusCode::BAD_REQUEST,
             "invalid_operation",
@@ -1001,6 +1012,8 @@ pub(crate) async fn socket_history(
 
 #[derive(Default, Deserialize)]
 struct HistoryWindowQuery {
+    limit: Option<usize>,
+    if_seq: Option<u64>,
     cursor: Option<String>,
     #[serde(default)]
     refresh: bool,
@@ -1017,10 +1030,36 @@ async fn history_window_global(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    if query.retained {
-        return retained_history_window(&state, &asid, query.cursor.as_deref()).await;
+    read_history_window(&state, &asid, query).await
+}
+
+async fn read_history_window(
+    state: &AppState,
+    asid: &str,
+    query: HistoryWindowQuery,
+) -> ApiResult<Json<Value>> {
+    use super::adapters::memory_mirror::history_window::WINDOW_ROWS;
+    let limit = query.limit.unwrap_or(WINDOW_ROWS);
+    if !(1..=WINDOW_ROWS).contains(&limit) || (query.if_seq.is_some() && query.cursor.is_none()) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_window",
+            "Use a limit from 1 to 100 and a cursor with if_seq",
+        ));
     }
-    socket_history_window(&state, &asid, query.cursor.as_deref(), query.refresh).await
+    if query.retained {
+        return retained_history_window(state, asid, query.cursor.as_deref(), limit, query.if_seq)
+            .await;
+    }
+    socket_history_window(
+        state,
+        asid,
+        query.cursor.as_deref(),
+        query.refresh,
+        limit,
+        query.if_seq,
+    )
+    .await
 }
 
 async fn history_page_global(
@@ -1049,6 +1088,8 @@ async fn socket_history_window(
     asid: &str,
     cursor: Option<&str>,
     refresh: bool,
+    limit: usize,
+    if_seq: Option<u64>,
 ) -> ApiResult<Json<Value>> {
     validate_history_cursor(cursor)?;
     let manager = session_manager_or_err(state, asid).await?;
@@ -1059,7 +1100,13 @@ async fn socket_history_window(
     }
     let window = manager
         .sessions()
-        .history_window(&AgentSessionId(asid.to_owned()), cursor, refresh)
+        .history_window(
+            &AgentSessionId(asid.to_owned()),
+            cursor,
+            refresh,
+            limit,
+            if_seq,
+        )
         .await
         .map_err(agent_error)?;
     project_history_window(state, asid, window).await
@@ -1072,21 +1119,33 @@ async fn retained_history_window(
     state: &AppState,
     asid: &str,
     cursor: Option<&str>,
+    limit: usize,
+    if_seq: Option<u64>,
 ) -> ApiResult<Json<Value>> {
     validate_history_cursor(cursor)?;
-    let manager = session_manager_or_err(state, asid).await?;
-    let window = manager
+    let not_retained = || {
+        api_error(
+            StatusCode::NOT_FOUND,
+            "not_retained",
+            "The Gateway holds no history for this session",
+        )
+    };
+    let manager = state
+        .agent_runtime
+        .retained_manager(asid)
+        .await
+        .ok_or_else(not_retained)?;
+    let pageable = manager.agent().supports_earlier_timeline();
+    let limit = if pageable { limit } else { usize::MAX };
+    let mut window = manager
         .sessions()
-        .retained_window(&AgentSessionId(asid.to_owned()), cursor)
+        .retained_window(&AgentSessionId(asid.to_owned()), cursor, limit, if_seq)
         .await
         .map_err(agent_error)?
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::NOT_FOUND,
-                "not_retained",
-                "The Gateway holds no history for this session",
-            )
-        })?;
+        .ok_or_else(not_retained)?;
+    if !pageable {
+        window.history_cursor = None;
+    }
     project_history_window(state, asid, window).await
 }
 
@@ -1101,15 +1160,13 @@ async fn project_history_window(
     if plumbing.task {
         hide_in_inbox(&mut snapshot.inbox);
     }
-    message_images::attach_to_items(
-        state,
-        asid,
-        snapshot.info.directory.as_deref(),
-        &mut snapshot.timeline,
-    )
-    .await;
-    message_images::attach_to_inbox(state, asid, &mut snapshot.inbox).await;
-    Ok(Json(content_envelope(json!(window))))
+    message_images::attach_window(state, asid, snapshot).await;
+    let mut data = json!(window);
+    if window.unchanged {
+        data.as_object_mut().unwrap().remove("timeline");
+        data["unchanged"] = json!(true);
+    }
+    Ok(Json(content_envelope(data)))
 }
 
 async fn socket_history_page(
@@ -1268,8 +1325,8 @@ async fn do_switch_mode(
     Ok(Json(content_envelope(json!({ "ok": true }))))
 }
 
-/// `{enabled, native}`: whether the session runs in the agent's own bypass
-/// mode, and that mode's native name. A bypass is never remembered as a
+/// `{enabled, native}`: the agent's own session permission bypass setting
+/// and its native name. A bypass is never remembered as a
 /// session default (`session_defaults::ELEVATING_MODES`).
 async fn auto_approve_state(
     manager: &super::manager::AgentManager,
@@ -1463,10 +1520,15 @@ async fn do_send_agent_prompt(
         body.text.clone()
     };
     let attachments = body.attachments.as_deref().unwrap_or(&[]);
+    let session_id = AgentSessionId(asid.to_string());
+    let held_since = manager
+        .mirror()
+        .held_prompt_boundary(&session_id, body.delivery.as_deref())
+        .await;
     let native_message_id = manager
         .prompts()
         .send_with_receipt(
-            &AgentSessionId(asid.to_string()),
+            &session_id,
             &text,
             &body.text,
             attachments,
@@ -1489,10 +1551,11 @@ async fn do_send_agent_prompt(
     manager
         .mirror()
         .present_user_prompt(
-            &AgentSessionId(asid.to_string()),
+            &session_id,
             &body.text,
             origin,
             native_message_id.as_deref(),
+            held_since,
         )
         .await;
 
@@ -4608,6 +4671,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copilot_autopilot_requires_owner_consent_for_creation_and_mode_switches() {
+        let mut state = state_with(vec![FakeAgent::new("copilot")]).await;
+        state.config.allow_remote_auto_approve = false;
+        let body = |mode: Option<&str>| CreateAgentSessionBody {
+            directory: None,
+            model: None,
+            mode: mode.map(str::to_owned),
+            agent_id: Some("copilot".into()),
+        };
+        let asid = do_create_agent_session(&state, body(None), &device_headers())
+            .await
+            .unwrap()
+            .0["data"]["asid"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let autopilot = "https://agentclientprotocol.com/protocol/session-modes#autopilot";
+        assert_eq!(
+            do_set_auto_approve(&state, &asid, true, &device_headers())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_ne!(
+            do_set_auto_approve(&state, &asid, false, &device_headers())
+                .await
+                .err()
+                .map(|refusal| refusal.0),
+            Some(StatusCode::FORBIDDEN)
+        );
+        let refusal = do_switch_mode(&state, &asid, autopilot, &device_headers())
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            do_create_agent_session(&state, body(Some(autopilot)), &device_headers())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        state.config.allow_remote_auto_approve = true;
+        let _ = do_switch_mode(&state, &asid, autopilot, &device_headers())
+            .await
+            .unwrap();
+        let _ = do_create_agent_session(&state, body(Some(autopilot)), &device_headers())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn account_limits_refuses_unsupported_and_never_falls_back() {
         let state = state_with(vec![FakeAgent::new("opencode")]).await;
         for (agent, status) in [
@@ -4900,6 +5015,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retained_window_with_no_route_does_not_probe_a_blocked_provider() {
+        let mut agent = FakeAgent::new("opencode").with_sessions(&[("unknown", 1)]);
+        agent.session_gate = Some(Default::default());
+        let state = state_with(vec![agent]).await;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            retained_history_window(&state, "unknown", None, 40, None),
+        )
+        .await
+        .expect("cache lookup did not call get_session")
+        .unwrap_err();
+        assert_eq!(
+            crate::test_support::error_body(&error)["error"]["code"],
+            "not_retained"
+        );
+    }
+
+    #[tokio::test]
     async fn retained_window_answers_only_from_the_mirror_and_labels_sent_prompts() {
         let state = state_with(vec![FakeAgent::new("claude")]).await;
         let asid = do_create_agent_session(
@@ -4937,7 +5070,7 @@ mod tests {
         let Ok(manager) = state.agent_runtime.request_manager_for_session(&asid).await else {
             panic!("the session has an owner");
         };
-        let Json(window) = retained_history_window(&state, &asid, None)
+        let Json(window) = retained_history_window(&state, &asid, None, 100, None)
             .await
             .expect("the mirror holds the new session");
         let rows = window["data"]["timeline"].as_array().unwrap();
@@ -4953,7 +5086,7 @@ mod tests {
             .mirror()
             .remove_session(&AgentSessionId(asid.clone()))
             .await;
-        let refusal = retained_history_window(&state, &asid, None)
+        let refusal = retained_history_window(&state, &asid, None, 100, None)
             .await
             .expect_err("the mirror no longer holds the session");
         assert_eq!(refusal.0, StatusCode::NOT_FOUND);
@@ -5040,7 +5173,55 @@ mod tests {
             .mirror()
             .mark_history_initialized(&AgentSessionId(id.clone()))
             .await;
-        let Json(window) = socket_history_window(&state, &id, None, false)
+        let request: super::super::ws_routes::HistoryRequest = serde_json::from_value(json!({
+            "request_id": "first", "asid": id, "operation": "window",
+            "retained": true, "limit": 40
+        }))
+        .unwrap();
+        let Json(socket) = socket_history(&state, &request).await.unwrap();
+        let Json(http) = history_window_global(
+            State(state.clone()),
+            Path(id.clone()),
+            Query(HistoryWindowQuery {
+                retained: true,
+                limit: Some(40),
+                ..Default::default()
+            }),
+            device_headers(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(socket["data"], http["data"]);
+        let entry = &http["data"];
+        let entry_rows = entry["timeline"].as_array().unwrap();
+        assert_eq!(entry_rows.len(), 40);
+        assert_eq!(entry_rows[0]["id"], snapshot.timeline[141].id);
+        let anchor = entry["history_cursor"].as_str().unwrap();
+        let Json(older) = socket_history_page(&state, &id, Some(anchor))
+            .await
+            .unwrap();
+        assert_eq!(older["data"]["items"][79]["id"], snapshot.timeline[140].id);
+        let seq = entry["seq"].as_u64().unwrap();
+        let Json(hit) = socket_history_window(&state, &id, Some(anchor), false, 40, Some(seq))
+            .await
+            .unwrap();
+        assert_eq!(hit["data"]["unchanged"], true);
+        assert!(hit["data"].get("timeline").is_none());
+        for field in [
+            "info",
+            "permissions",
+            "forms",
+            "inbox",
+            "seq",
+            "history_cursor",
+        ] {
+            assert_eq!(hit["data"][field], entry[field]);
+        }
+        let Json(miss) = socket_history_window(&state, &id, Some(anchor), false, 40, Some(seq - 1))
+            .await
+            .unwrap();
+        assert_eq!(miss["data"]["timeline"], entry["timeline"]);
+        let Json(window) = socket_history_window(&state, &id, None, false, 100, None)
             .await
             .unwrap();
         assert_eq!(window["data"]["timeline"].as_array().unwrap().len(), 100);
@@ -5064,7 +5245,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(end["data"]["exhausted"], true);
-        let Json(reopen) = socket_history_window(&state, &id, None, false)
+        let Json(reopen) = socket_history_window(&state, &id, None, false, 100, None)
             .await
             .unwrap();
         assert_eq!(reopen["data"]["timeline"].as_array().unwrap().len(), 100);

@@ -80,6 +80,7 @@ fn recovery_snapshot_value(
     Ok(NativeSnapshot {
         session_id: id.into(),
         entries,
+        streamed: None,
         last_user,
         last_assistant,
     })

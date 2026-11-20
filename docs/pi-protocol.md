@@ -102,11 +102,14 @@ on the host; discovery alone does not verify model authentication.
   of conservatively accounted retained payload per folder. A folder overflow
   fails that session. Accounting traverses retained payloads without
   serializing the entire folder on every text delta.
-- History reads retain at most 16 MiB per file/tail and 8 MiB per entry;
-  headers are bounded at 64 KiB. Discovery scans at most 4,096 session files
-  and 1,024 directories. Reads reject non-regular files and final symlinks;
+- Saved history pages use a file index of row IDs and byte ranges. Opening
+  a saved session builds its index. Later pages reuse it while the file is
+  unchanged and read the requested rows and their associated tool results.
+  A changed file invalidates the index. Large records use a compact projection
+  for display. Native forks preserve the original attachment data.
+  Headers are bounded at 64 KiB. Discovery scans at most 4,096 session files
+  and 1,024 directories. Reads reject non-regular files and final symlinks.
   Unix opens are nonblocking so a FIFO cannot hold session discovery open.
-  A history read above its budget returns an explicit error.
 - The extension is written to `<state_dir>/pi/` (owner-only directory, atomic
   rename, a symlink at the file is removed, a symlinked directory refused).
   Without a state directory Pi is not attached (discovery `offline`, reason
@@ -127,14 +130,11 @@ on the host; discovery alone does not verify model authentication.
 Session summaries use a separate streaming projection. It retains entry
 identity and parent links, titles, model/effort changes and usage counters,
 while discarding image data and conversation bodies from the summary. A
-valid large image entry therefore does not prevent the whole session list
-from loading. Opening that session's history still uses the history budgets
-above and may return a size error.
-
-Each summary scan allows 128 MiB of source data, 8 MiB per record, 32,768
-projected entries and 16 MiB of accounted retained metadata. An incomplete
-scan keeps the session visible with a metadata error and leaves model,
-tokens and cost unknown; it does not present partial totals as complete.
+large image entry can be scanned without retaining its encoded payload.
+When the in-memory projection fills, a temporary SQLite index stores branch
+links and summary fields for the remainder of the scan. Usage and cost
+follow the active branch from its root to the current leaf.
+An incomplete summary leaves unknown values unset.
 At most 64 summaries are cached by file path, precise modification time and
 length. An appended model change, rename or message invalidates that file's
 cached summary. Live status and authoritative native statistics are applied
