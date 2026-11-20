@@ -97,7 +97,7 @@ existing service owner, and keep the old image for recovery. Do not delete the
 installed binary to bypass the check.
 
 Fresh installs resolve one stable `vX.Y.Z` tag, download its binary and matching
-checksum over HTTPS into private staging, and verify SHA256 before publication
+checksum over HTTPS into private staging, and display the verified SHA-256 before installation
 (integrity, not publisher signing). Native ELF/Mach-O headers and architecture
 are checked before staged execution; a time/output-bounded `--version` probe
 must match the pinned tag before publication. Fresh installation requires `curl`
@@ -274,18 +274,17 @@ muqun-gateway --version        # side-effect-free installed binary version
 
 Settings (`4`) in `manage` has the same update/check use case: Enter on
 Updates checks, and asks for confirmation before downloading or downtime. Nothing
-checks or installs updates in the background. Stable `vX.Y.Z` versions only;
-development/prerelease builds and downgrades are not supported.
+checks or installs updates in the background. The default channel is stable.
+Use `--channel preview` to check or install a preview explicitly. Both channels
+require a forward version change for installation.
 
-The updater locks one concrete release from **osuki-dev/muqun-gateway on
-GitHub**, and requires all four macOS/Linux binary assets and their individual
-`.sha256` assets to be fully uploaded. It refuses old releases without checksums
-and partially uploaded releases: wait for a newer checksum-equipped, complete
-release. It does not retrofit checksums to old releases or fall back to an
-unverified download. HTTPS, restricted redirects, bounded time/size, SHA256,
-native platform headers and the downloaded binary's `--version` are checked
-before stopping anything. **SHA256 is integrity checking, not publisher signing**:
-the official GitHub release account and HTTPS trust remain the authority.
+The updater resolves its channel at `https://muqun.dev/api/releases/gateway/`
+and pins the version before downloading. The release manifest lists all four
+macOS/Linux binaries and their checksum files. Publication verifies the release
+assets before advancing the channel. The updater checks the download size,
+SHA-256, native platform headers and the binary's reported version before
+stopping the service. The integrity checks depend on the official release
+publisher and the HTTPS distribution endpoint.
 
 Self-update supports the owned, writable, regular standalone executable at
 `~/.local/bin/muqun-gateway`. For a custom installer directory, supply the same
@@ -748,13 +747,11 @@ muqun-gateway update --channel preview --check
 muqun-gateway update --channel preview
 ```
 
-The preview command selects the highest numeric `X.Y.Z-preview.N` release with
-all four platform binaries and their checksums. Drafts and incomplete releases
-are excluded. It pins the selected tag before downloading; it never falls back
-to stable when no preview exists. Metadata searches are bounded to ten pages
-of 100 releases, at 1 MiB per page; an incomplete search fails without installing.
-Fresh preview installation and bootstrap from a pre-channel updater require
-Python 3 for JSON parsing. Stable has no new prerequisite.
+The preview command reads the Gateway preview channel and downloads from its
+versioned release directory. Publication advances this channel only after the
+complete platform matrix and checksums are available. If the preview channel
+is empty or unavailable, installation stops. Desktop previews have a separate
+channel under `/api/releases/desktop/preview`.
 
 An existing channel-capable installation uses its protected updater. If its
 protected updater predates channels, the installer verifies the selected preview

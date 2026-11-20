@@ -6,11 +6,21 @@ use std::sync::Arc;
 use rune::{col, el, row as hrow, text, El, SurfaceFit};
 use rune_kit::Kit;
 
-use super::{group, link_button, row};
+use super::{button, group, link_button, row};
 use crate::branding::{APP_MARK_PNG, APP_NAME};
 use crate::config::Language;
+use crate::platform::update::{self, Status};
 use crate::ui::copy::{tr, tr_ref};
 use crate::ui::UiState;
+
+impl UiState {
+    pub(super) fn check_desktop_update(&mut self) {
+        if self.desktop_update != Status::Checking {
+            self.desktop_update = Status::Checking;
+            self.send(crate::model::commands::Command::CheckDesktopUpdate);
+        }
+    }
+}
 
 fn hub_label(language: Language, raw: &str) -> String {
     match raw {
@@ -146,17 +156,54 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
         .map(|(name, _)| name)
         .unwrap_or_else(|| s.cfg.appearance.theme_id.clone());
     let repo = env!("CARGO_PKG_REPOSITORY");
+    let channel = tr_ref(
+        language,
+        if update::is_preview_build() {
+            "Preview releases"
+        } else {
+            "Stable releases"
+        },
+    );
+    let result = match &s.desktop_update {
+        Status::Idle => String::new(),
+        Status::Checking => tr(language, "Checking…"),
+        Status::Current => tr(language, "Up to date"),
+        Status::NoRelease => tr(language, "No published version in this channel"),
+        Status::Available(version) => {
+            format!("{} {version}", tr_ref(language, "New version available:"))
+        }
+        Status::Failed => tr(language, "Check failed"),
+    };
     let update_row = row(
         k,
         "update-manual",
-        tr_ref(language, "Software updates"),
-        tr_ref(language, "Download a Desktop package for your system from Releases and install it manually. Gateway packages do not update Desktop."),
-        link_button(
-            k,
-            "desktop-releases",
-            tr_ref(language, "View downloads"),
-            crate::platform::update::RELEASES_URL,
-        ),
+        channel,
+        &result,
+        hrow()
+            .key("desktop-update-actions")
+            .gap(6.0)
+            .center_y()
+            .flex_wrap()
+            .child(
+                button(tr_ref(
+                    language,
+                    if matches!(s.desktop_update, Status::Idle | Status::Checking) {
+                        "Check for updates"
+                    } else {
+                        "Check again"
+                    },
+                ))
+                .disabled(s.desktop_update == Status::Checking)
+                .on_press(UiState::check_desktop_update)
+                .build(k)
+                .key("check-desktop-update"),
+            )
+            .child(link_button(
+                k,
+                "desktop-downloads",
+                tr_ref(language, "View downloads"),
+                update::INSTALL_URL,
+            )),
     );
     vec![
         hero(s, k),

@@ -131,3 +131,15 @@ jobs:
           gh release create "$tag" --target "$SOURCE_SHA" --draft --prerelease --latest=false --title "$tag" --notes-file preview-notes.md
           gh release upload "$tag" artifacts/*
           gh release edit "$tag" --draft=false --prerelease --latest=false
+
+  mirror:
+    needs: [checks, publish]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/mirror-release.yml
+    with:
+      tag: v${{ needs.checks.outputs.version }}
+    secrets:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}

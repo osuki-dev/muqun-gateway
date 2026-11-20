@@ -1,0 +1,83 @@
+name: Desktop stable release
+
+on:
+  push:
+    tags:
+      - 'desktop-v*'
+      - '!desktop-v*-preview.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the stable version and its release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, re, tomllib
+          from pathlib import Path
+          tag = os.environ["TAG"]
+          version = tomllib.loads(Path("desktop/Cargo.toml").read_text())["package"]["version"]
+          if not re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2}", version) or tag != f"desktop-v{version}":
+              raise SystemExit(f"{tag} does not match the stable Desktop crate version {version}")
+          if not Path(f"release-notes/{tag}.md").read_text().strip():
+              raise SystemExit("Human-written release notes are required")
+          PY
+
+  checks-and-build:
+    needs: prepare
+    uses: ./.github/workflows/desktop-ci.yml
+
+  sign-macos:
+    needs: checks-and-build
+    uses: ./.github/workflows/desktop-notarize.yml
+    secrets: inherit
+
+  publish:
+    needs: sign-macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: muqun-desktop-Linux
+          path: linux
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-preview-signed-macos
+          path: packages
+      - name: Verify both packages and publish the tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#desktop-v}"
+          archive=muqun-desktop-linux-x86_64.tar.gz
+          zip="muqun-desktop-$version-macos-arm64.zip"
+          cp "linux/$archive" "linux/$archive.sha256" packages/
+          cd packages
+          bash ../desktop/scripts/verify-stable-packages.sh "$version"
+          gh release create "$TAG" "$archive" "$archive.sha256" "$zip" "$zip.sha256" \
+            --verify-tag --latest=false --title "Muqun Desktop $version" --notes-file "../release-notes/$TAG.md"
+
+  mirror:
+    needs: publish
+    uses: ./.github/workflows/mirror-release.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}

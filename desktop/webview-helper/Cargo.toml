@@ -1,0 +1,18 @@
+[package]
+name = "muqun-wry-embedded"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "Linux WebKitGTK surface for Muqun Desktop"
+
+[dependencies]
+futures-channel = "0.3"
+futures-util = "0.3"
+gtk = "0.18"
+webkit2gtk = "2.0"
+wry = "0.55"
+serde_json = "1"
+url = "2"
+
+[workspace]

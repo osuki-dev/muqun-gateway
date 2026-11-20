@@ -49,6 +49,17 @@ jobs:
     uses: ./.github/workflows/desktop-notarize.yml
     secrets: inherit
 
+  archive-candidate:
+    needs: sign-macos
+    if: github.repository == 'osuki-dev/muqun-gateway' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/archive-desktop-ci.yml
+    with:
+      signed: true
+    secrets:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
   publish:
     if: inputs.publish
     needs: [prepare, checks-and-build, sign-macos]
@@ -103,3 +114,13 @@ jobs:
           assert r['isPrerelease'] and r['body'].strip()
           assert {a['name'] for a in r['assets']} == {p.name for p in Path('artifacts').iterdir()}
           PY
+
+  mirror:
+    needs: [prepare, publish]
+    uses: ./.github/workflows/mirror-release.yml
+    with:
+      tag: desktop-v${{ needs.prepare.outputs.version }}
+    secrets:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}

@@ -3,6 +3,8 @@
 - Upgrade bundled SQLCipher to 4.20.0 / SQLite 3.54.1 through rusqlite 0.42, addressing RUSTSEC-2026-0502 (crafted database/WAL memory disclosure). Existing encryption remains enabled.
 ## Changes and fixes
 
+- The Gateway installer and updater discover stable and preview releases through muqun.dev. Installation verifies the platform binary and displays its full SHA-256.
+
 - **Sent messages no longer appear twice after an attachment or a steered prompt.**
   Gateway reconciles device-origin presentation with the submitted message using
   arrival order and the original prose, preserving attachments and intentional
