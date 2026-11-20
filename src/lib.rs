@@ -32,6 +32,7 @@ pub(crate) use platform::metadata::*;
 pub use platform::runtimes;
 pub(crate) use platform::server::*;
 pub use platform::set_directories;
+pub use platform::update::Version as ReleaseVersion;
 // Small pure helpers an embedding host shows the same way the gateway does:
 // a "3m ago", a folder named from `~`, and whether a title is only an
 // adapter's placeholder for an unnamed session.

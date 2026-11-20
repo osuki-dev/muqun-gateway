@@ -4,6 +4,8 @@ This is an early Desktop preview, published separately from Muqun Gateway. It do
 
 ## Changes
 
+- The Desktop installer downloads a versioned package from muqun.dev and displays its verified SHA-256 before extracting it. Use `--channel preview` to select a preview.
+
 - Plugin split panes place their display-mode menu in the pane title bar beside the close control, removing the extra toolbar row above plugin content.
 - Full-page plugins retain a themed reading surface over the wallpaper without limiting their content width. Native plugins can reuse the conversation Markdown palette for headings, emphasis and tables.
 

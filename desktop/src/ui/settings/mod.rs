@@ -108,6 +108,7 @@ pub(super) fn open(s: &mut UiState, tab: SettingsTab) {
     s.settings_tab = tab;
     s.menu = None;
     match tab {
+        SettingsTab::About if s.desktop_update == Default::default() => s.check_desktop_update(),
         SettingsTab::Agents => s.refresh_account_limits(),
         SettingsTab::Themes => s.send(Command::ThemeRefresh),
         SettingsTab::Plugins => s.refresh_runtimes(),

@@ -215,6 +215,7 @@ pub enum Command {
     },
     /// Re-read the delegated task list (and the default folder).
     RefreshTasks,
+    CheckDesktopUpdate,
     /// Measure what the desktop keeps on disk (Settings → Storage).
     ScanStorage,
     /// Delete the rebuildable caches (theme previews, gallery index), then measure again.

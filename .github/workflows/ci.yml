@@ -35,6 +35,9 @@ jobs:
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
 
+      - name: Verify release mirroring offline
+        run: python3 -m unittest discover -s scripts/tests -p test_mirror_release.py
+
       - name: Format
         run: cargo fmt --all -- --check
 

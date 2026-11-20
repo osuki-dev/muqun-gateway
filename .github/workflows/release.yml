@@ -104,3 +104,15 @@ jobs:
           files: |
             muqun-gateway-${{ matrix.target }}
             muqun-gateway-${{ matrix.target }}.sha256
+
+  mirror:
+    needs: build
+    permissions:
+      contents: read
+    uses: ./.github/workflows/mirror-release.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}

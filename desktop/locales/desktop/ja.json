@@ -1,4 +1,7 @@
 {
+  "Stable releases": "安定版",
+  "Preview releases": "プレビュー版",
+  "No published version in this channel": "このチャンネルには公開済みのバージョンがありません",
   "Describe the task…": "タスクを入力…",
   "Message…": "メッセージ…",
   "Open": "開く",

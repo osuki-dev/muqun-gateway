@@ -404,6 +404,7 @@ impl Core {
                     | Command::ThemeApply(..)
                     | Command::ThemeImportFile(_)
                     | Command::ThemeImportUrl(_)
+                    | Command::CheckDesktopUpdate
                     | Command::ScanStorage
                     | Command::ClearStorage
                     | Command::ProbeRuntimes
@@ -815,6 +816,13 @@ impl Core {
                 }
             }
             Command::RefreshTasks => self.refresh_tasks().await,
+            Command::CheckDesktopUpdate => {
+                let status = crate::platform::update::check().await;
+                self.inbox
+                    .push(Update::Ui(crate::model::inbox::UiAction::DesktopUpdate(
+                        status,
+                    )));
+            }
             Command::ScanStorage => {
                 if let Ok(report) = tokio::task::spawn_blocking(super::storage::scan).await {
                     self.inbox.push(Update::Storage(report));
