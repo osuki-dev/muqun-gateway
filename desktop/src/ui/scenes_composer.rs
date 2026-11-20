@@ -87,12 +87,22 @@ fn echo_scene(s: &mut UiState, running: bool, words: &str, picture: bool) -> u64
     };
     let token = s.token(super::Slot::Session);
     s.pending_submit = None;
-    s.echo_sent("s1", token, words.into(), &staged, running);
+    s.echo_sent("s1", token, words.into(), &staged, running.then_some(super::echo::BusyDelivery::Steer));
     token
 }
 
 fn composer_scenes() -> Vec<Scene> {
     vec![
+        ("staged-image-terminal", |s| {
+            terminal_scene(s, vim_fixture);
+            s.staged.push(crate::model::compose::StagedFile {
+                draft_token: None,
+                path: SCENE_PICTURE.into(),
+                name: "pasted.png".into(),
+                size: 1,
+                image: true,
+            });
+        }),
         // Sent while the agent works: on its way.
         ("echo-sending", |s| {
             echo_scene(s, true, "Also keep the badge hidden while the count loads.", true);
@@ -116,7 +126,6 @@ fn composer_scenes() -> Vec<Scene> {
                     files: vec![],
                 },
             ];
-            s.echo_inbox("s1", &inbox);
             s.queue = inbox;
         }),
         ("echo-failed", |s| {
@@ -127,6 +136,23 @@ fn composer_scenes() -> Vec<Scene> {
             let token = echo_scene(s, false, "Run the full test suite again.", false);
             s.echo_submitted(token, false);
             zh(s);
+        }),
+        ("home-copilot", |s| {
+            home(s);
+            s.agents.push(agent("copilot", "GitHub Copilot", true));
+            s.start_agent = "copilot".into();
+            s.start_catalog = Some(std::sync::Arc::new(crate::hub::CatalogView {
+                catalog: serde_json::from_value(json!({
+                    "models": [],
+                    "modes": [
+                        { "id": "agent", "name": "Agent" },
+                        { "id": "plan", "name": "Plan" },
+                        { "id": "autopilot", "name": "Autopilot" }
+                    ],
+                    "defaults": { "mode": "agent" },
+                    "mcp": []
+                })).expect("Copilot scene catalog"),
+            }));
         }),
         ("composer", |s| composer_session(s, true)),
         ("composer-idle", |s| composer_session(s, false)),

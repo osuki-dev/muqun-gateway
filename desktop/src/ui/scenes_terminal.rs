@@ -42,7 +42,11 @@ fn shell_fixture(cols: u16, _rows: u16) -> Vec<u8> {
     prompt(&mut o, "colors");
     for base in [40, 100] {
         for i in 0..8 {
-            o.push_str(&format!("\x1b[{}m {} \x1b[0m", base + i, (base - 40) / 60 * 8 + i));
+            o.push_str(&format!(
+                "\x1b[{}m {} \x1b[0m",
+                base + i,
+                (base - 40) / 60 * 8 + i
+            ));
         }
         o.push_str("\r\n");
     }
@@ -128,4 +132,51 @@ fn terminal_scene(s: &mut UiState, fixture: fn(u16, u16) -> Vec<u8>) {
     s.term.open = true;
     s.term.pane.set_open(true);
     s.term.sink.focused = true;
+}
+
+/// Interactive developer scene. Start a real editor only when a local preview
+/// server was supplied explicitly. The UI uses the standard plugin dock.
+fn terminal_webview_live(s: &mut UiState) {
+    use crate::plugin::{ExternalPlugin, PluginManifest, PluginTileManifest};
+    session_scene(s);
+    if let Some(workspace) = std::env::var_os("MUQUN_PREVIEW_WORKSPACE_DIR") {
+        let path = std::path::PathBuf::from(workspace);
+        assert!(
+            path.is_absolute() && path.is_dir(),
+            "invalid preview workspace"
+        );
+        s.sessions[0].directory = Some(path.display().to_string());
+    }
+    let plugin = if let Some(package) = std::env::var_os("MUQUN_PREVIEW_PLUGIN_DIR") {
+        ExternalPlugin::from_dir(std::path::Path::new(&package))
+            .expect("valid local preview plugin")
+    } else if let Ok(url) = std::env::var("MUQUN_PREVIEW_WEBVIEW_URL") {
+        let manifest = PluginManifest {
+            id: "preview-local-panel".into(),
+            name: "Mobile Dev".into(),
+            version: "0".into(),
+            tile: Some(PluginTileManifest {
+                kind: "webview".into(),
+                title: "Mobile Dev".into(),
+                entry: Some(url),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        ExternalPlugin::new(manifest, std::path::PathBuf::new())
+    } else {
+        return;
+    };
+    s.right.set_width(640.0);
+    s.term.pane.set_width(640.0);
+    s.sidebar.set_open(false);
+    s.open_terminal();
+    s.ensure_term_tabs_seeded(true);
+    // The scene's isolated session starts when Rune supplies its window waker.
+    s.term.tabs[0].pending_command =
+        Some("exec nvim -u NONE -i NONE -n --cmd 'set title titlestring=Vim'\n".into());
+    s.term.tabs[0].title = Some("Vim".into());
+    let id = plugin.manifest().id.clone();
+    s.plugins.register(std::sync::Arc::new(plugin));
+    s.open_plugin_drawer(&id);
 }

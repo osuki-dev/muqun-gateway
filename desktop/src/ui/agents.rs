@@ -66,6 +66,7 @@ pub fn name(id: &str, agents: &[AgentDiscoveryInfo]) -> String {
 
 pub fn fallback_name(id: &str) -> &str {
     match id {
+        "copilot" => "GitHub Copilot CLI",
         "codex" => "Codex",
         "opencode" => "OpenCode",
         "deepseek" => "DeepSeek",
@@ -96,6 +97,7 @@ pub fn mark_icon(kind: &str) -> &'static Icon {
         "opencode" => &agent_marks::OPENCODE,
         "deepseek" => &agent_marks::DEEPSEEK,
         "t3" => &agent_marks::T3,
+        "copilot" => &agent_marks::COPILOT,
         "codex" => &agent_marks::CODEX,
         "pi" => &agent_marks::PI,
         "fx" => &agent_marks::FX,

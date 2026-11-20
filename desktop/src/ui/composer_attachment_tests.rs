@@ -21,6 +21,40 @@ fn state() -> UiState {
 }
 
 #[test]
+fn sends_an_image_only_after_its_upload_and_accepts_an_unlabelled_file_picker_image() {
+    let (tx, mut rx) = crate::model::commands::channel();
+    let mut s = UiState::new(tx);
+    s.selected = Some("images".into());
+    s.mode = super::super::Mode::Session;
+    let mut next_submit = || {
+        std::iter::from_fn(|| rx.try_recv().ok()).find_map(|cmd| match cmd {
+            Command::Compose(ComposeCommand::Submit {
+                deliver,
+                attachments,
+                ..
+            }) => Some((deliver, attachments)),
+            _ => None,
+        })
+    };
+    insert_image_pill(&mut s.draft, 42);
+    s.pending_image_uploads.insert(42);
+    submit_session(&mut s);
+    assert!(next_submit().is_none());
+    assert!(has_image_pill(&s.draft, 42));
+    finish_staging(&mut s, 42, Ok(uploaded()));
+    submit_session(&mut s);
+    assert_eq!(next_submit().unwrap().1, [uploaded().path]);
+
+    s.staged.push(uploaded());
+    assert!(s.draft.text.is_empty());
+    submit_session(&mut s);
+    let (deliver, attachments) = next_submit().unwrap();
+    assert!(matches!(deliver, Deliver::Prompt(text) if text.is_empty()));
+    assert_eq!(attachments, [uploaded().path]);
+    assert_eq!(s.echoes_of("images").len(), 2);
+}
+
+#[test]
 fn deleting_inline_image_removes_only_its_attachment() {
     let mut s = state();
     finish_staging(&mut s, 42, Ok(uploaded()));

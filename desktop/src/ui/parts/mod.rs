@@ -664,16 +664,7 @@ impl<'a> ToolCard<'a> {
         let asid = cx.asid.to_string();
         let menu_id = id.clone();
         let line = line.on_secondary_press(move |s: &mut UiState, press, tx: &mut rune::Tx| {
-            let selection = tx
-                .text_selection()
-                .map(|ts| ts.text().to_string())
-                .filter(|s| !s.is_empty());
-            s.row_menu = Some(crate::ui::RowMenu {
-                asid: asid.clone(),
-                id: menu_id.clone(),
-                point: press,
-                selection,
-            });
+            s.row_menu = Some(crate::ui::RowMenu::at(&asid, &menu_id, press, tx));
         });
         let mut block = col()
             .key(format!("call-{id}"))
@@ -682,14 +673,7 @@ impl<'a> ToolCard<'a> {
             .child(line);
         // A picture, a presented file or a checklist is the point: in view.
         if let Some(preview) = self.preview {
-            block = block.child(
-                col()
-                    .key("preview")
-                    .w_full()
-                    .pl(27.0)
-                    .pb(4.0)
-                    .child(preview),
-            );
+            block = block.child(col().key("preview").w_full().pb(4.0).child(preview));
         }
         if open {
             if let Some(err) = self.error {
@@ -697,22 +681,12 @@ impl<'a> ToolCard<'a> {
                     col()
                         .key("error")
                         .w_full()
-                        .pl(27.0)
-                        .pr(6.0)
                         .pb(4.0)
                         .child(text(err).font(k.ty.small).color(k.c.danger.fg)),
                 );
             }
             if let Some(body) = self.body {
-                block = block.child(
-                    col()
-                        .key("body")
-                        .w_full()
-                        .pl(27.0)
-                        .pr(6.0)
-                        .pb(4.0)
-                        .child(body),
-                );
+                block = block.child(col().key("body").w_full().pb(4.0).child(body));
             }
         }
         block

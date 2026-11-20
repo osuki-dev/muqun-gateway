@@ -149,3 +149,47 @@ pub fn save_copy(source: PathBuf) {
         post(UiAction::FileSaved(result));
     });
 }
+
+/// Standalone mode used by local Bun plugins. Run before app initialization
+/// so choosing a file cannot create a second Desktop session.
+pub fn plugin_pick_path(mut args: impl Iterator<Item = std::ffi::OsString>) -> anyhow::Result<()> {
+    let directory = match args.next().as_deref().and_then(|v| v.to_str()) {
+        Some("directory") => true,
+        Some("file") => false,
+        _ => anyhow::bail!("expected directory or file"),
+    };
+    let mut title = if directory {
+        "Choose a folder"
+    } else {
+        "Choose a file"
+    }
+    .to_owned();
+    let mut start = None;
+    while let Some(flag) = args.next() {
+        let value = args
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing picker argument"))?;
+        match flag.to_str() {
+            Some("--start-directory") => start = Some(PathBuf::from(value)),
+            Some("--title") => {
+                title = value
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("invalid dialog title"))?
+            }
+            _ => anyhow::bail!("unknown picker argument"),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let chosen = super::plugin_picker_linux::pick(directory, &title, start.as_deref())?;
+    #[cfg(not(target_os = "linux"))]
+    let chosen = {
+        let picker = dialog(&title, start);
+        if directory {
+            picker.pick_folder()
+        } else {
+            picker.pick_file()
+        }
+    };
+    serde_json::to_writer(std::io::stdout().lock(), &chosen)?;
+    Ok(())
+}

@@ -30,7 +30,7 @@ Rerun the installer to update Desktop. It stages the package on the destination 
 
 The installer reuses an existing Gateway installation or service, including a stopped or externally managed installation. On a fresh computer it invokes the bundled official Gateway installer. Gateway selects and checks its own stable release. Setup requires an existing tmux or Herdr installation. Any persistent startup registration follows Gateway's own prompts and uses a user systemd unit on Linux or a LaunchAgent on macOS. Gateway setup errors leave the installed Desktop available. Resolve the reported prerequisite or installation error and retry. [Gateway installer](../install.sh) · [Standalone setup](../README.md)
 
-The packaged installer includes a Gateway-only entry point. The Desktop app can also use local in-process agents or connect to a paired remote Gateway.
+The same Gateway-only entry point is bundled for direct app downloads. Desktop restores the selected paired computer first. On this computer it probes the Gateway's `local-client.json` and authenticated `GET /api/meta`. When the service is unavailable, the in-process backend supports local work without opening a network listener. For a fresh packaged install Desktop can provision the missing service in the background. Diagnostics shows its status, retry and connection actions. A running session can finish before the switch. `--without-gateway` persists the local-only preference in Desktop's config directory. An offline remote computer stays selected. [Desktop startup and preferences](../desktop/README.md)
 
 ## Updating or removing Gateway
 

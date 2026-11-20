@@ -169,7 +169,13 @@ fn dangerous_permission() -> PermissionRequest {
 fn cards_state(s: &mut UiState, open_all: bool) {
     base(s);
     let mut items = every_card();
-    items.push(item("p2", TimelineRole::Assistant, AgentPart::Approval { request: dangerous_permission() }));
+    items.push(item(
+        "p2",
+        TimelineRole::Assistant,
+        AgentPart::Approval {
+            request: dangerous_permission(),
+        },
+    ));
     items.push(tool_item("q2", "question", "running", json!({
         "input": { "questions": [{ "header": "Branch", "question": "Where should the fix go?" }] },
     })));
@@ -182,6 +188,7 @@ fn cards_state(s: &mut UiState, open_all: bool) {
             ], "custom": true }],
     }))
     .expect("demo form");
+    s.open_session_current(&s.sessions[0].asid.0.clone());
     s.apply_updates(vec![crate::model::inbox::Update::Snapshot(Box::new(
         muqun_gateway::agents::ports::AgentSessionSnapshot {
             info: s.sessions[0].clone(),
@@ -238,6 +245,7 @@ fn timeline_long(s: &mut UiState) {
             items.push(c);
         }
     }
+    s.open_session_current(&s.sessions[1].asid.0.clone());
     s.apply_updates(vec![crate::model::inbox::Update::Snapshot(Box::new(
         muqun_gateway::agents::ports::AgentSessionSnapshot {
             info: s.sessions[1].clone(),
@@ -254,7 +262,7 @@ fn timeline_long(s: &mut UiState) {
     s.demo = true;
 }
 
-/// A subagent's session open in the detail sheet over its parent.
+/// A subagent's details docked beside its parent's conversation.
 fn timeline_subagent(s: &mut UiState) {
     cards_state(s, false);
     let child: Vec<TimelineItem> = every_card().into_iter().take(9).collect();
@@ -262,10 +270,27 @@ fn timeline_subagent(s: &mut UiState) {
     tl.replace(child);
     tl.earlier_exhausted = true;
     s.timelines.insert("s2".into(), tl);
-    s.detail = Some(super::timeline::DetailSheet {
-        stack: vec!["s2".into()],
-        error: None,
-    });
+    s.open_detail("s1", "s2");
+}
+
+/// A UUID-named, pinned child is open beside its parent, but recent rows are roots.
+fn sessions_root_only(s: &mut UiState) {
+    cards_state(s, false);
+    let child = "019a0000-0000-7000-8000-000000000007";
+    let mut info = session(child, child, "codex", "busy", "/home/demo/gateway", 0);
+    info.parent_id = Some("s1".into());
+    info.agent_role = Some("explorer".into());
+    s.merge_sessions(vec![info]);
+    let mut timeline = super::timeline::SessionTimeline::default();
+    timeline.replace(vec![item("child-result", TimelineRole::Assistant, AgentPart::Text {
+        text: "I checked the parent-child records. This child remains accessible here; the sidebar continues to list root conversations.".into(),
+    })]);
+    timeline.earlier_exhausted = true;
+    s.timelines.insert(child.into(), timeline);
+    s.cfg.general.pinned.push(child.into());
+    s.sidebar_all_sessions = false;
+    s.open_in_tile(child);
+    s.cfg.general.language = crate::config::Language::ZhCn;
 }
 
 /// The context meter's sheet, with a Codex-style account limits answer.
@@ -400,6 +425,7 @@ fn turn_state(s: &mut UiState, running: bool) {
             muqun_gateway::agents::AgentSessionStatus::Idle
         };
     }
+    s.open_session_current(&s.sessions[0].asid.0.clone());
     s.apply_updates(vec![crate::model::inbox::Update::Snapshot(Box::new(
         muqun_gateway::agents::ports::AgentSessionSnapshot {
             info: s.sessions[0].clone(),

@@ -11,6 +11,7 @@ GLYPHS = ROOT / "assets" / "glyphs"
 OUT = ROOT / "src" / "ui" / "agent_marks.rs"
 
 NAMES = [
+    ("COPILOT", "brand-copilot"),
     ("CODEX", "brand-codex"),
     ("OPENCODE", "brand-opencode"),
     ("DEEPSEEK", "brand-deepseek"),

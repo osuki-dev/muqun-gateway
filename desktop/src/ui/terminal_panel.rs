@@ -68,6 +68,13 @@ pub struct TermTab {
 }
 
 impl TermTab {
+    fn accept_frame(&mut self, frame: Frame) {
+        if let (Some(session), Some(command)) = (&self.session, self.pending_command.take()) {
+            session.send(Msg::Text(command));
+        }
+        self.frame = Some(frame);
+    }
+
     pub fn send_bytes(&self, bytes: &[u8]) {
         if let Some(session) = &self.session {
             if let Ok(text) = std::str::from_utf8(bytes) {
@@ -158,8 +165,6 @@ pub struct TermPanel {
     /// Screenshot scenes: how the fixture's shell ended.
     pub fixture_ended: Option<Ended>,
     pub error: Option<String>,
-    /// A command queued to run as soon as the shell session starts.
-    pub pending_command: Option<String>,
     /// The grid's size the shell and emulator have, in cells.
     size: Option<Size>,
     /// Per-tab grid sizes when multiple terminal tiles sit side by side.
@@ -201,7 +206,6 @@ impl TermPanel {
             fixture: None,
             fixture_ended: None,
             error: None,
-            pending_command: None,
             size: None,
             tab_sizes: std::collections::HashMap::new(),
             resize: Resizer::default(),
@@ -620,6 +624,10 @@ impl UiState {
             self.focus_terminal();
             return;
         }
+        if self.dock_tabs.iter().any(|tab| tab == "terminal") {
+            self.open_terminal();
+            return;
+        }
         match self.cfg.ui.terminal_open_mode {
             crate::config::TerminalOpenMode::Docked => self.open_terminal(),
             crate::config::TerminalOpenMode::Split | crate::config::TerminalOpenMode::Floating => {
@@ -657,6 +665,14 @@ impl UiState {
     }
 
     pub fn open_terminal(&mut self) {
+        self.hidden_dock_tab = None;
+        if let Some(previous) = self.selected_dock_tab().map(str::to_owned) {
+            self.carry_dock_width(&previous, "terminal");
+            self.remember_dock_tab(&previous);
+        }
+        self.remember_dock_tab("terminal");
+        self.active_plugin_drawer = None;
+        self.quick_notes_edit.focused = false;
         self.term.open = true;
         self.term.pane.set_open(true);
         self.focus_terminal();
@@ -666,6 +682,7 @@ impl UiState {
 
     /// Hide the panel; the shell keeps running.
     pub fn close_terminal(&mut self) {
+        let was_open = self.term.open;
         self.term.open = false;
         self.term.pane.set_open(false);
         self.term.sink.focused = false;
@@ -677,6 +694,10 @@ impl UiState {
         }
         if self.mode == super::Mode::Session {
             self.draft.focused = true;
+        }
+
+        if was_open {
+            self.remove_dock_tab("terminal", true);
         }
     }
 
@@ -749,7 +770,7 @@ impl UiState {
             frame: None,
             cwd: cwd.clone(),
             title: None,
-            pending_command: command.clone(),
+            pending_command: command,
         });
         self.term.active_tab = self.term.tabs.len() - 1;
         if self.in_split() && self.tiles.get(self.focus).is_some_and(|t| t.is_terminal()) {
@@ -757,7 +778,6 @@ impl UiState {
         }
         self.term.session = None;
         self.term.frame = None;
-        self.term.pending_command = command;
         self.start_terminal_in(cwd);
         self.open_terminal_default();
     }
@@ -845,6 +865,9 @@ impl UiState {
     /// Remove empty terminal surfaces through the normal tile lifecycle so
     /// neighbouring sessions retain their state and the exit motion still runs.
     fn close_empty_terminal_surfaces(&mut self) {
+        if !self.term.open {
+            self.remove_dock_tab("terminal", false);
+        }
         let terminal_tiles: Vec<_> = self
             .tiles
             .iter()
@@ -1178,13 +1201,12 @@ impl UiState {
                         frame: None,
                         cwd,
                         title: None,
-                        pending_command: self.term.pending_command.clone(),
+                        pending_command: None,
                     });
                     self.term.active_tab = 0;
                 } else if let Some(active) = self.term.tabs.get_mut(self.term.active_tab) {
                     active.session = Some(session);
                     active.cwd = cwd;
-                    active.pending_command = self.term.pending_command.clone();
                 }
                 self.term.sent = Some(colors);
                 self.term.error = None;
@@ -1371,15 +1393,9 @@ impl UiState {
             }
         }
         if let Some(frame) = self.term.session.as_ref().and_then(Session::take_frame) {
-            if let Some(cmd) = self.term.pending_command.take() {
-                if let Some(sess) = &self.term.session {
-                    sess.send(Msg::Text(cmd));
-                }
-            }
             self.term.frame = Some(frame.clone());
             if let Some(active) = self.term.tabs.get_mut(self.term.active_tab) {
-                active.pending_command = None;
-                active.frame = Some(frame);
+                active.accept_frame(frame);
             }
             changed = true;
         }
@@ -1389,12 +1405,7 @@ impl UiState {
         for (i, tab) in self.term.tabs.iter_mut().enumerate() {
             if i != self.term.active_tab {
                 if let Some(frame) = tab.session.as_ref().and_then(Session::take_frame) {
-                    if let Some(cmd) = tab.pending_command.take() {
-                        if let Some(sess) = &tab.session {
-                            sess.send(Msg::Text(cmd));
-                        }
-                    }
-                    tab.frame = Some(frame);
+                    tab.accept_frame(frame);
                     // Another tile shows this tab: redraw it.
                     changed |= shown.contains(&i);
                 }
@@ -1805,42 +1816,19 @@ fn shell_tab(k: &Kit, key: String, title: String, active: bool, number: usize) -
     )
 }
 
-pub fn view(
-    s: &UiState,
-    k: &Kit,
-    scheme: ColorScheme,
-    scale: f32,
-    layer: &mut Vec<El>,
-    controls: El,
-) -> El {
+pub(crate) fn shell_tabs(s: &UiState, k: &Kit, in_dock: bool) -> El {
     let language = s.cfg.general.language;
-    let colors = colors(k, scheme);
-    s.term.want.set(Some(colors));
-    let m = metrics();
     let frame = s.term.frame.as_ref();
-    let bg = color(frame.map_or(colors.bg, |f| f.bg));
-    let ended = s
-        .term
-        .session
-        .as_ref()
-        .and_then(Session::ended)
-        .or(s.term.fixture_ended);
-
     let tab_count = s.term.tabs.len().max(1);
-    let mut tabs_strip = row()
-        .key("terminal-tabs-strip")
-        .gap(4.0)
-        .center_y()
-        .shrink()
-        .min_w(0.0)
-        .grow(1.0);
+    let mut tabs_strip = row().key("terminal-tabs-strip").gap(4.0).center_y();
 
     for i in 0..tab_count {
-        let is_active = i == s.term.active_tab;
-        let tab_title = if is_active {
+        let is_active = i == s.term.active_tab && (!in_dock || s.term.open);
+        let tab_title = if i == s.term.active_tab {
             frame
                 .map(|f| f.title.clone())
                 .filter(|t| !t.is_empty())
+                .or_else(|| s.term.tabs.get(i).and_then(|tab| tab.title.clone()))
                 .unwrap_or_else(|| {
                     let cwd = s
                         .term
@@ -1855,6 +1843,7 @@ pub fn view(
                 .as_ref()
                 .map(|f| f.title.clone())
                 .filter(|t| !t.is_empty())
+                .or_else(|| tab.title.clone())
                 .unwrap_or_else(|| short_path(&tab.cwd))
         } else {
             format!("Tab {}", i + 1)
@@ -1881,6 +1870,9 @@ pub fn view(
 
         let mut tab_pill = shell_tab(k, format!("terminal-tab-{i}"), tab_title, is_active, i)
             .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
+                if in_dock && !s.term.open {
+                    s.open_terminal();
+                }
                 s.term_switch_tab(i);
                 s.focus_terminal_tx(tx);
             });
@@ -1892,27 +1884,29 @@ pub fn view(
         tabs_strip = tabs_strip.child(tab_pill);
     }
 
-    let add_tab_btn = IconButton::new(&PLUS)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
-        .label(tr_ref(language, "New tab (Ctrl+Shift+T)"))
-        .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
-            s.term_new_tab();
-            s.focus_terminal_tx(tx);
-        })
-        .build(k)
-        .key("terminal-new-tab");
+    tabs_strip
+}
 
-    let sync_cwd_btn = IconButton::new(&rune_kit::glyphs::FOLDER)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
-        .label(super::copy::t_ref(language, "Sync directory with session"))
-        .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
-            s.term_sync_cwd();
-            s.focus_terminal_tx(tx);
-        })
-        .build(k)
-        .key("terminal-sync-cwd");
+pub fn view(
+    s: &UiState,
+    k: &Kit,
+    scheme: ColorScheme,
+    scale: f32,
+    layer: &mut Vec<El>,
+    controls: El,
+) -> El {
+    let language = s.cfg.general.language;
+    let colors = colors(k, scheme);
+    s.term.want.set(Some(colors));
+    let m = metrics();
+    let frame = s.term.frame.as_ref();
+    let bg = color(frame.map_or(colors.bg, |f| f.bg));
+    let ended = s
+        .term
+        .session
+        .as_ref()
+        .and_then(Session::ended)
+        .or(s.term.fixture_ended);
 
     let mut header = row()
         .key("terminal-head")
@@ -1924,34 +1918,20 @@ pub fn view(
         .center_y()
         .fill(k.alpha(k.c.layer_01, 0.65))
         .preserve_focus_on_press(true)
-        .child(
+        .child(crate::plugin::window::dock_tabs(s, k).unwrap_or_else(|| {
             el().key("shell-tabs-viewport")
                 .scroll_x()
                 .h(34.0)
                 .grow(1.0)
                 .shrink()
                 .min_w(0.0)
-                .child(tabs_strip),
-        )
-        .child(add_tab_btn)
-        .child(sync_cwd_btn);
+                .child(shell_tabs(s, k, false))
+        }))
+        .child(crate::plugin::window::dock_actions(s, k, true, layer));
     if s.term.is_prefix_armed() {
         header = header.child(prefix_badge(k, ""));
     }
-    let header = header
-        .child(
-            IconButton::new(&RESTART)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Restart shell"))
-                .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
-                    s.restart_terminal();
-                    s.focus_terminal_tx(tx);
-                })
-                .build(k)
-                .key("terminal-restart"),
-        )
-        .child(controls);
+    let header = header.child(controls);
 
     let ended_now = s.term.fixture_ended.is_some()
         || s.term.session.as_ref().is_some_and(|x| x.ended().is_some());
@@ -3006,7 +2986,7 @@ fn sink(s: &UiState, k: &Kit, m: Metrics, col: u16, row: u16, bg: Color) -> El {
     field
 }
 
-fn shell_quote_path(path: &std::path::Path) -> String {
+pub(crate) fn shell_quote_path(path: &std::path::Path) -> String {
     let raw = path.to_string_lossy();
     if raw
         .chars()
@@ -3246,6 +3226,61 @@ mod tests {
         assert!(s.palette.is_none(), "a command leaves the palette");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn switching_before_the_first_frame_delivers_a_command_only_to_its_new_tab() {
+        let tmp = tempfile::tempdir().unwrap();
+        let make_shell = |name: &str| {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args([
+                "-c",
+                r#"printf ready; while IFS= read -r line; do printf '%s\n' "$line" >> "$1"; done"#,
+                "shell",
+            ])
+            .arg(tmp.path().join(name));
+            Session::start_command(
+                cmd,
+                grid_size(560.0, 340.0, Metrics { cw: 8.0, ch: 17.0 }, 1.0),
+                colors(&Kit::neutral(false), ColorScheme::Light),
+                std::sync::Arc::new(|| {}),
+            )
+            .unwrap()
+        };
+        let (tx, _rx) = commands::channel();
+        let mut state = UiState::new(tx);
+        let old = make_shell("old");
+        state.term.session = Some(old.clone());
+        state.term_new_tab_in(tmp.path().into(), Some("manage-fixture\n".into()));
+        let new = make_shell("new");
+        state.term.session = Some(new.clone());
+        state.term_switch_tab(0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.term.frame.is_none() || !tmp.path().join("new").exists() {
+            state.poll_terminal(0.1, &mut rune::Tx::default());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "new tab never received its command"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        old.send(Msg::Text("sentinel\n".into()));
+        while !std::fs::read_to_string(tmp.path().join("old"))
+            .unwrap_or_default()
+            .contains("sentinel")
+        {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("old")).unwrap(),
+            "sentinel\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("new")).unwrap(),
+            "manage-fixture\n"
+        );
+    }
+
     #[test]
     fn open_file_in_terminal_opens_terminal_and_queues_command() {
         let (tx, _rx) = commands::channel();
@@ -3257,7 +3292,9 @@ mod tests {
         assert!(state.term.sink.focused);
         assert!(state.viewer.is_none());
         assert_eq!(
-            state.term.pending_command.as_deref(),
+            state.term.tabs[state.term.active_tab]
+                .pending_command
+                .as_deref(),
             Some("nvim '/tmp/test_file.rs'\n")
         );
     }
@@ -3294,7 +3331,9 @@ mod tests {
         assert_eq!(state.term.tabs.len(), 2);
         assert_eq!(state.term.active_tab, 1);
         assert_eq!(
-            state.term.pending_command.as_deref(),
+            state.term.tabs[state.term.active_tab]
+                .pending_command
+                .as_deref(),
             Some("nvim '/tmp/another_file.rs'\n")
         );
     }

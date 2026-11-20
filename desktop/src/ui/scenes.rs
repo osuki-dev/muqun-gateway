@@ -239,6 +239,7 @@ fn timeline(s: &mut UiState) {
         item("f1", Assistant, AgentPart::Form { request: form() }),
         item("st1", Assistant, AgentPart::Status { text: "Waiting for approval".into() }),
     ];
+    s.open_session_current(&s.sessions[0].asid.0.clone());
     s.apply_updates(vec![crate::model::inbox::Update::Snapshot(Box::new(
         muqun_gateway::agents::ports::AgentSessionSnapshot {
             info: s.sessions[0].clone(),
@@ -729,6 +730,8 @@ fn viewer_with(s: &mut UiState, name: &str, kind: crate::model::viewer::FileKind
         },
         body: text_body(body.into(), false),
         zoom: None,
+        image_viewport: [0.0; 2],
+        image_pan_start: None,
         source: false,
     });
     s.show_file_window();
@@ -845,12 +848,44 @@ fn latest_scene(s: &mut UiState) {
 }
 
 /// A scene name and the state it applies.
-fn image_plugin(s: &mut UiState) -> Option<String> {
+fn scene_plugin() -> Option<crate::plugin::ExternalPlugin> {
     let dir = std::env::var_os("MUQUN_SCENE_PLUGIN_DIR")?;
-    let plugin = crate::plugin::ExternalPlugin::from_dir(&std::path::PathBuf::from(dir)).ok()?;
+    crate::plugin::ExternalPlugin::from_dir(&std::path::PathBuf::from(dir)).ok()
+}
+
+fn image_plugin(s: &mut UiState) -> Option<String> {
+    let plugin = scene_plugin()?;
     let id = plugin.manifest().id.clone();
     s.plugins.register(std::sync::Arc::new(plugin));
     Some(id)
+}
+
+fn plugin_update_scene(s: &mut UiState, failed: bool) {
+    use crate::plugin::packages::{Operation, PackageStage};
+    settings(s);
+    s.settings_tab = SettingsTab::Plugins;
+    s.runtime_statuses = muqun_gateway::platform::runtimes::probe_all();
+    let op = if let Some(plugin) = scene_plugin() {
+        let manifest = plugin.manifest();
+        let id = manifest.id.clone();
+        s.plugin_query = TextEdit::new(&id);
+        s.plugins
+            .managed_versions
+            .insert(id.clone(), manifest.version.clone());
+        s.plugins.register(std::sync::Arc::new(plugin));
+        Operation::Update(id)
+    } else {
+        s.plugin_source = TextEdit::new("@example/plugin");
+        Operation::Install(s.plugin_source.text.clone())
+    };
+    let request = s.plugin_packages.start(op).unwrap();
+    s.plugin_packages.advance(request, PackageStage::Resolving);
+    if failed {
+        s.plugin_packages.finish(
+            request,
+            &Err("Could not reach the package registry.".into()),
+        );
+    }
 }
 
 pub type Scene = (&'static str, fn(&mut UiState));
@@ -868,10 +903,32 @@ pub fn scenes() -> &'static [Scene] {
 
 fn base_scenes() -> &'static [Scene] {
     &[
+        ("session-error-notice", |s| {
+            session_scene(s);
+            s.error = Some(crate::model::inbox::UiError {
+                message: "Agent not available: ACP session is disconnected. Reopen the session to continue.".into(),
+                detail: None,
+                unreachable: true,
+            });
+        }),
         ("plugin-image-settings", |s| {
             settings(s);
             s.settings_tab = SettingsTab::Plugins;
             image_plugin(s);
+        }),
+        ("settings-plugin-updating", |s| {
+            plugin_update_scene(s, false)
+        }),
+        ("settings-plugin-update-failed", |s| {
+            plugin_update_scene(s, true)
+        }),
+        ("settings-plugins-catalog", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Plugins;
+            s.runtime_statuses = muqun_gateway::platform::runtimes::probe_all();
+            if let Some(id) = image_plugin(s) {
+                s.plugins.managed_versions.insert(id, "1.2.3".into());
+            }
         }),
         ("plugin-image-tile", |s| {
             home(s);
@@ -980,6 +1037,21 @@ fn base_scenes() -> &'static [Scene] {
         ("settings-shortcuts", |s| {
             settings(s);
             s.settings_tab = SettingsTab::Shortcuts;
+        }),
+        ("settings-diagnostics", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Diagnostics;
+            crate::diagnostics::Attempt::new(
+                crate::diagnostics::EventKind::PluginInstall,
+                "Example",
+                Some("1.0.0"),
+            )
+            .finish(crate::diagnostics::Outcome::SdkIncompatible);
+        }),
+        ("settings-plugins", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Plugins;
+            s.runtime_statuses = muqun_gateway::platform::runtimes::probe_all();
         }),
         ("settings-about", |s| {
             settings(s);
@@ -1281,6 +1353,24 @@ fn base_scenes() -> &'static [Scene] {
             s.inspect_pane.set_width(550.0);
         }),
         ("timeline-cards", timeline_cards),
+        ("timeline-tool-output", |s| {
+            base(s);
+            timeline(s);
+            s.sidebar.set_open(false);
+            s.right_open = false;
+            s.right.set_open(false);
+            s.waiting_perms.clear();
+            s.waiting_forms.clear();
+            if let Some(tl) = s.timelines.get_mut("s1") {
+                let mut items = std::mem::take(&mut tl.items);
+                items.retain(|it| matches!(it.id.as_str(), "r1" | "a1" | "t1" | "d1"));
+                tl.replace(items);
+                tl.flip("r1");
+                tl.flip("t1");
+                tl.earlier_exhausted = true;
+            }
+            s.demo = true;
+        }),
         ("timeline-narrow", timeline_narrow),
         ("timeline-long", timeline_long),
         ("timeline-zh", timeline_zh),
@@ -1337,7 +1427,13 @@ fn base_scenes() -> &'static [Scene] {
             ];
             s.term.active_tab = 0;
         }),
+        ("plugin-dock-tabs", |s| {
+            terminal_scene(s, vim_fixture);
+            let id = image_plugin(s).unwrap_or_else(|| "quicknotes".into());
+            s.open_plugin_drawer(&id);
+        }),
         ("terminal-vim", |s| terminal_scene(s, vim_fixture)),
+        ("terminal-webview-live", terminal_webview_live),
         ("terminal-ended", |s| {
             terminal_scene(s, shell_fixture);
             s.term.fixture_ended = Some(crate::term::session::Ended::Shell(
@@ -1365,7 +1461,7 @@ fn base_scenes() -> &'static [Scene] {
                 asid: "s1".into(),
                 id: "sh2".into(),
                 point: rune::PointerPress { x: 500.0, y: 300.0 },
-                selection: Some("git status".into()),
+                selection: None,
             });
         }),
         ("terminal-search", |s| {
@@ -1449,6 +1545,20 @@ fn base_scenes() -> &'static [Scene] {
         ("voice-realtime", voice_realtime_scene),
         ("voice-settings", voice_settings_scene),
         ("timeline-subagent", timeline_subagent),
+        ("sessions-root-only", sessions_root_only),
+        ("timeline-subagent-waiting", |s| {
+            timeline_subagent(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+            let agent = s
+                .sessions
+                .iter_mut()
+                .find(|session| session.asid.0 == "s2")
+                .unwrap();
+            agent.title = "Subagent".into();
+            agent.agent_name = Some("Pascal".into());
+            agent.status = muqun_gateway::agents::AgentSessionStatus::Busy;
+            s.timelines.insert("s2".into(), Default::default());
+        }),
         ("timeline-context", timeline_context),
         ("palette", palette_scene),
         ("quick-open", |s| {

@@ -34,11 +34,13 @@ pub enum Command {
     SwitchComputer(String),
     /// Request a pairing code from a remote computer.
     PairComputerRequest {
+        attempt: u64,
         server_id: String,
         url: String,
     },
     /// Claim pairing token with code.
     PairComputerClaim {
+        attempt: u64,
         server_id: String,
         url: String,
         request_id: String,
@@ -47,6 +49,7 @@ pub enum Command {
     },
     /// Save a manually entered or verified token.
     PairComputerToken {
+        attempt: u64,
         server_id: String,
         url: String,
         token: String,
@@ -216,6 +219,14 @@ pub enum Command {
     /// Re-read the delegated task list (and the default folder).
     RefreshTasks,
     CheckDesktopUpdate,
+    RefreshLocalPairings,
+    ReadLocalInvite(u64),
+    RevokeLocalPairing(String),
+    UnpairComputer {
+        computer: String,
+        request: uuid::Uuid,
+        gateway: crate::hub::LocalGateway,
+    },
     /// Measure what the desktop keeps on disk (Settings → Storage).
     ScanStorage,
     /// Delete the rebuildable caches (theme previews, gallery index), then measure again.
@@ -266,6 +277,7 @@ pub enum Command {
     },
     /// Probe managed & system runtimes (Bun & Herdr) on the background worker.
     ProbeRuntimes,
+    PluginPackage(uuid::Uuid, crate::plugin::packages::Operation, Vec<String>),
     /// Download and install a managed runtime (Bun or Herdr) on the background worker.
     InstallManagedRuntime(muqun_gateway::platform::runtimes::RuntimeKind),
 }

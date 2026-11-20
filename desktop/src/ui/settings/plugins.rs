@@ -4,152 +4,13 @@ use muqun_gateway::platform::runtimes::{RuntimeKind, RuntimeSource};
 use rune::{col, row as hrow, text, El};
 use rune_kit::{Badge, BadgeVariant, ButtonVariant, Kit};
 
-use super::{flag_disabled, group, row, row_with};
-use crate::config::ConfigEdit;
-use crate::plugin::{is_always_on, is_enabled, PluginRenderKind};
+mod cards;
+mod progress;
+
+use super::{group, row};
+use crate::plugin::packages::Operation;
 use crate::ui::copy::tr_ref;
 use crate::ui::UiState;
-
-fn surface_chip(k: &Kit, key: &str, label: &str) -> El {
-    hrow()
-        .key(key.to_string())
-        .h(20.0)
-        .px(6.0)
-        .center()
-        .radius(k.radius.sm)
-        .fill(k.c.text_base.alpha(0.06))
-        .border(1.0, k.c.border_weak)
-        .child(
-            text(label.to_string())
-                .font(k.ty.small)
-                .color(k.c.text_muted),
-        )
-}
-
-fn plugin_label(
-    s: &UiState,
-    k: &Kit,
-    language: crate::config::Language,
-    plugin: &dyn crate::plugin::DesktopPlugin,
-) -> El {
-    let title = plugin.title(language);
-    let id = plugin.id();
-    let desc = plugin
-        .description(language)
-        .unwrap_or_else(|| plugin.category().label(language).to_string());
-    let kind = plugin.render_kind();
-    let kind_label = match &kind {
-        PluginRenderKind::Native { kind, .. } if !kind.is_empty() && kind != "native" => {
-            kind.clone()
-        }
-        other => tr_ref(language, other.label()).to_string(),
-    };
-
-    let mut chips = hrow().key("surfaces").gap(4.0).flex_wrap().center_y();
-    for slot in plugin.surfaces() {
-        chips = chips.child(surface_chip(
-            k,
-            &format!("surf-{id}-{slot:?}"),
-            slot.label(language),
-        ));
-    }
-    chips = chips.child(surface_chip(k, &format!("kind-{id}"), &kind_label));
-
-    col()
-        .key("label")
-        .w(super::LABEL_MIN_W)
-        .min_w(super::LABEL_MIN_W.min(super::INNER_W.get()))
-        .grow(1.0)
-        .shrink()
-        .gap(4.0)
-        .child(
-            hrow()
-                .key("title")
-                .gap(8.0)
-                .center_y()
-                .child(plugin.render_icon(s, 14.0, k.c.icon_muted))
-                .child(
-                    text(title)
-                        .font(k.ty.ui_medium)
-                        .color(k.c.text_base)
-                        .shrink()
-                        .min_w(0.0)
-                        .truncate(),
-                )
-                .child(
-                    text(id.to_string())
-                        .font(k.ty.mono)
-                        .color(k.c.text_faint)
-                        .shrink()
-                        .min_w(0.0)
-                        .truncate(),
-                ),
-        )
-        .child(
-            text(desc)
-                .font(k.ty.small)
-                .color(k.c.text_muted)
-                .wrap()
-                .w_full(),
-        )
-        .child(chips)
-}
-
-fn plugin_row(s: &UiState, k: &Kit, plugin: &dyn crate::plugin::DesktopPlugin) -> El {
-    let language = s.cfg.general.language;
-    let id = plugin.id().to_string();
-    let always = is_always_on(&id);
-    let enabled = is_enabled(&id, &s.cfg.plugins_disabled);
-    let toggle_id = id.clone();
-    let detail = if always {
-        tr_ref(language, "Always on")
-    } else {
-        tr_ref(language, "Enabled")
-    };
-    let mut controls = hrow()
-        .key(format!("plugin-controls-{id}"))
-        .gap(8.0)
-        .center_y()
-        .flex_wrap();
-    for slot in plugin.surfaces().into_iter().filter(|slot| {
-        matches!(
-            slot,
-            crate::plugin::PluginSlot::Tile
-                | crate::plugin::PluginSlot::Page
-                | crate::plugin::PluginSlot::Drawer
-        )
-    }) {
-        let open_id = id.clone();
-        controls = controls.child(
-            super::button(slot.label(language))
-                .disabled(!enabled)
-                .on_press(move |s: &mut UiState| s.switch_plugin_surface(&open_id, slot))
-                .build(k)
-                .key(format!("open-{id}-{slot:?}")),
-        );
-    }
-    row_with(
-        k,
-        &format!("plugin-{id}"),
-        plugin_label(s, k, language, plugin),
-        controls.child(flag_disabled(
-            k,
-            &format!("plugin-{id}"),
-            enabled,
-            detail,
-            always,
-            move |s| {
-                if is_always_on(&toggle_id) {
-                    return;
-                }
-                s.edit(ConfigEdit::PluginEnabled {
-                    plugin: toggle_id.clone(),
-                    on: !is_enabled(&toggle_id, &s.cfg.plugins_disabled),
-                });
-            },
-        )),
-    )
-}
 
 fn runtime_detail(
     language: crate::config::Language,
@@ -222,7 +83,7 @@ fn runtime_row(s: &UiState, k: &Kit, kind: RuntimeKind) -> El {
                 } else {
                     ButtonVariant::Outline
                 })
-                .disabled(is_installing)
+                .disabled(is_installing || status.is_none())
                 .on_press(move |s: &mut UiState| {
                     s.install_managed_runtime(kind);
                 })
@@ -245,30 +106,91 @@ pub(super) fn actions(s: &UiState, k: &Kit) -> Vec<El> {
 
 pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
     let language = s.cfg.general.language;
-    let mut plugins = s.plugins.all();
-    plugins.sort_by_key(|plugin| {
-        !matches!(plugin.category(), crate::plugin::PluginCategory::Extensions)
-    });
-    let mut plugin_rows = Vec::with_capacity(plugins.len());
-    for plugin in &plugins {
-        plugin_rows.push(plugin_row(s, k, plugin.as_ref()));
-    }
     let mut out = Vec::new();
-    if plugin_rows.is_empty() {
-        out.push(super::empty(
-            k,
-            "plugins-empty",
-            tr_ref(language, "No plugins"),
-            tr_ref(language, "Built-in and loaded plugins appear here."),
-        ));
+    let bun = s
+        .runtime_statuses
+        .iter()
+        .find(|st| st.kind == RuntimeKind::Bun);
+    let install = tr_ref(language, "Install");
+    let package_control = if bun.is_some_and(|st| st.available) {
+        hrow()
+            .w_full()
+            .min_w(0.0)
+            .gap(4.0)
+            .center_y()
+            .flex_wrap()
+            .child(
+                rune_kit::TextInput::new(&s.plugin_source)
+                    .label(tr_ref(language, "Plugin source"))
+                    .placeholder(tr_ref(language, "Plugin source"))
+                    .width(None)
+                    .on_edit(|s: &mut UiState| &mut s.plugin_source)
+                    .build(k)
+                    .w(220.0)
+                    .min_w(140.0)
+                    .grow(1.0)
+                    .shrink()
+                    .key("plugin-source"),
+            )
+            .child(
+                super::button(install)
+                    .disabled(s.plugin_packages.busy() || s.plugin_source.text.trim().is_empty())
+                    .on_press(|s: &mut UiState| {
+                        s.change_plugin_package(Operation::Install(s.plugin_source.text.clone()))
+                    })
+                    .build(k),
+            )
+            .child(
+                super::button(tr_ref(language, "Choose file…"))
+                    .disabled(s.plugin_packages.busy())
+                    .on_press(move |_: &mut UiState| {
+                        crate::platform::dialogs::pick_file(
+                            tr_ref(language, "Choose plugin source"),
+                            None,
+                            None,
+                            |path| {
+                                crate::platform::dialogs::post(
+                                    crate::model::inbox::UiAction::PluginFilePicked(path),
+                                )
+                            },
+                        )
+                    })
+                    .build(k),
+            )
     } else {
-        out.push(group(
-            k,
-            "plugins-list",
-            tr_ref(language, "Installed"),
-            plugin_rows,
-        ));
+        super::button(tr_ref(language, "Install Bun"))
+            .disabled(bun.is_none() || s.runtime_installing.contains(&RuntimeKind::Bun))
+            .on_press(|s: &mut UiState| s.install_managed_runtime(RuntimeKind::Bun))
+            .build(k)
+            .key("plugin-install-bun")
+    };
+    let detail = match bun {
+        None => "Checking for Bun…",
+        Some(st) if !st.available => "Bun is required to install and run plugin packages.",
+        _ => "Choose a plugin source to install.",
+    };
+    out.push(group(
+        k,
+        "plugin-packages",
+        tr_ref(language, "Install plugin"),
+        vec![col()
+            .w_full()
+            .min_w(0.0)
+            .gap(8.0)
+            .py(12.0)
+            .child(
+                text(tr_ref(language, detail))
+                    .font(k.ty.small)
+                    .color(k.c.text_muted)
+                    .w_full()
+                    .wrap(),
+            )
+            .child(package_control)],
+    ));
+    if let Some(progress) = progress::install_progress(s, k) {
+        out.push(progress);
     }
+    out.push(cards::catalog(s, k));
     out.push(group(
         k,
         "plugins-runtimes",

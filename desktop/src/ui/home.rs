@@ -2,9 +2,8 @@
 
 use std::path::PathBuf;
 
-use muqun_gateway::agents::ModelRef;
 use rune::{col, el, row, text, El, ScrollSpec, Tx};
-use rune_kit::{Button, ButtonVariant, ControlSize, Kit, SegmentedControl, TextInput};
+use rune_kit::{Button, ButtonVariant, ControlSize, Kit, TextInput};
 
 use super::composer::{self, branch_menu, catalog_models, model_menu};
 use super::copy::{tr, tr_ref};
@@ -36,11 +35,11 @@ const FOLDERS_SHOWN: usize = 8;
 
 pub fn submit_start(s: &mut UiState) {
     // The aggregate list has no execution target. Never use the previous hub.
-    if s.current_computer() == "all" {
+    if s.current_computer() == "all" || s.pending_start.is_some() {
         return;
     }
     let prompt = s.start_draft.text.trim().to_string();
-    if prompt.is_empty() {
+    if !composer::ready_to_send(s, Slot::Start) {
         return;
     }
     if s.start_agent.is_empty() {
@@ -49,7 +48,7 @@ pub fn submit_start(s: &mut UiState) {
     }
     let typed = s.start_cwd.text.trim();
     let cwd = if typed.is_empty() {
-        s.cfg.general.initial_cwd(&s.start_agent)
+        s.start_default_directory(&s.start_agent)
     } else {
         PathBuf::from(typed)
     };
@@ -86,6 +85,7 @@ pub fn submit_start(s: &mut UiState) {
         "asid": pending_asid,
         "agent_id": agent,
         "title": pending_title,
+        "directory": cwd,
         "status": "idle",
         "updated_ms": now_ms,
     })) {
@@ -94,10 +94,24 @@ pub fn submit_start(s: &mut UiState) {
 
     let staged_files = s.staged.clone();
     if !prompt.trim().is_empty() || !staged_files.is_empty() {
-        s.echo_sent(&pending_asid, token, prompt.clone(), &staged_files, false);
+        s.echo_sent(&pending_asid, token, prompt.clone(), &staged_files, None);
     }
     s.pending_start = Some((pending_asid.clone(), token));
-    s.open_session(&pending_asid);
+    s.tiles_restored = true;
+    if let Some(i) = s
+        .pending_tile
+        .take()
+        .filter(|&i| s.tiles.get(i).is_some_and(|t| t.is_empty()))
+    {
+        s.focus_tile(i);
+        s.open_here(&pending_asid);
+    } else {
+        s.open_session_current(&pending_asid);
+    }
+    s.timelines
+        .entry(pending_asid)
+        .or_default()
+        .earlier_exhausted = true;
 
     s.start_draft.text.clear();
     s.start_draft.anchor = 0;
@@ -119,8 +133,10 @@ pub fn submit_start(s: &mut UiState) {
     }));
 }
 
-fn pick_agent(s: &mut UiState, id: String) {
-    s.start_cwd = rune::TextEdit::new(s.cfg.general.initial_cwd(&id).display().to_string());
+pub(super) fn pick_agent(s: &mut UiState, id: String) {
+    if !s.start_cwd_explicit {
+        s.start_cwd = rune::TextEdit::new(s.start_default_directory(&id).display().to_string());
+    }
     s.completions.clear();
     s.send(Command::LoadProjects { agent: id.clone() });
     s.start_agent = id;
@@ -132,11 +148,13 @@ fn pick_agent(s: &mut UiState, id: String) {
 }
 
 /// Take `path` as the start folder and look up what it offers.
-fn pick_folder_path(s: &mut UiState, path: String) {
+pub(super) fn pick_folder_path(s: &mut UiState, path: String) {
+    s.start_cwd_explicit = true;
     s.start_cwd = rune::TextEdit::new(path);
     s.completions.clear();
     s.start_model = None;
     s.start_mode = None;
+    s.start_catalog = None;
     s.refresh_start_catalog();
 }
 
@@ -443,19 +461,21 @@ fn folder(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 })
                 .child(list),
         );
-        pop = pop.child(
-            Button::new(tr_ref(language, "Choose folder…"))
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Small)
-                .on_press(move |s: &mut UiState| {
-                    close_folders(s);
-                    crate::platform::dialogs::choose_project(start.clone());
-                })
-                .build(k)
-                .key("choose-folder")
-                .self_start()
-                .mt(4.0),
-        );
+        if s.current_computer() == "local" {
+            pop = pop.child(
+                Button::new(tr_ref(language, "Choose folder…"))
+                    .variant(ButtonVariant::Ghost)
+                    .control_size(ControlSize::Small)
+                    .on_press(move |s: &mut UiState| {
+                        close_folders(s);
+                        crate::platform::dialogs::choose_project(start.clone());
+                    })
+                    .build(k)
+                    .key("choose-folder")
+                    .self_start()
+                    .mt(4.0),
+            );
+        }
     }
     pop.build(k, layer)
 }
@@ -514,18 +534,26 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
         .or_else(|| defaults.and_then(|d| d.model.as_ref()));
     let mut line = row().key("start-pills").gap(8.0).center_y();
     let mut any = false;
+    if view.is_none() && s.start_catalog_failed {
+        line = line.child(
+            Button::new(tr_ref(language, "Reload model list"))
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .on_press(UiState::refresh_start_catalog)
+                .build(k)
+                .key("start-model-reload"),
+        );
+        any = true;
+    }
     if !models.is_empty() {
+        let selected = picked.and_then(|model| super::labels::catalog_model_info(view?, model));
         let label = picked
-            .map(|m| {
-                let catalog = models
-                    .iter()
-                    .find(|(p, id, _)| {
-                        (*p == m.provider_id && *id == m.model_id)
-                            || (super::labels::bare_catalog_id(id)
-                                == super::labels::bare_catalog_id(&m.model_id))
-                    })
-                    .map(|(_, _, n)| n.as_str());
-                super::labels::format_model_name(m, tr_ref(language, "Model"), catalog)
+            .map(|model| {
+                super::labels::format_model_name(
+                    model,
+                    tr_ref(language, "Model"),
+                    selected.map(|entry| entry.name.as_str()),
+                )
             })
             .unwrap_or_else(|| tr(language, "Model"));
         line = line.child(model_menu(
@@ -539,13 +567,33 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
             picked.map(|m| (m.provider_id.as_str(), m.model_id.as_str())),
             |s: &mut UiState, provider_id: String, model_id: String| {
                 s.menu = None;
-                s.start_model = Some(ModelRef {
+                let current = s
+                    .start_model
+                    .as_ref()
+                    .or_else(|| s.start_catalog.as_ref()?.catalog.defaults.model.as_ref());
+                s.start_model = Some(composer::choose_model(
+                    s.start_catalog.as_deref(),
+                    current,
                     provider_id,
                     model_id,
-                    variant: None,
-                });
+                ));
             },
         ));
+        if let Some(variants) = selected
+            .and_then(|entry| entry.variants.as_ref())
+            .filter(|levels| !levels.is_empty())
+        {
+            let levels = variants.iter().map(|v| v.id.clone()).collect::<Vec<_>>();
+            line = line.child(composer::effort_menu(
+                k,
+                layer,
+                "home",
+                Slot::Start,
+                s.menu == Some(OpenMenu::StartEffort),
+                picked.and_then(|model| model.variant.as_deref()),
+                &levels,
+            ));
+        }
         any = true;
     }
     let modes: Vec<(String, String)> = view
@@ -576,46 +624,31 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
                 .iter()
                 .position(|(id, _)| id == m || id.eq_ignore_ascii_case(m))
         });
-        let ids: Vec<String> = modes.iter().map(|(id, _)| id.clone()).collect();
-        if modes.len() <= 4 {
-            let labels: Vec<&str> = modes.iter().map(|(_, n)| n.as_str()).collect();
-            line = line.child(
-                SegmentedControl::new(&labels, at)
-                    .fit()
-                    .label(tr_ref(language, "Mode"))
-                    .on_pick(move |s: &mut UiState, i, _: &mut Tx| {
-                        s.start_mode = Some(ids[i].clone());
-                    })
-                    .build(k)
-                    .key("start-modes"),
+        let open = s.menu == Some(OpenMenu::StartMode);
+        let label = at.map_or_else(|| tr(language, "Mode"), |i| modes[i].1.clone());
+        let mut menu = rune_kit::Menu::new("start-mode")
+            .placement(rune_kit::Placement::TopStart)
+            .trigger(super::composer::pill(
+                k,
+                "start-mode-pill",
+                label,
+                open,
+                OpenMenu::StartMode,
+            ))
+            .open(open)
+            .on_close(|s: &mut UiState| s.menu = None);
+        for (i, (id, name)) in modes.iter().enumerate() {
+            let id = id.clone();
+            menu = menu.item(
+                rune_kit::MenuItem::new(name.clone())
+                    .checked(at == Some(i))
+                    .on_select(move |s: &mut UiState| {
+                        s.menu = None;
+                        s.start_mode = Some(id.clone());
+                    }),
             );
-        } else {
-            let open = s.menu == Some(OpenMenu::StartMode);
-            let label = at.map_or_else(|| tr(language, "Mode"), |i| modes[i].1.clone());
-            let mut menu = rune_kit::Menu::new("start-mode")
-                .placement(rune_kit::Placement::TopStart)
-                .trigger(super::composer::pill(
-                    k,
-                    "start-mode-pill",
-                    label,
-                    open,
-                    OpenMenu::StartMode,
-                ))
-                .open(open)
-                .on_close(|s: &mut UiState| s.menu = None);
-            for (i, (id, name)) in modes.iter().enumerate() {
-                let id = id.clone();
-                menu = menu.item(
-                    rune_kit::MenuItem::new(name.clone())
-                        .checked(at == Some(i))
-                        .on_select(move |s: &mut UiState| {
-                            s.menu = None;
-                            s.start_mode = Some(id.clone());
-                        }),
-                );
-            }
-            line = line.child(menu.build(k, layer));
         }
+        line = line.child(menu.build(k, layer));
         any = true;
     }
     any.then_some(line)
@@ -688,7 +721,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
                     .control_size(ControlSize::Large)
                     .disabled(
                         s.pending_submit.is_some()
-                            || s.start_draft.text.trim().is_empty()
+                            || !composer::ready_to_send(s, Slot::Start)
                             || s.start_agent.is_empty(),
                     )
                     .on_press(submit_start)
@@ -697,7 +730,7 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
                     .size(36.0, 36.0)
                     .radius(k.radius.lg),
                 k.c.bg_accent,
-                if s.start_draft.text.trim().is_empty() {
+                if !composer::ready_to_send(s, Slot::Start) {
                     0.0
                 } else {
                     0.6

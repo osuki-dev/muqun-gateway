@@ -18,6 +18,8 @@ use crate::{
 
 #[path = "office_uploads.rs"]
 mod office_uploads;
+#[cfg(test)]
+pub(crate) use office_uploads::fixture as legacy_office_fixture;
 
 /// The one route allowed a body bigger than [`MAX_REQUEST_BODY_BYTES`]. Named
 /// so the router and the encrypted transport cannot disagree about which route

@@ -189,3 +189,28 @@ pub static PLUS: Icon = Icon {
     view: 16.0,
     body: r#"<path d="M8 3.75V12.25M3.75 8H12.25" stroke="currentColor"/>"#,
 };
+
+pub static MORE: Icon = Icon {
+    name: "cmp-more",
+    view: 24.0,
+    body: r#"<circle cx="5" cy="12" r="1" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="12" r="1" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="19" cy="12" r="1" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
+/// Add a neighboring pane. The plus distinguishes this action from changing placement.
+pub static ADD_PANE: Icon = Icon {
+    name: "add-pane",
+    view: 24.0,
+    body: r#"<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="16" rx="2"/><path d="M10 4v16m3-8h5m-2.5-2.5v5"/></g>"#,
+};
+
+pub(crate) fn header_button(
+    glyph: &'static Icon,
+    label: impl Into<String>,
+) -> rune_kit::IconButton {
+    let label = label.into();
+    rune_kit::IconButton::new(glyph)
+        .variant(rune_kit::IconButtonVariant::GhostMuted)
+        .control_size(rune_kit::ControlSize::Regular)
+        .label(label.clone())
+        .help(label)
+}

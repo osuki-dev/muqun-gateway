@@ -83,14 +83,7 @@ pub struct LocalGateway {
 /// `GET /api/meta`. `MUQUN_LOCAL_GATEWAY` overrides the file's path; the
 /// default is the gateway service's own state directory.
 pub async fn discover_local_gateway() -> Option<LocalGateway> {
-    let path = std::env::var_os("MUQUN_LOCAL_GATEWAY")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            dirs::data_dir()
-                .or_else(dirs::config_dir)
-                .map(|d| d.join("muqun-gateway").join("local-client.json"))
-        })?;
+    let path = local_gateway_file()?;
     let found = read_credential(&path)?;
     match probe(&found).await {
         Ok(()) => Some(found),
@@ -99,6 +92,15 @@ pub async fn discover_local_gateway() -> Option<LocalGateway> {
             None
         }
     }
+}
+
+/// Read the endpoint and credential without contacting the advertised host.
+pub(crate) fn local_gateway_credential() -> Option<LocalGateway> {
+    read_credential(&local_gateway_file()?)
+}
+
+fn local_gateway_file() -> Option<PathBuf> {
+    muqun_gateway::local_gateway_client_file().ok()
 }
 
 fn read_credential(path: &Path) -> Option<LocalGateway> {
@@ -152,15 +154,25 @@ impl Drop for RemoteHub {
 impl RemoteHub {
     /// Connect to `gateway` and start the event socket (which reconnects).
     pub fn start(gateway: LocalGateway) -> anyhow::Result<Arc<Self>> {
+        let hub = Self::client(gateway, reqwest::redirect::Policy::default())?;
+        tokio::spawn(event_socket(Arc::downgrade(&hub), hub.shutdown.subscribe()));
+        Ok(hub)
+    }
+
+    fn client(
+        gateway: LocalGateway,
+        redirects: reqwest::redirect::Policy,
+    ) -> anyhow::Result<Arc<Self>> {
         let material = gateway
             .transport_key
             .as_deref()
             .and_then(|k| muqun_gateway::connectivity::transport::decode_key(k).ok());
         let http = reqwest::Client::builder()
+            .redirect(redirects)
             .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(120))
             .build()?;
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let hub = Arc::new(Self {
             http,
             base: reqwest::Url::parse(gateway.url.trim_end_matches('/'))?,
@@ -175,8 +187,49 @@ impl RemoteHub {
             link: tokio::sync::watch::channel(None).0,
             shutdown: shutdown_tx,
         });
-        tokio::spawn(event_socket(Arc::downgrade(&hub), shutdown_rx));
         Ok(hub)
+    }
+
+    /// Revoke only the device authenticated by this saved login. Older profiles
+    /// may lack a device ID, so the Gateway's own current marker is authoritative.
+    pub async fn revoke_own_login(gateway: LocalGateway) -> anyhow::Result<()> {
+        if let Some(key) = &gateway.transport_key {
+            anyhow::ensure!(
+                gateway.device_id.is_some()
+                    && muqun_gateway::connectivity::transport::decode_key(key)?.len() == 32,
+                "Invalid saved pairing credentials"
+            );
+        }
+        let client = Self::client(gateway, reqwest::redirect::Policy::none())?;
+        let list = client
+            .call(Method::GET, &["api", "pairings"], &[], None)
+            .await?;
+        let mut current = list["devices"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Missing paired-device list"))?
+            .iter()
+            .filter(|d| d["current"].as_bool() == Some(true));
+        let id = current
+            .next()
+            .and_then(|d| d["id"].as_str())
+            .filter(|id| !matches!(*id, "" | "." | ".."))
+            .ok_or_else(|| anyhow::anyhow!("Gateway did not identify this device"))?;
+        anyhow::ensure!(
+            current.next().is_none()
+                && client
+                    .device_id
+                    .as_deref()
+                    .is_none_or(|expected| expected == id),
+            "Gateway returned a different device identity"
+        );
+        let answer = client
+            .call(Method::DELETE, &["api", "pairings", id], &[], None)
+            .await?;
+        anyhow::ensure!(
+            answer["ok"] == true && answer["revoked"] == id,
+            "Gateway did not confirm device revocation"
+        );
+        Ok(())
     }
 
     fn url(&self, segments: &[&str], query: &[(&str, &str)]) -> reqwest::Url {
@@ -1132,6 +1185,16 @@ impl SessionHub for RemoteHub {
                 .next()
                 .unwrap_or_default()
                 .to_string();
+            if field("mime").starts_with("image/") {
+                if let Some(target) = super::connection_origin().and_then(|(computer, _)| {
+                    crate::model::media::upload_target(&computer, field("path"))
+                }) {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::model::media::write(&target, &bytes)
+                    })
+                    .await;
+                }
+            }
             Ok(StoredUpload {
                 path: PathBuf::from(field("path")),
                 stored_name,

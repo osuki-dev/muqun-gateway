@@ -103,56 +103,29 @@ pub fn format_model_name(model: &ModelRef, fallback: &str, catalog_name: Option<
     readable_catalog_id(id)
 }
 
-fn catalog_entry<'a>(
-    models: &[&'a ModelInfo],
-    id: &str,
-    default_id: Option<&str>,
-) -> Option<&'a ModelInfo> {
-    let find = |wanted: &str| {
-        models
-            .iter()
-            .find(|m| m.id == wanted)
-            .or_else(|| {
-                models
-                    .iter()
-                    .find(|m| bare_catalog_id(&m.id) == bare_catalog_id(wanted))
-            })
-            .copied()
-    };
-    if let Some(hit) = find(id) {
-        return Some(hit);
-    }
-    let default_id = default_id?;
-    if bare_catalog_id(id).eq_ignore_ascii_case("default") {
-        find(default_id)
-    } else {
-        None
-    }
-}
-
-/// Exact provider match first, then bare-id / default.
+/// Resolve an enabled model in its own provider. An unresolved automatic choice
+/// has no discoverable effort levels unless the catalog identifies its default.
 pub fn catalog_model_info<'a>(
-    models: &[&'a ModelInfo],
+    view: &'a crate::hub::CatalogView,
     model: &ModelRef,
-    default_model: Option<&ModelRef>,
 ) -> Option<&'a ModelInfo> {
-    if model.model_id.is_empty() {
-        return None;
-    }
-    models
-        .iter()
-        .find(|m| {
-            m.id == model.model_id
-                && (model.provider_id.is_empty() || m.provider_id == model.provider_id)
-        })
-        .copied()
-        .or_else(|| {
-            catalog_entry(
-                models,
-                &model.model_id,
-                default_model.map(|d| d.model_id.as_str()),
-            )
-        })
+    let find = |choice: &ModelRef| {
+        let mut models = view.catalog.models.iter().filter(|m| {
+            m.enabled && (choice.provider_id.is_empty() || m.provider_id == choice.provider_id)
+        });
+        models
+            .clone()
+            .find(|m| m.id == choice.model_id)
+            .or_else(|| {
+                models.find(|m| bare_catalog_id(&m.id) == bare_catalog_id(&choice.model_id))
+            })
+    };
+    find(model).or_else(|| {
+        bare_catalog_id(&model.model_id)
+            .eq_ignore_ascii_case("default")
+            .then(|| view.catalog.defaults.model.as_ref().and_then(find))
+            .flatten()
+    })
 }
 
 #[cfg(test)]

@@ -20,6 +20,8 @@ pub(crate) mod inbox;
 pub(crate) mod inspector;
 pub mod keymap;
 mod labels;
+mod notifications;
+mod package_activity;
 pub mod pair_computer;
 pub(crate) mod palette;
 mod panes;
@@ -27,6 +29,7 @@ pub(crate) mod parts;
 mod running;
 pub mod scenes;
 mod search;
+mod session_lineage;
 mod sessions;
 pub(crate) mod settings;
 mod shell;
@@ -56,7 +59,7 @@ use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 use rune::{Cx, El, ImageCache, KeyEvent, TextEdit, Tx};
 use rune_kit::diff::{parse, DiffState};
 use rune_kit::shell::PaneState;
-use rune_kit::{Kit, ToastRegion};
+use rune_kit::Kit;
 
 use crate::config::{ConfigEdit, DesktopConfig, Scheme};
 use crate::hub::CatalogView;
@@ -170,6 +173,7 @@ pub enum OpenMenu {
     ComposerDelivery,
     /// The start page's model, mode and branch menus.
     StartModel,
+    StartEffort,
     StartMode,
     StartBranch,
     /// The start page's other agents.
@@ -192,7 +196,11 @@ pub enum OpenMenu {
     ComputerPicker,
     /// The sidebar inventory scope. Search remains global.
     SidebarScope,
+    PluginSelect(String),
+    PluginTextSelection(String),
     WindowSurface(String),
+    DockActions,
+    ViewerImageActions,
     /// The tasks page's computer filter picker.
     TasksComputerPicker,
 }
@@ -215,6 +223,7 @@ pub struct SessionSlot {
     pub diff_active_file: usize,
     pub revert_staged: bool,
     pub catalog: Option<Arc<CatalogView>>,
+    catalog_request: u64,
     pub descendants: Vec<AgentSessionInfo>,
     pub saved_permissions: Vec<SavedPermission>,
 }
@@ -269,6 +278,7 @@ impl TileContent {
             TileContent::Session(id) => Some(id.clone()),
             TileContent::Terminal => Some("terminal".to_string()),
             TileContent::Diff(path) => Some(format!("diff:{path}")),
+            TileContent::Custom { kind, .. } if kind == parts::detail::ID => None,
             TileContent::Custom { id, kind, .. } => Some(format!("custom:{kind}:{id}")),
         }
     }
@@ -377,6 +387,7 @@ pub fn seed_config(config: DesktopConfig) {
 pub struct ComputerData {
     focused_slot: Option<SessionSlot>,
     start_draft: Option<TextEdit>,
+    start_folder: Option<(TextEdit, bool)>,
     form_inputs: HashMap<String, TextEdit>,
     pub session_open_errors: HashMap<String, String>,
     pub pending_receipts: Vec<Update>,
@@ -417,6 +428,8 @@ pub struct UiState {
     /// every [`ConfigEdit`] sent to the core.
     pub cfg: DesktopConfig,
     pub dark: bool,
+    pub system_dark: std::cell::Cell<Option<bool>>,
+    pub system_reduced_motion: std::cell::Cell<bool>,
     pub mode: Mode,
     pub settings_tab: SettingsTab,
     pub sidebar: PaneState,
@@ -437,9 +450,9 @@ pub struct UiState {
     /// Timelines on screen, by asid: the focused session's and every tile's
     /// (`timeline::SessionTimeline`; drawn by `timeline::session_view`).
     pub timelines: HashMap<String, timeline::SessionTimeline>,
-    /// A timeline picture opened full size (`timeline::overlay`).
-    pub zoom: Option<PathBuf>,
-    /// A subagent's session shown read-only over its parent (`timeline::overlay`).
+    /// Full-size image above its originating session or plugin.
+    pub zoom: Option<Box<viewer::Viewer>>,
+    /// A subagent's session shown read-only over its parent.
     pub detail: Option<timeline::DetailSheet>,
     /// The timeline row open in the right-hand detail pane (`parts::pane`).
     pub inspect: Option<Inspect>,
@@ -463,16 +476,20 @@ pub struct UiState {
     pub start_draft: TextEdit,
     pub start_agent: String,
     pub start_cwd: TextEdit,
+    start_cwd_explicit: bool,
     pub start_worktree: bool,
     /// The start page's model and mode picks; `None` leaves the agent's own.
     pub start_model: Option<ModelRef>,
     pub start_mode: Option<String>,
     pub start_catalog: Option<Arc<CatalogView>>,
+    start_catalog_request: u64,
+    start_catalog_failed: bool,
     pub completions: Vec<DirectoryEntry>,
     pub staged: Vec<StagedFile>,
     pub queue: Vec<InboxItem>,
     pub file_hits: Vec<FileHit>,
     pub catalog: Option<Arc<CatalogView>>,
+    catalog_request: u64,
     pub branches: HashMap<String, BranchInfo>,
     /// Computers `@` may name.
     pub peers: Vec<PeerMention>,
@@ -525,12 +542,12 @@ pub struct UiState {
     pub sidebar_all_sessions: bool,
     pub sidebar_opened: HashMap<String, u64>,
     pub pairing_target: Option<String>,
-    pub pairing_request_id: Option<String>,
+    pub pairing_attempt: u64,
+    pub pairing_offer: Option<crate::platform::pairing::PairingOffer>,
     pub pairing_code_input: TextEdit,
     pub pairing_token_input: TextEdit,
     pub pairing_url_input: TextEdit,
     pub pairing_manual_token_mode: bool,
-    pub pairing_transport_required: bool,
     pub pairing_busy: bool,
     pub pairing_error: Option<String>,
     /// The sidebar's "In messages" hits (`ui/search.rs`).
@@ -573,6 +590,18 @@ pub struct UiState {
     pub theme_previews: HashMap<String, PathBuf>,
     pub theme_jobs: HashMap<String, Job>,
     pub theme_url: TextEdit,
+    pub plugin_source: TextEdit,
+    pub plugin_query: TextEdit,
+    pub plugin_category: Option<crate::plugin::PluginCategory>,
+    pub plugin_fields: HashMap<(String, String), HashMap<(String, String), TextEdit>>,
+    pub diagnostic_filter: settings::DiagnosticFilter,
+    pub computer_unpair: settings::computers::Unpair,
+    forgotten_computers: HashSet<String>,
+    pub local_revoke: settings::revoke_device::State,
+    pub(crate) local_invite: Option<settings::local_devices::InvitePanel>,
+    pub desktop_update: crate::platform::update::Status,
+    pub local_pairings: crate::platform::paired_devices::List,
+    pub(crate) plugin_packages: package_activity::PackageActivity,
     /// Settings → Themes: the search over both grids.
     pub theme_query: TextEdit,
     pub theme_tab: settings::ThemeTab,
@@ -600,7 +629,6 @@ pub struct UiState {
     pub agents_seen: bool,
     /// A screenshot scene is showing: live core updates are ignored.
     pub demo: bool,
-    pub desktop_update: crate::platform::update::Status,
     /// What the desktop keeps on disk (Settings → Storage), once scanned.
     pub storage: Option<crate::model::storage::StorageReport>,
     /// The terminal panel on the right (`ui/terminal_panel.rs`).
@@ -650,8 +678,12 @@ pub struct UiState {
     /// Active plugin opened in the full-screen Page slot (`PluginSlot::Page`).
     pub active_plugin_page: Option<String>,
     pub plugin_page_origin: Option<crate::plugin::PluginSlot>,
+    moving_plugin_view: Option<(String, String)>,
     /// Active plugin opened in the right-hand Drawer slot (`PluginSlot::Drawer`).
     pub active_plugin_drawer: Option<String>,
+    pub(crate) dock_tabs: Vec<String>,
+    hidden_dock_tab: Option<String>,
+    pub(crate) browser: crate::plugin::browser::Browser,
     /// Interactive text buffer for the Quick Notes (`"quicknotes"`) scratchpad plugin.
     pub quick_notes_edit: TextEdit,
     /// Persistent or active notes per quick notes tile.
@@ -686,7 +718,9 @@ impl UiState {
                 .unwrap_or_default(),
         );
         let start_agent = cfg.general.last_agent.clone().unwrap_or_default();
-        let start_cwd_text = if !start_agent.is_empty() {
+        let start_cwd_text = if !matches!(cfg.current_computer.as_str(), "" | "self" | "local") {
+            "~".to_owned()
+        } else if !start_agent.is_empty() {
             cfg.general.initial_cwd(&start_agent).display().to_string()
         } else {
             String::new()
@@ -696,6 +730,8 @@ impl UiState {
             session_open_errors: HashMap::new(),
             computer_generations: HashMap::new(),
             dark,
+            system_dark: Default::default(),
+            system_reduced_motion: Default::default(),
             mode: Mode::Home,
             settings_tab: SettingsTab::Agents,
             sidebar: PaneState::new(260.0)
@@ -731,15 +767,19 @@ impl UiState {
             start_draft,
             start_agent,
             start_cwd: TextEdit::new(start_cwd_text),
+            start_cwd_explicit: false,
             start_worktree: false,
             start_model: None,
             start_mode: None,
             start_catalog: None,
+            start_catalog_request: 0,
+            start_catalog_failed: false,
             completions: Vec::new(),
             staged: Vec::new(),
             queue: Vec::new(),
             file_hits: Vec::new(),
             catalog: None,
+            catalog_request: 0,
             branches: HashMap::new(),
             peers: Vec::new(),
             computer_data: HashMap::new(),
@@ -775,12 +815,12 @@ impl UiState {
             sidebar_all_sessions: false,
             sidebar_opened: HashMap::new(),
             pairing_target: None,
-            pairing_request_id: None,
+            pairing_attempt: 0,
+            pairing_offer: None,
             pairing_code_input: TextEdit::new(""),
             pairing_token_input: TextEdit::new(""),
             pairing_url_input: TextEdit::new(""),
             pairing_manual_token_mode: false,
-            pairing_transport_required: false,
             pairing_busy: false,
             pairing_error: None,
             content: Default::default(),
@@ -808,6 +848,18 @@ impl UiState {
             theme_previews: HashMap::new(),
             theme_jobs: HashMap::new(),
             theme_url: TextEdit::new(""),
+            plugin_source: TextEdit::new(""),
+            plugin_query: TextEdit::new(""),
+            plugin_category: None,
+            plugin_fields: HashMap::new(),
+            diagnostic_filter: Default::default(),
+            local_invite: None,
+            desktop_update: Default::default(),
+            local_pairings: Default::default(),
+            local_revoke: Default::default(),
+            computer_unpair: Default::default(),
+            forgotten_computers: HashSet::new(),
+            plugin_packages: Default::default(),
             theme_query: TextEdit::new(""),
             theme_tab: settings::ThemeTab::Installed,
             gallery_limit: GALLERY_PAGE,
@@ -826,7 +878,6 @@ impl UiState {
             timeline_search: TimelineSearch::default(),
             agents_seen: false,
             demo: false,
-            desktop_update: Default::default(),
             storage: None,
             viewer: None,
             voice: None,
@@ -853,20 +904,14 @@ impl UiState {
             plugins: crate::plugin::PluginRegistry::default_registry(),
             active_plugin_page: None,
             plugin_page_origin: None,
+            moving_plugin_view: None,
             active_plugin_drawer: None,
+            dock_tabs: Vec::new(),
+            hidden_dock_tab: None,
+            browser: Default::default(),
             quick_notes_edit: TextEdit::new(""),
             quick_notes: HashMap::new(),
-            runtime_statuses: muqun_gateway::platform::runtimes::RuntimeKind::ALL
-                .into_iter()
-                .map(|kind| muqun_gateway::platform::runtimes::RuntimeStatus {
-                    kind,
-                    available: false,
-                    source: None,
-                    binary_path: None,
-                    version: None,
-                    managed_dir: std::env::temp_dir().join("muqun-runtimes").join(kind.id()),
-                })
-                .collect(),
+            runtime_statuses: Vec::new(),
             runtime_installing: HashSet::new(),
             cfg,
         };
@@ -931,7 +976,14 @@ impl UiState {
         let term = self.poll_terminal(t, tx);
         let search = self.poll_search(tx);
         let echoes = self.poll_echoes(tx);
-        self.poll_splash(t, tx) | voice | fit | term | search | echoes | plugins
+        self.poll_local_invite(tx)
+            | self.poll_splash(t, tx)
+            | voice
+            | fit
+            | term
+            | search
+            | echoes
+            | plugins
     }
 
     pub fn poll_splash(&mut self, t: f64, _: &mut Tx) -> bool {
@@ -1063,6 +1115,18 @@ impl UiState {
         }
     }
 
+    pub fn can_connect_new_local_gateway(&self) -> bool {
+        self.current_computer() == "local"
+            && self.selected.is_none()
+            && self.tiles.is_empty()
+            && self.busy_since.is_empty()
+            && self.pending_submit.is_none()
+            && self.pending_start.is_none()
+            && self.start_draft.text.trim().is_empty()
+            && !self.term.open
+            && !self.cfg.general.gateway_local_only
+    }
+
     pub fn computer_name(&self, id: &str) -> String {
         let language = self.cfg.general.language;
         if id == "all" {
@@ -1114,6 +1178,9 @@ impl UiState {
             );
         }
         for (id, profile) in &self.cfg.computers {
+            if profile.url.is_none() && profile.token.is_none() {
+                continue;
+            }
             if !list.iter().any(|p| &p.server_id == id) {
                 list.push(crate::hub::PeerMention {
                     server_id: id.clone(),
@@ -1150,14 +1217,16 @@ impl UiState {
     }
 
     pub fn peer_url(&self, computer_id: &str) -> Option<String> {
+        let profile = self.cfg.computers.get(computer_id);
+        if let Some(saved) = profile
+            .filter(|p| p.token.is_some())
+            .and_then(|p| p.url.clone())
+        {
+            return Some(saved);
+        }
         self.peer_by_id(computer_id)
             .and_then(|p| p.url.clone())
-            .or_else(|| {
-                self.cfg
-                    .computers
-                    .get(computer_id)
-                    .and_then(|p| p.url.clone())
-            })
+            .or_else(|| profile.and_then(|p| p.url.clone()))
     }
 
     pub fn computer_of_session(&self, asid: &str) -> Option<String> {
@@ -1205,10 +1274,34 @@ impl UiState {
         self.sessions.dedup_by(|a, b| a.asid == b.asid);
     }
 
+    pub fn open_manual_pairing(&mut self) {
+        self.open_pairing(String::new());
+        self.pairing_url_input.focused = true;
+        self.pairing_code_input.focused = false;
+    }
+
+    fn begin_pairing(&mut self, address: &str) -> Option<(u64, String)> {
+        if self.pairing_busy {
+            return None;
+        }
+        match crate::platform::pairing::gateway_url(address) {
+            Ok(url) => {
+                self.pairing_attempt = self.pairing_attempt.wrapping_add(1);
+                self.pairing_busy = true;
+                self.pairing_error = None;
+                Some((self.pairing_attempt, url))
+            }
+            Err(e) => {
+                self.pairing_error = Some(e.to_string());
+                None
+            }
+        }
+    }
+
     pub fn open_pairing(&mut self, target_id: String) {
         let default_url = self.peer_url(&target_id).unwrap_or_default();
         self.pairing_target = Some(target_id);
-        self.pairing_request_id = None;
+        self.pairing_offer = None;
         self.pairing_busy = false;
         self.pairing_error = None;
         self.pairing_manual_token_mode = false;
@@ -1220,13 +1313,21 @@ impl UiState {
 
     pub fn close_pairing(&mut self) {
         self.pairing_target = None;
-        self.pairing_request_id = None;
+        self.pairing_offer = None;
         self.pairing_busy = false;
         self.pairing_error = None;
         self.pairing_manual_token_mode = false;
         self.pairing_code_input.clear();
         self.pairing_code_input.focused = true;
         self.pairing_token_input.clear();
+    }
+
+    fn start_default_directory(&self, agent: &str) -> PathBuf {
+        if self.current_computer() == "local" {
+            self.cfg.general.initial_cwd(agent)
+        } else {
+            PathBuf::from("~")
+        }
     }
 
     pub fn switch_computer(&mut self, id: String) {
@@ -1242,9 +1343,24 @@ impl UiState {
             self.waiting_forms.clear();
             self.persist_draft(Slot::Session);
             let slot = self.take_slot();
+            let default_cwd = if id == "local" {
+                self.cfg.general.initial_cwd(&self.start_agent)
+            } else {
+                PathBuf::from("~")
+            };
+            self.completions.clear();
+            self.start_catalog = None;
+            self.folder_query = TextEdit::new("");
             let data = ComputerData {
                 form_inputs: std::mem::take(&mut self.form_inputs),
                 focused_slot: Some(slot),
+                start_folder: Some((
+                    std::mem::replace(
+                        &mut self.start_cwd,
+                        TextEdit::new(default_cwd.display().to_string()),
+                    ),
+                    std::mem::take(&mut self.start_cwd_explicit),
+                )),
                 start_draft: Some(std::mem::replace(&mut self.start_draft, TextEdit::new(""))),
                 session_open_errors: std::mem::take(&mut self.session_open_errors),
                 pending_receipts: Vec::new(),
@@ -1289,6 +1405,10 @@ impl UiState {
                 self.selected = None;
                 self.mode = Mode::Home;
             } else if let Some(restored) = self.computer_data.remove(&id) {
+                if let Some((cwd, explicit)) = restored.start_folder {
+                    self.start_cwd = cwd;
+                    self.start_cwd_explicit = explicit;
+                }
                 self.form_inputs = restored.form_inputs;
                 self.start_draft = restored.start_draft.unwrap_or_else(|| TextEdit::new(""));
                 self.session_open_errors = restored.session_open_errors;
@@ -1338,7 +1458,7 @@ impl UiState {
         self.edit(ConfigEdit::CurrentComputer(id.clone()));
         self.agent_inputs.clear();
         self.agent_errors.clear();
-        self.pairing_request_id = None;
+        self.pairing_offer = None;
         self.pairing_busy = false;
         self.pairing_error = None;
         self.pairing_code_input.clear();
@@ -1364,7 +1484,7 @@ impl UiState {
                 .iter()
                 .filter_map(|tile| tile.asid.clone())
                 .collect();
-            for asid in sessions {
+            for asid in sessions.into_iter().filter(|id| !id.starts_with("new-")) {
                 self.session_open_errors.remove(&asid);
                 self.send(Command::OpenTile(AgentSessionId(asid)));
             }
@@ -1384,12 +1504,36 @@ impl UiState {
     }
 
     pub fn notify(&mut self, level: ToastLevel, title: impl Into<String>, detail: Option<String>) {
-        let title = title.into();
+        self.add_toast(level, title.into(), detail, None);
+    }
+
+    pub fn notify_diagnostic(
+        &mut self,
+        event: uuid::Uuid,
+        level: ToastLevel,
+        title: impl Into<String>,
+        detail: Option<String>,
+    ) {
+        self.add_toast(
+            level,
+            title.into(),
+            detail,
+            Some(format!("diagnostics:{event}")),
+        );
+    }
+
+    pub(crate) fn add_toast(
+        &mut self,
+        level: ToastLevel,
+        title: String,
+        detail: Option<String>,
+        target: Option<String>,
+    ) {
         let now = std::time::Instant::now();
         if let Some(existing) = self
             .toasts
             .iter_mut()
-            .find(|t| t.target.is_none() && t.title == title && t.detail == detail)
+            .find(|t| t.target == target && t.title == title && t.detail == detail)
         {
             existing.level = level;
             existing.created_at = now;
@@ -1403,7 +1547,7 @@ impl UiState {
             title,
             detail,
             created_at: now,
-            target: None,
+            target,
         });
         while self.toasts.len() > MAX_TOASTS {
             self.toasts.remove(0);
@@ -1553,6 +1697,24 @@ impl UiState {
     }
 
     pub fn open_notification(&mut self, key: &str) {
+        if let Some(target) = key.strip_prefix("plugin:") {
+            if let Ok((id, action)) = serde_json::from_str::<(String, String)>(target) {
+                if let Some(plugin) = self.plugins.get_enabled(&id, &self.cfg.plugins_disabled) {
+                    plugin.on_notification_action(self, &action);
+                }
+            }
+            return;
+        }
+        if let Some(id) = key
+            .strip_prefix("diagnostics:")
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        {
+            self.go(Mode::Settings);
+            self.settings_tab = SettingsTab::Diagnostics;
+            self.diagnostic_filter = Default::default();
+            self.diagnostic_filter.selected = Some(id);
+            return;
+        }
         if let Ok((computer, asid)) = serde_json::from_str::<(String, String)>(key) {
             self.open_session_on(&computer, &asid);
         }
@@ -1560,8 +1722,10 @@ impl UiState {
 
     fn open_session_current(&mut self, asid: &str) {
         self.session_open_errors.remove(asid);
-        let key = format!("{}:{asid}", self.current_computer());
-        self.sidebar_opened.insert(key, now_ms());
+        if let Some(root) = self.sidebar_root(asid).map(str::to_owned) {
+            let key = format!("{}:{root}", self.current_computer());
+            self.sidebar_opened.insert(key, now_ms());
+        }
         if self.sidebar_opened.len() > 256 {
             if let Some(oldest) = self
                 .sidebar_opened
@@ -1573,7 +1737,7 @@ impl UiState {
             }
         }
         self.sidebar_all_sessions = false;
-        self.active_plugin_page = None;
+        self.release_plugin_page();
         if self.in_split() && self.tile_of(asid).is_none() {
             crate::platform::notify::withdraw(&crate::model::fleet_attention::notice_key(
                 self.current_computer(),
@@ -1608,7 +1772,7 @@ impl UiState {
         self.show_diff = false;
         if changed {
             if let Some(tile) = self.tiles.get_mut(self.focus) {
-                tile.asid = Some(asid.to_string());
+                tile.set_session(asid);
                 self.persist_tiles();
                 self.sync_watch();
             }
@@ -1787,7 +1951,7 @@ impl UiState {
         }
         self.insert_into_composer(&notes);
         if self.active_plugin_page.as_deref() == Some("quicknotes") {
-            self.active_plugin_page = None;
+            self.release_plugin_page();
         }
         self.notify(
             ToastLevel::Success,
@@ -1808,12 +1972,40 @@ impl UiState {
         self.send(Command::ProbeRuntimes);
     }
 
+    pub fn change_plugin_package(&mut self, op: crate::plugin::packages::Operation) {
+        if self.plugin_packages.busy() {
+            return;
+        }
+        if !self.runtime_statuses.iter().any(|status| {
+            status.kind == muqun_gateway::platform::runtimes::RuntimeKind::Bun && status.available
+        }) {
+            self.toast(
+                "Bun is required",
+                Some("Choose Install Bun in Settings → Plugins to continue.".into()),
+            );
+            return;
+        }
+        let Some(request) = self.plugin_packages.start(op.clone()) else {
+            return;
+        };
+        let reserved = self
+            .plugins
+            .all()
+            .into_iter()
+            .filter(|p| !self.plugins.managed_versions.contains_key(p.id()))
+            .map(|p| p.id().to_owned())
+            .collect();
+        self.send(Command::PluginPackage(request, op, reserved));
+    }
+
     /// Trigger background installation or update of a managed runtime (`bun` or `herdr`).
     pub fn install_managed_runtime(
         &mut self,
         kind: muqun_gateway::platform::runtimes::RuntimeKind,
     ) {
-        self.runtime_installing.insert(kind);
+        if !self.runtime_installing.insert(kind) {
+            return;
+        }
         self.notify(
             ToastLevel::Info,
             format!("Installing managed {} runtime…", kind.display_name()),
@@ -1964,7 +2156,7 @@ impl UiState {
         if plugin.is_some_and(|id| !crate::plugin::is_enabled(id, &self.cfg.plugins_disabled)) {
             return;
         }
-        self.active_plugin_page = None;
+        self.release_plugin_page();
         self.mode = mode;
         composer::restore_attachments(self);
         match mode {
@@ -1997,7 +2189,11 @@ impl UiState {
         }
         let cwd = self.start_cwd.text.trim().to_string();
         let directory = (!cwd.is_empty()).then(|| cwd.clone());
+        self.start_catalog_failed = false;
+        self.start_catalog_request = self.next_token;
+        self.next_token += 1;
         self.send(Command::Compose(C::Catalog {
+            request: self.start_catalog_request,
             agent: self.start_agent.clone(),
             directory,
             asid: None,
@@ -2018,7 +2214,7 @@ impl UiState {
         }
     }
 
-    fn session_draft_key(&self, asid: &str) -> String {
+    pub(crate) fn session_draft_key(&self, asid: &str) -> String {
         if self.current_computer() == "local" {
             asid.to_owned()
         } else {
@@ -2125,30 +2321,26 @@ impl UiState {
     pub fn inline_inspector_open(&self) -> bool {
         self.mode == Mode::Session
             && self.in_split()
+            && self.tiles.get(self.focus).is_some_and(Tile::is_session)
             && self.right_open
             && !self.term.open
             && self.active_plugin_drawer.is_none()
     }
 
     pub fn close_inspector(&mut self) {
-        self.right_open = false;
-        self.right.set_open(false);
+        self.close_plugin_drawer();
     }
 
     pub fn toggle_inspector(&mut self) {
-        if !crate::plugin::is_enabled("inspector", &self.cfg.plugins_disabled) {
-            return;
-        }
-        self.active_plugin_drawer = None;
-        if self.term.open {
-            // One panel on the right at a time: the inspector takes it back.
-            self.close_terminal();
-            self.right_open = false;
-        }
-        self.right_open = !self.right_open;
-        self.right.set_open(self.right_open);
-        if self.right_open {
-            self.refresh_inspector();
+        if self.right_open
+            && self
+                .active_plugin_drawer
+                .as_deref()
+                .is_none_or(|id| id == "inspector")
+        {
+            self.close_inspector();
+        } else {
+            self.open_plugin_drawer("inspector");
         }
     }
 
@@ -2156,39 +2348,66 @@ impl UiState {
         if !crate::plugin::is_enabled("inspector", &self.cfg.plugins_disabled) {
             return;
         }
-        self.active_plugin_drawer = None;
         if self.mode != Mode::Session && self.selected.is_some() {
             self.go(Mode::Session);
         }
-        if self.term.open {
-            self.close_terminal();
-        }
         self.inspector_tab = InspectorTab::Git;
-        self.right_open = true;
-        self.right.set_open(true);
-        self.refresh_inspector();
+        self.open_plugin_drawer("inspector");
     }
 
     pub fn toggle_git_inspector(&mut self) {
         if self.mode != Mode::Session && self.selected.is_some() {
             self.go(Mode::Session);
         }
-        if self.right_open && self.inspector_tab == InspectorTab::Git && !self.term.open {
-            self.right_open = false;
-            self.right.set_open(false);
+        if self.right_open
+            && self
+                .active_plugin_drawer
+                .as_deref()
+                .is_none_or(|id| id == "inspector")
+            && self.inspector_tab == InspectorTab::Git
+            && !self.term.open
+        {
+            self.close_inspector();
         } else {
             self.open_git_inspector();
         }
     }
 
+    fn request_session_catalog(&mut self, info: &AgentSessionInfo) {
+        let request = self.next_token;
+        if self.selected.as_deref() == Some(&info.asid.0) {
+            self.catalog_request = request;
+        } else if let Some(tile) = self
+            .tiles
+            .iter_mut()
+            .find(|t| t.asid.as_deref() == Some(&info.asid.0))
+        {
+            tile.slot.catalog_request = request;
+        } else {
+            return;
+        }
+        self.next_token += 1;
+        self.send(Command::Compose(
+            crate::model::compose::ComposeCommand::Catalog {
+                request,
+                agent: info.agent_id.clone(),
+                directory: info.directory.clone(),
+                asid: Some(info.asid.clone()),
+            },
+        ));
+    }
+
     /// The composer's catalogue, branch and bypass state for a freshly opened session.
     fn session_opened(&mut self, info: &AgentSessionInfo) {
+        if self
+            .pending_start
+            .as_ref()
+            .is_some_and(|(pending, _)| pending == &info.asid.0)
+        {
+            return;
+        }
         use crate::model::compose::ComposeCommand as C;
-        self.send(Command::Compose(C::Catalog {
-            agent: info.agent_id.clone(),
-            directory: info.directory.clone(),
-            asid: Some(info.asid.clone()),
-        }));
+        self.request_session_catalog(info);
         self.send(Command::Compose(C::AutoApprove {
             asid: info.asid.clone(),
         }));
@@ -2257,6 +2476,7 @@ impl UiState {
             diff_active_file: std::mem::take(&mut self.diff_active_file),
             revert_staged: std::mem::replace(&mut self.revert_staged, false),
             catalog: self.catalog.take(),
+            catalog_request: std::mem::take(&mut self.catalog_request),
             descendants: std::mem::take(&mut self.descendants),
             saved_permissions: std::mem::take(&mut self.saved_permissions),
         }
@@ -2272,6 +2492,7 @@ impl UiState {
         self.diff_active_file = slot.diff_active_file;
         self.revert_staged = slot.revert_staged;
         self.catalog = slot.catalog;
+        self.catalog_request = slot.catalog_request;
         self.descendants = slot.descendants;
         self.saved_permissions = slot.saved_permissions;
     }
@@ -2480,9 +2701,11 @@ impl UiState {
             }
             return;
         }
-        self.close_terminal();
-        self.right_open = false;
-        self.right.set_open(false);
+        if self.term.open {
+            self.close_terminal();
+        } else {
+            self.remove_dock_tab("terminal", false);
+        }
 
         if self.tiles.is_empty() {
             let current = self.selected.clone();
@@ -2793,6 +3016,9 @@ impl UiState {
             }
         }
         let gone = self.tiles.remove(i);
+        if let TileContent::Custom { id, kind, .. } = &gone.content {
+            self.release_plugin_view(kind, id);
+        }
         self.tile_tree = dwindle::remove(self.tile_layout_of(self.tiles.len() + 1), i)
             .unwrap_or(crate::config::TileNode::Leaf(0));
         if self.focus > i {
@@ -2869,6 +3095,9 @@ impl UiState {
     /// Remember the split for the next launch: its sessions and their
     /// tiling, empty panes left out.
     pub fn persist_tiles(&mut self) {
+        if self.pending_start.is_some() {
+            return;
+        }
         let asids: Vec<String> = self
             .tiles
             .iter()
@@ -2989,6 +3218,9 @@ impl UiState {
                     generation,
                     updates,
                 } => {
+                    if self.forgotten_computers.contains(&computer) {
+                        continue;
+                    }
                     let latest = self
                         .computer_generations
                         .entry(computer.clone())
@@ -2997,7 +3229,7 @@ impl UiState {
                     *latest = (*latest).max(generation);
                     let active = self.current_computer() == computer;
                     for update in updates {
-                        let receipt = matches!(&update, Update::SessionCreated(_))
+                        let receipt = matches!(&update, Update::SessionCreated(..))
                             || matches!(&update, Update::Composer(composer)
                                 if matches!(**composer, ComposerUpdate::Submitted { .. }));
                         if receipt {
@@ -3018,8 +3250,20 @@ impl UiState {
                         if active {
                             self.apply_updates(vec![update]);
                         } else if let Update::AgentSessions { agent, sessions } = update {
+                            let children: HashSet<_> = self
+                                .computer_data
+                                .get(&computer)
+                                .into_iter()
+                                .flat_map(|data| &data.sessions)
+                                .filter(|info| self.is_subagent_session_on(&computer, info))
+                                .map(|info| info.asid.0.clone())
+                                .collect();
+                            for info in &sessions {
+                                self.remember_session_lineage_on(&computer, info);
+                            }
                             let data = self.computer_data.entry(computer.clone()).or_default();
-                            data.sessions.retain(|s| s.agent_id != agent);
+                            data.sessions
+                                .retain(|s| s.agent_id != agent || children.contains(&s.asid.0));
                             data.sessions.extend(sessions);
                             if self.current_computer() == "all" {
                                 self.rebuild_all_sessions();
@@ -3035,61 +3279,91 @@ impl UiState {
                     self.restore_tiles();
                 }
                 Update::ComputerPairingRequested {
-                    server_id: _,
-                    request_id,
-                    expires_in_ms: _,
-                    transport_required,
+                    attempt,
+                    url,
+                    result,
                 } => {
+                    if self.pairing_target.is_none()
+                        || !self.pairing_busy
+                        || self.pairing_attempt != attempt
+                    {
+                        continue;
+                    }
                     self.pairing_busy = false;
-                    self.pairing_request_id = Some(request_id);
-                    self.pairing_transport_required = transport_required;
-                    self.pairing_error = None;
-                    self.pairing_code_input.focused = true;
-                    self.toast(
-                        copy::tr(
-                            self.cfg.general.language,
-                            "Pairing code requested. Check the remote computer.",
-                        ),
-                        None,
-                    );
+                    match result {
+                        Ok(offer) => {
+                            self.pairing_url_input = TextEdit::new(url);
+                            self.pairing_offer = Some(offer);
+                            self.pairing_error = None;
+                            self.pairing_code_input.focused = true;
+                            self.toast(
+                                copy::tr(
+                                    self.cfg.general.language,
+                                    "Pairing code requested. Check the remote computer.",
+                                ),
+                                None,
+                            );
+                        }
+                        Err(error) => self.pairing_error = Some(error),
+                    }
                 }
                 Update::ComputerPairingOutcome {
-                    server_id,
-                    token,
-                    device_id,
-                    transport_key,
-                    error,
+                    attempt,
+                    url,
+                    result,
                 } => {
+                    if self.pairing_target.is_none()
+                        || !self.pairing_busy
+                        || self.pairing_attempt != attempt
+                    {
+                        continue;
+                    }
                     self.pairing_busy = false;
-                    if let Some(tok) = token {
-                        self.close_pairing();
-                        let comp = self.cfg.computers.entry(server_id.clone()).or_default();
-                        comp.token = Some(tok);
-                        if device_id.is_some() {
-                            comp.device_id = device_id;
+                    match result {
+                        Ok(claim) => {
+                            self.close_pairing();
+                            let server_id = claim.server_id;
+                            self.forgotten_computers.remove(&server_id);
+                            self.computer_unpair.invalidate(&server_id);
+                            self.edit(ConfigEdit::ComputerToken {
+                                computer: server_id.clone(),
+                                label: claim.server_label,
+                                url,
+                                token: claim.token,
+                                device_id: claim.device_id,
+                                transport_key: claim.transport_key,
+                            });
+                            self.toast(
+                                format!(
+                                    "{}: {}",
+                                    self.computer_name(&server_id),
+                                    copy::tr(self.cfg.general.language, "Connected successfully")
+                                ),
+                                None,
+                            );
+                            self.switch_computer(server_id);
                         }
-                        if transport_key.is_some() {
-                            comp.transport_key = transport_key;
-                        }
-                        let name = self.computer_name(&server_id);
-                        self.toast(
-                            format!(
-                                "{}: {}",
-                                name,
-                                copy::tr(self.cfg.general.language, "Connected successfully")
-                            ),
-                            None,
-                        );
-                        self.switch_computer(server_id);
-                    } else if let Some(err) = error {
-                        self.pairing_error = Some(err);
+                        Err(error) => self.pairing_error = Some(error),
                     }
                 }
                 Update::AgentSessions { agent, sessions } => {
                     self.listed_agents.insert(agent.clone());
                     let curr = self.current_computer().to_string();
                     if curr != "all" {
-                        self.sessions.retain(|s| s.agent_id != agent);
+                        let children: HashSet<_> = self
+                            .sessions
+                            .iter()
+                            .filter(|info| self.is_subagent_session(info))
+                            .map(|info| info.asid.0.clone())
+                            .collect();
+                        self.sessions.retain(|s| {
+                            s.agent_id != agent
+                                || children.contains(&s.asid.0)
+                                || self
+                                    .pending_start
+                                    .as_ref()
+                                    .is_some_and(|(pending, _)| pending == &s.asid.0)
+                        });
                         self.merge_sessions(sessions);
                         if self.error.as_ref().is_some_and(|e| e.unreachable) {
                             self.error = None;
@@ -3101,9 +3375,29 @@ impl UiState {
                         self.rebuild_all_sessions();
                     }
                 }
-                Update::SessionCreated(info) => {
-                    self.adopt_created_session(&info.asid.0);
-                    self.merge_sessions(vec![*info]);
+                Update::SessionCreated(info, start_token) => {
+                    let asid = info.asid.clone();
+                    self.merge_sessions(vec![(*info).clone()]);
+                    if let Some(token) = start_token {
+                        if self
+                            .pending_start
+                            .as_ref()
+                            .is_some_and(|(_, t)| *t == token)
+                        {
+                            self.adopt_created_session(&asid.0);
+                            if self.mode == Mode::Session
+                                && self.selected.as_deref() == Some(&asid.0)
+                            {
+                                self.send(Command::OpenSession(asid));
+                                self.session_opened(&info);
+                            } else if self.tile_of(&asid.0).is_some() && self.mode == Mode::Session
+                            {
+                                self.send(Command::OpenTile(asid));
+                            }
+                        }
+                    } else {
+                        self.open_session_current(&asid.0);
+                    }
                 }
                 Update::SessionGone(asid) => {
                     self.sessions.retain(|s| s.asid.0 != asid);
@@ -3124,9 +3418,6 @@ impl UiState {
                 Update::Event(event) => self.apply_event(*event),
                 Update::Error(mut err) => {
                     err.message = crate::model::inbox::clean_error_message(&err.message);
-                    if self.pending_start.is_some() {
-                        self.cleanup_pending_start();
-                    }
                     self.status = err.message.clone();
                     self.error_at = Some(std::time::Instant::now());
                     self.error = Some(err);
@@ -3150,6 +3441,9 @@ impl UiState {
                     items,
                     exhausted,
                 } => {
+                    if self.timelines.contains_key(&asid) {
+                        self.remember_timeline_lineage(&asid, &items);
+                    }
                     if let Some(tl) = self.timelines.get_mut(&asid) {
                         tl.prepend(items, exhausted);
                     }
@@ -3194,6 +3488,13 @@ impl UiState {
                     self.tasks_view.history.insert(id, steps);
                 }
                 Update::Descendants { asid, sessions } => {
+                    for info in &sessions {
+                        self.remember_session_lineage(info);
+                        self.remember_subagent_context(
+                            &info.asid.0,
+                            info.parent_id.as_deref().or(Some(&asid)),
+                        );
+                    }
                     if self.selected.as_deref() == Some(asid.as_str()) {
                         self.descendants = sessions;
                     } else if let Some(slot) = self.parked_slot(&asid) {
@@ -3215,15 +3516,49 @@ impl UiState {
                     generation,
                     outcome,
                 } => self.on_search(generation, outcome),
-                Update::FleetAttention(change) => self.on_fleet_attention(*change),
+                Update::FleetAttention(change) => {
+                    if !self.forgotten_computers.contains(&change.computer) {
+                        self.on_fleet_attention(*change);
+                    }
+                }
                 Update::FleetAttentionUnavailable(computer) => {
+                    if self.forgotten_computers.contains(&computer) {
+                        continue;
+                    }
                     self.toast(format!("{} · {}", self.computer_name(&computer), copy::tr(self.cfg.general.language, "Gateway update required")), Some(copy::tr(self.cfg.general.language, "Update this computer’s Gateway to recover approvals and questions after reconnecting. Live requests still appear.")));
                 }
                 Update::Voice(event) => self.on_voice(event),
+                Update::PluginPackageProgress(request, stage) => {
+                    self.plugin_packages.advance(request, stage)
+                }
+                Update::PluginPackage(request, event, result) => {
+                    if !self.plugin_packages.finish(request, &result) {
+                        continue;
+                    }
+                    match result {
+                        Ok(id) => {
+                            self.plugins.reload_package(&id);
+                            if self.plugins.get(&id).is_none() {
+                                self.close_plugin_windows(&id);
+                            }
+                            self.toast("Plugin packages updated", Some(id));
+                        }
+                        Err(err) => self.notify_diagnostic(
+                            event,
+                            ToastLevel::Error,
+                            "Plugin operation failed",
+                            Some(err),
+                        ),
+                    }
+                }
                 Update::Runtimes(statuses) => {
                     self.runtime_statuses = statuses;
                 }
-                Update::RuntimeInstalled { kind, result } => {
+                Update::RuntimeInstalled {
+                    kind,
+                    result,
+                    event,
+                } => {
                     self.runtime_installing.remove(&kind);
                     match result {
                         Ok(status) => {
@@ -3244,7 +3579,8 @@ impl UiState {
                             );
                         }
                         Err(err) => {
-                            self.notify(
+                            self.notify_diagnostic(
+                                event,
                                 ToastLevel::Error,
                                 format!("Failed to install {}", kind.display_name()),
                                 Some(err),
@@ -3388,6 +3724,11 @@ impl UiState {
         let usable = |a: &AgentDiscoveryInfo| a.enabled;
         let known = agents.iter().any(|a| a.id == self.start_agent);
         if !known {
+            self.start_model = None;
+            self.start_mode = None;
+            self.start_catalog = None;
+            self.start_catalog_request = 0;
+            self.start_catalog_failed = false;
             self.start_agent = agents
                 .iter()
                 .find(|a| usable(a))
@@ -3400,7 +3741,7 @@ impl UiState {
         self.agents = agents;
         if first {
             if self.start_cwd.text.is_empty() {
-                let cwd = self.cfg.general.initial_cwd(&self.start_agent);
+                let cwd = self.start_default_directory(&self.start_agent);
                 self.start_cwd = TextEdit::new(cwd.display().to_string());
             }
             if !self.start_agent.is_empty() {
@@ -3409,13 +3750,17 @@ impl UiState {
                 });
                 self.refresh_start_catalog();
             }
-        } else if !self.start_agent.is_empty() && self.start_catalog.is_none() {
+        } else if !self.start_agent.is_empty()
+            && self.start_catalog.is_none()
+            && self.start_catalog_request == 0
+        {
             self.refresh_start_catalog();
         }
     }
 
     fn merge_sessions(&mut self, incoming: Vec<AgentSessionInfo>) {
         for info in incoming {
+            self.remember_session_lineage(&info);
             match self.sessions.iter_mut().find(|s| s.asid.0 == info.asid.0) {
                 Some(slot) => *slot = info,
                 None => self.sessions.push(info),
@@ -3430,6 +3775,9 @@ impl UiState {
         // Migrate optimistic pending session created from home composer if present.
         if let Some((pending_asid, _)) = self.pending_start.take() {
             self.sessions.retain(|s| s.asid.0 != pending_asid);
+            if let Some(timeline) = self.timelines.remove(&pending_asid) {
+                self.timelines.entry(asid.to_owned()).or_insert(timeline);
+            }
             if let Some(pending_echoes) = self.echoes.remove(&pending_asid) {
                 let list = self.echoes.entry(asid.to_owned()).or_default();
                 for echo in pending_echoes {
@@ -3447,84 +3795,63 @@ impl UiState {
                     tile.content = TileContent::Session(asid.to_owned());
                 }
             }
+            self.persist_tiles();
         }
     }
 
     fn on_snapshot(&mut self, snapshot: muqun_gateway::agents::ports::AgentSessionSnapshot) {
         self.session_open_errors.remove(&snapshot.info.asid.0);
         let asid = snapshot.info.asid.0.clone();
-        self.adopt_created_session(&asid);
-        // A session opened into a tile that is not focused fills that tile.
-        if let Some(i) = self.tile_of(&asid) {
-            if i != self.focus {
-                self.merge_sessions(vec![snapshot.info.clone()]);
-                self.timelines
-                    .entry(asid.clone())
-                    .or_default()
-                    .replace(snapshot.timeline);
-                self.echo_rows(&asid);
-                self.waiting_perms
-                    .insert(asid.clone(), snapshot.permissions);
-                self.waiting_forms.insert(asid.clone(), snapshot.forms);
-                let queue = InboxItem::list(&snapshot.inbox);
-                self.echo_inbox(&asid, &queue);
-                self.tiles[i].slot.queue = queue;
-                return;
-            }
+        // Navigation belongs to the action that opened a pane. A delayed read can
+        // update its existing pane, but cannot claim the current Home submission.
+        let selected = self.selected.as_deref() == Some(&asid);
+        if !selected && self.tile_of(&asid).is_none() {
+            return;
         }
-        // A session started from an empty tile lands in it.
-        if let Some(i) = self.pending_tile.take() {
-            if self.tiles.get(i).is_some_and(|t| t.asid.is_none()) {
-                self.tiles[i].asid = Some(asid.clone());
-                self.focus_tile(i);
-                self.sync_watch();
-            }
-        }
-        // A session started while split view is up joins it in a new pane
-        // (at the most panes, it takes the focused one's place below).
-        if self.in_split() && self.tile_of(&asid).is_none() && self.tiles.len() < MAX_TILES {
-            let at = self.add_tile();
-            self.focus_tile(at);
-        }
-        let fresh = self.selected.as_deref() != Some(asid.as_str());
-        self.selected = Some(asid.clone());
-        if let Some(tile) = self.tiles.get_mut(self.focus) {
-            if matches!(tile.content, TileContent::Session(_) | TileContent::Empty)
-                && tile.asid.as_deref() != Some(asid.as_str())
-            {
-                tile.asid = Some(asid.clone());
-                tile.content = TileContent::Session(asid.clone());
-                self.sync_watch();
-                self.persist_tiles();
-            }
-        }
-        if self.mode == Mode::Home {
-            self.mode = Mode::Session;
-        }
+        let focused = selected && self.mode == Mode::Session;
+        let first_read = !self.timelines.contains_key(&asid);
         self.merge_sessions(vec![snapshot.info.clone()]);
+        self.remember_timeline_lineage(&asid, &snapshot.timeline);
         let count = snapshot.timeline.len();
         self.timelines
             .entry(asid.clone())
             .or_default()
             .replace(snapshot.timeline);
         self.echo_rows(&asid);
-        if fresh {
-            self.sync_watch();
-            self.retain_timelines();
-        }
         self.waiting_perms
             .insert(asid.clone(), snapshot.permissions);
         self.waiting_forms.insert(asid.clone(), snapshot.forms);
         let queue = InboxItem::list(&snapshot.inbox);
-        self.echo_inbox(&asid, &queue);
-        self.queue = queue;
+        self.apply_session_inbox(&asid, queue, snapshot.seq);
+        if !focused {
+            return;
+        }
         self.status = format!("{count} messages");
         if self.error.as_ref().is_some_and(|e| e.unreachable) {
             self.error = None;
         }
-        if fresh {
-            self.load_draft(&asid);
+        if first_read {
             self.session_opened(&snapshot.info);
+        }
+    }
+
+    fn apply_session_inbox(&mut self, asid: &str, items: Vec<InboxItem>, seq: u64) {
+        if self.selected.as_deref() != Some(asid) && self.tile_of(asid).is_none() {
+            return;
+        }
+        if !self
+            .timelines
+            .entry(asid.to_string())
+            .or_default()
+            .apply_inbox(&items, seq)
+        {
+            return;
+        }
+        self.echo_inbox(asid, &items);
+        if self.selected.as_deref() == Some(asid) {
+            self.queue = items;
+        } else if let Some(slot) = self.parked_slot(asid) {
+            slot.queue = items;
         }
     }
 
@@ -3548,6 +3875,7 @@ impl UiState {
                 muqun_gateway::agents::message_images::enrich_timeline(
                     &asid.0, directory, &mut items,
                 );
+                self.remember_timeline_lineage(&asid.0, &items);
                 if let Some(tl) = self.timelines.get_mut(&asid.0) {
                     tl.upsert(items);
                 }
@@ -3617,14 +3945,8 @@ impl UiState {
                     slot.revert_staged = revert.is_some();
                 }
             }
-            AgentDomainEvent::InboxChanged { asid, items, .. } => {
-                let items = InboxItem::list(&items);
-                self.echo_inbox(&asid.0, &items);
-                if current(self, &asid) {
-                    self.queue = items;
-                } else if let Some(slot) = self.parked_slot(&asid.0) {
-                    slot.queue = items;
-                }
+            AgentDomainEvent::InboxChanged { asid, items, seq } => {
+                self.apply_session_inbox(&asid.0, InboxItem::list(&items), seq);
             }
             AgentDomainEvent::WorktreeChanged { .. } => {
                 if self.right_open && self.inspector_tab == InspectorTab::Git {
@@ -3642,9 +3964,39 @@ impl UiState {
 
     fn on_action(&mut self, action: UiAction) {
         match action {
-            UiAction::DesktopUpdate(status) => self.desktop_update = status,
             UiAction::Open(asid) => self.open_session(&asid),
             UiAction::Toast { title, detail } => self.toast(title, detail),
+            UiAction::ComputerUnpaired {
+                computer,
+                request,
+                result,
+            } => self.finish_computer_unpair(computer, request, result),
+            UiAction::LocalPairingRevoked { id, result } => self.finish_local_revoke(id, result),
+            UiAction::LocalInvite(id, result) => self.receive_local_invite(id, result),
+            UiAction::DesktopUpdate(status) => self.desktop_update = status,
+            UiAction::LocalPairings(devices) => {
+                self.local_revoke.cancel_confirmation();
+                self.local_pairings = devices;
+            }
+            UiAction::LocalGatewayStatus(status) => {
+                let language = self.cfg.general.language;
+                self.notify(
+                    if status == crate::platform::gateway_bootstrap::Status::Failed {
+                        ToastLevel::Error
+                    } else {
+                        ToastLevel::Info
+                    },
+                    copy::tr(language, "Local Gateway setup"),
+                    Some(copy::tr(language, status.message())),
+                );
+            }
+            UiAction::LocalGatewayReady => {
+                // Never displace a remote computer, open session, terminal or
+                // pending/unfinished work when background setup completes.
+                if self.can_connect_new_local_gateway() {
+                    self.switch_computer("local".into());
+                }
+            }
             UiAction::ToggleDiffPanel => self.show_diff = !self.show_diff,
             UiAction::OpenDiffFile { asid, path } => {
                 if self.selected.as_deref() == Some(asid.as_str()) {
@@ -3658,11 +4010,9 @@ impl UiState {
                 }
             }
             UiAction::ProjectPicked(path) => {
-                self.start_cwd = TextEdit::new(path.display().to_string());
-                self.completions.clear();
-                self.start_model = None;
-                self.start_mode = None;
-                self.refresh_start_catalog();
+                if self.current_computer() == "local" {
+                    home::pick_folder_path(self, path.display().to_string());
+                }
             }
             UiAction::FoldersDropped(paths) => {
                 let mut text = self.draft.text.clone();
@@ -3689,6 +4039,9 @@ impl UiState {
                     composer::stage_path(self, path);
                 }
             }
+            UiAction::PluginFilePicked(path) => {
+                self.plugin_source = TextEdit::new(path.to_string_lossy().as_ref())
+            }
             UiAction::ThemeFilePicked(path) => self.send(Command::ThemeImportFile(path)),
             UiAction::ViewerLoaded { path, loaded } => self.viewer_loaded(&path, *loaded),
             UiAction::FileSaved(result) => self.file_saved(result),
@@ -3704,32 +4057,45 @@ impl UiState {
     fn on_composer(&mut self, update: ComposerUpdate) {
         match update {
             ComposerUpdate::Files { hits } => self.file_hits = hits,
+            ComposerUpdate::SessionCatalogChanged(asid) => {
+                if let Some(info) = self.session_by_id(&asid.0).cloned() {
+                    self.request_session_catalog(&info);
+                }
+            }
             ComposerUpdate::Catalog {
+                request,
                 asid,
                 agent,
                 directory,
                 view,
             } => {
                 if let Some(asid) = asid {
+                    let Some(view) = view else { return };
                     if self.selected.as_deref() == Some(asid.0.as_str()) {
-                        self.catalog = Some(view);
+                        if self.catalog_request == request {
+                            self.catalog = Some(view);
+                        }
                     } else if let Some(tile) = self
                         .tiles
                         .iter_mut()
                         .find(|t| t.asid.as_deref() == Some(asid.0.as_str()))
                     {
-                        tile.slot.catalog = Some(view);
+                        if tile.slot.catalog_request == request {
+                            tile.slot.catalog = Some(view);
+                        }
                     }
                     return;
                 }
                 let typed = self.start_cwd.text.trim();
                 let start = agent == self.start_agent
-                    && (directory.as_deref().unwrap_or("").trim_end_matches('/')
-                        == typed.trim_end_matches('/')
-                        || directory.is_none()
-                        || typed.is_empty());
-                if start {
-                    self.start_catalog = Some(view);
+                    && directory.as_deref().unwrap_or("").trim_end_matches('/')
+                        == typed.trim_end_matches('/');
+                if start && self.start_catalog_request == request {
+                    self.start_catalog_request = 0;
+                    self.start_catalog_failed = view.is_none();
+                    if let Some(view) = view {
+                        self.start_catalog = Some(view);
+                    }
                 }
             }
             ComposerUpdate::Staged { id, result } => composer::finish_staging(self, id, result),
@@ -3773,14 +4139,6 @@ impl UiState {
                     self.status = "Send failed".into();
                 }
             }
-            ComposerUpdate::Inbox { asid, items } => {
-                self.echo_inbox(&asid, &items);
-                if self.selected.as_deref() == Some(asid.as_str()) {
-                    self.queue = items;
-                } else if let Some(slot) = self.parked_slot(&asid) {
-                    slot.queue = items;
-                }
-            }
             ComposerUpdate::Branch { cwd, info } => {
                 self.branches.insert(cwd, info);
             }
@@ -3791,8 +4149,10 @@ impl UiState {
                         if !p.name.is_empty() {
                             entry.name = p.name.clone();
                         }
-                        if let Some(url) = &p.url {
-                            entry.url = Some(url.clone());
+                        if entry.token.is_none() {
+                            if let Some(url) = &p.url {
+                                entry.url = Some(url.clone());
+                            }
                         }
                     }
                 }
@@ -3891,14 +4251,22 @@ impl UiState {
             &self.folder_query,
             &self.task_goal,
             &self.theme_url,
+            &self.plugin_source,
+            &self.plugin_query,
             &self.theme_query,
             &self.cwd_input,
             &self.rename_edit,
             &self.project_edit,
             &self.quick_notes_edit,
+            &self.browser.address,
         ]
         .into_iter()
         .chain(self.form_inputs.values())
+        .chain(
+            self.plugin_fields
+                .values()
+                .flat_map(|fields| fields.values()),
+        )
         .chain(self.agent_inputs.values())
         .find(|e| e.focused)
         .map(|e| e.selected().to_string())
@@ -4076,7 +4444,10 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     if FIRST_FRAME.swap(false, std::sync::atomic::Ordering::Relaxed) {
         tracing::debug!("build_ui");
     }
-    let dark = s.is_dark(cx.system_dark());
+    let system_dark = cx.system_dark();
+    s.system_dark.set(Some(system_dark));
+    s.system_reduced_motion.set(cx.is_reduced_motion());
+    let dark = s.is_dark(system_dark);
     let scheme = if dark {
         ColorScheme::Dark
     } else {
@@ -4091,8 +4462,15 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     }
     let mut layer: Vec<El> = Vec::new();
     let body = shell::view(s, cx, &k, &mut layer);
-    if let Some(zoom) = timeline::overlay(s, &k) {
-        layer.push(zoom);
+    viewer::image_overlay(s, &k, cx.env().scale, &mut layer);
+    if let Some(selection) = s.row_menu.as_ref().and_then(|m| m.selection.as_ref()) {
+        cx.mark_texts(
+            selection
+                .texts()
+                .iter()
+                .filter(|t| t.is_selected())
+                .map(rune::SelectedText::mark),
+        );
     }
     parts::pane::row_menu(s, &k, &mut layer);
     welcome::mount(s, &k, &mut layer);
@@ -4105,71 +4483,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     shortcuts::mount(s, &k, &mut layer);
     pair_computer::mount(s, &k, &mut layer);
     if s.error.is_some() || !s.toasts.is_empty() {
-        let mut region = ToastRegion::new();
-        if let Some(err) = &s.error {
-            let dot = rune::el()
-                .size(8.0, 8.0)
-                .radius(4.0)
-                .fill(k.c.danger.icon)
-                .a11y_hidden();
-            let mut toast = rune_kit::Toast::new("alert-bar", err.message.clone())
-                .lead(dot)
-                .on_close(|s: &mut UiState| {
-                    s.error = None;
-                    s.error_at = None;
-                });
-            if let Some(d) = &err.detail {
-                toast = toast.description(d.clone());
-            }
-            if err.unreachable {
-                let retry_label = copy::tr(s.cfg.general.language, "Retry");
-                toast = toast.action(&k, &retry_label, true, |s: &mut UiState, _| {
-                    s.send(Command::Refresh);
-                });
-            }
-            region = region.toast(toast.build(&k));
-        }
-        for t in s.toasts.iter().filter(|t| {
-            let ttl = if t.level == ToastLevel::Error {
-                5000
-            } else {
-                3500
-            };
-            t.created_at.elapsed() < std::time::Duration::from_millis(ttl)
-        }) {
-            let id = t.id;
-            let dot_color = match t.level {
-                ToastLevel::Info => k.c.info.icon,
-                ToastLevel::Success => k.c.success.icon,
-                ToastLevel::Warning => k.c.warning.icon,
-                ToastLevel::Error => k.c.danger.icon,
-            };
-            let dot = rune::el()
-                .size(8.0, 8.0)
-                .radius(4.0)
-                .fill(dot_color)
-                .a11y_hidden();
-            let mut toast = rune_kit::Toast::new(format!("toast-{id}"), t.title.clone())
-                .lead(dot)
-                .on_close(move |s: &mut UiState| s.toasts.retain(|t| t.id != id));
-            if let Some(target) = &t.target {
-                let target = target.clone();
-                toast = toast.action(
-                    &k,
-                    &copy::tr(s.cfg.general.language, "Open"),
-                    true,
-                    move |s: &mut UiState, _| {
-                        s.open_notification(&target);
-                        s.toasts.retain(|t| t.id != id);
-                    },
-                );
-            }
-            if let Some(d) = &t.detail {
-                toast = toast.description(d.clone());
-            }
-            region = region.toast(toast.build(&k));
-        }
-        layer.push(region.build(&k));
+        layer.push(notifications::region(s, &k));
     }
     rune_kit::root(body, layer)
 }
@@ -4388,11 +4702,21 @@ mod tests {
             catalog: Default::default(),
         });
         s.catalog = Some(current.clone());
+        s.tiles[1].slot.catalog_request = 2;
         s.on_composer(ComposerUpdate::Catalog {
+            request: 2,
             asid: Some(AgentSessionId("parked".into())),
             agent: "codex".into(),
             directory: None,
-            view: arriving.clone(),
+            view: Some(arriving.clone()),
+        });
+        // A slower read started before the model switch completes afterwards.
+        s.on_composer(ComposerUpdate::Catalog {
+            request: 1,
+            asid: Some(AgentSessionId("parked".into())),
+            agent: "codex".into(),
+            directory: None,
+            view: Some(current.clone()),
         });
         assert!(Arc::ptr_eq(s.catalog.as_ref().unwrap(), &current));
         assert!(Arc::ptr_eq(
@@ -4503,7 +4827,7 @@ mod tests {
             computer: "local".into(),
             generation: 0,
             updates: vec![
-                Update::SessionCreated(Box::new(session_fixture("created-local"))),
+                Update::SessionCreated(Box::new(session_fixture("created-local")), Some(42)),
                 Update::Composer(Box::new(ComposerUpdate::Submitted {
                     token: 42,
                     ok: true,
@@ -4726,6 +5050,89 @@ mod tests {
     }
 
     #[test]
+    fn late_session_reads_cannot_claim_a_new_home_submission_or_steal_navigation() {
+        use muqun_gateway::agents::ports::AgentSessionSnapshot;
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.demo = false;
+        s.cfg.current_computer = "local".into();
+        s.open_session("previous");
+        s.go(Mode::Home);
+        home::pick_folder_path(&mut s, "/work/picked".into());
+        home::pick_agent(&mut s, "copilot".into());
+        s.switch_computer("mini".into());
+        assert_eq!(s.start_cwd.text, "~");
+        home::pick_folder_path(&mut s, "/remote/project".into());
+        s.switch_computer("local".into());
+        assert_eq!(s.start_cwd.text, "/work/picked");
+        s.start_draft = TextEdit::new("work here");
+        s.splash = None;
+        let mut rt = rune::Runtime::new(s, view, (1440.0, 900.0), rune::Env::new(true, 1.0));
+        for frame in 0..4 {
+            rt.frame(frame as f64 / 60.0);
+        }
+        let (x, y) = rt.find("start").expect("Home start button");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for frame in 4..12 {
+            rt.frame(frame as f64 / 60.0);
+        }
+        let (_, token) = rt.state.pending_start.as_ref().expect("submit started");
+        assert!(
+            rt.find(&format!("echo-{token}")).is_some(),
+            "the first prompt is painted before the backend replies"
+        );
+        let s = &mut rt.state;
+        let (pending, token) = s.pending_start.clone().unwrap();
+        assert_eq!(
+            s.current().unwrap().directory.as_deref(),
+            Some("/work/picked")
+        );
+        assert!(s.timelines.contains_key(&pending));
+        let snapshot = |id| {
+            Update::Snapshot(Box::new(AgentSessionSnapshot {
+                info: session_fixture(id),
+                timeline: vec![],
+                permissions: vec![],
+                forms: vec![],
+                inbox: vec![],
+                seq: 1,
+            }))
+        };
+        s.apply_updates(vec![
+            snapshot("previous"),
+            Update::AgentSessions {
+                agent: "copilot".into(),
+                sessions: vec![],
+            },
+            Update::SessionCreated(Box::new(session_fixture("other")), Some(token + 1)),
+        ]);
+        assert_eq!(s.current().unwrap().asid.0, pending);
+        assert_eq!(s.echoes_of(&pending).len(), 1);
+        let mut sent_to = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            if let Command::Compose(crate::model::compose::ComposeCommand::Submit {
+                target: crate::model::compose::Target::New { cwd, .. },
+                ..
+            }) = cmd
+            {
+                sent_to.push(cwd);
+            }
+        }
+        assert_eq!(sent_to, [PathBuf::from("/work/picked")]);
+        s.go(Mode::Home);
+        s.apply_updates(vec![
+            Update::SessionCreated(Box::new(session_fixture("created")), Some(token)),
+            snapshot("created"),
+            snapshot("previous"),
+        ]);
+        assert_eq!(s.mode, Mode::Home);
+        assert_eq!(s.selected.as_deref(), Some("created"));
+        assert_eq!(s.echoes_of("created").len(), 1);
+        assert!(s.echoes_of("previous").is_empty());
+    }
+
+    #[test]
     fn submit_start_does_not_open_optimistic_placeholder_on_backend_and_cleans_up_on_failure() {
         use crate::model::commands::Command;
         use crate::model::compose::{ComposeCommand, ComposerUpdate, Target};
@@ -4784,6 +5191,40 @@ mod tests {
         assert!(s.pending_start.is_none());
         assert_eq!(s.mode, Mode::Home);
         assert_eq!(s.start_draft.text, "Hello Cursor");
+    }
+
+    #[test]
+    fn newly_installed_gateway_connects_only_from_an_idle_local_view() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut s = UiState::new(tx);
+        s.cfg.current_computer = "local".into();
+        s.cfg.general.gateway_local_only = false;
+        s.selected = None;
+        s.tiles.clear();
+        s.busy_since.clear();
+        s.pending_start = None;
+        s.pending_submit = None;
+        s.term.open = false;
+        s.start_draft = TextEdit::new("");
+        s.on_action(UiAction::LocalGatewayReady);
+        let mut connected = false;
+        while let Ok(command) = rx.try_recv() {
+            connected |=
+                matches!(command, Command::SwitchComputer(ref target) if target == "local");
+        }
+        assert!(connected);
+        s.cfg.current_computer = "work-mac".into();
+        s.on_action(UiAction::LocalGatewayReady);
+        assert!(rx.try_recv().is_err());
+        s.cfg.current_computer = "local".into();
+        s.start_draft = TextEdit::new("unfinished local work");
+        s.on_action(UiAction::LocalGatewayReady);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(s.start_draft.text, "unfinished local work");
+        s.start_draft = TextEdit::new("");
+        s.selected = Some("active-session".into());
+        s.on_action(UiAction::LocalGatewayReady);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

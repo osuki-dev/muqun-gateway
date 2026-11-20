@@ -1,11 +1,11 @@
 //! GPU effect layers through Rune's compositor hook: every `El::effect(mark)`
 //! slot in the tree becomes one rune-fx layer drawn at its rect.
 //!
-//! Two kinds, chosen by the slot's mark; the slot's `effect_data` carries the
+//! The slot's mark selects the effect; the slot's `effect_data` carries the
 //! colour (linear RGB) and one parameter, so the compositor needs no app
 //! state. Views emit slots only through [`UiState::fx_on`]: nothing under
 //! reduce motion or reduce transparency. [`Fx::animating`] is true only while
-//! a drawn layer moves on its own (the splash's liquid metal), so an idle window stays idle.
+//! a drawn layer moves on its own, so an idle window stays idle.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -25,6 +25,8 @@ pub const GLOW: u32 = 1;
 /// Liquid metal filling the slot, tinted toward `data[0..3]`; `data[3]` is
 /// the flow (0 holds a polished, still surface that costs no frames).
 pub const METAL: u32 = 3;
+/// A highlight circulating around a busy composer's rounded outline.
+pub const COMPOSER_RIM: u32 = 4;
 
 impl UiState {
     /// Whether views may emit effect slots this frame.
@@ -119,6 +121,22 @@ fn layer(kind: u32, d: [f32; 4], shape: Shape, t: f32, reduced: bool) -> Option<
             occlusion: 0.1,
             ..Default::default()
         }),
+        COMPOSER_RIM => rune_fx::Fx::glow(GlowParams {
+            // One bright lobe and two unlit stops give the accent a single
+            // lap around the actual perimeter, including the corner arcs.
+            style: GlowStyle::Aura,
+            color: to_rgb(d),
+            core: Rgb([0.0; 3]),
+            third: Rgb([0.0; 3]),
+            radius: 3.0,
+            rim_width: 1.15,
+            intensity: d[3],
+            inner: 0.22,
+            occlusion: 0.0,
+            aura_speed: 0.22,
+            hot: 0.0,
+            ..Default::default()
+        }),
         METAL => {
             let tint = to_rgb(d);
             // Chrome lit through the theme's accent: a cool studio, a warm tint.
@@ -204,11 +222,15 @@ impl Compositor<UiState> for Fx {
         let mut at: Vec<u32> = Vec::new();
         let mut layers: Vec<FxLayer> = Vec::new();
         let mut slots: Vec<FxSlot> = Vec::new();
+        let rim_active = f.rt.state.demo || crate::platform::notify::window_focused();
         for (n, i) in f.rt.instances.iter().enumerate() {
             if i.params[1] != KIND_EFFECT {
                 continue;
             }
             let kind = f.rt.marks.get(n).copied().unwrap_or(0);
+            if kind == COMPOSER_RIM && (reduced || !rim_active) {
+                continue;
+            }
             let k = i.params[3].max(1e-3);
             let [x, y, w, h] = i.rect.map(|v| v / k);
             let r = i.radii.iter().fold(0.0f32, |a, v| a.max(v.abs())) / k;

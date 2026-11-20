@@ -1,68 +1,20 @@
 # Muqun Desktop preview
 
-This is an early Desktop preview, published separately from Muqun Gateway. It does not replace the stable Gateway release.
+## Changes and fixes
 
-## Changes
+- Desktop Settings → Computers lists paired computers and connected devices. Pair another Gateway by address or display this computer’s QR and pending verification code. Desktop keeps a selected remote computer when it is offline.
+- Home starts a session in the chosen project and immediately shows its first message. Late session updates retain the active conversation. The composer keeps attachments with their draft, separates queued input from delivered messages, and keeps Send in the input while Stop sits beside the delivery mode.
+- Conversation and file images open in Desktop’s viewer with wheel zoom and drag to pan. Plugin images can use the same viewer. Sub-agent details open in a shared window and stay out of recent top-level sessions.
+- Terminal, browser and plugin panes share window controls. Linux browser tabs show the page title and favicon, support closing a tab, and use the packaged WebKitGTK helper for page rendering and common selection actions.
+- Plugin settings show searchable cards with descriptions, keywords and source links from the package metadata. Bun resolves plugin sources and updates display progress. The host and SDK provide native content, notifications, image previews and selection actions to installed plugins. The distribution includes the existing Review Center plugin. Fizzy remains independently installed and updated.
+- Desktop checks its own stable or preview channel from Settings → About. The installer displays the verified SHA-256, installs the platform package and provisions a missing local Gateway. Packaged Desktop can recover missing Gateway setup from Diagnostics or run local-only.
 
-- The Desktop installer downloads a versioned package from muqun.dev and displays its verified SHA-256 before extracting it. Use `--channel preview` to select a preview.
+## Compatibility and installation
 
-- Plugin split panes place their display-mode menu in the pane title bar beside the close control, removing the extra toolbar row above plugin content.
-- Full-page plugins retain a themed reading surface over the wallpaper without limiting their content width. Native plugins can reuse the conversation Markdown palette for headings, emphasis and tables.
+Linux x86_64 and Apple Silicon macOS are supported. The Linux embedded browser needs WebKitGTK 4.1. The macOS archive contains a Developer ID signed, notarized and stapled application. Existing users can install the verified preview with:
 
-- Paired computers keep their approval and question notifications active even while another workspace is selected. Desktop notifications and Inbox entries name the computer and open the correct session; answered requests are withdrawn, and identical session IDs on different computers remain isolated. The new `agent_attention_v1` Gateway capability restores retained pending requests after reconnect without transferring transcripts or waking an agent. Older Gateways retain live notifications and show an upgrade notice for reconnect recovery.
+```sh
+curl -fsSL https://muqun.dev/desktop.sh | sh -s -- --channel preview
+```
 
-- Terminal settings now offer docked, split, or floating placement for new opens. Normally exited shells remove their empty terminal tiles, including background tabs, without stealing focus from another conversation; failed startups retain their error view.
-
-- Delegated task details use readable line spacing and a bounded scroll area, so a single long instruction cannot expand across the whole conversation. Full instructions remain selectable and copyable.
-
-- Compact composer footers keep delivery controls on one line in narrow split panes; controls and bottom spacing remain consistent when focus changes. Icon-only controls use matching circular hit areas instead of narrow ovals.
-
-- Upgrade bundled SQLCipher to 4.20.0 / SQLite 3.54.1 through rusqlite 0.42, addressing RUSTSEC-2026-0502 (crafted database/WAL memory disclosure). Existing encryption remains enabled.
-- CI validation and Desktop builds use Rust 1.99.1 consistently; Rust 1.100 support remains pending an async-stream compatibility fix.
-
-- Split-pane composer controls keep their positions on hover. Returning from the timeline to the composer restores paste focus without an extra click. The default launch icon uses the full-resolution asset with rounded corners.
-
-- Inline image markers and attachment chips now delete together. Removed images stay removed when an upload finishes late, and image uploads finish in their original split pane.
-
-- Hover activates split panes without requiring a click. Clicking text in an already active pane no longer refocuses the composer and clears the selected word.
-
-- Command, shortcuts, pairing and welcome dialogs share a single entrance/exit motion and reduced-motion fallback. Pane action menus reserve room for keyboard shortcuts and translate directional swap actions.
-
-
-- Native desktop panels, theme-aware message rendering, and a compact composer with separate controls below the input.
-- All-computers navigation routes existing sessions to their owning computer. The aggregate start page asks which computer to use instead of reporting that no agents are installed.
-- Model catalogs stay with the session that requested them when switching split panes. Unavailable catalogs can be requested again from the model control.
-- Enter sends and Shift+Enter inserts a newline by default. Custom shortcuts remain supported.
-- Git and context controls are available below the session composer.
-- Sidebar search shares a row with the recent-session filter. Focusing search expands it across the row; an active query remains visible until cleared.
-- Running command rows keep their position while output arrives and commands finish. Activity folds together after the reply ends, reducing jumps between tool summaries.
-- Split-pane composers share the same controls and footer sizing when focus moves between sessions.
-- In-session search highlights matching message text, code and command output; matched folded groups open when navigating results.
-- On Omarchy Linux, Appearance offers an optional system-palette theme. It reads Omarchy's colours without changing system files and refreshes when the palette changes.
-
-- Message-level fork actions now require an explicit agent capability; whole-session fork support no longer exposes an unsupported “Fork from here” button or menu item.
-
-- Context details open in a compact, scrollable popover above their own session button. Composer menus use session-specific anchors so split panes no longer open menus over another conversation.
-
-## Platforms and compatibility
-
-- Linux x86_64 with a graphical desktop; the CI installation smoke check uses X11 and software rendering.
-- macOS Apple Silicon; public preview archives must be Developer ID signed, notarized, and stapled.
-- Windows and Intel macOS packages are not included in this preview.
-- Desktop and Gateway are separate executables. Headless servers need only Gateway. Remote Desktop connections require a paired Gateway with the agent-session APIs; optional features depend on the connected Gateway and agent capabilities.
-- The App does not need an update to install Desktop. Herdr is optional for coding-agent sessions; terminal features using Herdr require Gateway's supported protocol 17 backend.
-
-## Installation
-
-Close the Desktop application before replacing it, then reopen it. Do not delete existing configuration or conversation data. No database migration is required by this Desktop preview. Updating the UI does not require restarting the shared agent backend.
-
-## Preview limitations
-
-This is not a stable release. Windows packaging and a complete cross-platform visual and interaction acceptance pass remain outside the current verified scope. Do not treat successful CI compilation as proof that every desktop workflow has been manually validated.
-
-- File drops now activate the destination split composer, including inactive panes. Documents and images stay with that draft if focus changes while uploading, and the UI no longer announces success before the upload completes. Restart Desktop; no Gateway or App update is required.
-
-- Fix native Wayland file-manager drops into Composer by receiving file URI offers and preserving target coordinates. Clipboard selection is unchanged; cancelled and unsupported transfers do not attach files. Restart Desktop after installing the update.
-
-- The launcher and splash use the transparent Muqun mark. Busy indicators use two theme-colored ribbons and respect reduced motion.
-- Escape dismisses the current pane's inspector. On Wayland, copy-capable file-manager drops also attach when the compositor announces the drag action before the pointer enters the window.
+Close Desktop before replacing it and reopen it afterward. Existing settings, pairing and conversations are retained. Installing the Desktop preview does not require a mobile App update. Terminal sessions can use tmux or Herdr protocol 17. Remote features depend on the paired Gateway and agent capabilities. A separately updated Gateway requires its own restart; active agent work should finish first.

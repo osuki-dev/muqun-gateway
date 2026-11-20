@@ -1,19 +1,8 @@
-//! The owner's message, shown the moment it is sent.
-//!
-//! A prompt sent from the session composer (Enter; while the agent works it
-//! steers) appears at once at the foot of the timeline as the owner's bubble,
-//! its pictures above it, saying "Sending…" until the gateway takes it. The
-//! gateway's own user row replaces it when it arrives: the first new user row
-//! that says the same words claims the echo, so the message is never drawn
-//! twice. A steer the gateway holds until the agent's next step shows up in
-//! the session's inbox; the echo claims that item too (the composer's queue
-//! strip leaves it out) and says it is waiting for the agent. A send that
-//! fails stays as a failed bubble with Retry and Discard.
-//!
-//! Queued sends (Alt+Enter) draw no echo: their inbox item is the queued row,
-//! in the queue strip as before. Commands and skills draw none either.
+//! Idle prompts receive a local timeline echo until their canonical user row arrives.
+//! A busy submission stays in flight until the gateway confirms it. An authoritative
+//! inbox item owns its editable preview, and the provider owns the delivered row.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -25,7 +14,7 @@ use rune_kit::{Button, ButtonVariant, ControlSize};
 use super::parts::Tcx;
 use super::UiState;
 use crate::model::commands::Command;
-use crate::model::compose::{ComposeCommand, Deliver, InboxItem, Target};
+use crate::model::compose::{ComposeCommand, Deliver, Target};
 
 /// A delivered echo whose row never came (an agent that rewrites the words,
 /// a missed event) leaves once the session has been idle this long.
@@ -41,6 +30,22 @@ pub enum EchoState {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusyDelivery {
+    Steer,
+    Queue,
+}
+
+impl BusyDelivery {
+    pub fn wire(self) -> String {
+        match self {
+            Self::Steer => "steer",
+            Self::Queue => "queue",
+        }
+        .to_owned()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Echo {
     /// The submit's token: which `Submitted` answers it, and the row's key.
@@ -50,13 +55,12 @@ pub struct Echo {
     pub files: Vec<String>,
     /// Which of them are pictures.
     pub images: Vec<String>,
-    /// Sent while the agent was working: it steers the running turn.
-    pub steer: bool,
+    /// Requested delivery while the agent was working.
+    pub delivery: Option<BusyDelivery>,
     pub state: EchoState,
     /// User rows that already said these words: none of them is this one.
     known: HashSet<String>,
-    /// The inbox item the gateway holds it as, until the agent takes it.
-    pub inbox: Option<String>,
+    inbox_id: Option<String>,
     /// When it last changed state.
     pub at: Instant,
 }
@@ -80,24 +84,24 @@ impl Echo {
         text: String,
         files: Vec<String>,
         images: Vec<String>,
-        steer: bool,
+        delivery: Option<BusyDelivery>,
         rows: &[TimelineItem],
     ) -> Self {
         let said = words(&text).to_string();
         let known = rows
             .iter()
             .filter(|r| user_words(r) == Some(said.as_str()))
-            .map(|r| r.id.clone())
+            .flat_map(|r| [r.id.clone(), r.message_id.clone()])
             .collect();
         Self {
             token,
             text,
             files,
             images,
-            steer,
+            delivery,
             state: EchoState::Sending,
             known,
-            inbox: None,
+            inbox_id: None,
             at: Instant::now(),
         }
     }
@@ -107,9 +111,27 @@ impl Echo {
     }
 }
 
+fn same_attachment(asid: &str, staged: &str, received: &str) -> bool {
+    if staged == received {
+        return true;
+    }
+    let Some(id) = received
+        .strip_prefix("/api/agent-images/")
+        .and_then(|rest| rest.strip_suffix("/original"))
+    else {
+        return false;
+    };
+    id == muqun_gateway::agents::message_images::original_asset_id(asid, staged)
+}
+
 /// Drop each echo a new user row in `rows` stands for, one row per echo.
 /// Returns whether any went.
-pub fn reconcile(echoes: &mut Vec<Echo>, rows: &mut [TimelineItem]) -> bool {
+fn reconcile(
+    asid: &str,
+    echoes: &mut Vec<Echo>,
+    rows: &mut [TimelineItem],
+    sent_images: &mut HashMap<String, Vec<String>>,
+) -> bool {
     let before = echoes.len();
     let len = rows.len();
     let start = len.saturating_sub(200);
@@ -119,60 +141,39 @@ pub fn reconcile(echoes: &mut Vec<Echo>, rows: &mut [TimelineItem]) -> bool {
             continue;
         };
         let Some(at) = echoes.iter().position(|e| {
-            e.state != EchoState::Failed && e.says(&said) && !e.known.contains(&row.id)
+            e.state != EchoState::Failed
+                && e.inbox_id.as_ref().map_or_else(
+                    || {
+                        e.says(&said)
+                            && row.attachments.as_ref().is_none_or(|files| {
+                                files.is_empty()
+                                    || e.files.is_empty()
+                                    || (files.len() == e.files.len()
+                                        && e.files.iter().zip(files).all(|(staged, received)| {
+                                            same_attachment(asid, staged, received)
+                                        }))
+                            })
+                    },
+                    |id| id == &row.message_id,
+                )
+                && !e.known.contains(&row.id)
+                && !e.known.contains(&row.message_id)
         }) else {
             continue;
         };
         let echo = echoes.remove(at);
         if row.attachments.as_ref().is_none_or(|a| a.is_empty()) && !echo.images.is_empty() {
             row.attachments = Some(echo.images.clone());
+            sent_images.insert(row.id.clone(), echo.images);
         }
         // The row is spoken for: a second echo of the same words waits for
         // a row of its own.
         for e in echoes.iter_mut().filter(|e| e.says(&said)) {
             e.known.insert(row.id.clone());
+            e.known.insert(row.message_id.clone());
         }
     }
     echoes.len() != before
-}
-
-/// The session's inbox changed: a steer item with an echo's words is that
-/// echo (until the agent takes it); an item gone from the inbox lets go.
-/// Returns whether anything changed.
-pub fn claim_inbox(echoes: &mut [Echo], items: &[InboxItem]) -> bool {
-    let mut changed = false;
-    for e in echoes.iter_mut() {
-        if let Some(id) = &e.inbox {
-            if !items.iter().any(|i| &i.id == id) {
-                e.inbox = None;
-                e.at = Instant::now();
-                changed = true;
-            }
-        }
-    }
-    for item in items.iter().filter(|i| i.steer) {
-        if echoes.iter().any(|e| e.inbox.as_ref() == Some(&item.id)) {
-            continue;
-        }
-        let claim = echoes
-            .iter()
-            .position(|e| {
-                e.inbox.is_none()
-                    && e.state != EchoState::Failed
-                    && e.files.len() == item.files.len()
-                    && e.says(words(&item.text))
-            })
-            .or_else(|| {
-                echoes.iter().position(|e| {
-                    e.inbox.is_none() && e.state != EchoState::Failed && e.says(words(&item.text))
-                })
-            });
-        if let Some(i) = claim {
-            echoes[i].inbox = Some(item.id.clone());
-            changed = true;
-        }
-    }
-    changed
 }
 
 impl UiState {
@@ -183,7 +184,7 @@ impl UiState {
         token: u64,
         text: String,
         staged: &[crate::model::compose::StagedFile],
-        steer: bool,
+        delivery: Option<BusyDelivery>,
     ) {
         let rows = self
             .timelines
@@ -196,7 +197,11 @@ impl UiState {
             .filter(|f| f.image)
             .map(|f| f.path.clone())
             .collect();
-        let echo = Echo::new(token, text, files, images, steer, rows);
+        let mut echo = Echo::new(token, text, files, images, delivery, rows);
+        if self.selected.as_deref() == Some(asid) {
+            echo.known
+                .extend(self.queue.iter().map(|item| item.id.clone()));
+        }
         self.echoes.entry(asid.to_string()).or_default().push(echo);
         self.echo_tokens.insert(token);
         self.echo_rev += 1;
@@ -207,21 +212,97 @@ impl UiState {
         if !self.echo_tokens.remove(&token) {
             return false;
         }
-        if let Some(echo) = self
-            .echoes
-            .values_mut()
-            .flat_map(|v| v.iter_mut())
-            .find(|e| e.token == token)
-        {
-            echo.state = if ok {
-                EchoState::Sent
-            } else {
-                EchoState::Failed
-            };
-            echo.at = Instant::now();
-            self.echo_rev += 1;
+        for echoes in self.echoes.values_mut() {
+            if let Some(index) = echoes.iter().position(|e| e.token == token) {
+                let echo = &mut echoes[index];
+                echo.state = if ok {
+                    EchoState::Sent
+                } else {
+                    EchoState::Failed
+                };
+                echo.at = Instant::now();
+                self.echo_rev += 1;
+                break;
+            }
         }
         true
+    }
+
+    /// Hand the preview to the editable queue item as soon as it appears.
+    /// Keep its native receipt ID to match the eventual timeline row.
+    pub(super) fn echo_inbox(&mut self, asid: &str, items: &[crate::model::compose::InboxItem]) {
+        let Some(echoes) = self.echoes.get_mut(asid) else {
+            return;
+        };
+        for item in items {
+            if echoes.iter().any(|e| e.inbox_id.as_ref() == Some(&item.id)) {
+                continue;
+            }
+            let mode = if item.steer {
+                BusyDelivery::Steer
+            } else {
+                BusyDelivery::Queue
+            };
+            if let Some(index) = echoes.iter().position(|e| {
+                e.delivery == Some(mode)
+                    && e.inbox_id.is_none()
+                    && e.state != EchoState::Failed
+                    && e.says(words(&item.text))
+                    && !e.known.contains(&item.id)
+                    && (item.files.is_empty()
+                        || e.files
+                            .iter()
+                            .map(String::as_str)
+                            .eq(item.files.iter().map(|f| f.path.as_str())))
+            }) {
+                echoes[index].inbox_id = Some(item.id.clone());
+                for (other, echo) in echoes.iter_mut().enumerate() {
+                    if other != index {
+                        echo.known.insert(item.id.clone());
+                    }
+                }
+                self.echo_rev += 1;
+            }
+        }
+    }
+
+    pub(super) fn queue_echo_images(&self, asid: &str, inbox_id: &str) -> &[String] {
+        self.echoes_of(asid)
+            .iter()
+            .find(|echo| echo.inbox_id.as_deref() == Some(inbox_id))
+            .map(|echo| echo.images.as_slice())
+            .or_else(|| {
+                let tl = self.timelines.get(asid)?;
+                if tl.sent_images.is_empty() {
+                    return None;
+                }
+                let row = tl
+                    .items
+                    .iter()
+                    .rev()
+                    .find(|r| r.message_id == inbox_id && r.role == TimelineRole::User)?;
+                tl.sent_images.get(&row.id).map(Vec::as_slice)
+            })
+            .unwrap_or_default()
+    }
+
+    pub(super) fn pending_queue_echoes(&self, asid: &str) -> impl Iterator<Item = &Echo> {
+        let timeline = self.timelines.get(asid);
+        self.echoes_of(asid).iter().filter(move |echo| {
+            echo.delivery.is_some()
+                && echo.state != EchoState::Failed
+                && !(echo.delivery == Some(BusyDelivery::Steer) && echo.state == EchoState::Sent)
+                && !echo
+                    .inbox_id
+                    .as_ref()
+                    .is_some_and(|id| timeline.is_some_and(|tl| tl.holds_inbox(id)))
+        })
+    }
+
+    pub(super) fn forget_queue_echo(&mut self, asid: &str, id: &str) {
+        if let Some(echoes) = self.echoes.get_mut(asid) {
+            echoes.retain(|echo| echo.inbox_id.as_deref() != Some(id));
+        }
     }
 
     /// `asid`'s timeline changed: drop the echoes its new rows stand for.
@@ -230,48 +311,20 @@ impl UiState {
         else {
             return;
         };
-        if reconcile(echoes, &mut tl.items) {
+        if reconcile(asid, echoes, &mut tl.items, &mut tl.sent_images) {
+            tl.regroup();
             self.echo_rev += 1;
         }
     }
 
-    /// `asid`'s inbox is now `items`.
-    pub fn echo_inbox(&mut self, asid: &str, items: &[InboxItem]) {
-        if let Some(echoes) = self.echoes.get_mut(asid) {
-            if claim_inbox(echoes, items) {
-                self.echo_rev += 1;
-            }
-        }
-    }
-
-    /// Whether inbox item `id` of the open session is drawn as an echo.
-    pub fn echoed(&self, id: &str) -> bool {
-        self.selected
-            .as_deref()
-            .and_then(|asid| self.echoes.get(asid))
-            .is_some_and(|v| v.iter().any(|e| e.inbox.as_deref() == Some(id)))
-    }
-
-    /// Whether `item` is already represented by a live echo in the timeline
-    /// (by claimed inbox id or by matching active steer words).
-    pub fn item_echoed(&self, item: &InboxItem) -> bool {
-        if self.echoed(&item.id) {
-            return true;
-        }
-        item.steer
-            && self
-                .selected
-                .as_deref()
-                .and_then(|asid| self.echoes.get(asid))
-                .is_some_and(|v| {
-                    v.iter().any(|e| {
-                        e.steer && e.state != EchoState::Failed && e.says(words(&item.text))
-                    })
-                })
-    }
-
     pub fn echoes_of(&self, asid: &str) -> &[Echo] {
         self.echoes.get(asid).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn timeline_echoes(&self, asid: &str) -> impl Iterator<Item = &Echo> {
+        self.echoes_of(asid)
+            .iter()
+            .filter(|echo| echo.delivery.is_none() || echo.state == EchoState::Failed)
     }
 
     /// Send a failed echo again, as it was.
@@ -285,10 +338,12 @@ impl UiState {
         else {
             return;
         };
+        echo.inbox_id = None;
         echo.token = next;
         echo.state = EchoState::Sending;
         self.echo_tokens.insert(next);
-        echo.steer = busy;
+        echo.delivery = busy.then(|| echo.delivery.unwrap_or(BusyDelivery::Steer));
+        let delivery = echo.delivery.map(BusyDelivery::wire);
         echo.at = Instant::now();
         let (text, files) = (echo.text.clone(), echo.files.clone());
         self.echo_rev += 1;
@@ -297,7 +352,7 @@ impl UiState {
             target: Target::Session(AgentSessionId(asid.to_string())),
             deliver: Deliver::Prompt(text),
             attachments: files,
-            delivery: busy.then(|| "steer".to_string()),
+            delivery,
         }));
     }
 
@@ -306,76 +361,6 @@ impl UiState {
             v.retain(|e| e.token != token);
             self.echo_rev += 1;
         }
-    }
-
-    /// Pull a steered echo back into the composer draft for editing before the agent reads it.
-    pub fn edit_steered_echo(&mut self, asid: &str, token: u64, inbox_id: &str, text: String) {
-        let resolved_id = if !inbox_id.is_empty() {
-            Some(inbox_id.to_string())
-        } else {
-            self.queue
-                .iter()
-                .find(|q| q.steer && words(&q.text) == words(&text))
-                .map(|q| q.id.clone())
-        };
-        if let Some(item_id) = resolved_id {
-            self.send(Command::Compose(ComposeCommand::InboxCancel {
-                asid: AgentSessionId(asid.to_string()),
-                item: item_id.clone(),
-            }));
-            self.queue.retain(|q| q.id != item_id);
-        }
-        if let Some(echo) = self
-            .echoes
-            .get(asid)
-            .and_then(|v| v.iter().find(|e| e.token == token))
-        {
-            for path in &echo.files {
-                if !self.staged.iter().any(|f| &f.path == path) {
-                    self.staged.push(crate::model::compose::StagedFile {
-                        draft_token: None,
-                        name: PathBuf::from(path)
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "attachment".into()),
-                        path: path.clone(),
-                        image: echo.images.contains(path),
-                        size: 0,
-                    });
-                }
-            }
-        }
-        self.discard_echo(asid, token);
-        let len = text.len();
-        self.draft = super::composer::fresh(text);
-        self.draft.set_caret(len);
-        self.persist_draft(super::Slot::Session);
-    }
-
-    /// Cancel a steered echo before the agent reads it.
-    pub fn cancel_steered_echo(&mut self, asid: &str, token: u64, inbox_id: &str) {
-        let echo_text = self
-            .echoes
-            .get(asid)
-            .and_then(|v| v.iter().find(|e| e.token == token))
-            .map(|e| e.text.clone())
-            .unwrap_or_default();
-        let resolved_id = if !inbox_id.is_empty() {
-            Some(inbox_id.to_string())
-        } else {
-            self.queue
-                .iter()
-                .find(|q| q.steer && words(&q.text) == words(&echo_text))
-                .map(|q| q.id.clone())
-        };
-        if let Some(item_id) = resolved_id {
-            self.send(Command::Compose(ComposeCommand::InboxCancel {
-                asid: AgentSessionId(asid.to_string()),
-                item: item_id.clone(),
-            }));
-            self.queue.retain(|q| q.id != item_id);
-        }
-        self.discard_echo(asid, token);
     }
 
     /// Before each frame: let go of delivered echoes whose row never came.
@@ -391,10 +376,9 @@ impl UiState {
             let before = v.len();
             v.retain(|e| {
                 let stale = e.state == EchoState::Sent
-                    && e.inbox.is_none()
                     && !busy.contains(asid)
                     && e.at.elapsed() >= IDLE_TTL;
-                if !stale && e.state == EchoState::Sent && e.inbox.is_none() {
+                if !stale && e.state == EchoState::Sent && !busy.contains(asid) {
                     tx.wake_after(IDLE_TTL.saturating_sub(e.at.elapsed()));
                 }
                 !stale
@@ -421,7 +405,14 @@ pub fn view(cx: &Tcx, echo: &Echo) -> El {
         .pt(10.0)
         .pb(4.0)
         .items_end();
-    let paths: Vec<PathBuf> = echo.images.iter().map(PathBuf::from).collect();
+    let paths: Vec<PathBuf> = echo
+        .images
+        .iter()
+        .map(|path| {
+            crate::model::media::cached_upload(cx.s.current_computer(), path)
+                .unwrap_or_else(|| PathBuf::from(path))
+        })
+        .collect();
     if let Some(g) = super::parts::images::gallery_sized(cx, &key, &paths, 0, 150.0) {
         wrap = wrap.child(g.justify_end().key("echo-imgs"));
     }
@@ -457,47 +448,6 @@ pub fn view(cx: &Tcx, echo: &Echo) -> El {
                 )
                 .child(note(cx.t("Sending…"), k.c.text_faint)),
         ),
-        EchoState::Sent if echo.inbox.is_some() || echo.steer => {
-            let asid = cx.asid.to_string();
-            let token = echo.token;
-            let inbox_id = echo.inbox.clone().unwrap_or_default();
-            let text = echo.text.clone();
-            let mut status_row = row().gap(6.0).center_y().child(note(
-                cx.t("Steered · the agent reads it at its next step"),
-                k.c.text_faint,
-            ));
-            {
-                let edit_asid = asid.clone();
-                let edit_inbox_id = inbox_id.clone();
-                let edit_text = text;
-                status_row = status_row.child(
-                    Button::new(cx.t("Edit"))
-                        .variant(ButtonVariant::Ghost)
-                        .control_size(ControlSize::Small)
-                        .on_press(move |s: &mut UiState| {
-                            s.edit_steered_echo(
-                                &edit_asid,
-                                token,
-                                &edit_inbox_id,
-                                edit_text.clone(),
-                            );
-                        })
-                        .build(k)
-                        .key(format!("echo-edit-{token}")),
-                );
-            }
-            status_row = status_row.child(
-                Button::new(cx.t("Cancel"))
-                    .variant(ButtonVariant::GhostMuted)
-                    .control_size(ControlSize::Small)
-                    .on_press(move |s: &mut UiState| {
-                        s.cancel_steered_echo(&asid, token, &inbox_id);
-                    })
-                    .build(k)
-                    .key(format!("echo-cancel-{token}")),
-            );
-            Some(status_row)
-        }
         EchoState::Sent => None,
         EchoState::Failed => {
             let asid = cx.asid.to_string();
@@ -554,16 +504,7 @@ mod tests {
     }
 
     fn echo(token: u64, text: &str, rows: &[TimelineItem]) -> Echo {
-        Echo::new(token, text.into(), vec![], vec![], true, rows)
-    }
-
-    fn steer(id: &str, text: &str) -> InboxItem {
-        InboxItem {
-            id: id.into(),
-            text: text.into(),
-            steer: true,
-            files: vec![],
-        }
+        Echo::new(token, text.into(), vec![], vec![], None, rows)
     }
 
     #[test]
@@ -575,19 +516,192 @@ mod tests {
             echo(2, "run the tests", &rows),
         ];
         // Re-reading what was already there (a snapshot) claims nothing.
-        assert!(!reconcile(&mut echoes, &mut rows));
+        assert!(!reconcile("s", &mut echoes, &mut rows, &mut HashMap::new()));
         // The first send's row arrives, its file list appended by the gateway.
         rows.push(user(
             "u1",
             "run the tests\n\nAttached files (on this host):\n- /up/a.png",
         ));
-        assert!(reconcile(&mut echoes, &mut rows));
+        assert!(reconcile("s", &mut echoes, &mut rows, &mut HashMap::new()));
         assert_eq!(echoes.iter().map(|e| e.token).collect::<Vec<_>>(), [2]);
         // The same rows again (a later snapshot) leave the second echo be.
-        assert!(!reconcile(&mut echoes, &mut rows));
+        assert!(!reconcile("s", &mut echoes, &mut rows, &mut HashMap::new()));
         rows.push(user("u2", "run the tests"));
-        assert!(reconcile(&mut echoes, &mut rows));
+        assert!(reconcile("s", &mut echoes, &mut rows, &mut HashMap::new()));
         assert!(echoes.is_empty());
+    }
+
+    #[test]
+    fn canonical_upload_url_replaces_only_its_own_image_echo() {
+        let sent = |token, path: &str| {
+            Echo::new(
+                token,
+                "[Image #1] review".into(),
+                vec![path.into()],
+                vec![path.into()],
+                None,
+                &[],
+            )
+        };
+        let mut echoes = vec![sent(1, "/uploads/a.jpg"), sent(2, "/uploads/b.jpg")];
+        let mut row = user("delivered", "[Image #1] review");
+        let id = muqun_gateway::agents::message_images::original_asset_id("s", "/uploads/b.jpg");
+        row.attachments = Some(vec![format!("/api/agent-images/{id}/original")]);
+        let mut rows = [row];
+        let mut images = HashMap::new();
+        assert!(!reconcile(
+            "other-session",
+            &mut echoes,
+            &mut rows,
+            &mut images
+        ));
+        assert!(reconcile("s", &mut echoes, &mut rows, &mut images));
+        assert_eq!(echoes.iter().map(|e| e.token).collect::<Vec<_>>(), [1]);
+        assert!(!reconcile("s", &mut echoes, &mut rows, &mut images));
+    }
+
+    #[test]
+    fn held_prompt_has_only_an_editable_receipt_until_delivery() {
+        use crate::model::compose::InboxItem;
+        use muqun_gateway::agents::AgentDomainEvent;
+        for mode in [BusyDelivery::Queue, BusyDelivery::Steer] {
+            let (tx, _rx) = crate::model::commands::channel();
+            let mut s = UiState::new(tx);
+            s.selected = Some("s1".into());
+            let asid = AgentSessionId("s1".into());
+            let text = "install on my phone";
+            s.timelines
+                .entry(asid.0.clone())
+                .or_default()
+                .replace(vec![user("previous", text)]);
+            s.echo_sent(&asid.0, 42, text.into(), &[], Some(mode));
+            assert_eq!(s.timeline_echoes(&asid.0).count(), 0);
+            let inbox_item =
+                serde_json::json!({"id":"m-next", "payload":{"text":text}, "delivery":mode.wire()});
+            let inbox = |items, seq| AgentDomainEvent::InboxChanged {
+                asid: asid.clone(),
+                items,
+                seq,
+            };
+            s.apply_event(inbox(vec![inbox_item.clone()], 8));
+            s.echo_submitted(42, true);
+            s.apply_event(AgentDomainEvent::TimelineUpsert {
+                asid: asid.clone(),
+                items: vec![user("next", text)],
+                seq: 9,
+            });
+            assert_eq!(s.timelines["s1"].blocks.len(), 1);
+            assert_eq!(s.queue, InboxItem::list(std::slice::from_ref(&inbox_item)));
+            s.apply_event(inbox(vec![], 10));
+            assert_eq!(s.timelines["s1"].blocks.len(), 2);
+            s.apply_event(inbox(vec![inbox_item], 8));
+            assert!(s.queue.is_empty());
+            assert_eq!(s.timelines["s1"].blocks.len(), 2);
+        }
+    }
+
+    #[test]
+    fn image_receipts_transfer_to_the_queue_or_delivered_row_once_per_send() {
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.selected = Some("images".into());
+        let asid = AgentSessionId("images".into());
+        let photo = crate::model::compose::StagedFile {
+            path: "/uploads/photo.png".into(),
+            name: "photo.png".into(),
+            image: true,
+            size: 16,
+            draft_token: None,
+        };
+        for token in [1, 2] {
+            s.echo_sent(
+                &asid.0,
+                token,
+                "".into(),
+                std::slice::from_ref(&photo),
+                Some(BusyDelivery::Queue),
+            );
+            assert!(s.echo_submitted(token, true));
+        }
+        let pending = |s: &UiState| {
+            s.pending_queue_echoes(&asid.0)
+                .map(|e| (e.token, e.images.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pending(&s),
+            vec![(1, vec![photo.path.clone()]), (2, vec![photo.path.clone()])]
+        );
+        let queued = crate::model::compose::InboxItem::from_value(&serde_json::json!({
+            "id":"m-first", "delivery":"queue", "payload":{"text":""}
+        }))
+        .unwrap();
+        s.apply_session_inbox(&asid.0, vec![queued.clone()], 3);
+        s.apply_session_inbox(&asid.0, vec![queued.clone()], 4);
+        assert_eq!(pending(&s), vec![(2, vec![photo.path.clone()])]);
+        s.apply_session_inbox(&asid.0, vec![], 5);
+        assert_eq!(pending(&s).len(), 2);
+        let tl = s.timelines.get_mut(&asid.0).unwrap();
+        tl.upsert(vec![user("first", ""), user("second", "")]);
+        s.echo_rows(&asid.0);
+        assert!(pending(&s).is_empty());
+        assert!(s.timelines[&asid.0]
+            .items
+            .iter()
+            .all(|r| r.attachments.as_deref() == Some(std::slice::from_ref(&photo.path))));
+        let tl = s.timelines.get_mut(&asid.0).unwrap();
+        tl.upsert(vec![user("second", "")]);
+        tl.replace(vec![user("first", ""), user("second", "")]);
+        assert!(tl
+            .items
+            .iter()
+            .all(|r| r.attachments.as_deref() == Some(std::slice::from_ref(&photo.path))));
+        s.apply_session_inbox(&asid.0, vec![], 5);
+        assert_eq!(s.timelines[&asid.0].blocks.len(), 2);
+    }
+
+    #[test]
+    fn accepted_image_steer_leaves_the_composer_before_the_transcript_arrives() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut state = UiState::new(tx);
+        let image = crate::model::compose::StagedFile {
+            path: "/uploads/chart.png".into(),
+            name: "chart.png".into(),
+            image: true,
+            size: 16,
+            draft_token: None,
+        };
+        state.echo_sent(
+            "live",
+            1,
+            "[Image #1]".into(),
+            &[image],
+            Some(BusyDelivery::Steer),
+        );
+        assert_eq!(state.pending_queue_echoes("live").count(), 1);
+        assert!(state.echo_submitted(1, true));
+        assert_eq!(state.pending_queue_echoes("live").count(), 0);
+    }
+
+    #[test]
+    fn direct_steer_gains_one_native_row_even_when_ack_arrives_last() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let id = "live";
+        s.echo_sent(
+            id,
+            1,
+            "change direction".into(),
+            &[],
+            Some(BusyDelivery::Steer),
+        );
+        let tl = s.timelines.entry(id.into()).or_default();
+        tl.upsert(vec![user("instruction", "change direction")]);
+        s.echo_rows(id);
+        assert_eq!(s.timeline_echoes(id).count(), 0);
+        assert!(s.echo_submitted(1, true));
+        assert_eq!(s.timelines[id].blocks.len(), 1);
+        assert!(s.echoes_of(id).is_empty());
     }
 
     #[test]
@@ -597,7 +711,7 @@ mod tests {
         let mut s = UiState::new(tx);
         s.timelines.entry("s1".into()).or_default().replace(vec![]);
         let token = s.token(super::super::Slot::Session);
-        s.echo_sent("s1", token, "ship it".into(), &[], false);
+        s.echo_sent("s1", token, "ship it".into(), &[], None);
         assert_eq!(s.echoes_of("s1")[0].state, EchoState::Sending);
         // The gateway's row lands before the submit is acknowledged.
         s.timelines
@@ -612,102 +726,9 @@ mod tests {
         assert!(s.pending_submit.is_none());
         // A refused send stays on screen, failed, for Retry.
         let token = s.token(super::super::Slot::Session);
-        s.echo_sent("s1", token, "and lint".into(), &[], false);
+        s.echo_sent("s1", token, "and lint".into(), &[], None);
         s.on_composer(ComposerUpdate::Submitted { token, ok: false });
         assert_eq!(s.echoes_of("s1")[0].state, EchoState::Failed);
         assert_eq!(s.draft.text, "next thought");
-    }
-
-    #[test]
-    fn a_failed_echo_stays_and_a_held_steer_is_the_echo_until_taken() {
-        let mut echoes = vec![echo(1, "stop and explain", &[]), echo(2, "also lint", &[])];
-        echoes[1].state = EchoState::Failed;
-        // The gateway holds the steer: the echo stands for its inbox item.
-        let held = [steer("q1", "stop and explain"), steer("q2", "also lint")];
-        assert!(claim_inbox(&mut echoes, &held));
-        assert_eq!(echoes[0].inbox.as_deref(), Some("q1"));
-        // A failed send is no inbox item, and no row takes it away.
-        assert_eq!(echoes[1].inbox, None);
-        assert!(!reconcile(&mut echoes, &mut [user("u9", "also lint")]));
-        assert_eq!(echoes.len(), 2);
-        // The agent took it: the item leaves the inbox, the echo waits for its row.
-        assert!(claim_inbox(&mut echoes, &[]));
-        assert_eq!(echoes[0].inbox, None);
-        assert!(reconcile(
-            &mut echoes,
-            &mut [user("u3", "stop and explain")]
-        ));
-        assert_eq!(echoes.len(), 1);
-        assert_eq!(echoes[0].state, EchoState::Failed);
-    }
-
-    #[test]
-    fn edit_and_cancel_steered_echo_restores_draft_or_discards() {
-        let (tx, mut rx) = crate::model::commands::channel();
-        let mut s = UiState::new(tx);
-        s.selected = Some("s1".into());
-        let token = 42;
-        s.echo_sent(
-            "s1",
-            token,
-            "typo in my prompt".into(),
-            &[crate::model::compose::StagedFile {
-                draft_token: None,
-                path: "/uploads/example.png".into(),
-                name: "example.png".into(),
-                size: 100,
-                image: true,
-            }],
-            true,
-        );
-        s.queue.push(steer("inbox-1", "typo in my prompt"));
-        s.echo_inbox("s1", &s.queue.clone());
-        assert_eq!(s.echoes_of("s1")[0].inbox.as_deref(), Some("inbox-1"));
-
-        // User edits the steered echo
-        s.edit_steered_echo("s1", token, "inbox-1", "typo in my prompt".into());
-
-        // Echo is removed and draft is restored with the text
-        assert!(s.echoes_of("s1").is_empty());
-        assert_eq!(s.draft.text, "typo in my prompt");
-        assert_eq!(s.staged.len(), 1);
-        assert_eq!(s.staged[0].path, "/uploads/example.png");
-        assert!(s.staged[0].image);
-        assert!(s.draft.focused);
-        assert!(s.queue.is_empty());
-
-        // Gateway received InboxCancel command
-        let mut found = false;
-        while let Ok(cmd) = rx.try_recv() {
-            if matches!(
-                cmd,
-                Command::Compose(ComposeCommand::InboxCancel { asid, item })
-                    if asid.0 == "s1" && item == "inbox-1"
-            ) {
-                found = true;
-                break;
-            }
-        }
-        assert!(found);
-    }
-
-    #[test]
-    fn steered_prompt_is_deduplicated_even_before_inbox_claim() {
-        let (tx, _rx) = crate::model::commands::channel();
-        let mut s = UiState::new(tx);
-        s.selected = Some("s1".into());
-        s.echo_sent("s1", 99, "refactor the tile layout".into(), &[], true);
-        let item = steer("q-steer-1", "refactor the tile layout");
-        // Even before `echo_inbox` claims `q-steer-1`, `item_echoed` recognizes the live steer echo!
-        assert!(s.item_echoed(&item));
-
-        // Non-steered queued item with different text is not echoed
-        let queued = InboxItem {
-            id: "q-queue-2".into(),
-            text: "run clippy afterwards".into(),
-            steer: false,
-            files: vec![],
-        };
-        assert!(!s.item_echoed(&queued));
     }
 }

@@ -211,6 +211,7 @@ struct ConnectionState {
 struct Core {
     connection: Mutex<crate::hub::ConnectionContext>,
     local_hub: Option<Arc<dyn SessionHub>>,
+    local_state_dir: Option<PathBuf>,
     fleet: Arc<super::fleet_attention::Fleet>,
     connection_generation: AtomicU64,
     connected: std::sync::atomic::AtomicBool,
@@ -232,6 +233,7 @@ pub fn spawn(
     config: Arc<ConfigStore>,
     commands: CommandReceiver,
     initial_connected: bool,
+    local_state_dir: PathBuf,
 ) {
     let (completions, completion_rx) = watch::channel(None);
     let (edits, edits_rx) = watch::channel(0);
@@ -254,6 +256,7 @@ pub fn spawn(
     tokio::spawn(fleet.clone().maintain(config.clone(), inbox.clone()));
     let core = Arc::new(Core {
         fleet,
+        local_state_dir: Some(local_state_dir),
         local_hub: (connection.computer == "local" || !initial_connected)
             .then(|| connection.hub.clone()),
         connection: Mutex::new(connection),
@@ -344,10 +347,6 @@ impl Core {
                 }
                 // In this loop, not a task: edits must apply in the order sent.
                 Command::Edit(edit) => self.edit(edit),
-                command @ (Command::PairComputerClaim { .. }
-                | Command::PairComputerToken { .. }) => {
-                    self.clone().run(command).await;
-                }
                 Command::SwitchComputer(target) => {
                     if let Some(stale) = search.take() {
                         stale.abort();
@@ -404,9 +403,14 @@ impl Core {
                     | Command::ThemeApply(..)
                     | Command::ThemeImportFile(_)
                     | Command::ThemeImportUrl(_)
+                    | Command::UnpairComputer { .. }
+                    | Command::RevokeLocalPairing(_)
+                    | Command::ReadLocalInvite(_)
                     | Command::CheckDesktopUpdate
+                    | Command::RefreshLocalPairings
                     | Command::ScanStorage
                     | Command::ClearStorage
+                    | Command::PluginPackage(..)
                     | Command::ProbeRuntimes
                     | Command::InstallManagedRuntime(_)
             )
@@ -430,115 +434,72 @@ impl Core {
         match command {
             Command::Refresh => self.refresh().await,
             Command::SwitchComputer(target) => self.switch_computer(target).await,
-            Command::PairComputerRequest { server_id, url } => {
-                match crate::platform::pairing::request_app_pairing(&url, "Muqun Desktop").await {
-                    Ok(offer) => {
-                        self.inbox.push(Update::ComputerPairingRequested {
-                            server_id,
-                            request_id: offer.request_id,
-                            expires_in_ms: offer.expires_in_ms,
-                            transport_required: offer.transport_required,
-                        });
-                    }
-                    Err(err) => {
-                        self.inbox.push(Update::ComputerPairingOutcome {
-                            server_id,
-                            token: None,
-                            device_id: None,
-                            transport_key: None,
-                            error: Some(err.to_string()),
-                        });
-                    }
+            Command::PairComputerRequest {
+                attempt,
+                server_id,
+                url,
+            } => {
+                let result = async {
+                    let offer =
+                        crate::platform::pairing::request_app_pairing(&url, "Muqun Desktop")
+                            .await?;
+                    crate::platform::pairing::validate_identity(&server_id, &offer.server_id)?;
+                    anyhow::Ok(offer)
                 }
+                .await
+                .map_err(|e| e.to_string());
+                self.inbox.push(Update::ComputerPairingRequested {
+                    attempt,
+                    url,
+                    result,
+                });
             }
             Command::PairComputerClaim {
+                attempt,
                 server_id,
                 url,
                 request_id,
                 code,
                 transport_required,
             } => {
-                match crate::platform::pairing::claim_app_pairing(
-                    &url,
-                    &request_id,
-                    &code,
-                    transport_required,
-                )
-                .await
-                {
-                    Ok(claimed) => {
-                        self.config.change(|c| {
-                            c.apply(crate::config::ConfigEdit::ComputerToken {
-                                computer: server_id.clone(),
-                                url,
-                                token: claimed.token.clone(),
-                                device_id: Some(claimed.device_id.clone()),
-                                transport_key: claimed.transport_key.clone(),
-                            })
-                        });
-                        self.inbox.push(Update::ComputerPairingOutcome {
-                            server_id: server_id.clone(),
-                            token: Some(claimed.token),
-                            device_id: Some(claimed.device_id),
-                            transport_key: claimed.transport_key,
-                            error: None,
-                        });
-                        self.switch_computer(server_id).await;
-                    }
-                    Err(err) => {
-                        self.inbox.push(Update::ComputerPairingOutcome {
-                            server_id,
-                            token: None,
-                            device_id: None,
-                            transport_key: None,
-                            error: Some(err.to_string()),
-                        });
-                    }
+                let result = async {
+                    let claimed = crate::platform::pairing::claim_app_pairing(
+                        &url,
+                        &request_id,
+                        &code,
+                        transport_required,
+                    )
+                    .await?;
+                    crate::platform::pairing::validate_identity(&server_id, &claimed.server_id)?;
+                    anyhow::Ok(claimed)
                 }
+                .await
+                .map_err(|e| e.to_string());
+                self.inbox.push(Update::ComputerPairingOutcome {
+                    attempt,
+                    url,
+                    result,
+                });
             }
             Command::PairComputerToken {
+                attempt,
                 server_id,
                 url,
                 token,
-            } => match crate::platform::pairing::verify_token(&url, &token).await {
-                Ok(true) => {
-                    self.config.change(|c| {
-                        c.apply(crate::config::ConfigEdit::ComputerToken {
-                            computer: server_id.clone(),
-                            url,
-                            token: token.clone(),
-                            device_id: None,
-                            transport_key: None,
-                        })
-                    });
-                    self.inbox.push(Update::ComputerPairingOutcome {
-                        server_id: server_id.clone(),
-                        token: Some(token),
-                        device_id: None,
-                        transport_key: None,
-                        error: None,
-                    });
-                    self.switch_computer(server_id).await;
+            } => {
+                let result = async {
+                    let verified = crate::platform::pairing::verify_token(&url, &token).await?;
+                    crate::platform::pairing::validate_identity(&server_id, &verified.server_id)?;
+                    anyhow::Ok(verified)
                 }
-                Ok(false) => {
-                    self.inbox.push(Update::ComputerPairingOutcome {
-                        server_id,
-                        token: None,
-                        device_id: None,
-                        transport_key: None,
-                        error: Some("Token is invalid or refused by remote gateway".into()),
-                    });
-                }
-                Err(err) => {
-                    self.inbox.push(Update::ComputerPairingOutcome {
-                        server_id,
-                        token: None,
-                        device_id: None,
-                        transport_key: None,
-                        error: Some(format!("Connection error: {err}")),
-                    });
-                }
-            },
+                .await
+                .map_err(|e| e.to_string());
+                self.inbox.push(Update::ComputerPairingOutcome {
+                    attempt,
+                    url,
+                    result,
+                });
+            }
             Command::OpenSession(asid) => {
                 *self.state().active.lock().unwrap() = Some(asid.clone());
                 self.open(&asid).await;
@@ -584,14 +545,16 @@ impl Core {
             }
             Command::CreateSession { agent, cwd } => match self.hub.create(&agent, &cwd).await {
                 Ok(info) => {
-                    let asid = info.asid.clone();
                     self.resolve_dirs(info.directory.iter().cloned().collect(), false);
-                    self.inbox.push(Update::SessionCreated(Box::new(info)));
-                    *self.state().active.lock().unwrap() = Some(asid.clone());
-                    self.open(&asid).await;
+                    self.inbox
+                        .push(Update::SessionCreated(Box::new(info), None));
                     self.config.change(|config| {
                         config.general.last_agent = Some(agent.clone());
-                        config.general.last_cwd.insert(agent, cwd);
+                        if crate::hub::connection_origin()
+                            .is_none_or(|(computer, _)| computer == "local")
+                        {
+                            config.general.last_cwd.insert(agent, cwd);
+                        }
                     });
                     self.edited();
                 }
@@ -761,11 +724,9 @@ impl Core {
             Command::ForkSession { asid, message_id } => {
                 match self.hub.fork(&asid, message_id.as_deref()).await {
                     Ok(info) => {
-                        let new_asid = info.asid.clone();
                         self.resolve_dirs(info.directory.iter().cloned().collect(), false);
-                        self.inbox.push(Update::SessionCreated(Box::new(info)));
-                        *self.state().active.lock().unwrap() = Some(new_asid.clone());
-                        self.open(&new_asid).await;
+                        self.inbox
+                            .push(Update::SessionCreated(Box::new(info), None));
                     }
                     Err(err) => self.fail(err),
                 }
@@ -816,11 +777,55 @@ impl Core {
                 }
             }
             Command::RefreshTasks => self.refresh_tasks().await,
+            Command::UnpairComputer {
+                computer,
+                request,
+                gateway,
+            } => {
+                let result = match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    crate::hub::RemoteHub::revoke_own_login(gateway),
+                )
+                .await
+                {
+                    Ok(outcome) => outcome.map_err(|err| err.to_string()),
+                    Err(_) => Err("Gateway timed out".into()),
+                };
+                self.inbox.push(Update::Ui(
+                    crate::model::inbox::UiAction::ComputerUnpaired {
+                        computer,
+                        request,
+                        result,
+                    },
+                ));
+            }
+            Command::RevokeLocalPairing(id) => {
+                let result = crate::platform::paired_devices::revoke(&id)
+                    .await
+                    .map_err(|e| e.to_string());
+                self.inbox.push(Update::Ui(
+                    crate::model::inbox::UiAction::LocalPairingRevoked { id, result },
+                ));
+            }
+            Command::ReadLocalInvite(id) => {
+                let invite = crate::platform::pairing_invite::load().await.ok();
+                self.inbox
+                    .push(Update::Ui(crate::model::inbox::UiAction::LocalInvite(
+                        id, invite,
+                    )));
+            }
             Command::CheckDesktopUpdate => {
                 let status = crate::platform::update::check().await;
                 self.inbox
                     .push(Update::Ui(crate::model::inbox::UiAction::DesktopUpdate(
                         status,
+                    )));
+            }
+            Command::RefreshLocalPairings => {
+                let devices = crate::platform::paired_devices::load().await;
+                self.inbox
+                    .push(Update::Ui(crate::model::inbox::UiAction::LocalPairings(
+                        devices,
                     )));
             }
             Command::ScanStorage => {
@@ -1025,6 +1030,37 @@ impl Core {
                     }
                 }
             }
+            Command::PluginPackage(request, op, reserved) => {
+                let inbox = self.inbox.clone();
+                tokio::task::spawn_blocking(move || {
+                    use crate::diagnostics::{Attempt, EventKind, Outcome};
+                    use crate::plugin::packages::Operation;
+                    let (action, source) = match &op {
+                        Operation::Install(_) => (EventKind::PluginInstall, "Desktop"),
+                        Operation::Update(id) => (EventKind::PluginUpdate, id.as_str()),
+                        Operation::Remove(id) => (EventKind::PluginRemove, id.as_str()),
+                    };
+                    let mut attempt = Attempt::new(action, source, None);
+                    let result =
+                        crate::plugin::packages::apply_with_progress(op, &reserved, |stage| {
+                            inbox.push(Update::PluginPackageProgress(request, stage))
+                        });
+                    if let Ok(id) = &result {
+                        attempt.set_source(id);
+                    }
+                    let event =
+                        attempt.finish(result.as_ref().err().map_or(Outcome::Completed, |err| {
+                            err.downcast_ref::<Outcome>()
+                                .copied()
+                                .unwrap_or(Outcome::PackageFailed)
+                        }));
+                    inbox.push(Update::PluginPackage(
+                        request,
+                        event,
+                        result.map_err(|err| format!("{err:#}")),
+                    ));
+                });
+            }
             Command::ProbeRuntimes => {
                 let inbox = self.inbox.clone();
                 tokio::task::spawn_blocking(move || {
@@ -1035,11 +1071,25 @@ impl Core {
             Command::InstallManagedRuntime(kind) => {
                 let inbox = self.inbox.clone();
                 crate::hub::spawn_connected(async move {
+                    let attempt = crate::diagnostics::Attempt::new(
+                        crate::diagnostics::EventKind::RuntimeInstall,
+                        kind.id(),
+                        None,
+                    );
                     let result =
                         muqun_gateway::platform::runtimes::install_managed(kind, None, None)
                             .await
                             .map_err(|e| format!("{e:#}"));
-                    inbox.push(Update::RuntimeInstalled { kind, result });
+                    let event = attempt.finish(if result.is_ok() {
+                        crate::diagnostics::Outcome::Completed
+                    } else {
+                        crate::diagnostics::Outcome::RuntimeInstallFailed
+                    });
+                    inbox.push(Update::RuntimeInstalled {
+                        kind,
+                        result,
+                        event,
+                    });
                     let statuses = muqun_gateway::platform::runtimes::probe_all();
                     inbox.push(Update::Runtimes(statuses));
                 });
@@ -1103,18 +1153,25 @@ impl Core {
                 match self.hub.create(&agent, &cwd).await {
                     Ok(info) => {
                         let asid = info.asid.clone();
-                        self.inbox.push(Update::SessionCreated(Box::new(info)));
-                        *self.state().active.lock().unwrap() = Some(asid.clone());
-                        self.open(&asid).await;
+                        self.inbox
+                            .push(Update::SessionCreated(Box::new(info), Some(token)));
+                        // The UI opens the canonical session only if its pending pane is still visible.
                         self.config.change(|config| {
                             config.general.last_agent = Some(agent.clone());
-                            config.general.last_cwd.insert(agent.clone(), cwd);
+                            if crate::hub::connection_origin()
+                                .is_none_or(|(computer, _)| computer == "local")
+                            {
+                                config.general.last_cwd.insert(agent.clone(), cwd);
+                            }
                         });
                         self.edited();
                         // The choices on the pills are the new session's.
                         if let Some(model) = model {
-                            if let Err(err) = self.hub.switch_model(&asid, &model).await {
-                                self.fail(err);
+                            match self.hub.switch_model(&asid, &model).await {
+                                Ok(()) => self.inbox.push(Update::Composer(Box::new(
+                                    ComposerUpdate::SessionCatalogChanged(asid.clone()),
+                                ))),
+                                Err(err) => self.fail(err),
                             }
                         }
                         if let Some(mode) = mode {
@@ -1166,6 +1223,7 @@ impl Core {
         }
         if self.connected.load(Ordering::Acquire)
             && self.connection.lock().unwrap().computer == target
+            && !(target == "local" && self.hub.mode() == crate::hub::HubMode::Standalone)
         {
             return;
         }
@@ -1187,8 +1245,14 @@ impl Core {
                 crate::hub::RemoteHub::start(gw)
                     .ok()
                     .map(|h| h as Arc<dyn SessionHub>)
+            } else if let Some(local) = &self.local_hub {
+                Some(local.clone())
+            } else if let Some(dir) = &self.local_state_dir {
+                // Startup restored a remote login and never created an in-process
+                // hub. The first switch home must initialize the same local store.
+                Some(crate::standalone_hub(crate::runtime_settings(&cfg), dir).await)
             } else {
-                self.local_hub.clone()
+                None
             }
         } else if let Some(profile) = cfg.computers.get(&target) {
             if let (Some(url), Some(token)) = (&profile.url, &profile.token) {
@@ -1508,7 +1572,6 @@ impl Core {
             .lock()
             .unwrap()
             .insert(snapshot.info.asid.0.clone(), snapshot.seq);
-        super::compose::push_inbox(&self.inbox, &snapshot.info.asid.0, &snapshot.inbox);
         self.inbox.push(Update::Snapshot(Box::new(snapshot)));
     }
 
@@ -1519,6 +1582,9 @@ impl Core {
         // the opening placeholder or a desktop-cached timeline.
         match self.hub.peek(asid).await {
             Ok(Some(snapshot)) => {
+                if !self.is_open(asid) {
+                    return;
+                }
                 self.resolve_dirs(snapshot.info.directory.iter().cloned().collect(), false);
                 self.push_snapshot(snapshot);
                 self.watch_viewed(asid);
@@ -1783,11 +1849,6 @@ impl Core {
                     tracing::info!(asid = %asid.0, %reason, "resync requested");
                     self.resync(Some(&asid)).await;
                 }
-                Ok(AgentDomainEvent::InboxChanged { asid, items, .. }) => {
-                    if self.is_open(&asid) {
-                        super::compose::push_inbox(&self.inbox, &asid.0, &items);
-                    }
-                }
                 Ok(event) => {
                     let active = self.state().active.lock().unwrap().clone();
                     let watched = self.state().watched.lock().unwrap().clone();
@@ -2000,7 +2061,19 @@ impl Core {
     }
 
     fn edit(&self, edit: ConfigEdit) {
+        let changed_login = match &edit {
+            ConfigEdit::ComputerToken { computer, .. } | ConfigEdit::ForgetComputer(computer) => {
+                Some(computer.clone())
+            }
+            _ => None,
+        };
         self.config.change(|config| config.apply(edit));
+        if let Some(computer) = changed_login {
+            self.fleet.invalidate(&computer);
+            if self.connection.lock().unwrap().computer == computer {
+                self.connected.store(false, Ordering::Release);
+            }
+        }
         self.edited();
     }
 
@@ -2049,6 +2122,7 @@ mod tests {
         Arc::new(Core {
             connection: Mutex::new(hub.connection("local".into(), 0)),
             local_hub: None,
+            local_state_dir: None,
             fleet: Arc::new(super::super::fleet_attention::Fleet::default()),
             connection_generation: AtomicU64::new(0),
             connected: std::sync::atomic::AtomicBool::new(true),
@@ -2060,6 +2134,102 @@ mod tests {
             completions: watch::channel(None).0,
             edits: watch::channel(0).0,
         })
+    }
+
+    #[tokio::test]
+    async fn manual_pairing_uses_verified_identity_and_switches_once_after_saving() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        let http = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (socket, _) = server.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                assert_eq!(line.trim(), "GET /api/meta HTTP/1.1");
+                let mut authorized = false;
+                loop {
+                    line.clear();
+                    assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    authorized |= line
+                        .trim()
+                        .eq_ignore_ascii_case("Authorization: Bearer fixture");
+                }
+                assert!(authorized);
+                let meta = r#"{"serverId":"lab-id","label":"Lab"}"#;
+                socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{meta}", meta.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let core = test_core();
+        let (tx, mut commands) = crate::model::commands::channel();
+        let mut ui = crate::ui::UiState::new(tx);
+        ui.open_manual_pairing();
+        ui.pairing_busy = true;
+        let verify = |id: &str| Command::PairComputerToken {
+            attempt: 0,
+            server_id: id.into(),
+            url: url.clone(),
+            token: "fixture".into(),
+        };
+        core.clone().run(verify("different-id")).await;
+        ui.apply_updates(core.inbox.take());
+        assert!(ui
+            .pairing_error
+            .as_deref()
+            .is_some_and(|e| e.contains("mismatch")));
+        assert_eq!(ui.current_computer(), "local");
+        assert!(ui.cfg.computers.is_empty());
+
+        ui.pairing_busy = true;
+        core.clone().run(verify("")).await;
+        ui.apply_updates(core.inbox.take());
+        http.await.unwrap();
+        assert_eq!(ui.current_computer(), "lab-id");
+        let mut switched = 0;
+        while let Ok(cmd) = commands.try_recv() {
+            match cmd {
+                Command::Edit(edit) => core.edit(edit),
+                Command::SwitchComputer(id) => {
+                    assert_eq!(id, "lab-id");
+                    let saved = core.config.get();
+                    let profile = &saved.computers[&id];
+                    assert_eq!(profile.url.as_deref(), Some(url.as_str()));
+                    assert_eq!(profile.token.as_deref(), Some("fixture"));
+                    assert_eq!(profile.name, "Lab");
+                    switched += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(switched, 1);
+        let storage = tempfile::tempdir().unwrap();
+        let path = storage.path().join("desktop.json");
+        core.config.get().save(&path).unwrap();
+        let restored = DesktopConfig::load(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
+        assert_eq!(restored.current_computer, "lab-id");
+        assert!(crate::configured_remote_hub(&restored).unwrap().is_some());
+
+        ui.open_manual_pairing();
+        ui.pairing_busy = true;
+        ui.pairing_attempt = 2;
+        ui.apply_updates(vec![Update::ComputerPairingOutcome {
+            attempt: 1,
+            url: url.clone(),
+            result: Err("late response".into()),
+        }]);
+        assert!(ui.pairing_error.is_none() && ui.pairing_busy);
     }
 
     #[tokio::test]

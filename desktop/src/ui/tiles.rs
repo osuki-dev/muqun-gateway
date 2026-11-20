@@ -298,13 +298,14 @@ pub fn fill_plugin_tile(s: &mut UiState, i: usize, plugin_id: &str) {
     if let Some(plugin) = s.plugins.get_enabled(plugin_id, &s.cfg.plugins_disabled) {
         let lang = s.cfg.general.language;
         let title = plugin.title(lang);
-        let token = s.next_token;
+        let instance = format!("{plugin_id}-{}", s.next_token);
         s.next_token += 1;
         s.tiles[i].content = super::TileContent::Custom {
-            id: format!("{plugin_id}-{token}"),
+            id: instance.clone(),
             kind: plugin_id.to_string(),
             title,
         };
+        s.mount_plugin_view(plugin_id, &instance);
         if plugin_id == "sysinfo" {
             s.refresh_runtimes();
         }
@@ -420,14 +421,19 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
             head = head
                 .child(plugin_icon.a11y_hidden())
                 .child(
-                    text(title.clone())
-                        .key("tile-title")
-                        .font(title_font)
-                        .color(if focused {
-                            k.c.text_base
-                        } else {
-                            k.c.text_muted
-                        }),
+                    text(
+                        s.plugins
+                            .get(kind)
+                            .and_then(|p| p.window_title(s))
+                            .unwrap_or_else(|| title.clone()),
+                    )
+                    .key("tile-title")
+                    .font(title_font)
+                    .color(if focused {
+                        k.c.text_base
+                    } else {
+                        k.c.text_muted
+                    }),
                 )
                 .child(
                     text(kind.clone())
@@ -477,24 +483,13 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
     let mut menu = Menu::new(format!("tile-menu-{i}"))
         .min_width(320.0)
         .trigger(
-            super::art::direction_button(
-                s,
-                k,
-                tr_ref(language, "Pane actions"),
-                if menu_open {
-                    -std::f32::consts::FRAC_PI_2
-                } else {
-                    std::f32::consts::FRAC_PI_2
-                },
-            )
-            .variant(ButtonVariant::GhostMuted)
-            .control_size(ControlSize::Small)
-            .expanded(menu_open)
-            .on_press(move |s: &mut UiState| {
-                s.menu = (!menu_open).then_some(OpenMenu::Tile(i));
-            })
-            .build(k)
-            .key(format!("tile-menu-btn-{i}")),
+            super::icons::header_button(&super::icons::MORE, tr_ref(language, "Pane actions"))
+                .expanded(menu_open)
+                .on_press(move |s: &mut UiState| {
+                    s.menu = (!menu_open).then_some(OpenMenu::Tile(i));
+                })
+                .build(k)
+                .key(format!("tile-menu-btn-{i}")),
         )
         .open(menu_open)
         .on_close(|s: &mut UiState| s.menu = None);
@@ -659,6 +654,13 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
         _ => None,
     };
     if let Some(plugin_id) = plugin_id {
+        if let Some(actions) = s
+            .plugins
+            .get(plugin_id)
+            .and_then(|p| p.window_actions(s, k))
+        {
+            head = head.child(actions);
+        }
         head = head.child(crate::plugin::surface_switcher(
             s,
             k,
@@ -684,14 +686,14 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
             .group_opacity(if focused { 0.7 } else { 0.0 }, 1.0),
     );
     // The split view has no toolbar: the top-right pane's header carries
-    // what it held, adding a pane and the terminal, always in view.
+    // what it held, adding a pane and toggling the right panel, always in view.
     if place.corner {
         head = head.child(window_actions(s, k));
     }
     head
 }
 
-/// Add to split view and the terminal toggle, at the trailing end of the
+/// Add to split view and the right panel toggle, at the trailing end of the
 /// top-right pane's header (the window's corner, where the toolbar had them).
 fn window_actions(s: &UiState, k: &Kit) -> El {
     use super::keymap::{tip, Action};
@@ -711,44 +713,17 @@ fn window_actions(s: &UiState, k: &Kit) -> El {
         );
     if s.tiles.len() < super::MAX_TILES {
         out = out.child(
-            IconButton::new(&super::icons::PLUS)
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Add to split view"))
-                .help(tip(tr_ref(language, "Add to split view"), Action::AddSplit))
-                .on_press(|s: &mut UiState| s.split())
-                .build(k)
-                .key("split-add"),
+            super::icons::header_button(
+                &super::icons::ADD_PANE,
+                tr_ref(language, "Add to split view"),
+            )
+            .help(tip(tr_ref(language, "Add to split view"), Action::AddSplit))
+            .on_press(|s: &mut UiState| s.split())
+            .build(k)
+            .key("split-add"),
         );
     }
-    let has_term_tile = s.has_terminal_tile();
-    out.child(
-        IconButton::new(&super::terminal_panel::TERMINAL_WINDOW)
-            .variant(if s.term.open || has_term_tile {
-                IconButtonVariant::Contrast
-            } else {
-                IconButtonVariant::GhostMuted
-            })
-            .control_size(ControlSize::Small)
-            .label(tr_ref(language, "Terminal"))
-            .help(tip(tr_ref(language, "Terminal"), Action::ToggleTerminal))
-            .on_press_tx(|s: &mut UiState, tx: &mut Tx| {
-                let mods = tx.mods();
-                if mods.ctrl || mods.cmd || mods.alt {
-                    s.open_terminal_tile();
-                } else if s.has_terminal_tile() {
-                    if let Some(i) = s.tile_of_terminal() {
-                        s.focus_tile(i);
-                    }
-                } else if s.term.open {
-                    s.close_terminal();
-                } else {
-                    s.open_terminal_default();
-                }
-            })
-            .build(k)
-            .key("terminal-toggle"),
-    )
+    out.child(super::shell::right_panel_toggle(s, k))
 }
 
 /// What a pane's header says about its session, as a bare mark by the
@@ -847,42 +822,24 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
                 | muqun_gateway::agents::AgentSessionStatus::Retry
         )
     });
-    let submit = Button::new(tr_ref(language, if running { "Stop" } else { "Send" }))
-        .label_with(move |font, ink| {
-            if running {
-                text(tr_ref(language, "Stop")).font(font).color(ink)
-            } else {
-                rune::icon(&composer::SEND, composer::SEND_ICON).color(ink)
-            }
-        })
+    let submit = Button::new(tr_ref(language, "Send"))
+        .label_with(|_, ink| rune::icon(&composer::SEND, composer::SEND_ICON).color(ink))
         .control_size(ControlSize::Regular)
-        .variant(if running {
-            ButtonVariant::Danger
-        } else {
-            ButtonVariant::Submit
-        })
+        .variant(ButtonVariant::Submit)
         .disabled(
-            !running
-                && s.tiles[i].slot.draft.text.trim().is_empty()
-                && s.tiles[i].slot.staged.is_empty(),
+            s.pending_submit.is_some()
+                || (s.tiles[i].slot.draft.text.trim().is_empty()
+                    && s.tiles[i].slot.staged.is_empty()),
         )
         .on_press(move |s: &mut UiState| {
             s.focus_tile(i);
-            if running {
-                if let Some(asid) = s.selected.clone() {
-                    s.send(Command::Interrupt(muqun_gateway::agents::AgentSessionId(
-                        asid,
-                    )));
-                }
-            } else {
-                composer::submit_session(s);
-            }
+            composer::send_with_delivery(s);
         })
         .build(k)
-        .h(36.0)
-        .key(if running { "stop" } else { "send" })
+        .size(36.0, 36.0)
+        .key("send")
         .radius(k.radius.lg);
-    actions = actions.child(if running { submit } else { submit.w(36.0) });
+    actions = actions.child(submit);
     let card = col()
         .key("composer-card")
         .on_drop_files(move |s: &mut UiState, files, _| {
@@ -910,11 +867,8 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         Some(asid),
         s.tiles[i].slot.catalog.as_deref(),
         &s.tiles[i].slot.diff_stat,
+        Some(i),
     );
-    let footer = col()
-        .w_full()
-        .on_background_press(move |s: &mut UiState| s.focus_tile(i))
-        .child(footer.inert());
     col()
         .key("tile-composer-pad")
         .w_full()
@@ -1070,7 +1024,6 @@ fn focus_hovered_tile(s: &mut UiState, i: usize, tx: &mut rune::Tx) {
         || s.row_menu.is_some()
         || s.context_open.is_some()
         || s.zoom.is_some()
-        || s.detail.is_some()
         || s.voice.is_some()
         || s.draft.preedit().is_some()
         || s.timeline_search.active
@@ -2217,6 +2170,22 @@ mod tests {
                 assert!(
                     delivery.rect[0] + delivery.rect[2] <= footer.rect[0] + footer.rect[2] + 1.0,
                     "delivery overflows at {width}"
+                );
+                let stop = nodes
+                    .iter()
+                    .find(|n| {
+                        n.key.as_deref() == Some("stop")
+                            && n.rect[0] >= footer.rect[0]
+                            && n.rect[0] < footer.rect[0] + footer.rect[2]
+                    })
+                    .expect("busy session retains interrupt control");
+                assert!(
+                    stop.rect[0] >= delivery.rect[0] + delivery.rect[2] - 1.0
+                        && stop.rect[0] + stop.rect[2] <= footer.rect[0] + footer.rect[2] + 1.0,
+                    "stop must follow delivery inside the footer at {width}: {:?} {:?} {:?}",
+                    delivery.rect,
+                    stop.rect,
+                    footer.rect
                 );
                 assert!(
                     (delivery.rect[1] - footer.rect[1]).abs() < 1.0,

@@ -154,7 +154,7 @@ pub(super) fn sniff(bytes: &[u8]) -> Option<UploadKind> {
 }
 
 #[cfg(test)]
-pub(super) fn fixture(extension: &str) -> Vec<u8> {
+pub(crate) fn fixture(extension: &str) -> Vec<u8> {
     use std::io::Write as _;
     let mut file = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
     match extension {

@@ -301,11 +301,6 @@ mod tests {
     #[test]
     fn the_typed_line_runs_the_command_and_prints_its_status() {
         let line = command_line("echo 'hi there'; exit 3", "t_abc");
-        assert_eq!(
-            line,
-            "sh -c 'PAGER=cat GIT_PAGER=cat sh -c \"$1\"; printf \"\\037muqun-exit:%s:%d\\037\\n\" \"$2\" \"$?\"' sh 'echo '\\''hi there'\\''; exit 3' t_abc"
-        );
-        assert!(line.contains(ECHOED_FORMAT));
         // What the interactive shell does with it: `exit 3` ends the inner
         // `sh` only, and the status comes through.
         let out = std::process::Command::new("sh")
@@ -316,14 +311,33 @@ mod tests {
         let text = String::from_utf8(out.stdout).unwrap();
         assert_eq!(text, "hi there\n\u{1f}muqun-exit:t_abc:3\u{1f}\n");
         assert_eq!(find_exit(&text, "t_abc"), Some(3));
-        // No pager waits for a key in the pane: the command runs with them off.
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(command_line("echo \"$PAGER $GIT_PAGER\"", "t_abc"))
-            .output()
-            .unwrap();
-        assert!(String::from_utf8(out.stdout)
-            .unwrap()
-            .starts_with("cat cat\n"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_git_command_in_a_terminal_bypasses_the_interactive_pager_and_finishes() {
+        // Git only starts its pager on a tty. Use a pager that identifies
+        // itself and exits, so a regression is observable without hanging CI.
+        let in_terminal = |command: &str| {
+            let mut script = std::process::Command::new("script");
+            #[cfg(target_os = "linux")]
+            script.args(["-qec", command, "/dev/null"]);
+            #[cfg(target_os = "macos")]
+            script.args(["-q", "/dev/null", "/bin/sh", "-c", command]);
+            let out = script
+                .env("SHELL", "/bin/sh")
+                .env("TERM", "xterm")
+                .env("GIT_PAGER", "printf 'pager started\\n'; cat")
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let command = "git -p version";
+        assert!(in_terminal(command).contains("pager started"));
+        let text = in_terminal(&command_line(command, "t_pager"));
+        assert!(!text.contains("pager started"));
+        assert!(output_after_command(&text, "t_pager").contains("git version"));
+        assert_eq!(find_exit_after_command(&text, "t_pager"), Some(0));
     }
 }

@@ -1518,6 +1518,23 @@ fn thread_metadata_preserves_git_snapshot_and_child_identity_without_usage_fabri
     assert!(info.cost.is_none());
 }
 
+#[test]
+fn explicit_subagent_source_survives_when_parent_and_display_metadata_are_missing() {
+    let mut wire = golden()["thread"].clone();
+    for source in [
+        json!("subAgentThreadSpawn"),
+        json!({"subAgent":{"other":"review"}}),
+    ] {
+        wire["source"] = source;
+        let child = mapper::session(&wire).unwrap();
+        assert_eq!(child.mode.as_deref(), Some("subagent"));
+        assert!(child.parent_id.is_none());
+    }
+    wire["source"] = json!("appServer");
+    wire["name"] = json!("Subagent");
+    assert!(mapper::session(&wire).unwrap().mode.is_none());
+}
+
 #[tokio::test]
 async fn usage_survives_metadata_reads_and_subagent_inventory_is_requested_explicitly() {
     let mut fixture = Fixture::new(|request| match request["method"].as_str().unwrap() {

@@ -28,7 +28,11 @@ const RECENT_LIMIT: usize = 8;
 const RECENT_AGE_MS: u64 = 3 * 24 * 60 * 60 * 1000;
 
 fn recent_sessions(s: &UiState, now: u64) -> Vec<&muqun_gateway::agents::AgentSessionInfo> {
-    let mut sessions: Vec<_> = s.sessions.iter().collect();
+    let mut sessions: Vec<_> = s
+        .sessions
+        .iter()
+        .filter(|info| !s.is_subagent_session(info))
+        .collect();
     let last_worked = |info: &muqun_gateway::agents::AgentSessionInfo| {
         info.updated_ms.max(info.time_viewed.unwrap_or(0)).max(
             s.sidebar_opened
@@ -41,8 +45,11 @@ fn recent_sessions(s: &UiState, now: u64) -> Vec<&muqun_gateway::agents::AgentSe
     let mut ordinary = 0;
     sessions.retain(|info| {
         let id = &info.asid.0;
-        if s.selected.as_ref() == Some(id)
-            || s.tile_of(id).is_some()
+        if s.selected.as_deref().and_then(|id| s.sidebar_root(id)) == Some(id.as_str())
+            || s.tiles
+                .iter()
+                .filter_map(|tile| tile.asid.as_deref())
+                .any(|open| s.sidebar_root(open) == Some(id.as_str()))
             || s.cfg.general.pinned.contains(id)
             || matches!(s.activity(info), Activity::Working | Activity::NeedsYou)
         {
@@ -96,7 +103,10 @@ fn projects(s: &UiState) -> Vec<Project> {
     let sessions = if recent_only {
         recent_sessions(s, now_ms())
     } else {
-        s.sessions.iter().collect()
+        s.sessions
+            .iter()
+            .filter(|info| !s.is_subagent_session(info))
+            .collect()
     };
     let listed: Vec<ListedSession> = sessions
         .into_iter()
@@ -585,6 +595,7 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
         } else {
             s.open_session(&id);
         }
+        tx.focus("draft", false);
     })
     .on_double_click(move |s: &mut UiState, _: &mut Tx| start_rename(s, &rename_id))
     .build(k)
@@ -602,32 +613,22 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let curr = s.current_computer();
     let open = s.menu == Some(OpenMenu::ComputerPicker);
 
-    let (icon_el, display_name, status_desc) = if curr == "all" {
-        (
-            rune::icon(&super::parts::glyphs::NETWORK, 15.0).color(k.c.text_accent),
-            super::copy::tr(language, "All computers"),
-            super::copy::tr(language, "Fleet"),
-        )
-    } else {
-        let name = s.computer_name(curr);
-        let peer = s.peer_by_id(curr);
-        let reachable = peer.map(|p| p.reachable).unwrap_or(true);
-        let status_color = if reachable {
-            k.c.success.fg
-        } else {
-            k.c.warning.fg
-        };
-        (
-            rune::icon(&super::parts::glyphs::COMPUTER, 16.0).color(status_color),
-            name,
-            if reachable {
-                super::copy::tr(language, "Online")
-            } else {
-                super::copy::tr(language, "Offline")
-            },
-        )
+    let (glyph, status, status_color) = match curr {
+        "all" => (&super::parts::glyphs::NETWORK, "Fleet", k.c.text_accent),
+        "local" | "self" => (
+            &super::parts::glyphs::COMPUTER,
+            "This computer",
+            k.c.success.fg,
+        ),
+        _ => {
+            let (label, color) = match s.peer_by_id(curr).map(|p| p.reachable) {
+                Some(true) => ("Online", k.c.success.fg),
+                Some(false) => ("Offline", k.c.warning.fg),
+                None => ("Paired", k.c.icon_muted),
+            };
+            (&super::parts::glyphs::COMPUTER, label, color)
+        }
     };
-
     let trigger = rune::row()
         .key("computer-switcher-trigger")
         .w_full()
@@ -644,9 +645,9 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .cursor(rune::Cursor::Pointer)
         .role("button")
         .label(super::copy::tr_ref(language, "Switch computer"))
-        .child(icon_el)
+        .child(rune::icon(glyph, 16.0).color(status_color))
         .child(
-            rune::text(display_name)
+            rune::text(s.computer_name(curr))
                 .font(k.ty.ui_medium)
                 .color(k.c.text_base)
                 .truncate()
@@ -656,12 +657,8 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .child(
             el().size(5.0, 5.0)
                 .radius(2.5)
-                .fill(if s.peer_by_id(curr).is_none_or(|p| p.reachable) {
-                    k.c.success.fg
-                } else {
-                    k.c.warning.fg
-                })
-                .help(status_desc),
+                .fill(status_color)
+                .help(super::copy::tr_ref(language, status)),
         )
         .child(super::art::directional_arrow(
             s,
@@ -710,7 +707,14 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         let reachable = comp.reachable;
         let is_paired = s.is_computer_paired(&cid);
 
-        let desc = if !reachable {
+        let local = matches!(cid.as_str(), "local" | "self");
+        let observed = local || s.peers.iter().any(|p| p.server_id == cid);
+        if !observed && !is_paired {
+            continue;
+        }
+        let desc = if !observed {
+            super::copy::tr(language, "Paired")
+        } else if !reachable {
             super::copy::tr(language, "Offline")
         } else if !is_paired {
             super::copy::tr(language, "Unpaired · Click to link")
@@ -721,7 +725,9 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         };
 
         let target_id = cid.clone();
-        let status_color = if reachable {
+        let status_color = if !observed {
+            k.c.icon_muted
+        } else if reachable {
             k.c.success.fg
         } else {
             k.c.warning.fg
@@ -743,7 +749,16 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         );
     }
 
-    menu.build(k, layer)
+    menu.separator()
+        .item(
+            MenuItem::new(super::copy::tr_ref(language, "Manage computers"))
+                .lead(rune::icon(&super::icons::CONTROLS, 16.0).color(k.c.text_muted))
+                .on_select(|s: &mut UiState| {
+                    s.go(Mode::Settings);
+                    super::settings::open(s, super::SettingsTab::Computers);
+                }),
+        )
+        .build(k, layer)
 }
 
 pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
@@ -1095,6 +1110,42 @@ mod tests {
         }
         assert!(rt.state.search.focused);
         assert_eq!(rt.state.selected, selected);
+    }
+
+    #[test]
+    fn selecting_a_sidebar_session_routes_the_next_paste_to_its_draft() {
+        let (tx, _) = crate::model::commands::channel();
+        let mut state = UiState::new(tx);
+        state.splash = None;
+        let (_, scene) = crate::ui::scenes::scenes()
+            .iter()
+            .find(|(name, _)| *name == "session")
+            .unwrap();
+        scene(&mut state);
+        state.sessions.push(session("paste-target", now_ms()));
+        let mut rt = rune::Runtime::new(
+            state,
+            crate::ui::view,
+            (1280.0, 800.0),
+            rune::Env::new(true, 1.0),
+        );
+        for _ in 0..60 {
+            rt.frame(1.0 / 60.0);
+        }
+        let rect = rt
+            .elements()
+            .into_iter()
+            .find(|n| n.key.as_deref() == Some("session-paste-target"))
+            .unwrap()
+            .rect;
+        let (x, y) = (rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.selected.as_deref(), Some("paste-target"));
+        rt.paste("pasted after switching");
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.draft.text, "pasted after switching");
     }
 
     fn session(id: &str, updated: u64) -> muqun_gateway::agents::AgentSessionInfo {
