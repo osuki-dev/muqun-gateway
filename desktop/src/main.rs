@@ -53,6 +53,10 @@ fn main() -> anyhow::Result<()> {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--plugin-pick-path")) {
         return platform::dialogs::plugin_pick_path(std::env::args_os().skip(2));
     }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--ensure-term-daemon")) {
+        println!("{}", term::daemon::ensure_daemon_running()?.display());
+        return Ok(());
+    }
     if let Some(pos) = std::env::args().position(|a| a == "--term-daemon") {
         let socket_path = std::env::args()
             .nth(pos + 1)

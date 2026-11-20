@@ -29,7 +29,6 @@ pub enum Status {
     Remote,
     Installing,
     Ready,
-    MissingBackend,
     Failed,
     Interrupted,
 }
@@ -41,18 +40,20 @@ impl Status {
             Self::Disabled => "Local-only mode: automatic Gateway installation is disabled.",
             Self::Existing => "An existing Gateway installation was left unchanged.",
             Self::Remote => "Remote computer selected; local Gateway setup was skipped.",
-            Self::Installing => "Installing local Gateway in the background. Local mode remains available.",
+            Self::Installing => {
+                "Installing local Gateway in the background. Local mode remains available."
+            }
             Self::Ready => "Local Gateway is ready. Connect when your current work is finished.",
-            Self::MissingBackend => "Gateway requires tmux or Herdr. Install one, then retry. Local mode remains available.",
-            Self::Failed => "Gateway setup failed or timed out. Local mode remains available; retry when ready.",
-            Self::Interrupted => "A previous Gateway setup did not finish. It will only run again when you retry.",
+            Self::Failed => {
+                "Gateway setup failed or timed out. Local mode remains available; retry when ready."
+            }
+            Self::Interrupted => {
+                "A previous Gateway setup did not finish. It will only run again when you retry."
+            }
         }
     }
     pub fn retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Failed | Self::Interrupted | Self::MissingBackend | Self::Disabled
-        )
+        matches!(self, Self::Failed | Self::Interrupted | Self::Disabled)
     }
 }
 
@@ -301,12 +302,6 @@ fn provision(context: &Context, retry: bool, deadline: Duration) -> Status {
     let Some(installer) = &context.installer else {
         return Status::Unavailable;
     };
-    if !paths
-        .iter()
-        .any(|path| path.join("tmux").is_file() || path.join("herdr").is_file())
-    {
-        return Status::MissingBackend;
-    }
     install_once(context, installer, &paths, retry, deadline, || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

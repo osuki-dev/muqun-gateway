@@ -1394,12 +1394,19 @@ pub fn ensure_daemon_running_at(socket_path: Option<PathBuf>) -> io::Result<Path
         return Ok(path);
     }
 
-    if path.exists() {
-        let _ = std::fs::remove_file(&path);
-    }
-
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
+    }
+    // Setup and a first terminal tab can request the same daemon concurrently.
+    // Hold the startup lock until its socket accepts clients.
+    let startup = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("startup.lock"))?;
+    startup.lock()?;
+    if is_socket_alive(&path) {
+        return Ok(path);
     }
 
     let exe = std::env::current_exe()?;
