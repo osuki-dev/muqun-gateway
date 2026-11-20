@@ -52,7 +52,7 @@ class DesktopInstaller(unittest.TestCase):
             "sh",
             "id",
             "tar",
-            "awk", "wc", "mktemp", "rm", "sha256sum", "unzip", "touch",
+            "awk", "wc", "sleep", "mktemp", "rm", "sha256sum", "unzip", "touch",
             "gzip",
             "cp",
             "mkdir",
@@ -201,6 +201,22 @@ cp "$FIXTURES/$name" "$out"''',
         self.run_installer("--tag", PREVIEW)
         self.confirm_gateway_setup()
         self.assertEqual((self.home / "desktop-starts").read_text(), "--ensure-term-daemon\n")
+
+    def test_tagged_gui_update_reports_measured_download_and_activation(self):
+        asset = self.fixture(PREVIEW)
+        total = (self.files / asset).stat().st_size
+        self.env["MUQUN_INSTALL_PROGRESS"] = "1"
+        def events(result):
+            return [line.removeprefix("MUQUN_PROGRESS ") for line in result.stderr.splitlines()
+                    if line.startswith("MUQUN_PROGRESS ")]
+        records = events(self.run_installer("--tag", PREVIEW))
+        self.assertEqual(records[0], f"download 0 {total}")
+        self.assertEqual(records[-3:], [f"download {total} {total}", "verify", "install"])
+        self.assertFalse((self.home / "gateway-invocations").exists())
+        (self.files / asset).write_bytes(b"broken")
+        records = events(self.run_installer("--tag", PREVIEW, success=False))
+        self.assertEqual(records[-1], "verify")
+        self.assertNotIn("install", records)
 
     def test_archive_with_external_link_fails_before_install(self):
         name = self.fixture(STABLE)

@@ -99,13 +99,51 @@ esac
 umask 077
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/muqun-desktop.XXXXXXXX")
 trap 'rm -rf "$tmp"' EXIT
-trap 'exit 1' HUP INT TERM
+transfer=
+cancel() {
+  if [ -n "$transfer" ]; then
+    kill "$transfer" 2>/dev/null || :
+    wait "$transfer" 2>/dev/null || :
+  fi
+  exit 1
+}
+trap cancel HUP INT TERM
+progress() {
+  if [ "${MUQUN_INSTALL_PROGRESS:-}" = 1 ]; then
+    printf 'MUQUN_PROGRESS %s\n' "$*" >&2
+  fi
+}
+download_sample() {
+  received=0
+  if [ -f "$1" ]; then received=$(wc -c < "$1"); fi
+  received=$((received + 0))
+  if [ "$received" != "$previous" ]; then
+    progress download "$received" "$2"
+    previous=$received
+  fi
+}
 fetch() {
   meter=--silent
   if [ -t 2 ] && [ "${4:-}" = package ]; then meter=--progress-bar; fi
-  curl -fSL "$meter" --proto '=https' --proto-redir '=https' --retry 2 --connect-timeout 15 \
-    --max-time 300 --max-filesize "$3" -o "$2" "$1" || die "Cannot download $1"
-  [ "$(wc -c < "$2")" -le "$3" ] || die "Download exceeds size limit: $1"
+  url=$1 output=$2 limit=$3 kind=${4:-}
+  set -- -fSL "$meter" --proto '=https' --proto-redir '=https' --retry 2 --connect-timeout 15 \
+    --max-time 300 --max-filesize "$limit" -o "$output" "$url"
+  if [ "${MUQUN_INSTALL_PROGRESS:-}" = 1 ] && [ "$kind" = package ]; then
+    previous=
+    download_sample "$output" "$limit"
+    curl "$@" &
+    transfer=$!
+    while kill -0 "$transfer" 2>/dev/null; do
+      download_sample "$output" "$limit"
+      sleep 0.25
+    done
+    wait "$transfer" || die "Cannot download $url"
+    transfer=
+    download_sample "$output" "$limit"
+  else
+    curl "$@" || die "Cannot download $url"
+  fi
+  [ "$(wc -c < "$output")" -le "$limit" ] || die "Download exceeds size limit: $url"
 }
 if [ -z "$tag" ]; then
   channel=${channel:-stable}
@@ -151,8 +189,10 @@ LC_ALL=C awk -v digest="$digest" -v file="$archive" '
   END {exit !(NR == 1 && !bad)}' "$tmp/checksum" || die "Checksum verification failed for $archive"
 printf 'Downloading %s (%s bytes)\n' "$archive" "$bytes"
 fetch "$base/$archive" "$tmp/$archive" "$bytes" package
+progress verify
 verify "$tmp/$archive" "$bytes" "$digest"
 printf '%s  %s  SHA-256 verified: %s\n' "$tag" "$archive" "$measured"
+progress install
 # Extract only the installer executable to a private file. The verified
 # executable validates all archive members before staging the package.
 if [ "$system" = Linux ]; then
