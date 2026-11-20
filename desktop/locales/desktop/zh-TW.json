@@ -909,5 +909,21 @@
   "Local Gateway is ready. Connect when your current work is finished.": "本機 Gateway 已就緒，請在完成目前工作後連線。",
   "Gateway requires tmux or Herdr. Install one, then retry. Local mode remains available.": "Gateway 需要 tmux 或 Herdr。安裝其中一個後重試；本機模式仍可使用。",
   "Gateway setup failed or timed out. Local mode remains available; retry when ready.": "Gateway 設定失敗或逾時；本機模式仍可使用，可稍後重試。",
-  "A previous Gateway setup did not finish. It will only run again when you retry.": "上次 Gateway 設定未完成；只有手動重試後才會再次執行。"
+  "A previous Gateway setup did not finish. It will only run again when you retry.": "上次 Gateway 設定未完成；只有手動重試後才會再次執行。",
+  "Install Muqun Gateway?": "安裝 Muqun Gateway？",
+  "Gateway is ready": "Gateway 已就緒",
+  "Gateway setup needs attention": "Gateway 設定需要處理",
+  "Installing Muqun Gateway": "正在安裝 Muqun Gateway",
+  "Connect your phone and other computers to this Desktop. You can also install Gateway later in Settings → Diagnostics.": "安裝後即可將手機和其他電腦連接到本機。你也可以稍後在「設定 → 診斷」中安裝 Gateway。",
+  "This computer is ready to pair.": "現在可以配對這台電腦。",
+  "Later": "稍後",
+  "Download & install": "下載並安裝",
+  "Show progress": "查看進度",
+  "Install Gateway to connect your devices to this computer.": "安裝 Gateway 即可將裝置連接到本機。",
+  "Gateway setup is available when you are ready.": "你可以隨時安裝 Gateway。",
+  "Preparing Gateway setup…": "正在準備安裝 Gateway…",
+  "Downloading Gateway…": "正在下載 Gateway…",
+  "Verifying the Gateway download…": "正在驗證 Gateway 下載檔案…",
+  "Installing Gateway…": "正在安裝 Gateway…",
+  "Starting Gateway…": "正在啟動 Gateway…"
 }

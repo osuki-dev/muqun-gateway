@@ -909,5 +909,21 @@
   "Local Gateway is ready. Connect when your current work is finished.": "ローカル Gateway の準備ができました。現在の作業が終わってから接続してください。",
   "Gateway requires tmux or Herdr. Install one, then retry. Local mode remains available.": "Gateway には tmux または Herdr が必要です。いずれかをインストールしてから再試行してください。ローカルモードは引き続き使用できます。",
   "Gateway setup failed or timed out. Local mode remains available; retry when ready.": "Gateway のセットアップに失敗したか、タイムアウトしました。ローカルモードは引き続き使用できます。準備ができたら再試行してください。",
-  "A previous Gateway setup did not finish. It will only run again when you retry.": "前回の Gateway セットアップは完了していません。再試行するまで自動では実行されません。"
+  "A previous Gateway setup did not finish. It will only run again when you retry.": "前回の Gateway セットアップは完了していません。再試行するまで自動では実行されません。",
+  "Install Muqun Gateway?": "Muqun Gateway をインストールしますか？",
+  "Gateway is ready": "Gateway の準備ができました",
+  "Gateway setup needs attention": "Gateway の設定を確認してください",
+  "Installing Muqun Gateway": "Muqun Gateway をインストール中",
+  "Connect your phone and other computers to this Desktop. You can also install Gateway later in Settings → Diagnostics.": "スマートフォンやほかのパソコンをこのデスクトップに接続できます。Gateway は後から「設定 → 診断」でもインストールできます。",
+  "This computer is ready to pair.": "このパソコンをペアリングできます。",
+  "Later": "後で",
+  "Download & install": "ダウンロードしてインストール",
+  "Show progress": "進捗を表示",
+  "Install Gateway to connect your devices to this computer.": "Gateway をインストールすると、デバイスをこのパソコンに接続できます。",
+  "Gateway setup is available when you are ready.": "Gateway はいつでも設定できます。",
+  "Preparing Gateway setup…": "Gateway のインストールを準備中…",
+  "Downloading Gateway…": "Gateway をダウンロード中…",
+  "Verifying the Gateway download…": "ダウンロードした Gateway を検証中…",
+  "Installing Gateway…": "Gateway をインストール中…",
+  "Starting Gateway…": "Gateway を起動中…"
 }

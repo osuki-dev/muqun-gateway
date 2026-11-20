@@ -909,5 +909,21 @@
   "Local Gateway is ready. Connect when your current work is finished.": "Local Gateway is ready. Connect when your current work is finished.",
   "Gateway requires tmux or Herdr. Install one, then retry. Local mode remains available.": "Gateway requires tmux or Herdr. Install one, then retry. Local mode remains available.",
   "Gateway setup failed or timed out. Local mode remains available; retry when ready.": "Gateway setup failed or timed out. Local mode remains available; retry when ready.",
-  "A previous Gateway setup did not finish. It will only run again when you retry.": "A previous Gateway setup did not finish. It will only run again when you retry."
+  "A previous Gateway setup did not finish. It will only run again when you retry.": "A previous Gateway setup did not finish. It will only run again when you retry.",
+  "Install Muqun Gateway?": "Install Muqun Gateway?",
+  "Gateway is ready": "Gateway is ready",
+  "Gateway setup needs attention": "Gateway setup needs attention",
+  "Installing Muqun Gateway": "Installing Muqun Gateway",
+  "Connect your phone and other computers to this Desktop. You can also install Gateway later in Settings → Diagnostics.": "Connect your phone and other computers to this Desktop. You can also install Gateway later in Settings → Diagnostics.",
+  "This computer is ready to pair.": "This computer is ready to pair.",
+  "Later": "Later",
+  "Download & install": "Download & install",
+  "Show progress": "Show progress",
+  "Install Gateway to connect your devices to this computer.": "Install Gateway to connect your devices to this computer.",
+  "Gateway setup is available when you are ready.": "Gateway setup is available when you are ready.",
+  "Preparing Gateway setup…": "Preparing Gateway setup…",
+  "Downloading Gateway…": "Downloading Gateway…",
+  "Verifying the Gateway download…": "Verifying the Gateway download…",
+  "Installing Gateway…": "Installing Gateway…",
+  "Starting Gateway…": "Starting Gateway…"
 }

@@ -909,5 +909,21 @@
   "Local Gateway is ready. Connect when your current work is finished.": "Le Gateway local est prêt. Connectez-le après avoir terminé votre travail en cours.",
   "Gateway requires tmux or Herdr. Install one, then retry. Local mode remains available.": "Gateway nécessite tmux ou Herdr. Installez l’un des deux, puis réessayez. Le mode local reste disponible.",
   "Gateway setup failed or timed out. Local mode remains available; retry when ready.": "La configuration du Gateway a échoué ou a dépassé le délai. Le mode local reste disponible ; réessayez quand vous le souhaitez.",
-  "A previous Gateway setup did not finish. It will only run again when you retry.": "Une configuration précédente du Gateway n’a pas abouti. Elle ne sera relancée que si vous réessayez."
+  "A previous Gateway setup did not finish. It will only run again when you retry.": "Une configuration précédente du Gateway n’a pas abouti. Elle ne sera relancée que si vous réessayez.",
+  "Install Muqun Gateway?": "Installer Muqun Gateway ?",
+  "Gateway is ready": "Gateway est prêt",
+  "Gateway setup needs attention": "Vérifiez l’installation de Gateway",
+  "Installing Muqun Gateway": "Installation de Muqun Gateway",
+  "Connect your phone and other computers to this Desktop. You can also install Gateway later in Settings → Diagnostics.": "Connectez votre téléphone et d’autres ordinateurs à ce poste. Vous pourrez aussi installer Gateway dans Paramètres → Diagnostic.",
+  "This computer is ready to pair.": "Cet ordinateur est prêt pour le jumelage.",
+  "Later": "Plus tard",
+  "Download & install": "Télécharger et installer",
+  "Show progress": "Voir la progression",
+  "Install Gateway to connect your devices to this computer.": "Installez Gateway pour connecter vos appareils à cet ordinateur.",
+  "Gateway setup is available when you are ready.": "Vous pouvez installer Gateway à tout moment.",
+  "Preparing Gateway setup…": "Préparation de l’installation de Gateway…",
+  "Downloading Gateway…": "Téléchargement de Gateway…",
+  "Verifying the Gateway download…": "Vérification du téléchargement de Gateway…",
+  "Installing Gateway…": "Installation de Gateway…",
+  "Starting Gateway…": "Démarrage de Gateway…"
 }

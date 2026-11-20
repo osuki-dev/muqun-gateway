@@ -10,9 +10,11 @@ pub(crate) mod art;
 mod composer;
 mod composer_row;
 pub mod copy;
+mod download_panel;
 mod dwindle;
 mod echo;
 pub mod fx;
+mod gateway_setup;
 mod home;
 pub mod i18n;
 pub(crate) mod icons;
@@ -599,6 +601,7 @@ pub struct UiState {
     forgotten_computers: HashSet<String>,
     pub local_revoke: settings::revoke_device::State,
     pub(crate) local_invite: Option<settings::local_devices::InvitePanel>,
+    pub gateway_setup: Option<crate::platform::gateway_bootstrap::Status>,
     pub desktop_update: crate::platform::update::Status,
     pub local_pairings: crate::platform::paired_devices::List,
     pub(crate) plugin_packages: package_activity::PackageActivity,
@@ -854,6 +857,7 @@ impl UiState {
             plugin_fields: HashMap::new(),
             diagnostic_filter: Default::default(),
             local_invite: None,
+            gateway_setup: None,
             desktop_update: Default::default(),
             local_pairings: Default::default(),
             local_revoke: Default::default(),
@@ -3978,18 +3982,7 @@ impl UiState {
                 self.local_revoke.cancel_confirmation();
                 self.local_pairings = devices;
             }
-            UiAction::LocalGatewayStatus(status) => {
-                let language = self.cfg.general.language;
-                self.notify(
-                    if status == crate::platform::gateway_bootstrap::Status::Failed {
-                        ToastLevel::Error
-                    } else {
-                        ToastLevel::Info
-                    },
-                    copy::tr(language, "Local Gateway setup"),
-                    Some(copy::tr(language, status.message())),
-                );
-            }
+            UiAction::LocalGatewayStatus(status) => self.receive_gateway_setup(status),
             UiAction::LocalGatewayReady => {
                 // Never displace a remote computer, open session, terminal or
                 // pending/unfinished work when background setup completes.
@@ -4473,7 +4466,9 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
         );
     }
     parts::pane::row_menu(s, &k, &mut layer);
-    welcome::mount(s, &k, &mut layer);
+    if s.gateway_setup.is_none() {
+        welcome::mount(s, &k, &mut layer);
+    }
     if let (Some(splash), Some(images)) = (s.splash.as_ref(), s.images.as_ref()) {
         if let Some(stage) = splash.view(images, &k, &s.look(), scheme) {
             layer.push(stage);
@@ -4482,6 +4477,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     palette::mount(s, &k, &mut layer);
     shortcuts::mount(s, &k, &mut layer);
     pair_computer::mount(s, &k, &mut layer);
+    gateway_setup::mount(s, &k, &mut layer);
     if s.error.is_some() || !s.toasts.is_empty() {
         layer.push(notifications::region(s, &k));
     }
@@ -4525,8 +4521,12 @@ pub fn spawn_inbox_pump(inbox: Arc<Inbox>, handle: rune::AppHandle<UiState>) {
                         .unwrap_or_default()
                 };
                 let before = questions(s);
+                let previous = s.gateway_setup.clone();
                 s.apply_updates(batch);
-                if !s.cfg.appearance.reduced_motion && before != questions(s) {
+                if !s.cfg.appearance.reduced_motion
+                    && !s.system_reduced_motion.get()
+                    && (before != questions(s) || previous != s.gateway_setup)
+                {
                     tx.animated();
                 }
             });

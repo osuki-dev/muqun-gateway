@@ -61,10 +61,27 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
         rune::row()
             .gap(8.0)
             .child(
-                super::button(tr("Retry Gateway setup"))
-                    .disabled(local_only || !gateway.retryable() || s.current_computer() != "local")
-                    .on_press(|s: &mut UiState| crate::platform::gateway_bootstrap::retry(&s.cfg))
-                    .build(k),
+                super::button(tr(if super::super::gateway_setup::running(&gateway) {
+                    "Show progress"
+                } else if matches!(
+                    gateway,
+                    crate::platform::gateway_bootstrap::Status::NeedsConsent
+                        | crate::platform::gateway_bootstrap::Status::Deferred
+                ) {
+                    "Install"
+                } else {
+                    "Retry Gateway setup"
+                }))
+                .disabled(
+                    local_only
+                        || (!gateway.retryable()
+                            && !super::super::gateway_setup::running(&gateway))
+                        || s.current_computer() != "local",
+                )
+                .on_press(|s: &mut UiState| {
+                    s.show_gateway_setup(crate::platform::gateway_bootstrap::status())
+                })
+                .build(k),
             )
             .child(
                 super::button(tr("Connect local Gateway"))
