@@ -1338,7 +1338,7 @@ impl TaskService {
         by: Requested,
         request: DelegateRequest,
     ) -> Result<TaskView, TaskError> {
-        self.delegate_in_session(state, by, request, None, None)
+        self.delegate_in_session(state, by, request, None, None, false)
             .await
     }
 
@@ -1349,6 +1349,7 @@ impl TaskService {
         request: DelegateRequest,
         existing: Option<&str>,
         display_goal: Option<&str>,
+        auto_approve: bool,
     ) -> Result<TaskView, TaskError> {
         if !is_self(
             request.machine.as_deref(),
@@ -1564,6 +1565,16 @@ impl TaskService {
                 request.mode.as_deref(),
             )
             .await;
+        }
+        if auto_approve {
+            if let Err(error) = manager.agent().set_auto_approve(&asid.0, true).await {
+                tracing::debug!(
+                    %error,
+                    agent_id,
+                    asid = %asid.0,
+                    "auto-approve not applied for orchestration session"
+                );
+            }
         }
         let binding = TaskBinding::AgentSession {
             agent_id: agent_id.to_owned(),

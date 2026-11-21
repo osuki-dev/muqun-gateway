@@ -32,6 +32,10 @@ fn request() -> Start {
         mode: None,
         reviewer: None,
         max_review_rounds: None,
+        computer_ids: vec![],
+        mentions: vec![],
+        machine: None,
+        auto_approve: None,
     }
 }
 
@@ -481,5 +485,192 @@ fn discovers_and_tracks_multiple_git_repositories_in_workspace() {
     assert!(paths.contains(&"app/client.ts"), "{paths:?}");
     assert!(summary.contains("Repository: gateway"));
     assert!(summary.contains("Repository: app"));
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn extract_timeline_evidence_captures_mcp_and_tool_file_changes() {
+    use crate::agents::domain::{AgentPart, ToolCall, ToolCallStatus, ToolTime};
+
+    let parts = vec![
+        AgentPart::Tool(ToolCall {
+            id: "tc-1".into(),
+            name: "edit".into(),
+            title: Some("Apply cross-repo patch".into()),
+            input: json!({}),
+            output: Some(json!("ok")),
+            content: None,
+            metadata: Some(json!({
+                "files": [{
+                    "path": "/remote/repo/app.ts",
+                    "additions": 4,
+                    "deletions": 1,
+                    "diff": "+export const remoteReady = true;\n"
+                }]
+            })),
+            state: ToolCallStatus::Completed,
+            status: ToolCallStatus::Completed,
+            error: None,
+            child_session_id: None,
+            background: false,
+            input_partial: None,
+            truncated: false,
+            time: ToolTime::default(),
+        }),
+        AgentPart::Tool(ToolCall {
+            id: "tc-2".into(),
+            name: "muqun_tasks_delegate".into(),
+            title: Some("Delegate remote mac test".into()),
+            input: json!({"goal": "Run cargo test on mac-mini"}),
+            output: Some(json!({"task_id": "t_remote_1", "state": "done"})),
+            content: None,
+            metadata: Some(json!({"exitCode": 0})),
+            state: ToolCallStatus::Completed,
+            status: ToolCallStatus::Completed,
+            error: None,
+            child_session_id: None,
+            background: false,
+            input_partial: None,
+            truncated: false,
+            time: ToolTime::default(),
+        }),
+        AgentPart::Diff {
+            file: String::new(),
+            diff: "+aggregated\n".into(),
+        },
+        AgentPart::Shell {
+            shell_id: "sh-1".into(),
+            command: "bun test".into(),
+            status: "completed".into(),
+            exit: Some(0.0),
+            output: Some("2 pass".into()),
+            truncated: false,
+        },
+    ];
+
+    let (files, summary) = super::extract_timeline_evidence(parts.iter());
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "/remote/repo/app.ts");
+    assert_eq!(files[0].additions, 4);
+    assert_eq!(files[0].deletions, 1);
+
+    let mut merged = vec![super::ChangedFile {
+        path: "repo/app.ts".into(),
+        additions: 2,
+        deletions: 1,
+    }];
+    super::merge_changed_files("/remote", &mut merged, files);
+    super::merge_changed_files(
+        "/remote",
+        &mut merged,
+        vec![super::ChangedFile {
+            path: String::new(),
+            additions: 99,
+            deletions: 99,
+        }],
+    );
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].path, "repo/app.ts");
+    assert_eq!(merged[0].additions, 4);
+    assert_eq!(merged[0].deletions, 1);
+    assert!(summary.contains("Session Tool & MCP Execution Evidence"));
+    assert!(summary.contains("muqun_tasks_delegate"));
+    assert!(summary.contains("remoteReady"));
+    assert!(summary.contains("bun test"));
+}
+
+#[tokio::test]
+async fn remote_peer_child_task_prevents_skipping_review_when_local_git_empty() {
+    let state = state();
+    let agent = FakeAgent::new("opencode").with_sessions(&[("coder-s", 1), ("rev-s", 2)]);
+    let prompts = agent.prompts.clone();
+    state.agent_runtime.attach_for_test(agent.manager()).await;
+
+    let ws = crate::test_state_dir().join(format!("non-git-remote-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&ws).unwrap();
+    let mut req = request();
+    req.cwd = ws.to_string_lossy().into_owned();
+    req.asid = Some("coder-s".into());
+    req.reviewer = Some(ReviewerSpec {
+        agent: "opencode".into(),
+        model: None,
+        variant: None,
+    });
+    let (status, created) = call(&state, "token", "POST", "/api/orchestrations", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let run_id = created["run"]["id"].as_str().unwrap().to_string();
+    let root_tid = created["tasks"][0]["task_id"].as_str().unwrap().to_string();
+
+    // Mark coder done and insert a remote Peer child task delegated via Muqun MCP.
+    let task_store = SqliteTaskStore::new(state.db.clone());
+    task_store
+        .insert(&Task {
+            id: TaskId("t_peer_child".into()),
+            kind: TaskKind::Delegation,
+            goal: "Run verification on remote build Mac".into(),
+            cwd: None,
+            binding: TaskBinding::Peer {
+                peer_id: "peer-1".into(),
+                peer_server_id: "srv-mac".into(),
+                remote_task_id: "t_remote_99".into(),
+                peer_name: "Mac-Build".into(),
+            },
+            state: TaskState::Done,
+            summary: Some("All remote tests passed on Mac-Build".into()),
+            exit_code: Some(0),
+            created_by: TaskPrincipal {
+                kind: PrincipalKind::Device,
+                id: "owner".into(),
+            },
+            created_ms: 10,
+            updated_ms: 20,
+            seq: 1,
+            parent: Some(TaskId(root_tid.clone())),
+            origin: TaskOrigin::Device,
+            label: Some("remote-check".into()),
+            requester_name: None,
+            session_title: None,
+            mentions: vec!["Mac-Build".into()],
+            client_ref: None,
+            requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
+        })
+        .await
+        .unwrap();
+    task_store
+        .transition(
+            &TaskId(root_tid.clone()),
+            crate::tasks::domain::TaskChange {
+                reopen: false,
+                reopen_count: None,
+                reopened_ms: None,
+                expected_seq: None,
+                to: TaskState::Done,
+                source: "test".into(),
+                note: None,
+                summary: Some("Delegated work to Mac-Build via MCP".into()),
+                exit_code: Some(0),
+                binding: None,
+                session_title: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let path = format!("/api/orchestrations/{run_id}");
+    let (status, fetched) = call(&state, "token", "GET", &path, Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    assert_eq!(fetched["mao_phase"], "reviewing");
+
+    let captured_prompts = prompts.lock().unwrap();
+    let review_prompt = captured_prompts
+        .iter()
+        .find(|p| p.contains("Read-Only Code Reviewer"))
+        .expect("reviewer must be triggered even without local git diff");
+    assert!(review_prompt.contains("Muqun MCP & Remote Computer Tasks"));
+    assert!(review_prompt.contains("Mac-Build"));
+    assert!(review_prompt.contains("All remote tests passed on Mac-Build"));
+    drop(captured_prompts);
     let _ = std::fs::remove_dir_all(&ws);
 }

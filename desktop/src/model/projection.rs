@@ -1155,67 +1155,116 @@ impl Core {
                         Vec::new()
                     };
                     let has_local_git = !repos.is_empty() || !base_commits.is_empty();
-                    if ((base_commit.is_none() && base_commits.is_empty()) || !has_local_git)
-                        && !coder_asid.starts_with("new-")
-                    {
+
+                    if allow_local_git && has_local_git {
+                        let cwd_clone = cwd.trim().to_string();
+                        let goal_clone = goal.clone();
+                        let base_map = base_commits.clone();
+                        let base = base_commit.clone();
+                        if let Ok((local_files, local_diff)) =
+                            tokio::task::spawn_blocking(move || {
+                                muqun_gateway::orchestration::collect_local_repos_diff(
+                                    &cwd_clone,
+                                    &goal_clone,
+                                    &base_map,
+                                    base.as_deref(),
+                                )
+                            })
+                            .await
+                        {
+                            let mut merged: Vec<muqun_gateway::orchestration::ChangedFile> =
+                                Vec::new();
+                            muqun_gateway::orchestration::merge_changed_files(
+                                &cwd,
+                                &mut merged,
+                                local_files,
+                            );
+                            summary = local_diff;
+                            changed_files = merged
+                                .into_iter()
+                                .map(|f| (f.path, f.additions, f.deletions))
+                                .collect();
+                        }
+                    }
+
+                    if !coder_asid.starts_with("new-") {
                         if let Ok(Ok(files)) = tokio::time::timeout(
                             LIST_TIMEOUT,
                             hub.vcs_diff(&AgentSessionId(coder_asid.clone())),
                         )
                         .await
                         {
-                            if !files.is_empty() {
-                                summary.push_str("Changed files (from session diff):\n");
-                                for f in files.iter().take(32) {
-                                    changed_files.push((f.path.clone(), f.additions, f.deletions));
-                                    summary.push_str(&format!(
-                                        "- {} (+{} -{})\n",
-                                        f.path, f.additions, f.deletions
-                                    ));
-                                }
-                                if files.len() > 32 {
-                                    summary.push_str(&format!(
-                                        "... and {} more file(s)\n",
-                                        files.len() - 32
-                                    ));
-                                }
-                                let mut patches = String::new();
-                                for f in &files {
-                                    if f.patch.trim().is_empty() {
-                                        continue;
+                            let non_empty: Vec<_> =
+                                files.iter().filter(|f| !f.path.trim().is_empty()).collect();
+                            if !non_empty.is_empty() {
+                                let prev_count = changed_files.len();
+                                let mut merged: Vec<muqun_gateway::orchestration::ChangedFile> =
+                                    changed_files
+                                        .into_iter()
+                                        .map(|(path, additions, deletions)| {
+                                            muqun_gateway::orchestration::ChangedFile {
+                                                path,
+                                                additions,
+                                                deletions,
+                                            }
+                                        })
+                                        .collect();
+                                let incoming = non_empty
+                                    .iter()
+                                    .take(32)
+                                    .map(|f| muqun_gateway::orchestration::ChangedFile {
+                                        path: f.path.clone(),
+                                        additions: f.additions,
+                                        deletions: f.deletions,
+                                    })
+                                    .collect();
+                                muqun_gateway::orchestration::merge_changed_files(
+                                    &cwd,
+                                    &mut merged,
+                                    incoming,
+                                );
+                                changed_files = merged
+                                    .into_iter()
+                                    .map(|f| (f.path, f.additions, f.deletions))
+                                    .collect();
+                                if summary.trim().is_empty() || changed_files.len() > prev_count {
+                                    if !summary.is_empty() {
+                                        summary.push('\n');
                                     }
-                                    let entry = format!("\n--- {}\n{}", f.path, f.patch);
-                                    if patches.len() + entry.len() > 10_000 {
-                                        break;
+                                    summary.push_str("Changed files (from session diff):\n");
+                                    for f in non_empty.iter().take(32) {
+                                        summary.push_str(&format!(
+                                            "- {} (+{} -{})\n",
+                                            muqun_gateway::orchestration::normalize_changed_path(
+                                                &cwd, &f.path,
+                                            ),
+                                            f.additions,
+                                            f.deletions
+                                        ));
                                     }
-                                    patches.push_str(&entry);
-                                }
-                                if !patches.is_empty() {
-                                    summary.push_str("\nDiff excerpt:\n");
-                                    summary.push_str(&patches);
+                                    if non_empty.len() > 32 {
+                                        summary.push_str(&format!(
+                                            "... and {} more file(s)\n",
+                                            non_empty.len() - 32
+                                        ));
+                                    }
+                                    let mut patches = String::new();
+                                    for f in non_empty {
+                                        if f.patch.trim().is_empty() {
+                                            continue;
+                                        }
+                                        let entry = format!("\n--- {}\n{}", f.path, f.patch);
+                                        if patches.len() + entry.len() > 10_000 {
+                                            break;
+                                        }
+                                        patches.push_str(&entry);
+                                    }
+                                    if !patches.is_empty() {
+                                        summary.push_str("\nDiff excerpt:\n");
+                                        summary.push_str(&patches);
+                                    }
                                 }
                             }
-                        }
-                    }
-
-                    if summary.is_empty() && allow_local_git && has_local_git {
-                        let cwd_clone = cwd.trim().to_string();
-                        if let Ok((local_files, local_diff)) =
-                            tokio::task::spawn_blocking(move || {
-                                muqun_gateway::orchestration::collect_local_repos_diff(
-                                    &cwd_clone,
-                                    &goal,
-                                    &base_commits,
-                                    base_commit.as_deref(),
-                                )
-                            })
-                            .await
-                        {
-                            summary = local_diff;
-                            changed_files = local_files
-                                .into_iter()
-                                .map(|f| (f.path, f.additions, f.deletions))
-                                .collect();
                         }
                     }
 
@@ -1325,6 +1374,17 @@ impl Core {
                 }
             }
         };
+        if self.config.get().ui.mao.enabled {
+            let shown = match self.hub.set_auto_approve(&asid, true).await {
+                Ok(now) => Some(now),
+                Err(_) => self.hub.auto_approve(&asid).await.ok(),
+            };
+            self.inbox
+                .push(Update::Composer(Box::new(ComposerUpdate::AutoApprove {
+                    asid: asid.0.clone(),
+                    enabled: shown,
+                })));
+        }
         let result = compose::deliver(
             self.hub.as_ref(),
             &asid,

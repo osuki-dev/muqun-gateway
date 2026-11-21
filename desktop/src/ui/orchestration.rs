@@ -854,6 +854,17 @@ fn toggle_enabled(s: &mut UiState, slot: Slot) {
                 model: role.model,
             });
         }
+        if let Some(asid) = s.selected.clone() {
+            if !asid.starts_with("new-") {
+                s.auto_approve.insert(asid.clone(), true);
+                s.send(Command::Compose(
+                    crate::model::compose::ComposeCommand::SetAutoApprove {
+                        asid: AgentSessionId(asid),
+                        enabled: true,
+                    },
+                ));
+            }
+        }
     }
     save_mao_prefs(s, next);
 }
@@ -989,6 +1000,8 @@ pub fn on_session_submitted(s: &mut UiState, asid: &str, prompt: &str) {
     {
         return;
     }
+
+    s.auto_approve.insert(asid.to_string(), true);
 
     let now = now_ms();
     let lang = s.cfg.general.language;
@@ -1160,6 +1173,7 @@ pub fn on_session_created(s: &mut UiState, token: u64, info: &AgentSessionInfo) 
         }
     }
     if matched {
+        s.auto_approve.insert(real_id, true);
         s.sync_watch();
         persist_runs(s);
     }
@@ -1546,7 +1560,7 @@ pub fn on_session_status(s: &mut UiState, asid: &str, status: AgentSessionStatus
 pub fn on_review_ready(
     s: &mut UiState,
     run_id: &str,
-    diff_summary: String,
+    mut diff_summary: String,
     files: Vec<(String, usize, usize)>,
 ) {
     let lang = s.cfg.general.language;
@@ -1554,6 +1568,43 @@ pub fn on_review_ready(
     let Some(idx) = s.orchestration.runs.iter().position(|r| r.id == run_id) else {
         return;
     };
+    let (coder_id_lookup, run_cwd_lookup) = {
+        let run = &s.orchestration.runs[idx];
+        (run.coder_asid.clone(), run.cwd.clone())
+    };
+    let mut merged: Vec<muqun_gateway::orchestration::ChangedFile> = Vec::new();
+    let incoming_files = files
+        .into_iter()
+        .map(
+            |(path, additions, deletions)| muqun_gateway::orchestration::ChangedFile {
+                path,
+                additions,
+                deletions,
+            },
+        )
+        .collect();
+    muqun_gateway::orchestration::merge_changed_files(&run_cwd_lookup, &mut merged, incoming_files);
+    if let Some(tl) = s.timelines.get(&coder_id_lookup) {
+        let (tl_files, tl_evidence) = muqun_gateway::orchestration::extract_timeline_evidence(
+            tl.items.iter().map(|i| &i.part),
+        );
+        muqun_gateway::orchestration::merge_changed_files(&run_cwd_lookup, &mut merged, tl_files);
+        if !tl_evidence.trim().is_empty()
+            && (diff_summary.trim().is_empty()
+                || tl_evidence.contains("tasks.")
+                || tl_evidence.contains("exec.")
+                || tl_evidence.contains("muqun"))
+        {
+            if !diff_summary.trim().is_empty() {
+                diff_summary.push_str("\n\n");
+            }
+            diff_summary.push_str(tl_evidence.trim());
+        }
+    }
+    let files: Vec<(String, usize, usize)> = merged
+        .into_iter()
+        .map(|f| (f.path, f.additions, f.deletions))
+        .collect();
     let (
         coder_asid,
         existing_rev,
@@ -1774,7 +1825,7 @@ fn build_review_prompt(
     prev_findings: &[MaoFinding],
 ) -> String {
     let diff_block = if diff_summary.trim().is_empty() {
-        "(No git diff returned cleanly from session; inspect workspace files and recent edits directly before concluding.)"
+        "(No local git diff returned cleanly; check remote/MCP task evidence, session tool logs, or workspace files before concluding.)"
     } else {
         diff_summary.trim()
     };
@@ -1799,13 +1850,14 @@ fn build_review_prompt(
     format!(
         "You are the designated **Read-Only Code Reviewer** in an automated Coder ⇄ Reviewer pipeline (Review Round {round}/{max_rounds}).\n\n\
          STRICT RULES:\n\
-         - Read-only verifier: NEVER edit, create, delete, or commit source files in the workspace. Only read files/diffs and run read-only verification checks or tests.\n\
-         - NEVER ask interactive questions or wait for user confirmation; make a decisive verdict from the diff and read-only checks.\n\
+         - Read-only verifier: NEVER edit, create, delete, or commit source files in the workspace. Only read files/diffs/task outputs and run read-only verification checks or tests.\n\
+         - Tasks in Muqun may modify single/multiple local git repos, external filesystem paths, OR remote linked computers via Muqun MCP (`tasks.delegate`, `exec.run`). NEVER assume no work happened just because local `git diff` is empty when MCP/remote execution evidence or tool logs show real changes or test results.\n\
+         - NEVER ask interactive questions or wait for user confirmation; make a decisive verdict from the evidence and read-only checks.\n\
          - Check for correctness bugs, edge cases, regressions, security issues, missing tests, and violations of project rules.\n\n\
          User task goal:\n{goal}\n\n\
          {delta_section}\
          Coder summary:\n{coder_summary}\n\n\
-         Working tree changes / Git diff:\n{diff_block}\n\n\
+         Changed files / Execution evidence:\n{diff_block}\n\n\
          Output format:\n\
          - Provide a concise review summary first.\n\
          - For each concrete issue found, include one line formatted exactly as:\n\

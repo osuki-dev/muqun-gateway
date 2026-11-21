@@ -40,6 +40,14 @@ struct Start {
     reviewer: Option<ReviewerSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_review_rounds: Option<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) computer_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) mentions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) machine: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) auto_approve: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,6 +390,235 @@ pub fn collect_local_repos_diff(
     (all_files, combined)
 }
 
+pub fn extract_timeline_evidence<'a, I>(parts: I) -> (Vec<ChangedFile>, String)
+where
+    I: IntoIterator<Item = &'a crate::agents::domain::timeline::AgentPart>,
+{
+    use crate::agents::domain::{AgentPart, ToolCallStatus};
+    use std::collections::BTreeMap;
+
+    let mut files_map: BTreeMap<String, ChangedFile> = BTreeMap::new();
+    let mut tool_lines: Vec<String> = Vec::new();
+    let mut diff_snippets: Vec<String> = Vec::new();
+    let mut snippet_bytes = 0usize;
+
+    for part in parts {
+        match part {
+            AgentPart::Tool(tc) => {
+                if let Some(meta_files) = tc
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("files"))
+                    .and_then(|v| v.as_array())
+                {
+                    for item in meta_files {
+                        let Some(path) = item
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        else {
+                            continue;
+                        };
+                        let additions =
+                            item.get("additions").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        let deletions =
+                            item.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        let entry =
+                            files_map
+                                .entry(path.to_string())
+                                .or_insert_with(|| ChangedFile {
+                                    path: path.to_string(),
+                                    additions: 0,
+                                    deletions: 0,
+                                });
+                        entry.additions = entry.additions.max(additions);
+                        entry.deletions = entry.deletions.max(deletions);
+
+                        if snippet_bytes < 5000 {
+                            if let Some(diff) = item.get("diff").and_then(|v| v.as_str()) {
+                                let trimmed = diff.trim();
+                                if !trimmed.is_empty() {
+                                    let excerpt = concise_excerpt(trimmed, 1200);
+                                    snippet_bytes += excerpt.len();
+                                    diff_snippets.push(format!("--- {path}\n{excerpt}"));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if matches!(tc.state, ToolCallStatus::Completed | ToolCallStatus::Failed)
+                    && tool_lines.len() < 24
+                {
+                    let status_label = match tc.state {
+                        ToolCallStatus::Completed => "ok",
+                        ToolCallStatus::Failed => "failed",
+                        _ => "pending",
+                    };
+                    let cmd_or_title = tc
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("command").and_then(|v| v.as_str()))
+                        .or_else(|| tc.input.get("command").and_then(|v| v.as_str()))
+                        .or_else(|| tc.input.get("goal").and_then(|v| v.as_str()))
+                        .or(tc.title.as_deref())
+                        .unwrap_or("");
+                    let exit_note = tc
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("exitCode").or_else(|| m.get("exit")))
+                        .and_then(|v| v.as_i64())
+                        .map(|code| format!(" exit={code}"))
+                        .unwrap_or_default();
+                    let out_str = tc
+                        .output
+                        .as_ref()
+                        .and_then(|v| {
+                            v.as_str()
+                                .map(str::to_string)
+                                .or_else(|| Some(v.to_string()))
+                        })
+                        .unwrap_or_default();
+                    let detail = concise_excerpt(cmd_or_title, 140);
+                    let out_excerpt = if out_str.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" => {}", concise_excerpt(out_str.trim(), 180))
+                    };
+                    tool_lines.push(format!(
+                        "- {} [{}{}]{}{}",
+                        tc.name,
+                        status_label,
+                        exit_note,
+                        if detail.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {detail}")
+                        },
+                        out_excerpt
+                    ));
+                }
+            }
+            AgentPart::Diff { file, diff } => {
+                let file_clean = file.trim();
+                if file_clean.is_empty() {
+                    if diff_snippets.is_empty() && snippet_bytes < 5000 && !diff.trim().is_empty() {
+                        let excerpt = concise_excerpt(diff.trim(), 1200);
+                        snippet_bytes += excerpt.len();
+                        diff_snippets.push(excerpt);
+                    }
+                    continue;
+                }
+                let mut additions = 0usize;
+                let mut deletions = 0usize;
+                for line in diff.lines() {
+                    if line.starts_with("+++") || line.starts_with("---") {
+                        continue;
+                    }
+                    if line.starts_with('+') {
+                        additions += 1;
+                    } else if line.starts_with('-') {
+                        deletions += 1;
+                    }
+                }
+                let entry =
+                    files_map
+                        .entry(file_clean.to_string())
+                        .or_insert_with(|| ChangedFile {
+                            path: file_clean.to_string(),
+                            additions: 0,
+                            deletions: 0,
+                        });
+                entry.additions = entry.additions.max(additions);
+                entry.deletions = entry.deletions.max(deletions);
+                if snippet_bytes < 5000 && !diff.trim().is_empty() {
+                    let excerpt = concise_excerpt(diff.trim(), 1200);
+                    snippet_bytes += excerpt.len();
+                    diff_snippets.push(format!("--- {file_clean}\n{excerpt}"));
+                }
+            }
+            AgentPart::Shell {
+                command,
+                status,
+                exit,
+                output,
+                ..
+            } if tool_lines.len() < 24 => {
+                let exit_note = exit
+                    .map(|code| format!(" exit={}", code as i64))
+                    .unwrap_or_default();
+                let out_excerpt = output
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| format!(" => {}", concise_excerpt(s, 180)))
+                    .unwrap_or_default();
+                tool_lines.push(format!(
+                    "- shell [{}{}]: {}{}",
+                    status,
+                    exit_note,
+                    concise_excerpt(command, 140),
+                    out_excerpt
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let mut summary = String::new();
+    if !tool_lines.is_empty() || !diff_snippets.is_empty() {
+        summary.push_str("=== Session Tool & MCP Execution Evidence ===\n");
+        if !tool_lines.is_empty() {
+            summary.push_str(&tool_lines.join("\n"));
+            summary.push('\n');
+        }
+        if !diff_snippets.is_empty() {
+            summary.push_str("\nTool Diff Excerpt:\n");
+            summary.push_str(&diff_snippets.join("\n"));
+            summary.push('\n');
+        }
+    }
+    let files: Vec<ChangedFile> = files_map.into_values().take(48).collect();
+    (files, summary)
+}
+
+pub fn normalize_changed_path(cwd: &str, path: &str) -> String {
+    let mut clean = path.trim().trim_start_matches("./");
+    let base = cwd.trim().trim_end_matches(['/', '\\']);
+    if !base.is_empty() {
+        if let Some(rest) = clean.strip_prefix(base) {
+            let stripped = rest.trim_start_matches(['/', '\\']);
+            if !stripped.is_empty() {
+                clean = stripped;
+            }
+        }
+    }
+    clean.trim_start_matches("./").to_string()
+}
+
+pub fn merge_changed_files(cwd: &str, target: &mut Vec<ChangedFile>, incoming: Vec<ChangedFile>) {
+    for item in incoming {
+        let norm = normalize_changed_path(cwd, &item.path);
+        if norm.is_empty() {
+            continue;
+        }
+        if let Some(existing) = target
+            .iter_mut()
+            .find(|f| normalize_changed_path(cwd, &f.path) == norm)
+        {
+            existing.additions = existing.additions.max(item.additions);
+            existing.deletions = existing.deletions.max(item.deletions);
+        } else {
+            target.push(ChangedFile {
+                path: norm,
+                additions: item.additions,
+                deletions: item.deletions,
+            });
+        }
+    }
+}
+
 impl RunState {
     fn for_request(request: &Start) -> Self {
         let now = crate::tasks::domain::now_ms();
@@ -689,8 +926,16 @@ impl Run {
         } else {
             String::new()
         };
+        let remote_hint = if !self.request.computer_ids.is_empty()
+            || !self.request.mentions.is_empty()
+            || self.request.machine.is_some()
+        {
+            "\nRemote/multi-computer execution context: use Muqun MCP tools (`tasks.delegate`, `exec.run`, `tasks.read`, `tasks.wait`) when delegating or verifying work on target remote computers.\n"
+        } else {
+            ""
+        };
         format!(
-            "Implement and verify the user goal carefully. Honor repository instructions, run relevant checks/tests to confirm your changes work cleanly, and finish with changed files, commands executed, and results.{multi_repo_hint}\n\n\
+            "Implement and verify the user goal carefully. Honor repository instructions, run relevant checks/tests to confirm your changes work cleanly, and finish with changed files, commands executed, and results.{multi_repo_hint}{remote_hint}\n\n\
              User goal:\n{}",
             self.request.goal
         )
@@ -704,7 +949,7 @@ impl Run {
         diff_summary: &str,
     ) -> String {
         let diff_block = if diff_summary.trim().is_empty() {
-            "(No git diff returned directly; inspect workspace files and recent changes before concluding.)"
+            "(No local git diff returned directly; check remote/MCP task evidence, session tool logs, or workspace files before concluding.)"
         } else {
             diff_summary.trim()
         };
@@ -716,13 +961,14 @@ impl Run {
         format!(
             "You are the designated **Read-Only Code Reviewer** in an automated Coder ⇄ Reviewer pipeline (Review Round {round}/{max_rounds}).\n\n\
              STRICT RULES:\n\
-             - Read-only verifier: NEVER edit, write, delete, or commit workspace source files. Only inspect diffs/files and run read-only verification checks or tests.\n\
-             - NEVER ask interactive questions or wait for user confirmation; make a decisive verdict from the diff and read-only checks.\n\
+             - Read-only verifier: NEVER edit, write, delete, or commit workspace source files. Only inspect diffs/files/task outputs and run read-only verification checks or tests.\n\
+             - Tasks in Muqun may modify single/multiple local git repos, external filesystem paths, OR remote linked computers via Muqun MCP (`tasks.delegate`, `exec.run`). NEVER assume no work happened just because local `git diff` is empty when MCP/remote execution evidence or tool logs show real changes or test results.\n\
+             - NEVER ask interactive questions or wait for user confirmation; make a decisive verdict from the evidence and read-only checks.\n\
              {cross_repo_rule}\
              - Focus on correctness bugs, edge cases, regressions, security flaws, missing tests, or rule violations.\n\n\
              User task goal:\n{}\n\n\
              Coder summary:\n{coder_summary}\n\n\
-             Changed files / Diff:\n{diff_block}\n\n\
+             Changed files / Execution evidence:\n{diff_block}\n\n\
              Output format:\n\
              - Give a concise review summary first.\n\
              - For each concrete issue found, add one line formatted as:\n\

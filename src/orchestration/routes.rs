@@ -11,8 +11,8 @@ use super::{concise_excerpt, parse_verdict, store, ChangedFile, PipelineStep, Ru
 use crate::agents::domain::{AgentPart, AgentSessionId, TimelineRole};
 use crate::tasks::{
     domain::{
-        now_ms, ForwardingContext, PrincipalKind, Requested, TaskBinding, TaskId, TaskOrigin,
-        TaskPrincipal, TaskState,
+        now_ms, ForwardingContext, PrincipalKind, Requested, TaskBinding, TaskId, TaskKind,
+        TaskOrigin, TaskPrincipal, TaskState,
     },
     service::{DelegateRequest, Delivery, TaskView},
 };
@@ -98,64 +98,112 @@ async fn latest_assistant_text(state: &AppState, agent_id: &str, asid: &str) -> 
     (!text.trim().is_empty()).then_some(text)
 }
 
+fn collect_task_tree_evidence(tasks: &[TaskView], root_id: &str, run_task_ref: &str) -> String {
+    let review_prefix = format!("{run_task_ref}:review:");
+    let rework_prefix = format!("{run_task_ref}:rework:");
+    let mut lines = Vec::new();
+    for task in tasks {
+        let is_internal_step = task.client_ref.as_deref().is_some_and(|cref| {
+            cref.starts_with(&review_prefix) || cref.starts_with(&rework_prefix)
+        });
+        if is_internal_step {
+            continue;
+        }
+        if task.task_id == root_id && !matches!(task.binding, TaskBinding::Peer { .. }) {
+            continue;
+        }
+        let target_label = match &task.binding {
+            TaskBinding::Peer {
+                peer_name,
+                remote_task_id,
+                ..
+            } => {
+                if remote_task_id.is_empty() {
+                    format!("peer:{peer_name}")
+                } else {
+                    format!("peer:{peer_name}#{remote_task_id}")
+                }
+            }
+            TaskBinding::AgentSession { agent_id, asid } => format!("session:{agent_id}#{asid}"),
+            TaskBinding::Pane {
+                session_id,
+                pane_id,
+                agent_id,
+                ..
+            } => match agent_id.as_deref() {
+                Some(agent) => format!("pane:{agent}@{session_id}/{pane_id}"),
+                None => format!("pane:{session_id}/{pane_id}"),
+            },
+            TaskBinding::None => "local".to_string(),
+        };
+        let kind_label = match task.kind {
+            TaskKind::Delegation => "delegation",
+            TaskKind::Command => "command",
+        };
+        let exit_note = task
+            .exit_code
+            .map(|c| format!(" exit={c}"))
+            .unwrap_or_default();
+        let goal_excerpt = concise_excerpt(&task.goal, 140);
+        let summary_excerpt = task
+            .summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(" | summary: {}", concise_excerpt(s, 200)))
+            .unwrap_or_default();
+        lines.push(format!(
+            "- {} [{}, {}, {:?}{}] target={} | {}{}",
+            task.task_id,
+            kind_label,
+            target_label,
+            task.state,
+            exit_note,
+            target_label,
+            goal_excerpt,
+            summary_excerpt
+        ));
+        if lines.len() >= 24 {
+            break;
+        }
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "=== Muqun MCP & Remote Computer Tasks ===\n{}\n",
+            lines.join("\n")
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn collect_deliverables(
     state: &AppState,
     agent_id: &str,
     asid: Option<&str>,
     cwd: &str,
     goal: &str,
+    coder_summary: &str,
     base_commit: Option<&str>,
     base_commits: &std::collections::BTreeMap<String, String>,
+    tasks: &[TaskView],
+    root_task_id: &str,
+    run_task_ref: &str,
 ) -> (Vec<ChangedFile>, String) {
     let mut files = Vec::new();
     let mut summary = String::new();
-    let discovered = super::discover_git_repos(cwd, goal);
+    let combined_goal = if coder_summary.trim().is_empty() {
+        goal.to_string()
+    } else {
+        format!("{goal}\n{coder_summary}")
+    };
+    let discovered = super::discover_git_repos(cwd, &combined_goal);
     let has_local_git = !discovered.is_empty() || !base_commits.is_empty();
-    if let (true, Some(asid)) = (
-        (base_commit.is_none() && base_commits.is_empty()) || !has_local_git,
-        asid,
-    ) {
-        if let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await {
-            if let Ok(diffs) = manager
-                .sessions()
-                .get_vcs_diff(&AgentSessionId(asid.to_string()), "working")
-                .await
-            {
-                if !diffs.is_empty() {
-                    summary.push_str("Changed files (session diff):\n");
-                    for item in diffs.iter().take(32) {
-                        files.push(ChangedFile {
-                            path: item.path.clone(),
-                            additions: item.additions,
-                            deletions: item.deletions,
-                        });
-                        summary.push_str(&format!(
-                            "- {} (+{} -{})\n",
-                            item.path, item.additions, item.deletions
-                        ));
-                    }
-                    let mut patches = String::new();
-                    for item in &diffs {
-                        if item.patch.trim().is_empty() {
-                            continue;
-                        }
-                        let chunk = format!("\n--- {}\n{}", item.path, item.patch);
-                        if patches.len() + chunk.len() > 8000 {
-                            break;
-                        }
-                        patches.push_str(&chunk);
-                    }
-                    if !patches.is_empty() {
-                        summary.push_str("\nDiff excerpt:\n");
-                        summary.push_str(&patches);
-                    }
-                }
-            }
-        }
-    }
-    if files.is_empty() && has_local_git {
+
+    if has_local_git {
         let dir = cwd.trim().to_string();
-        let goal_owned = goal.to_string();
+        let goal_owned = combined_goal;
         let base_map = base_commits.clone();
         let base = base_commit.map(str::to_string);
         if let Ok((local_files, local_summary)) = tokio::task::spawn_blocking(move || {
@@ -163,14 +211,106 @@ async fn collect_deliverables(
         })
         .await
         {
-            if files.is_empty() {
-                files = local_files;
-            }
-            if summary.is_empty() {
-                summary = local_summary;
+            super::merge_changed_files(cwd, &mut files, local_files);
+            if !local_summary.trim().is_empty() {
+                summary.push_str(local_summary.trim());
+                summary.push('\n');
             }
         }
     }
+
+    let mut timeline_evidence = String::new();
+    if let Some(asid) = asid {
+        if let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await {
+            if let Ok(diffs) = manager
+                .sessions()
+                .get_vcs_diff(&AgentSessionId(asid.to_string()), "working")
+                .await
+            {
+                let non_empty: Vec<_> = diffs
+                    .iter()
+                    .filter(|item| !item.path.trim().is_empty())
+                    .collect();
+                if !non_empty.is_empty() {
+                    let prev_count = files.len();
+                    let vcs_files: Vec<ChangedFile> = non_empty
+                        .iter()
+                        .take(32)
+                        .map(|item| ChangedFile {
+                            path: item.path.clone(),
+                            additions: item.additions,
+                            deletions: item.deletions,
+                        })
+                        .collect();
+                    super::merge_changed_files(cwd, &mut files, vcs_files);
+                    if summary.is_empty() || files.len() > prev_count {
+                        if !summary.is_empty() {
+                            summary.push('\n');
+                        }
+                        summary.push_str("=== Changed files (session diff) ===\n");
+                        for item in non_empty.iter().take(32) {
+                            summary.push_str(&format!(
+                                "- {} (+{} -{})\n",
+                                super::normalize_changed_path(cwd, &item.path),
+                                item.additions,
+                                item.deletions
+                            ));
+                        }
+                        let mut patches = String::new();
+                        for item in non_empty {
+                            if item.patch.trim().is_empty() {
+                                continue;
+                            }
+                            let chunk = format!("\n--- {}\n{}", item.path, item.patch);
+                            if patches.len() + chunk.len() > 8000 {
+                                break;
+                            }
+                            patches.push_str(&chunk);
+                        }
+                        if !patches.is_empty() {
+                            summary.push_str("\nDiff excerpt:\n");
+                            summary.push_str(&patches);
+                            summary.push('\n');
+                        }
+                    }
+                }
+            }
+
+            if let Ok(snapshot) = manager
+                .sessions()
+                .get_snapshot(&AgentSessionId(asid.to_string()))
+                .await
+            {
+                let (tl_files, tl_summary) =
+                    super::extract_timeline_evidence(snapshot.timeline.iter().map(|i| &i.part));
+                super::merge_changed_files(cwd, &mut files, tl_files);
+                timeline_evidence = tl_summary;
+            }
+        }
+    }
+
+    if !timeline_evidence.is_empty()
+        && (summary.trim().is_empty()
+            || timeline_evidence.contains("tasks.")
+            || timeline_evidence.contains("exec.")
+            || timeline_evidence.contains("muqun"))
+    {
+        if !summary.is_empty() {
+            summary.push('\n');
+        }
+        summary.push_str(timeline_evidence.trim());
+        summary.push('\n');
+    }
+
+    let task_evidence = collect_task_tree_evidence(tasks, root_task_id, run_task_ref);
+    if !task_evidence.is_empty() {
+        if !summary.is_empty() {
+            summary.push('\n');
+        }
+        summary.push_str(task_evidence.trim());
+        summary.push('\n');
+    }
+
     (files, summary)
 }
 
@@ -268,14 +408,26 @@ async fn reconcile_pipeline(
                 coder_asid.as_deref(),
                 &run.request.cwd,
                 &run.request.goal,
+                &coder_summary,
                 run.state.base_commit.as_deref(),
                 &run.state.base_commits,
+                tasks,
+                root,
+                &run.task_ref(),
             )
             .await;
-            if (!run.state.base_commits.is_empty() || run.state.base_commit.is_some())
-                && files.is_empty()
+            let review_prefix = format!("{}:review:", run.task_ref());
+            let rework_prefix = format!("{}:rework:", run.task_ref());
+            let has_child_or_peer_tasks = tasks.iter().any(|t| {
+                let is_internal = t.client_ref.as_deref().is_some_and(|c| {
+                    c.starts_with(&review_prefix) || c.starts_with(&rework_prefix)
+                });
+                !is_internal && (t.task_id != root || matches!(t.binding, TaskBinding::Peer { .. }))
+            });
+            if files.is_empty()
                 && diff_summary.trim().is_empty()
                 && run.state.files.is_empty()
+                && !has_child_or_peer_tasks
             {
                 let round = run.state.round;
                 run.state.reviewed_round = round;
@@ -333,15 +485,16 @@ async fn reconcile_pipeline(
                         client_ref: Some(client_ref),
                         label: Some(format!("Review #{round}")),
                         delivery: Some(Delivery::Session),
-                        computer_ids: vec![],
+                        computer_ids: run.request.computer_ids.clone(),
                         mode: None,
-                        machine: None,
-                        mentions: vec![],
+                        machine: run.request.machine.clone(),
+                        mentions: run.request.mentions.clone(),
                         session_id: run.state.reviewer_asid.clone(),
                         attachments: vec![],
                     },
                     run.state.reviewer_asid.as_deref(),
                     Some(&format!("MAO Code Review #{round}")),
+                    run.request.auto_approve.unwrap_or(true),
                 )
                 .await;
 
@@ -490,15 +643,16 @@ async fn reconcile_pipeline(
                                         )),
                                         label: Some(format!("Rework #{next_round}")),
                                         delivery: Some(Delivery::Session),
-                                        computer_ids: vec![],
+                                        computer_ids: run.request.computer_ids.clone(),
                                         mode: run.request.mode.clone(),
-                                        machine: None,
-                                        mentions: vec![],
+                                        machine: run.request.machine.clone(),
+                                        mentions: run.request.mentions.clone(),
                                         session_id: run.state.coder_asid.clone(),
                                         attachments: vec![],
                                     },
                                     run.state.coder_asid.as_deref(),
                                     Some(&format!("MAO Rework #{next_round}")),
+                                    run.request.auto_approve.unwrap_or(true),
                                 )
                                 .await;
                             let rework_tid = delegated.as_ref().ok().map(|t| t.task_id.clone());
@@ -804,6 +958,7 @@ async fn start(
     } else {
         run.prompt()
     };
+    let start_auto_approve = request.auto_approve.unwrap_or(true);
     let delegated = state
         .tasks
         .delegate_in_session(
@@ -818,15 +973,16 @@ async fn start(
                 client_ref: Some(run.task_ref()),
                 label: Some("Orchestration".into()),
                 delivery: Some(Delivery::Session),
-                computer_ids: vec![],
+                computer_ids: request.computer_ids,
                 mode: request.mode,
-                machine: None,
-                mentions: vec![],
+                machine: request.machine,
+                mentions: request.mentions,
                 session_id: None,
                 attachments: request.attachments,
             },
             request.asid.as_deref(),
             Some(&request.goal),
+            start_auto_approve,
         )
         .await;
     let mut run = run;
@@ -950,15 +1106,16 @@ async fn rework(
                 client_ref: Some(format!("{}:rework:{next_round}", run.task_ref())),
                 label: Some(format!("Rework #{next_round}")),
                 delivery: Some(Delivery::Session),
-                computer_ids: vec![],
+                computer_ids: run.request.computer_ids.clone(),
                 mode: run.request.mode.clone(),
-                machine: None,
-                mentions: vec![],
+                machine: run.request.machine.clone(),
+                mentions: run.request.mentions.clone(),
                 session_id: run.state.coder_asid.clone(),
                 attachments: vec![],
             },
             run.state.coder_asid.as_deref(),
             Some(&format!("MAO Rework #{next_round}")),
+            run.request.auto_approve.unwrap_or(true),
         )
         .await;
     let rework_tid = delegated.as_ref().ok().map(|t| t.task_id.clone());
