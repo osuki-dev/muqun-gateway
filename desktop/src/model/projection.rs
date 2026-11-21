@@ -413,6 +413,7 @@ impl Core {
                     | Command::PluginPackage(..)
                     | Command::ProbeRuntimes
                     | Command::InstallManagedRuntime(_)
+                    | Command::MaoPrepareReview { .. }
             )
         {
             if let Command::OpenSession(asid) | Command::OpenTile(asid) = &command {
@@ -776,6 +777,44 @@ impl Core {
                     Err(err) => self.fail(err),
                 }
             }
+            Command::Orchestration {
+                computer,
+                ticket,
+                request,
+            } => {
+                let target = if matches!(computer.as_str(), "" | "self") {
+                    "local"
+                } else {
+                    computer.as_str()
+                };
+                let origin_matches = crate::hub::connection_origin()
+                    .is_none_or(|(c, _)| c == target || (c == "local" && target == "self"));
+                let result = if !origin_matches {
+                    Err(crate::hub::OrchestrationError {
+                        uncertain: false,
+                        message: "Computer is still switching; wait for it to connect".into(),
+                    })
+                } else {
+                    self.hub.orchestration(request).await.map_err(|e| {
+                        crate::hub::OrchestrationError {
+                            uncertain: !matches!(
+                                &e,
+                                HubError::Agent(
+                                    AgentError::InvalidRequest(_)
+                                        | AgentError::Unsupported(_)
+                                        | AgentError::NotAvailable(_)
+                                )
+                            ),
+                            message: e.to_string(),
+                        }
+                    })
+                };
+                self.inbox.push(Update::Orchestration {
+                    computer,
+                    ticket,
+                    result,
+                });
+            }
             Command::RefreshTasks => self.refresh_tasks().await,
             Command::UnpairComputer {
                 computer,
@@ -1092,6 +1131,182 @@ impl Core {
                     });
                     let statuses = muqun_gateway::platform::runtimes::probe_all();
                     inbox.push(Update::Runtimes(statuses));
+                });
+            }
+            Command::MaoPrepareReview {
+                run_id,
+                coder_asid,
+                cwd,
+                base_commit,
+            } => {
+                let hub = self.hub.clone();
+                let inbox = self.inbox.clone();
+                crate::hub::spawn_connected(async move {
+                    let mut summary = String::new();
+                    let mut changed_files: Vec<(String, usize, usize)> = Vec::new();
+                    let allow_local_git = hub.mode() == crate::hub::HubMode::Standalone
+                        || crate::hub::connection_origin()
+                            .is_none_or(|(c, _)| c == "local" || c == "self");
+                    let has_local_git = allow_local_git
+                        && !cwd.trim().is_empty()
+                        && std::path::Path::new(cwd.trim()).join(".git").exists();
+                    if (base_commit.is_none() || !has_local_git) && !coder_asid.starts_with("new-")
+                    {
+                        if let Ok(Ok(files)) = tokio::time::timeout(
+                            LIST_TIMEOUT,
+                            hub.vcs_diff(&AgentSessionId(coder_asid.clone())),
+                        )
+                        .await
+                        {
+                            if !files.is_empty() {
+                                summary.push_str("Changed files (from session diff):\n");
+                                for f in files.iter().take(32) {
+                                    changed_files.push((f.path.clone(), f.additions, f.deletions));
+                                    summary.push_str(&format!(
+                                        "- {} (+{} -{})\n",
+                                        f.path, f.additions, f.deletions
+                                    ));
+                                }
+                                if files.len() > 32 {
+                                    summary.push_str(&format!(
+                                        "... and {} more file(s)\n",
+                                        files.len() - 32
+                                    ));
+                                }
+                                let mut patches = String::new();
+                                for f in &files {
+                                    if f.patch.trim().is_empty() {
+                                        continue;
+                                    }
+                                    let entry = format!("\n--- {}\n{}", f.path, f.patch);
+                                    if patches.len() + entry.len() > 10_000 {
+                                        break;
+                                    }
+                                    patches.push_str(&entry);
+                                }
+                                if !patches.is_empty() {
+                                    summary.push_str("\nDiff excerpt:\n");
+                                    summary.push_str(&patches);
+                                }
+                            }
+                        }
+                    }
+
+                    if summary.is_empty() && has_local_git {
+                        let cwd_clone = cwd.trim().to_string();
+                        if let Ok((local_diff, local_files)) =
+                            tokio::task::spawn_blocking(move || {
+                                let run_git = |args: &[&str]| -> String {
+                                    std::process::Command::new("git")
+                                        .arg("-C")
+                                        .arg(&cwd_clone)
+                                        .args(args)
+                                        .output()
+                                        .ok()
+                                        .filter(|out| out.status.success())
+                                        .map(|out| {
+                                            String::from_utf8_lossy(&out.stdout).into_owned()
+                                        })
+                                        .unwrap_or_default()
+                                };
+                                let mut numstat_args = vec!["diff", "--numstat"];
+                                let mut stat_args = vec!["diff", "--stat"];
+                                let mut raw_args = vec!["diff", "--no-color"];
+                                if let Some(ref rev) = base_commit {
+                                    numstat_args.push(rev);
+                                    stat_args.push(rev);
+                                    raw_args.push(rev);
+                                }
+                                let status = run_git(&["status", "--porcelain"]);
+                                let stat = run_git(&stat_args);
+                                let numstat = run_git(&numstat_args);
+                                let raw = run_git(&raw_args);
+                                let mut parsed_files: Vec<(String, usize, usize)> = Vec::new();
+                                for line in numstat.lines().take(32) {
+                                    let mut parts = line.split('\t');
+                                    if let (Some(a), Some(d), Some(path)) =
+                                        (parts.next(), parts.next(), parts.next())
+                                    {
+                                        let add = a.trim().parse::<usize>().unwrap_or(0);
+                                        let del = d.trim().parse::<usize>().unwrap_or(0);
+                                        parsed_files.push((path.trim().to_string(), add, del));
+                                    }
+                                }
+                                let mut untracked_notes = Vec::new();
+                                for line in status.lines().take(32) {
+                                    if let Some(rest) = line.strip_prefix("?? ") {
+                                        let clean = rest.trim().trim_matches('"');
+                                        if !clean.is_empty()
+                                            && !parsed_files.iter().any(|(p, _, _)| p == clean)
+                                        {
+                                            let full = std::path::Path::new(&cwd_clone).join(clean);
+                                            let lines = std::fs::metadata(&full)
+                                                .ok()
+                                                .filter(|m| m.is_file() && m.len() <= 131_072)
+                                                .and_then(|_| std::fs::read_to_string(&full).ok())
+                                                .map(|body| body.lines().count())
+                                                .unwrap_or(0);
+                                            parsed_files.push((clean.to_string(), lines, 0));
+                                            untracked_notes.push(format!(
+                                                "- {clean} (new file, +{lines} lines)"
+                                            ));
+                                        }
+                                    }
+                                }
+                                if parsed_files.is_empty() {
+                                    for line in status.lines().take(32) {
+                                        if line.len() >= 4 {
+                                            let p = line[3..].trim().trim_matches('"');
+                                            if !p.is_empty() {
+                                                parsed_files.push((p.to_string(), 0, 0));
+                                            }
+                                        }
+                                    }
+                                }
+                                let mut out = String::new();
+                                if !status.trim().is_empty() {
+                                    out.push_str("Git status:\n");
+                                    out.push_str(status.trim());
+                                    out.push('\n');
+                                }
+                                if !stat.trim().is_empty() {
+                                    out.push_str("\nGit diff --stat:\n");
+                                    out.push_str(stat.trim());
+                                    out.push('\n');
+                                }
+                                if !untracked_notes.is_empty() {
+                                    out.push_str("\nNew untracked files:\n");
+                                    out.push_str(&untracked_notes.join("\n"));
+                                    out.push('\n');
+                                }
+                                if !raw.trim().is_empty() {
+                                    let max_bytes = 10_000;
+                                    let excerpt = if raw.len() <= max_bytes {
+                                        raw.as_str()
+                                    } else {
+                                        let mut cut = max_bytes;
+                                        while cut > 0 && !raw.is_char_boundary(cut) {
+                                            cut -= 1;
+                                        }
+                                        &raw[..cut]
+                                    };
+                                    out.push_str("\nGit diff excerpt:\n");
+                                    out.push_str(excerpt);
+                                }
+                                (out, parsed_files)
+                            })
+                            .await
+                        {
+                            summary = local_diff;
+                            changed_files = local_files;
+                        }
+                    }
+
+                    inbox.push(Update::MaoReviewReady {
+                        run_id,
+                        diff_summary: summary,
+                        files: changed_files,
+                    });
                 });
             }
             Command::CompleteDirectory { .. } | Command::Edit(_) => {

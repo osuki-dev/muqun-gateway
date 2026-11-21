@@ -50,7 +50,7 @@ impl UiState {
         }
         if matches!(
             (id, self.mode),
-            ("tasks", Mode::Tasks) | ("inbox", Mode::Inbox)
+            ("tasks", Mode::Tasks) | ("inbox", Mode::Inbox) | ("mao", Mode::Mao)
         ) {
             self.go(if self.selected.is_some() {
                 Mode::Session

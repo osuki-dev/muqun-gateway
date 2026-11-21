@@ -93,6 +93,20 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
                     .and_then(|p| p.render_surface(&ctx, layer))
                     .unwrap_or_else(|| tasks::view(s, k, layer))
             }
+            Mode::Mao => {
+                let ctx = crate::plugin::PluginViewContext {
+                    s,
+                    k,
+                    look: &look,
+                    tile_id: "mao",
+                    scale,
+                    surface: crate::plugin::PluginSlot::Page,
+                };
+                s.plugins
+                    .get("mao")
+                    .and_then(|p| p.render_surface(&ctx, layer))
+                    .unwrap_or_else(|| super::orchestration::page_view(s, k, layer))
+            }
             Mode::Settings => {
                 let ctx = crate::plugin::PluginViewContext {
                     s,
@@ -143,7 +157,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     split = split.toolbar(
         if matches!(
             s.mode,
-            Mode::Home | Mode::Settings | Mode::Inbox | Mode::Tasks
+            Mode::Home | Mode::Settings | Mode::Inbox | Mode::Tasks | Mode::Mao
         ) || (s.mode == Mode::Session && s.in_split())
             || s.active_plugin_page.is_some()
         {
@@ -578,6 +592,7 @@ fn page_title(s: &UiState) -> String {
         Mode::Home => tr(language, "New session"),
         Mode::Inbox => tr(language, "Inbox"),
         Mode::Tasks => tr(language, "Tasks"),
+        Mode::Mao => tr(language, "MAO · Orchestration"),
         Mode::Settings => tr(language, "Settings"),
         Mode::Session => s
             .current()
@@ -866,7 +881,9 @@ fn session(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> El {
     if s.revert_staged {
         page = page.child(revert_banner(s, k));
     }
-    page.child(body).child(composer::view(s, k, layer))
+    page.children(super::orchestration::session_banner(s, k))
+        .child(body)
+        .child(composer::view(s, k, layer))
 }
 
 fn revert_banner(s: &UiState, k: &Kit) -> El {

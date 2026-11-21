@@ -21,6 +21,7 @@ pub(crate) mod inspector;
 pub mod keymap;
 mod labels;
 mod notifications;
+pub(crate) mod orchestration;
 mod package_activity;
 pub mod pair_computer;
 pub(crate) mod palette;
@@ -85,6 +86,7 @@ pub enum Mode {
     Session,
     Inbox,
     Tasks,
+    Mao,
     Settings,
 }
 
@@ -203,6 +205,8 @@ pub enum OpenMenu {
     ViewerImageActions,
     /// The tasks page's computer filter picker.
     TasksComputerPicker,
+    /// MAO reviewer agent / model / effort / rounds menu.
+    MaoReviewer(Slot),
 }
 
 /// The view state of one open session: what the timeline and composer read.
@@ -577,6 +581,7 @@ pub struct UiState {
     pub fleet_pending: HashMap<String, Vec<crate::model::fleet_attention::Pending>>,
     /// The Tasks page's selection, filters and task histories.
     pub tasks_view: tasks::TasksView,
+    pub orchestration: orchestration::View,
     /// Form answers, by `form id / field key`.
     pub form_inputs: HashMap<String, TextEdit>,
 
@@ -839,6 +844,7 @@ impl UiState {
             inbox_view: Default::default(),
             fleet_pending: HashMap::new(),
             tasks_view: Default::default(),
+            orchestration: Default::default(),
             form_inputs: HashMap::new(),
             agent_inputs: HashMap::new(),
             agent_errors: HashMap::new(),
@@ -2150,6 +2156,7 @@ impl UiState {
     pub fn go(&mut self, mode: Mode) {
         let plugin = match mode {
             Mode::Tasks => Some("tasks"),
+            Mode::Mao => Some("mao"),
             Mode::Inbox => Some("inbox"),
             _ => None,
         };
@@ -2161,6 +2168,7 @@ impl UiState {
         composer::restore_attachments(self);
         match mode {
             Mode::Tasks => self.send(Command::RefreshTasks),
+            Mode::Mao => orchestration::request_gateway_sync(self),
             Mode::Home => {
                 self.send(Command::LoadProjects {
                     agent: self.start_agent.clone(),
@@ -2614,13 +2622,18 @@ impl UiState {
 
     /// Tell the core which sessions are on screen in split tiles, and who is focused.
     fn sync_watch(&self) {
-        let watched: Vec<AgentSessionId> = self
+        let mut watched: Vec<AgentSessionId> = self
             .tiles
             .iter()
             .filter_map(|t| t.asid.clone())
             .filter(|asid| !asid.starts_with("new-"))
             .map(AgentSessionId)
             .collect();
+        for asid in self.orchestration.tracked_asids() {
+            if !watched.contains(&asid) {
+                watched.push(asid);
+            }
+        }
         self.send(Command::WatchSessions(watched));
         if let Some(ref asid) = self.selected {
             if !asid.starts_with("new-") {
@@ -3379,6 +3392,7 @@ impl UiState {
                     let asid = info.asid.clone();
                     self.merge_sessions(vec![(*info).clone()]);
                     if let Some(token) = start_token {
+                        orchestration::on_session_created(self, token, &info);
                         if self
                             .pending_start
                             .as_ref()
@@ -3588,6 +3602,16 @@ impl UiState {
                         }
                     }
                 }
+                Update::Orchestration {
+                    computer,
+                    ticket,
+                    result,
+                } => orchestration::on_gateway_orchestration(self, &computer, ticket, result),
+                Update::MaoReviewReady {
+                    run_id,
+                    diff_summary,
+                    files,
+                } => orchestration::on_review_ready(self, &run_id, diff_summary, files),
             }
         }
         if LAYOUT_DIRTY.swap(false, Ordering::AcqRel) {
@@ -3756,6 +3780,7 @@ impl UiState {
         {
             self.refresh_start_catalog();
         }
+        orchestration::ensure_gateway_synced(self);
     }
 
     fn merge_sessions(&mut self, incoming: Vec<AgentSessionInfo>) {
@@ -3805,7 +3830,8 @@ impl UiState {
         // Navigation belongs to the action that opened a pane. A delayed read can
         // update its existing pane, but cannot claim the current Home submission.
         let selected = self.selected.as_deref() == Some(&asid);
-        if !selected && self.tile_of(&asid).is_none() {
+        let tracked = self.orchestration.is_tracked(&asid);
+        if !selected && self.tile_of(&asid).is_none() && !tracked {
             return;
         }
         let focused = selected && self.mode == Mode::Session;
@@ -3823,6 +3849,9 @@ impl UiState {
         self.waiting_forms.insert(asid.clone(), snapshot.forms);
         let queue = InboxItem::list(&snapshot.inbox);
         self.apply_session_inbox(&asid, queue, snapshot.seq);
+        if tracked {
+            orchestration::on_session_status(self, &asid, snapshot.info.status);
+        }
         if !focused {
             return;
         }
@@ -3896,6 +3925,7 @@ impl UiState {
                 if let Some(slot) = self.sessions.iter_mut().find(|s| s.asid == asid) {
                     slot.status = status;
                 }
+                orchestration::on_session_status(self, &asid.0, status);
                 if let Some(err) = error {
                     let message = crate::model::inbox::clean_error_message(&err.message);
                     self.error_at = Some(std::time::Instant::now());
@@ -4085,6 +4115,9 @@ impl UiState {
                         }
                     }
                     return;
+                }
+                if let Some(ref view_arc) = view {
+                    orchestration::on_catalog(self, request, &agent, view_arc.clone());
                 }
                 let typed = self.start_cwd.text.trim();
                 let start = agent == self.start_agent

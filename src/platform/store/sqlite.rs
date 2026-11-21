@@ -24,6 +24,7 @@ pub(crate) const ALL_MIGRATIONS: &[Migration] = &[
     crate::agents::runtime::SESSION_ROUTES_MIGRATION,
     crate::connectivity::replay_store::MIGRATION,
     crate::tasks::store_sqlite::MIGRATION,
+    crate::orchestration::MIGRATION,
     crate::mcp::tokens::MIGRATION,
     crate::fleet::peers::MIGRATION,
     crate::fleet::home_grants::MIGRATION,

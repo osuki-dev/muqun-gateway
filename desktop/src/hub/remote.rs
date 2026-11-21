@@ -538,6 +538,7 @@ fn map_error(status: u16, body: &Value, asid: &str, raw: &str) -> HubError {
             )
         });
     match (status, code) {
+        (_, Some("coordinator_unavailable")) => HubError::Agent(AgentError::NotAvailable(message)),
         (_, Some("session_not_found")) => HubError::SessionNotFound(asid.to_string()),
         (503, Some("agent_unavailable")) => HubError::AgentUnavailable {
             agent: message.split('\'').nth(1).unwrap_or_default().to_string(),
@@ -567,6 +568,37 @@ fn map_error(status: u16, body: &Value, asid: &str, raw: &str) -> HubError {
 }
 
 impl SessionHub for RemoteHub {
+    fn orchestration(&self, request: super::OrchestrationRequest) -> HubFuture<'_, Value> {
+        Box::pin(async move {
+            if !self
+                .has_capability("agent_orchestration_preview_v1")
+                .await?
+            {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "This Gateway needs the intelligent orchestration preview update".into(),
+                )));
+            }
+            match request {
+                super::OrchestrationRequest::List => {
+                    self.call(Method::GET, &["api", "orchestrations"], &[], None)
+                        .await
+                }
+                super::OrchestrationRequest::Read(id) => {
+                    self.call(Method::GET, &["api", "orchestrations", &id], &[], None)
+                        .await
+                }
+                super::OrchestrationRequest::Start(body) => {
+                    self.call(Method::POST, &["api", "orchestrations"], &[], Some(body))
+                        .await
+                }
+                super::OrchestrationRequest::CancelTask { run, task } => {
+                    self.cancel_task(&task).await?;
+                    self.call(Method::GET, &["api", "orchestrations", &run], &[], None)
+                        .await
+                }
+            }
+        })
+    }
     fn pending_attention(
         &self,
     ) -> HubFuture<'_, Option<Vec<muqun_gateway::agents::ports::AgentPendingSnapshot>>> {

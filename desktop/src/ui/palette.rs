@@ -84,6 +84,7 @@ impl Act {
             Self::Go(Mode::Home) => Action::Home,
             Self::Go(Mode::Inbox) => Action::Inbox,
             Self::Go(Mode::Tasks) => Action::Tasks,
+            Self::Go(Mode::Mao) => Action::Mao,
             Self::Split => Action::AddSplit,
             Self::Inspector => Action::ToggleInspector,
             Self::Git => Action::ToggleGit,
@@ -318,6 +319,7 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
         (tr_ref(language, "Home"), Mode::Home, Action::Home),
         (tr_ref(language, "Inbox"), Mode::Inbox, Action::Inbox),
         (tr_ref(language, "Tasks"), Mode::Tasks, Action::Tasks),
+        (tr_ref(language, "MAO"), Mode::Mao, Action::Mao),
     ] {
         out.push(action(
             format!("{} {label}", tr(language, "Go to")),
@@ -793,6 +795,7 @@ fn glyph(s: &UiState, k: &Kit, act: &Act) -> El {
     let glyph = match act {
         Act::Go(Mode::Inbox) => &super::icons::INBOX,
         Act::Go(Mode::Tasks) => &super::icons::TASK,
+        Act::Go(Mode::Mao) => &super::parts::glyphs::WORKFLOW,
         Act::Dictation => &super::voice::MIC,
         Act::Git => &super::icons::BRANCH,
         Act::Settings(_)

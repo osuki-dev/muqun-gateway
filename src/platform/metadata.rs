@@ -38,6 +38,7 @@ pub(crate) const GATEWAY_API_MAJOR: u64 = 1;
 /// A feature whose availability depends on the terminal on the other side does
 /// not belong in this list -- see [`AGENT_COLLABORATION_CAPABILITY`].
 pub(crate) const API_CAPABILITIES: &[&str] = &[
+    crate::orchestration::CAPABILITY,
     "agent_catalog",
     // `visibility`/`picker` on discovery agents and
     // `PUT /api/agents/{kind}/visibility`.

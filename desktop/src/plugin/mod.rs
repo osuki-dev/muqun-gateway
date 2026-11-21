@@ -310,6 +310,7 @@ impl PluginRegistry {
         r.register(Arc::new(DiffPlugin));
         r.register(Arc::new(InspectorPlugin));
         r.register(Arc::new(TasksPlugin));
+        r.register(Arc::new(MaoPlugin));
         r.register(Arc::new(InboxPlugin));
         r.register(Arc::new(SettingsPlugin));
         r.register(Arc::new(SysInfoPlugin));
@@ -1517,6 +1518,75 @@ impl DesktopPlugin for TasksPlugin {
 
     fn render_tile(&self, ctx: &PluginViewContext<'_>, layer: &mut Vec<El>) -> Option<El> {
         Some(crate::ui::tasks::view(ctx.s, ctx.k, layer))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in Plugin 6b: MAO Orchestration Plugin
+// ---------------------------------------------------------------------------
+
+pub struct MaoPlugin;
+
+impl DesktopPlugin for MaoPlugin {
+    fn id(&self) -> &'static str {
+        "mao"
+    }
+
+    fn title(&self, lang: Language) -> String {
+        tr_ref(lang, "MAO").to_string()
+    }
+
+    fn icon(&self) -> &'static Icon {
+        &crate::ui::parts::glyphs::WORKFLOW
+    }
+
+    fn description(&self, lang: Language) -> Option<String> {
+        Some(
+            tr_ref(
+                lang,
+                "Multi-agent Coder ⇄ Reviewer orchestration, live status, deliverables & quality gates",
+            )
+            .to_string(),
+        )
+    }
+
+    fn category(&self) -> PluginCategory {
+        PluginCategory::Core
+    }
+
+    fn surfaces(&self) -> Vec<PluginSlot> {
+        vec![PluginSlot::Page, PluginSlot::Tile, PluginSlot::Drawer]
+    }
+
+    fn can_move_view(&self, _from: &str) -> bool {
+        true
+    }
+
+    fn commands(&self) -> Vec<PluginCommand> {
+        vec![PluginCommand {
+            id: "mao.open",
+            title: "Open MAO".to_string(),
+            shortcut: Some("Ctrl+Shift+O"),
+        }]
+    }
+
+    fn on_command(&self, s: &mut UiState, command_id: &str) -> bool {
+        match command_id {
+            "mao.open" => {
+                s.go(Mode::Mao);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn render_tile(&self, ctx: &PluginViewContext<'_>, layer: &mut Vec<El>) -> Option<El> {
+        Some(crate::ui::orchestration::window_view(
+            ctx.s,
+            ctx.k,
+            ctx.surface,
+            layer,
+        ))
     }
 }
 

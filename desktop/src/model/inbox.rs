@@ -129,6 +129,11 @@ pub enum SearchOutcome {
 
 #[derive(Debug, Clone)]
 pub enum Update {
+    Orchestration {
+        computer: String,
+        ticket: u64,
+        result: Result<serde_json::Value, crate::hub::OrchestrationError>,
+    },
     Computer {
         computer: String,
         generation: u64,
@@ -257,6 +262,12 @@ pub enum Update {
         event: uuid::Uuid,
         kind: muqun_gateway::platform::runtimes::RuntimeKind,
         result: Result<muqun_gateway::platform::runtimes::RuntimeStatus, String>,
+    },
+    /// Prepared diff/context summary ready to dispatch to the MAO reviewer session.
+    MaoReviewReady {
+        run_id: String,
+        diff_summary: String,
+        files: Vec<(String, usize, usize)>,
     },
 }
 

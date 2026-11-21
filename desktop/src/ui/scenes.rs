@@ -1593,7 +1593,213 @@ fn base_scenes() -> &'static [Scene] {
         ("viewer-markdown", viewer_markdown),
         ("viewer-image", viewer_image),
         ("viewer-video", viewer_video),
+        ("mao", mao_session_scene),
+        ("mao-page", mao_page_scene),
     ]
+}
+
+fn mao_sample_runs(now: u64) -> Vec<super::orchestration::MaoRun> {
+    use super::orchestration::{
+        MaoDeliverableFile, MaoFinding, MaoPhase, MaoRole, MaoRun, MaoStep, MaoStepKind,
+    };
+    use muqun_gateway::agents::ModelRef;
+
+    vec![
+        MaoRun {
+            id: "mao-2".into(),
+            computer: "local".into(),
+            goal: "Refactor session search indexer batch flush into background worker".into(),
+            cwd: "/home/demo/gateway".into(),
+            coder: MaoRole {
+                agent: "opencode".into(),
+                model: None,
+            },
+            reviewer: MaoRole {
+                agent: "claude".into(),
+                model: None,
+            },
+            coder_asid: "s3".into(),
+            reviewer_asid: Some("s3".into()),
+            pending_reviewer_token: None,
+            pending_review_diff: false,
+            pre_review_msg_id: None,
+            base_commit: Some("a1b2c3d".into()),
+            last_diff_fingerprint: None,
+            snapshot_retries: 0,
+            round: 1,
+            max_rounds: 2,
+            phase: MaoPhase::Approved {
+                round: 1,
+                summary: "Batch channel cleanup and backpressure tests verified clean.".into(),
+            },
+            files: vec![
+                MaoDeliverableFile {
+                    path: "src/search/indexer.rs".into(),
+                    additions: 64,
+                    deletions: 28,
+                },
+                MaoDeliverableFile {
+                    path: "src/search/tests.rs".into(),
+                    additions: 41,
+                    deletions: 2,
+                },
+            ],
+            coder_summary: "Moved batch index flush to bounded worker task; cargo test search::tests passed (18/18).".into(),
+            review_summary: "Reviewed indexer shutdown path and bounded mpsc backpressure behavior. All 18 unit tests pass.".into(),
+            findings: Vec::new(),
+            steps: vec![
+                MaoStep {
+                    kind: MaoStepKind::Coding,
+                    round: 1,
+                    title: "Coding #1 · OpenCode".into(),
+                    detail: "Moved batch flush to bounded mpsc worker".into(),
+                    status: "completed",
+                    asid: Some("s3".into()),
+                    time_ms: now.saturating_sub(620_000),
+                },
+                MaoStep {
+                    kind: MaoStepKind::Verdict,
+                    round: 1,
+                    title: "Review approved #1".into(),
+                    detail: "Batch channel cleanup and backpressure tests verified clean.".into(),
+                    status: "completed",
+                    asid: Some("s3".into()),
+                    time_ms: now.saturating_sub(580_000),
+                },
+            ],
+            expanded: false,
+            created_ms: now.saturating_sub(680_000),
+            updated_ms: now.saturating_sub(580_000),
+        },
+        MaoRun {
+            id: "mao-1".into(),
+            computer: "local".into(),
+            goal: "Add rate limiting middleware to /api/search and verify existing unit tests".into(),
+            cwd: "/home/demo/gateway".into(),
+            coder: MaoRole {
+                agent: "claude".into(),
+                model: Some(ModelRef {
+                    provider_id: "anthropic".into(),
+                    model_id: "claude-haiku-4-5".into(),
+                    variant: Some("low".into()),
+                }),
+            },
+            reviewer: MaoRole {
+                agent: "codex".into(),
+                model: Some(ModelRef {
+                    provider_id: "openai".into(),
+                    model_id: "gpt-5.1-codex-mini".into(),
+                    variant: Some("low".into()),
+                }),
+            },
+            coder_asid: "s1".into(),
+            reviewer_asid: Some("s2".into()),
+            pending_reviewer_token: None,
+            pending_review_diff: false,
+            pre_review_msg_id: None,
+            base_commit: Some("e4f5g6h".into()),
+            last_diff_fingerprint: None,
+            snapshot_retries: 0,
+            round: 2,
+            max_rounds: 2,
+            phase: MaoPhase::Reviewing { round: 2 },
+            files: vec![
+                MaoDeliverableFile {
+                    path: "src/platform/server.rs".into(),
+                    additions: 84,
+                    deletions: 6,
+                },
+                MaoDeliverableFile {
+                    path: "src/orchestration/routes.rs".into(),
+                    additions: 58,
+                    deletions: 12,
+                },
+                MaoDeliverableFile {
+                    path: "src/orchestration/tests.rs".into(),
+                    additions: 45,
+                    deletions: 0,
+                },
+            ],
+            coder_summary: "Implemented per-IP token bucket limiter on /api/search with X-Forwarded-For loopback validation and added 6 integration tests.".into(),
+            review_summary: "Round 1 caught missing X-Forwarded-For fallback check; Coder updated trusted proxy parsing. Verifying Round 2 diff now…".into(),
+            findings: vec![
+                MaoFinding {
+                    severity: "medium".into(),
+                    location: "src/orchestration/routes.rs:142".into(),
+                    message: "Verify X-Forwarded-For uses right-most untrusted hop behind loopback proxy".into(),
+                },
+            ],
+            steps: vec![
+                MaoStep {
+                    kind: MaoStepKind::Coding,
+                    round: 1,
+                    title: "Coding #1 · Claude".into(),
+                    detail: "Added token bucket middleware and route guard".into(),
+                    status: "completed",
+                    asid: Some("s1".into()),
+                    time_ms: now.saturating_sub(180_000),
+                },
+                MaoStep {
+                    kind: MaoStepKind::Review,
+                    round: 1,
+                    title: "Code review #1 · Codex".into(),
+                    detail: "Changes requested: handle X-Forwarded-For fallback when behind loopback proxy".into(),
+                    status: "warning",
+                    asid: Some("s2".into()),
+                    time_ms: now.saturating_sub(110_000),
+                },
+                MaoStep {
+                    kind: MaoStepKind::Rework,
+                    round: 2,
+                    title: "Rework #2 · Claude".into(),
+                    detail: "Added trusted proxy header parsing and unit test coverage".into(),
+                    status: "completed",
+                    asid: Some("s1".into()),
+                    time_ms: now.saturating_sub(50_000),
+                },
+                MaoStep {
+                    kind: MaoStepKind::Review,
+                    round: 2,
+                    title: "Code review #2 · Codex".into(),
+                    detail: "Inspecting updated middleware diff and loopback test cases…".into(),
+                    status: "running",
+                    asid: Some("s2".into()),
+                    time_ms: now.saturating_sub(15_000),
+                },
+            ],
+            expanded: false,
+            created_ms: now.saturating_sub(200_000),
+            updated_ms: now.saturating_sub(15_000),
+        },
+    ]
+}
+
+fn mao_session_scene(s: &mut UiState) {
+    base(s);
+    timeline(s);
+    diff_stat(s);
+    s.draft = TextEdit::new("");
+    s.cfg.ui.mao = crate::config::MaoPrefs {
+        enabled: true,
+        reviewer: Some(crate::config::MaoRoleConfig {
+            agent: "codex".into(),
+            model: Some(muqun_gateway::agents::ModelRef {
+                provider_id: "openai".into(),
+                model_id: "gpt-5.1-codex-mini".into(),
+                variant: Some("low".into()),
+            }),
+        }),
+        max_rounds: 2,
+    };
+    let now = super::now_ms();
+    s.orchestration.runs = mao_sample_runs(now);
+    s.orchestration.selected_run = Some("mao-1".into());
+    s.demo = true;
+}
+
+fn mao_page_scene(s: &mut UiState) {
+    mao_session_scene(s);
+    s.go(Mode::Mao);
 }
 
 #[cfg(test)]

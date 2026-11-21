@@ -49,9 +49,10 @@ pub fn empty_diff() -> &'static DiffState {
 }
 
 pub fn clip(text: &str, max: usize) -> String {
-    match text.char_indices().nth(max) {
-        Some((at, _)) => format!("{}…", &text[..at]),
-        None => text.to_string(),
+    let clean = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match clean.char_indices().nth(max) {
+        Some((at, _)) => format!("{}…", &clean[..at]),
+        None => clean,
     }
 }
 
@@ -335,8 +336,11 @@ impl UiState {
         let selected = self.selected.clone();
         let mut keep: Vec<String> = self.tiles.iter().filter_map(|t| t.asid.clone()).collect();
         keep.extend(self.detail_asids());
-        self.timelines
-            .retain(|asid, _| selected.as_deref() == Some(asid.as_str()) || keep.contains(asid));
+        self.timelines.retain(|asid, _| {
+            selected.as_deref() == Some(asid.as_str())
+                || keep.contains(asid)
+                || self.orchestration.is_tracked(asid)
+        });
     }
 
     /// Open a file a timeline card names (a presented file, a glob or grep

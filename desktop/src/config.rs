@@ -594,6 +594,42 @@ pub struct SubagentContext {
     pub ancestor: Option<String>,
 }
 
+/// One MAO (Multi-Agent Orchestration) role binding: agent id + optional model/effort.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MaoRoleConfig {
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<muqun_gateway::agents::ModelRef>,
+}
+
+/// Persisted MAO preferences for the composer's Coder ⇄ Reviewer flow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MaoPrefs {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<MaoRoleConfig>,
+    #[serde(default = "MaoPrefs::default_max_rounds")]
+    pub max_rounds: u8,
+}
+
+impl MaoPrefs {
+    pub const fn default_max_rounds() -> u8 {
+        2
+    }
+}
+
+impl Default for MaoPrefs {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reviewer: None,
+            max_rounds: Self::default_max_rounds(),
+        }
+    }
+}
+
 /// Window furniture the owner arranged and expects back.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -633,6 +669,9 @@ pub struct UiPrefs {
     /// The sidebar's Running list is open (`ui/running.rs`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub running_open: bool,
+    /// Multi-Agent Orchestration (`ui/orchestration.rs`) reviewer & round preferences.
+    #[serde(default)]
+    pub mao: MaoPrefs,
 }
 
 /// Default placement only; opening an existing terminal never relocates it.
@@ -775,6 +814,7 @@ impl Default for UiPrefs {
             tile_layout: None,
             tile_mode: TileLayoutMode::Dwindle,
             running_open: false,
+            mao: MaoPrefs::default(),
         }
     }
 }
@@ -889,6 +929,8 @@ pub enum ConfigEdit {
         plugin: String,
         on: bool,
     },
+    /// Update Multi-Agent Orchestration (`MAO`) preferences.
+    Mao(MaoPrefs),
 }
 
 impl DesktopConfig {
@@ -1069,6 +1111,7 @@ impl DesktopConfig {
                     self.plugins_disabled.insert(plugin);
                 }
             }
+            ConfigEdit::Mao(mao) => self.ui.mao = mao,
         }
     }
 }

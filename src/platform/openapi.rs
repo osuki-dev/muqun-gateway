@@ -1126,6 +1126,68 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
     );
     vec![
         (
+            "/api/orchestrations",
+            json!({"get": {
+                "summary": "List the newest 100 orchestration runs visible to paired Apps; requires agent_orchestration_preview_v1",
+                "responses": {"200":{"description":"Run records; read an individual run for current execution state"},"401":{"description":"Authentication required"},"403":{"description":"App device required"}}
+            },"post": {
+                "summary": "Start a goal-driven coordinator using native agent and Muqun task tools; requires agent_orchestration_preview_v1",
+                "requestBody": json_body(json!({"type":"object","additionalProperties":false,
+                    "required":["client_ref","goal","cwd","coordinator"],
+                    "properties":{
+                        "client_ref":{"type":"string","description":"Required idempotency key, scoped to this device; reuse only for an identical request"},
+                        "goal":{"type":"string","description":"User objective and constraints, maximum 24 KiB"},
+                        "cwd":{"type":"string","description":"Existing absolute project directory"},
+                        "coordinator":{"type":"string","description":"Attached native agent that supports Muqun MCP registration"},
+                        "model":{"type":"string"},
+                        "variant":{"type":"string"},
+                        "asid":{"type":"string"},
+                        "attachments":{"type":"array","items":{"type":"string"}},
+                        "mode":{"type":"string"},
+                        "reviewer":{"type":"object","additionalProperties":false,"required":["agent"],"properties":{
+                            "agent":{"type":"string"},
+                            "model":{"type":"string"},
+                            "variant":{"type":"string"}
+                        }},
+                        "max_review_rounds":{"type":"integer","minimum":1,"maximum":5}
+                    }})),
+                "responses":{"200":{"description":"Run and observed task tree. dispatch_unconfirmed means delivery is not confirmed; never automatically resubmit with a new key. accepted is false: execution is not quality verification."},"400":{"description":"Invalid request or directory"},"401":{"description":"Authentication required"},"403":{"description":"App device required"},"409":{"description":"Coordinator unavailable or idempotency key reused with a different request"}}
+            }}),
+        ),
+        (
+            "/api/orchestrations/{id}",
+            json!({"get": {
+                "summary":"Read a run, reconcile MAO pipeline state, and return universal deliverables, quality gates, steps, and current task tree; idle runs require explicit acceptance",
+                "parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+                "responses":{"200":{"description":"Run, phase, mao_phase, round, max_review_rounds, coder, reviewer, deliverables, quality_gates, steps, tasks, truncation flag and accepted flag. A truncated tree is incomplete_observation. Follow task IDs through the existing task API for history and cancellation."},"401":{"description":"Authentication required"},"403":{"description":"App device required"},"404":{"description":"Unknown run"}}
+            }}),
+        ),
+        (
+            "/api/orchestrations/{id}/approve",
+            json!({"post": {
+                "summary":"Accept and close a MAO orchestration run after reviewing deliverables and quality gates",
+                "parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+                "responses":{"200":{"description":"Updated orchestration run state with mao_phase=done and accepted=true"},"401":{"description":"Authentication required"},"403":{"description":"App device required"},"404":{"description":"Unknown run"}}
+            }}),
+        ),
+        (
+            "/api/orchestrations/{id}/rework",
+            json!({"post": {
+                "summary":"Send feedback to the coder agent and start a new rework round in the orchestration run",
+                "parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+                "requestBody":{"required":false,"content":{"application/json":{"schema":{"type":"object","properties":{"feedback":{"type":"string"}}}}}},
+                "responses":{"200":{"description":"Updated orchestration run state with mao_phase=reworking"},"401":{"description":"Authentication required"},"403":{"description":"App device required"},"404":{"description":"Unknown run"}}
+            }}),
+        ),
+        (
+            "/api/orchestrations/{id}/cancel",
+            json!({"post": {
+                "summary":"Cancel active coder/reviewer tasks and mark the orchestration run cancelled",
+                "parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+                "responses":{"200":{"description":"Updated orchestration run state with mao_phase=cancelled and accepted=false"},"401":{"description":"Authentication required"},"403":{"description":"App device required"},"404":{"description":"Unknown run"}}
+            }}),
+        ),
+        (
             "/api/tasks",
             json!({ "get": {
                 "summary": "List tasks. Requires the task_ledger capability and a device token",

@@ -356,10 +356,13 @@ fn send_session(s: &mut UiState, queue: bool) {
         return;
     }
     s.record_prompt_history(&text);
+    let busy = s.busy();
+    if !busy {
+        super::orchestration::on_session_submitted(s, &asid, &text);
+    }
     let attachments: Vec<String> = s.staged.iter().map(|f| f.path.clone()).collect();
     let deliver = deliver_of(catalog_of(s, Slot::Session), &text, !attachments.is_empty());
     note_skill_args(s, &deliver);
-    let busy = s.busy();
     let delivery = busy.then_some(if queue {
         super::echo::BusyDelivery::Queue
     } else {
@@ -814,7 +817,7 @@ fn queued_chip(
         .trigger(
             Button::new(label.clone())
                 .label_with(move |font, ink| {
-                    row().w_full().min_w(0.0).child(
+                    row().grow(1.0).w_full().min_w(0.0).center_y().child(
                         text(label.clone())
                             .font(font)
                             .color(ink)
@@ -862,7 +865,7 @@ fn queued_chip(
         .center_y()
         .px(4.0)
         .radius(k.radius.xl)
-        .fill(k.c.bg_base.alpha(0.65))
+        .fill(k.c.surface_raised_base)
         .border(1.0, k.c.border_weak);
     let mut thumbs: Vec<&str> = item
         .files
@@ -891,7 +894,7 @@ fn queued_chip(
                 .build(k)
                 .key(format!("queued-edit-{id}"))
                 .radius(k.radius.xl)
-                .fill(k.c.bg_base.alpha(0.65))
+                .fill(k.c.surface_raised_base)
                 .border(1.0, k.c.border_weak),
         );
     }
@@ -905,7 +908,7 @@ fn queued_chip(
             .build(k)
             .key(format!("queued-cancel-{id}"))
             .radius(k.radius.xl)
-            .fill(k.c.bg_base.alpha(0.65))
+            .fill(k.c.surface_raised_base)
             .border(1.0, k.c.border_weak),
     )
 }
@@ -971,17 +974,17 @@ pub(super) fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
             let next = queue[(page + 1) % queue.len()].id.clone();
             deck = deck.child(
                 row()
-                    .gap(6.0)
+                    .gap(2.0)
                     .center_y()
                     .child(
                         Button::new(format!(
-                            "{} · {}/{}",
+                            "{} {}/{}",
                             tr_ref(s.cfg.general.language, "Queued:"),
                             page + 1,
                             queue.len()
                         ))
                         .variant(ButtonVariant::GhostMuted)
-                        .control_size(ControlSize::Large)
+                        .control_size(ControlSize::Small)
                         .on_press(|s: &mut UiState| {
                             s.composer_queue_expanded = !s.composer_queue_expanded
                         })
@@ -991,7 +994,7 @@ pub(super) fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
                     .child(
                         Button::new("›")
                             .variant(ButtonVariant::GhostMuted)
-                            .control_size(ControlSize::Large)
+                            .control_size(ControlSize::Small)
                             .help(tr_ref(s.cfg.general.language, "Next"))
                             .on_press(move |s: &mut UiState| {
                                 s.composer_queue_page = Some(next.clone())
@@ -1019,17 +1022,17 @@ pub(super) fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
             );
         } else {
             let depth = (queue.len() - 1).min(2);
-            let mut stack = el().w_full().pb(depth as f32 * 5.0);
+            let mut stack = el().w_full().pb(depth as f32 * 4.0);
             for n in (1..=depth).rev() {
                 stack = stack.child(
                     el().key(format!("queue-page-{n}"))
                         .pin(
-                            Some(n as f32 * 8.0),
-                            Some(n as f32 * 5.0),
-                            Some(80.0 + n as f32 * 8.0),
-                            Some(0.0),
+                            Some(n as f32 * 6.0),
+                            Some(n as f32 * 4.0),
+                            Some(88.0 + n as f32 * 6.0),
+                            Some((depth - n) as f32 * 4.0),
                         )
-                        .radius(k.radius.lg)
+                        .radius(k.radius.xl)
                         .fill(k.c.layer_01)
                         .border(1.0, k.c.border_weak)
                         .a11y_hidden(),
@@ -2510,7 +2513,21 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     use super::composer_row::{ACTION_GAP, CARD_PAD};
     let inner = rune::memo::layout_with("composer-card", |r| r[2].round())
         .map_or(f32::INFINITY, |w| w - CARD_PAD - 24.0);
-    let tools = row().gap(ACTION_GAP).center_y().child(attach);
+    let mut tools = row()
+        .gap(ACTION_GAP)
+        .center_y()
+        .flex_wrap()
+        .shrink()
+        .min_w(0.0)
+        .child(attach);
+    if has_session && !s.in_split() {
+        tools = tools.child(super::orchestration::composer_bar(
+            s,
+            k,
+            layer,
+            Slot::Session,
+        ));
+    }
     let mut actions = row().key("composer-actions").gap(ACTION_GAP).center_y();
     if s.cfg.voice.usable() || s.voice.is_some() {
         actions = actions.child(

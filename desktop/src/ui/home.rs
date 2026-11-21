@@ -96,6 +96,14 @@ pub fn submit_start(s: &mut UiState) {
     if !prompt.trim().is_empty() || !staged_files.is_empty() {
         s.echo_sent(&pending_asid, token, prompt.clone(), &staged_files, None);
     }
+    super::orchestration::on_start_submitted(
+        s,
+        &pending_asid,
+        &prompt,
+        &cwd.display().to_string(),
+        &agent,
+        model.clone(),
+    );
     s.pending_start = Some((pending_asid.clone(), token));
     s.tiles_restored = true;
     if let Some(i) = s
@@ -700,12 +708,17 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
     }
     let attach_cwd = PathBuf::from(s.start_cwd.text.trim());
     let tools = composer::attachment_button(k, language, Some(attach_cwd), true, "start-attach");
-    let actions = row()
-        .key("start-actions")
+    let left_tools = row()
         .gap(6.0)
         .center_y()
+        .flex_wrap()
         .child(tools)
-        .child(el().grow(1.0).a11y_hidden())
+        .child(super::orchestration::composer_bar(s, k, layer, Slot::Start));
+    let actions = row()
+        .key("start-actions")
+        .gap(8.0)
+        .center_y()
+        .child(left_tools.grow(1.0).min_w(0.0))
         .child(
             look.glow(
                 Button::new(tr_ref(language, "Start"))

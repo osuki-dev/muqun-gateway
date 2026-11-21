@@ -36,6 +36,7 @@ const TASK_EVENT_CAPACITY: usize = 512;
 pub struct LocalHub {
     runtime: Arc<AgentRuntime>,
     tasks: Arc<LocalTaskManager>,
+    orchestrations: Mutex<Vec<serde_json::Value>>,
 }
 
 /// Fill `image_assets` the HTTP routes would attach — Desktop never hits those.
@@ -52,6 +53,7 @@ impl LocalHub {
         Self {
             runtime,
             tasks: Arc::new(LocalTaskManager::new()),
+            orchestrations: Mutex::new(Vec::new()),
         }
     }
 
@@ -90,6 +92,88 @@ impl LocalHub {
 }
 
 impl SessionHub for LocalHub {
+    fn orchestration(
+        &self,
+        request: super::OrchestrationRequest,
+    ) -> HubFuture<'_, serde_json::Value> {
+        Box::pin(async move {
+            match request {
+                super::OrchestrationRequest::List => {
+                    let runs = self.orchestrations.lock().unwrap().clone();
+                    Ok(serde_json::json!({ "runs": runs }))
+                }
+                super::OrchestrationRequest::Read(id) => {
+                    let run = self
+                        .orchestrations
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|r| r.get("id").and_then(serde_json::Value::as_str) == Some(&id))
+                        .cloned()
+                        .ok_or_else(|| {
+                            HubError::Agent(AgentError::InvalidRequest(
+                                "Orchestration not found".into(),
+                            ))
+                        })?;
+                    let task_id = run
+                        .get("task_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let tasks = self.tasks.list(Some(task_id), None);
+                    Ok(serde_json::json!({
+                        "run": run,
+                        "phase": "working",
+                        "tasks": tasks,
+                        "truncated": false,
+                        "accepted": false
+                    }))
+                }
+                super::OrchestrationRequest::Start(body) => {
+                    let goal = body
+                        .get("goal")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .trim();
+                    if goal.is_empty() {
+                        return Err(HubError::Agent(AgentError::InvalidRequest(
+                            "Orchestration goal must not be empty".into(),
+                        )));
+                    }
+                    let coordinator = body
+                        .get("coordinator")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|s| !s.is_empty());
+                    let cwd = body
+                        .get("cwd")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|s| !s.is_empty());
+                    let task = self.create_task(goal, coordinator, cwd, None).await?;
+                    let id = format!("o_{}", uuid::Uuid::new_v4());
+                    let run = serde_json::json!({
+                        "id": id,
+                        "owner": "local",
+                        "request": body,
+                        "created_ms": now_ms(),
+                        "task_id": task.id,
+                    });
+                    self.orchestrations.lock().unwrap().insert(0, run.clone());
+                    let tasks = self.tasks.list(Some(&task.id), None);
+                    Ok(serde_json::json!({
+                        "run": run,
+                        "phase": "working",
+                        "tasks": tasks,
+                        "truncated": false,
+                        "accepted": false
+                    }))
+                }
+                super::OrchestrationRequest::CancelTask { run, task } => {
+                    self.cancel_task(&task).await?;
+                    self.orchestration(super::OrchestrationRequest::Read(run))
+                        .await
+                }
+            }
+        })
+    }
     fn pending_attention(
         &self,
     ) -> HubFuture<'_, Option<Vec<muqun_gateway::agents::ports::AgentPendingSnapshot>>> {

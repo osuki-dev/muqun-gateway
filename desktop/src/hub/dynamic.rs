@@ -188,6 +188,14 @@ async fn forward_tasks(
 }
 
 impl SessionHub for DynamicHub {
+    fn orchestration(
+        &self,
+        request: super::OrchestrationRequest,
+    ) -> HubFuture<'_, serde_json::Value> {
+        let active = self.active();
+        Box::pin(async move { active.orchestration(request).await })
+    }
+
     fn pending_attention(
         &self,
     ) -> HubFuture<'_, Option<Vec<muqun_gateway::agents::ports::AgentPendingSnapshot>>> {

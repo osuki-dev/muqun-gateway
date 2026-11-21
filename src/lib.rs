@@ -14,6 +14,7 @@ pub(crate) mod cli;
 pub mod connectivity;
 pub(crate) mod fleet;
 pub(crate) mod mcp;
+pub(crate) mod orchestration;
 pub mod platform;
 pub(crate) mod search;
 pub(crate) mod tasks;

@@ -38,6 +38,20 @@ pub use muqun_gateway::agents::runtime::AGENT_PREFERENCE;
 
 pub type HubFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, HubError>> + Send + 'a>>;
 
+#[derive(Debug, Clone)]
+pub enum OrchestrationRequest {
+    List,
+    Read(String),
+    Start(serde_json::Value),
+    CancelTask { run: String, task: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct OrchestrationError {
+    pub message: String,
+    pub uncertain: bool,
+}
+
 /// What the composer offers for one agent in one folder: the gateway's
 /// catalogue (models, modes, slash commands, skills).
 #[derive(Debug, Clone, Default)]
@@ -343,6 +357,13 @@ pub struct TimelineCatchUp {
 }
 
 pub trait SessionHub: Send + Sync {
+    fn orchestration(&self, _request: OrchestrationRequest) -> HubFuture<'_, serde_json::Value> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "Connect to a Gateway with intelligent orchestration support".into(),
+            )))
+        })
+    }
     /// Which kind of backend this hub is.
     fn mode(&self) -> HubMode;
     /// Every agent this hub knows, with the gateway's availability words.

@@ -26,6 +26,11 @@ impl std::fmt::Debug for VoiceStart {
 
 #[derive(Debug, Clone)]
 pub enum Command {
+    Orchestration {
+        computer: String,
+        ticket: u64,
+        request: crate::hub::OrchestrationRequest,
+    },
     /// Record and transcribe into the composer.
     Voice(std::sync::Arc<VoiceStart>),
     /// Re-read agent status and the session list.
@@ -280,6 +285,13 @@ pub enum Command {
     PluginPackage(uuid::Uuid, crate::plugin::packages::Operation, Vec<String>),
     /// Download and install a managed runtime (Bun or Herdr) on the background worker.
     InstallManagedRuntime(muqun_gateway::platform::runtimes::RuntimeKind),
+    /// Gather git diff/changed-file context for an MAO Coder -> Reviewer handoff.
+    MaoPrepareReview {
+        run_id: String,
+        coder_asid: String,
+        cwd: String,
+        base_commit: Option<String>,
+    },
 }
 
 pub type CommandSender = mpsc::UnboundedSender<Command>;

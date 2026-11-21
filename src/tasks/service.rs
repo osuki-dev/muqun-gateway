@@ -1338,6 +1338,18 @@ impl TaskService {
         by: Requested,
         request: DelegateRequest,
     ) -> Result<TaskView, TaskError> {
+        self.delegate_in_session(state, by, request, None, None)
+            .await
+    }
+
+    pub(crate) async fn delegate_in_session(
+        &self,
+        state: &AppState,
+        by: Requested,
+        request: DelegateRequest,
+        existing: Option<&str>,
+        display_goal: Option<&str>,
+    ) -> Result<TaskView, TaskError> {
         if !is_self(
             request.machine.as_deref(),
             &self.machine_id,
@@ -1398,6 +1410,18 @@ impl TaskService {
         }
         let manager = agent_for(state, request.agent_id.as_deref()).await?;
         let agent_id = manager.agent().kind();
+        let existing_session = if let Some(asid) = existing {
+            let info = manager.sessions().get_session(asid).await?;
+            if info.status != AgentSessionStatus::Idle {
+                return Err(AgentError::InvalidRequest(
+                    "Wait for this session to become idle before enabling orchestration".into(),
+                )
+                .into());
+            }
+            Some(info)
+        } else {
+            None
+        };
         // No supported session adapter currently supplies a credential bound
         // to this new task. Refuse before registration, task or session creation.
         if self
@@ -1505,14 +1529,18 @@ impl TaskService {
                 tracing::debug!("Codex computer tools unavailable; continuing ordinary task");
             }
         }
-        let created = manager
-            .sessions()
-            .create_session(
-                request.cwd.as_deref(),
-                model.as_ref(),
-                request.mode.as_deref(),
-            )
-            .await;
+        let created = if let Some(session) = existing_session {
+            Ok(session)
+        } else {
+            manager
+                .sessions()
+                .create_session(
+                    request.cwd.as_deref(),
+                    model.as_ref(),
+                    request.mode.as_deref(),
+                )
+                .await
+        };
         let asid = match created {
             Ok(session) => session.asid,
             Err(error) => {
@@ -1526,15 +1554,17 @@ impl TaskService {
             .agent_runtime
             .record_session_route(&asid.0, agent_id)
             .await;
-        crate::agents::session_defaults::after_create(
-            &state.db,
-            &manager,
-            &asid.0,
-            request.cwd.as_deref(),
-            model.as_ref(),
-            request.mode.as_deref(),
-        )
-        .await;
+        if existing.is_none() {
+            crate::agents::session_defaults::after_create(
+                &state.db,
+                &manager,
+                &asid.0,
+                request.cwd.as_deref(),
+                model.as_ref(),
+                request.mode.as_deref(),
+            )
+            .await;
+        }
         let binding = TaskBinding::AgentSession {
             agent_id: agent_id.to_owned(),
             asid: asid.0.clone(),
@@ -1612,7 +1642,13 @@ impl TaskService {
             };
             manager
                 .prompts()
-                .send_prompt_with_display(&asid, &goal, &request.goal, &request.attachments, None)
+                .send_prompt_with_display(
+                    &asid,
+                    &goal,
+                    display_goal.unwrap_or(&request.goal),
+                    &request.attachments,
+                    None,
+                )
                 .await?;
             let task = self
                 .store()
@@ -1636,11 +1672,13 @@ impl TaskService {
                 Err(error)
             }
             Err(error) => {
-                if let Err(interrupt) = manager.prompts().interrupt(&asid).await {
-                    tracing::warn!(
-                        "task {}: could not stop the session: {interrupt}",
-                        task.id.0
-                    );
+                if existing.is_none() {
+                    if let Err(interrupt) = manager.prompts().interrupt(&asid).await {
+                        tracing::warn!(
+                            "task {}: could not stop the session: {interrupt}",
+                            task.id.0
+                        );
+                    }
                 }
                 let failed = TaskChange {
                     binding: Some(binding),

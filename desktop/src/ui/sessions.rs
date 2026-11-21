@@ -92,6 +92,11 @@ fn nav(s: &UiState, k: &Kit, label: &str, icon: &'static rune::Icon, mode: Mode)
         if waiting > 0 {
             row = row.badge(waiting.to_string());
         }
+    } else if mode == Mode::Mao {
+        let active = s.orchestration.active_count();
+        if active > 0 {
+            row = row.badge(active.to_string());
+        }
     }
     row.build(k).key(format!("nav-{label}"))
 }
@@ -545,7 +550,10 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
         return el().key(format!("session-{asid}")).h(0.0);
     };
     let look = s.look();
-    let activity = s.activity(info);
+    let mut activity = s.activity(info);
+    if activity == super::Activity::Idle && s.orchestration.row_working(asid) {
+        activity = super::Activity::Working;
+    }
     let pinned = s.cfg.general.pinned.iter().any(|p| p == asid);
     let in_tile = s.in_split() && s.tile_of(asid).is_some();
     let when = ago(info.updated_ms, now_ms(), s.cfg.general.language);
@@ -555,7 +563,15 @@ fn session_row(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El {
         .as_deref()
         .and_then(|path| std::path::Path::new(path).file_name())
         .map(|name| name.to_string_lossy().into_owned());
-    let subtitle = directory.unwrap_or_default();
+    let subtitle = match (
+        s.orchestration.row_status(asid, s.cfg.general.language),
+        directory,
+    ) {
+        (Some(mao), Some(dir)) => format!("{mao} · {dir}"),
+        (Some(mao), None) => mao,
+        (None, Some(dir)) => dir,
+        (None, None) => String::new(),
+    };
     let mut row = SidebarRow::new(format!(
         "{}{}",
         if pinned { "★ " } else { "" },
@@ -849,7 +865,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .key("nav-plugins");
     // Measure localized labels at the active text scale; each pair wraps
     // to one column when its two complete labels no longer fit.
-    let cell_width = ["Plugins", "Inbox", "Tasks", "Settings"]
+    let cell_width = ["Plugins", "Inbox", "Tasks", "MAO", "Settings"]
         .iter()
         .map(|label| {
             rune::text::measure(super::copy::tr_ref(language, label), &[], k.ty.ui, None).0 + 64.0
@@ -861,6 +877,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     for (id, label, glyph, mode) in [
         ("inbox", "Inbox", &INBOX, Mode::Inbox),
         ("tasks", "Tasks", &TASK, Mode::Tasks),
+        ("mao", "MAO", &super::parts::glyphs::WORKFLOW, Mode::Mao),
         ("settings", "Settings", &SETTINGS, Mode::Settings),
     ] {
         if crate::plugin::is_enabled(id, &s.cfg.plugins_disabled) {
