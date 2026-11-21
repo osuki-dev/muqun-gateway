@@ -32,10 +32,14 @@ pub(crate) use platform::metadata::*;
 pub use platform::runtimes;
 pub(crate) use platform::server::*;
 pub use platform::set_directories;
+pub use platform::update::Version as ReleaseVersion;
 // Small pure helpers an embedding host shows the same way the gateway does:
 // a "3m ago", a folder named from `~`, and whether a title is only an
 // adapter's placeholder for an unnamed session.
-pub use platform::manage::relative_since;
+pub use platform::manage::{
+    local_gateway_client_file, local_pairing_invitation, relative_since, PairingCode,
+    PairingInvitation,
+};
 /// Workspace `@` file search: the same bounded walk the terminal pane uses.
 /// Desktop falls back here when the agent has no `find_files` (ACP/Cursor).
 pub mod filesearch {

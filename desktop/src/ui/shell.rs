@@ -8,8 +8,8 @@ use std::sync::Arc;
 use rune::{col, el, row, text, Color, Cx, El, SurfaceFit};
 use rune_kit::shell::{SidebarToggle, SplitView, Toolbar, INSPECTOR};
 use rune_kit::{
-    Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, IconButton, IconButtonVariant,
-    Kit, Menu, MenuItem,
+    Badge, BadgeVariant, Button, ButtonVariant, Card, ControlSize, IconButtonVariant, Kit, Menu,
+    MenuItem,
 };
 
 use super::copy::{tr, tr_ref};
@@ -157,9 +157,12 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         (s.right_open && s.mode == Mode::Session && !s.in_split()) || plugin_drawer;
     // A row's details take the right-hand slot while they are open; an open
     // terminal takes it over both, and the inspector comes last.
-    let details = (s.mode == Mode::Session && s.active_plugin_page.is_none() && !plugin_drawer)
-        .then(|| timeline::detail_pane(s, k))
-        .flatten();
+    let details = (s.mode == Mode::Session
+        && s.active_plugin_page.is_none()
+        && !plugin_drawer
+        && s.inspect_pane.is_open())
+    .then(|| timeline::detail_pane(s, k))
+    .flatten();
     // The right-hand pane's width, for the main card's floor on a
     // see-through window.
     let mut right_w = 0.0;
@@ -683,24 +686,13 @@ fn session_more(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str, busy: boo
     let pinned = s.cfg.general.pinned.iter().any(|p| p == asid);
     Menu::new("session-more")
         .trigger(
-            super::art::direction_button(
-                s,
-                k,
-                tr_ref(language, "More"),
-                if open {
-                    -std::f32::consts::FRAC_PI_2
-                } else {
-                    std::f32::consts::FRAC_PI_2
-                },
-            )
-            .variant(ButtonVariant::GhostMuted)
-            .control_size(ControlSize::Small)
-            .expanded(open)
-            .on_press(move |s: &mut UiState| {
-                s.menu = (!open).then_some(OpenMenu::SessionMore);
-            })
-            .build(k)
-            .key("session-more-btn"),
+            super::icons::header_button(&super::icons::MORE, tr_ref(language, "More"))
+                .expanded(open)
+                .on_press(move |s: &mut UiState| {
+                    s.menu = (!open).then_some(OpenMenu::SessionMore);
+                })
+                .build(k)
+                .key("session-more-btn"),
         )
         .open(open)
         .on_close(|s: &mut UiState| s.menu = None)
@@ -774,15 +766,16 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
             let fit = super::Fit::of("main");
             if fit == super::Fit::Wide {
                 bar = bar.trailing(
-                    Button::new(tr_ref(language, "Split view"))
-                        .variant(ButtonVariant::Ghost)
-                        .control_size(ControlSize::Small)
-                        .disabled(asid.is_empty())
-                        .help(tr_ref(language, "Open another session beside this one"))
-                        .shortcut(super::keymap::label(super::keymap::Action::AddSplit))
-                        .on_press(|s: &mut UiState| s.split())
-                        .build(k)
-                        .key("split-session"),
+                    super::icons::header_button(
+                        &super::icons::ADD_PANE,
+                        tr_ref(language, "Split view"),
+                    )
+                    .disabled(asid.is_empty())
+                    .help(tr_ref(language, "Open another session beside this one"))
+                    .shortcut(super::keymap::label(super::keymap::Action::AddSplit))
+                    .on_press(|s: &mut UiState| s.split())
+                    .build(k)
+                    .key("split-session"),
                 );
             }
             if !asid.is_empty() {
@@ -801,60 +794,39 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
             }
         }
     }
-    if s.mode != Mode::Home {
-        let has_term_tile = s.has_terminal_tile();
-        bar = bar.trailing(
-            IconButton::new(&super::terminal_panel::TERMINAL_WINDOW)
-                .variant(if s.term.open || has_term_tile {
-                    IconButtonVariant::Contrast
-                } else {
-                    IconButtonVariant::Ghost
-                })
-                .label(tr_ref(language, "Terminal"))
-                .help(super::keymap::tip(
-                    tr_ref(language, "Terminal"),
-                    super::keymap::Action::ToggleTerminal,
-                ))
-                .on_press_tx(|s: &mut UiState, tx: &mut rune::Tx| {
-                    let mods = tx.mods();
-                    if mods.ctrl || mods.cmd || mods.alt {
-                        s.open_terminal_tile();
-                    } else if s.has_terminal_tile() {
-                        if let Some(i) = s.tile_of_terminal() {
-                            s.focus_tile(i);
-                        }
-                    } else if s.term.open {
-                        s.close_terminal();
-                    } else {
-                        s.open_terminal_default();
-                    }
-                })
-                .build(k)
-                .key("terminal-toggle"),
-        );
-    }
-    if s.mode == Mode::Session
-        && !s.in_split()
-        && crate::plugin::is_enabled("inspector", &s.cfg.plugins_disabled)
-    {
-        bar = bar.trailing(
-            IconButton::new(&INSPECTOR)
-                .variant(if s.right_open && !s.term.open {
-                    IconButtonVariant::Contrast
-                } else {
-                    IconButtonVariant::Ghost
-                })
-                .label(tr_ref(language, "Inspector"))
-                .help(super::keymap::tip(
-                    tr_ref(language, "Inspector"),
-                    super::keymap::Action::ToggleInspector,
-                ))
-                .on_press(|s: &mut UiState| s.toggle_inspector())
-                .build(k)
-                .key("inspector-toggle"),
-        );
-    }
-    bar
+    bar.trailing(right_panel_toggle(s, k))
+}
+
+pub(super) fn right_panel_toggle(s: &UiState, k: &Kit) -> El {
+    let open = s.right_panel_open();
+    let label = tr_ref(
+        s.cfg.general.language,
+        if open {
+            "Hide right panel"
+        } else {
+            "Show right panel"
+        },
+    );
+    super::icons::header_button(&INSPECTOR, label)
+        .variant(if open {
+            IconButtonVariant::Contrast
+        } else {
+            IconButtonVariant::GhostMuted
+        })
+        .on_press_tx(|s: &mut UiState, tx: &mut rune::Tx| {
+            s.toggle_right_panel();
+            if s.term.open {
+                s.focus_terminal_tx(tx);
+            } else if !s.right_panel_open() {
+                if s.in_split() {
+                    s.focus_pane_input(tx);
+                } else if s.mode == Mode::Session {
+                    tx.focus("draft", false);
+                }
+            }
+        })
+        .build(k)
+        .key("dock-toggle")
 }
 
 /// A hairline of light under the title band, in the session agent's colour.

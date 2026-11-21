@@ -1,9 +1,18 @@
 //! Plugin discovery and external plugin runtime loader.
 //!
-//! Scans configured plugin search paths for folders containing `plugin.json`,
+//! Scans configured plugin search paths for native-view packages and standalone manifests,
 //! parses their manifests, and instantiates [`ExternalPlugin`] which implements
 //! [`DesktopPlugin`].
 
+mod native_media;
+mod native_selection;
+mod native_view;
+mod notifications;
+mod panel;
+mod web_surface;
+pub(crate) use web_surface::webview_helper;
+
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
@@ -18,6 +27,7 @@ use rune::{col, el, icon, row, text, El, Icon};
 use rune_kit::{Button, ButtonVariant, ControlSize, Markdown};
 
 use crate::config::Language;
+use crate::diagnostics::{Attempt, EventKind, Outcome};
 use crate::plugin::manifest::{
     PluginCategory, PluginCommandManifest, PluginManifest, PluginRenderKind, PluginSlot,
 };
@@ -53,7 +63,35 @@ pub struct BunScriptResponse {
     pub composer_text: Option<String>,
 }
 
-/// An external file-based plugin loaded from a `plugin.json` manifest.
+#[derive(Clone, Debug)]
+struct ScriptOutput {
+    media: native_media::Images,
+    body: String,
+    wrote_stderr: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ScriptFailure {
+    reason: Outcome,
+    detail: String,
+}
+
+struct ScriptJob {
+    draft_target: Option<super::draft::Target>,
+    receiver: mpsc::Receiver<Result<ScriptOutput, ScriptFailure>>,
+    cancel: Arc<AtomicBool>,
+    title: String,
+    attempt: Attempt,
+}
+
+impl ScriptJob {
+    fn cancel(self) {
+        self.cancel.store(true, Ordering::Release);
+        self.attempt.finish(Outcome::Cancelled);
+    }
+}
+
+/// An external file-based plugin loaded from a manifest.
 pub struct ExternalPlugin {
     id: &'static str,
     manifest: PluginManifest,
@@ -61,14 +99,24 @@ pub struct ExternalPlugin {
     commands: Vec<PluginCommand>,
     image_icon: Option<Arc<[u8]>>,
     dynamic_markdown: Mutex<Option<String>>,
-    script_job: Mutex<Option<mpsc::Receiver<Result<String, String>>>>,
-    script_title: Mutex<String>,
-    script_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    panels: Mutex<HashMap<String, panel::Panel>>,
+    native_views: Mutex<HashMap<String, native_selection::Document>>,
+    jobs: Mutex<HashMap<Option<String>, ScriptJob>>,
+    notifications: Mutex<notifications::Poll>,
+    web_surfaces: Mutex<HashMap<String, super::webview_preview::Surface>>,
     /// Optional override for the Bun binary resolution:
     /// - `None`: resolve via `muqun_gateway::platform::runtimes::resolve_binary(RuntimeKind::Bun, None)`
     /// - `Some(Some(path))`: resolve with `configured = Some(path)`
     /// - `Some(None)`: force Bun unavailable (used for testing missing-runtime fallback)
     bun_binary_override: Mutex<Option<Option<PathBuf>>>,
+}
+
+impl Drop for ExternalPlugin {
+    fn drop(&mut self) {
+        for (_, job) in self.jobs.get_mut().unwrap().drain() {
+            job.cancel();
+        }
+    }
 }
 
 impl ExternalPlugin {
@@ -108,9 +156,11 @@ impl ExternalPlugin {
             commands,
             image_icon,
             dynamic_markdown: Mutex::new(None),
-            script_cancel: Mutex::new(None),
-            script_job: Mutex::new(None),
-            script_title: Mutex::new(String::new()),
+            native_views: Mutex::default(),
+            panels: Mutex::default(),
+            jobs: Mutex::default(),
+            notifications: Mutex::default(),
+            web_surfaces: Mutex::default(),
             bun_binary_override: Mutex::new(None),
         }
     }
@@ -125,14 +175,35 @@ impl ExternalPlugin {
         self.dynamic_markdown.lock().unwrap().clone()
     }
 
-    /// Load an external plugin from a directory containing `plugin.json`.
+    /// Load a plugin from an opted-in package or standalone manifest.
     pub fn from_dir(dir: &Path) -> anyhow::Result<Self> {
-        let manifest_path = dir.join("plugin.json");
-        let manifest = PluginManifest::from_file(&manifest_path)?;
-        if manifest.id.trim().is_empty() {
-            anyhow::bail!("Plugin manifest in {} has an empty id", dir.display());
-        }
-        Ok(Self::new(manifest, dir.to_path_buf()))
+        Self::try_from_dir(dir)?.ok_or_else(|| anyhow::anyhow!("No plugin in {}", dir.display()))
+    }
+
+    fn try_from_dir(dir: &Path) -> anyhow::Result<Option<Self>> {
+        let package_path = dir.join("package.json");
+        let legacy_path = dir.join("plugin.json");
+        let package = if package_path.is_file() {
+            let data = std::fs::read(package_path)?;
+            match serde_json::from_slice(&data) {
+                Ok(value) => PluginManifest::from_package(value)?,
+                Err(_) if legacy_path.is_file() => None,
+                Err(err) => return Err(err.into()),
+            }
+        } else {
+            None
+        };
+        let manifest = match package {
+            Some(package) => package,
+            None if legacy_path.is_file() => PluginManifest::from_file(legacy_path)?,
+            None => return Ok(None),
+        };
+        anyhow::ensure!(
+            !manifest.id.trim().is_empty(),
+            "Empty plugin ID in {}",
+            dir.display()
+        );
+        Ok(Some(Self::new(manifest, dir.to_path_buf())))
     }
 
     /// Access the underlying manifest.
@@ -206,8 +277,35 @@ impl ExternalPlugin {
         command_title: &str,
         script_path: &Path,
     ) -> bool {
+        self.start_script(s, command_id, command_title, script_path, None)
+    }
+
+    fn start_script(
+        &self,
+        s: &mut UiState,
+        command_id: &str,
+        command_title: &str,
+        script_path: &Path,
+        view: Option<(&str, &str)>,
+    ) -> bool {
+        let instance = view.map(|(id, _)| id.to_owned());
+        let mut jobs = self.jobs.lock().unwrap();
+        if jobs.contains_key(&instance) {
+            return true;
+        }
+        let kind = match view {
+            Some((_, "open")) => EventKind::PluginOpen,
+            Some(_) => EventKind::PluginAction,
+            None => EventKind::PluginCommand,
+        };
+        let mut attempt = Attempt::new(kind, self.id, Some(&self.manifest.version));
+        attempt.bun_version = s
+            .runtime_statuses
+            .iter()
+            .find(|st| st.kind == RuntimeKind::Bun)
+            .and_then(|st| st.version.clone());
         let Some(bun_bin) = self.resolve_bun_binary() else {
-            s.notify(
+            s.notify_diagnostic(attempt.finish(Outcome::RuntimeMissing),
                 ToastLevel::Warning,
                 format!("{}: Bun runtime required", self.manifest.name),
                 Some(
@@ -219,7 +317,8 @@ impl ExternalPlugin {
         };
 
         if !script_path.is_file() {
-            s.notify(
+            s.notify_diagnostic(
+                attempt.finish(Outcome::EntryMissing),
                 ToastLevel::Error,
                 format!("{}: Script not found", self.manifest.name),
                 Some(format!("Missing script file `{}`", script_path.display())),
@@ -233,11 +332,45 @@ impl ExternalPlugin {
             .unwrap_or_else(|| s.terminal_cwd().display().to_string());
         let session_id = s.selected.clone().unwrap_or_default();
 
+        let media_dir = view.and_then(|_| native_media::invocation_dir().ok());
+        let mut context = serde_json::json!(super::context::web_context(s, true));
+        context["capabilities"] = serde_json::json!({"webviewEntry":cfg!(target_os = "linux") && web_surface::webview_helper().is_some(), "nativeLayout":true, "nativePresentation":true, "nativeImages":media_dir.is_some(), "fillLayout":true, "markdownAnchors":true,"nativeSelect":true});
+        if let Some((instance, action)) = view {
+            if let Some(fields) = s
+                .plugin_fields
+                .get(&(self.id.to_owned(), instance.to_owned()))
+            {
+                let values: serde_json::Map<_, _> = fields
+                    .iter()
+                    .filter(|((form, _), _)| form == action)
+                    .map(|((_, name), edit)| {
+                        (name.clone(), serde_json::Value::String(edit.text.clone()))
+                    })
+                    .collect();
+                context["form"] = values.into();
+            }
+        }
+        let encoded = context.to_string();
+        if encoded.len() > 60 * 1024 {
+            s.toast_error(
+                self.manifest.name.clone(),
+                Some("Form exceeds the 60 KiB submission limit".into()),
+            );
+            return true;
+        }
         let mut command = ProcessCommand::new(&bun_bin);
+        command.env_remove("MUQUN_PLUGIN_MEDIA_DIR");
+        if let Some(dir) = &media_dir {
+            command.env("MUQUN_PLUGIN_MEDIA_DIR", dir.path());
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            command.env("MUQUN_DESKTOP_EXECUTABLE", exe);
+        }
         command
             .arg("run")
             .arg(script_path)
             .current_dir(&self.dir)
+            .env("MUQUN_PLUGIN_CONTEXT", encoded)
             .env("MUQUN_PLUGIN_ID", self.id)
             .env("MUQUN_PLUGIN_DIR", self.dir.as_os_str())
             .env("MUQUN_WORKSPACE_CWD", &workspace_cwd)
@@ -248,17 +381,29 @@ impl ExternalPlugin {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut job = self.script_job.lock().unwrap();
-        if job.is_some() {
-            return true;
+        if let Some((_, action)) = view {
+            command.env("MUQUN_PLUGIN_ACTION", action);
         }
         let (tx, rx) = mpsc::channel();
-        *job = Some(rx);
-        *self.script_title.lock().unwrap() = command_title.to_string();
         let cancel = Arc::new(AtomicBool::new(false));
-        *self.script_cancel.lock().unwrap() = Some(cancel.clone());
+        jobs.insert(
+            instance,
+            ScriptJob {
+                draft_target: super::draft::Target::capture(s),
+                receiver: rx,
+                cancel: cancel.clone(),
+                title: command_title.into(),
+                attempt,
+            },
+        );
         std::thread::spawn(move || {
-            let _ = tx.send(run_script(command, cancel));
+            let result = run_script(command, cancel).map(|mut output| {
+                if let Some(dir) = &media_dir {
+                    output.media = native_media::read_view(&output.body, dir.path());
+                }
+                output
+            });
+            let _ = tx.send(result);
         });
         true
     }
@@ -401,6 +546,14 @@ impl DesktopPlugin for ExternalPlugin {
         self.manifest.category()
     }
 
+    fn keywords(&self) -> &[String] {
+        &self.manifest.keywords
+    }
+
+    fn repository(&self) -> Option<&super::PluginRepository> {
+        self.manifest.repository.as_ref()
+    }
+
     fn surfaces(&self) -> Vec<PluginSlot> {
         self.manifest.supported_surfaces()
     }
@@ -421,7 +574,19 @@ impl DesktopPlugin for ExternalPlugin {
         let tile_id = ctx.tile_id;
         let pid = self.id.to_string();
         let render_kind = self.manifest.render_kind();
+        if let Some(surface) = self.web_surfaces.lock().unwrap().get(ctx.tile_id) {
+            return Some(surface.view(k, ctx.scale));
+        }
 
+        if matches!(render_kind, PluginRenderKind::BunScript { .. })
+            && self
+                .manifest
+                .tile
+                .as_ref()
+                .is_some_and(|t| t.kind == "native-view")
+        {
+            return Some(self.render_native_view(ctx, layer));
+        }
         if let PluginRenderKind::TerminalTui { command, cwd } = &render_kind {
             let cmd_str = command.join(" ");
             let cwd_opt = cwd.clone();
@@ -525,7 +690,7 @@ impl DesktopPlugin for ExternalPlugin {
                     let cmd_id = cmd.id.clone();
                     let pid_clone = pid.clone();
                     let btn = Button::new(&cmd.title)
-                        .disabled(self.script_job.lock().unwrap().is_some())
+                        .disabled(self.jobs.lock().unwrap().contains_key(&None))
                         .variant(ButtonVariant::Ghost)
                         .control_size(ControlSize::Small)
                         .on_press(move |s: &mut UiState| {
@@ -536,7 +701,7 @@ impl DesktopPlugin for ExternalPlugin {
                         .build(k);
                     cmd_bar = cmd_bar.child(btn.key(format!("plugin-command-{}", cmd.id)));
                 }
-                if self.script_job.lock().unwrap().is_some() {
+                if self.jobs.lock().unwrap().contains_key(&None) {
                     cmd_bar = cmd_bar.child(
                         text(tr_ref(lang, "Loading…"))
                             .font(k.ty.small)
@@ -651,11 +816,6 @@ impl DesktopPlugin for ExternalPlugin {
                                     ),
                             )
                             .child(
-                                text(format!("Entry: {entry_str}"))
-                                    .font(k.ty.mono)
-                                    .color(k.c.text_muted),
-                            )
-                            .child(
                                 Button::new(tr_ref(lang, "Open in Browser"))
                                     .variant(ButtonVariant::Outline)
                                     .control_size(ControlSize::Small)
@@ -747,10 +907,13 @@ impl DesktopPlugin for ExternalPlugin {
 
     fn enabled_changed(&self, enabled: bool) {
         if !enabled {
-            if let Some(cancel) = self.script_cancel.lock().unwrap().take() {
-                cancel.store(true, Ordering::Release);
+            *self.notifications.lock().unwrap() = Default::default();
+            for (_, job) in self.jobs.lock().unwrap().drain() {
+                job.cancel();
             }
-            self.script_job.lock().unwrap().take();
+            self.panels.lock().unwrap().clear();
+            self.native_views.lock().unwrap().clear();
+            self.web_surfaces.lock().unwrap().clear();
         }
     }
 
@@ -759,38 +922,211 @@ impl DesktopPlugin for ExternalPlugin {
             self.enabled_changed(false);
             return false;
         }
-        let result = {
-            let mut job = self.script_job.lock().unwrap();
-            let Some(rx) = job.as_ref() else {
-                return false;
-            };
-            match rx.try_recv() {
-                Ok(result) => {
-                    *job = None;
-                    Some(result)
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    tx.wake_after(Duration::from_millis(16));
-                    None
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    *job = None;
-                    Some(Err("Plugin worker stopped".into()))
-                }
-            }
-        };
-        match result {
-            Some(Ok(output)) => {
-                self.apply_script_output(s, &self.script_title.lock().unwrap(), output)
-            }
-            Some(Err(error)) => s.notify(
-                ToastLevel::Error,
-                format!("{}: command failed", self.manifest.name),
-                Some(error),
-            ),
-            None => return false,
+        let notified = self.poll_notifications(s, tx);
+        let panel_changed = self.poll_panels(s, tx) || notified;
+        let web_changed = self.poll_web_surfaces(s) || panel_changed;
+        let mut jobs = self.jobs.lock().unwrap();
+        if jobs.is_empty() {
+            return web_changed;
         }
-        true
+        let mut completed = Vec::new();
+        for (instance, job) in jobs.iter() {
+            let result = match job.receiver.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => continue,
+                Err(mpsc::TryRecvError::Disconnected) => Err(ScriptFailure {
+                    reason: Outcome::ProcessFailed,
+                    detail: "Plugin worker stopped".into(),
+                }),
+            };
+            completed.push((instance.clone(), result));
+        }
+        let completed: Vec<_> = completed
+            .into_iter()
+            .map(|(instance, result)| {
+                let job = jobs.remove(&instance).unwrap();
+                (instance, job, result)
+            })
+            .collect();
+        if !jobs.is_empty() {
+            tx.wake_after(Duration::from_millis(16));
+        }
+        drop(jobs);
+        let changed = !completed.is_empty();
+        for (instance, job, result) in completed {
+            let mut attempt = job.attempt;
+            let outcome =
+                result.and_then(|output| {
+                    attempt.wrote_stderr = output.wrote_stderr;
+                    let media = output.media;
+                    let output = output.body;
+                    if let Some(instance) = instance {
+                        let parsed = serde_json::from_str::<native_view::Response>(&output)
+                            .map_err(|_| ScriptFailure {
+                                reason: Outcome::InvalidResponse,
+                                detail: "Expected one native view response on stdout".into(),
+                            })?;
+                        if parsed.version != 1 {
+                            return Err(ScriptFailure {
+                                reason: Outcome::InvalidResponse,
+                                detail: format!("Unsupported view version {}", parsed.version),
+                            });
+                        }
+                        let fields = parsed.view.fields(&media)?;
+                        if let native_view::Node::WebView { entry } = &parsed.view {
+                            self.start_panel(s, &instance, entry, job.draft_target)
+                                .map_err(|detail| ScriptFailure {
+                                    reason: Outcome::ProcessFailed,
+                                    detail,
+                                })?;
+                            tx.wake_after(Duration::from_millis(16));
+                        } else if self.panels.lock().unwrap().remove(&instance).is_some() {
+                            self.clear_web_instance(&instance);
+                        }
+                        s.plugin_fields
+                            .insert((self.id.to_owned(), instance.clone()), fields);
+                        self.native_views
+                            .lock()
+                            .unwrap()
+                            .insert(instance, native_selection::Document::new(parsed.view));
+                    } else {
+                        self.apply_script_output(s, &job.title, output);
+                    }
+                    Ok(())
+                });
+            let event = attempt.finish(
+                outcome
+                    .as_ref()
+                    .err()
+                    .map_or(Outcome::Completed, |err| err.reason),
+            );
+            if let Err(err) = outcome {
+                s.notify_diagnostic(
+                    event,
+                    ToastLevel::Error,
+                    self.manifest.name.clone(),
+                    Some(err.detail),
+                );
+            }
+        }
+        web_changed || changed
+    }
+
+    fn open_terminal_entry(&self, s: &mut UiState, entry: &str) {
+        let Some((root, path)) = self
+            .dir
+            .canonicalize()
+            .ok()
+            .zip(self.dir.join(entry).canonicalize().ok())
+        else {
+            s.toast_error(
+                self.manifest.name.clone(),
+                Some("Terminal entry is unavailable".into()),
+            );
+            return;
+        };
+        if !path.starts_with(&root)
+            || !path.is_file()
+            || path.to_string_lossy().chars().any(char::is_control)
+        {
+            s.toast_error(
+                self.manifest.name.clone(),
+                Some("Invalid terminal entry".into()),
+            );
+            return;
+        }
+        let Some(bun) = self.resolve_bun_binary() else {
+            s.toast_error(
+                self.manifest.name.clone(),
+                Some("Bun runtime required".into()),
+            );
+            return;
+        };
+        let quote = crate::ui::terminal_panel::shell_quote_path;
+        s.term_new_tab_in(
+            root,
+            Some(format!("{} run {}\n", quote(&bun), quote(&path))),
+        );
+    }
+
+    fn can_move_view(&self, instance: &str) -> bool {
+        self.web_surfaces.lock().unwrap().contains_key(instance)
+            || self.has_panel_service(instance)
+            || self.native_views.lock().unwrap().contains_key(instance)
+            || self
+                .jobs
+                .lock()
+                .unwrap()
+                .contains_key(&Some(instance.to_owned()))
+    }
+
+    fn move_view(&self, from: &str, to: &str) {
+        let mut surfaces = self.web_surfaces.lock().unwrap();
+        if let Some(surface) = surfaces.remove(from) {
+            surfaces.insert(to.to_owned(), surface);
+        }
+        drop(surfaces);
+        self.move_panel_service(from, to);
+        let mut jobs = self.jobs.lock().unwrap();
+        if let Some(job) = jobs.remove(&Some(from.to_owned())) {
+            jobs.insert(Some(to.to_owned()), job);
+        }
+        drop(jobs);
+        let mut views = self.native_views.lock().unwrap();
+        if let Some(node) = views.remove(from) {
+            views.insert(to.to_owned(), node);
+        }
+    }
+
+    fn close_view(&self, instance: &str) {
+        self.clear_web_instance(instance);
+        if let Some(job) = self.jobs.lock().unwrap().remove(&Some(instance.to_owned())) {
+            job.cancel();
+        }
+        self.panels.lock().unwrap().remove(instance);
+        self.native_views.lock().unwrap().remove(instance);
+    }
+
+    fn on_view_action(&self, s: &mut UiState, instance: &str, action: &str) -> bool {
+        if self.manifest.notification_entry.is_some() {
+            self.notifications.lock().unwrap().armed = true;
+        }
+        if action == "open" && webview_helper().is_some() {
+            if let PluginRenderKind::WebView { entry } = self.manifest.render_kind() {
+                if web_surface::local_panel_url(&entry) {
+                    if let Err(reason) = self.open_web_url(s, instance, &entry, false, None) {
+                        s.toast_error(self.manifest.name.clone(), Some(reason));
+                    }
+                    return true;
+                }
+            }
+        }
+        let PluginRenderKind::BunScript { entry } = self.manifest.render_kind() else {
+            return false;
+        };
+        if !super::is_enabled(self.id, &s.cfg.plugins_disabled)
+            || !self
+                .manifest
+                .tile
+                .as_ref()
+                .is_some_and(|t| t.kind == "native-view")
+        {
+            return false;
+        }
+        self.start_script(
+            s,
+            "view",
+            &self.manifest.name,
+            &self.resolve_script_path(&entry),
+            Some((instance, action)),
+        )
+    }
+
+    fn on_notification_action(&self, s: &mut UiState, action: &str) {
+        if self.manifest.notification_entry.is_some() {
+            s.open_plugin_page(self.id);
+            self.notifications.lock().unwrap().pending = Some(action.to_owned());
+        }
     }
 
     fn on_command(&self, s: &mut UiState, command_id: &str) -> bool {
@@ -850,13 +1186,19 @@ impl DesktopPlugin for ExternalPlugin {
 }
 
 /// Drain both pipes concurrently: a verbose child must never block on a full pipe.
-fn run_script(mut command: ProcessCommand, cancel: Arc<AtomicBool>) -> Result<String, String> {
+fn run_script(
+    mut command: ProcessCommand,
+    cancel: Arc<AtomicBool>,
+) -> Result<ScriptOutput, ScriptFailure> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let mut child = command.spawn().map_err(|e| ScriptFailure {
+        reason: Outcome::ProcessFailed,
+        detail: e.to_string(),
+    })?;
     fn drain(mut pipe: impl Read, cap: usize) -> String {
         let mut bytes = Vec::new();
         let _ = pipe.by_ref().take(cap as u64).read_to_end(&mut bytes);
@@ -881,13 +1223,14 @@ fn run_script(mut command: ProcessCommand, cancel: Arc<AtomicBool>) -> Result<St
                 }
                 let _ = child.kill();
                 let _ = child.wait();
-                break Err(result.err().map(|e| e.to_string()).unwrap_or_else(|| {
-                    if cancel.load(Ordering::Acquire) {
-                        "Plugin command cancelled".into()
-                    } else {
-                        "Plugin command timed out".into()
-                    }
-                }));
+                let (reason, detail) = if let Err(err) = result {
+                    (Outcome::ProcessFailed, err.to_string())
+                } else if cancel.load(Ordering::Acquire) {
+                    (Outcome::Cancelled, "Plugin command cancelled".into())
+                } else {
+                    (Outcome::TimedOut, "Plugin command timed out".into())
+                };
+                break Err(ScriptFailure { reason, detail });
             }
         }
     };
@@ -899,9 +1242,20 @@ fn run_script(mut command: ProcessCommand, cancel: Arc<AtomicBool>) -> Result<St
     let stdout = out.join().unwrap_or_default();
     let stderr = err.join().unwrap_or_default();
     if status?.success() {
-        Ok(stdout)
+        Ok(ScriptOutput {
+            media: HashMap::new(),
+            body: stdout,
+            wrote_stderr: !stderr.is_empty(),
+        })
     } else {
-        Err(if stderr.is_empty() { stdout } else { stderr })
+        Err(ScriptFailure {
+            reason: Outcome::ProcessFailed,
+            detail: if stderr.is_empty() {
+                "Plugin process exited unsuccessfully".into()
+            } else {
+                stderr
+            },
+        })
     }
 }
 
@@ -1012,62 +1366,30 @@ pub fn discover_plugins(plugin_dirs: &[PathBuf]) -> Vec<ExternalPlugin> {
     let mut plugins = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();
 
+    let mut load = |path: &Path| match ExternalPlugin::try_from_dir(path) {
+        Ok(Some(plugin)) => {
+            if seen_ids.insert(plugin.manifest().id.clone()) {
+                plugins.push(plugin);
+            }
+            true
+        }
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "Failed to load external plugin");
+            false
+        }
+    };
+
     for base_dir in plugin_dirs {
-        if !base_dir.is_dir() {
+        if load(base_dir) {
             continue;
         }
-
-        // Direct directory check
-        let direct_manifest = base_dir.join("plugin.json");
-        if direct_manifest.is_file() {
-            match ExternalPlugin::from_dir(base_dir) {
-                Ok(plugin) => {
-                    let id = plugin.manifest().id.clone();
-                    if seen_ids.insert(id) {
-                        plugins.push(plugin);
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        path = %base_dir.display(),
-                        error = %err,
-                        "Failed to load external plugin"
-                    );
-                }
-            }
-            continue;
-        }
-
-        // Subdirectories check
-        let read_dir = match std::fs::read_dir(base_dir) {
-            Ok(rd) => rd,
-            Err(_) => continue,
-        };
-
-        let mut entries: Vec<_> = read_dir.flatten().collect();
-        entries.sort_by_key(|e| e.file_name());
-
-        for entry in entries {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let manifest_path = path.join("plugin.json");
-            if manifest_path.is_file() {
-                match ExternalPlugin::from_dir(&path) {
-                    Ok(plugin) => {
-                        let id = plugin.manifest().id.clone();
-                        if seen_ids.insert(id) {
-                            plugins.push(plugin);
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            path = %path.display(),
-                            error = %err,
-                            "Failed to load external plugin"
-                        );
-                    }
+        if let Ok(children) = std::fs::read_dir(base_dir) {
+            let mut entries: Vec<_> = children.flatten().collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                if entry.path().is_dir() {
+                    load(&entry.path());
                 }
             }
         }
@@ -1079,6 +1401,31 @@ pub fn discover_plugins(plugin_dirs: &[PathBuf]) -> Vec<ExternalPlugin> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rediscovery_reads_native_plugin_version_from_package() {
+        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let path = root.join("example");
+        std::fs::create_dir_all(&path).unwrap();
+        let package = path.join("package.json");
+        std::fs::write(&package, r#"{"name":"ordinary"}"#).unwrap();
+        let paths = [root.clone()];
+        assert!(discover_plugins(&paths).is_empty());
+        std::fs::write(
+            path.join("plugin.json"),
+            r#"{"id":"legacy","name":"Legacy","version":"0.1.0","description":""}"#,
+        )
+        .unwrap();
+        for version in ["1.2.3", "2.0.0"] {
+            let value = serde_json::json!({"name":"example","main":"src/main.ts","version":version,"muqun":{}});
+            std::fs::write(&package, value.to_string()).unwrap();
+            let plugins = discover_plugins(&paths);
+            assert_eq!(plugins.len(), 1);
+            assert_eq!(plugins[0].manifest().id, "example");
+            assert_eq!(plugins[0].manifest().version, version);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn image_icons_are_bounded_local_assets_and_cached_after_discovery() {
@@ -1132,6 +1479,59 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn closing_one_view_discards_its_worker_while_another_submits_its_own_form() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"name":"test-views","version":"1","main":"entry.ts","muqun":{"requires":["forms"]}}"#).unwrap();
+        std::fs::write(dir.join("entry.ts"), "").unwrap();
+        let bun = dir.join("bun");
+        std::fs::write(
+            &bun,
+            r#"#!/bin/sh
+if [ "$MUQUN_PLUGIN_ACTION" = slow ]; then exec sleep 30; fi
+printf '%s' "$MUQUN_PLUGIN_CONTEXT" > submitted.json
+printf '%s' '{"version":1,"view":{"type":"text","text":"saved"}}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bun, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plugin = ExternalPlugin::from_dir(&dir).unwrap();
+        plugin.set_bun_binary_override(Some(Some(bun)));
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.plugin_fields.insert(
+            ("test-views".into(), "drawer".into()),
+            HashMap::from([
+                (
+                    ("save".into(), "body".into()),
+                    rune::TextEdit::new("drawer draft"),
+                ),
+                (
+                    ("other".into(), "secret".into()),
+                    rune::TextEdit::new("other form"),
+                ),
+            ]),
+        );
+        assert!(plugin.on_view_action(&mut s, "page", "slow"));
+        assert!(plugin.on_view_action(&mut s, "drawer", "save"));
+        assert_eq!(plugin.jobs.lock().unwrap().len(), 2);
+        plugin.close_view("page");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !plugin.poll(&mut s, &mut rune::Tx::default()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let data: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("submitted.json")).unwrap()).unwrap();
+        assert_eq!(data["form"], serde_json::json!({"body":"drawer draft"}));
+        let views = plugin.native_views.lock().unwrap();
+        assert!(views.contains_key("drawer"));
+        assert!(!views.contains_key("page"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn disabling_a_plugin_cancels_its_running_process() {
         let dir =
             std::env::temp_dir().join(format!("muqun-plugin-cancel-{}", uuid::Uuid::new_v4()));
@@ -1150,9 +1550,17 @@ mod tests {
         .unwrap();
         let plugin = Arc::new(ExternalPlugin::new(manifest, dir.clone()));
         let cancel = Arc::new(AtomicBool::new(false));
-        *plugin.script_cancel.lock().unwrap() = Some(cancel.clone());
         let (sender, receiver) = mpsc::channel();
-        *plugin.script_job.lock().unwrap() = Some(receiver);
+        plugin.jobs.lock().unwrap().insert(
+            None,
+            ScriptJob {
+                draft_target: None,
+                receiver,
+                cancel: cancel.clone(),
+                title: String::new(),
+                attempt: Attempt::new(EventKind::PluginCommand, "cancel-test", None),
+            },
+        );
         let worker = std::thread::spawn(move || {
             let result = run_script(command, cancel);
             let _ = sender.send(result.clone());
@@ -1175,11 +1583,11 @@ mod tests {
             on: false,
         });
         assert_eq!(
-            worker.join().unwrap().unwrap_err(),
+            worker.join().unwrap().unwrap_err().detail,
             "Plugin command cancelled"
         );
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-        assert!(plugin.script_job.lock().unwrap().is_none());
+        assert!(plugin.jobs.lock().unwrap().is_empty());
         assert!(!plugin.on_command(&mut state, "__run_entry__"));
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1192,7 +1600,8 @@ mod tests {
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let output = run_script(command, Arc::new(AtomicBool::new(false)))
             .expect("a full stdout/stderr pipe must not stall the worker");
-        assert_eq!(output.len(), 64 * 1024);
+        assert_eq!(output.body.len(), 64 * 1024);
+        assert!(output.wrote_stderr);
     }
 
     #[test]
@@ -1312,10 +1721,14 @@ mod tests {
             description: "Test description".to_string(),
             author: Some("Tester".to_string()),
             category: Some(PluginCategory::Tools),
+            keywords: vec![],
+            repository: None,
             icon: Some("terminal".to_string()),
             runtime: None,
             entry: None,
             surfaces: vec![],
+            composer_draft: false,
+            notification_entry: None,
             commands: vec![PluginCommandManifest {
                 id: "ext.run".to_string(),
                 title: "Run Command".to_string(),
@@ -1368,6 +1781,7 @@ mod tests {
         std::fs::write(
             &mock_bun,
             r##"#!/bin/sh
+printf '%s' "$MUQUN_PLUGIN_CONTEXT" > observed-context.json
 printf '{"toast":{"title":"Bun Executed %s","detail":"session=%s cmd=%s","level":"success"},"markdown":"# Dynamic Output from %s","composer_text":"generated prompt from bun"}\n' "$MUQUN_PLUGIN_ID" "$MUQUN_SESSION_ID" "$MUQUN_COMMAND_ID" "$MUQUN_PLUGIN_ID"
 "##,
         )
@@ -1423,20 +1837,39 @@ printf '{"toast":{"title":"Bun Executed %s","detail":"session=%s cmd=%s","level"
             .contains("System & Diagnostics"));
 
         // 2. Configure mock Bun binary -> executes script, parses JSON stdout, updates markdown & composer & toast
+        s.cfg.general.language = Language::ZhTw;
+        s.cfg.appearance.scheme = crate::config::Scheme::System;
+        s.system_dark.set(Some(false));
+        s.cfg.appearance.reduced_motion = true;
         plugin.set_bun_binary_override(Some(Some(mock_bun)));
         s.toasts.clear();
         s.draft.text.clear();
         assert!(plugin.on_command(&mut s, "bun.analyze"));
         let result = plugin
-            .script_job
+            .jobs
             .lock()
             .unwrap()
-            .take()
+            .remove(&None)
             .unwrap()
+            .receiver
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
-        plugin.apply_script_output(&mut s, "Analyze workspace", result);
+        let context: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(temp_dir.join("observed-context.json")).unwrap())
+                .unwrap();
+        assert_eq!(context["locale"], "zh-TW");
+        assert_eq!(
+            context["workspace"]["path"],
+            s.terminal_cwd().display().to_string()
+        );
+        let url_page = serde_json::json!(crate::plugin::context::web_context(&s, false));
+        assert!(url_page.get("workspace").is_none());
+        assert_eq!(url_page["theme"]["colors"], context["theme"]["colors"]);
+        assert_eq!(context["theme"]["preference"], "system");
+        assert_eq!(context["theme"]["colorScheme"], "light");
+        assert_eq!(context["theme"]["reducedMotion"], true);
+        plugin.apply_script_output(&mut s, "Analyze workspace", result.body);
         assert_eq!(s.toasts.len(), 1);
         assert_eq!(s.toasts[0].level, ToastLevel::Success);
         assert_eq!(s.toasts[0].title, "Bun Executed bun-demo");

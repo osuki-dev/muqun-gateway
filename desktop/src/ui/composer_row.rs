@@ -5,8 +5,8 @@
 //! controls move into a "…" menu, so the row stays one line beside the
 //! send buttons and everything stays a click away.
 
-use rune::{icon, row, text, Color, El, Icon, Tx};
-use rune_kit::{Button, ButtonVariant, ControlSize, Kit, Menu, MenuItem, SegmentedControl};
+use rune::{icon, row, text, Color, El, Icon};
+use rune_kit::{Button, ButtonVariant, ControlSize, Kit, Menu, MenuItem};
 
 use super::composer::{
     catalog_models, effort_menu, mode_label, model_menu, switch_effort, switch_mode, switch_model,
@@ -43,12 +43,6 @@ static MODEL: Icon = Icon {
     name: "cmp-processor",
     view: 24.0,
     body: r#"<rect x="6" y="6" width="12" height="12" rx="3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M9 3v3m6-3v3M9 18v3m6-3v3M3 9h3m-3 6h3m12-6h3m-3 6h3M10 10h4v4h-4v-4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-
-static MORE: Icon = Icon {
-    name: "cmp-more",
-    view: 24.0,
-    body: r#"<circle cx="5" cy="12" r="1" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="12" r="1" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="19" cy="12" r="1" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
 static AUTO_APPROVE: Icon = Icon {
@@ -183,7 +177,6 @@ pub struct Controls {
     asid: muqun_gateway::agents::AgentSessionId,
     auto_on: bool,
     auto_visible: bool,
-    auto_native: String,
     auto_applies: String,
     busy: bool,
 }
@@ -213,14 +206,11 @@ impl Controls {
         catalog: Option<&crate::hub::CatalogView>,
     ) -> Option<Controls> {
         let info = s.session_by_id(asid)?;
-        let model_infos: Vec<&muqun_gateway::agents::ModelInfo> = catalog
-            .map(|c| c.catalog.models.iter().filter(|m| m.enabled).collect())
-            .unwrap_or_default();
         let models = catalog.map(catalog_models).unwrap_or_default();
         let default_model = catalog.and_then(|c| c.catalog.defaults.model.as_ref());
-        let model = match &info.model {
+        let model = match info.model.as_ref().or(default_model) {
             Some(m) => {
-                let selected = super::labels::catalog_model_info(&model_infos, m, default_model);
+                let selected = catalog.and_then(|v| super::labels::catalog_model_info(v, m));
                 let variants: Vec<String> = selected
                     .and_then(|i| i.variants.as_ref())
                     .map(|v| v.iter().map(|v| v.id.clone()).collect())
@@ -270,10 +260,6 @@ impl Controls {
             .find(|a| a.id == info.agent_id)
             .and_then(|a| a.features.extra.get("autoApprove"));
         let auto_visible = standalone_approval(auto_feature, &modes);
-        let auto_native = auto_feature
-            .and_then(|f| f["native"].as_str())
-            .unwrap_or("")
-            .to_owned();
         let auto_applies = auto_feature
             .and_then(|f| f["applies"].as_str())
             .unwrap_or("")
@@ -289,7 +275,6 @@ impl Controls {
             mode: info.mode.clone(),
             asid: info.asid.clone(),
             auto_visible,
-            auto_native,
             auto_applies,
             auto_on: s.auto_approve.get(&info.asid.0).copied().unwrap_or(false),
             busy: s.session_busy(asid),
@@ -310,11 +295,6 @@ impl Controls {
                 .cloned()
                 .unwrap_or_else(|| (mode.clone(), mode_label(mode, None))),
         )
-    }
-
-    /// 2–4 modes read best as a segmented control while there is room.
-    fn segmented(&self) -> bool {
-        (2..=4).contains(&self.modes.len())
     }
 
     fn branch_label(&self) -> Option<String> {
@@ -367,13 +347,6 @@ impl Controls {
                 if self.mode.is_some() || self.modes.len() > 1 {
                     items.push(ICON_PILL);
                 }
-            } else if self.segmented() {
-                let widest = self
-                    .modes
-                    .iter()
-                    .map(|(_, n)| text_w(n, k.ty.ui))
-                    .fold(0.0, f32::max);
-                items.push((widest + 24.0) * self.modes.len() as f32);
             } else if self.mode.is_some() || self.modes.len() > 1 {
                 let label = self
                     .current_mode()
@@ -539,14 +512,16 @@ fn model_items(menu: Menu, c: &Controls, m: &ModelChip, with_effort: bool) -> Me
         menu = menu.group_label(c.tr("Effort")).item(
             MenuItem::new(c.tr("Default"))
                 .checked(m.variant.is_none())
-                .on_select(|s: &mut UiState| switch_effort(s, None)),
+                .on_select(|s: &mut UiState| switch_effort(s, super::Slot::Session, None)),
         );
         for v in &m.variants {
             let name = v.clone();
             menu = menu.item(
                 MenuItem::new(readable_catalog_id(v))
                     .checked(m.variant.as_deref() == Some(v.as_str()))
-                    .on_select(move |s: &mut UiState| switch_effort(s, Some(name.clone()))),
+                    .on_select(move |s: &mut UiState| {
+                        switch_effort(s, super::Slot::Session, Some(name.clone()))
+                    }),
             );
         }
     }
@@ -595,6 +570,7 @@ fn model_chips(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold,
                 k,
                 layer,
                 &c.asid.0,
+                super::Slot::Session,
                 s.menu == Some(OpenMenu::Effort),
                 m.variant.as_deref(),
                 &m.variants,
@@ -654,23 +630,6 @@ fn mode_items(menu: Menu, c: &Controls, k: &Kit) -> Menu {
 }
 
 fn mode_control(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -> Option<El> {
-    if !f.mode_icon && c.segmented() {
-        let labels: Vec<&str> = c.modes.iter().map(|(_, n)| n.as_str()).collect();
-        let at = c.mode.as_ref().and_then(|m| {
-            c.modes
-                .iter()
-                .position(|(id, _)| id == m || bare_catalog_id(id) == m.as_str())
-        });
-        let ids: Vec<String> = c.modes.iter().map(|(id, _)| id.clone()).collect();
-        return Some(
-            SegmentedControl::new(&labels, at)
-                .fit()
-                .label(c.tr("Mode"))
-                .on_pick(move |s: &mut UiState, i, _: &mut Tx| switch_mode(s, ids[i].clone()))
-                .build(k)
-                .key("modes"),
-        );
-    }
     let (id, label) = c
         .current_mode()
         .unwrap_or_else(|| (String::new(), c.tr("Mode").to_string()));
@@ -743,7 +702,7 @@ fn auto_help(c: &Controls) -> String {
     format!(
         "{} · {} · {} · {}",
         c.agent_name,
-        c.auto_native,
+        c.tr("Auto-approve"),
         if c.auto_on {
             c.tr("Enabled")
         } else {
@@ -758,7 +717,7 @@ fn auto_control(c: &Controls, k: &Kit) -> El {
     rune_kit::IconButton::new(&AUTO_APPROVE)
         .variant(rune_kit::IconButtonVariant::GhostMuted)
         .control_size(ControlSize::Large)
-        .label(format!("{} · {}", c.agent_name, c.auto_native))
+        .label(format!("{} · {}", c.agent_name, c.tr("Auto-approve")))
         .help(auto_help(c))
         .disabled(c.busy && c.auto_applies == "restart_when_idle")
         .on_press(move |s: &mut UiState| set_auto(s, &asid, !on))
@@ -812,7 +771,7 @@ fn more_menu(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -
     let trigger = pill_button(
         k,
         "composer-more-pill",
-        Face::Glyph(&MORE, None),
+        Face::Glyph(&super::icons::MORE, None),
         label.to_string(),
         Some(label.to_string()),
         open,
@@ -860,7 +819,8 @@ fn more_menu(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -
     if f.more_auto && c.auto_visible {
         let (on, asid) = (c.auto_on, c.asid.clone());
         menu = section(menu).item(
-            MenuItem::new(c.auto_native.clone())
+            MenuItem::new(c.tr("Auto-approve"))
+                .lead(icon(&AUTO_APPROVE, GLYPH).color(k.c.icon_muted))
                 .checked(on)
                 .disabled(c.busy && c.auto_applies == "restart_when_idle")
                 .on_select(move |s: &mut UiState| {
@@ -871,12 +831,13 @@ fn more_menu(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -
     }
     if let (true, Some((_, info))) = (f.more_branch, c.branch.as_ref()) {
         menu = section(menu).item(
-            MenuItem::new(info.current.clone().unwrap_or_else(|| "Git".into())).on_select(
-                |s: &mut UiState| {
+            MenuItem::new(c.tr("Git inspector"))
+                .lead(icon(&super::icons::BRANCH, GLYPH).color(k.c.icon_muted))
+                .description(info.current.clone().unwrap_or_default())
+                .on_select(|s: &mut UiState| {
                     s.menu = None;
                     s.toggle_git_inspector();
-                },
-            ),
+                }),
         );
     }
     menu.build(k, layer)
@@ -977,7 +938,6 @@ mod tests {
             asid: muqun_gateway::agents::AgentSessionId("s".into()),
             auto_on: true,
             auto_visible: false,
-            auto_native: "bypassPermissions".into(),
             auto_applies: "immediate".into(),
             busy: false,
         }

@@ -26,6 +26,12 @@ pub(super) fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// Identity used by the Gateway when it serves an original upload. Clients that
+/// staged the upload can match its host path to the later session-scoped URL.
+pub fn original_asset_id(asid: &str, host_path: &str) -> String {
+    format!("ai_{}", digest(format!("{asid}\n{host_path}").as_bytes()))
+}
+
 /// Create only gateway-owned directories; reject a symlink before changing
 /// permissions. Files below are written create-new, never replacing originals.
 pub(super) fn private_dir(path: &Path) -> std::io::Result<()> {
@@ -313,10 +319,7 @@ fn normalize(
     head.truncate(read);
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let kind = crate::sniff_asset_type(&head, &name);
-    let id = format!(
-        "ai_{}",
-        digest(format!("{asid}\n{}", path.display()).as_bytes())
-    );
+    let id = original_asset_id(asid, &path.to_string_lossy());
     let url = format!("/api/agent-images/{id}/original");
     let (width, height) = image_dimensions(&head).unzip();
     let image = kind.kind == AssetKind::Image;

@@ -39,6 +39,7 @@ mod originals;
 mod previews;
 mod versions;
 pub(crate) use originals::content as image_content;
+pub use originals::original_asset_id;
 pub(crate) use originals::version_content as image_version_content;
 
 /// How many served images are remembered. Old entries fall off; the next read

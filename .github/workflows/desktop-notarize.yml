@@ -21,9 +21,10 @@ permissions:
 
 jobs:
   sign:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/desktop-v') && !contains(github.ref_name, '-preview.'))
     runs-on: macos-15
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: muqun-desktop-macOS
@@ -86,12 +87,13 @@ jobs:
           if len(identities) != 1:
               raise SystemExit("Expected one valid imported Developer ID Application identity; check private key, expiry and certificate chain")
           print("::add-mask::" + identities[0], flush=True)
-          subprocess.run([
-              "codesign", "--force", "--options", "runtime", "--timestamp",
-              "--keychain", keychain, "--sign", identities[0], app,
-          ], check=True)
+          for target in (app + "/Contents/Helpers/muqun-desktop-install", app):
+              subprocess.run([
+                  "codesign", "--force", "--options", "runtime", "--timestamp",
+                  "--keychain", keychain, "--sign", identities[0], target,
+              ], check=True)
           PY
-          codesign --verify --strict "$app"
+          codesign --verify --deep --strict "$app"
           mkdir -p ../signed
           ditto -c -k --keepParent "$app" "../signed/$archive"
           xcrun notarytool submit "../signed/$archive" --key "$RUNNER_TEMP/notary.p8" --key-id "$KEY_ID" --issuer "$ISSUER" --wait --timeout 30m --output-format json > "$RUNNER_TEMP/notary-result.json"
@@ -103,6 +105,7 @@ jobs:
           ditto -c -k --keepParent "$app" "../signed/$archive"
           cd ../signed
           shasum -a 256 "$archive" > "$archive.sha256"
+          bash "$GITHUB_WORKSPACE/desktop/scripts/smoke-signed-installer.sh" "$archive"
       - name: Remove signing credentials
         if: always()
         shell: bash

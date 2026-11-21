@@ -767,6 +767,7 @@ fn subagent(
     card.body = Some(body);
     if let Some(child_id) = call.child_session_id.clone() {
         let view = child_id.clone();
+        let parent = cx.asid.to_owned();
         let split_id = child_id.clone();
         let in_tile = cx.s.tile_of(&child_id).is_some();
         card.actions.push(
@@ -788,7 +789,7 @@ fn subagent(
             Button::new(cx.t("Details"))
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
-                .on_press(move |s: &mut UiState| s.open_detail(&view))
+                .on_press(move |s: &mut UiState| s.open_detail(&parent, &view))
                 .build(k),
         );
         card.actions.push(

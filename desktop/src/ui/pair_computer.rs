@@ -15,16 +15,20 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
 
     let look = s.look();
     let language = s.cfg.general.language;
-    let name = s.computer_name(target_id);
-    let peer = s.peer_by_id(target_id);
-    let url = s.peer_url(target_id).unwrap_or_default();
-    let reachable = peer.map(|p| p.reachable).unwrap_or(true);
-
-    let effective_url = if !s.pairing_url_input.text.trim().is_empty() {
-        s.pairing_url_input.text.trim().to_string()
+    let name = if let Some(offer) = &s.pairing_offer {
+        if offer.server_label.is_empty() {
+            offer.server_id.clone()
+        } else {
+            offer.server_label.clone()
+        }
+    } else if target_id.is_empty() {
+        tr(language, "Pair a computer")
     } else {
-        url.clone()
+        s.computer_name(target_id)
     };
+    let peer = s.peer_by_id(target_id);
+    let reachable = peer.is_some_and(|p| p.reachable);
+    let effective_url = s.pairing_url_input.text.trim().to_owned();
 
     let mut card = col()
         .key("pair-computer-card")
@@ -99,9 +103,13 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                     row()
                         .gap(6.0)
                         .center_y()
-                        .child(rune::el().w(7.0).h(7.0).radius(3.5).fill(status_color))
-                        .child(text(status_text).font(k.ty.caption()).color(status_color))
-                        .child(text("·").font(k.ty.caption()).color(k.c.text_faint))
+                        .children(peer.map(|_| {
+                            row()
+                                .center_y()
+                                .gap(6.0)
+                                .child(rune::el().w(7.0).h(7.0).radius(3.5).fill(status_color))
+                                .child(text(status_text).font(k.ty.caption()).color(status_color))
+                        }))
                         .child(
                             text(if effective_url.is_empty() {
                                 tr(language, "Fleet gateway").to_string()
@@ -123,8 +131,8 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
 
     card = card.child(header_card);
 
-    // 2. If URL is missing, offer input
-    if effective_url.is_empty() {
+    // Keep the address editable until a request binds it to a particular offer.
+    if s.pairing_offer.is_none() && !s.pairing_busy {
         card = card.child(
             col()
                 .gap(6.0)
@@ -211,12 +219,14 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                                     Some(tr(language, "Please provide a gateway URL").to_string());
                                 return;
                             }
-                            if !busy && !token_val.is_empty() {
-                                s.pairing_busy = true;
-                                s.pairing_error = None;
+                            if !token_val.is_empty() {
+                                let Some((attempt, url)) = s.begin_pairing(&token_url) else {
+                                    return;
+                                };
                                 s.send(Command::PairComputerToken {
                                     server_id: token_target.clone(),
-                                    url: token_url.clone(),
+                                    attempt,
+                                    url,
                                     token: token_val.clone(),
                                 });
                             }
@@ -228,6 +238,9 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                             .build(k)
                             .key("pair-toggle-to-code")
                             .on_press(|s: &mut UiState| {
+                                if s.pairing_busy {
+                                    return;
+                                }
                                 s.pairing_manual_token_mode = false;
                                 s.pairing_error = None;
                             }),
@@ -242,12 +255,11 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
             );
 
         card = card.child(form);
-    } else if let Some(req_id) = &s.pairing_request_id {
-        // Mode A Stage 2: Code Entry with Cyber PIN Matrix
-        let claim_target = target.clone();
+    } else if let Some(offer) = &s.pairing_offer {
+        let claim_target = offer.server_id.clone();
         let claim_url = target_url.clone();
-        let claim_req_id = req_id.clone();
-        let transport_req = s.pairing_transport_required;
+        let claim_req_id = offer.request_id.clone();
+        let transport_req = offer.transport_required;
 
         let clean_code =
             crate::platform::pairing::normalize_pairing_code(&s.pairing_code_input.text);
@@ -374,11 +386,10 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                                 &s.pairing_code_input.text,
                             );
                             if !busy && final_code.len() == 9 {
-                                s.pairing_busy = true;
-                                s.pairing_error = None;
+                                let Some((attempt, url)) = s.begin_pairing(&claim_url) else {return};
                                 s.send(Command::PairComputerClaim {
                                     server_id: claim_target.clone(),
-                                    url: claim_url.clone(),
+                                    attempt, url,
                                     request_id: claim_req_id.clone(),
                                     code: final_code,
                                     transport_required: transport_req,
@@ -400,7 +411,8 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                             .build(k)
                             .key("pair-code-cancel")
                             .on_press(|s: &mut UiState| {
-                                s.pairing_request_id = None;
+                                if s.pairing_busy {return;}
+                            s.pairing_offer = None;
                                 s.pairing_busy = false;
                                 s.pairing_error = None;
                             }),
@@ -515,12 +527,11 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                                 Some(tr(language, "Please provide a gateway URL").to_string());
                             return;
                         }
-                        if !busy {
-                            s.pairing_busy = true;
-                            s.pairing_error = None;
+                        if let Some((attempt, url)) = s.begin_pairing(&req_url) {
                             s.send(Command::PairComputerRequest {
                                 server_id: req_target.clone(),
-                                url: req_url.clone(),
+                                attempt,
+                                url,
                             });
                         }
                     }),
@@ -531,6 +542,9 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                         .build(k)
                         .key("pair-toggle-to-token")
                         .on_press(|s: &mut UiState| {
+                            if s.pairing_busy {
+                                return;
+                            }
                             s.pairing_manual_token_mode = true;
                             s.pairing_error = None;
                         }),

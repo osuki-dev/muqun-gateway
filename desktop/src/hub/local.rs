@@ -1940,6 +1940,8 @@ mod tests {
 
         // Non-git directory gracefully falls back to base directory
         let non_git = temp_test_dir("non-git");
+        // A project-local TMPDIR must not let this fixture discover the developer's checkout.
+        std::fs::write(non_git.join(".git"), "gitdir: missing-test-repository").unwrap();
         let (fallback_path, fallback_branch) = prepare_task_worktree(&non_git, "task-2");
         assert_eq!(fallback_path, non_git);
         assert_eq!(fallback_branch, None);

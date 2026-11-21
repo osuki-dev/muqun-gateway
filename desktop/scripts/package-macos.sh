@@ -15,8 +15,11 @@ trap 'rm -rf -- "$STAGE"' EXIT
 APP="$STAGE/Muqun Desktop.app"
 RES="$APP/Contents/Resources"
 mkdir -p "$APP/Contents/MacOS" "$RES/bundled-plugins/review-center" "$STAGE/AppIcon.iconset"
+mkdir -p "$RES/installers" "$APP/Contents/Helpers"
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$APP/Contents/Helpers/muqun-desktop-install" "$ROOT"/desktop/installer/*.go
+cp "$ROOT/install-desktop.sh" "$ROOT/install.sh" "$RES/installers/"
 cp "$TARGET/release/muqun-desktop" "$APP/Contents/MacOS/"
-cp "$ROOT/LICENSE" "$ROOT/LICENSE-MIT" "$RES/"
+cp "$ROOT/LICENSE" "$ROOT/LICENSE-MIT" "$ROOT/desktop/assets/glyphs/LICENSE-octicons" "$RES/"
 for file in plugin.json review.ts README.md; do
   cp "$ROOT/desktop/assets/plugins/review-center/$file" "$RES/bundled-plugins/review-center/"
 done
@@ -27,6 +30,7 @@ for size in 16 32 128 256 512; do
 done
 iconutil -c icns "$STAGE/AppIcon.iconset" -o "$RES/AppIcon.icns"
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT/desktop/Cargo.toml" | head -1)"
+printf '%s\n' "$VERSION" > "$RES/installers/VERSION"
 BUNDLE_VERSION="${VERSION%%-*}"
 BUILD_NUMBER="${VERSION##*-preview.}"
 if [[ "$VERSION" != *-preview.* ]]; then BUILD_NUMBER="$BUNDLE_VERSION"; fi
@@ -51,6 +55,7 @@ if [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then
   printf 'dirty working tree; local candidate only\n' >> "$RES/SOURCE"
 fi
 if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
+  codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$APP/Contents/Helpers/muqun-desktop-install"
   codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$APP"
 else
   codesign --force --sign - "$APP"

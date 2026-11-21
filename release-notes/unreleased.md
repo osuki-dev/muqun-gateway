@@ -3,6 +3,17 @@
 - Upgrade bundled SQLCipher to 4.20.0 / SQLite 3.54.1 through rusqlite 0.42, addressing RUSTSEC-2026-0502 (crafted database/WAL memory disclosure). Existing encryption remains enabled.
 ## Changes and fixes
 
+- The Gateway installer and updater discover stable and preview releases through muqun.dev. Installation verifies the platform binary and displays its full SHA-256.
+
+- Desktop keeps the send arrow in the message field during a running turn. It uses the selected Steer or Queue mode. Stop now sits beside that selector.
+
+- Desktop Settings now lists paired computers and lets you pair another Gateway by address. The same page displays the local Gateway’s QR and pending pairing code, and can revoke a device after confirmation. Open the computer switcher and choose Manage computers to reach it.
+
+- Starting a session from Desktop Home immediately shows the first message in the chosen project. Changing agents keeps an explicitly selected folder, and late updates from another session no longer switch the active conversation.
+
+- Linux Desktop can open browser and plugin WebViews in the same dock as the terminal. The installer includes the WebView helper. The Actions menu stays accessible when switching tabs. Update Desktop and restart its window to pick up these changes.
+- Plugin settings displays searchable cards using package descriptions, keywords and source repositories. Bun resolves installation sources, and updates show their progress while the existing version remains available. Local plugin services can use the native project picker and follow the host theme and language.
+
 - **Sent messages no longer appear twice after an attachment or a steered prompt.**
   Gateway reconciles device-origin presentation with the submitted message using
   arrival order and the original prose, preserving attachments and intentional
@@ -1091,3 +1102,5 @@ list request that could delay or prevent interruption.
   unknown states; these figures are not account-wide billing or quota totals.
 - Theme-driven workspace/composer accents and App-inspired native startup motion
   follow the selected theme and reduced-motion preferences.
+
+- Local ACP sessions receive checked filesystem paths for supported Office and PDF attachments from paired clients. Update the receiving Gateway after active turns finish.

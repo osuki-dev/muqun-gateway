@@ -1100,10 +1100,10 @@ fn handle_leader_group(
                 let _ = run(s, Action::NewSession, ev, tx);
             }
             Some('p' | '[') => {
-                let _ = step_session(s, false);
+                let _ = step_session(s, tx, false);
             }
             Some(']') => {
-                let _ = step_session(s, true);
+                let _ = step_session(s, tx, true);
             }
             Some('r') => {
                 let _ = run(s, Action::ToggleRecentSession, ev, tx);
@@ -1160,7 +1160,7 @@ fn handle_leader_group(
             Some('z' | 'Z') => s.toggle_terminal_zoom(),
             Some('/' | 'f' | 'F' | '[') => s.open_terminal_search(),
             Some(',') => {
-                let _ = step_session(s, false);
+                let _ = step_session(s, tx, false);
             }
             Some(']') => s.term_next_tab(),
             Some(d @ '1'..='9') => s.term_switch_tab((d as u8 - b'1') as usize),
@@ -1242,10 +1242,10 @@ pub fn handle_leader_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
                 rune::Key::Left => s.term_prev_tab(),
                 rune::Key::Right => s.term_next_tab(),
                 rune::Key::Up => {
-                    let _ = step_session(s, false);
+                    let _ = step_session(s, tx, false);
                 }
                 rune::Key::Down => {
-                    let _ = step_session(s, true);
+                    let _ = step_session(s, tx, true);
                 }
                 _ => {}
             }
@@ -1296,14 +1296,14 @@ pub fn handle_leader_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
             if was_term_focused || s.term.open {
                 s.open_terminal_search();
             } else {
-                let _ = step_session(s, false);
+                let _ = step_session(s, tx, false);
             }
         }
         Some(',') => {
-            let _ = step_session(s, false);
+            let _ = step_session(s, tx, false);
         }
         Some(']') => {
-            let _ = step_session(s, true);
+            let _ = step_session(s, tx, true);
         }
         Some('h' | '-') => {
             s.split_terminal_with_axis(false);
@@ -1367,7 +1367,6 @@ pub fn intercept_global_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool
         && s.keys_sheet.is_none()
         && s.pairing_target.is_none()
         && s.zoom.is_none()
-        && s.detail.is_none()
         && !s.show_diff
         && !s.timeline_search.active
         && s.voice.is_none()
@@ -1403,13 +1402,14 @@ pub fn dispatch(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         s.show_diff = false;
         return true;
     }
-    if let Some(sel) = tx.text_selection() {
-        let letter =
-            |c: char| matches!(&ev.key, rune::Key::Command(k) if k.eq_ignore_ascii_case(&c));
-        let is_copy =
-            (ev.mods.ctrl || ev.mods.cmd) && !ev.mods.alt && !ev.mods.shift && letter('c');
-        if is_copy {
-            tx.copy(sel.text().to_string());
+    if ev.is_command('c') && !ev.mods.shift && !ev.mods.alt {
+        if let Some(selected) = s.row_menu.as_ref().and_then(|menu| menu.selection.as_ref()) {
+            tx.copy(selected.text().to_owned());
+            s.row_menu = None;
+            return true;
+        }
+        if let Some(selected) = tx.text_selection() {
+            tx.copy(selected.text().to_owned());
             return true;
         }
     }
@@ -1638,9 +1638,14 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
             }
         }
         A::SearchMessages => s.focus_search(true),
-        A::ToggleRecentSession => s.toggle_recent_session(),
+        A::ToggleRecentSession => {
+            s.toggle_recent_session();
+            if s.mode == Mode::Session {
+                tx.focus("draft", false);
+            }
+        }
         A::PrevSession | A::NextSession => {
-            return step_session(s, action == A::NextSession);
+            return step_session(s, tx, action == A::NextSession);
         }
         A::AddSplit => s.split(),
         A::SplitHorizontal => s.split_tile_with_axis(false),
@@ -1680,6 +1685,7 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
         }
         A::FocusComposer => match s.mode {
             Mode::Session => {
+                tx.focus("draft", false);
                 s.draft.focused = true;
                 s.term.sink.focused = false;
             }
@@ -1740,7 +1746,7 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
 
 /// Alt+↑ / Alt+↓: the session above or below the open one in the sidebar,
 /// the first or last when none of them is open.
-fn step_session(s: &mut UiState, down: bool) -> bool {
+fn step_session(s: &mut UiState, tx: &mut Tx, down: bool) -> bool {
     let list = super::sessions::listed(s);
     if list.is_empty() {
         return false;
@@ -1758,6 +1764,7 @@ fn step_session(s: &mut UiState, down: bool) -> bool {
     };
     let asid = list[at].clone();
     s.open_session(&asid);
+    tx.focus("draft", false);
     true
 }
 
@@ -1797,10 +1804,13 @@ pub fn esc_step(s: &UiState) -> Option<EscStep> {
     if s.menu.is_some() || s.row_menu.is_some() || s.context_open.is_some() {
         return Some(EscStep::Popup);
     }
+    if s.zoom.is_some() {
+        return Some(EscStep::Dialog);
+    }
     if s.active_plugin_page.is_some() {
         return Some(EscStep::Page);
     }
-    if s.voice.is_some() || s.file_window_focused() || s.zoom.is_some() || s.detail.is_some() {
+    if s.voice.is_some() || s.file_window_focused() || s.detail_window_focused() {
         return Some(EscStep::Dialog);
     }
     if s.show_diff {
@@ -1859,11 +1869,13 @@ pub fn escape(s: &mut UiState) -> bool {
         EscStep::Dialog => {
             if s.pairing_target.is_some() {
                 s.close_pairing();
+            } else if s.zoom.is_some() {
+                s.zoom = None;
             } else if s.voice.is_some() {
                 s.cancel_voice();
             } else if s.file_window_focused() {
                 s.close_viewer();
-            } else if s.zoom.take().is_none() {
+            } else {
                 s.close_detail();
             }
         }

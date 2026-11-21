@@ -286,6 +286,7 @@ pub enum ComposeCommand {
         query: String,
     },
     Catalog {
+        request: u64,
         agent: String,
         directory: Option<String>,
         asid: Option<AgentSessionId>,
@@ -360,11 +361,13 @@ pub enum ComposerUpdate {
     Files {
         hits: Vec<FileHit>,
     },
+    SessionCatalogChanged(AgentSessionId),
     Catalog {
+        request: u64,
         asid: Option<AgentSessionId>,
         agent: String,
         directory: Option<String>,
-        view: Arc<CatalogView>,
+        view: Option<Arc<CatalogView>>,
     },
     Staged {
         #[allow(dead_code)]
@@ -375,10 +378,6 @@ pub enum ComposerUpdate {
     Submitted {
         token: u64,
         ok: bool,
-    },
-    Inbox {
-        asid: String,
-        items: Vec<InboxItem>,
     },
     Branch {
         cwd: String,
@@ -397,17 +396,6 @@ pub enum ComposerUpdate {
 
 /// The newest `@` search asked for; older ones drop out after their pause.
 static LATEST_FILES: AtomicU64 = AtomicU64::new(0);
-
-/// The waiting prompts of a session, to the composer.
-pub fn push_inbox(inbox: &Inbox, asid: &str, items: &[Value]) {
-    push(
-        inbox,
-        ComposerUpdate::Inbox {
-            asid: asid.to_string(),
-            items: InboxItem::list(items),
-        },
-    );
-}
 
 fn push(inbox: &Inbox, update: ComposerUpdate) {
     inbox.push(Update::Composer(Box::new(update)));
@@ -469,11 +457,12 @@ pub async fn run(
             None
         }
         ComposeCommand::Catalog {
+            request,
             agent,
             directory,
             asid,
         } => {
-            match hub
+            let view = match hub
                 .catalog(&agent, asid.as_ref(), directory.as_deref())
                 .await
             {
@@ -486,21 +475,23 @@ pub async fn run(
                         skills = view.catalog.skills.len(),
                         "catalogue loaded"
                     );
-                    push(
-                        &inbox,
-                        ComposerUpdate::Catalog {
-                            asid,
-                            agent,
-                            directory,
-                            view: Arc::new(view),
-                        },
-                    )
+                    Some(Arc::new(view))
                 }
-                // Not attached yet, or no answer: nothing is stored, and the
-                // composer asks again after a pause. Session header still shows
-                // the live model/mode without a catalogue.
-                Err(err) => tracing::debug!(agent = %agent, %err, "catalogue unavailable"),
-            }
+                Err(err) => {
+                    tracing::debug!(agent = %agent, %err, "catalogue unavailable");
+                    None
+                }
+            };
+            push(
+                &inbox,
+                ComposerUpdate::Catalog {
+                    request,
+                    asid,
+                    agent,
+                    directory,
+                    view,
+                },
+            );
             None
         }
         ComposeCommand::Stage { id, name, source } => {
@@ -508,7 +499,15 @@ pub async fn run(
             push(&inbox, ComposerUpdate::Staged { id, result });
             None
         }
-        ComposeCommand::SwitchModel { asid, model } => hub.switch_model(&asid, &model).await.err(),
+        ComposeCommand::SwitchModel { asid, model } => {
+            match hub.switch_model(&asid, &model).await {
+                Ok(()) => {
+                    push(&inbox, ComposerUpdate::SessionCatalogChanged(asid));
+                    None
+                }
+                Err(err) => Some(err),
+            }
+        }
         ComposeCommand::SwitchMode { asid, mode } => hub.switch_mode(&asid, &mode).await.err(),
         ComposeCommand::AutoApprove { asid } => {
             let enabled = hub.auto_approve(&asid).await.ok();

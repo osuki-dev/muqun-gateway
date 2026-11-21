@@ -63,6 +63,27 @@ pub fn target(src: &str) -> Option<PathBuf> {
     Some(dir()?.join(file_name(src)?))
 }
 
+/// A sender-side copy of a remote upload. Keep each computer's paths in its
+/// own namespace; the remote filesystem path is only ever used as a key.
+pub(crate) fn upload_target(computer: &str, remote: &str) -> Option<PathBuf> {
+    if computer == "local" {
+        return None;
+    }
+    let name = Path::new(remote).file_name()?.to_str()?;
+    let (id, extension) = name.rsplit_once('.')?;
+    uuid::Uuid::parse_str(id).ok()?;
+    if !super::compose::image_name(name) {
+        return None;
+    }
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    (computer, remote).hash(&mut hash);
+    Some(dir()?.join(format!("sent-{:016x}.{extension}", hash.finish())))
+}
+
+pub(crate) fn cached_upload(computer: &str, remote: &str) -> Option<PathBuf> {
+    upload_target(computer, remote).filter(|path| path.is_file())
+}
+
 fn local_file(src: &str) -> bool {
     let raw = src.strip_prefix("file://").unwrap_or(src);
     Path::new(raw).is_absolute() && Path::new(raw).is_file()
@@ -216,6 +237,17 @@ pub fn write(path: &Path, bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uploaded_images_preview_on_the_sending_computer_without_reading_the_remote_path() {
+        let remote = format!("/remote/uploads/{}.png", uuid::Uuid::new_v4());
+        let path = upload_target("paired-a", &remote).unwrap();
+        assert!(write(&path, b"local copy of sent image"));
+        assert_eq!(cached_upload("paired-a", &remote).as_ref(), Some(&path));
+        assert!(cached_upload("paired-b", &remote).is_none());
+        assert!(cached_upload("local", &remote).is_none());
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn only_gateway_media_routes_map_to_cache_files() {

@@ -26,6 +26,7 @@ use tokio::sync::broadcast;
 
 pub use dynamic::{connection_origin, spawn_connected, ConnectionContext, DynamicHub};
 pub use local::LocalHub;
+pub(crate) use remote::local_gateway_credential;
 pub use remote::{discover_local_gateway, LocalGateway, RemoteHub};
 
 /// The agent a fresh install suggests first.

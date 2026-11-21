@@ -54,6 +54,13 @@ if [[ ! -x "$BIN_SRC" ]]; then
 fi
 
 mkdir -p "$BIN_DIR" "$APPS_DIR"
+webview_src="$(dirname "$BIN_SRC")/muqun-wry-embedded"
+if [[ ! -x "$webview_src" ]]; then
+  echo "missing embedded WebView helper: $webview_src (install the complete Linux package)" >&2
+  exit 1
+fi
+install -m 755 "$webview_src" "$BIN_DIR/.muqun-wry-embedded.new.$$"
+mv -f "$BIN_DIR/.muqun-wry-embedded.new.$$" "$BIN_DIR/muqun-wry-embedded"
 
 # Copy next to the target, then rename over it: a running Muqun keeps its old
 # binary until it restarts, and a half-written file is never what launches.
@@ -68,6 +75,16 @@ for dir in "$PACKAGING"/icons/hicolor/*/apps; do
   install -m 644 "$dir/$APP_ID.png" "$ICONS_DIR/$size/apps/$APP_ID.png"
 done
 
+installers="$PREFIX/share/$APP_ID/installers"
+mkdir -p "$installers"
+install -m 755 "$ROOT/install-desktop.sh" "$ROOT/install.sh" "$installers/"
+if [[ -f "$ROOT/VERSION" ]]; then
+  install -m 644 "$ROOT/VERSION" "$installers/VERSION"
+elif [[ -f "$ROOT/desktop/Cargo.toml" ]]; then
+  sed -n 's/^version = "\([^"]*\)"$/\1/p' "$ROOT/desktop/Cargo.toml" > "$installers/VERSION"
+fi
+install -m 755 "$ROOT/desktop/scripts/uninstall-local.sh" "$installers/"
+
 # Package files never overwrite the separate user plugins/ directory.
 PLUGIN_DIR="$PREFIX/share/$APP_ID/bundled-plugins/review-center"
 mkdir -p "$PLUGIN_DIR"
@@ -77,9 +94,10 @@ install -m 644 "$ROOT/desktop/assets/plugins/review-center/README.md" "$PLUGIN_D
 
 # The launcher runs the installed binary by its full path, so it works even
 # when $PREFIX/bin is not on the session's PATH.
-exec_path="$(printf '%s' "$BIN_DIR/$APP_ID" | sed 's/[\\"`$]/\\\\&/g')"
+launch_bin="${MUQUN_DESKTOP_LAUNCH_PREFIX:-$PREFIX}/bin/$APP_ID"
+exec_path="$(printf '%s' "$launch_bin" | sed 's/[\\"`$]/\\\\&/g')"
 exec_replacement="$(printf '"%s"' "$exec_path" | sed 's/[\\&|]/\\&/g')"
-try_replacement="$(printf '%s' "$BIN_DIR/$APP_ID" | sed 's/[\\&|]/\\&/g')"
+try_replacement="$(printf '%s' "$launch_bin" | sed 's/[\\&|]/\\&/g')"
 sed -e "s|^Exec=muqun-desktop|Exec=$exec_replacement|" \
   -e "s|^TryExec=muqun-desktop|TryExec=$try_replacement|" \
   "$PACKAGING/$APP_ID.desktop" >"$APPS_DIR/$APP_ID.desktop"
@@ -98,7 +116,7 @@ fi
 if command -v desktop-file-validate >/dev/null 2>&1; then
   desktop-file-validate "$APPS_DIR/$APP_ID.desktop" || true
 fi
-if command -v update-desktop-database >/dev/null 2>&1; then
+if [[ -z "${MUQUN_DESKTOP_LAUNCH_PREFIX:-}" ]] && command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
 fi
 if command -v gtk-update-icon-cache >/dev/null 2>&1 && [[ -f "$ICONS_DIR/index.theme" ]]; then

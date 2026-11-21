@@ -25,7 +25,6 @@ use super::UiState;
 use crate::config::Language;
 use crate::model::viewer::{self as files, FileKind, FileRef, Loaded, Meta};
 
-/// What the viewer shows.
 #[derive(Debug, Clone)]
 pub struct Viewer {
     /// The local file, when the target is on this computer.
@@ -36,6 +35,8 @@ pub struct Viewer {
     pub body: Body,
     /// Images: `None` fits the window, else the scale (1.0 = actual pixels).
     pub zoom: Option<f32>,
+    pub(super) image_viewport: [f32; 2],
+    pub(super) image_pan_start: Option<[f32; 2]>,
     /// Markdown: show the source instead of the rendering.
     pub source: bool,
 }
@@ -50,7 +51,8 @@ pub enum Body {
         lines: usize,
         truncated: bool,
     },
-    Image,
+    /// Overlays retain the originating image handle; the Files pane loads its image by path.
+    Image(Option<rune::Image>),
     /// Not drawn here: metadata and the system app.
     External,
     /// The target is not a file on this computer.
@@ -139,7 +141,7 @@ impl UiState {
                 files::spawn_load(path.clone());
                 Body::Loading
             }
-            Some(_) if kind == FileKind::Image => Body::Image,
+            Some(_) if kind == FileKind::Image => Body::Image(None),
             Some(_) => Body::External,
         };
         self.viewer = Some(Viewer {
@@ -149,9 +151,55 @@ impl UiState {
             meta,
             body,
             zoom: None,
+            image_viewport: [0.0; 2],
+            image_pan_start: None,
             source: false,
         });
         self.show_file_window();
+    }
+
+    pub fn open_attachment_image(&mut self, path: &Path) {
+        let Some(cache) = &self.images else { return };
+        let image = super::parts::images::picture_file(cache, path);
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        self.open_image_overlay(Some(path.to_owned()), name, image, Meta::of(path));
+    }
+
+    pub fn open_plugin_image(&mut self, name: String, image: rune::Image, bytes: u64) {
+        self.open_image_overlay(
+            None,
+            name,
+            image,
+            Meta {
+                size: Some(bytes),
+                modified: None,
+            },
+        );
+    }
+
+    fn open_image_overlay(
+        &mut self,
+        path: Option<PathBuf>,
+        name: String,
+        image: rune::Image,
+        meta: Meta,
+    ) {
+        self.menu = None;
+        self.zoom = Some(Box::new(Viewer {
+            path,
+            name,
+            kind: FileKind::Image,
+            meta,
+            body: Body::Image(Some(image)),
+            zoom: None,
+            image_viewport: [0.0; 2],
+            image_pan_start: None,
+            source: false,
+        }));
     }
 
     pub fn show_file_window(&mut self) {
@@ -189,7 +237,7 @@ impl UiState {
     pub fn close_viewer(&mut self) {
         self.viewer = None;
         if self.active_plugin_page.as_deref() == Some("files") {
-            self.active_plugin_page = None;
+            self.release_plugin_page();
             self.plugin_page_origin = None;
         }
         if self.active_plugin_drawer.as_deref() == Some("files") {
@@ -307,20 +355,70 @@ pub fn text_body(text: Arc<str>, truncated: bool) -> Body {
 }
 
 /// File content uses the same host-owned window as any extension.
-pub fn content(s: &UiState, k: &Kit, scale: f32) -> El {
+pub fn content(s: &UiState, k: &Kit, scale: f32, layer: &mut Vec<El>) -> El {
     let Some(v) = s.viewer.as_ref() else {
         return el().center().child(text(tr_ref(
             s.cfg.general.language,
             "Open a file to preview it",
         )));
     };
+    viewer_content(s, v, k, scale, layer)
+}
+
+pub(super) fn image_overlay(s: &UiState, k: &Kit, scale: f32, layer: &mut Vec<El>) {
+    let Some(v) = &s.zoom else {
+        return;
+    };
+    let mut menus = Vec::new();
+    let close = |s: &mut UiState| {
+        s.zoom = None;
+        s.menu = None;
+    };
+    let dialog = col()
+        .key("plugin-image-dialog")
+        .absolute(0.0, 0.0)
+        .w_full()
+        .h_full()
+        .padding(20.0)
+        .fill(k.alpha(k.c.black, 0.88))
+        .on_press(close)
+        .modal(true, close)
+        .child(
+            col()
+                .w_full()
+                .h_full()
+                .fill(k.c.layer_01)
+                .on_press(|_: &mut UiState| {})
+                .child(viewer_content(s, v, k, scale, &mut menus)),
+        );
+    layer.push(dialog);
+    layer.extend(menus);
+}
+
+fn viewer_content(s: &UiState, v: &Viewer, k: &Kit, scale: f32, layer: &mut Vec<El>) -> El {
+    let picture = match (&v.body, &s.images, &v.path) {
+        (Body::Image(Some(image)), _, _) => Some(image.clone()),
+        (Body::Image(None), Some(images), Some(path)) => {
+            Some(images.file(path, 1024.0, scale.max(1.0)))
+        }
+        _ => None,
+    };
+    let dimensions = picture
+        .as_ref()
+        .and_then(rune::Image::size)
+        .map(|[w, h]| [w as f32 / scale, h as f32 / scale]);
+    let fit_zoom = dimensions.map_or(1.0, |[w, h]| {
+        ((v.image_viewport[0] - 48.0).max(1.0) / w).min((v.image_viewport[1] - 48.0).max(1.0) / h)
+    });
     col()
         .key("viewer-panel")
         .w_full()
         .h_full()
         .min_h(0.0)
-        .child(header(v, k, s.cfg.general.language))
-        .child(body(s, v, k, scale, s.cfg.general.language))
+        .child(header(s, v, k, fit_zoom, layer))
+        .child(body(v, k, s.cfg.general.language, || {
+            image(v, k, picture, dimensions, fit_zoom, s.cfg.general.language)
+        }))
 }
 
 fn kind_label(kind: FileKind, language: Language) -> String {
@@ -417,7 +515,8 @@ fn civil_date(when: SystemTime) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-fn header(v: &Viewer, k: &Kit, language: Language) -> El {
+fn header(s: &UiState, v: &Viewer, k: &Kit, fit_zoom: f32, layer: &mut Vec<El>) -> El {
+    let language = s.cfg.general.language;
     let folder = v.path.as_deref().and_then(Path::parent).map(home_relative);
     let mut title = col()
         .key("viewer-title")
@@ -480,8 +579,28 @@ fn header(v: &Viewer, k: &Kit, language: Language) -> El {
                 .key("viewer-md-mode"),
         );
     }
-    if matches!(v.body, Body::Image) {
-        bar = bar.child(zoom_controls(v, k, language));
+    if matches!(v.body, Body::Image(_)) {
+        bar = bar.child(image_actions(s, v, k, fit_zoom, layer));
+        if matches!(v.body, Body::Image(Some(_))) {
+            let close = tr_ref(language, "Close");
+            bar = bar.child(
+                k.interactive(
+                    el().size(32.0, 32.0)
+                        .center()
+                        .child(rune::icon(&rune_kit::glyphs::CLOSE, 16.0).color(k.c.text_base)),
+                )
+                .key("plugin-image-close")
+                .role("button")
+                .focusable(true)
+                .cursor(rune::Cursor::Pointer)
+                .label(close)
+                .on_press(|s: &mut UiState| {
+                    s.zoom = None;
+                    s.menu = None;
+                }),
+            );
+        }
+        return bar;
     }
     if let Some(path) = v.path.clone() {
         let open = path.clone();
@@ -524,55 +643,88 @@ fn header(v: &Viewer, k: &Kit, language: Language) -> El {
     bar
 }
 
-fn zoom_controls(v: &Viewer, k: &Kit, language: Language) -> El {
-    let step = |dir: i32| {
+fn image_actions(s: &UiState, v: &Viewer, k: &Kit, fit_zoom: f32, layer: &mut Vec<El>) -> El {
+    use rune_kit::{Menu, MenuItem};
+    let lang = s.cfg.general.language;
+    let overlay_image = matches!(v.body, Body::Image(Some(_)));
+    let open =
+        s.menu == Some(super::OpenMenu::ViewerImageActions) && (s.zoom.is_none() || overlay_image);
+    let current = v.zoom.unwrap_or(fit_zoom);
+    let trigger = Button::new(format!(
+        "{} · {:.0}% ▾",
+        tr_ref(lang, "Actions"),
+        current * 100.0
+    ))
+    .variant(ButtonVariant::Ghost)
+    .on_press(move |s: &mut UiState| {
+        s.menu = (!open).then_some(super::OpenMenu::ViewerImageActions)
+    })
+    .build(k)
+    .key("viewer-image-actions-button");
+    let mut menu = Menu::new("viewer-image-actions")
+        .trigger(trigger)
+        .open(open)
+        .on_close(|s: &mut UiState| s.menu = None);
+    let set_zoom = move |value| {
         move |s: &mut UiState| {
-            if let Some(v) = s.viewer.as_mut() {
-                let now = v.zoom.unwrap_or(1.0);
-                let next = if dir > 0 {
-                    ZOOM_STEPS.iter().copied().find(|z| *z > now + 0.01)
-                } else {
-                    ZOOM_STEPS.iter().rev().copied().find(|z| *z < now - 0.01)
-                };
-                v.zoom = Some(next.unwrap_or(now));
+            if let Some(v) = image_viewer_mut(s, overlay_image) {
+                v.zoom = value;
             }
+            s.menu = None;
         }
     };
-    let fit = v.zoom.is_none();
-    let label = match v.zoom {
-        None => tr(language, "Fit"),
-        Some(z) => format!("{:.0}%", z * 100.0),
-    };
-    row()
-        .key("viewer-zoom")
-        .gap(4.0)
-        .center_y()
-        .child(
-            Button::new("−")
-                .variant(ButtonVariant::Ghost)
-                .on_press(step(-1))
-                .build(k)
-                .key("zoom-out"),
+    let lower = ZOOM_STEPS.iter().copied().rfind(|&z| z < current - 0.001);
+    let higher = ZOOM_STEPS.iter().copied().find(|&z| z > current + 0.001);
+    for (label, target) in [("−", lower), ("+", higher)] {
+        menu = menu.item(
+            MenuItem::new(format!("{} {label}", tr_ref(lang, "Zoom")))
+                .disabled(target.is_none())
+                .on_select(set_zoom(target)),
+        );
+    }
+    menu = menu
+        .item(
+            MenuItem::new(tr_ref(lang, "Fit"))
+                .checked(v.zoom.is_none())
+                .on_select(set_zoom(None)),
         )
-        .child(
-            Button::new(label)
-                .variant(ButtonVariant::Ghost)
-                .help(tr(language, "Fit to the window / actual size"))
-                .on_press(move |s: &mut UiState| {
-                    if let Some(v) = s.viewer.as_mut() {
-                        v.zoom = if fit { Some(1.0) } else { None };
-                    }
-                })
-                .build(k)
-                .key("zoom-fit"),
-        )
-        .child(
-            Button::new("+")
-                .variant(ButtonVariant::Ghost)
-                .on_press(step(1))
-                .build(k)
-                .key("zoom-in"),
-        )
+        .item(
+            MenuItem::new("100%")
+                .checked(v.zoom == Some(1.0))
+                .on_select(set_zoom(Some(1.0))),
+        );
+    if let Some(path) = &v.path {
+        let open_path = path.clone();
+        let reveal_path = path.clone();
+        let save_path = path.clone();
+        menu = menu
+            .separator()
+            .item(
+                MenuItem::new(tr_ref(lang, "Open with system app"))
+                    .icon(&OPEN_EXTERNAL)
+                    .on_select(move |s: &mut UiState| {
+                        s.menu = None;
+                        crate::platform::shell::open_path(&open_path);
+                    }),
+            )
+            .item(
+                MenuItem::new(tr_ref(lang, "Reveal in folder"))
+                    .icon(&OPEN_FOLDER)
+                    .on_select(move |s: &mut UiState| {
+                        s.menu = None;
+                        crate::platform::shell::reveal(&reveal_path);
+                    }),
+            )
+            .item(
+                MenuItem::new(tr_ref(lang, "Save as…"))
+                    .icon(&DOWNLOAD)
+                    .on_select(move |s: &mut UiState| {
+                        s.menu = None;
+                        crate::platform::dialogs::save_copy(save_path.clone());
+                    }),
+            );
+    }
+    menu.build(k, layer)
 }
 
 fn home_relative(path: &Path) -> String {
@@ -583,7 +735,7 @@ fn home_relative(path: &Path) -> String {
     }
 }
 
-fn body(s: &UiState, v: &Viewer, k: &Kit, scale: f32, language: Language) -> El {
+fn body(v: &Viewer, k: &Kit, language: Language, image_view: impl FnOnce() -> El) -> El {
     let frame = col().key("viewer-body").w_full().grow(1.0).min_h(0.0);
     match &v.body {
         Body::Loading => frame.center().child(
@@ -612,7 +764,7 @@ fn body(s: &UiState, v: &Viewer, k: &Kit, scale: f32, language: Language) -> El 
             }
             frame
         }
-        Body::Image => frame.child(image(s, v, k, scale, language)),
+        Body::Image(_) => frame.child(image_view()),
         Body::External => frame.center().child(external(v, k, language)),
         Body::Missing => frame.center().child(notice(
             k,
@@ -739,45 +891,132 @@ fn truncation_note(k: &Kit, language: Language) -> El {
         )
 }
 
-fn image(s: &UiState, v: &Viewer, k: &Kit, scale: f32, language: Language) -> El {
-    let (Some(images), Some(path)) = (s.images.as_ref(), v.path.as_ref()) else {
+fn image_viewer_mut(s: &mut UiState, overlay: bool) -> Option<&mut Viewer> {
+    if overlay {
+        s.zoom.as_deref_mut()
+    } else {
+        s.viewer.as_mut()
+    }
+}
+
+fn image(
+    v: &Viewer,
+    k: &Kit,
+    picture: Option<rune::Image>,
+    dimensions: Option<[f32; 2]>,
+    fit_zoom: f32,
+    language: Language,
+) -> El {
+    let Some(picture) = picture else {
         return el().key("viewer-image").w_full().grow(1.0);
     };
-    let picture = images.file(path, 1024.0, scale.max(1.0));
-    if picture.error().is_some() {
+    if let Some(error) = picture.error() {
         return col()
             .key("viewer-image")
             .w_full()
             .grow(1.0)
             .center()
-            .child(external(v, k, language));
+            .child(external(v, k, language))
+            .child(
+                text(error.to_string())
+                    .font(k.ty.small)
+                    .color(k.c.text_muted),
+            );
     }
     // A checkerboard-free, theme-coloured stage so transparent pictures read.
+    let overlay_image = matches!(v.body, Body::Image(Some(_)));
+    let stage_key = if overlay_image {
+        "viewer-plugin-image"
+    } else {
+        "viewer-image"
+    };
     let stage = col()
-        .key("viewer-image")
+        .key(stage_key)
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .fill(k.c.bg_deep);
-    match (v.zoom, picture.size()) {
+        .fill(k.c.bg_deep)
+        .on_layout(move |s: &mut UiState, [_, _, w, h]| {
+            if let Some(v) = image_viewer_mut(s, overlay_image) {
+                v.image_viewport = [w, h];
+            }
+        })
+        .on_wheel(move |s: &mut UiState, e: rune::WheelEvent, _| {
+            if e.dy == 0.0 || e.dx.abs() > e.dy.abs() || dimensions.is_none() {
+                return false;
+            }
+            if !e.momentum {
+                if let Some(v) = image_viewer_mut(s, overlay_image) {
+                    let current = v.zoom.unwrap_or(fit_zoom);
+                    let factor = (e.dy.clamp(-120.0, 120.0) / 240.0).exp();
+                    v.zoom = Some((current * factor).clamp(fit_zoom.min(0.25), fit_zoom.max(8.0)));
+                }
+            }
+            true
+        });
+    match (v.zoom, dimensions) {
         (Some(zoom), Some([w, h])) => {
-            let (w, h) = (w as f32 / scale * zoom, h as f32 / scale * zoom);
+            let (w, h) = (w * zoom, h * zoom);
+            let offset = std::rc::Rc::new(std::cell::Cell::new([0.0; 2]));
+            let reported = offset.clone();
+            let stage = if w + 48.0 > v.image_viewport[0] || h + 48.0 > v.image_viewport[1] {
+                stage
+                    .cursor(if v.image_pan_start.is_some() {
+                        rune::Cursor::Grabbing
+                    } else {
+                        rune::Cursor::Grab
+                    })
+                    .on_scroll_offset(move |pos| reported.set(pos.offset))
+                    .on_drag(move |s: &mut UiState, d, tx| {
+                        let Some(v) = image_viewer_mut(s, overlay_image) else {
+                            return;
+                        };
+                        if d.phase == rune::Phase::Down {
+                            v.image_pan_start = Some(offset.get());
+                        } else if let Some([x, y]) = v.image_pan_start {
+                            let (dx, dy) = if d.cancelled() {
+                                (0.0, 0.0)
+                            } else {
+                                (d.dx, d.dy)
+                            };
+                            tx.scroll_to_instant(stage_key, x - dx, y - dy);
+                            if d.phase == rune::Phase::Up {
+                                v.image_pan_start = None;
+                            }
+                        }
+                    })
+            } else {
+                stage
+            };
             stage
                 .child(
-                    col().key("viewer-image-canvas").padding(24.0).child(
-                        el().key("viewer-picture")
-                            .pixels_fit(picture.pixels(), SurfaceFit::Fit)
-                            .size(w, h),
-                    ),
+                    col()
+                        .key("viewer-image-canvas")
+                        .size(
+                            (w + 48.0).max(v.image_viewport[0]),
+                            (h + 48.0).max(v.image_viewport[1]),
+                        )
+                        .center()
+                        .child(
+                            el().key("viewer-picture")
+                                .pixels_fit(picture.pixels(), SurfaceFit::Fit)
+                                .size(w, h),
+                        ),
                 )
                 .scroll_xy()
         }
-        _ => stage.padding(24.0).child(
-            el().key("viewer-picture")
+        _ => {
+            let mut face = col()
+                .key("viewer-picture")
+                .center()
                 .pixels_fit(picture.pixels(), SurfaceFit::Fit)
                 .w_full()
-                .grow(1.0),
-        ),
+                .grow(1.0);
+            if !picture.is_ready() {
+                face = face.child(crate::ui::art::ActivityMark::Standalone.build(k));
+            }
+            stage.padding(24.0).child(face)
+        }
     }
 }
 
@@ -866,9 +1105,136 @@ mod tests {
         assert!(s.tile_of_plugin("files").is_none());
         assert!(s.term.open && s.term.sink.focused);
         assert_eq!(
-            s.term.pending_command.as_deref(),
+            s.term.tabs[s.term.active_tab].pending_command.as_deref(),
             Some(format!("nvim '{}'\n", path.display()).as_str())
         );
+    }
+
+    #[test]
+    fn closing_a_plugin_image_keeps_the_originating_page_and_existing_file_view() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.open_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/icons/app-icon.png"));
+        let original = s.viewer.as_ref().unwrap().path.clone();
+        s.active_plugin_page = Some("fizzy-sdk-preview".into());
+        let tiles = s.tiles.len();
+        let cache = rune::ImageCache::new(Arc::new(|| {}));
+        let png = include_bytes!("../../assets/icons/app-icon.png");
+        s.open_plugin_image("Cover".into(), cache.load(&png[..]), png.len() as u64);
+        assert!(s.zoom.is_some());
+        assert!(crate::ui::keymap::escape(&mut s));
+        assert!(s.zoom.is_none());
+        assert_eq!(s.active_plugin_page.as_deref(), Some("fizzy-sdk-preview"));
+        assert_eq!(s.viewer.as_ref().unwrap().path, original);
+        assert_eq!(s.tiles.len(), tiles);
+    }
+
+    #[test]
+    fn wheel_zoom_and_pointer_pan_in_files_plugins_and_chat_attachments() {
+        fn render(s: &UiState, _: &mut rune::Cx<UiState>) -> El {
+            let v = match &s.zoom {
+                Some(v) => v,
+                _ => s.viewer.as_ref().unwrap(),
+            };
+            let k = Kit::neutral(true);
+            let mut menus = vec![];
+            let body = viewer_content(s, v, &k, 1.0, &mut menus);
+            rune_kit::root(body, menus)
+        }
+        for origin in ["files", "plugin", "attachment"] {
+            let (tx, _) = crate::model::commands::channel();
+            let mut s = UiState::new(tx);
+            let cache = rune::ImageCache::new(Arc::new(|| {}));
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/icons/app-icon.png");
+            let img = if origin == "attachment" {
+                super::super::parts::images::picture_file(&cache, &path)
+            } else {
+                cache.file(&path, 1024.0, 1.0)
+            };
+            img.wait().unwrap();
+            s.images = Some(cache);
+            s.open_file(path.clone());
+            match origin {
+                "plugin" => s.open_plugin_image("Card image".into(), img, 0),
+                "attachment" => s.open_attachment_image(&path),
+                _ => {}
+            }
+            let mut rt = rune::Runtime::new(s, render, (520.0, 440.0), rune::Env::new(true, 1.0));
+            rt.set_system_reduced_motion(true);
+            let settle = |rt: &mut rune::Runtime<UiState>| {
+                for _ in 0..6 {
+                    rt.frame(0.016);
+                }
+            };
+            let rect = |rt: &rune::Runtime<UiState>, key: &str| {
+                rt.elements()
+                    .into_iter()
+                    .find(|e| e.key.as_deref() == Some(key))
+                    .unwrap()
+                    .rect
+            };
+            settle(&mut rt);
+            let key = if origin != "files" {
+                "viewer-plugin-image"
+            } else {
+                "viewer-image"
+            };
+            let [sx, sy, sw, sh] = rect(&rt, key);
+            let (x, y) = (sx + sw / 2.0, sy + sh / 2.0);
+            for _ in 0..3 {
+                rt.wheel_event(rune::WheelEvent::new(0.0, 120.0).at(x, y));
+                settle(&mut rt);
+            }
+            let first = rect(&rt, "viewer-picture");
+            assert!(first[2] > sw && first[3] > sh, "wheel zoom {first:?}");
+            let drag = |rt: &mut rune::Runtime<UiState>, dx, dy| {
+                rt.pointer_down(x, y);
+                rt.frame(0.016);
+                rt.pointer_move(x + dx, y + dy);
+                rt.frame(0.016);
+                rt.pointer_up(x + dx, y + dy);
+                settle(rt);
+            };
+            drag(&mut rt, -60.0, -90.0);
+            let moved = rect(&rt, "viewer-picture");
+            assert!(
+                (first[0] - moved[0] - 60.0).abs() < 2.0
+                    && (first[1] - moved[1] - 90.0).abs() < 2.0,
+                "pan {first:?} -> {moved:?}"
+            );
+            drag(&mut rt, -15.0, 12.0);
+            let second = rect(&rt, "viewer-picture");
+            assert!(
+                (second[0] - moved[0] + 15.0).abs() < 2.0
+                    && (second[1] - moved[1] - 12.0).abs() < 2.0,
+                "second pan {moved:?} -> {second:?}"
+            );
+            drag(&mut rt, -20000.0, -20000.0);
+            let edge = rect(&rt, "viewer-picture");
+            assert!((edge[0] + edge[2] - (sx + sw - 24.0)).abs() < 2.0);
+            assert!((edge[1] + edge[3] - (sy + sh - 24.0)).abs() < 2.0);
+            drag(&mut rt, 20000.0, 20000.0);
+            assert_eq!(rect(&rt, "viewer-picture"), first);
+        }
+    }
+
+    #[test]
+    fn session_inspector_leaves_image_window_unobstructed() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.mode = crate::ui::Mode::Session;
+        s.tiles = vec![
+            crate::ui::Tile::session("one"),
+            crate::ui::Tile::session("two"),
+        ];
+        s.selected = Some("one".into());
+        s.open_git_inspector();
+        assert!(s.inline_inspector_open());
+        s.open_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/icons/app-icon.png"));
+        assert!(s.file_window_focused());
+        assert!(!s.inline_inspector_open());
+        s.focus_tile(0);
+        assert!(s.inline_inspector_open());
     }
 
     #[test]

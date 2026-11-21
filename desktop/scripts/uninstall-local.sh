@@ -22,6 +22,10 @@ remove() {
   fi
 }
 
+for name in install-desktop.sh install.sh uninstall-local.sh VERSION; do
+  remove "$PREFIX/share/$APP_ID/installers/$name"
+done
+
 PLUGIN_DIR="$PREFIX/share/$APP_ID/bundled-plugins/review-center"
 remove "$PLUGIN_DIR/plugin.json"
 remove "$PLUGIN_DIR/review.ts"
@@ -31,6 +35,7 @@ if [[ -d "$PLUGIN_DIR" ]]; then
 fi
 
 remove "$BIN_DIR/$APP_ID"
+remove "$BIN_DIR/muqun-wry-embedded"
 remove "$APPS_DIR/$APP_ID.desktop"
 for icon in "$ICONS_DIR"/*/apps/"$APP_ID".png; do
   remove "$icon"

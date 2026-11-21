@@ -2,7 +2,6 @@
 //! branch pills, and the `@` / `$` / `/` popups.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use muqun_gateway::agents::{AgentSessionId, ModelRef};
 use rune::{col, el, row, text, Cursor, El, ImageCache, PillStyle, SurfaceFit, TextEdit, Tx};
@@ -11,7 +10,6 @@ use rune_kit::{
     TextArea,
 };
 
-use super::art;
 use super::copy::tr_ref;
 use super::{OpenMenu, Slot, UiState};
 use crate::config::ConfigEdit;
@@ -162,6 +160,28 @@ fn draft_of(s: &UiState, slot: Slot) -> &TextEdit {
     }
 }
 
+pub(super) fn ready_to_send(s: &UiState, slot: Slot) -> bool {
+    let draft = draft_of(s, slot);
+    let target = match slot {
+        Slot::Start => None,
+        Slot::Session => s.selected.as_ref(),
+    };
+    (!draft.text.trim().is_empty() || !s.staged.is_empty())
+        && !draft.pills().any(|(_, id)| {
+            id.strip_prefix("image:")
+                .and_then(|id| id.parse().ok())
+                .is_some_and(|id| s.pending_image_uploads.contains(&id))
+        })
+        && !s
+            .pending_file_targets
+            .iter()
+            .any(|(id, (computer, session))| {
+                !s.pending_image_uploads.contains(id)
+                    && computer == s.current_computer()
+                    && session.as_ref() == target
+            })
+}
+
 fn draft_of_mut(s: &mut UiState, slot: Slot) -> &mut TextEdit {
     match slot {
         Slot::Session => &mut s.draft,
@@ -254,25 +274,27 @@ pub fn composer_card(
         )
         .border_gradient(
             1.0,
-            k.c.info.icon.alpha(if active { 0.80 } else { 0.30 }),
+            k.c.info.icon.alpha(if active { 0.65 } else { 0.22 }),
             k.c.bg_accent.alpha(if active { 0.65 } else { 0.25 }),
         )
         .box_shadow(rune::Shadow {
             x: 0.0,
-            y: 16.0,
-            blur: 42.0,
+            y: 6.0,
+            blur: 22.0,
             spread: -8.0,
             color: k.c.black.alpha(if look.dark { 0.45 } else { 0.12 }),
             inset: false,
         })
         .motion(look.focus_fade());
-    if busy {
-        card.child(look.energy_line(k, "composer-energy", true).w(120.0).pin(
-            Some(28.0),
-            Some(0.0),
-            None,
-            None,
-        ))
+    if busy && look.motion && look.glass && super::fx::fx_enabled() {
+        card.child(
+            el().key("composer-energy")
+                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .radius(k.radius.xl)
+                .effect(super::fx::COMPOSER_RIM)
+                .effect_data(super::fx::data(k.c.bg_accent, 1.8))
+                .a11y_hidden(),
+        )
     } else {
         card
     }
@@ -320,26 +342,36 @@ pub fn queue_session(s: &mut UiState) {
 
 fn send_session(s: &mut UiState, queue: bool) {
     let text = s.draft.text.trim().to_string();
-    if text.is_empty() {
+    if !ready_to_send(s, Slot::Session) {
         return;
     }
-    s.record_prompt_history(&text);
     let Some(asid) = s.selected.clone() else {
         s.status = "Pick a session first".into();
         return;
     };
+    if s.pending_start
+        .as_ref()
+        .is_some_and(|(pending, _)| *pending == asid)
+    {
+        return;
+    }
+    s.record_prompt_history(&text);
     let attachments: Vec<String> = s.staged.iter().map(|f| f.path.clone()).collect();
     let deliver = deliver_of(catalog_of(s, Slot::Session), &text, !attachments.is_empty());
     note_skill_args(s, &deliver);
     let busy = s.busy();
-    let delivery = busy.then(|| if queue { "queue" } else { "steer" }.to_string());
+    let delivery = busy.then_some(if queue {
+        super::echo::BusyDelivery::Queue
+    } else {
+        super::echo::BusyDelivery::Steer
+    });
     let token = s.token(Slot::Session);
     s.status = "Sending…".into();
     // A prompt shows in the timeline at once and leaves the draft; a queued
     // one is its inbox item in the queue strip, as before.
-    if let (Deliver::Prompt(words), false) = (&deliver, queue && busy) {
+    if let Deliver::Prompt(words) = &deliver {
         let staged = std::mem::take(&mut s.staged);
-        s.echo_sent(&asid, token, words.clone(), &staged, busy);
+        s.echo_sent(&asid, token, words.clone(), &staged, delivery);
         s.draft = fresh("");
         s.persist_draft(Slot::Session);
     }
@@ -348,7 +380,7 @@ fn send_session(s: &mut UiState, queue: bool) {
         target: Target::Session(AgentSessionId(asid)),
         deliver,
         attachments,
-        delivery,
+        delivery: delivery.map(super::echo::BusyDelivery::wire),
     }));
 }
 
@@ -372,9 +404,7 @@ fn mention_search_target(s: &UiState, slot: Slot) -> Option<(String, String)> {
             let directory = {
                 let typed = s.start_cwd.text.trim();
                 if typed.is_empty() {
-                    s.cfg
-                        .general
-                        .initial_cwd(&s.start_agent)
+                    s.start_default_directory(&s.start_agent)
                         .display()
                         .to_string()
                 } else {
@@ -593,6 +623,7 @@ pub(super) fn edit_queued(s: &mut UiState, id: &str, text: String) {
             });
         }
     }
+    s.forget_queue_echo(&asid, id);
     s.queue.retain(|q| q.id != id);
     s.send(Command::Compose(ComposeCommand::InboxCancel {
         asid: AgentSessionId(asid),
@@ -607,6 +638,7 @@ fn cancel_queued(s: &mut UiState, id: &str) {
     let Some(asid) = s.selected.clone() else {
         return;
     };
+    s.forget_queue_echo(&asid, id);
     s.queue.retain(|q| q.id != id);
     s.send(Command::Compose(ComposeCommand::InboxCancel {
         asid: AgentSessionId(asid),
@@ -631,14 +663,14 @@ fn toggle_queued_steer(s: &mut UiState, id: &str, steer: bool) {
 
 fn chip_thumb(k: &Kit, images: Option<&ImageCache>, path: &str, key: &str) -> El {
     if let Some(images) = images {
-        if let Ok(bytes) = std::fs::read(path) {
-            return art::picture(images, Arc::<[u8]>::from(bytes), SurfaceFit::Fill)
-                .key(key.to_string())
-                .w(CHIP_THUMB_W)
-                .h(CHIP_THUMB_H)
-                .radius(k.radius.sm)
-                .clip_rounded(k.radius.sm);
-        }
+        let image = super::parts::images::picture_file(images, Path::new(path));
+        return el()
+            .pixels_fit(image.pixels(), SurfaceFit::Fill)
+            .key(key.to_string())
+            .w(CHIP_THUMB_W)
+            .h(CHIP_THUMB_H)
+            .radius(k.radius.sm)
+            .clip_rounded(k.radius.sm);
     }
     el().key(key.to_string())
         .w(CHIP_THUMB_W)
@@ -649,16 +681,40 @@ fn chip_thumb(k: &Kit, images: Option<&ImageCache>, path: &str, key: &str) -> El
 
 /// Thumbnails for queued image attachments (composer chips and the inspector).
 pub(super) fn queue_thumbs(s: &UiState, k: &Kit, prefix: &str, paths: &[&str]) -> Option<El> {
-    image_thumbs(k, s.images.as_ref(), prefix, paths)
+    image_thumbs(s, k, prefix, paths)
 }
 
-fn image_thumbs(k: &Kit, images: Option<&ImageCache>, prefix: &str, paths: &[&str]) -> Option<El> {
+fn openable_picture(k: &Kit, face: El, key: String, label: &str, path: &Path) -> El {
+    let path = path.to_owned();
+    k.interactive(face)
+        .key(key)
+        .label(label.to_string())
+        .cursor(Cursor::Pointer)
+        .on_press(move |s: &mut UiState| s.open_attachment_image(&path))
+}
+
+fn image_thumbs(s: &UiState, k: &Kit, prefix: &str, paths: &[&str]) -> Option<El> {
     if paths.is_empty() {
         return None;
     }
     let mut row = row().key(format!("{prefix}-thumbs")).gap(4.0).center_y();
     for (i, path) in paths.iter().take(4).enumerate() {
-        row = row.child(chip_thumb(k, images, path, &format!("{prefix}-thumb-{i}")));
+        let cached = crate::model::media::cached_upload(s.current_computer(), path);
+        let path = cached.as_deref().unwrap_or_else(|| Path::new(path));
+        let thumb = chip_thumb(
+            k,
+            s.images.as_ref(),
+            &path.to_string_lossy(),
+            &format!("{prefix}-thumb-{i}"),
+        );
+        let label = path.file_name().unwrap_or_default().to_string_lossy();
+        row = row.child(openable_picture(
+            k,
+            thumb,
+            format!("{prefix}-preview-{i}"),
+            &label,
+            path,
+        ));
     }
     if paths.len() > 4 {
         row = row.child(
@@ -672,11 +728,15 @@ fn image_thumbs(k: &Kit, images: Option<&ImageCache>, prefix: &str, paths: &[&st
 
 fn staged_chip(s: &UiState, k: &Kit, i: usize, file: &crate::model::compose::StagedFile) -> El {
     let language = s.cfg.general.language;
-    let lead = if file.image && Path::new(&file.path).is_file() {
+    let preview_path = crate::model::media::cached_upload(s.current_computer(), &file.path);
+    let preview_path = preview_path
+        .as_deref()
+        .unwrap_or_else(|| Path::new(&file.path));
+    let lead = if file.image && preview_path.is_file() {
         chip_thumb(
             k,
             s.images.as_ref(),
-            &file.path,
+            &preview_path.to_string_lossy(),
             &format!("staged-thumb-{i}"),
         )
     } else {
@@ -708,13 +768,14 @@ fn staged_chip(s: &UiState, k: &Kit, i: usize, file: &crate::model::compose::Sta
         .font(k.ty.small)
         .color(k.c.text_base);
     let preview = row().center_y().gap(6.0).child(lead).child(label);
-    let preview = if file.image && Path::new(&file.path).is_file() {
-        let path = PathBuf::from(&file.path);
-        k.interactive(preview)
-            .key(format!("staged-preview-{i}"))
-            .label(file.name.clone())
-            .cursor(Cursor::Pointer)
-            .on_press(move |s: &mut UiState| s.zoom = Some(path.clone()))
+    let preview = if file.image && preview_path.is_file() {
+        openable_picture(
+            k,
+            preview,
+            format!("staged-preview-{i}"),
+            &file.name,
+            preview_path,
+        )
     } else {
         preview
     };
@@ -803,12 +864,17 @@ fn queued_chip(
         .radius(k.radius.xl)
         .fill(k.c.bg_base.alpha(0.65))
         .border(1.0, k.c.border_weak);
-    let thumbs: Vec<&str> = item
+    let mut thumbs: Vec<&str> = item
         .files
         .iter()
         .filter(|f| f.image)
         .map(|f| f.path.as_str())
         .collect();
+    if item.files.is_empty() {
+        if let Some(asid) = s.selected.as_deref() {
+            thumbs.extend(s.queue_echo_images(asid, &id).iter().map(String::as_str));
+        }
+    }
     if let Some(thumbs) = queue_thumbs(s, k, &format!("q-{id}"), &thumbs) {
         content = content.child(thumbs);
     }
@@ -845,13 +911,48 @@ fn queued_chip(
 }
 
 pub(super) fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
-    // A steer the timeline already shows as its echo is not listed twice.
-    let queue: Vec<_> = s.queue.iter().filter(|q| !s.item_echoed(q)).collect();
-    if s.staged.is_empty() && queue.is_empty() {
+    let queue = &s.queue;
+    let mut sending = s
+        .pending_queue_echoes(s.selected.as_deref().unwrap_or_default())
+        .peekable();
+    if s.staged.is_empty() && queue.is_empty() && sending.peek().is_none() {
         return None;
     }
     let look = s.look();
     let mut line = col().key("chips").w_full().gap(8.0);
+    for echo in sending {
+        let key = format!("pending-queue-{}", echo.token);
+        let mut receipt = row()
+            .key(key.clone())
+            .gap(8.0)
+            .px(8.0)
+            .py(4.0)
+            .center_y()
+            .radius(k.radius.md)
+            .fill(k.c.surface_raised_base)
+            .border(1.0, k.c.border_weak)
+            .role("status");
+        let paths = echo.images.iter().map(String::as_str).collect::<Vec<_>>();
+        if let Some(thumbs) = queue_thumbs(s, k, &key, &paths) {
+            receipt = receipt.child(thumbs);
+        }
+        let label = match (echo.state, echo.delivery) {
+            (super::echo::EchoState::Sent, Some(super::echo::BusyDelivery::Queue)) => "Queued:",
+            (super::echo::EchoState::Sent, _) => "Steer:",
+            _ => "Sending…",
+        };
+        line = line.child(
+            receipt.child(
+                text(format!(
+                    "{} {}",
+                    tr_ref(s.cfg.general.language, label),
+                    super::timeline::clip(&echo.text, 32)
+                ))
+                .font(k.ty.small)
+                .color(k.c.text_muted),
+            ),
+        );
+    }
     if !s.staged.is_empty() {
         let mut files = row().w_full().gap(6.0).flex_wrap();
         for (i, file) in s.staged.iter().enumerate() {
@@ -902,7 +1003,7 @@ pub(super) fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
         }
         if s.composer_queue_expanded {
             let mut pages = col().w_full().gap(6.0);
-            for item in &queue {
+            for item in queue {
                 pages = pages.child(look.arrive(queued_chip(s, k, layer, item), 0));
             }
             deck = deck.child(
@@ -934,7 +1035,7 @@ pub(super) fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
                         .a11y_hidden(),
                 );
             }
-            stack = stack.child(look.arrive(queued_chip(s, k, layer, queue[page]), 0));
+            stack = stack.child(look.arrive(queued_chip(s, k, layer, &queue[page]), 0));
             deck = deck.child(stack);
         }
         line = line.child(deck);
@@ -1730,17 +1831,37 @@ pub(super) fn switch_model(s: &mut UiState, provider_id: String, model_id: Strin
     let Some(asid) = s.selected.clone() else {
         return;
     };
-    let keep_variant = s
-        .sessions
-        .iter()
-        .find(|i| i.asid.0 == asid)
+    let current = s
+        .current()
         .and_then(|i| i.model.as_ref())
-        .and_then(|m| m.variant.clone());
-    let model = ModelRef {
+        .or_else(|| s.catalog.as_ref()?.catalog.defaults.model.as_ref());
+    let model = choose_model(s.catalog.as_deref(), current, provider_id, model_id);
+    apply_session_model(s, asid, model);
+}
+
+pub(super) fn choose_model(
+    view: Option<&crate::hub::CatalogView>,
+    current: Option<&ModelRef>,
+    provider_id: String,
+    model_id: String,
+) -> ModelRef {
+    let mut model = ModelRef {
         provider_id,
         model_id,
-        variant: keep_variant,
+        variant: None,
     };
+    model.variant = current
+        .and_then(|m| m.variant.as_ref())
+        .filter(|level| {
+            view.and_then(|v| super::labels::catalog_model_info(v, &model))
+                .and_then(|entry| entry.variants.as_ref())
+                .is_some_and(|variants| variants.iter().any(|v| v.id == level.as_str()))
+        })
+        .cloned();
+    model
+}
+
+fn apply_session_model(s: &mut UiState, asid: String, model: ModelRef) {
     if let Some(info) = s.sessions.iter_mut().find(|i| i.asid.0 == asid) {
         info.model = Some(model.clone());
     }
@@ -1751,32 +1872,37 @@ pub(super) fn switch_model(s: &mut UiState, provider_id: String, model_id: Strin
     remember(s);
 }
 
-pub(super) fn switch_effort(s: &mut UiState, variant: Option<String>) {
+pub(super) fn switch_effort(s: &mut UiState, slot: Slot, variant: Option<String>) {
     s.menu = None;
-    let Some(asid) = s.selected.clone() else {
+    let (view, explicit) = match slot {
+        Slot::Start => (s.start_catalog.as_deref(), s.start_model.as_ref()),
+        Slot::Session => (
+            s.catalog.as_deref(),
+            s.current().and_then(|i| i.model.as_ref()),
+        ),
+    };
+    let Some(view) = view else { return };
+    let Some(mut model) = explicit.or(view.catalog.defaults.model.as_ref()).cloned() else {
         return;
     };
-    let Some(current) = s
-        .sessions
-        .iter()
-        .find(|i| i.asid.0 == asid)
-        .and_then(|i| i.model.clone())
-    else {
+    let offered = super::labels::catalog_model_info(view, &model).and_then(|m| m.variants.as_ref());
+    if !offered.is_some_and(|levels| {
+        !levels.is_empty()
+            && variant
+                .as_ref()
+                .is_none_or(|level| levels.iter().any(|v| &v.id == level))
+    }) {
         return;
-    };
-    let model = ModelRef {
-        provider_id: current.provider_id,
-        model_id: current.model_id,
-        variant,
-    };
-    if let Some(info) = s.sessions.iter_mut().find(|i| i.asid.0 == asid) {
-        info.model = Some(model.clone());
     }
-    s.send(Command::Compose(ComposeCommand::SwitchModel {
-        asid: AgentSessionId(asid),
-        model,
-    }));
-    remember(s);
+    model.variant = variant;
+    match slot {
+        Slot::Start => s.start_model = Some(model),
+        Slot::Session => {
+            if let Some(asid) = s.selected.clone() {
+                apply_session_model(s, asid, model);
+            }
+        }
+    }
 }
 
 pub(super) fn switch_mode(s: &mut UiState, mode: String) {
@@ -1954,6 +2080,7 @@ pub(super) fn effort_menu(
     k: &Kit,
     layer: &mut Vec<El>,
     scope: &str,
+    slot: Slot,
     open: bool,
     current: Option<&str>,
     variants: &[String],
@@ -1963,21 +2090,30 @@ pub(super) fn effort_menu(
         .unwrap_or_else(|| "Default".into());
     let mut menu = Menu::new(format!("effort-{scope}"))
         .placement(rune_kit::Placement::TopStart)
-        .trigger(pill(k, "effort-pill", label, open, OpenMenu::Effort))
+        .trigger(pill(
+            k,
+            "effort-pill",
+            label,
+            open,
+            match slot {
+                Slot::Start => OpenMenu::StartEffort,
+                Slot::Session => OpenMenu::Effort,
+            },
+        ))
         .open(open)
         .min_width(160.0)
         .on_close(|s: &mut UiState| s.menu = None);
     menu = menu.item(
         MenuItem::new("Default")
             .checked(current.is_none())
-            .on_select(|s: &mut UiState| switch_effort(s, None)),
+            .on_select(move |s: &mut UiState| switch_effort(s, slot, None)),
     );
     for variant in variants {
         let name = variant.clone();
         menu = menu.item(
             MenuItem::new(super::labels::readable_catalog_id(variant))
                 .checked(current == Some(variant.as_str()))
-                .on_select(move |s: &mut UiState| switch_effort(s, Some(name.clone()))),
+                .on_select(move |s: &mut UiState| switch_effort(s, slot, Some(name.clone()))),
         );
     }
     menu.build(k, layer)
@@ -2162,9 +2298,8 @@ fn delivery_button(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El 
     let language = s.cfg.general.language;
     let queue = s.composer_queue_delivery;
     let open = s.menu == Some(OpenMenu::ComposerDelivery);
-    let disabled = s.selected.is_none()
-        || (s.draft.text.trim().is_empty() && s.staged.is_empty())
-        || s.pending_submit.is_some();
+    let disabled =
+        s.selected.is_none() || !ready_to_send(s, Slot::Session) || s.pending_submit.is_some();
     let caption = tr_ref(language, if queue { "Queue" } else { "Steer" });
     let action = if queue {
         super::keymap::Action::Queue
@@ -2233,19 +2368,21 @@ fn delivery_button(s: &UiState, k: &Kit, layer: &mut Vec<El>, asid: &str) -> El 
                 .control_size(ControlSize::Regular)
                 .disabled(disabled)
                 .shortcut(super::keymap::label_with(action, Some(&s.cfg.keymap)))
-                .on_press(|s: &mut UiState| {
-                    if s.composer_queue_delivery {
-                        queue_session(s);
-                    } else {
-                        submit_session(s);
-                    }
-                })
+                .on_press(send_with_delivery)
                 .build(k)
                 .key("composer-deliver")
                 .h(32.0),
         )
         .child(el().w(1.0).h(16.0).fill(k.c.border_weak))
         .child(menu.build(k, layer))
+}
+
+pub(super) fn send_with_delivery(s: &mut UiState) {
+    if s.busy() && s.composer_queue_delivery {
+        queue_session(s);
+    } else {
+        submit_session(s);
+    }
 }
 
 /// The same controls and metrics for focused and parked session composers.
@@ -2256,13 +2393,14 @@ pub(super) fn session_footer(
     asid: Option<&str>,
     catalog: Option<&crate::hub::CatalogView>,
     diff_stat: &crate::model::types::DiffStat,
+    parked: Option<usize>,
 ) -> El {
     use super::composer_row as controls_row;
     let language = s.cfg.general.language;
     let busy = asid.is_some_and(|id| s.session_busy(id));
     let inner = rune::memo::layout_with("composer-card", |r| r[2].round())
         .map_or(f32::INFINITY, |w| w - controls_row::CARD_PAD - 24.0);
-    let room = (inner - if busy { 340.0 } else { 180.0 }).max(80.0);
+    let room = (inner - if busy { 400.0 } else { 180.0 }).max(80.0);
     let own_line = asid
         .and_then(|id| controls_row::Controls::for_session(s, id, catalog))
         .map(|c| {
@@ -2270,15 +2408,11 @@ pub(super) fn session_footer(
                 .key("composer-controls")
                 .w_full()
         });
-    let mut footer = row()
-        .key("composer-footer")
-        .w_full()
-        .min_w(0.0)
-        .min_h(32.0)
-        .gap(8.0)
-        .center_y();
+    let mut footer = row().grow(1.0).min_w(0.0).min_h(32.0).gap(8.0).center_y();
     if let Some(controls) = own_line {
-        footer = footer.child(controls.w(0.0).grow(1.0).min_w(80.0));
+        footer = footer.child(controls.w(0.0).grow(1.0).min_w(0.0));
+    } else if busy {
+        footer = footer.child(el().grow(1.0));
     }
     if let Some(asid) = asid {
         if crate::plugin::is_enabled("inspector", &s.cfg.plugins_disabled)
@@ -2319,7 +2453,43 @@ pub(super) fn session_footer(
     if busy {
         footer = footer.child(delivery_button(s, k, layer, asid.unwrap_or("none")));
     }
-    footer
+    if let Some(i) = parked {
+        footer = el()
+            .grow(1.0)
+            .min_w(0.0)
+            .on_background_press(move |s: &mut UiState| s.focus_tile(i))
+            .child(footer.inert().w_full());
+    }
+    let mut bar = row()
+        .key("composer-footer")
+        .w_full()
+        .min_w(0.0)
+        .center_y()
+        .gap(8.0)
+        .child(footer);
+    if let Some(asid) = asid.filter(|_| busy && (parked.is_some() || s.voice.is_none())) {
+        let target = AgentSessionId(asid.to_owned());
+        bar = bar.child(
+            Button::new(tr_ref(language, "Stop"))
+                .variant(ButtonVariant::Danger)
+                .control_size(ControlSize::Regular)
+                .shortcut(super::keymap::label_with(
+                    super::keymap::Action::Stop,
+                    Some(&s.cfg.keymap),
+                ))
+                .on_press(move |s: &mut UiState| {
+                    if let Some(i) = parked {
+                        s.focus_tile(i);
+                    }
+                    s.send(Command::Interrupt(target.clone()));
+                })
+                .build(k)
+                .key("stop")
+                .h(32.0)
+                .radius(k.radius.lg),
+        );
+    }
+    bar
 }
 
 pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
@@ -2331,18 +2501,11 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let start = s
         .current()
         .and_then(|i| i.directory.clone().map(PathBuf::from));
-    let has_text = !s.draft.text.trim().is_empty() || !s.staged.is_empty();
+    let has_text = ready_to_send(s, Slot::Session);
 
     // The row under the field: the session's controls on the left (see
     // `composer_row`), the actions on the right.
     let attach = attachment_button(k, language, start, has_session, "attach");
-    let stop_label = tr_ref(language, "Stop");
-    let send_label = if busy {
-        tr_ref(language, "Steer")
-    } else {
-        tr_ref(language, "Send")
-    };
-
     // Measure the actual card so controls also fold inside split panes.
     use super::composer_row::{ACTION_GAP, CARD_PAD};
     let inner = rune::memo::layout_with("composer-card", |r| r[2].round())
@@ -2355,65 +2518,40 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .unwrap_or_else(|| super::voice::mic_button(s, k)),
         );
     }
-    if busy && s.voice.is_none() {
-        if let Some(asid) = s.selected.clone() {
-            actions = actions.child(
-                Button::new(stop_label)
-                    .variant(ButtonVariant::Danger)
-                    .control_size(ControlSize::Regular)
-                    .shortcut(super::keymap::label_with(
-                        super::keymap::Action::Stop,
-                        Some(&s.cfg.keymap),
-                    ))
-                    .on_press(move |s: &mut UiState| {
-                        s.send(Command::Interrupt(AgentSessionId(asid.clone())))
-                    })
-                    .build(k)
-                    .key("stop")
-                    .h(36.0)
-                    .radius(k.radius.lg),
-            );
-        }
-    }
-    let send = Button::new(send_label)
-        .label_with(move |font, ink| {
-            if busy {
-                text(send_label).font(font).color(ink)
-            } else {
-                rune::icon(&SEND, SEND_ICON).color(ink)
-            }
-        })
+    let send = Button::new(tr_ref(language, "Send"))
+        .label_with(|_, ink| rune::icon(&SEND, SEND_ICON).color(ink))
         .variant(ButtonVariant::Submit)
         .control_size(ControlSize::Regular)
         .disabled(!has_session || !has_text || s.pending_submit.is_some())
         .shortcut(super::keymap::label_with(
-            super::keymap::Action::Send,
+            if busy && s.composer_queue_delivery {
+                super::keymap::Action::Queue
+            } else {
+                super::keymap::Action::Send
+            },
             Some(&s.cfg.keymap),
         ))
-        .help(if busy {
-            format!(
-                "{} · {} {}",
-                tr_ref(language, "Steer the running turn"),
-                super::keymap::label_with(super::keymap::Action::Queue, Some(&s.cfg.keymap)),
-                tr_ref(language, "queues it instead")
-            )
-        } else {
-            tr_ref(language, "Send").to_string()
-        })
-        .on_press(submit_session)
+        .help(tr_ref(
+            language,
+            if busy && s.composer_queue_delivery {
+                "Queue"
+            } else if busy {
+                "Steer the running turn"
+            } else {
+                "Send"
+            },
+        ))
+        .on_press(send_with_delivery)
         .build(k)
-        .key("send");
-    let send = if busy {
-        send.h(36.0).radius(k.radius.lg)
-    } else {
-        send.size(36.0, 36.0).radius(k.radius.lg)
-    };
+        .key("send")
+        .size(36.0, 36.0)
+        .radius(k.radius.lg);
     let send = look.glow(
         send,
         k.c.bg_accent,
         if has_text && has_session { 0.9 } else { 0.0 },
     );
-    if !busy && s.voice.is_none() {
+    if s.voice.is_none() {
         actions = actions.child(send);
     }
 
@@ -2477,13 +2615,12 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
 
     // Keep focus visible without competing with the message content.
     let card = composer_card(k, &look, card, focused, busy, s.drop_hover)
-        .on_hover_change(|s: &mut UiState, inside, _| {
+        .on_hover_change(|s: &mut UiState, inside, tx| {
             if inside
                 && s.menu.is_none()
                 && s.row_menu.is_none()
                 && s.context_open.is_none()
                 && s.zoom.is_none()
-                && s.detail.is_none()
                 && !s.timeline_search.active
                 && s.tile_drag.is_none()
                 && s.tile_card_drag.is_none()
@@ -2491,6 +2628,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             {
                 s.draft.focused = true;
                 s.term.sink.focused = false;
+                tx.focus("draft", false);
             }
         })
         .on_drop_files(|s: &mut UiState, files, _| attach_dropped_files(s, files))
@@ -2552,6 +2690,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         s.selected.as_deref(),
         s.catalog.as_deref(),
         &s.diff_stat,
+        None,
     );
     deck = deck.child(card.w_full()).child(footer);
     col()
@@ -2567,6 +2706,67 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effort_uses_native_default_and_only_follows_compatible_model_switches() {
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let catalog = std::sync::Arc::new(crate::hub::CatalogView {
+            catalog: serde_json::from_value(serde_json::json!({
+                "models":[
+                    {"id":"one","provider_id":"p","name":"One","variants":[{"id":"deep"}]},
+                    {"id":"two","provider_id":"p","name":"Two","variants":[{"id":"deep"}]},
+                    {"id":"two","provider_id":"q","name":"Two","variants":[{"id":"quick"}]}
+                ],
+                "defaults":{"model":{"provider_id":"p","model_id":"one"}},
+                "modes":[],"mcp":[]
+            }))
+            .unwrap(),
+        });
+        while rx.try_recv().is_ok() {}
+        s.start_catalog = Some(catalog.clone());
+        switch_effort(&mut s, Slot::Start, Some("deep".into()));
+        let picked = s.start_model.as_ref().unwrap();
+        assert_eq!(
+            (picked.model_id.as_str(), picked.variant.as_deref()),
+            ("one", Some("deep"))
+        );
+        assert!(rx.try_recv().is_err());
+        let session = crate::ui::scenes::scenes()
+            .iter()
+            .find(|(name, _)| *name == "composer-idle")
+            .unwrap()
+            .1;
+        session(&mut s);
+        let sid = s.selected.clone().unwrap();
+        s.sessions
+            .iter_mut()
+            .find(|i| i.asid.0 == sid)
+            .unwrap()
+            .model = None;
+        s.catalog = Some(catalog);
+        switch_effort(&mut s, Slot::Session, Some("deep".into()));
+        let selected = s.current().unwrap().model.as_ref().unwrap();
+        assert_eq!(
+            (selected.model_id.as_str(), selected.variant.as_deref()),
+            ("one", Some("deep"))
+        );
+        switch_model(&mut s, "p".into(), "two".into());
+        assert_eq!(
+            s.current()
+                .unwrap()
+                .model
+                .as_ref()
+                .unwrap()
+                .variant
+                .as_deref(),
+            Some("deep")
+        );
+        switch_model(&mut s, "q".into(), "two".into());
+        assert_eq!(s.current().unwrap().model.as_ref().unwrap().variant, None);
+        switch_effort(&mut s, Slot::Session, Some("deep".into()));
+        assert_eq!(s.current().unwrap().model.as_ref().unwrap().variant, None);
+    }
 
     #[test]
     fn editing_a_steered_image_preserves_files_and_delivery_without_sending() {
@@ -2714,7 +2914,14 @@ mod tests {
                     Command::Compose(ComposeCommand::Submit { .. })
                 ));
             }
-            click(&mut rt, "composer-deliver");
+            click(
+                &mut rt,
+                if expected == "queue" {
+                    "send"
+                } else {
+                    "composer-deliver"
+                },
+            );
             let mut sent = Vec::new();
             while let Ok(command) = rx.try_recv() {
                 if let Command::Compose(ComposeCommand::Submit { delivery, .. }) = command {
@@ -2722,6 +2929,20 @@ mod tests {
                 }
             }
             assert_eq!(sent, vec![Some(expected.into())]);
+            assert!(rt.state.draft.text.is_empty());
+            click(&mut rt, "send");
+            click(&mut rt, "stop");
+            let mut interrupted = Vec::new();
+            while let Ok(command) = rx.try_recv() {
+                match command {
+                    Command::Interrupt(target) => interrupted.push(target.0),
+                    Command::Compose(ComposeCommand::Submit { .. }) => {
+                        panic!("empty draft submitted")
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(interrupted, vec![asid]);
         }
     }
 
@@ -2994,35 +3215,6 @@ mod tests {
         let bare = bare_field(&k);
         assert!(bare.blend_over.is_none());
         assert!(bare.selection().a >= 0.29);
-    }
-
-    #[test]
-    fn steered_prompt_chip_is_deduplicated_when_echo_is_active() {
-        use crate::model::compose::InboxItem;
-        let (tx, _rx) = crate::ui::commands::channel();
-        let mut s = UiState::new(tx);
-        s.selected = Some("s1".into());
-        s.echo_sent("s1", 10, "steer the agent now".into(), &[], true);
-        s.queue.push(InboxItem {
-            id: "inbox-steer-1".into(),
-            text: "steer the agent now".into(),
-            steer: true,
-            files: vec![],
-        });
-
-        let k = Kit::neutral(s.dark);
-        let mut layer = Vec::new();
-        // Should return None because the steered item is already shown as an Echo!
-        assert!(chips(&s, &k, &mut layer).is_none());
-
-        // Adding a non-steered queued item renders a chip with inline Edit and Cancel buttons
-        s.queue.push(InboxItem {
-            id: "inbox-queue-2".into(),
-            text: "follow up later".into(),
-            steer: false,
-            files: vec![],
-        });
-        assert!(chips(&s, &k, &mut layer).is_some());
     }
 }
 

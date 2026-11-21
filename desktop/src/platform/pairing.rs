@@ -19,6 +19,7 @@ fn now_unix_ms() -> u128 {
 fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to build http client")
 }
@@ -26,9 +27,7 @@ fn http_client() -> Result<reqwest::Client> {
 #[derive(Debug, Clone)]
 pub struct PairingOffer {
     pub request_id: String,
-    #[allow(dead_code)]
     pub server_id: String,
-    #[allow(dead_code)]
     pub server_label: String,
     #[allow(dead_code)]
     pub expires_in_ms: u64,
@@ -38,13 +37,57 @@ pub struct PairingOffer {
 #[derive(Debug, Clone)]
 pub struct ClaimedToken {
     pub token: String,
-    #[allow(dead_code)]
     pub server_id: String,
-    #[allow(dead_code)]
     pub server_label: String,
-    #[allow(dead_code)]
-    pub device_id: String,
+    pub device_id: Option<String>,
     pub transport_key: Option<String>,
+}
+
+/// A bare host uses the Gateway's default port. Explicit HTTP(S) URLs keep
+/// their port. Session and event routes are rooted at the gateway origin.
+pub fn gateway_url(input: &str) -> Result<String> {
+    let input = input.trim();
+    anyhow::ensure!(!input.is_empty(), "Enter a gateway address");
+    let bare = !input.contains("://");
+    let address = if bare {
+        format!("http://{input}")
+    } else {
+        input.to_owned()
+    };
+    let mut parsed = reqwest::Url::parse(&address).context("Invalid gateway address")?;
+    anyhow::ensure!(
+        matches!(parsed.scheme(), "http" | "https")
+            && parsed.host_str().is_some()
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.path() == "/"
+            && parsed.query().is_none()
+            && parsed.fragment().is_none(),
+        "Invalid gateway address"
+    );
+    if bare
+        && parsed.port().is_none()
+        && !input.split('/').next().unwrap_or_default().ends_with(":80")
+    {
+        parsed
+            .set_port(Some(23847))
+            .map_err(|_| anyhow!("Invalid gateway port"))?;
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_owned())
+}
+
+pub fn validate_identity(expected: &str, received: &str) -> Result<()> {
+    anyhow::ensure!(
+        !received.trim().is_empty()
+            && received.trim() == received
+            && !matches!(received, "local" | "self" | "all"),
+        "Invalid remote computer identity"
+    );
+    anyhow::ensure!(
+        expected.is_empty() || expected == received,
+        "Gateway identity mismatch (expected {expected}, received {received})"
+    );
+    Ok(())
 }
 
 /// Request pairing from a remote gateway (`POST /api/pair/request`).
@@ -78,12 +121,12 @@ pub async fn request_app_pairing(url: &str, device_name: &str) -> Result<Pairing
         return Err(anyhow!("{msg} (status: {status})"));
     }
 
+    anyhow::ensure!(
+        body.get("request_id").and_then(Value::as_str) == Some(&request_id),
+        "Unexpected pairing request identity"
+    );
     Ok(PairingOffer {
-        request_id: body
-            .get("request_id")
-            .and_then(Value::as_str)
-            .unwrap_or(&request_id)
-            .to_string(),
+        request_id,
         server_id: body
             .get("server_id")
             .and_then(Value::as_str)
@@ -230,13 +273,23 @@ pub async fn claim_app_pairing(
     let device_id = final_body
         .get("device_id")
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
     let transport_key = final_body
         .get("transport_key")
         .and_then(Value::as_str)
         .map(String::from);
 
+    anyhow::ensure!(
+        !token.is_empty()
+            && (!transport_required || (device_id.is_some() && transport_key.is_some())),
+        "Incomplete pairing credentials"
+    );
+    if let Some(key) = transport_key.as_deref() {
+        let decoded = transport::decode_key(key).context("Invalid device transport key")?;
+        anyhow::ensure!(decoded.len() == 32, "Invalid device transport key length");
+        anyhow::ensure!(device_id.is_some(), "Missing paired device identity");
+    }
     Ok(ClaimedToken {
         token,
         server_id,
@@ -247,7 +300,7 @@ pub async fn claim_app_pairing(
 }
 
 /// Verify that a token works against `{url}/api/meta`.
-pub async fn verify_token(url: &str, token: &str) -> Result<bool> {
+pub async fn verify_token(url: &str, token: &str) -> Result<ClaimedToken> {
     let client = http_client()?;
     let url_trimmed = url.trim_end_matches('/');
     let res = client
@@ -256,7 +309,19 @@ pub async fn verify_token(url: &str, token: &str) -> Result<bool> {
         .send()
         .await
         .context("connection failed")?;
-    Ok(res.status().is_success())
+    anyhow::ensure!(
+        res.status().is_success(),
+        "Token verification failed (HTTP {})",
+        res.status()
+    );
+    let meta: Value = res.json().await.context("Invalid gateway metadata")?;
+    Ok(ClaimedToken {
+        token: token.trim().to_string(),
+        server_id: meta["serverId"].as_str().unwrap_or_default().into(),
+        server_label: meta["label"].as_str().unwrap_or_default().into(),
+        device_id: None,
+        transport_key: None,
+    })
 }
 
 #[cfg(test)]

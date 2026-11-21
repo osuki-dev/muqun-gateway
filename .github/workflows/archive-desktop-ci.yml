@@ -1,0 +1,49 @@
+name: Archive checked Desktop CI artifacts
+on:
+  workflow_call:
+    inputs:
+      signed:
+        type: boolean
+        required: true
+    secrets:
+      R2_ACCESS_KEY_ID:
+        required: true
+      R2_SECRET_ACCESS_KEY:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    if: github.repository == 'osuki-dev/muqun-gateway' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: muqun-desktop-*
+          path: candidates
+      - uses: actions/download-artifact@v4
+        if: inputs.signed
+        with:
+          name: desktop-preview-signed-macos
+          path: candidates/desktop-preview-signed-macos
+      - run: python3 -m pip install boto3==1.38.46
+      - name: Archive complete verified build
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          AWS_EC2_METADATA_DISABLED: 'true'
+          SIGNED: ${{ inputs.signed }}
+        run: |
+          set -eu
+          : "${AWS_ACCESS_KEY_ID:?Missing R2_ACCESS_KEY_ID}" "${AWS_SECRET_ACCESS_KEY:?Missing R2_SECRET_ACCESS_KEY}" "${CLOUDFLARE_ACCOUNT_ID:?Missing CLOUDFLARE_ACCOUNT_ID}"
+          args=(candidates)
+          if [[ "$SIGNED" == true ]]; then args+=(--signed); fi
+          python3 scripts/archive_desktop_ci.py "${args[@]}"

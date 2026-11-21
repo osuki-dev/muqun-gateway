@@ -9,6 +9,11 @@
 //! for both the control wraps under its label.
 
 mod about;
+pub(super) mod computers;
+mod diagnostics;
+pub(crate) mod local_devices;
+pub(super) mod revoke_device;
+pub use diagnostics::DiagnosticFilter;
 mod agents;
 mod appearance;
 mod general;
@@ -33,6 +38,7 @@ use crate::model::commands::Command;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
     General,
+    Computers,
     Appearance,
     Themes,
     Agents,
@@ -40,14 +46,16 @@ pub enum SettingsTab {
     Shortcuts,
     Plugins,
     Storage,
+    Diagnostics,
     About,
 }
 
 /// Every page in nav order, with its name.
-pub(super) fn tabs(language: Language) -> [(&'static str, SettingsTab); 9] {
+pub(super) fn tabs(language: Language) -> [(&'static str, SettingsTab); 11] {
     use SettingsTab as T;
     [
         (tr_ref(language, "General"), T::General),
+        (tr_ref(language, "Computers"), T::Computers),
         (tr_ref(language, "Appearance"), T::Appearance),
         (tr_ref(language, "Themes"), T::Themes),
         (tr_ref(language, "Agents"), T::Agents),
@@ -55,6 +63,7 @@ pub(super) fn tabs(language: Language) -> [(&'static str, SettingsTab); 9] {
         (tr_ref(language, "Shortcuts"), T::Shortcuts),
         (tr_ref(language, "Plugins"), T::Plugins),
         (tr_ref(language, "Storage"), T::Storage),
+        (tr_ref(language, "Diagnostics"), T::Diagnostics),
         (tr_ref(language, "About"), T::About),
     ]
 }
@@ -64,6 +73,7 @@ impl SettingsTab {
         use super::icons as i;
         match self {
             Self::General => &i::CONTROLS,
+            Self::Computers => &super::parts::glyphs::COMPUTER,
             Self::Appearance => &i::APPEARANCE,
             Self::Themes => &i::GRID,
             Self::Agents => &i::AGENT,
@@ -71,6 +81,7 @@ impl SettingsTab {
             Self::Shortcuts => &i::KEYBOARD,
             Self::Plugins => &i::GRID,
             Self::Storage => &i::STORAGE,
+            Self::Diagnostics => &i::INFORMATION,
             Self::About => &i::INFORMATION,
         }
     }
@@ -82,6 +93,7 @@ impl SettingsTab {
                 language,
                 "Language, where new sessions start, and notifications.",
             ),
+            Self::Computers => tr_ref(language, "Manage connections to other computers."),
             Self::Appearance => tr_ref(language, "Light or dark, text size, density and motion."),
             Self::Themes => tr_ref(
                 language,
@@ -97,6 +109,7 @@ impl SettingsTab {
                 language,
                 "Built-in and loaded plugins, and the Bun and Herdr runtimes.",
             ),
+            Self::Diagnostics => tr_ref(language, "Recent Desktop and plugin events."),
             Self::Storage => tr_ref(language, "What Muqun keeps on this computer."),
             Self::About => tr_ref(language, "Version, connection, links and licences."),
         }
@@ -105,9 +118,13 @@ impl SettingsTab {
 
 /// Open `tab`, asking for what it shows.
 pub(super) fn open(s: &mut UiState, tab: SettingsTab) {
+    s.local_revoke.cancel_confirmation();
+    s.computer_unpair.dismiss();
     s.settings_tab = tab;
     s.menu = None;
     match tab {
+        SettingsTab::About if s.desktop_update == Default::default() => s.check_desktop_update(),
+        SettingsTab::Computers => s.refresh_local_pairings(),
         SettingsTab::Agents => s.refresh_account_limits(),
         SettingsTab::Themes => s.send(Command::ThemeRefresh),
         SettingsTab::Plugins => s.refresh_runtimes(),
@@ -119,8 +136,8 @@ pub(super) fn open(s: &mut UiState, tab: SettingsTab) {
 // ---- the grid --------------------------------------------------------------------------
 
 /// The page column's widest, padding included: past it the nav and page
-/// stay together as one composition centred in the card. Themes alone
-/// runs on into the spare width, for more columns of pictures.
+/// stay together as one composition centred in the card. Theme and plugin
+/// catalogs run into the spare width for more columns.
 const BODY_MAX: f32 = 1100.0;
 /// The nav column, and the rail it folds into on a narrow card.
 const NAV_W: f32 = 196.0;
@@ -550,7 +567,7 @@ fn nav(s: &UiState, k: &Kit, rail: bool) -> El {
     for (i, (name, tab)) in tabs(language).into_iter().enumerate() {
         // A breath between what the window looks like, what it runs, and
         // what it keeps.
-        if i == 3 || i == 7 {
+        if i == 4 || i == 8 {
             list = list.child(el().key(format!("nav-gap-{i}")).h(10.0));
         }
         let selected = s.settings_tab == tab;
@@ -637,11 +654,11 @@ fn header(
 
 /// Where the nav and page sit in a card `card_w` wide: the margin before
 /// the nav, the one after the page, and the page column's widest. The pair
-/// is centred as one; Themes keeps the nav where every page has it and
-/// runs on into the card's spare width.
+/// is centred as one; catalogs keep the nav where every page has it and
+/// run into the card's spare width.
 fn frame(card_w: f32, nav_w: f32, tab: SettingsTab) -> (f32, f32, f32) {
     let margin = ((card_w - nav_w - BODY_MAX) / 2.0).max(0.0);
-    if tab == SettingsTab::Themes {
+    if matches!(tab, SettingsTab::Themes | SettingsTab::Plugins) {
         let trailing = margin.min(PAD_X);
         (margin, trailing, card_w - margin - trailing - nav_w)
     } else {
@@ -659,6 +676,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let (lead, trail, max_w) = frame(card_w, nav_w, tab);
     INNER_W.set((card_w - lead - trail - nav_w).min(max_w) - 2.0 * PAD_X);
     let (actions, sub, body): (Vec<El>, Option<El>, Vec<El>) = match tab {
+        SettingsTab::Computers => (computers::actions(s, k), None, computers::page(s, k)),
         SettingsTab::General => (Vec::new(), None, general::page(s, k, layer)),
         SettingsTab::Appearance => (Vec::new(), None, appearance::page(s, k)),
         SettingsTab::Themes => (
@@ -671,6 +689,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         SettingsTab::Shortcuts => (keys::actions(s, k), None, keys::page(s, k)),
         SettingsTab::Plugins => (plugins::actions(s, k), None, plugins::page(s, k)),
         SettingsTab::Storage => (Vec::new(), None, storage::page(s, k)),
+        SettingsTab::Diagnostics => (Vec::new(), None, diagnostics::page(s, k, layer)),
         SettingsTab::About => (Vec::new(), None, about::page(s, k)),
     };
     let mut page = col()

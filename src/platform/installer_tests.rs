@@ -98,7 +98,7 @@ struct DownloadCase {
     preview: bool,
     existing: Option<&'static str>,
     fault: Option<&'static str>,
-    tag: Option<&'static str>,
+    version: Option<&'static str>,
     shasum: bool,
     term: Option<&'static str>,
     no_color: bool,
@@ -141,7 +141,7 @@ fn run_installer_case(
     // A closed PATH makes backend detection independent of the test host.
     for name in [
         "awk", "cut", "head", "chmod", "mkdir", "basename", "id", "uname", "cp", "sleep", "grep",
-        "mktemp", "rm", "wc", "ln", "cat", "ls", "stty", "od", "perl", "stat", "python3",
+        "mktemp", "rm", "wc", "ln", "cat", "ls", "stty", "od", "perl", "stat",
     ] {
         let program = [format!("/usr/bin/{name}"), format!("/bin/{name}")]
             .into_iter()
@@ -158,7 +158,10 @@ fn run_installer_case(
         // Only the emulated Darwin branch uses a synthetic Mach-O header;
         // ordinary cases inspect/execute the real host-native fixture bytes.
         fs::remove_file(bin.join("od")).unwrap();
-        executable(&bin.join("od"), "#!/bin/sh\nprintf '%s\\n' 'cf fa ed fe 07 00 00 01 03 00 00 00 02 00 00 00 00 00 00 00'\n");
+        executable(
+            &bin.join("od"),
+            "#!/bin/sh\nprintf '%s\\n' 'cf fa ed fe 07 00 00 01 03 00 00 00 02 00 00 00 00 00 00 00'\n",
+        );
     }
     if case.fault == Some("missing-perl") {
         fs::remove_file(bin.join("perl")).unwrap();
@@ -221,7 +224,7 @@ exec '{}' "$@"
         &bin.join("curl"),
         r#"#!/bin/sh
 call="$*"
-output= url= limit= proto= redir= connect= time= head=0
+output= url= limit= proto= redir= connect= time=
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) output="$2"; shift;;
@@ -230,8 +233,6 @@ while [ $# -gt 0 ]; do
     --proto-redir) redir="$2"; shift;;
     --connect-timeout) connect="$2"; shift;;
     --max-time) time="$2"; shift;;
-    -w) [ "$2" = '%{url_effective}' ] || exit 91; shift;;
-    -fsSLI) head=1;;
     -fsSL|-fSL|--progress-bar) :;;
     https://*) url="$1";;
     *) exit 91;;
@@ -243,13 +244,6 @@ done
 printf 'curl %s\n' "$call" > "$MOCK_DOWNLOAD_LOG.${output##*/}"
 [ "$proto" = '=https' ] && [ "$redir" = '=https' ] &&
   [ "$connect" = 10 ] && [ -n "$time" ] && [ -n "$limit" ] || exit 91
-if [ "$head" = 1 ]; then
-  [ "$output" = /dev/null ] &&
-    [ "$url" = https://github.com/osuki-dev/muqun-gateway/releases/latest ] || exit 91
-  [ "$MOCK_FAULT" != resolve ] || exit 22
-  printf 'https://github.com/osuki-dev/muqun-gateway/releases/tag/%s' "$MOCK_TAG"
-  exit
-fi
 case "$output" in
   "$MOCK_INSTALL_DIR"/.muqun-gateway-install.??????/*) :;;
   *) exit 91;;
@@ -265,10 +259,11 @@ else
 fi
 [ "$permissions" = 700 ] || exit 91
 case "$url" in
-  "https://api.github.com/repos/osuki-dev/muqun-gateway/releases?per_page=100&page=1")
-    [ "$limit" = 1048576 ] || exit 91
-    cp "$MOCK_RELEASES" "$output";;
-  "https://github.com/osuki-dev/muqun-gateway/releases/download/$MOCK_TAG/muqun-gateway-"*.sha256)
+  "https://muqun.dev/api/releases/gateway/$MOCK_CHANNEL/version")
+    [ "$limit" = 256 ] || exit 91
+    case "$MOCK_FAULT" in resolve|preview-empty) exit 22;; esac
+    printf '%s\n' "$MOCK_POINTER" > "$output";;
+  "https://muqun.dev/api/releases/gateway/v$MOCK_POINTER/muqun-gateway-"*.sha256)
     [ "$limit" = 1024 ] || exit 91
     [ "$MOCK_FAULT" != missing ] || exit 22
     if [ -x "${0%/*}/sha256sum" ]; then
@@ -291,7 +286,7 @@ case "$url" in
     [ "$MOCK_FAULT" != empty ] || : > "$output"
     [ "$MOCK_FAULT" != oversized ] || printf '%02048d' 0 > "$output"
     ;;
-  "https://github.com/osuki-dev/muqun-gateway/releases/download/$MOCK_TAG/muqun-gateway-"*)
+  "https://muqun.dev/api/releases/gateway/v$MOCK_POINTER/muqun-gateway-"*)
     [ "$limit" = 268435456 ] || exit 91
     cat "$MOCK_BINARY" > "$output"
     [ "$MOCK_FAULT" != download ] || exit 22
@@ -392,36 +387,6 @@ esac
     let setup_log = root.join("setup.args");
     let socket = socket_name.map(|name| root.join(name));
     let installer = Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh");
-    // Preview parsing must not import modules supplied by the installer's cwd.
-    fs::write(
-        root.join("json.py"),
-        "raise RuntimeError('untrusted cwd module imported')\n",
-    )
-    .unwrap();
-    let preview_release = |tag: &str| {
-        let assets: Vec<_> = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"].into_iter().flat_map(|target| {
-            [format!("muqun-gateway-{target}"), format!("muqun-gateway-{target}.sha256")].into_iter().map(move |name| serde_json::json!({
-                "browser_download_url": format!("https://github.com/osuki-dev/muqun-gateway/releases/download/{tag}/{name}"),
-                "name": name, "size": 100, "state": "uploaded"
-            }))
-        }).collect();
-        serde_json::json!({"tag_name": tag, "draft": false, "prerelease": true, "assets": assets})
-    };
-    let mut incomplete = preview_release("v0.13.0-preview.11");
-    incomplete["assets"].as_array_mut().unwrap().pop();
-    let mut metadata = vec![
-        preview_release("v0.13.0-preview.10"),
-        preview_release("v0.13.0-preview.9"),
-        incomplete,
-    ];
-    if case.fault == Some("preview-empty") {
-        metadata.clear();
-    }
-    fs::write(
-        root.join("releases.json"),
-        serde_json::to_vec(&metadata).unwrap(),
-    )
-    .unwrap();
     let mut cmd = if answer.is_some() {
         let mut cmd = Command::new("/usr/bin/script");
         #[cfg(target_os = "macos")]
@@ -481,7 +446,10 @@ esac
         .env("MUQUN_GATEWAY_INSTALL_DIR", &install)
         .env("MOCK_INSTALL_DIR", &install)
         .env("MOCK_BINARY", &fake)
-        .env("MOCK_RELEASES", root.join("releases.json"))
+        .env(
+            "MOCK_CHANNEL",
+            if case.preview { "preview" } else { "stable" },
+        )
         .env(
             "MOCK_VERSION",
             if case.preview {
@@ -496,7 +464,7 @@ esac
         .env("MOCK_DOWNLOAD_LOG", &download_log)
         .env("MOCK_EXISTING", case.existing.unwrap_or(""))
         .env("MOCK_FAULT", case.fault.unwrap_or(""))
-        .env("MOCK_TAG", case.tag.unwrap_or("v0.13.0"))
+        .env("MOCK_POINTER", case.version.unwrap_or("0.13.0"))
         .env("MOCK_SETUP_LOG", &setup_log)
         .env("MOCK_BACKENDS", backends)
         .env("MOCK_GATEWAY", gateway)
@@ -598,11 +566,13 @@ esac
         fs::read(&fake).unwrap(),
         fs::read(install.join("muqun-gateway.new")).unwrap()
     );
-    assert!(fs::read_dir(&install).unwrap().all(|entry| !entry
-        .unwrap()
-        .file_name()
-        .to_string_lossy()
-        .starts_with(".muqun-gateway-install.")));
+    assert!(fs::read_dir(&install).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".muqun-gateway-install.")
+    }));
     if let Some(existing) = case.existing {
         if !(case.preview && existing.starts_with("modern")) {
             assert!(
@@ -807,39 +777,50 @@ fn installer_verifies_tag_pinned_downloads_before_installing_or_executing() {
         assert!(failure.contains("Error:"), "{fault}: {failure}");
         assert!(!failure.contains("configured and running"), "{failure}");
         if fault != "resolve" {
-            assert!(failure.contains("/releases/download/v0.13.0/"), "{failure}");
+            assert!(
+                failure.contains("/api/releases/gateway/v0.13.0/"),
+                "{failure}"
+            );
         }
         assert!(!failure.contains("latest/download"), "{failure}");
     }
     // No final newline is also accepted by the protected updater's checksum
     // parser. Exercise the standard macOS hash tool as well as sha256sum.
-    security_case(DownloadCase {
+    let transcript = security_case(DownloadCase {
         fault: Some("no-newline"),
         shasum: true,
+        transcript: true,
         ..Default::default()
     })
     .unwrap();
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(native_fixture());
+    assert!(transcript.contains(&format!("SHA-256 verified: {}", hex::encode(digest))));
 }
 
 #[test]
-fn installer_rejects_noncanonical_stable_tags_before_asset_download() {
-    for tag in [
-        "v0.13.0-rc.1",
-        "v0.13.0/other",
-        "v0.13.0?download=1",
-        "v01.13.0",
-        "0.13.0",
-        "v0.13.0\nv0.14.0",
-        "v0.13.0\nmalicious",
-        "",
+fn installer_rejects_invalid_channel_pointer_before_asset_download() {
+    for (preview, version) in [
+        (false, "0.13.0-rc.1"),
+        (false, "0.13.0/other"),
+        (false, "0.13.0?download=1"),
+        (false, "01.13.0"),
+        (false, "v0.13.0"),
+        (false, "0.13.0\n0.14.0"),
+        (false, "0.13.0\nmalicious"),
+        (false, "0.13.0-preview.1"),
+        (false, "18446744073709551616.0.0"),
+        (false, ""),
+        (true, "0.13.0"),
+        (true, "0.13.0-preview.01"),
     ] {
         let failure = security_case(DownloadCase {
-            tag: Some(tag),
+            preview,
+            version: Some(version),
             ..Default::default()
         })
-        .expect_err(tag);
-        assert!(failure.contains("stable vX.Y.Z tag"), "{failure}");
-        assert!(!failure.contains("/releases/download/"), "{failure}");
+        .expect_err(version);
+        assert!(failure.contains("Gateway version"), "{failure}");
+        assert!(!failure.contains("/api/releases/gateway/v"), "{failure}");
     }
 }
 
@@ -863,11 +844,11 @@ fn installer_delegates_modern_updates_without_shell_restart_or_replacement() {
 }
 
 #[test]
-fn preview_installer_selects_latest_complete_and_requires_capable_updater() {
+fn preview_installer_pins_channel_version_and_requires_capable_updater() {
     let calls = security_case(DownloadCase {
         preview: true,
         existing: Some("modern"),
-        tag: Some("v0.13.0-preview.10"),
+        version: Some("0.13.0-preview.10"),
         ..Default::default()
     })
     .unwrap();
@@ -885,7 +866,7 @@ fn preview_installer_selects_latest_complete_and_requires_capable_updater() {
         let failure = security_case(DownloadCase {
             preview: true,
             existing: Some("modern"),
-            tag: Some("v0.13.0-preview.10"),
+            version: Some("0.13.0-preview.10"),
             fault: Some(fault),
             ..Default::default()
         })
@@ -909,7 +890,7 @@ fn preview_installer_selects_latest_complete_and_requires_capable_updater() {
     assert_eq!(calls, "update --help\nupdate --channel preview\n");
     let calls = security_case(DownloadCase {
         preview: true,
-        tag: Some("v0.13.0-preview.10"),
+        version: Some("0.13.0-preview.10"),
         ..Default::default()
     })
     .unwrap();
@@ -921,7 +902,7 @@ fn preview_installer_selects_latest_complete_and_requires_capable_updater() {
     })
     .unwrap_err();
     assert!(
-        failure.contains("Cannot resolve a complete preview release"),
+        failure.contains("Cannot resolve the preview Gateway release"),
         "{failure}"
     );
     assert!(!failure.contains("--version"));
@@ -1130,7 +1111,7 @@ fn installer_requires_bounded_successful_exact_tag_version_before_publication() 
         assert!(!failure.contains("Installed verified"), "{failure}");
     }
     let failure = security_case(DownloadCase {
-        tag: Some("v0.14.0"),
+        version: Some("0.14.0"),
         ..Default::default()
     })
     .unwrap_err();
@@ -1168,6 +1149,6 @@ fn installer_publication_refuses_destinations_created_at_the_atomic_boundary() {
     })
     .unwrap_err();
     assert!(failure.contains("System Perl is required"), "{failure}");
-    assert!(!failure.contains("/releases/download/"), "{failure}");
+    assert!(!failure.contains("/api/releases/gateway/v"), "{failure}");
     assert!(!failure.contains("--version\n"), "{failure}");
 }

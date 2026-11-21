@@ -1,7 +1,8 @@
 # Muqun Desktop
 
 A native desktop client for the coding agents on this computer, written in Rust on
-[Rune](https://github.com/ryuhzk/rune) (our fork; GPU-drawn UI, no webview, no Chromium). Every
+[Rune](https://github.com/ryuhzk/rune). Rune draws the native UI. On Linux, browser
+tabs and plugins with web content can embed a Wry surface in the same window. Every
 agent's sessions in one window: Codex, OpenCode, Claude Code, Cursor, Qoder, Pi, FX, Antigravity,
 DeepSeek and T3.
 
@@ -9,7 +10,31 @@ When a Muqun gateway service runs on this computer the desktop attaches to it (t
 `local-client.json`), so the phone and the desktop see the same sessions. Without one it runs the
 gateway's agents plane in-process — no HTTP server, nothing listening.
 
-## Install (Linux)
+On the first normal launch of a packaged Linux installation or a standalone
+macOS app, Desktop checks for a missing local Gateway and runs the packaged
+distribution installer in the background. Local mode remains immediately usable.
+It leaves existing binaries, configurations, services, custom Gateway overrides,
+and remote-computer selections unchanged. The official Gateway installer still
+requires tmux or Herdr; Desktop explains a missing backend without installing it.
+
+**Settings → Diagnostics** shows setup progress, an explicit retry after
+failure, and **Local-only mode** to disable or cancel automatic provisioning.
+`general.gateway_local_only: true` in Desktop's config has the same effect.
+Installing with `--without-gateway` leaves `gateway-auto-install.disabled` in
+Desktop's config directory. An interrupted attempt is never retried on reopen.
+The shared installer verifies the Gateway release; Desktop does not implement a
+second downloader. Optional backend startup and persistent service activation
+keep the official installer's noninteractive defaults. A ready Gateway connects
+automatically only while the local view has no active or unfinished work;
+otherwise use **Connect local Gateway** in diagnostics after finishing it.
+
+For released packages, startup behavior and the local Gateway setup flow, see the [Desktop deployment guide](../docs/desktop-deployment.md).
+
+## Install a published Desktop package
+
+Use the official `install-desktop.sh` for Linux x86_64 or macOS arm64. Stable is the default. Use `--channel preview` for a published Desktop preview, or `--without-gateway` to use an existing remote computer or stay local-only. The installer downloads prebuilt packages and provisions a missing local Gateway. [Installation options](../docs/desktop-deployment.md)
+
+## Local development install (Linux)
 
 ```sh
 desktop/scripts/install-local.sh          # builds --release, installs for this user (no sudo)
@@ -68,6 +93,12 @@ notifications, file dialogs and "Reveal in folder". For the fonts the UI looks f
 and JetBrains Mono Nerd Font (`src/platform/fonts.rs`) — missing ones fall back to the system's.
 
 ## Release build
+
+Linux builds include a sibling executable, `muqun-wry-embedded`, for embedded browser
+and plugin tabs. It uses the system WebKitGTK 4.1 library. Building the helper requires
+the GTK 3 and WebKitGTK 4.1 development packages. For a local debug build, run
+`cargo build --locked --manifest-path desktop/webview-helper/Cargo.toml` alongside the
+Desktop build. Both executables must be in the same directory.
 
 Desktop candidate CI uses Rust 1.99.1, matching the validated Linux and macOS
 builds. Rust 1.100 currently fails to compile the locked async-stream activity
@@ -270,4 +301,4 @@ The UI never runs on the tokio thread: the core pushes `Update`s into the inbox
   clients; size is saved).
 * System notifications are Linux-only so far (macOS and Windows build with a no-op), and single
   instance is Unix-only (on Windows every launch is its own).
-* No status icon on macOS yet; no installer for macOS or Windows, no code signing.
+* macOS preview distribution uses a signed and notarized app ZIP. The macOS status icon and Windows installer are still pending.
