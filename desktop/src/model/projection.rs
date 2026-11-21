@@ -1137,7 +1137,9 @@ impl Core {
                 run_id,
                 coder_asid,
                 cwd,
+                goal,
                 base_commit,
+                base_commits,
             } => {
                 let hub = self.hub.clone();
                 let inbox = self.inbox.clone();
@@ -1147,10 +1149,14 @@ impl Core {
                     let allow_local_git = hub.mode() == crate::hub::HubMode::Standalone
                         || crate::hub::connection_origin()
                             .is_none_or(|(c, _)| c == "local" || c == "self");
-                    let has_local_git = allow_local_git
-                        && !cwd.trim().is_empty()
-                        && std::path::Path::new(cwd.trim()).join(".git").exists();
-                    if (base_commit.is_none() || !has_local_git) && !coder_asid.starts_with("new-")
+                    let repos = if allow_local_git {
+                        muqun_gateway::orchestration::discover_git_repos(&cwd, &goal)
+                    } else {
+                        Vec::new()
+                    };
+                    let has_local_git = !repos.is_empty() || !base_commits.is_empty();
+                    if ((base_commit.is_none() && base_commits.is_empty()) || !has_local_git)
+                        && !coder_asid.starts_with("new-")
                     {
                         if let Ok(Ok(files)) = tokio::time::timeout(
                             LIST_TIMEOUT,
@@ -1192,113 +1198,24 @@ impl Core {
                         }
                     }
 
-                    if summary.is_empty() && has_local_git {
+                    if summary.is_empty() && allow_local_git && has_local_git {
                         let cwd_clone = cwd.trim().to_string();
-                        if let Ok((local_diff, local_files)) =
+                        if let Ok((local_files, local_diff)) =
                             tokio::task::spawn_blocking(move || {
-                                let run_git = |args: &[&str]| -> String {
-                                    std::process::Command::new("git")
-                                        .arg("-C")
-                                        .arg(&cwd_clone)
-                                        .args(args)
-                                        .output()
-                                        .ok()
-                                        .filter(|out| out.status.success())
-                                        .map(|out| {
-                                            String::from_utf8_lossy(&out.stdout).into_owned()
-                                        })
-                                        .unwrap_or_default()
-                                };
-                                let mut numstat_args = vec!["diff", "--numstat"];
-                                let mut stat_args = vec!["diff", "--stat"];
-                                let mut raw_args = vec!["diff", "--no-color"];
-                                if let Some(ref rev) = base_commit {
-                                    numstat_args.push(rev);
-                                    stat_args.push(rev);
-                                    raw_args.push(rev);
-                                }
-                                let status = run_git(&["status", "--porcelain"]);
-                                let stat = run_git(&stat_args);
-                                let numstat = run_git(&numstat_args);
-                                let raw = run_git(&raw_args);
-                                let mut parsed_files: Vec<(String, usize, usize)> = Vec::new();
-                                for line in numstat.lines().take(32) {
-                                    let mut parts = line.split('\t');
-                                    if let (Some(a), Some(d), Some(path)) =
-                                        (parts.next(), parts.next(), parts.next())
-                                    {
-                                        let add = a.trim().parse::<usize>().unwrap_or(0);
-                                        let del = d.trim().parse::<usize>().unwrap_or(0);
-                                        parsed_files.push((path.trim().to_string(), add, del));
-                                    }
-                                }
-                                let mut untracked_notes = Vec::new();
-                                for line in status.lines().take(32) {
-                                    if let Some(rest) = line.strip_prefix("?? ") {
-                                        let clean = rest.trim().trim_matches('"');
-                                        if !clean.is_empty()
-                                            && !parsed_files.iter().any(|(p, _, _)| p == clean)
-                                        {
-                                            let full = std::path::Path::new(&cwd_clone).join(clean);
-                                            let lines = std::fs::metadata(&full)
-                                                .ok()
-                                                .filter(|m| m.is_file() && m.len() <= 131_072)
-                                                .and_then(|_| std::fs::read_to_string(&full).ok())
-                                                .map(|body| body.lines().count())
-                                                .unwrap_or(0);
-                                            parsed_files.push((clean.to_string(), lines, 0));
-                                            untracked_notes.push(format!(
-                                                "- {clean} (new file, +{lines} lines)"
-                                            ));
-                                        }
-                                    }
-                                }
-                                if parsed_files.is_empty() {
-                                    for line in status.lines().take(32) {
-                                        if line.len() >= 4 {
-                                            let p = line[3..].trim().trim_matches('"');
-                                            if !p.is_empty() {
-                                                parsed_files.push((p.to_string(), 0, 0));
-                                            }
-                                        }
-                                    }
-                                }
-                                let mut out = String::new();
-                                if !status.trim().is_empty() {
-                                    out.push_str("Git status:\n");
-                                    out.push_str(status.trim());
-                                    out.push('\n');
-                                }
-                                if !stat.trim().is_empty() {
-                                    out.push_str("\nGit diff --stat:\n");
-                                    out.push_str(stat.trim());
-                                    out.push('\n');
-                                }
-                                if !untracked_notes.is_empty() {
-                                    out.push_str("\nNew untracked files:\n");
-                                    out.push_str(&untracked_notes.join("\n"));
-                                    out.push('\n');
-                                }
-                                if !raw.trim().is_empty() {
-                                    let max_bytes = 10_000;
-                                    let excerpt = if raw.len() <= max_bytes {
-                                        raw.as_str()
-                                    } else {
-                                        let mut cut = max_bytes;
-                                        while cut > 0 && !raw.is_char_boundary(cut) {
-                                            cut -= 1;
-                                        }
-                                        &raw[..cut]
-                                    };
-                                    out.push_str("\nGit diff excerpt:\n");
-                                    out.push_str(excerpt);
-                                }
-                                (out, parsed_files)
+                                muqun_gateway::orchestration::collect_local_repos_diff(
+                                    &cwd_clone,
+                                    &goal,
+                                    &base_commits,
+                                    base_commit.as_deref(),
+                                )
                             })
                             .await
                         {
                             summary = local_diff;
-                            changed_files = local_files;
+                            changed_files = local_files
+                                .into_iter()
+                                .map(|f| (f.path, f.additions, f.deletions))
+                                .collect();
                         }
                     }
 

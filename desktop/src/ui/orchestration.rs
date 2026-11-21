@@ -30,13 +30,13 @@ use super::{ago, composer, now_ms, Mode, OpenMenu, Slot, ToastLevel, UiState};
 const MAX_W: f32 = 1760.0;
 const STACK_AT: f32 = 900.0;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MaoRole {
     pub agent: String,
     pub model: Option<ModelRef>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MaoPhase {
     Coding { round: u8 },
     Reviewing { round: u8 },
@@ -46,7 +46,7 @@ pub enum MaoPhase {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MaoStepKind {
     Coding,
     Review,
@@ -55,7 +55,7 @@ pub enum MaoStepKind {
     System,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MaoStep {
     pub kind: MaoStepKind,
     pub round: u8,
@@ -66,21 +66,57 @@ pub struct MaoStep {
     pub time_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl<'de> serde::Deserialize<'de> for MaoStep {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            kind: MaoStepKind,
+            round: u8,
+            title: String,
+            detail: String,
+            status: String,
+            asid: Option<String>,
+            time_ms: u64,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let status = match wire.status.as_str() {
+            "completed" | "done" => "completed",
+            "warning" => "warning",
+            "failed" => "failed",
+            "cancelled" => "cancelled",
+            _ => "running",
+        };
+        Ok(Self {
+            kind: wire.kind,
+            round: wire.round,
+            title: wire.title,
+            detail: wire.detail,
+            status,
+            asid: wire.asid,
+            time_ms: wire.time_ms,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MaoDeliverableFile {
     pub path: String,
     pub additions: usize,
     pub deletions: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MaoFinding {
     pub severity: String,
     pub location: String,
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct MaoRun {
     pub id: String,
     pub computer: String,
@@ -94,6 +130,7 @@ pub struct MaoRun {
     pub pending_review_diff: bool,
     pub pre_review_msg_id: Option<String>,
     pub base_commit: Option<String>,
+    pub base_commits: std::collections::BTreeMap<String, String>,
     pub last_diff_fingerprint: Option<String>,
     pub snapshot_retries: u8,
     pub round: u8,
@@ -107,6 +144,45 @@ pub struct MaoRun {
     pub expanded: bool,
     pub created_ms: u64,
     pub updated_ms: u64,
+}
+
+impl Default for MaoRun {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            computer: "local".into(),
+            goal: String::new(),
+            cwd: String::new(),
+            coder: MaoRole {
+                agent: String::new(),
+                model: None,
+            },
+            reviewer: MaoRole {
+                agent: String::new(),
+                model: None,
+            },
+            coder_asid: String::new(),
+            reviewer_asid: None,
+            pending_reviewer_token: None,
+            pending_review_diff: false,
+            pre_review_msg_id: None,
+            base_commit: None,
+            base_commits: std::collections::BTreeMap::new(),
+            last_diff_fingerprint: None,
+            snapshot_retries: 0,
+            round: 1,
+            max_rounds: 2,
+            phase: MaoPhase::Coding { round: 1 },
+            files: Vec::new(),
+            coder_summary: String::new(),
+            review_summary: String::new(),
+            findings: Vec::new(),
+            steps: Vec::new(),
+            expanded: false,
+            created_ms: 0,
+            updated_ms: 0,
+        }
+    }
 }
 
 impl MaoRun {
@@ -176,7 +252,7 @@ pub enum MenuSection {
     Rounds,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct View {
     pub runs: Vec<MaoRun>,
     pub selected_run: Option<String>,
@@ -186,6 +262,66 @@ pub struct View {
     pub catalog_requests: HashMap<u64, String>,
     pub synced_computers: HashSet<String>,
     pub next_seq: u64,
+}
+
+fn runs_state_path() -> Option<PathBuf> {
+    let (_, data_dir) = crate::platform::directories().ok()?;
+    Some(data_dir.join("orchestration-runs.json"))
+}
+
+fn load_persisted_runs() -> Vec<MaoRun> {
+    if cfg!(test) {
+        return Vec::new();
+    }
+    let Some(path) = runs_state_path() else {
+        return Vec::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+fn persist_runs(s: &UiState) {
+    if cfg!(test) || s.demo {
+        return;
+    }
+    let Some(path) = runs_state_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let len = s.orchestration.runs.len();
+    let keep = &s.orchestration.runs[len.saturating_sub(40)..];
+    if let Ok(json) = serde_json::to_string_pretty(keep) {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(tmp, path);
+        }
+    }
+}
+
+impl Default for View {
+    fn default() -> Self {
+        let runs = load_persisted_runs();
+        let next_seq = runs
+            .iter()
+            .filter_map(|r| r.id.strip_prefix("mao-")?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0);
+        let selected_run = runs.last().map(|r| r.id.clone());
+        Self {
+            runs,
+            selected_run,
+            filter: Filter::default(),
+            menu_section: None,
+            reviewer_catalogs: HashMap::new(),
+            catalog_requests: HashMap::new(),
+            synced_computers: HashSet::new(),
+            next_seq,
+        }
+    }
 }
 
 impl View {
@@ -418,24 +554,6 @@ fn concise_excerpt(text: &str, max_chars: usize) -> String {
     }
 }
 
-pub fn git_head_sha(cwd: &str) -> Option<String> {
-    let trimmed = cwd.trim();
-    if trimmed.is_empty() || !std::path::Path::new(trimmed).join(".git").exists() {
-        return None;
-    }
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(trimmed)
-        .args(["rev-parse", "--verify", "HEAD"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!sha.is_empty()).then_some(sha)
-}
-
 fn usable_agents(s: &UiState) -> Vec<AgentDiscoveryInfo> {
     let list: Vec<AgentDiscoveryInfo> = agents::by_standing(&s.agents)
         .into_iter()
@@ -481,9 +599,15 @@ pub fn effective_reviewer(s: &UiState, coder_agent: &str) -> MaoRole {
     if let Some(cfg) = &s.cfg.ui.mao.reviewer {
         let valid = usable.is_empty() || usable.iter().any(|a| a.id == cfg.agent);
         if valid {
+            let model = match cfg.model.as_ref() {
+                Some(m) if !model_in_options(s, &cfg.agent, &m.model_id) => {
+                    preferred_cheap_model(s, &cfg.agent)
+                }
+                other => other.cloned(),
+            };
             return MaoRole {
                 agent: cfg.agent.clone(),
-                model: cfg.model.clone(),
+                model,
             };
         }
     }
@@ -541,13 +665,13 @@ pub fn on_catalog(s: &mut UiState, request: u64, agent: &str, view: Arc<CatalogV
     let key = requested.as_deref().unwrap_or(agent).to_string();
     if !key.is_empty() {
         s.orchestration.reviewer_catalogs.insert(key.clone(), view);
-        if s.cfg
-            .ui
-            .mao
-            .reviewer
-            .as_ref()
-            .is_some_and(|r| r.agent == key && r.model.is_none())
-        {
+        if s.cfg.ui.mao.reviewer.as_ref().is_some_and(|r| {
+            r.agent == key
+                && (r.model.is_none()
+                    || r.model
+                        .as_ref()
+                        .is_some_and(|m| !model_in_options(s, &key, &m.model_id)))
+        }) {
             if let Some(cheap) = preferred_cheap_model(s, &key) {
                 let mut next = s.cfg.ui.mao.clone();
                 if let Some(rev) = next.reviewer.as_mut() {
@@ -559,17 +683,36 @@ pub fn on_catalog(s: &mut UiState, request: u64, agent: &str, view: Arc<CatalogV
     }
 }
 
+fn model_in_options(s: &UiState, agent_id: &str, model_id: &str) -> bool {
+    let opts = model_options(s, agent_id);
+    opts.is_empty() || opts.iter().any(|(_, id, _, _)| id == model_id)
+}
+
 fn cheap_model_score(id: &str, name: &str) -> u8 {
     let hay = format!("{} {}", id.to_ascii_lowercase(), name.to_ascii_lowercase());
     if hay.contains("nano") {
         0
-    } else if hay.contains("mini") || hay.contains("haiku") || hay.contains("flash") {
+    } else if hay.contains("mini")
+        || hay.contains("haiku")
+        || hay.contains("flash")
+        || hay.contains("5.6-luna")
+    {
         1
-    } else if hay.contains("lite") || hay.contains("small") || hay.contains("deepseek") {
+    } else if hay.contains("lite")
+        || hay.contains("small")
+        || hay.contains("deepseek")
+        || hay.contains("luna")
+    {
         2
-    } else if hay.contains("sonnet") || hay.contains("codex") {
+    } else if hay.contains("terra") || hay.contains("sonnet") || hay.contains("codex") {
         3
-    } else if hay.contains("opus") || hay.contains("pro") || hay.contains("max") {
+    } else if hay.contains("sol") {
+        4
+    } else if hay.contains("astra")
+        || hay.contains("opus")
+        || hay.contains("pro")
+        || hay.contains("max")
+    {
         5
     } else {
         4
@@ -642,10 +785,12 @@ fn resolved_reviewer_model<'a>(
     role: &'a MaoRole,
 ) -> (Option<ModelRef>, Option<&'a str>) {
     if let Some(m) = &role.model {
-        let display = catalog_for_agent(s, &role.agent)
-            .and_then(|v| catalog_model_info(v, m))
-            .map(|i| i.name.as_str());
-        return (Some(m.clone()), display);
+        if model_in_options(s, &role.agent, &m.model_id) {
+            let display = catalog_for_agent(s, &role.agent)
+                .and_then(|v| catalog_model_info(v, m))
+                .map(|i| i.name.as_str());
+            return (Some(m.clone()), display);
+        }
     }
     if let Some(cheap) = preferred_cheap_model(s, &role.agent) {
         let display = catalog_for_agent(s, &role.agent)
@@ -786,6 +931,8 @@ pub fn on_start_submitted(
     let lang = s.cfg.general.language;
     let coder_name = s.agent_name(coder_agent);
     let id = format!("mao-{seq}");
+    let base_commits = muqun_gateway::orchestration::capture_base_commits(cwd, prompt);
+    let base_commit = base_commits.values().next().cloned();
     let run = MaoRun {
         id: id.clone(),
         computer: s.current_computer().to_string(),
@@ -801,7 +948,8 @@ pub fn on_start_submitted(
         pending_reviewer_token: None,
         pending_review_diff: false,
         pre_review_msg_id: None,
-        base_commit: git_head_sha(cwd),
+        base_commit,
+        base_commits,
         last_diff_fingerprint: None,
         snapshot_retries: 0,
         round: 1,
@@ -826,6 +974,7 @@ pub fn on_start_submitted(
     };
     s.orchestration.runs.push(run);
     s.orchestration.selected_run = Some(id);
+    persist_runs(s);
 }
 
 pub fn on_session_submitted(s: &mut UiState, asid: &str, prompt: &str) {
@@ -856,7 +1005,9 @@ pub fn on_session_submitted(s: &mut UiState, asid: &str, prompt: &str) {
             existing.goal = prompt.trim().to_string();
             existing.phase = MaoPhase::Coding { round: 1 };
             existing.pending_review_diff = false;
-            existing.base_commit = git_head_sha(&existing.cwd);
+            existing.base_commits =
+                muqun_gateway::orchestration::capture_base_commits(&existing.cwd, &existing.goal);
+            existing.base_commit = existing.base_commits.values().next().cloned();
             existing.last_diff_fingerprint = None;
             existing.snapshot_retries = 0;
             existing.files.clear();
@@ -874,6 +1025,7 @@ pub fn on_session_submitted(s: &mut UiState, asid: &str, prompt: &str) {
                 time_ms: now,
             });
             s.orchestration.selected_run = Some(existing.id.clone());
+            persist_runs(s);
         } else {
             existing.updated_ms = now;
         }
@@ -898,7 +1050,8 @@ pub fn on_session_submitted(s: &mut UiState, asid: &str, prompt: &str) {
     };
     let coder_name = s.agent_name(&coder_agent);
     let id = format!("mao-{seq}");
-    let base_commit = git_head_sha(&cwd);
+    let base_commits = muqun_gateway::orchestration::capture_base_commits(&cwd, prompt);
+    let base_commit = base_commits.values().next().cloned();
     s.orchestration.runs.push(MaoRun {
         id: id.clone(),
         computer: s.current_computer().to_string(),
@@ -915,6 +1068,7 @@ pub fn on_session_submitted(s: &mut UiState, asid: &str, prompt: &str) {
         pending_review_diff: false,
         pre_review_msg_id: None,
         base_commit,
+        base_commits,
         last_diff_fingerprint: None,
         snapshot_retries: 0,
         round: 1,
@@ -939,6 +1093,7 @@ pub fn on_session_submitted(s: &mut UiState, asid: &str, prompt: &str) {
     });
     s.orchestration.selected_run = Some(id);
     s.sync_watch();
+    persist_runs(s);
 }
 
 pub fn on_session_created(s: &mut UiState, token: u64, info: &AgentSessionInfo) {
@@ -956,8 +1111,12 @@ pub fn on_session_created(s: &mut UiState, token: u64, info: &AgentSessionInfo) 
                     run.cwd = dir.clone();
                 }
             }
-            if run.base_commit.is_none() {
-                run.base_commit = git_head_sha(&run.cwd);
+            if run.base_commits.is_empty() {
+                run.base_commits =
+                    muqun_gateway::orchestration::capture_base_commits(&run.cwd, &run.goal);
+                if run.base_commit.is_none() {
+                    run.base_commit = run.base_commits.values().next().cloned();
+                }
             }
             for step in &mut run.steps {
                 if step.asid.as_deref() == Some(pending_id.as_str()) {
@@ -1002,6 +1161,7 @@ pub fn on_session_created(s: &mut UiState, token: u64, info: &AgentSessionInfo) 
     }
     if matched {
         s.sync_watch();
+        persist_runs(s);
     }
 }
 
@@ -1036,7 +1196,7 @@ pub fn on_session_status(s: &mut UiState, asid: &str, status: AgentSessionStatus
     let now = now_ms();
 
     // Check Coder state transitions first.
-    let mut prepare_diff: Option<(String, String, String, Option<String>)> = None;
+    let mut prepare_cmd: Option<Command> = None;
     for run in &mut s.orchestration.runs {
         if run.coder_asid != asid {
             continue;
@@ -1054,12 +1214,14 @@ pub fn on_session_status(s: &mut UiState, asid: &str, status: AgentSessionStatus
                     {
                         step.status = "completed";
                     }
-                    prepare_diff = Some((
-                        run.id.clone(),
-                        run.coder_asid.clone(),
-                        run.cwd.clone(),
-                        run.base_commit.clone(),
-                    ));
+                    prepare_cmd = Some(Command::MaoPrepareReview {
+                        run_id: run.id.clone(),
+                        coder_asid: run.coder_asid.clone(),
+                        cwd: run.cwd.clone(),
+                        goal: run.goal.clone(),
+                        base_commit: run.base_commit.clone(),
+                        base_commits: run.base_commits.clone(),
+                    });
                 }
                 AgentSessionStatus::Failed => {
                     run.pending_review_diff = false;
@@ -1087,13 +1249,8 @@ pub fn on_session_status(s: &mut UiState, asid: &str, status: AgentSessionStatus
             }
         }
     }
-    if let Some((run_id, coder_asid, cwd, base_commit)) = prepare_diff {
-        s.send(Command::MaoPrepareReview {
-            run_id,
-            coder_asid,
-            cwd,
-            base_commit,
-        });
+    if let Some(cmd) = prepare_cmd {
+        s.send(cmd);
     }
 
     // Check Reviewer state transitions.
@@ -1324,6 +1481,7 @@ pub fn on_session_status(s: &mut UiState, asid: &str, status: AgentSessionStatus
                 round,
             } => {
                 s.sync_watch();
+                persist_runs(s);
                 s.notify(
                     ToastLevel::Success,
                     tr(lang, "MAO review approved"),
@@ -1371,6 +1529,7 @@ pub fn on_session_status(s: &mut UiState, asid: &str, status: AgentSessionStatus
                 round,
             } => {
                 s.sync_watch();
+                persist_runs(s);
                 s.notify(
                     ToastLevel::Warning,
                     tr(lang, "MAO review requested changes"),
@@ -1378,6 +1537,9 @@ pub fn on_session_status(s: &mut UiState, asid: &str, status: AgentSessionStatus
                 );
             }
         }
+    }
+    if s.orchestration.is_tracked(asid) {
+        persist_runs(s);
     }
 }
 
@@ -1474,6 +1636,7 @@ pub fn on_review_ready(
             time_ms: now,
         });
         s.sync_watch();
+        persist_runs(s);
         s.notify(
             ToastLevel::Success,
             tr(lang, "MAO review approved"),
@@ -1511,6 +1674,7 @@ pub fn on_review_ready(
             time_ms: now,
         });
         s.sync_watch();
+        persist_runs(s);
         s.notify(
             ToastLevel::Warning,
             tr(lang, "MAO review requested changes"),
@@ -1598,6 +1762,7 @@ pub fn on_review_ready(
         }));
     }
     s.sync_watch();
+    persist_runs(s);
 }
 
 fn build_review_prompt(
@@ -1735,6 +1900,8 @@ pub fn continue_rework(s: &mut UiState, run_id: &str) {
         tr(lang, "MAO rework dispatched"),
         Some(format!("{reviewer_name} → #{next_round}")),
     );
+    s.sync_watch();
+    persist_runs(s);
 }
 
 pub fn mark_approved(s: &mut UiState, run_id: &str) {
@@ -1758,6 +1925,7 @@ pub fn mark_approved(s: &mut UiState, run_id: &str) {
             time_ms: now,
         });
         s.sync_watch();
+        persist_runs(s);
     }
 }
 
@@ -1797,6 +1965,7 @@ pub fn cancel_run(s: &mut UiState, run_id: &str) {
         }
     }
     s.sync_watch();
+    persist_runs(s);
 }
 
 // ---- Composer Bar -------------------------------------------------------------------------
@@ -3065,10 +3234,9 @@ fn page_head(s: &UiState, k: &Kit, stacked: bool) -> El {
     let reviewer = effective_reviewer(s, &coder_id);
     let max_rounds = s.cfg.ui.mao.max_rounds.clamp(1, 5);
     let policy_summary = format!(
-        "{} → {} · {max_rounds} {}",
+        "{} → {}",
         s.agent_name(&coder_id),
         reviewer_summary_label(s, &reviewer, max_rounds, language),
-        tr_ref(language, "rounds")
     );
 
     let controls = row()
@@ -3128,27 +3296,40 @@ fn page_head(s: &UiState, k: &Kit, stacked: bool) -> El {
                 .min_w(0.0)
                 .gap(4.0)
                 .child(
-                    text(tr_ref(language, "MAO · Orchestration"))
-                        .key("page-title")
-                        .font(TextStyle {
-                            size: 22.0,
-                            line_height: 28.0,
-                            ..k.ty.ui_medium
-                        })
-                        .color(k.c.text_base),
+                    row()
+                        .w_full()
+                        .gap(10.0)
+                        .center_y()
+                        .flex_wrap()
+                        .child(
+                            text(tr_ref(language, "MAO · Orchestration"))
+                                .key("page-title")
+                                .font(TextStyle {
+                                    size: 22.0,
+                                    line_height: 28.0,
+                                    ..k.ty.ui_medium
+                                })
+                                .color(k.c.text_base),
+                        )
+                        .child(
+                            el().px(10.0)
+                                .py(3.0)
+                                .radius(k.radius.xl)
+                                .fill(k.c.layer_01)
+                                .border(1.0, k.c.border_weak)
+                                .child(text(policy_summary).font(k.ty.small).color(k.c.text_muted)),
+                        ),
                 )
                 .child(
-                    text(format!(
-                        "{}  ({policy_summary})",
-                        tr_ref(
-                            language,
-                            "Automated Coder ⇄ Reviewer delivery & code-review loop."
-                        )
+                    text(tr_ref(
+                        language,
+                        "Automated Coder ⇄ Reviewer delivery & code-review loop.",
                     ))
                     .key("page-subtitle")
                     .font(k.ty.small)
                     .color(k.c.text_muted)
-                    .truncate(),
+                    .wrap()
+                    .w_full(),
                 ),
         )
         .child(controls)
@@ -3212,20 +3393,47 @@ fn page_empty(s: &UiState, k: &Kit) -> El {
         ),
     ];
 
-    let mut cards = row().gap(12.0).flex_wrap().w_full().max_w(780.0);
+    let mut cards = row().gap(12.0).flex_wrap().w_full().max_w(860.0);
     for (num, title, desc) in steps {
         cards = cards.child(
             col()
                 .grow(1.0)
-                .min_w(210.0)
-                .padding(16.0)
-                .gap(6.0)
+                .min_w(230.0)
+                .max_w(280.0)
+                .padding(18.0)
+                .gap(10.0)
                 .radius(k.radius.lg)
                 .fill(k.c.layer_01)
                 .border(1.0, k.c.border_weak)
-                .child(Badge::new(num).variant(BadgeVariant::Accent).build(k))
-                .child(text(title).font(k.ty.ui_medium).color(k.c.text_base))
-                .child(text(desc).font(k.ty.small).color(k.c.text_muted)),
+                .child(
+                    row()
+                        .w_full()
+                        .gap(10.0)
+                        .center_y()
+                        .child(
+                            el().size(24.0, 24.0)
+                                .radius(12.0)
+                                .fill(k.c.bg_accent.alpha(0.16))
+                                .border(1.0, k.c.bg_accent.alpha(0.45))
+                                .center()
+                                .child(text(num).font(k.ty.small_medium).color(k.c.text_accent)),
+                        )
+                        .child(
+                            text(title)
+                                .font(k.ty.ui_medium)
+                                .color(k.c.text_base)
+                                .wrap()
+                                .grow(1.0)
+                                .min_w(0.0),
+                        ),
+                )
+                .child(
+                    text(desc)
+                        .font(k.ty.small)
+                        .color(k.c.text_muted)
+                        .wrap()
+                        .w_full(),
+                ),
         );
     }
 
@@ -3236,7 +3444,14 @@ fn page_empty(s: &UiState, k: &Kit) -> El {
         .center()
         .padding(28.0)
         .gap(18.0)
-        .child(icon(&glyphs::WORKFLOW, 28.0).color(k.c.text_accent))
+        .child(
+            el().size(52.0, 52.0)
+                .radius(16.0)
+                .fill(k.c.bg_accent.alpha(0.12))
+                .border(1.0, k.c.bg_accent.alpha(0.35))
+                .center()
+                .child(icon(&glyphs::WORKFLOW, 26.0).color(k.c.text_accent)),
+        )
         .child(
             text(tr_ref(language, "No MAO runs yet"))
                 .font(k.ty.ui_medium)
@@ -3629,6 +3844,7 @@ fn page_detail(s: &UiState, k: &Kit, run: &MaoRun, width: f32) -> El {
 
     let diff_target = (!run.coder_asid.starts_with("new-")).then(|| run.coder_asid.clone());
 
+    let repo_count = run.base_commits.len();
     let mut files_box = col()
         .w_full()
         .padding(12.0)
@@ -3639,6 +3855,7 @@ fn page_detail(s: &UiState, k: &Kit, run: &MaoRun, width: f32) -> El {
         .child(
             row()
                 .w_full()
+                .gap(8.0)
                 .center_y()
                 .child(
                     text(tr_ref(language, "Changed files"))
@@ -3646,6 +3863,11 @@ fn page_detail(s: &UiState, k: &Kit, run: &MaoRun, width: f32) -> El {
                         .color(k.c.text_faint)
                         .grow(1.0),
                 )
+                .children((repo_count > 1).then(|| {
+                    Badge::new(format!("{repo_count} {}", tr_ref(language, "repos")))
+                        .variant(BadgeVariant::Subtle)
+                        .build(k)
+                }))
                 .children((!run.files.is_empty()).then(|| {
                     let (adds, dels) = diff_totals(&run.files);
                     row()
@@ -4308,6 +4530,7 @@ pub fn on_gateway_orchestration(
         if s.orchestration.selected_run.is_none() {
             s.orchestration.selected_run = s.orchestration.runs.last().map(|r| r.id.clone());
         }
+        persist_runs(s);
     }
 }
 
@@ -4396,6 +4619,10 @@ fn merge_gateway_run(s: &mut UiState, computer: &str, raw: &serde_json::Value) -
         .and_then(|v| v.get("base_commit"))
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let base_commits: std::collections::BTreeMap<String, String> = st
+        .and_then(|v| v.get("base_commits"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
     let coder_summary = st
         .and_then(|v| v.get("coder_summary"))
         .and_then(|v| v.as_str())
@@ -4540,6 +4767,7 @@ fn merge_gateway_run(s: &mut UiState, computer: &str, raw: &serde_json::Value) -
         pending_review_diff: false,
         pre_review_msg_id: None,
         base_commit,
+        base_commits,
         last_diff_fingerprint: None,
         snapshot_retries: 0,
         round,
@@ -4773,6 +5001,45 @@ MAO_VERDICT: CHANGES_REQUESTED";
             s.orchestration.runs[0].phase,
             MaoPhase::ChangesRequested { round: 1, .. }
         ));
+    }
+
+    #[test]
+    fn cheap_model_prefers_luna_and_serde_roundtrips_cleanly() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let mut codex = test_agent("codex", "Codex");
+        codex.models = serde_json::from_value(serde_json::json!([
+            {"id": "gpt-6.2-astra", "name": "GPT-6.2-Astra", "providerId": "openai", "supportsReasoning": true, "reasoningEffortTiers": ["low", "high"]},
+            {"id": "gpt-6.1-terra", "name": "GPT-6.1 Terra", "providerId": "openai", "supportsReasoning": true, "reasoningEffortTiers": ["low", "medium"]},
+            {"id": "gpt-5.6-luna", "name": "GPT-5.6-Luna", "providerId": "openai", "supportsReasoning": true, "reasoningEffortTiers": ["low", "medium", "high"]}
+        ]))
+        .unwrap();
+        s.agents = vec![codex];
+        // Configure an unavailable legacy model -> must auto-fallback to gpt-5.6-luna / low.
+        s.cfg.ui.mao = MaoPrefs {
+            enabled: true,
+            reviewer: Some(MaoRoleConfig {
+                agent: "codex".into(),
+                model: Some(ModelRef {
+                    provider_id: "openai".into(),
+                    model_id: "gpt-5.1-codex-mini".into(),
+                    variant: Some("low".into()),
+                }),
+            }),
+            max_rounds: 2,
+        };
+
+        let picked = preferred_cheap_model(&s, "codex").expect("cheap model");
+        assert_eq!(picked.model_id, "gpt-5.6-luna");
+        assert_eq!(picked.variant.as_deref(), Some("low"));
+
+        let eff = effective_reviewer(&s, "claude");
+        assert_eq!(eff.model.as_ref().unwrap().model_id, "gpt-5.6-luna");
+
+        on_start_submitted(&mut s, "new-1", "Persist check", "/tmp/repo", "codex", None);
+        let json = serde_json::to_string(&s.orchestration.runs).unwrap();
+        let decoded: Vec<MaoRun> = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, s.orchestration.runs);
     }
 
     #[test]

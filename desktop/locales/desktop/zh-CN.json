@@ -1016,5 +1016,6 @@
   "No code changes detected; skipped code review.": "未检测到代码变更，已自动跳过代码审查。",
   "Skipped review (no code changes)": "无代码变更 · 已跳过审查",
   "Review findings": "结构化审查问题",
-  "Sync": "同步状态"
+  "Sync": "同步状态",
+  "repos": "个仓库"
 }

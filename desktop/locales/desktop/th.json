@@ -1016,5 +1016,6 @@
   "No code changes detected; skipped code review.": "No code changes detected; skipped code review.",
   "Skipped review (no code changes)": "Skipped review (no code changes)",
   "Review findings": "Review findings",
-  "Sync": "Sync"
+  "Sync": "Sync",
+  "repos": "repos"
 }

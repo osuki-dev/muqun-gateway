@@ -290,7 +290,9 @@ pub enum Command {
         run_id: String,
         coder_asid: String,
         cwd: String,
+        goal: String,
         base_commit: Option<String>,
+        base_commits: std::collections::BTreeMap<String, String>,
     },
 }
 

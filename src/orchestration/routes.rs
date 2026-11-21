@@ -103,13 +103,18 @@ async fn collect_deliverables(
     agent_id: &str,
     asid: Option<&str>,
     cwd: &str,
+    goal: &str,
     base_commit: Option<&str>,
+    base_commits: &std::collections::BTreeMap<String, String>,
 ) -> (Vec<ChangedFile>, String) {
     let mut files = Vec::new();
     let mut summary = String::new();
-    let has_local_git =
-        !cwd.trim().is_empty() && std::path::Path::new(cwd.trim()).join(".git").exists();
-    if let (None, Some(asid)) = (base_commit.filter(|_| has_local_git), asid) {
+    let discovered = super::discover_git_repos(cwd, goal);
+    let has_local_git = !discovered.is_empty() || !base_commits.is_empty();
+    if let (true, Some(asid)) = (
+        (base_commit.is_none() && base_commits.is_empty()) || !has_local_git,
+        asid,
+    ) {
         if let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await {
             if let Ok(diffs) = manager
                 .sessions()
@@ -150,102 +155,11 @@ async fn collect_deliverables(
     }
     if files.is_empty() && has_local_git {
         let dir = cwd.trim().to_string();
+        let goal_owned = goal.to_string();
+        let base_map = base_commits.clone();
         let base = base_commit.map(str::to_string);
         if let Ok((local_files, local_summary)) = tokio::task::spawn_blocking(move || {
-            let run_git = |args: &[&str]| -> String {
-                std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(&dir)
-                    .args(args)
-                    .output()
-                    .ok()
-                    .filter(|out| out.status.success())
-                    .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-                    .unwrap_or_default()
-            };
-            let mut diff_numstat_args = vec!["diff", "--numstat"];
-            let mut diff_stat_args = vec!["diff", "--stat"];
-            let mut diff_raw_args = vec!["diff", "--no-color"];
-            if let Some(ref rev) = base {
-                diff_numstat_args.push(rev);
-                diff_stat_args.push(rev);
-                diff_raw_args.push(rev);
-            }
-            let numstat = run_git(&diff_numstat_args);
-            let status = run_git(&["status", "--porcelain"]);
-            let stat = run_git(&diff_stat_args);
-            let raw = run_git(&diff_raw_args);
-            let mut parsed = Vec::new();
-            for line in numstat.lines().take(32) {
-                let mut parts = line.split('\t');
-                if let (Some(a), Some(d), Some(path)) = (parts.next(), parts.next(), parts.next()) {
-                    parsed.push(ChangedFile {
-                        path: path.trim().to_string(),
-                        additions: a.trim().parse().unwrap_or(0),
-                        deletions: d.trim().parse().unwrap_or(0),
-                    });
-                }
-            }
-            let mut untracked_notes = Vec::new();
-            for line in status.lines().take(32) {
-                if let Some(rest) = line.strip_prefix("?? ") {
-                    let clean = rest.trim().trim_matches('"');
-                    if !clean.is_empty() && !parsed.iter().any(|f| f.path == clean) {
-                        let full = std::path::Path::new(&dir).join(clean);
-                        let lines = std::fs::metadata(&full)
-                            .ok()
-                            .filter(|m| m.is_file() && m.len() <= 131_072)
-                            .and_then(|_| std::fs::read_to_string(&full).ok())
-                            .map(|body| body.lines().count())
-                            .unwrap_or(0);
-                        parsed.push(ChangedFile {
-                            path: clean.to_string(),
-                            additions: lines,
-                            deletions: 0,
-                        });
-                        untracked_notes.push(format!("- {clean} (new file, +{lines} lines)"));
-                    }
-                }
-            }
-            if parsed.is_empty() {
-                for line in status.lines().take(32) {
-                    if line.len() >= 4 {
-                        let clean = line[3..].trim().trim_matches('"');
-                        if !clean.is_empty() {
-                            parsed.push(ChangedFile {
-                                path: clean.to_string(),
-                                additions: 0,
-                                deletions: 0,
-                            });
-                        }
-                    }
-                }
-            }
-            let mut text = String::new();
-            if !status.trim().is_empty() {
-                text.push_str("Git status:\n");
-                text.push_str(status.trim());
-                text.push('\n');
-            }
-            if !stat.trim().is_empty() {
-                text.push_str("\nGit diff --stat:\n");
-                text.push_str(stat.trim());
-                text.push('\n');
-            }
-            if !untracked_notes.is_empty() {
-                text.push_str("\nNew untracked files:\n");
-                text.push_str(&untracked_notes.join("\n"));
-                text.push('\n');
-            }
-            if !raw.trim().is_empty() {
-                let mut cut = raw.len().min(8000);
-                while cut > 0 && !raw.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                text.push_str("\nGit diff excerpt:\n");
-                text.push_str(&raw[..cut]);
-            }
-            (parsed, text)
+            super::collect_local_repos_diff(&dir, &goal_owned, &base_map, base.as_deref())
         })
         .await
         {
@@ -269,6 +183,16 @@ async fn reconcile_pipeline(
     let mut dirty = false;
     let now = now_ms();
     let root_task = tasks.iter().find(|t| t.task_id == root).cloned();
+    let active_coder_task = run
+        .state
+        .steps
+        .iter()
+        .rev()
+        .find(|s| matches!(s.kind.as_str(), "coding" | "rework") && s.task_id.is_some())
+        .and_then(|s| s.task_id.as_deref())
+        .and_then(|tid| tasks.iter().find(|t| t.task_id == tid))
+        .cloned()
+        .or_else(|| root_task.clone());
 
     if let Some(ref rt) = root_task {
         if let Some((_, ref asid)) = agent_asid(&rt.binding) {
@@ -288,7 +212,10 @@ async fn reconcile_pipeline(
                 dirty = true;
             }
         }
-        if rt.state == TaskState::Failed && run.state.mao_phase == "coding" {
+    }
+
+    if let Some(ref ct) = active_coder_task {
+        if ct.state == TaskState::Failed && run.state.mao_phase == "coding" {
             run.state.mao_phase = "failed".into();
             if let Some(step) = run.state.steps.last_mut() {
                 if step.status == "running" {
@@ -296,7 +223,7 @@ async fn reconcile_pipeline(
                 }
             }
             dirty = true;
-        } else if rt.state == TaskState::Cancelled && run.state.mao_phase == "coding" {
+        } else if ct.state == TaskState::Cancelled && run.state.mao_phase == "coding" {
             run.state.mao_phase = "cancelled".into();
             if let Some(step) = run.state.steps.last_mut() {
                 if step.status == "running" {
@@ -308,7 +235,7 @@ async fn reconcile_pipeline(
     }
 
     if let Some(rev_spec) = run.request.reviewer.clone() {
-        let coder_settled = root_task
+        let coder_settled = active_coder_task
             .as_ref()
             .is_some_and(|t| matches!(t.state, TaskState::Done | TaskState::IdleUnconfirmed));
         if run.state.mao_phase == "coding"
@@ -331,7 +258,7 @@ async fn reconcile_pipeline(
                 None
             };
             let coder_summary = coder_reply
-                .or_else(|| root_task.as_ref().and_then(|t| t.summary.clone()))
+                .or_else(|| active_coder_task.as_ref().and_then(|t| t.summary.clone()))
                 .unwrap_or_else(|| "(No summary recorded yet.)".into());
             run.state.coder_summary = Some(concise_excerpt(&coder_summary, 600));
 
@@ -340,10 +267,12 @@ async fn reconcile_pipeline(
                 &run.request.coordinator,
                 coder_asid.as_deref(),
                 &run.request.cwd,
+                &run.request.goal,
                 run.state.base_commit.as_deref(),
+                &run.state.base_commits,
             )
             .await;
-            if run.state.base_commit.is_some()
+            if (!run.state.base_commits.is_empty() || run.state.base_commit.is_some())
                 && files.is_empty()
                 && diff_summary.trim().is_empty()
                 && run.state.files.is_empty()

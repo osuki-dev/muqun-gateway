@@ -361,3 +361,125 @@ MAO_VERDICT: CHANGES_REQUESTED";
     assert!(!summary.contains("MAO_ISSUE:"));
     assert!(summary.contains("Missing null check"));
 }
+
+#[test]
+fn low_severity_only_findings_auto_approve_in_gateway() {
+    let reply = "\
+Clean fix overall.\n\
+- MAO_ISSUE: [LOW] src/routes.rs:12 | Consider renaming helper\n\
+MAO_VERDICT: CHANGES_REQUESTED";
+
+    let (verdict, summary) = super::parse_verdict(reply);
+    assert_eq!(verdict, "approved");
+    assert!(!summary.contains("MAO_VERDICT:"));
+}
+
+#[tokio::test]
+async fn round_two_rework_tracks_new_rework_task_rather_than_settled_root() {
+    let state = state();
+    let mut req = request();
+    req.reviewer = Some(ReviewerSpec {
+        agent: "opencode".into(),
+        model: None,
+        variant: None,
+    });
+    let (mut run, _) = store::reserve(&state.db, "owner".into(), req)
+        .await
+        .unwrap();
+    let root = insert_task(&state, Some(run.task_ref()), None, TaskState::Done).await;
+    let rework_task = insert_task(
+        &state,
+        Some(format!("{}:rework:2", run.task_ref())),
+        Some(root.id.clone()),
+        TaskState::Working,
+    )
+    .await;
+
+    run.state.round = 2;
+    run.state.reviewed_round = 1;
+    run.state.steps.push(super::PipelineStep {
+        kind: "rework".into(),
+        round: 2,
+        title: "Rework #2 · opencode".into(),
+        detail: "Fix edge case".into(),
+        status: "running".into(),
+        asid: None,
+        task_id: Some(rework_task.id.0.clone()),
+        time_ms: 2,
+    });
+    store::save_state(&state.db, run.id.clone(), run.state.clone())
+        .await
+        .unwrap();
+
+    let path = format!("/api/orchestrations/{}", run.id);
+    let (status, fetched) = call(&state, "token", "GET", &path, Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    assert_eq!(fetched["round"], 2);
+    assert_eq!(fetched["mao_phase"], "coding");
+    assert!(fetched["reviewer"]["asid"].is_null());
+}
+
+#[test]
+fn discovers_and_tracks_multiple_git_repositories_in_workspace() {
+    let ws = crate::test_state_dir().join(format!("multi-repo-{}", uuid::Uuid::new_v4()));
+    let repo_a = ws.join("gateway");
+    let repo_b = ws.join("app");
+    std::fs::create_dir_all(&repo_a).unwrap();
+    std::fs::create_dir_all(&repo_b).unwrap();
+
+    for (repo, file, content) in [
+        (&repo_a, "api.rs", "pub fn v() -> u8 { 1 }\n"),
+        (&repo_b, "client.ts", "export const v = 1;\n"),
+    ] {
+        for args in [
+            vec!["init"],
+            vec!["config", "user.name", "Test"],
+            vec!["config", "user.email", "test@example.com"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(repo.join(file), content).unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-m", "init"]] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success());
+        }
+    }
+
+    let base_commits = super::capture_base_commits(&ws.to_string_lossy(), "Sync gateway and app");
+    assert_eq!(base_commits.len(), 2);
+
+    // Modify repo_a in working tree and commit a change in repo_b mid-task.
+    std::fs::write(repo_a.join("api.rs"), "pub fn v() -> u8 { 2 }\n").unwrap();
+    std::fs::write(repo_b.join("client.ts"), "export const v = 2;\n").unwrap();
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo_b)
+        .args(["commit", "-am", "bump v"])
+        .status()
+        .unwrap()
+        .success());
+
+    let (files, summary) = super::collect_local_repos_diff(
+        &ws.to_string_lossy(),
+        "Sync gateway and app",
+        &base_commits,
+        None,
+    );
+    let paths: Vec<_> = files.iter().map(|f| f.path.as_str()).collect();
+    assert!(paths.contains(&"gateway/api.rs"), "{paths:?}");
+    assert!(paths.contains(&"app/client.ts"), "{paths:?}");
+    assert!(summary.contains("Repository: gateway"));
+    assert!(summary.contains("Repository: app"));
+    let _ = std::fs::remove_dir_all(&ws);
+}

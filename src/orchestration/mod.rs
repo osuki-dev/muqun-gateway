@@ -89,6 +89,7 @@ pub struct RunState {
     pub reviewer_task_id: Option<String>,
     pub reviewed_round: u8,
     pub base_commit: Option<String>,
+    pub base_commits: std::collections::BTreeMap<String, String>,
     pub files: Vec<ChangedFile>,
     pub coder_summary: Option<String>,
     pub review_summary: Option<String>,
@@ -109,6 +110,7 @@ impl Default for RunState {
             reviewer_task_id: None,
             reviewed_round: 0,
             base_commit: None,
+            base_commits: std::collections::BTreeMap::new(),
             files: Vec::new(),
             coder_summary: None,
             review_summary: None,
@@ -119,27 +121,274 @@ impl Default for RunState {
     }
 }
 
-pub(crate) fn git_head_sha(cwd: &str) -> Option<String> {
-    let trimmed = cwd.trim();
-    if trimmed.is_empty() || !std::path::Path::new(trimmed).join(".git").exists() {
-        return None;
-    }
-    let output = std::process::Command::new("git")
+fn run_git_cmd(dir: &std::path::Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
         .arg("-C")
-        .arg(trimmed)
-        .args(["rev-parse", "--verify", "HEAD"])
+        .arg(dir)
+        .args(args)
         .output()
         .ok()?;
-    if !output.status.success() {
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn resolve_repo_root(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    if !dir.is_dir() {
         return None;
     }
-    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!sha.is_empty()).then_some(sha)
+    if dir.join(".git").exists() {
+        return dir.canonicalize().ok().or_else(|| Some(dir.to_path_buf()));
+    }
+    let root = run_git_cmd(dir, &["rev-parse", "--show-toplevel"])?;
+    let p = std::path::PathBuf::from(root.trim());
+    p.is_dir().then(|| p.canonicalize().ok().unwrap_or(p))
+}
+
+fn push_unique_repo(repos: &mut Vec<std::path::PathBuf>, candidate: std::path::PathBuf) {
+    if repos.len() < 8 && !repos.iter().any(|existing| existing == &candidate) {
+        repos.push(candidate);
+    }
+}
+
+pub fn discover_git_repos(cwd: &str, goal: &str) -> Vec<std::path::PathBuf> {
+    let mut repos = Vec::new();
+    let trimmed = cwd.trim();
+    if !trimmed.is_empty() {
+        let base_dir = std::path::Path::new(trimmed);
+        if let Some(root) = resolve_repo_root(base_dir) {
+            push_unique_repo(&mut repos, root);
+        }
+        if base_dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(base_dir) {
+                let mut subdirs: Vec<std::path::PathBuf> = entries
+                    .flatten()
+                    .filter_map(|entry| {
+                        let name = entry.file_name();
+                        let name = name.to_str()?;
+                        if name.starts_with('.') || matches!(name, "target" | "node_modules") {
+                            return None;
+                        }
+                        let path = entry.path();
+                        (path.is_dir() && path.join(".git").exists()).then_some(path)
+                    })
+                    .collect();
+                subdirs.sort();
+                for sub in subdirs.into_iter().take(24) {
+                    if let Some(root) = resolve_repo_root(&sub) {
+                        push_unique_repo(&mut repos, root);
+                    }
+                }
+            }
+        }
+    }
+
+    for token in goal.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '`'
+            )
+    }) {
+        let cleaned = token.trim_end_matches(['.', ':', '!']);
+        if cleaned.starts_with('/') && cleaned.len() > 1 {
+            let p = std::path::Path::new(cleaned);
+            if p.exists() {
+                let target_dir = if p.is_file() {
+                    p.parent().unwrap_or(p)
+                } else {
+                    p
+                };
+                if let Some(root) = resolve_repo_root(target_dir) {
+                    push_unique_repo(&mut repos, root);
+                }
+            }
+        }
+    }
+
+    repos
+}
+
+pub fn capture_base_commits(cwd: &str, goal: &str) -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    for repo in discover_git_repos(cwd, goal) {
+        if let Some(sha) = run_git_cmd(&repo, &["rev-parse", "--verify", "HEAD"]) {
+            let sha = sha.trim().to_string();
+            if !sha.is_empty() {
+                map.insert(repo.to_string_lossy().into_owned(), sha);
+            }
+        }
+    }
+    map
+}
+
+pub fn collect_local_repos_diff(
+    cwd: &str,
+    goal: &str,
+    base_commits: &std::collections::BTreeMap<String, String>,
+    legacy_base: Option<&str>,
+) -> (Vec<ChangedFile>, String) {
+    let mut repos: Vec<std::path::PathBuf> = Vec::new();
+    for path_str in base_commits.keys() {
+        if let Some(root) = resolve_repo_root(std::path::Path::new(path_str)) {
+            push_unique_repo(&mut repos, root);
+        }
+    }
+    for discovered in discover_git_repos(cwd, goal) {
+        push_unique_repo(&mut repos, discovered);
+    }
+    if repos.is_empty() {
+        return (Vec::new(), String::new());
+    }
+
+    let trimmed_cwd = cwd.trim();
+    let canonical_cwd = (!trimmed_cwd.is_empty()).then(|| {
+        std::path::Path::new(trimmed_cwd)
+            .canonicalize()
+            .ok()
+            .unwrap_or_else(|| std::path::PathBuf::from(trimmed_cwd))
+    });
+    let multi_repo = repos.len() > 1
+        || repos
+            .first()
+            .is_some_and(|first| canonical_cwd.as_ref().is_none_or(|c| c != first));
+
+    let mut all_files: Vec<ChangedFile> = Vec::new();
+    let mut combined = String::new();
+    let total_budget = 8_000usize;
+
+    for (idx, repo_dir) in repos.iter().enumerate() {
+        let key = repo_dir.to_string_lossy();
+        let base = base_commits
+            .get(key.as_ref())
+            .map(String::as_str)
+            .or(if idx == 0 { legacy_base } else { None });
+        let mut numstat_args = vec!["diff", "--numstat"];
+        let mut stat_args = vec!["diff", "--stat"];
+        let mut raw_args = vec!["diff", "--no-color"];
+        if let Some(rev) = base {
+            numstat_args.push(rev);
+            stat_args.push(rev);
+            raw_args.push(rev);
+        }
+        let numstat = run_git_cmd(repo_dir, &numstat_args).unwrap_or_default();
+        let status = run_git_cmd(repo_dir, &["status", "--porcelain"]).unwrap_or_default();
+        let stat = run_git_cmd(repo_dir, &stat_args).unwrap_or_default();
+        let raw = run_git_cmd(repo_dir, &raw_args).unwrap_or_default();
+
+        let mut parsed: Vec<ChangedFile> = Vec::new();
+        for line in numstat.lines().take(32) {
+            let mut parts = line.split('\t');
+            if let (Some(a), Some(d), Some(path)) = (parts.next(), parts.next(), parts.next()) {
+                parsed.push(ChangedFile {
+                    path: path.trim().to_string(),
+                    additions: a.trim().parse().unwrap_or(0),
+                    deletions: d.trim().parse().unwrap_or(0),
+                });
+            }
+        }
+        let mut untracked_notes = Vec::new();
+        for line in status.lines().take(32) {
+            if let Some(rest) = line.strip_prefix("?? ") {
+                let clean = rest.trim().trim_matches('"');
+                if !clean.is_empty() && !parsed.iter().any(|f| f.path == clean) {
+                    let full = repo_dir.join(clean);
+                    let lines = std::fs::metadata(&full)
+                        .ok()
+                        .filter(|m| m.is_file() && m.len() <= 131_072)
+                        .and_then(|_| std::fs::read_to_string(&full).ok())
+                        .map(|body| body.lines().count())
+                        .unwrap_or(0);
+                    parsed.push(ChangedFile {
+                        path: clean.to_string(),
+                        additions: lines,
+                        deletions: 0,
+                    });
+                    untracked_notes.push(format!("- {clean} (new file, +{lines} lines)"));
+                }
+            }
+        }
+        if parsed.is_empty() {
+            for line in status.lines().take(32) {
+                if line.len() >= 4 {
+                    let clean = line[3..].trim().trim_matches('"');
+                    if !clean.is_empty() {
+                        parsed.push(ChangedFile {
+                            path: clean.to_string(),
+                            additions: 0,
+                            deletions: 0,
+                        });
+                    }
+                }
+            }
+        }
+
+        if parsed.is_empty() && status.trim().is_empty() && raw.trim().is_empty() {
+            continue;
+        }
+
+        let repo_name = repo_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("repo");
+        for mut file in parsed {
+            if multi_repo {
+                file.path = format!("{repo_name}/{}", file.path);
+            }
+            all_files.push(file);
+            if all_files.len() >= 48 {
+                break;
+            }
+        }
+
+        if multi_repo {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(&format!(
+                "=== Repository: {repo_name} ({}) ===\n",
+                repo_dir.display()
+            ));
+        }
+        if !status.trim().is_empty() {
+            combined.push_str("Git status:\n");
+            combined.push_str(status.trim());
+            combined.push('\n');
+        }
+        if !stat.trim().is_empty() {
+            combined.push_str("\nGit diff --stat:\n");
+            combined.push_str(stat.trim());
+            combined.push('\n');
+        }
+        if !untracked_notes.is_empty() {
+            combined.push_str("\nNew untracked files:\n");
+            combined.push_str(&untracked_notes.join("\n"));
+            combined.push('\n');
+        }
+        if !raw.trim().is_empty() && combined.len() < total_budget {
+            let remaining = total_budget.saturating_sub(combined.len());
+            let mut cut = raw.len().min(remaining);
+            while cut > 0 && !raw.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            if cut > 0 {
+                combined.push_str("\nGit diff excerpt:\n");
+                combined.push_str(&raw[..cut]);
+                combined.push('\n');
+            }
+        }
+    }
+
+    (all_files, combined)
 }
 
 impl RunState {
     fn for_request(request: &Start) -> Self {
         let now = crate::tasks::domain::now_ms();
+        let base_commits = capture_base_commits(&request.cwd, &request.goal);
+        let base_commit = resolve_repo_root(std::path::Path::new(&request.cwd))
+            .and_then(|root| base_commits.get(&root.display().to_string()).cloned())
+            .or_else(|| base_commits.values().next().cloned());
         Self {
             round: 1,
             max_rounds: request.max_review_rounds.unwrap_or(2).clamp(1, 5),
@@ -149,7 +398,8 @@ impl RunState {
             reviewer_asid: None,
             reviewer_task_id: None,
             reviewed_round: 0,
-            base_commit: git_head_sha(&request.cwd),
+            base_commit,
+            base_commits,
             files: Vec::new(),
             coder_summary: None,
             review_summary: None,
@@ -425,8 +675,22 @@ impl Run {
     }
 
     fn coding_prompt(&self) -> String {
+        let multi_repo_hint = if self.state.base_commits.len() > 1 {
+            let repos = self
+                .state
+                .base_commits
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n- ");
+            format!(
+                "\nMulti-repository workspace detected:\n- {repos}\nCoordinate interface contracts consistently across repositories and run verification checks in each modified repo.\n"
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "Implement and verify the user goal carefully. Honor repository instructions, run relevant checks/tests to confirm your changes work cleanly, and finish with changed files, commands executed, and results.\n\n\
+            "Implement and verify the user goal carefully. Honor repository instructions, run relevant checks/tests to confirm your changes work cleanly, and finish with changed files, commands executed, and results.{multi_repo_hint}\n\n\
              User goal:\n{}",
             self.request.goal
         )
@@ -444,11 +708,17 @@ impl Run {
         } else {
             diff_summary.trim()
         };
+        let cross_repo_rule = if self.state.base_commits.len() > 1 {
+            "- Cross-repo consistency: verify API contracts, shared types, imports, and configuration changes match across every affected repository.\n"
+        } else {
+            ""
+        };
         format!(
             "You are the designated **Read-Only Code Reviewer** in an automated Coder ⇄ Reviewer pipeline (Review Round {round}/{max_rounds}).\n\n\
              STRICT RULES:\n\
              - Read-only verifier: NEVER edit, write, delete, or commit workspace source files. Only inspect diffs/files and run read-only verification checks or tests.\n\
              - NEVER ask interactive questions or wait for user confirmation; make a decisive verdict from the diff and read-only checks.\n\
+             {cross_repo_rule}\
              - Focus on correctness bugs, edge cases, regressions, security flaws, missing tests, or rule violations.\n\n\
              User task goal:\n{}\n\n\
              Coder summary:\n{coder_summary}\n\n\
