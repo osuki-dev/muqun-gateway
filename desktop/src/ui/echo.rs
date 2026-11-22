@@ -66,9 +66,23 @@ pub struct Echo {
 }
 
 /// What a user row says, as the echo compares it: the words before any
-/// "Attached files" list, trimmed.
+/// "Attached files" list or Gateway orchestration/task wrapper, trimmed.
 fn words(text: &str) -> &str {
-    prompt_display_body(text).trim()
+    let body = prompt_display_body(text).trim();
+    let body = body
+        .split_once("\n\nYou were started for a Muqun task:")
+        .map_or(body, |(head, _)| head.trim());
+    if body.starts_with("Implement and verify the user goal carefully.") {
+        if let Some((_, goal)) = body.rsplit_once("\nUser goal:\n") {
+            return goal.trim();
+        }
+    }
+    if body.starts_with("Coordinate this task") {
+        if let Some((_, goal)) = body.rsplit_once("\n\nGoal:\n") {
+            return goal.trim();
+        }
+    }
+    body
 }
 
 fn user_words(item: &TimelineItem) -> Option<&str> {

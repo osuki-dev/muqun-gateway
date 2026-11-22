@@ -5078,6 +5078,7 @@ pub fn on_gateway_orchestration(
         Ok(payload) => payload,
         Err(err) => {
             if let Some((pending_asid, token)) = pending_start {
+                s.echo_submitted(token, false);
                 if s.pending_start.as_ref().is_some_and(|(_, t)| *t == token) {
                     s.pending_start = None;
                 }
@@ -5157,6 +5158,8 @@ pub fn on_gateway_orchestration(
                 if s.pending_start.as_ref().is_some_and(|(_, t)| *t == token) {
                     s.adopt_created_session(&real_asid);
                 }
+                s.echo_submitted(token, true);
+                s.echo_rows(&real_asid);
                 s.orchestration.enabled_sessions.remove(&pending_asid);
                 s.orchestration.enabled_sessions.insert(real_asid.clone());
                 s.auto_approve.insert(real_asid.clone(), true);
@@ -5165,6 +5168,8 @@ pub fn on_gateway_orchestration(
                     s.session_opened(&info);
                 }
             } else {
+                s.echo_submitted(token, true);
+                s.echo_rows(&real_asid);
                 s.orchestration.enabled_sessions.insert(real_asid.clone());
                 s.auto_approve.insert(real_asid, true);
             }
@@ -5173,6 +5178,8 @@ pub fn on_gateway_orchestration(
             }
             s.status = "Running…".into();
             s.sync_watch();
+        } else {
+            s.echo_submitted(token, false);
         }
     }
 
@@ -6052,6 +6059,7 @@ MAO_VERDICT: CHANGES_REQUESTED";
         };
         s.pending_start = Some(("new-7".into(), 7));
         s.selected = Some("new-7".into());
+        s.echo_sent("new-7", 7, "Cross-machine refactor".into(), &[], None);
 
         assert!(dispatch_gateway_start(
             &mut s,
@@ -6124,6 +6132,38 @@ MAO_VERDICT: CHANGES_REQUESTED";
         assert_eq!(
             s.orchestration.runs[0].reviewer.machine.as_deref(),
             Some("mac-studio")
+        );
+        // Echo must leave `Sending` immediately once Gateway accepts the orchestration.
+        assert_eq!(
+            s.echoes
+                .get("coder-gw-99")
+                .and_then(|list| list.first())
+                .map(|e| e.state),
+            Some(super::super::echo::EchoState::Sent)
+        );
+        // Wrapped provider user row reconciles and drops the optimistic echo cleanly.
+        s.timelines
+            .entry("coder-gw-99".into())
+            .or_default()
+            .replace(vec![serde_json::from_value(serde_json::json!({
+                "id": "u1",
+                "message_id": "m_u1",
+                "role": "user",
+                "part": {
+                    "type": "text",
+                    "text": "Implement and verify the user goal carefully. Honor repository instructions, run relevant checks/tests to confirm your changes work cleanly, and finish with changed files, commands executed, and results.\n\nUser goal:\nCross-machine refactor\n\nYou were started for a Muqun task: call tasks.complete."
+                },
+                "seq": 1,
+                "updated_ms": 2,
+                "ordinal": 0
+            }))
+            .unwrap()]);
+        s.echo_rows("coder-gw-99");
+        assert!(
+            s.echoes
+                .get("coder-gw-99")
+                .is_none_or(|list| list.is_empty()),
+            "optimistic echo should reconcile against wrapped orchestration prompt"
         );
 
         // Control actions on o_* runs forward to Gateway endpoints (with optional extra rework note).
