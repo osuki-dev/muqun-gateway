@@ -692,6 +692,41 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
 // Core implementation functions (pure OpenCode, zero herdr/tmux dependency)
 // ---------------------------------------------------------------------------
 
+fn validate_session_directory(directory: Option<&str>) -> ApiResult<Option<String>> {
+    let expanded = expand_directory_param(directory);
+    match expanded.as_deref() {
+        Some(dir) if !dir.trim().is_empty() => {
+            let p = std::path::Path::new(dir.trim());
+            if !p.is_absolute() {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_directory",
+                    "Working directory must be an absolute path",
+                ));
+            }
+            let canonical = std::fs::canonicalize(p).map_err(|e| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "directory_not_found",
+                    &format!("Directory does not exist or is inaccessible: {e}"),
+                )
+            })?;
+            if !canonical.is_dir() {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "not_a_directory",
+                    "Specified path is not a directory",
+                ));
+            }
+            Ok(Some(canonical.to_string_lossy().to_string()))
+        }
+        // The App shows `~/` for a session it opens without naming a folder,
+        // so that is the folder it gets. Left as `None`, OpenCode used its own
+        // cwd and DeepSeek Harness refused the relative "." outright.
+        _ => Ok(dirs::home_dir().map(|home| home.to_string_lossy().to_string())),
+    }
+}
+
 async fn warm_agent(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
@@ -706,17 +741,7 @@ async fn warm_agent(
     let manager = agent_manager_or_err(&state, &agent_id).await?;
     let auto_approve = body.auto_approve == Some(true);
     refuse_remote_elevation(&state, &headers, auto_approve)?;
-    let dir = expand_directory_param(body.directory.as_deref()).and_then(|d| {
-        let p = std::path::Path::new(d.trim());
-        if p.is_absolute() {
-            std::fs::canonicalize(p)
-                .ok()
-                .filter(|c| c.is_dir())
-                .map(|c| c.to_string_lossy().to_string())
-        } else {
-            None
-        }
-    });
+    let dir = validate_session_directory(body.directory.as_deref())?;
     tokio::spawn(async move {
         let _ = manager
             .agent()
@@ -903,38 +928,7 @@ async fn do_create_agent_session(
             }),
     )?;
 
-    let directory = expand_directory_param(body.directory.as_deref());
-    let validated_dir = match directory.as_deref() {
-        Some(dir) if !dir.trim().is_empty() => {
-            let p = std::path::Path::new(dir.trim());
-            if !p.is_absolute() {
-                return Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_directory",
-                    "Working directory must be an absolute path",
-                ));
-            }
-            let canonical = std::fs::canonicalize(p).map_err(|e| {
-                api_error(
-                    StatusCode::BAD_REQUEST,
-                    "directory_not_found",
-                    &format!("Directory does not exist or is inaccessible: {e}"),
-                )
-            })?;
-            if !canonical.is_dir() {
-                return Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    "not_a_directory",
-                    "Specified path is not a directory",
-                ));
-            }
-            Some(canonical.to_string_lossy().to_string())
-        }
-        // The App shows `~/` for a session it opens without naming a folder,
-        // so that is the folder it gets. Left as `None`, OpenCode used its own
-        // cwd and DeepSeek Harness refused the relative "." outright.
-        _ => dirs::home_dir().map(|home| home.to_string_lossy().to_string()),
-    };
+    let validated_dir = validate_session_directory(body.directory.as_deref())?;
 
     let session = manager
         .sessions()
@@ -5974,6 +5968,51 @@ mod tests {
                 "{typed}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn warm_agent_rejects_invalid_or_missing_explicit_directory() {
+        let state = state_with(vec![FakeAgent::new("codex")]).await;
+        let headers = device_headers();
+
+        for (typed, code) in [
+            ("~nobody", "invalid_directory"),
+            ("relative/dir", "invalid_directory"),
+            ("~/muqun-no-such-dir-for-tests", "directory_not_found"),
+        ] {
+            let refusal = warm_agent(
+                State(state.clone()),
+                Path("codex".into()),
+                headers.clone(),
+                Some(Json(WarmAgentBody {
+                    directory: Some(typed.into()),
+                    auto_approve: None,
+                })),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{typed} should be refused"));
+            assert_eq!(refusal.0, StatusCode::BAD_REQUEST, "{typed}");
+            assert_eq!(
+                crate::test_support::error_body(&refusal)["error"]["code"],
+                code,
+                "{typed}"
+            );
+        }
+
+        let home = std::fs::canonicalize(dirs::home_dir().unwrap()).unwrap();
+        let ok = warm_agent(
+            State(state),
+            Path("codex".into()),
+            headers,
+            Some(Json(WarmAgentBody {
+                directory: Some(home.to_string_lossy().into_owned()),
+                auto_approve: None,
+            })),
+        )
+        .await
+        .expect("valid directory succeeds");
+        assert_eq!(ok.0["ok"], true);
     }
 
     #[tokio::test]
