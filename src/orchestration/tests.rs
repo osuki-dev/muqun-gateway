@@ -1057,3 +1057,188 @@ async fn runtime_reviewer_rate_limit_failure_auto_switches_to_next_configured_ag
 
     let _ = std::fs::remove_dir_all(&ws);
 }
+
+#[test]
+fn account_limits_with_no_extra_credits_but_open_rate_window_is_not_exhausted() {
+    use crate::agents::domain::account_limits::{
+        AccountLimit, AccountLimitWindow, AccountLimits, Credits,
+    };
+
+    let limits = AccountLimits {
+        status: "available",
+        reason: None,
+        observed_at_ms: 1,
+        ordinary_usage_allowed: Some(true),
+        reset_credits: None,
+        limits: vec![AccountLimit {
+            id: "sub".into(),
+            name: Some("Plus".into()),
+            plan_type: Some("plus".into()),
+            model_id: None,
+            credits: Some(Credits {
+                has_credits: Some(false),
+                unlimited: Some(false),
+                balance: Some("0".into()),
+            }),
+            individual_limit: None,
+            spend_control_reached: Some(false),
+            limit_reached_reason: None,
+            windows: vec![AccountLimitWindow {
+                id: "5h".into(),
+                label: Some("5h".into()),
+                unit: "percent".into(),
+                used: Some(25.0),
+                limit: Some(100.0),
+                remaining: Some(75.0),
+                window_duration_minutes: Some(300),
+                resets_at_ms: None,
+            }],
+        }],
+    };
+    assert!(
+        super::is_account_limits_exhausted(&limits, None).is_none(),
+        "has_credits=false must not mark an account with remaining rate windows as exhausted"
+    );
+}
+
+#[tokio::test]
+async fn pool_instruction_reaches_coder_on_turn_one_and_failover_skips_same_agent_default_and_persists_task_id(
+) {
+    let state = state();
+    let claude = FakeAgent::new("claude").with_sessions(&[("claude_s1", 1)]);
+    let claude_prompts = claude.prompts.clone();
+    let codex = FakeAgent::new("codex").with_sessions(&[("codex_s1", 1)]);
+    let codex_prompts = codex.prompts.clone();
+    state.agent_runtime.attach_for_test(claude.manager()).await;
+    state.agent_runtime.attach_for_test(codex.manager()).await;
+
+    let mut req = request();
+    req.client_ref = "pool-turn1-1".into();
+    req.coordinator = "claude".into();
+    req.model = Some("anthropic/claude-opus-4-6".into());
+    req.reviewer = Some(ReviewerSpec {
+        agent: "codex".into(),
+        model: None,
+        variant: None,
+        machine: None,
+    });
+    req.auto_failover = Some(true);
+    // Pool includes a model-less `claude` entry BEFORE `codex`: exhausting `claude` with
+    // an explicit model must NOT bounce back to `claude (model: None)`!
+    req.agent_pool = vec![
+        ReviewerSpec {
+            agent: "claude".into(),
+            model: None,
+            variant: None,
+            machine: None,
+        },
+        ReviewerSpec {
+            agent: "codex".into(),
+            model: None,
+            variant: None,
+            machine: None,
+        },
+    ];
+
+    let (status, started) = call(&state, "token", "POST", "/api/orchestrations", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    // Turn 1 coder prompt received the user-configured candidate pool instructions!
+    {
+        let turn1_prompts = claude_prompts.lock().unwrap();
+        assert_eq!(turn1_prompts.len(), 1);
+        assert!(
+            turn1_prompts[0].contains("User-configured agent & model pool"),
+            "expected turn 1 prompt to carry pool instruction: {}",
+            turn1_prompts[0]
+        );
+    }
+
+    // Persisted task_id is saved in SQLite right away.
+    let run_id = started["run"]["id"].as_str().unwrap().to_string();
+    let persisted = store::read(&state.db, run_id.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(persisted.task_id.is_some());
+
+    // Fail primary coder with quota error -> switches straight to codex (skipping claude default),
+    // and completing codex with zero workspace changes does NOT misreport the `:failover:` task
+    // as an MCP child task!
+    let root_tid = persisted.task_id.unwrap();
+    let task_store = SqliteTaskStore::new(state.db.clone());
+    task_store
+        .transition(
+            &TaskId(root_tid),
+            crate::tasks::domain::TaskChange {
+                reopen: false,
+                reopen_count: None,
+                reopened_ms: None,
+                expected_seq: None,
+                to: TaskState::Failed,
+                source: "test".into(),
+                note: None,
+                summary: Some("HTTP 429 rate limit exceeded".into()),
+                exit_code: None,
+                binding: None,
+                session_title: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (status, after_fo) = call(
+        &state,
+        "token",
+        "GET",
+        &format!("/api/orchestrations/{run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{after_fo}");
+    assert_eq!(after_fo["coder"]["agent"], "codex");
+    assert_eq!(codex_prompts.lock().unwrap().len(), 1);
+    let fo_tid = after_fo["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|s| s["kind"] == "coding")
+        .and_then(|s| s["task_id"].as_str())
+        .unwrap()
+        .to_string();
+
+    // Mark fallback coder done with no git diff -> must skip review (failover child excluded).
+    task_store
+        .transition(
+            &TaskId(fo_tid),
+            crate::tasks::domain::TaskChange {
+                reopen: false,
+                reopen_count: None,
+                reopened_ms: None,
+                expected_seq: None,
+                to: TaskState::Done,
+                source: "test".into(),
+                note: None,
+                summary: Some("Answered directly, no code changes".into()),
+                exit_code: Some(0),
+                binding: None,
+                session_title: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (status, done) = call(
+        &state,
+        "token",
+        "GET",
+        &format!("/api/orchestrations/{run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    assert_eq!(
+        done["mao_phase"], "approved",
+        "internal failover child task must not force code review when no files changed: {done}"
+    );
+}

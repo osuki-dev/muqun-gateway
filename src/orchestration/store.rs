@@ -90,6 +90,21 @@ pub(super) async fn save_state(
     .await
 }
 
+pub(super) async fn set_task_id(
+    db: &SqliteStore,
+    id: String,
+    task_id: String,
+) -> anyhow::Result<()> {
+    db.call(move |db| {
+        db.execute(
+            "UPDATE orchestration_runs SET task_id=?2 WHERE id=?1",
+            params![id, task_id],
+        )?;
+        Ok(())
+    })
+    .await
+}
+
 pub(super) async fn read(db: &SqliteStore, id: String) -> anyhow::Result<Option<Run>> {
     db.call(move |db| {
         Ok(db
@@ -141,10 +156,12 @@ pub(super) async fn recover(db: &SqliteStore, run: Run) -> anyhow::Result<Run> {
                 kind: crate::tasks::domain::PrincipalKind::Device,
                 id: run.owner.clone(),
             })?;
+            let exact_ref = run.task_ref();
+            let failover_like = format!("{exact_ref}:failover:%");
             run.task_id = db
                 .query_row(
-                    "SELECT id FROM tasks WHERE client_ref=?1 AND created_by=?2 AND parent_task_id IS NULL ORDER BY created_ms LIMIT 1",
-                    params![run.task_ref(), owner],
+                    "SELECT id FROM tasks WHERE (client_ref=?1 OR client_ref LIKE ?2) AND created_by=?3 AND parent_task_id IS NULL ORDER BY created_ms DESC LIMIT 1",
+                    params![exact_ref, failover_like, owner],
                     |row| row.get(0),
                 )
                 .optional()?;

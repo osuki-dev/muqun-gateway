@@ -205,8 +205,8 @@ pub enum OpenMenu {
     ViewerImageActions,
     /// The tasks page's computer filter picker.
     TasksComputerPicker,
-    /// MAO reviewer agent / model / effort / rounds menu.
-    MaoReviewer(Slot),
+    /// MAO reviewer agent / model / effort / rounds menu, keyed by surface anchor.
+    MaoReviewer(orchestration::MaoMenuAnchor),
     /// Settings → Agents MAO candidate pool add-entry menu.
     MaoPoolAdd,
 }

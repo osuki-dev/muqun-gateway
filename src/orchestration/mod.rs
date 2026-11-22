@@ -8,6 +8,7 @@ mod tests;
 pub(crate) use routes::{mount, spawn_reconciler};
 pub(crate) use store::MIGRATION;
 pub(crate) const CAPABILITY: &str = "agent_orchestration_preview_v1";
+pub(crate) const POOL_CAPABILITY: &str = "agent_orchestration_pool_v1";
 
 use serde::{Deserialize, Serialize};
 
@@ -251,38 +252,38 @@ fn bare_model_name(model: &str) -> &str {
 pub fn is_account_limits_exhausted(
     limits: &crate::agents::domain::account_limits::AccountLimits,
     target_model: Option<&str>,
-) -> Option<String> {
+) -> Option<(String, bool)> {
     if limits.status != "available" {
         return None;
     }
     if limits.ordinary_usage_allowed == Some(false) {
-        return Some("account usage limit reached".into());
+        return Some(("account usage limit reached".into(), true));
     }
     let target_bare = target_model
         .map(bare_model_name)
         .filter(|m| !m.is_empty())
         .map(str::to_ascii_lowercase);
     for limit in &limits.limits {
-        if let (Some(limit_model), Some(target)) = (
-            limit
-                .model_id
-                .as_deref()
-                .map(bare_model_name)
-                .filter(|m| !m.is_empty()),
-            target_bare.as_deref(),
-        ) {
+        let model_scoped = limit
+            .model_id
+            .as_deref()
+            .map(bare_model_name)
+            .filter(|m| !m.is_empty());
+        if let (Some(limit_model), Some(target)) = (model_scoped, target_bare.as_deref()) {
             let lm = limit_model.to_ascii_lowercase();
             if lm != target && !lm.contains(target) && !target.contains(&lm) {
                 continue;
             }
         }
+        let agent_wide = model_scoped.is_none();
         if limit.spend_control_reached == Some(true) {
-            return Some(
+            return Some((
                 limit
                     .limit_reached_reason
                     .clone()
                     .unwrap_or_else(|| "spend control limit reached".into()),
-            );
+                agent_wide,
+            ));
         }
         if let Some(reason) = limit
             .limit_reached_reason
@@ -290,7 +291,7 @@ pub fn is_account_limits_exhausted(
             .map(str::trim)
             .filter(|r| !r.is_empty())
         {
-            return Some(reason.to_string());
+            return Some((reason.to_string(), agent_wide));
         }
         if limit
             .individual_limit
@@ -298,27 +299,32 @@ pub fn is_account_limits_exhausted(
             .and_then(|il| il.remaining_percent)
             .is_some_and(|pct| pct <= 0.5)
         {
-            return Some("individual quota exhausted".into());
+            return Some(("individual quota exhausted".into(), agent_wide));
         }
-        if limit
-            .credits
-            .as_ref()
-            .is_some_and(|c| c.has_credits == Some(false) && c.unlimited != Some(true))
+        // Only treat missing extra credits as exhausted when the provider reports no
+        // included rate windows at all (subscription accounts routinely have
+        // `has_credits: false` for optional overage credits while included windows
+        // still have remaining capacity).
+        if limit.windows.is_empty()
+            && limit
+                .credits
+                .as_ref()
+                .is_some_and(|c| c.has_credits == Some(false) && c.unlimited != Some(true))
         {
-            return Some("account credits exhausted".into());
+            return Some(("account credits exhausted".into(), agent_wide));
         }
         for w in &limit.windows {
             let label = w.label.as_deref().unwrap_or(&w.id);
             if w.remaining.is_some_and(|r| r <= 0.0) {
-                return Some(format!("rate window `{label}` exhausted"));
+                return Some((format!("rate window `{label}` exhausted"), agent_wide));
             }
             if let (Some(used), Some(cap)) = (w.used, w.limit) {
                 if cap > 0.0 && used >= cap {
-                    return Some(format!("rate window `{label}` reached 100%"));
+                    return Some((format!("rate window `{label}` reached 100%"), agent_wide));
                 }
             }
             if w.unit.eq_ignore_ascii_case("percent") && w.used.is_some_and(|u| u >= 99.5) {
-                return Some(format!("rate window `{label}` reached 100%"));
+                return Some((format!("rate window `{label}` reached 100%"), agent_wide));
             }
         }
     }

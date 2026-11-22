@@ -109,37 +109,83 @@ fn agent_asid(binding: &TaskBinding) -> Option<(String, String)> {
     }
 }
 
-fn mark_candidate_exhausted(exhausted: &mut Vec<String>, spec: &ReviewerSpec) {
+fn candidate_agent_key(spec: &ReviewerSpec) -> String {
+    format!(
+        "agent:{}|{}",
+        spec.agent.trim().to_ascii_lowercase(),
+        spec.machine
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+    )
+}
+
+fn mark_candidate_exhausted(exhausted: &mut Vec<String>, spec: &ReviewerSpec, agent_wide: bool) {
     let key = candidate_key(spec);
     if !exhausted.contains(&key) {
         exhausted.push(key);
+    }
+    if agent_wide || spec.model.is_none() {
+        let akey = candidate_agent_key(spec);
+        if !exhausted.contains(&akey) {
+            exhausted.push(akey);
+        }
     }
 }
 
 fn is_candidate_exhausted(exhausted: &[String], spec: &ReviewerSpec) -> bool {
     let key = candidate_key(spec);
-    exhausted.contains(&key)
+    let akey = candidate_agent_key(spec);
+    if exhausted.contains(&key) || exhausted.contains(&akey) {
+        return true;
+    }
+    if spec.model.is_none() {
+        let agent_prefix = format!("{}|", spec.agent.trim().to_ascii_lowercase());
+        let machine_suffix = format!(
+            "|{}",
+            spec.machine
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+        );
+        if exhausted
+            .iter()
+            .any(|e| e.starts_with(&agent_prefix) && e.ends_with(&machine_suffix))
+        {
+            return true;
+        }
+    }
+    false
 }
 
+/// Returns `Err((reason, agent_wide))` if the candidate is disconnected, missing
+/// required MCP tools, or has exhausted its account/model rate window.
 async fn check_candidate_quota(
     state: &AppState,
     spec: &ReviewerSpec,
     require_mcp: bool,
-) -> Result<(), String> {
+) -> Result<(), (String, bool)> {
     if spec.machine.is_some() {
         return Ok(());
     }
     let Some(manager) = state.agent_runtime.manager_for_agent(&spec.agent).await else {
-        return Err(format!("agent `{}` is not connected", spec.agent));
+        return Err((format!("agent `{}` is not connected", spec.agent), true));
     };
     if require_mcp
         && (!crate::mcp::inject::enabled(&state.config) || !manager.agent().adds_mcp_servers())
     {
-        return Err(format!("agent `{}` has no Muqun MCP tools", spec.agent));
+        return Err((
+            format!("agent `{}` has no Muqun MCP tools", spec.agent),
+            true,
+        ));
     }
     if let Ok(limits) = manager.agent().account_limits().await {
-        if let Some(reason) = is_account_limits_exhausted(&limits, spec.model.as_deref()) {
-            return Err(reason);
+        if let Some((reason, agent_wide)) =
+            is_account_limits_exhausted(&limits, spec.model.as_deref())
+        {
+            return Err((reason, agent_wide));
         }
     }
     Ok(())
@@ -176,28 +222,12 @@ async fn select_fallback_candidate(
     None
 }
 
-async fn apply_pool_instruction(
-    state: &AppState,
-    agent_id: &str,
-    asid: &str,
-    pool: &[ReviewerSpec],
-) {
-    if pool.is_empty() || !crate::mcp::inject::enabled(&state.config) {
-        return;
+fn pool_instruction_for(run: &Run) -> Option<String> {
+    if run.request.agent_pool.is_empty() {
+        return None;
     }
-    let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await else {
-        return;
-    };
-    if !manager.agent().takes_session_instructions() {
-        return;
-    }
-    let instruction = super::format_agent_pool_instruction(pool);
-    if !instruction.is_empty() {
-        let _ = manager
-            .agent()
-            .set_session_instruction(asid, "muqun_orchestration_pool", &instruction)
-            .await;
-    }
+    let text = super::format_agent_pool_instruction(&run.request.agent_pool);
+    (!text.is_empty()).then_some(text)
 }
 
 fn task_failure_reason(task: &TaskView) -> String {
@@ -261,10 +291,13 @@ async fn latest_assistant_text(state: &AppState, agent_id: &str, asid: &str) -> 
 fn collect_task_tree_evidence(tasks: &[TaskView], root_id: &str, run_task_ref: &str) -> String {
     let review_prefix = format!("{run_task_ref}:review:");
     let rework_prefix = format!("{run_task_ref}:rework:");
+    let failover_prefix = format!("{run_task_ref}:failover:");
     let mut lines = Vec::new();
     for task in tasks {
         let is_internal_step = task.client_ref.as_deref().is_some_and(|cref| {
-            cref.starts_with(&review_prefix) || cref.starts_with(&rework_prefix)
+            cref.starts_with(&review_prefix)
+                || cref.starts_with(&rework_prefix)
+                || cref.starts_with(&failover_prefix)
         });
         if is_internal_step {
             continue;
@@ -566,8 +599,9 @@ async fn reconcile_pipeline(
             let quota_err = check_candidate_quota(state, &active_coder, requires_mcp)
                 .await
                 .err();
+            let agent_wide = quota_err.as_ref().is_none_or(|(_, wide)| *wide);
             if reason.is_empty() {
-                if let Some(ref q) = quota_err {
+                if let Some((ref q, _)) = quota_err {
                     reason = q.clone();
                 }
             }
@@ -575,7 +609,11 @@ async fn reconcile_pipeline(
                 && run.state.failover_count < max_failovers
                 && (quota_err.is_some() || is_quota_or_capacity_error(&reason));
             if should_failover {
-                mark_candidate_exhausted(&mut run.state.exhausted_candidates, &active_coder);
+                mark_candidate_exhausted(
+                    &mut run.state.exhausted_candidates,
+                    &active_coder,
+                    agent_wide,
+                );
                 if let Some(next_coder) = select_fallback_candidate(
                     state,
                     &run.request.agent_pool,
@@ -627,14 +665,38 @@ async fn reconcile_pipeline(
                         name: None,
                         server_id: None,
                     };
+                    let is_rework_round = round > 1;
                     let failover_goal = if run.request.reviewer.is_some() {
-                        format!(
-                            "Previous agent ({prev_label}) reached a quota/rate limit. Inspect any partial changes already in the workspace and complete the user goal:\n\n{}",
-                            run.request.goal.trim()
-                        )
+                        if is_rework_round {
+                            let feedback =
+                                run.state.review_summary.as_deref().unwrap_or(
+                                    "Address the review findings from the previous round.",
+                                );
+                            let issues_block = format_findings_for_rework(&run.state.findings);
+                            format!(
+                                "[MAO Automated Rework · Round {round}/{}]\n\n\
+                                 Previous agent ({prev_label}) reached a quota/rate limit during rework. \
+                                 Inspect any partial workspace changes and finish addressing all review feedback for task:\n{}\n\n\
+                                 Review feedback:\n{feedback}{issues_block}\n\n\
+                                 Fix every raised issue, re-run verification checks, and summarize your changes.",
+                                run.state.max_rounds,
+                                run.request.goal.trim()
+                            )
+                        } else {
+                            format!(
+                                "Previous agent ({prev_label}) reached a quota/rate limit. Inspect any partial changes already in the workspace and complete the user goal:\n\n{}",
+                                run.request.goal.trim()
+                            )
+                        }
                     } else {
                         run.prompt()
                     };
+                    let extra_inst = run
+                        .request
+                        .reviewer
+                        .is_some()
+                        .then(|| pool_instruction_for(run))
+                        .flatten();
                     let delegated = state
                         .tasks
                         .delegate_in_session(
@@ -662,25 +724,33 @@ async fn reconcile_pipeline(
                             None,
                             Some(&run.request.goal),
                             run.request.auto_approve.unwrap_or(true),
+                            extra_inst.as_deref(),
                         )
                         .await;
+                    let step_kind = if is_rework_round { "rework" } else { "coding" };
+                    let step_title = if is_rework_round {
+                        format!("Rework #{round} · {}", next_coder.agent)
+                    } else {
+                        format!("Coding #{round} · {}", next_coder.agent)
+                    };
                     match delegated {
                         Ok(task) => {
                             if let Some((_, asid)) = agent_asid(&task.binding) {
-                                run.state.coder_asid = Some(asid.clone());
-                                apply_pool_instruction(
-                                    state,
-                                    &next_coder.agent,
-                                    &asid,
-                                    &run.request.agent_pool,
-                                )
-                                .await;
+                                run.state.coder_asid = Some(asid);
                             }
                             run.state.steps.push(PipelineStep {
-                                kind: "coding".into(),
+                                kind: step_kind.into(),
                                 round,
-                                title: format!("Coding #{round} · {}", next_coder.agent),
-                                detail: concise_excerpt(&run.request.goal, 180),
+                                title: step_title,
+                                detail: if is_rework_round {
+                                    run.state
+                                        .review_summary
+                                        .as_deref()
+                                        .map(|s| concise_excerpt(s, 220))
+                                        .unwrap_or_else(|| concise_excerpt(&run.request.goal, 180))
+                                } else {
+                                    concise_excerpt(&run.request.goal, 180)
+                                },
                                 status: "running".into(),
                                 asid: run.state.coder_asid.clone(),
                                 task_id: Some(task.task_id.clone()),
@@ -706,9 +776,9 @@ async fn reconcile_pipeline(
                             run.state.review_summary =
                                 Some(format!("Fallback coder dispatch failed: {error}"));
                             run.state.steps.push(PipelineStep {
-                                kind: "coding".into(),
+                                kind: step_kind.into(),
                                 round,
-                                title: format!("Coding #{round} · {}", next_coder.agent),
+                                title: step_title,
                                 detail: error.to_string(),
                                 status: "failed".into(),
                                 asid: None,
@@ -791,9 +861,12 @@ async fn reconcile_pipeline(
             .await;
             let review_prefix = format!("{}:review:", run.task_ref());
             let rework_prefix = format!("{}:rework:", run.task_ref());
+            let failover_prefix = format!("{}:failover:", run.task_ref());
             let has_child_or_peer_tasks = tasks.iter().any(|t| {
                 let is_internal = t.client_ref.as_deref().is_some_and(|c| {
-                    c.starts_with(&review_prefix) || c.starts_with(&rework_prefix)
+                    c.starts_with(&review_prefix)
+                        || c.starts_with(&rework_prefix)
+                        || c.starts_with(&failover_prefix)
                 });
                 !is_internal && (t.task_id != root || matches!(t.binding, TaskBinding::Peer { .. }))
             });
@@ -859,8 +932,14 @@ async fn reconcile_pipeline(
             run.state.last_diff_fingerprint = Some(fp);
             // Proactive pre-dispatch quota / availability failover for Reviewer.
             if auto_failover && run.state.failover_count < max_failovers {
-                if let Err(reason) = check_candidate_quota(state, &rev_spec, false).await {
-                    mark_candidate_exhausted(&mut run.state.exhausted_candidates, &rev_spec);
+                if let Err((reason, agent_wide)) =
+                    check_candidate_quota(state, &rev_spec, false).await
+                {
+                    mark_candidate_exhausted(
+                        &mut run.state.exhausted_candidates,
+                        &rev_spec,
+                        agent_wide,
+                    );
                     if let Some(next_rev) = select_fallback_candidate(
                         state,
                         &run.request.agent_pool,
@@ -929,12 +1008,13 @@ async fn reconcile_pipeline(
                     run.state.reviewer_asid.as_deref(),
                     Some(&format!("MAO Code Review #{round}")),
                     run.request.auto_approve.unwrap_or(true),
+                    None,
                 )
                 .await;
             if let Err(ref err) = delegated {
                 let err_msg = err.to_string();
                 if auto_failover && run.state.failover_count < max_failovers {
-                    mark_candidate_exhausted(&mut run.state.exhausted_candidates, &rev_spec);
+                    mark_candidate_exhausted(&mut run.state.exhausted_candidates, &rev_spec, true);
                     if let Some(next_rev) = select_fallback_candidate(
                         state,
                         &run.request.agent_pool,
@@ -991,6 +1071,7 @@ async fn reconcile_pipeline(
                                 None,
                                 Some(&format!("MAO Code Review #{round}")),
                                 run.request.auto_approve.unwrap_or(true),
+                                None,
                             )
                             .await;
                     }
@@ -1156,6 +1237,7 @@ async fn reconcile_pipeline(
                                     run.state.coder_asid.as_deref(),
                                     Some(&format!("MAO Rework #{next_round}")),
                                     run.request.auto_approve.unwrap_or(true),
+                                    None,
                                 )
                                 .await;
                             let rework_tid = delegated.as_ref().ok().map(|t| t.task_id.clone());
@@ -1204,8 +1286,9 @@ async fn reconcile_pipeline(
                         let round = run.state.round;
                         let mut reason = task_failure_reason(rt);
                         let quota_err = check_candidate_quota(state, &rev_spec, false).await.err();
+                        let agent_wide = quota_err.as_ref().is_none_or(|(_, wide)| *wide);
                         if reason.is_empty() {
-                            if let Some(ref q) = quota_err {
+                            if let Some((ref q, _)) = quota_err {
                                 reason = q.clone();
                             }
                         }
@@ -1216,6 +1299,7 @@ async fn reconcile_pipeline(
                             mark_candidate_exhausted(
                                 &mut run.state.exhausted_candidates,
                                 &rev_spec,
+                                agent_wide,
                             );
                             if let Some(next_rev) = select_fallback_candidate(
                                 state,
@@ -1332,6 +1416,7 @@ async fn reconcile_pipeline(
                                         None,
                                         Some(&format!("MAO Code Review #{round}")),
                                         run.request.auto_approve.unwrap_or(true),
+                                        None,
                                     )
                                     .await;
                                 match delegated {
@@ -1630,12 +1715,12 @@ async fn start(
     };
     let mut effective_coder = primary_coder.clone();
     let mut effective_asid = request.asid.clone();
-    let mut pre_failover: Option<(ReviewerSpec, ReviewerSpec, String)> = None;
+    let mut pre_failover: Option<(ReviewerSpec, ReviewerSpec, String, bool)> = None;
     let primary_health = check_candidate_quota(&state, &primary_coder, requires_mcp).await;
-    if let Err(reason) = primary_health {
+    if let Err((reason, agent_wide)) = primary_health {
         if auto_failover {
             let mut exhausted = Vec::new();
-            mark_candidate_exhausted(&mut exhausted, &primary_coder);
+            mark_candidate_exhausted(&mut exhausted, &primary_coder, agent_wide);
             if let Some(fallback) = select_fallback_candidate(
                 &state,
                 &request.agent_pool,
@@ -1645,7 +1730,7 @@ async fn start(
             )
             .await
             {
-                pre_failover = Some((primary_coder.clone(), fallback.clone(), reason));
+                pre_failover = Some((primary_coder.clone(), fallback.clone(), reason, agent_wide));
                 effective_coder = fallback;
                 effective_asid = None;
             }
@@ -1707,8 +1792,8 @@ async fn start(
     if !fresh {
         return repeated(&state, run, request).await;
     }
-    if let Some((from_spec, to_spec, reason)) = pre_failover {
-        mark_candidate_exhausted(&mut run.state.exhausted_candidates, &from_spec);
+    if let Some((from_spec, to_spec, reason, agent_wide)) = pre_failover {
+        mark_candidate_exhausted(&mut run.state.exhausted_candidates, &from_spec, agent_wide);
         run.state.active_coder = Some(to_spec.clone());
         run.state.coder_asid = None;
         run.state.failover_count = 1;
@@ -1750,6 +1835,15 @@ async fn start(
     } else {
         run.prompt()
     };
+    // Deliver the user's configured candidate pool BEFORE turn 1 via
+    // `delegate_in_session` (uses invisible `SESSION_INSTRUCTION_KEY` when
+    // supported, or prompt suffix while keeping `display_goal` clean).
+    let extra_pool_inst = run
+        .request
+        .reviewer
+        .is_some()
+        .then(|| pool_instruction_for(&run))
+        .flatten();
     let start_auto_approve = request.auto_approve.unwrap_or(true);
     let mut delegated = state
         .tasks
@@ -1778,6 +1872,7 @@ async fn start(
             effective_asid.as_deref(),
             Some(&request.goal),
             start_auto_approve,
+            extra_pool_inst.as_deref(),
         )
         .await;
     if let Err(ref error) = delegated {
@@ -1786,7 +1881,7 @@ async fn start(
             && (run.state.failover_count as usize) < request.agent_pool.len().min(6)
             && is_quota_or_capacity_error(&err_msg)
         {
-            mark_candidate_exhausted(&mut run.state.exhausted_candidates, &effective_coder);
+            mark_candidate_exhausted(&mut run.state.exhausted_candidates, &effective_coder, true);
             if let Some(fallback) = select_fallback_candidate(
                 &state,
                 &request.agent_pool,
@@ -1849,6 +1944,7 @@ async fn start(
                         None,
                         Some(&request.goal),
                         start_auto_approve,
+                        extra_pool_inst.as_deref(),
                     )
                     .await;
             }
@@ -1857,15 +1953,9 @@ async fn start(
     match &delegated {
         Ok(task) => {
             run.task_id = Some(task.task_id.clone());
+            let _ = store::set_task_id(&state.db, run.id.clone(), task.task_id.clone()).await;
             if let Some((_, asid)) = agent_asid(&task.binding) {
                 run.state.coder_asid = Some(asid.clone());
-                apply_pool_instruction(
-                    &state,
-                    &effective_coder.agent,
-                    &asid,
-                    &run.request.agent_pool,
-                )
-                .await;
                 if let Some(coding_step) = run
                     .state
                     .steps
@@ -2038,6 +2128,7 @@ async fn rework(
             run.state.coder_asid.as_deref(),
             Some(&format!("MAO Rework #{next_round}")),
             run.request.auto_approve.unwrap_or(true),
+            None,
         )
         .await;
     let rework_tid = delegated.as_ref().ok().map(|t| t.task_id.clone());

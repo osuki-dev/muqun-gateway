@@ -1338,10 +1338,11 @@ impl TaskService {
         by: Requested,
         request: DelegateRequest,
     ) -> Result<TaskView, TaskError> {
-        self.delegate_in_session(state, by, request, None, None, false)
+        self.delegate_in_session(state, by, request, None, None, false, None)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn delegate_in_session(
         &self,
         state: &AppState,
@@ -1350,6 +1351,7 @@ impl TaskService {
         existing: Option<&str>,
         display_goal: Option<&str>,
         auto_approve: bool,
+        extra_instruction: Option<&str>,
     ) -> Result<TaskView, TaskError> {
         if !is_self(
             request.machine.as_deref(),
@@ -1581,6 +1583,7 @@ impl TaskService {
             agent_id: agent_id.to_owned(),
             asid: asid.0.clone(),
         };
+        let extra_clean = extra_instruction.map(str::trim).filter(|s| !s.is_empty());
         // The task's sentence for this session only, outside its
         // conversation, where the agent takes one; removed when the task
         // ends (`driver::spawn_instruction_cleanup`).
@@ -1590,7 +1593,12 @@ impl TaskService {
         if crate::mcp::inject::enabled(&state.config) && manager.agent().task_sentence_in_prompt() {
             self.mark_task_session(&asid.0);
             let fleet = fleet_line(state, &task).await;
-            prompt_sentence = Some(crate::mcp::inject::task_sentence(fleet.as_deref()));
+            let mut sentence = crate::mcp::inject::task_sentence(fleet.as_deref());
+            if let Some(extra) = extra_clean {
+                sentence.push_str("\n\n");
+                sentence.push_str(extra);
+            }
+            prompt_sentence = Some(sentence);
         } else if crate::mcp::inject::enabled(&state.config)
             && manager.agent().takes_session_instructions()
         {
@@ -1598,17 +1606,25 @@ impl TaskService {
             // instruction may leave at once is stripped like the rest.
             self.mark_task_session(&asid.0);
             let fleet = fleet_line(state, &task).await;
+            let mut instruction = crate::mcp::inject::task_sentence(fleet.as_deref());
+            if let Some(extra) = extra_clean {
+                instruction.push_str("\n\n");
+                instruction.push_str(extra);
+            }
             match manager
                 .agent()
                 .set_session_instruction(
                     &asid.0,
                     crate::mcp::inject::SESSION_INSTRUCTION_KEY,
-                    &crate::mcp::inject::task_sentence(fleet.as_deref()),
+                    &instruction,
                 )
                 .await
             {
                 Ok(true) => {}
                 Ok(false) => {
+                    if let Some(extra) = extra_clean {
+                        prompt_sentence = Some(extra.to_string());
+                    }
                     unannounced = Some(
                         "the agent took no per-session instruction for this session; it is \
                          not told to report the task's end"
@@ -1617,11 +1633,16 @@ impl TaskService {
                 }
                 Err(error) => {
                     tracing::warn!(%error, "the task's session instruction was not set");
+                    if let Some(extra) = extra_clean {
+                        prompt_sentence = Some(extra.to_string());
+                    }
                     unannounced = Some(
                         "the task's session instruction was not set; it may end paused".to_owned(),
                     )
                 }
             }
+        } else if let Some(extra) = extra_clean {
+            prompt_sentence = Some(extra.to_string());
         }
         let dispatched = async {
             let dispatching = TaskChange {

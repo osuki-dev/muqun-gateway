@@ -587,7 +587,20 @@ impl SessionHub for RemoteHub {
                     self.call(Method::GET, &["api", "orchestrations", &id], &[], None)
                         .await
                 }
-                super::OrchestrationRequest::Start(body) => {
+                super::OrchestrationRequest::Start(mut body) => {
+                    // Older Gateways running `agent_orchestration_preview_v1` use
+                    // `deny_unknown_fields` and reject `agent_pool`/`auto_failover`
+                    // unless they also advertise `agent_orchestration_pool_v1`.
+                    if !self
+                        .has_capability("agent_orchestration_pool_v1")
+                        .await
+                        .unwrap_or(false)
+                    {
+                        if let Some(obj) = body.as_object_mut() {
+                            obj.remove("agent_pool");
+                            obj.remove("auto_failover");
+                        }
+                    }
                     self.call(Method::POST, &["api", "orchestrations"], &[], Some(body))
                         .await
                 }
