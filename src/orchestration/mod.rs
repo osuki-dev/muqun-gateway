@@ -98,6 +98,8 @@ pub struct RunState {
     pub reviewed_round: u8,
     pub base_commit: Option<String>,
     pub base_commits: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_diff_fingerprint: Option<String>,
     pub files: Vec<ChangedFile>,
     pub coder_summary: Option<String>,
     pub review_summary: Option<String>,
@@ -119,6 +121,7 @@ impl Default for RunState {
             reviewed_round: 0,
             base_commit: None,
             base_commits: std::collections::BTreeMap::new(),
+            last_diff_fingerprint: None,
             files: Vec::new(),
             coder_summary: None,
             review_summary: None,
@@ -127,6 +130,15 @@ impl Default for RunState {
             steps: Vec::new(),
         }
     }
+}
+
+pub fn diff_fingerprint(files: &[ChangedFile], diff_summary: &str) -> String {
+    let mut out = String::new();
+    for f in files {
+        out.push_str(&format!("{}:{}:{};", f.path, f.additions, f.deletions));
+    }
+    out.push_str(&format!("len={}", diff_summary.trim().len()));
+    out
 }
 
 fn run_git_cmd(dir: &std::path::Path, args: &[&str]) -> Option<String> {
@@ -637,6 +649,7 @@ impl RunState {
             reviewed_round: 0,
             base_commit,
             base_commits,
+            last_diff_fingerprint: None,
             files: Vec::new(),
             coder_summary: None,
             review_summary: None,

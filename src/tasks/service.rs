@@ -1535,10 +1535,11 @@ impl TaskService {
         } else {
             manager
                 .sessions()
-                .create_session(
+                .create_session_with_auto_approve(
                     request.cwd.as_deref(),
                     model.as_ref(),
                     request.mode.as_deref(),
+                    auto_approve,
                 )
                 .await
         };
@@ -1566,7 +1567,7 @@ impl TaskService {
             )
             .await;
         }
-        if auto_approve {
+        if auto_approve && existing.is_some() {
             if let Err(error) = manager.agent().set_auto_approve(&asid.0, true).await {
                 tracing::debug!(
                     %error,

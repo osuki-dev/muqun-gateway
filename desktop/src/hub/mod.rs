@@ -390,6 +390,34 @@ pub trait SessionHub: Send + Sync {
     /// Folders under a typed prefix, on the host the sessions run on.
     fn directories<'a>(&'a self, prefix: &'a str) -> HubFuture<'a, Completion>;
     fn create<'a>(&'a self, agent: &'a str, cwd: &'a Path) -> HubFuture<'a, AgentSessionInfo>;
+    /// Create a session and apply initial model, mode, and auto-approve in one
+    /// round-trip where the backend supports it.
+    fn create_with_options<'a>(
+        &'a self,
+        agent: &'a str,
+        cwd: &'a Path,
+        model: Option<&'a ModelRef>,
+        mode: Option<&'a str>,
+        auto_approve: bool,
+    ) -> HubFuture<'a, AgentSessionInfo> {
+        Box::pin(async move {
+            let mut info = self.create(agent, cwd).await?;
+            if let Some(m) = model {
+                if self.switch_model(&info.asid, m).await.is_ok() {
+                    info.model = Some(m.clone());
+                }
+            }
+            if let Some(m) = mode {
+                if self.switch_mode(&info.asid, m).await.is_ok() {
+                    info.mode = Some(m.to_string());
+                }
+            }
+            if auto_approve {
+                let _ = self.set_auto_approve(&info.asid, true).await;
+            }
+            Ok(info)
+        })
+    }
     /// The session's newest history and what it still has pending, after
     /// preparing it as the App's `/prepare` does (which may restore a dormant
     /// runtime or start following a terminal). For an explicit selection.

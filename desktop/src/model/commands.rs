@@ -285,6 +285,12 @@ pub enum Command {
     PluginPackage(uuid::Uuid, crate::plugin::packages::Operation, Vec<String>),
     /// Download and install a managed runtime (Bun or Herdr) on the background worker.
     InstallManagedRuntime(muqun_gateway::platform::runtimes::RuntimeKind),
+    /// Capture baseline git commits asynchronously off the main UI thread when an MAO run starts.
+    MaoCaptureBaseline {
+        run_id: String,
+        cwd: String,
+        goal: String,
+    },
     /// Gather git diff/changed-file context for an MAO Coder -> Reviewer handoff.
     MaoPrepareReview {
         run_id: String,

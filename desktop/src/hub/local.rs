@@ -243,12 +243,23 @@ impl SessionHub for LocalHub {
     }
 
     fn create<'a>(&'a self, agent: &'a str, cwd: &'a Path) -> HubFuture<'a, AgentSessionInfo> {
+        self.create_with_options(agent, cwd, None, None, false)
+    }
+
+    fn create_with_options<'a>(
+        &'a self,
+        agent: &'a str,
+        cwd: &'a Path,
+        model: Option<&'a ModelRef>,
+        mode: Option<&'a str>,
+        auto_approve: bool,
+    ) -> HubFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
             let manager = self.manager_for_agent(agent).await?;
             let directory = directories::expand_directory_param(Some(&cwd.to_string_lossy()));
             let info = manager
                 .sessions()
-                .create_session(directory.as_deref(), None, None)
+                .create_session_with_auto_approve(directory.as_deref(), model, mode, auto_approve)
                 .await?;
             self.runtime
                 .record_session_route(&info.asid.0, manager.agent().kind())

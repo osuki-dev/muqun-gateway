@@ -325,6 +325,24 @@ pub trait AgentPort: Send + Sync {
         mode: Option<&'a str>,
     ) -> AgentFuture<'a, AgentSessionInfo>;
 
+    /// Create a new session with optional initial auto-approve enabled at launch
+    /// so launch-scoped bypass agents avoid a spawn-then-respawn cycle.
+    fn create_session_with_auto_approve<'a>(
+        &'a self,
+        directory: Option<&'a str>,
+        model: Option<&'a ModelRef>,
+        mode: Option<&'a str>,
+        auto_approve: bool,
+    ) -> AgentFuture<'a, AgentSessionInfo> {
+        Box::pin(async move {
+            let info = self.create_session(directory, model, mode).await?;
+            if auto_approve {
+                let _ = self.set_auto_approve(&info.asid.0, true).await;
+            }
+            Ok(info)
+        })
+    }
+
     /// Prepare a shared session from supported native CLI choices. Unsupported
     /// is returned only before creating a session; other failures are ambiguous
     /// and must never trigger a second launch or prompt delivery.

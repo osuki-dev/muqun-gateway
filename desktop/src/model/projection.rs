@@ -1133,6 +1133,19 @@ impl Core {
                     inbox.push(Update::Runtimes(statuses));
                 });
             }
+            Command::MaoCaptureBaseline { run_id, cwd, goal } => {
+                let inbox = self.inbox.clone();
+                tokio::task::spawn_blocking(move || {
+                    let base_commits =
+                        muqun_gateway::orchestration::capture_base_commits(&cwd, &goal);
+                    let base_commit = base_commits.values().next().cloned();
+                    inbox.push(Update::MaoBaselineCaptured {
+                        run_id,
+                        base_commit,
+                        base_commits,
+                    });
+                });
+            }
             Command::MaoPrepareReview {
                 run_id,
                 coder_asid,
@@ -1305,8 +1318,8 @@ impl Core {
             }
             return;
         };
-        let asid = match target {
-            Target::Session(asid) => asid,
+        let (asid, created_new) = match target {
+            Target::Session(asid) => (asid, false),
             Target::New {
                 agent,
                 cwd,
@@ -1332,9 +1345,27 @@ impl Core {
                 } else {
                     cwd
                 };
-                match self.hub.create(&agent, &cwd).await {
-                    Ok(info) => {
+                match self
+                    .hub
+                    .create_with_options(
+                        &agent,
+                        &cwd,
+                        model.as_ref(),
+                        mode.as_deref(),
+                        auto_approve,
+                    )
+                    .await
+                {
+                    Ok(mut info) => {
+                        if info.model.is_none() {
+                            info.model = model;
+                        }
+                        if info.mode.is_none() {
+                            info.mode = mode;
+                        }
                         let asid = info.asid.clone();
+                        *self.state().active.lock().unwrap() = Some(asid.clone());
+                        self.watch_viewed(&asid);
                         self.inbox
                             .push(Update::SessionCreated(Box::new(info), Some(token)));
                         // The UI opens the canonical session only if its pending pane is still visible.
@@ -1347,21 +1378,15 @@ impl Core {
                             }
                         });
                         self.edited();
-                        // The choices on the pills are the new session's.
-                        if let Some(model) = model {
-                            match self.hub.switch_model(&asid, &model).await {
-                                Ok(()) => self.inbox.push(Update::Composer(Box::new(
-                                    ComposerUpdate::SessionCatalogChanged(asid.clone()),
-                                ))),
-                                Err(err) => self.fail(err),
-                            }
+                        if auto_approve {
+                            self.inbox.push(Update::Composer(Box::new(
+                                ComposerUpdate::AutoApprove {
+                                    asid: asid.0.clone(),
+                                    enabled: Some(true),
+                                },
+                            )));
                         }
-                        if let Some(mode) = mode {
-                            if let Err(err) = self.hub.switch_mode(&asid, &mode).await {
-                                self.fail(err);
-                            }
-                        }
-                        asid
+                        (asid, true)
                     }
                     Err(err) => {
                         self.fail(err);
@@ -1375,7 +1400,7 @@ impl Core {
                 }
             }
         };
-        if auto_approve {
+        if auto_approve && !created_new {
             let shown = match self.hub.set_auto_approve(&asid, true).await {
                 Ok(now) => Some(now),
                 Err(_) => self.hub.auto_approve(&asid).await.ok(),

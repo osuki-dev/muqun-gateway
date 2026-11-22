@@ -240,6 +240,22 @@ impl SessionHub for DynamicHub {
         Box::pin(async move { active.create(agent, cwd).await })
     }
 
+    fn create_with_options<'a>(
+        &'a self,
+        agent: &'a str,
+        cwd: &'a Path,
+        model: Option<&'a ModelRef>,
+        mode: Option<&'a str>,
+        auto_approve: bool,
+    ) -> HubFuture<'a, AgentSessionInfo> {
+        let active = self.active();
+        Box::pin(async move {
+            active
+                .create_with_options(agent, cwd, model, mode, auto_approve)
+                .await
+        })
+    }
+
     fn open<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, AgentSessionSnapshot> {
         let active = self.active();
         Box::pin(async move { active.open(asid).await })

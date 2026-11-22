@@ -38,7 +38,19 @@ fn internal(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
 
 async fn list(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    let runs = store::list(&state.db).await.map_err(internal)?;
+    let mut runs = store::list(&state.db).await.map_err(internal)?;
+    for run in &mut runs {
+        if matches!(run.state.mao_phase.as_str(), "coding" | "reviewing") {
+            if let Ok(recovered) = store::recover(&state.db, run.clone()).await {
+                *run = recovered;
+            }
+            if let Some(root) = run.task_id.clone() {
+                if let Ok(mut tasks) = state.tasks.tree(&TaskId(root.clone()), None, 1000).await {
+                    let _ = reconcile_pipeline(&state, run, &mut tasks, &root).await;
+                }
+            }
+        }
+    }
     Ok(Json(json!({"runs": runs})))
 }
 
@@ -464,6 +476,32 @@ async fn reconcile_pipeline(
 
             let round = run.state.round;
             let max_rounds = run.state.max_rounds;
+            let fp = super::diff_fingerprint(&run.state.files, &diff_summary);
+            if round > 1 && run.state.last_diff_fingerprint.as_deref() == Some(fp.as_str()) {
+                run.state.reviewed_round = round;
+                run.state.mao_phase = "changes_requested".into();
+                run.state.accepted = false;
+                run.state.verdict = Some("changes_requested".into());
+                let summary = format!(
+                    "Rework round #{round} produced no new workspace changes; paused for user decision."
+                );
+                run.state.review_summary = Some(summary.clone());
+                run.state.steps.push(PipelineStep {
+                    kind: "verdict".into(),
+                    round,
+                    title: format!("Stagnant rework #{round} (paused)"),
+                    detail: summary,
+                    status: "warning".into(),
+                    asid: coder_asid.clone(),
+                    task_id: root_task.as_ref().map(|t| t.task_id.clone()),
+                    time_ms: now,
+                });
+                store::save_state(&state.db, run.id.clone(), run.state.clone())
+                    .await
+                    .map_err(internal)?;
+                return Ok(());
+            }
+            run.state.last_diff_fingerprint = Some(fp);
             let prompt = run.review_prompt(round, max_rounds, &coder_summary, &diff_summary);
             let by = Requested {
                 forwarding: ForwardingContext::Unknown,

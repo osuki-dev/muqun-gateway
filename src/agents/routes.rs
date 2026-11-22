@@ -253,6 +253,8 @@ pub struct CreateAgentSessionBody {
     pub mode: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
+    #[serde(default)]
+    pub auto_approve: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -853,9 +855,10 @@ async fn do_create_agent_session(
     refuse_remote_elevation(
         state,
         headers,
-        body.mode.as_deref().is_some_and(|mode| {
-            crate::agents::auto_approve::is_elevating(manager.agent().kind(), mode)
-        }),
+        body.auto_approve == Some(true)
+            || body.mode.as_deref().is_some_and(|mode| {
+                crate::agents::auto_approve::is_elevating(manager.agent().kind(), mode)
+            }),
     )?;
 
     let directory = expand_directory_param(body.directory.as_deref());
@@ -893,10 +896,11 @@ async fn do_create_agent_session(
 
     let session = manager
         .sessions()
-        .create_session(
+        .create_session_with_auto_approve(
             validated_dir.as_deref(),
             body.model.as_ref(),
             body.mode.as_deref(),
+            body.auto_approve == Some(true),
         )
         .await
         .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
@@ -4580,6 +4584,7 @@ mod tests {
             model: None,
             mode: mode.map(str::to_owned),
             agent_id: Some("claude".into()),
+            auto_approve: None,
         };
         let asid = do_create_agent_session(&state, session(None), &device_headers())
             .await
@@ -4919,6 +4924,7 @@ mod tests {
                 model: None,
                 mode: None,
                 agent_id: Some("claude".into()),
+                auto_approve: None,
             },
             &device_headers(),
         )
@@ -5827,6 +5833,7 @@ mod tests {
                 model: None,
                 mode: None,
                 agent_id: agent_id.map(str::to_string),
+                auto_approve: None,
             };
             let Json(created) = do_create_agent_session(&state, body, &headers)
                 .await
@@ -5874,6 +5881,7 @@ mod tests {
             model: None,
             mode: None,
             agent_id: None,
+            auto_approve: None,
         };
 
         // A real subdirectory of home, whatever this machine has.

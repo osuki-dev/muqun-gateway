@@ -3402,7 +3402,7 @@ impl UiState {
                             if self.mode == Mode::Session
                                 && self.selected.as_deref() == Some(&asid.0)
                             {
-                                self.send(Command::OpenSession(asid));
+                                self.send(Command::FocusSession(asid));
                                 self.session_opened(&info);
                             } else if self.tile_of(&asid.0).is_some() && self.mode == Mode::Session
                             {
@@ -3607,6 +3607,11 @@ impl UiState {
                     ticket,
                     result,
                 } => orchestration::on_gateway_orchestration(self, &computer, ticket, result),
+                Update::MaoBaselineCaptured {
+                    run_id,
+                    base_commit,
+                    base_commits,
+                } => orchestration::on_baseline_captured(self, &run_id, base_commit, base_commits),
                 Update::MaoReviewReady {
                     run_id,
                     diff_summary,
@@ -3813,6 +3818,9 @@ impl UiState {
             }
             if self.selected.as_deref() == Some(pending_asid.as_str()) {
                 self.selected = Some(asid.to_owned());
+                if self.catalog.is_none() {
+                    self.catalog = self.start_catalog.clone();
+                }
             }
             for tile in &mut self.tiles {
                 if tile.asid.as_deref() == Some(pending_asid.as_str()) {
@@ -3820,6 +3828,7 @@ impl UiState {
                     tile.content = TileContent::Session(asid.to_owned());
                 }
             }
+            self.sync_watch();
             self.persist_tiles();
         }
     }

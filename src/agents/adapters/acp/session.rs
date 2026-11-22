@@ -4660,6 +4660,15 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
         model: Option<&'a ModelRef>,
         mode: Option<&'a str>,
     ) -> AgentFuture<'a, AgentSessionInfo> {
+        self.create_session_with_auto_approve(directory, model, mode, false)
+    }
+    fn create_session_with_auto_approve<'a>(
+        &'a self,
+        directory: Option<&'a str>,
+        model: Option<&'a ModelRef>,
+        mode: Option<&'a str>,
+        auto_approve: bool,
+    ) -> AgentFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
             if model.is_some() && !P::MODEL_SELECTION {
                 return Err(AgentError::Unsupported("ACP model selection".into()));
@@ -4673,9 +4682,16 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             }
             let _mutation = self.mutations.lock().await;
             self.invalidate_session_lists().await;
-            let opened = self.open(directory, None).await;
+            let launch_bypass = P::LAUNCH_BYPASS.is_some()
+                && (auto_approve
+                    || mode.is_some_and(|m| crate::agents::auto_approve::is_elevating(P::KIND, m)));
+            let opened = self.open_launch(directory, None, launch_bypass).await;
             self.invalidate_session_lists().await;
             let session = opened?;
+            if launch_bypass {
+                let id = session.state.lock().await.info.asid.0.clone();
+                self.launch_bypass.lock().unwrap().insert(id);
+            }
             if let Some(model) = model {
                 if let Err(error) = self.select_model(&session, model).await {
                     let id = session.state.lock().await.info.asid.0.clone();
@@ -4706,6 +4722,10 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 }
             }
             let info = session.state.lock().await.info.clone();
+            drop(_mutation);
+            if auto_approve && !launch_bypass {
+                let _ = self.set_auto_approve(&info.asid.0, true).await;
+            }
             Ok(info)
         })
     }

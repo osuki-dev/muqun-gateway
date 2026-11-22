@@ -146,18 +146,45 @@ impl UiState {
 }
 
 fn title(s: &UiState, asid: &str) -> String {
+    if let Some(run) = s
+        .orchestration
+        .runs
+        .iter()
+        .rev()
+        .find(|r| r.reviewer_asid.as_deref() == Some(asid))
+    {
+        return format!(
+            "{} · {}",
+            tr_ref(s.cfg.general.language, "Reviewer"),
+            s.agent_name(&run.reviewer.agent)
+        );
+    }
     let info = s.session_by_id(asid);
-    info.and_then(|i| {
-        i.agent_name
-            .as_deref()
-            .filter(|n| !n.trim().is_empty())
-            .or_else(|| {
-                (!i.title.trim().is_empty() && !i.title.eq_ignore_ascii_case("subagent"))
-                    .then_some(i.title.as_str())
-            })
-    })
-    .unwrap_or_else(|| tr_ref(s.cfg.general.language, "Subagent"))
-    .to_owned()
+    let raw = info
+        .and_then(|i| {
+            i.agent_name
+                .as_deref()
+                .filter(|n| !n.trim().is_empty())
+                .or_else(|| {
+                    (!i.title.trim().is_empty() && !i.title.eq_ignore_ascii_case("subagent"))
+                        .then_some(i.title.as_str())
+                })
+        })
+        .unwrap_or_else(|| tr_ref(s.cfg.general.language, "Subagent"));
+    let first = raw
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(raw);
+    let cleaned = first.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.chars().count() > 64 {
+        let head: String = cleaned.chars().take(63).collect();
+        format!("{head}…")
+    } else if cleaned.is_empty() {
+        tr_ref(s.cfg.general.language, "Subagent").to_owned()
+    } else {
+        cleaned
+    }
 }
 
 fn actions(s: &UiState, k: &Kit, sheet: &DetailSheet, asid: &str) -> El {
@@ -342,5 +369,38 @@ mod tests {
         s.close_plugin_drawer();
         assert_eq!(s.selected_dock_tab(), Some("quicknotes"));
         assert!(s.detail.is_none());
+    }
+
+    #[test]
+    fn detail_window_title_sanitizes_multiline_prompt_and_labels_mao_reviewer() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.sessions.push(
+            serde_json::from_value(serde_json::json!({
+                "asid": "rev-multiline",
+                "agent_id": "codex",
+                "title": "You are the designated **Read-Only Code Reviewer**.\n\nInspect the diff.\n\nReturn MAO_VERDICT.",
+                "status": "busy",
+                "updated_ms": 1
+            }))
+            .unwrap(),
+        );
+        let sanitized = title(&s, "rev-multiline");
+        assert!(!sanitized.contains('\n'));
+        assert!(!sanitized.contains('\r'));
+        assert!(sanitized.starts_with("You are the designated"));
+
+        s.orchestration.runs.push(crate::ui::orchestration::MaoRun {
+            id: "mao-1".into(),
+            reviewer: crate::ui::orchestration::MaoRole {
+                agent: "codex".into(),
+                model: None,
+            },
+            reviewer_asid: Some("rev-multiline".into()),
+            ..Default::default()
+        });
+        let labeled = title(&s, "rev-multiline");
+        assert!(!labeled.contains('\n'));
+        assert!(labeled.contains("codex") || labeled.contains("Codex"));
     }
 }

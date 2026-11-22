@@ -263,6 +263,12 @@ pub enum Update {
         kind: muqun_gateway::platform::runtimes::RuntimeKind,
         result: Result<muqun_gateway::platform::runtimes::RuntimeStatus, String>,
     },
+    /// Baseline git commit map captured asynchronously for an MAO run.
+    MaoBaselineCaptured {
+        run_id: String,
+        base_commit: Option<String>,
+        base_commits: std::collections::BTreeMap<String, String>,
+    },
     /// Prepared diff/context summary ready to dispatch to the MAO reviewer session.
     MaoReviewReady {
         run_id: String,

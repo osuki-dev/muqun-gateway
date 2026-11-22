@@ -418,22 +418,32 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
                 .get(kind)
                 .map(|p| p.render_icon(s, 14.0, k.c.text_accent))
                 .unwrap_or_else(|| rune::icon(&super::icons::GRID, 14.0).color(k.c.text_accent));
+            let raw_title = s
+                .plugins
+                .get(kind)
+                .and_then(|p| p.window_title(s))
+                .unwrap_or_else(|| title.clone());
+            let clean_title = raw_title
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             head = head
                 .child(plugin_icon.a11y_hidden())
                 .child(
-                    text(
-                        s.plugins
-                            .get(kind)
-                            .and_then(|p| p.window_title(s))
-                            .unwrap_or_else(|| title.clone()),
-                    )
-                    .key("tile-title")
-                    .font(title_font)
-                    .color(if focused {
-                        k.c.text_base
-                    } else {
-                        k.c.text_muted
-                    }),
+                    text(clean_title)
+                        .key("tile-title")
+                        .font(title_font)
+                        .single_line()
+                        .truncate()
+                        .color(if focused {
+                            k.c.text_base
+                        } else {
+                            k.c.text_muted
+                        }),
                 )
                 .child(
                     text(kind.clone())

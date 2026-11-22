@@ -718,14 +718,33 @@ impl SessionHub for RemoteHub {
     }
 
     fn create<'a>(&'a self, agent: &'a str, cwd: &'a Path) -> HubFuture<'a, AgentSessionInfo> {
+        self.create_with_options(agent, cwd, None, None, false)
+    }
+
+    fn create_with_options<'a>(
+        &'a self,
+        agent: &'a str,
+        cwd: &'a Path,
+        model: Option<&'a ModelRef>,
+        mode: Option<&'a str>,
+        auto_approve: bool,
+    ) -> HubFuture<'a, AgentSessionInfo> {
         Box::pin(async move {
-            self.data(
-                Method::POST,
-                &["api", "agent-sessions"],
-                &[],
-                Some(json!({"agent_id": agent, "directory": cwd.to_string_lossy()})),
-            )
-            .await
+            let mut body = json!({
+                "agent_id": agent,
+                "directory": cwd.to_string_lossy(),
+            });
+            if let Some(model) = model {
+                body["model"] = json!(model);
+            }
+            if let Some(mode) = mode {
+                body["mode"] = json!(mode);
+            }
+            if auto_approve {
+                body["auto_approve"] = json!(true);
+            }
+            self.data(Method::POST, &["api", "agent-sessions"], &[], Some(body))
+                .await
         })
     }
 

@@ -69,6 +69,21 @@ pub fn render(
     Some(chrome(plugin.id(), ctx, body, layer))
 }
 
+fn sanitize_window_title(raw: &str) -> String {
+    let first = raw
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    let cleaned = first.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.chars().count() > 80 {
+        let head: String = cleaned.chars().take(79).collect();
+        format!("{head}…")
+    } else {
+        cleaned
+    }
+}
+
 /// Shared leading slot of the right dock header. Each shell is a tab of its own.
 pub(crate) fn dock_tabs(s: &crate::ui::UiState, k: &rune_kit::Kit) -> Option<El> {
     use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant};
@@ -89,9 +104,10 @@ pub(crate) fn dock_tabs(s: &crate::ui::UiState, k: &rune_kit::Kit) -> Option<El>
             continue;
         };
         let active = s.selected_dock_tab() == Some(id.as_str());
-        let title = plugin
+        let raw_title = plugin
             .window_title(s)
             .unwrap_or_else(|| plugin.title(s.cfg.general.language));
+        let title = sanitize_window_title(&raw_title);
         let select_id = id.clone();
         let close_id = id.clone();
         let close = crate::ui::copy::tr_ref(s.cfg.general.language, "Close tab");
@@ -210,7 +226,7 @@ pub fn chrome(id: &str, ctx: &PluginViewContext<'_>, body: El, layer: &mut Vec<E
     let mut header = row()
         .key(format!("window-header-{id}-{:?}", ctx.surface))
         .w_full()
-        .min_h(rune_kit::shell::TOOLBAR_HEIGHT)
+        .h(rune_kit::shell::TOOLBAR_HEIGHT)
         .px(10.0)
         .py(4.0)
         .gap(8.0)
@@ -222,19 +238,18 @@ pub fn chrome(id: &str, ctx: &PluginViewContext<'_>, body: El, layer: &mut Vec<E
         header = header.child(tabs);
     } else {
         if let Some(plugin) = ctx.s.plugins.get(id) {
+            let raw_title = plugin
+                .window_title(ctx.s)
+                .unwrap_or_else(|| plugin.title(ctx.s.cfg.general.language));
             header = header.child(
-                text(
-                    plugin
-                        .window_title(ctx.s)
-                        .unwrap_or_else(|| plugin.title(ctx.s.cfg.general.language)),
-                )
-                .font(ctx.k.ty.ui_medium)
-                .color(ctx.k.c.text_base)
-                .single_line()
-                .truncate()
-                .min_w(0.0)
-                .w(0.0)
-                .grow(1.0),
+                text(sanitize_window_title(&raw_title))
+                    .font(ctx.k.ty.ui_medium)
+                    .color(ctx.k.c.text_base)
+                    .single_line()
+                    .truncate()
+                    .min_w(0.0)
+                    .w(0.0)
+                    .grow(1.0),
             );
         } else {
             header = header.child(el().grow(1.0));

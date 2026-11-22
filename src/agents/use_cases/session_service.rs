@@ -122,7 +122,21 @@ impl SessionService {
         model: Option<&ModelRef>,
         mode: Option<&str>,
     ) -> Result<AgentSessionInfo, AgentError> {
-        let mut info = self.agent.create_session(directory, model, mode).await?;
+        self.create_session_with_auto_approve(directory, model, mode, false)
+            .await
+    }
+
+    pub async fn create_session_with_auto_approve(
+        &self,
+        directory: Option<&str>,
+        model: Option<&ModelRef>,
+        mode: Option<&str>,
+        auto_approve: bool,
+    ) -> Result<AgentSessionInfo, AgentError> {
+        let mut info = self
+            .agent
+            .create_session_with_auto_approve(directory, model, mode, auto_approve)
+            .await?;
         self.stamp(&mut info);
         self.observe_runtime(&mut info).await;
         self.mirror.update_session(info.clone()).await;
