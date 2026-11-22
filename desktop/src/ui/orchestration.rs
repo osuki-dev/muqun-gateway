@@ -3531,8 +3531,8 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
         _ => {}
     }
 
-    // Row 1: Full-width pipeline stepper so stages stay on one clean horizontal line.
-    let pipeline = row()
+    // Single compact header bar: pipeline stepper on the left, actions on the right.
+    let mut header_bar = row()
         .w_full()
         .gap(6.0)
         .center_y()
@@ -3542,20 +3542,17 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
         .child(text("›").font(k.ty.small_medium).color(k.c.text_faint))
         .child(review_stage)
         .child(text("›").font(k.ty.small_medium).color(k.c.text_faint))
-        .child(verdict_chip);
+        .child(verdict_chip)
+        .child(el().grow(1.0).min_w(8.0))
+        .child(left_actions);
+    if matches!(
+        run.phase,
+        MaoPhase::Coding { .. } | MaoPhase::Reviewing { .. } | MaoPhase::ChangesRequested { .. }
+    ) {
+        header_bar = header_bar.child(right_actions);
+    }
 
-    // Row 3: Separated action footer bar (left: diff/inspect/window, right: primary CTA).
-    let action_bar = row()
-        .w_full()
-        .pt(6.0)
-        .gap(8.0)
-        .center_y()
-        .flex_wrap()
-        .child(left_actions)
-        .child(el().grow(1.0))
-        .child(right_actions);
-
-    let active_activity = if matches!(run.phase, MaoPhase::Reviewing { .. }) {
+    let active_activity = clean_one_line(&if matches!(run.phase, MaoPhase::Reviewing { .. }) {
         format!(
             "{reviewer_name}: {} · {}",
             rev_live.status_label, rev_live.activity_line
@@ -3567,13 +3564,13 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
         )
     } else {
         phase_summary_line(run, &coder_name, &reviewer_name, language)
-    };
+    });
 
     let rework_note_row = matches!(run.phase, MaoPhase::ChangesRequested { .. }).then(|| {
         let note_run_edit = run.id.clone();
         let note_run_submit = run.id.clone();
         let placeholder = tr_ref(language, "Optional extra guidance for rework…");
-        row().w_full().pt(4.0).child(
+        row().w_full().pt(2.0).child(
             TextInput::new(&s.orchestration.rework_note)
                 .placeholder(placeholder)
                 .width(None)
@@ -3594,100 +3591,109 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
     let mut inner = col()
         .w_full()
         .px(14.0)
-        .py(10.0)
+        .py(8.0)
         .gap(6.0)
         .fill(k.c.layer_01)
-        .child(pipeline)
-        .child(
-            text(active_activity)
+        .child(header_bar)
+        .children((!active_activity.is_empty()).then(|| {
+            text(active_activity.clone())
                 .font(k.ty.small)
-                .color(k.c.text_muted)
+                .color(if matches!(run.phase, MaoPhase::Failed { .. }) {
+                    k.c.danger.fg
+                } else {
+                    k.c.text_muted
+                })
                 .single_line()
-                .truncate(),
-        )
-        .children(rework_note_row)
-        .child(
-            el().w_full()
-                .h(1.0)
-                .fill(k.c.border_weak.alpha(0.55))
-                .a11y_hidden(),
-        )
-        .child(action_bar);
+                .truncate()
+        }))
+        .children(rework_note_row);
 
     if run.expanded {
-        let mut gates_row = row().w_full().gap(6.0).flex_wrap();
-        for gate in quality_gates_for_run(run, language) {
-            let (fill, border, ink) = gate_status_colors(k, gate.status);
-            gates_row = gates_row.child(
-                row()
-                    .px(8.0)
-                    .py(4.0)
-                    .gap(5.0)
-                    .center_y()
-                    .radius(k.radius.sm)
-                    .fill(fill)
-                    .border(1.0, border)
-                    .child(text(gate.title).font(k.ty.small_medium).color(ink))
-                    .child(text(gate.detail).font(k.ty.small).color(ink.alpha(0.85))),
-            );
-        }
-        let mut drawer = col().w_full().gap(6.0).pt(4.0).child(gates_row);
-        if !run.files.is_empty() || !run.review_summary.is_empty() {
-            let left = col()
-                .grow(1.0)
-                .min_w(220.0)
-                .padding(10.0)
-                .gap(4.0)
-                .radius(k.radius.md)
-                .fill(k.c.layer_02)
-                .child(
-                    text(tr_ref(language, "Coder summary"))
-                        .font(k.ty.small_medium)
-                        .color(k.c.text_faint),
-                )
-                .child(
-                    text(if run.coder_summary.is_empty() {
-                        tr(
-                            language,
-                            "Waiting for Coder to finish before collecting deliverables.",
+        let mut drawer_body = col().w_full().gap(8.0).pt(6.0);
+        let coder_clean = clean_summary_excerpt(&run.coder_summary, 220);
+        let review_clean = clean_summary_excerpt(&run.review_summary, 220);
+        let show_review_card = !review_clean.is_empty() && review_clean != active_activity;
+        if !coder_clean.is_empty() || show_review_card {
+            let mut summary_row = row().w_full().gap(8.0).flex_wrap();
+            if !coder_clean.is_empty() {
+                summary_row = summary_row.child(
+                    col()
+                        .w(0.0)
+                        .grow(1.0)
+                        .min_w(220.0)
+                        .px(10.0)
+                        .py(8.0)
+                        .gap(4.0)
+                        .radius(k.radius.md)
+                        .fill(k.c.layer_02)
+                        .border(1.0, k.c.border_weak)
+                        .child(
+                            text(tr_ref(language, "Coder summary"))
+                                .font(k.ty.small_medium)
+                                .color(k.c.text_faint),
                         )
-                    } else {
-                        run.coder_summary.clone()
-                    })
-                    .font(k.ty.small)
-                    .color(k.c.text_base)
-                    .wrap()
-                    .w_full(),
+                        .child(
+                            text(coder_clean)
+                                .font(k.ty.small)
+                                .color(k.c.text_base)
+                                .wrap()
+                                .w_full(),
+                        ),
                 );
-            let right = col()
-                .grow(1.0)
-                .min_w(220.0)
-                .padding(10.0)
-                .gap(4.0)
-                .radius(k.radius.md)
-                .fill(k.c.layer_02)
-                .child(
-                    text(tr_ref(language, "Review report"))
-                        .font(k.ty.small_medium)
-                        .color(k.c.text_faint),
-                )
-                .child(
-                    text(if run.review_summary.is_empty() {
-                        tr(language, "Waiting for Reviewer report.")
-                    } else {
-                        run.review_summary.clone()
-                    })
-                    .font(k.ty.small)
-                    .color(k.c.text_base)
-                    .wrap()
-                    .w_full(),
+            }
+            if show_review_card {
+                summary_row = summary_row.child(
+                    col()
+                        .w(0.0)
+                        .grow(1.0)
+                        .min_w(220.0)
+                        .px(10.0)
+                        .py(8.0)
+                        .gap(4.0)
+                        .radius(k.radius.md)
+                        .fill(k.c.layer_02)
+                        .border(1.0, k.c.border_weak)
+                        .child(
+                            text(tr_ref(language, "Review report"))
+                                .font(k.ty.small_medium)
+                                .color(k.c.text_faint),
+                        )
+                        .child(
+                            text(review_clean)
+                                .font(k.ty.small)
+                                .color(k.c.text_base)
+                                .wrap()
+                                .w_full(),
+                        ),
                 );
-            drawer = drawer.child(row().w_full().gap(8.0).flex_wrap().child(left).child(right));
+            }
+            drawer_body = drawer_body.child(summary_row);
         }
-        for (idx, step) in run.steps.iter().rev().take(6).rev().enumerate() {
-            drawer = drawer.child(step_row(k, idx, step));
+        if !run.steps.is_empty() {
+            let mut steps_box = col().w_full().gap(4.0);
+            for (idx, step) in run.steps.iter().rev().take(4).rev().enumerate() {
+                steps_box = steps_box.child(step_row(k, idx, step));
+            }
+            drawer_body = drawer_body.child(steps_box);
         }
-        inner = inner.child(drawer);
+        inner = inner
+            .child(
+                el().w_full()
+                    .h(1.0)
+                    .fill(k.c.border_weak.alpha(0.55))
+                    .a11y_hidden(),
+            )
+            .child(
+                col()
+                    .key("mao-banner-drawer-scroll")
+                    .w_full()
+                    .max_h(220.0)
+                    .child(drawer_body)
+                    .scroll(rune::ScrollSpec {
+                        stick_bottom: false,
+                    })
+                    .scroll_bar(k),
+            );
     }
 
     Some(
@@ -3801,6 +3807,32 @@ fn phase_summary_line(
     }
 }
 
+fn clean_one_line(raw: &str) -> String {
+    let mut parts = Vec::new();
+    for line in raw.lines() {
+        let stripped = line
+            .trim()
+            .trim_start_matches('#')
+            .trim_start_matches('-')
+            .trim_start_matches('*')
+            .trim();
+        if stripped.is_empty() {
+            continue;
+        }
+        parts.push(stripped.replace("**", "").replace('`', ""));
+    }
+    parts
+        .join(" · ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn clean_summary_excerpt(raw: &str, max_chars: usize) -> String {
+    let cleaned = clean_one_line(raw);
+    concise_excerpt(&cleaned, max_chars)
+}
+
 fn step_row(k: &Kit, idx: usize, step: &MaoStep) -> El {
     let dot_color = match step.status {
         "running" => k.c.text_accent,
@@ -3809,16 +3841,18 @@ fn step_row(k: &Kit, idx: usize, step: &MaoStep) -> El {
         "failed" => k.c.danger.icon,
         _ => k.c.text_faint,
     };
+    let clean_detail = clean_one_line(&step.detail);
     let mut item = row()
         .key(format!("mao-step-{idx}-{}", step.round))
         .w_full()
-        .px(8.0)
-        .py(5.0)
+        .h(28.0)
+        .px(10.0)
         .gap(8.0)
         .center_y()
         .radius(k.radius.sm)
         .fill(k.c.layer_02)
-        .child(el().size(7.0, 7.0).radius(3.5).fill(dot_color))
+        .border(1.0, k.c.border_weak.alpha(0.45))
+        .child(el().size(6.0, 6.0).radius(3.0).fill(dot_color))
         .child(
             text(step.title.clone())
                 .font(k.ty.small_medium)
@@ -3826,9 +3860,10 @@ fn step_row(k: &Kit, idx: usize, step: &MaoStep) -> El {
                 .single_line(),
         )
         .child(
-            text(step.detail.clone())
+            text(clean_detail)
                 .font(k.ty.small)
                 .color(k.c.text_muted)
+                .single_line()
                 .truncate()
                 .grow(1.0)
                 .min_w(0.0),

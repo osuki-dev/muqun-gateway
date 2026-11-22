@@ -992,7 +992,7 @@ async fn reconcile_pipeline(
                         agent_id: Some(rev_spec.agent.clone()),
                         model: rev_spec.model.clone(),
                         variant: rev_spec.variant.clone(),
-                        client_ref: Some(client_ref),
+                        client_ref: Some(client_ref.clone()),
                         label: Some(format!("Review #{round}")),
                         delivery: Some(Delivery::Session),
                         computer_ids: run.request.computer_ids.clone(),
@@ -1002,7 +1002,7 @@ async fn reconcile_pipeline(
                             .clone()
                             .or_else(|| run.request.machine.clone()),
                         mentions: run.request.mentions.clone(),
-                        session_id: run.state.reviewer_asid.clone(),
+                        session_id: None,
                         attachments: vec![],
                     },
                     run.state.reviewer_asid.as_deref(),
@@ -1011,6 +1011,41 @@ async fn reconcile_pipeline(
                     None,
                 )
                 .await;
+            if delegated.is_err() && run.state.reviewer_asid.is_some() {
+                // Previous reviewer session may have expired or disappeared across a
+                // Gateway restart; retry cleanly in a fresh reviewer session.
+                run.state.reviewer_asid = None;
+                delegated = state
+                    .tasks
+                    .delegate_in_session(
+                        state,
+                        by.clone(),
+                        DelegateRequest {
+                            goal: prompt.clone(),
+                            cwd: Some(run.request.cwd.clone()),
+                            agent_id: Some(rev_spec.agent.clone()),
+                            model: rev_spec.model.clone(),
+                            variant: rev_spec.variant.clone(),
+                            client_ref: Some(format!("{client_ref}:fresh")),
+                            label: Some(format!("Review #{round}")),
+                            delivery: Some(Delivery::Session),
+                            computer_ids: run.request.computer_ids.clone(),
+                            mode: None,
+                            machine: rev_spec
+                                .machine
+                                .clone()
+                                .or_else(|| run.request.machine.clone()),
+                            mentions: run.request.mentions.clone(),
+                            session_id: None,
+                            attachments: vec![],
+                        },
+                        None,
+                        Some(&format!("MAO Code Review #{round}")),
+                        run.request.auto_approve.unwrap_or(true),
+                        None,
+                    )
+                    .await;
+            }
             if let Err(ref err) = delegated {
                 let err_msg = err.to_string();
                 if auto_failover && run.state.failover_count < max_failovers {
@@ -1231,7 +1266,7 @@ async fn reconcile_pipeline(
                                             .clone()
                                             .or_else(|| run.request.machine.clone()),
                                         mentions: run.request.mentions.clone(),
-                                        session_id: run.state.coder_asid.clone(),
+                                        session_id: None,
                                         attachments: vec![],
                                     },
                                     run.state.coder_asid.as_deref(),
@@ -1241,11 +1276,23 @@ async fn reconcile_pipeline(
                                 )
                                 .await;
                             let rework_tid = delegated.as_ref().ok().map(|t| t.task_id.clone());
+                            let rework_detail = match &delegated {
+                                Ok(_) => concise_excerpt(&excerpt, 220),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        run_id = %run.id,
+                                        round = next_round,
+                                        %err,
+                                        "failed to dispatch automated rework"
+                                    );
+                                    concise_excerpt(&format!("Rework dispatch failed: {err}"), 220)
+                                }
+                            };
                             run.state.steps.push(PipelineStep {
                                 kind: "rework".into(),
                                 round: next_round,
                                 title: format!("Rework #{next_round} · {}", active_coder.agent),
-                                detail: concise_excerpt(&excerpt, 220),
+                                detail: rework_detail,
                                 status: if delegated.is_ok() {
                                     "running".into()
                                 } else {
@@ -2133,7 +2180,7 @@ async fn rework(
                     .clone()
                     .or_else(|| run.request.machine.clone()),
                 mentions: run.request.mentions.clone(),
-                session_id: run.state.coder_asid.clone(),
+                session_id: None,
                 attachments: vec![],
             },
             run.state.coder_asid.as_deref(),

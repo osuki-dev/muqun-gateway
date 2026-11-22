@@ -1242,3 +1242,163 @@ async fn pool_instruction_reaches_coder_on_turn_one_and_failover_skips_same_agen
         "internal failover child task must not force code review when no files changed: {done}"
     );
 }
+
+#[tokio::test]
+async fn rework_and_second_round_review_reuse_agent_session_without_terminal_session_error() {
+    let ws = crate::test_state_dir().join(format!("mao-r2-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&ws).unwrap();
+    let run_git = |args: &[&str]| {
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&ws)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    };
+    run_git(&["init"]);
+    run_git(&["config", "user.email", "t@example.com"]);
+    run_git(&["config", "user.name", "T"]);
+    std::fs::write(ws.join("main.rs"), "fn main() {}\n").unwrap();
+    run_git(&["add", "."]);
+    run_git(&["commit", "-m", "init"]);
+
+    let state = state();
+    let claude = FakeAgent::new("claude").with_sessions(&[("claude_s1", 1), ("claude_new", 1)]);
+    let codex = FakeAgent::new("codex").with_sessions(&[("codex_rev_1", 1), ("codex_new", 1)]);
+    state.agent_runtime.attach_for_test(claude.manager()).await;
+    state.agent_runtime.attach_for_test(codex.manager()).await;
+
+    let mut req = request();
+    req.client_ref = "r2-reuse-1".into();
+    req.cwd = ws.to_string_lossy().into_owned();
+    req.coordinator = "claude".into();
+    req.reviewer = Some(ReviewerSpec {
+        agent: "codex".into(),
+        model: None,
+        variant: None,
+        machine: None,
+    });
+    req.max_review_rounds = Some(2);
+
+    let (status, started) = call(&state, "token", "POST", "/api/orchestrations", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let run_id = started["run"]["id"].as_str().unwrap().to_string();
+    let root_tid = started["run"]["task_id"].as_str().unwrap().to_string();
+    let task_store = SqliteTaskStore::new(state.db.clone());
+
+    // Round 1 edit -> review #1
+    std::fs::write(ws.join("main.rs"), "fn main() { let x = 1; }\n").unwrap();
+    task_store
+        .transition(
+            &TaskId(root_tid),
+            crate::tasks::domain::TaskChange {
+                reopen: false,
+                reopen_count: None,
+                reopened_ms: None,
+                expected_seq: None,
+                to: TaskState::Done,
+                source: "test".into(),
+                note: None,
+                summary: Some("Round 1 edit".into()),
+                exit_code: Some(0),
+                binding: None,
+                session_title: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (_, r1) = call(
+        &state,
+        "token",
+        "GET",
+        &format!("/api/orchestrations/{run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(r1["mao_phase"], "reviewing", "{r1}");
+    let rev1_tid = r1["run"]["state"]["reviewer_task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Reviewer #1 requests changes -> triggers Rework #2 in existing coder_asid (must NOT fail with TerminalUnknown!)
+    task_store
+        .transition(
+            &TaskId(rev1_tid),
+            crate::tasks::domain::TaskChange {
+                reopen: false,
+                reopen_count: None,
+                reopened_ms: None,
+                expected_seq: None,
+                to: TaskState::Done,
+                source: "test".into(),
+                note: None,
+                summary: Some("Please print x.\nMAO_VERDICT: CHANGES_REQUESTED".into()),
+                exit_code: Some(0),
+                binding: None,
+                session_title: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (_, rw2) = call(
+        &state,
+        "token",
+        "GET",
+        &format!("/api/orchestrations/{run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        rw2["mao_phase"], "coding",
+        "rework #2 must dispatch into existing coder session without TerminalUnknown: {rw2}"
+    );
+    let rw2_tid = rw2["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|s| s["kind"] == "rework")
+        .and_then(|s| s["task_id"].as_str())
+        .expect("rework #2 task_id")
+        .to_string();
+
+    // Round 2 edit -> Review #2 in existing reviewer_asid (must NOT fail with TerminalUnknown!)
+    std::fs::write(ws.join("main.rs"), "fn main() { println!(\"1\"); }\n").unwrap();
+    task_store
+        .transition(
+            &TaskId(rw2_tid),
+            crate::tasks::domain::TaskChange {
+                reopen: false,
+                reopen_count: None,
+                reopened_ms: None,
+                expected_seq: None,
+                to: TaskState::Done,
+                source: "test".into(),
+                note: None,
+                summary: Some("Printed 1".into()),
+                exit_code: Some(0),
+                binding: None,
+                session_title: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (_, r2) = call(
+        &state,
+        "token",
+        "GET",
+        &format!("/api/orchestrations/{run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        r2["mao_phase"], "reviewing",
+        "review #2 must dispatch cleanly without TerminalUnknown: {r2}"
+    );
+    let _ = std::fs::remove_dir_all(&ws);
+}
