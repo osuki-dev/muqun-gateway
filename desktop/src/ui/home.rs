@@ -96,14 +96,31 @@ pub fn submit_start(s: &mut UiState) {
     if !prompt.trim().is_empty() || !staged_files.is_empty() {
         s.echo_sent(&pending_asid, token, prompt.clone(), &staged_files, None);
     }
-    super::orchestration::on_start_submitted(
-        s,
-        &pending_asid,
-        &prompt,
-        &cwd.display().to_string(),
-        &agent,
-        model.clone(),
-    );
+    let gateway_mao = s.cfg.ui.mao.enabled
+        && !worktree
+        && matches!(&deliver, crate::model::compose::Deliver::Prompt(_))
+        && super::orchestration::dispatch_gateway_start(
+            s,
+            &pending_asid,
+            token,
+            &prompt,
+            &cwd.display().to_string(),
+            &agent,
+            model.as_ref(),
+            mode.as_deref(),
+            None,
+            &attachments,
+        );
+    if !gateway_mao {
+        super::orchestration::on_start_submitted(
+            s,
+            &pending_asid,
+            &prompt,
+            &cwd.display().to_string(),
+            &agent,
+            model.clone(),
+        );
+    }
     s.pending_start = Some((pending_asid.clone(), token));
     s.tiles_restored = true;
     if let Some(i) = s
@@ -126,20 +143,22 @@ pub fn submit_start(s: &mut UiState) {
     s.start_draft.focus = 0;
     s.staged.clear();
 
-    s.send(Command::Compose(ComposeCommand::Submit {
-        token,
-        target: Target::New {
-            agent,
-            cwd,
-            model,
-            mode,
-            worktree,
-        },
-        deliver,
-        attachments,
-        delivery: None,
-        auto_approve: s.cfg.ui.mao.enabled,
-    }));
+    if !gateway_mao {
+        s.send(Command::Compose(ComposeCommand::Submit {
+            token,
+            target: Target::New {
+                agent,
+                cwd,
+                model,
+                mode,
+                worktree,
+            },
+            deliver,
+            attachments,
+            delivery: None,
+            auto_approve: s.cfg.ui.mao.enabled,
+        }));
+    }
 }
 
 pub(super) fn pick_agent(s: &mut UiState, id: String) {

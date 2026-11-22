@@ -34,6 +34,8 @@ const STACK_AT: f32 = 900.0;
 pub struct MaoRole {
     pub agent: String,
     pub model: Option<ModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -156,10 +158,12 @@ impl Default for MaoRun {
             coder: MaoRole {
                 agent: String::new(),
                 model: None,
+                machine: None,
             },
             reviewer: MaoRole {
                 agent: String::new(),
                 model: None,
+                machine: None,
             },
             coder_asid: String::new(),
             reviewer_asid: None,
@@ -249,6 +253,7 @@ pub enum MenuSection {
     Agent,
     Model,
     Effort,
+    Machine,
     Rounds,
 }
 
@@ -262,6 +267,7 @@ pub struct View {
     pub catalog_requests: HashMap<u64, String>,
     pub synced_computers: HashSet<String>,
     pub enabled_sessions: HashSet<String>,
+    pub gateway_start_tokens: HashMap<u64, (String, u64)>,
     pub next_seq: u64,
 }
 
@@ -326,6 +332,7 @@ impl Default for View {
             catalog_requests: HashMap::new(),
             synced_computers: HashSet::new(),
             enabled_sessions,
+            gateway_start_tokens: HashMap::new(),
             next_seq,
         }
     }
@@ -619,12 +626,14 @@ pub fn effective_reviewer(s: &UiState, coder_agent: &str) -> MaoRole {
             return MaoRole {
                 agent: cfg.agent.clone(),
                 model,
+                machine: cfg.machine.clone(),
             };
         }
     }
     MaoRole {
         agent: default_reviewer_agent(s, coder_agent),
         model: None,
+        machine: None,
     }
 }
 
@@ -871,6 +880,7 @@ fn ensure_default_reviewer_prefs(s: &mut UiState, slot: Slot) {
         next.reviewer = Some(MaoRoleConfig {
             agent: role.agent,
             model: role.model,
+            machine: role.machine,
         });
         save_mao_prefs(s, next);
     }
@@ -912,10 +922,18 @@ fn toggle_enabled(s: &mut UiState, slot: Slot) {
 
 fn set_reviewer_agent(s: &mut UiState, slot: Slot, agent_id: String) {
     ensure_reviewer_catalog(s, &agent_id);
+    let machine = s
+        .cfg
+        .ui
+        .mao
+        .reviewer
+        .as_ref()
+        .and_then(|r| r.machine.clone());
     let mut next = s.cfg.ui.mao.clone();
     next.reviewer = Some(MaoRoleConfig {
         agent: agent_id,
         model: None,
+        machine,
     });
     save_mao_prefs(s, next);
     s.orchestration.menu_section = Some(MenuSection::Model);
@@ -931,6 +949,7 @@ fn set_reviewer_model(s: &mut UiState, slot: Slot, provider_id: String, model_id
     next.reviewer = Some(MaoRoleConfig {
         agent: current.agent,
         model: Some(picked),
+        machine: current.machine,
     });
     save_mao_prefs(s, next);
     s.orchestration.menu_section = Some(MenuSection::Effort);
@@ -949,6 +968,20 @@ fn set_reviewer_effort(s: &mut UiState, slot: Slot, variant: Option<String>) {
     next.reviewer = Some(MaoRoleConfig {
         agent: current.agent,
         model: Some(model),
+        machine: current.machine,
+    });
+    save_mao_prefs(s, next);
+    s.menu = Some(OpenMenu::MaoReviewer(slot));
+}
+
+fn set_reviewer_machine(s: &mut UiState, slot: Slot, machine: Option<String>) {
+    let coder = active_coder_agent(s, slot);
+    let current = effective_reviewer(s, &coder);
+    let mut next = s.cfg.ui.mao.clone();
+    next.reviewer = Some(MaoRoleConfig {
+        agent: current.agent,
+        model: current.model,
+        machine,
     });
     save_mao_prefs(s, next);
     s.menu = Some(OpenMenu::MaoReviewer(slot));
@@ -1016,6 +1049,7 @@ pub fn on_start_submitted(
         coder: MaoRole {
             agent: coder_agent.to_string(),
             model: coder_model,
+            machine: None,
         },
         reviewer,
         coder_asid: pending_asid.to_string(),
@@ -1150,6 +1184,7 @@ pub fn on_session_submitted(s: &mut UiState, asid: &str, prompt: &str) {
         coder: MaoRole {
             agent: coder_agent,
             model: coder_model,
+            machine: None,
         },
         reviewer,
         coder_asid: asid.to_string(),
@@ -1297,10 +1332,32 @@ pub fn on_session_status(s: &mut UiState, asid: &str, status: AgentSessionStatus
     let lang = s.cfg.general.language;
     let now = now_ms();
 
-    // Check Coder state transitions first.
+    let mut gateway_reads: Vec<String> = Vec::new();
+    for run in &s.orchestration.runs {
+        if !run.id.starts_with("o_") || !run.is_active() {
+            continue;
+        }
+        let matches_role = run.coder_asid == asid || run.reviewer_asid.as_deref() == Some(asid);
+        if matches_role
+            && matches!(
+                status,
+                AgentSessionStatus::Idle
+                    | AgentSessionStatus::Failed
+                    | AgentSessionStatus::Interrupted
+            )
+            && !gateway_reads.contains(&run.id)
+        {
+            gateway_reads.push(run.id.clone());
+        }
+    }
+    for run_id in &gateway_reads {
+        request_gateway_read(s, run_id);
+    }
+
+    // Check Coder state transitions first (local standalone runs only).
     let mut prepare_cmd: Option<Command> = None;
     for run in &mut s.orchestration.runs {
-        if run.coder_asid != asid {
+        if run.id.starts_with("o_") || run.coder_asid != asid {
             continue;
         }
         if let MaoPhase::Coding { .. } = run.phase {
@@ -2004,6 +2061,27 @@ fn build_rework_prompt(
 }
 
 pub fn continue_rework(s: &mut UiState, run_id: &str) {
+    if run_id.starts_with("o_") {
+        let computer = s.current_computer().to_string();
+        if !computer.is_empty() && computer != "all" {
+            let ticket = s.next_token;
+            s.next_token += 1;
+            s.send(Command::Orchestration {
+                computer,
+                ticket,
+                request: crate::hub::OrchestrationRequest::Rework {
+                    run: run_id.to_string(),
+                    feedback: None,
+                },
+            });
+            s.notify(
+                ToastLevel::Info,
+                tr(s.cfg.general.language, "MAO rework dispatched"),
+                None,
+            );
+        }
+        return;
+    }
     let lang = s.cfg.general.language;
     let now = now_ms();
     let Some((coder_asid, prompt, echo, next_round, reviewer_name)) = (|| {
@@ -2080,6 +2158,18 @@ pub fn continue_rework(s: &mut UiState, run_id: &str) {
 }
 
 pub fn mark_approved(s: &mut UiState, run_id: &str) {
+    if run_id.starts_with("o_") {
+        let computer = s.current_computer().to_string();
+        if !computer.is_empty() && computer != "all" {
+            let ticket = s.next_token;
+            s.next_token += 1;
+            s.send(Command::Orchestration {
+                computer,
+                ticket,
+                request: crate::hub::OrchestrationRequest::Approve(run_id.to_string()),
+            });
+        }
+    }
     let lang = s.cfg.general.language;
     let now = now_ms();
     if let Some(run) = s.orchestration.runs.iter_mut().find(|r| r.id == run_id) {
@@ -2105,6 +2195,18 @@ pub fn mark_approved(s: &mut UiState, run_id: &str) {
 }
 
 pub fn cancel_run(s: &mut UiState, run_id: &str) {
+    if run_id.starts_with("o_") {
+        let computer = s.current_computer().to_string();
+        if !computer.is_empty() && computer != "all" {
+            let ticket = s.next_token;
+            s.next_token += 1;
+            s.send(Command::Orchestration {
+                computer,
+                ticket,
+                request: crate::hub::OrchestrationRequest::Cancel(run_id.to_string()),
+            });
+        }
+    }
     let lang = s.cfg.general.language;
     let now = now_ms();
     let Some((coder, reviewer)) = (|| {
@@ -2220,7 +2322,20 @@ fn reviewer_summary_label(
 ) -> String {
     let agent_name = s.agent_name(&reviewer.agent);
     let (model, display) = resolved_reviewer_model(s, reviewer);
-    let mut parts = vec![format!("{}: {agent_name}", tr_ref(language, "Reviewer"))];
+    let machine_suffix = reviewer.machine.as_deref().map(|m| {
+        let label = s
+            .peers
+            .iter()
+            .find(|p| p.server_id == m || p.name == m)
+            .map(|p| p.name.as_str())
+            .unwrap_or(m);
+        format!(" @ {label}")
+    });
+    let mut parts = vec![format!(
+        "{}: {agent_name}{}",
+        tr_ref(language, "Reviewer"),
+        machine_suffix.as_deref().unwrap_or("")
+    )];
     if let Some(m) = &model {
         parts.push(format_model_name(m, "Default", display));
         if let Some(v) = m.variant.as_deref() {
@@ -2379,6 +2494,7 @@ fn reviewer_config_menu(
                         next.reviewer = Some(MaoRoleConfig {
                             agent: cur.agent,
                             model: None,
+                            machine: cur.machine,
                         });
                         save_mao_prefs(s, next);
                         s.menu = Some(OpenMenu::MaoReviewer(slot));
@@ -2440,7 +2556,60 @@ fn reviewer_config_menu(
             }),
     );
 
-    // 4. Max review rounds
+    // 4. Reviewer target computer (when fleet peers are linked)
+    if s.peers.len() > 1 {
+        let current_machine_label = reviewer
+            .machine
+            .as_deref()
+            .map(|m| {
+                s.peers
+                    .iter()
+                    .find(|p| p.server_id == m || p.name == m)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| m.to_string())
+            })
+            .unwrap_or_else(|| tr(language, "This computer"));
+        let mut machine_entries = vec![MenuEntry::item(
+            MenuItem::new(tr_ref(language, "This computer"))
+                .checked(reviewer.machine.is_none())
+                .on_select(move |s: &mut UiState| set_reviewer_machine(s, slot, None)),
+        )];
+        for peer in &s.peers {
+            if peer.current {
+                continue;
+            }
+            let target_id = peer.name.clone();
+            let is_on = reviewer
+                .machine
+                .as_deref()
+                .is_some_and(|m| m == peer.name || m == peer.server_id);
+            let badge = if peer.reachable {
+                tr_ref(language, "Online")
+            } else {
+                tr_ref(language, "Offline")
+            };
+            machine_entries.push(MenuEntry::item(
+                MenuItem::new(peer.name.clone())
+                    .badge(badge)
+                    .checked(is_on)
+                    .disabled(!peer.reachable)
+                    .on_select(move |s: &mut UiState| {
+                        set_reviewer_machine(s, slot, Some(target_id.clone()));
+                    }),
+            ));
+        }
+        menu = menu.item(
+            MenuItem::new(tr_ref(language, "Computer"))
+                .badge(current_machine_label)
+                .submenu(machine_entries, section == MenuSection::Machine)
+                .on_select(move |s: &mut UiState| {
+                    s.orchestration.menu_section = Some(MenuSection::Machine);
+                    s.menu = Some(OpenMenu::MaoReviewer(slot));
+                }),
+        );
+    }
+
+    // 5. Max review rounds
     let round_entries: Vec<MenuEntry> = [1_u8, 2, 3, 5]
         .into_iter()
         .map(|n| {
@@ -4650,6 +4819,112 @@ fn open_run_diff(s: &mut UiState, target: &str) {
     s.send(Command::RefreshDiff(AgentSessionId(target.to_string())));
 }
 
+pub fn gateway_dispatch_available(s: &UiState) -> bool {
+    !s.demo
+        && !s.hub_label.is_empty()
+        && !s.hub_label.eq_ignore_ascii_case("standalone")
+        && !s.hub_label.eq_ignore_ascii_case("demo")
+}
+
+fn format_gateway_model_id(model: &ModelRef) -> String {
+    if model.provider_id.is_empty() {
+        model.model_id.clone()
+    } else {
+        format!("{}/{}", model.provider_id, model.model_id)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_gateway_start(
+    s: &mut UiState,
+    pending_or_asid: &str,
+    token: u64,
+    prompt: &str,
+    cwd: &str,
+    coder_agent: &str,
+    coder_model: Option<&ModelRef>,
+    coder_mode: Option<&str>,
+    existing_asid: Option<&str>,
+    attachments: &[String],
+) -> bool {
+    if !gateway_dispatch_available(s) {
+        return false;
+    }
+    let computer = s.current_computer().to_string();
+    if computer.is_empty() || computer == "all" {
+        return false;
+    }
+    let trimmed_cwd = cwd.trim();
+    if trimmed_cwd.is_empty() {
+        return false;
+    }
+    let reviewer = effective_reviewer(s, coder_agent);
+    ensure_reviewer_catalog(s, &reviewer.agent);
+    let max_rounds = s.cfg.ui.mao.max_rounds.clamp(1, 5);
+    let now = now_ms();
+    let client_ref = format!("desktop-{token}-{now}");
+    let mut rev_obj = serde_json::json!({
+        "agent": reviewer.agent,
+    });
+    if let Some(m) = reviewer.model.as_ref() {
+        rev_obj["model"] = serde_json::json!(format_gateway_model_id(m));
+        if let Some(v) = m.variant.as_deref() {
+            rev_obj["variant"] = serde_json::json!(v);
+        }
+    }
+    if let Some(machine) = reviewer.machine.as_deref() {
+        rev_obj["machine"] = serde_json::json!(machine);
+    }
+
+    let mut body = serde_json::json!({
+        "client_ref": client_ref,
+        "goal": prompt,
+        "cwd": trimmed_cwd,
+        "coordinator": coder_agent,
+        "model": coder_model.map(format_gateway_model_id),
+        "variant": coder_model.and_then(|m| m.variant.clone()),
+        "attachments": attachments,
+        "auto_approve": true,
+        "reviewer": rev_obj,
+        "max_review_rounds": max_rounds,
+    });
+    if let Some(mode) = coder_mode {
+        body["mode"] = serde_json::json!(mode);
+    }
+    if let Some(asid) = existing_asid {
+        body["asid"] = serde_json::json!(asid);
+    }
+
+    let ticket = s.next_token;
+    s.next_token += 1;
+    s.orchestration
+        .gateway_start_tokens
+        .insert(ticket, (pending_or_asid.to_string(), token));
+    s.orchestration
+        .enabled_sessions
+        .insert(pending_or_asid.to_string());
+    s.send(Command::Orchestration {
+        computer,
+        ticket,
+        request: crate::hub::OrchestrationRequest::Start(body),
+    });
+    true
+}
+
+pub fn request_gateway_read(s: &mut UiState, run_id: &str) {
+    let computer = s.current_computer().to_string();
+    if computer.is_empty() || computer == "all" {
+        return;
+    }
+    let ticket = s.next_token;
+    s.next_token += 1;
+    s.send(Command::Orchestration {
+        computer,
+        ticket,
+        request: crate::hub::OrchestrationRequest::Read(run_id.to_string()),
+    });
+}
+
 pub fn ensure_gateway_synced(s: &mut UiState) {
     let computer = s.current_computer().to_string();
     if computer.is_empty() || computer == "all" {
@@ -4677,11 +4952,28 @@ pub fn request_gateway_sync(s: &mut UiState) {
 pub fn on_gateway_orchestration(
     s: &mut UiState,
     computer: &str,
-    _ticket: u64,
+    ticket: u64,
     result: Result<serde_json::Value, crate::hub::OrchestrationError>,
 ) {
-    let Ok(payload) = result else {
-        return;
+    let pending_start = s.orchestration.gateway_start_tokens.remove(&ticket);
+    let payload = match result {
+        Ok(payload) => payload,
+        Err(err) => {
+            if let Some((pending_asid, token)) = pending_start {
+                if s.pending_start.as_ref().is_some_and(|(_, t)| *t == token) {
+                    s.pending_start = None;
+                }
+                if pending_asid.starts_with("new-") {
+                    s.sessions.retain(|item| item.asid.0 != pending_asid);
+                }
+                s.notify(
+                    ToastLevel::Error,
+                    tr(s.cfg.general.language, "Failed to start orchestration"),
+                    Some(err.message),
+                );
+            }
+            return;
+        }
     };
     let computer = if computer.is_empty() || computer == "self" {
         "local"
@@ -4689,22 +4981,100 @@ pub fn on_gateway_orchestration(
         computer
     };
     let mut changed = false;
+    let mut newly_reviewing: Vec<(String, String)> = Vec::new();
     if let Some(runs) = payload.get("runs").and_then(|v| v.as_array()) {
         for raw in runs {
-            if merge_gateway_run(s, computer, raw) {
+            if let Some(pair) = merge_gateway_run(s, computer, raw) {
                 changed = true;
+                if let Some(rev_pair) = pair {
+                    newly_reviewing.push(rev_pair);
+                }
             }
         }
     } else if let Some(single) = payload.get("run") {
-        if merge_gateway_run(s, computer, single) {
+        if let Some(pair) = merge_gateway_run(s, computer, single) {
             changed = true;
+            if let Some(rev_pair) = pair {
+                newly_reviewing.push(rev_pair);
+            }
         }
     }
+
+    if let Some((pending_asid, token)) = pending_start {
+        let coder_asid = payload
+            .pointer("/coder/asid")
+            .or_else(|| payload.pointer("/run/state/coder_asid"))
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        if let Some(real_asid) = coder_asid {
+            if pending_asid.starts_with("new-") {
+                let agent_id = payload
+                    .pointer("/coder/agent")
+                    .or_else(|| payload.pointer("/run/request/coordinator"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&s.start_agent)
+                    .to_string();
+                let dir = payload
+                    .pointer("/run/request/cwd")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let title = payload
+                    .pointer("/run/request/goal")
+                    .and_then(|v| v.as_str())
+                    .map(|g| concise_excerpt(g, 40))
+                    .unwrap_or_else(|| agent_id.clone());
+                if s.session_by_id(&real_asid).is_none() {
+                    if let Ok(stub) = serde_json::from_value(serde_json::json!({
+                        "asid": real_asid,
+                        "agent_id": agent_id,
+                        "title": title,
+                        "directory": dir,
+                        "status": "busy",
+                        "updated_ms": now_ms(),
+                    })) {
+                        s.sessions.insert(0, stub);
+                    }
+                }
+                if s.pending_start.as_ref().is_some_and(|(_, t)| *t == token) {
+                    s.adopt_created_session(&real_asid);
+                }
+                s.orchestration.enabled_sessions.remove(&pending_asid);
+                s.orchestration.enabled_sessions.insert(real_asid.clone());
+                s.auto_approve.insert(real_asid.clone(), true);
+                s.send(Command::FocusSession(AgentSessionId(real_asid.clone())));
+                if let Some(info) = s.session_by_id(&real_asid).cloned() {
+                    s.session_opened(&info);
+                }
+            } else {
+                s.orchestration.enabled_sessions.insert(real_asid.clone());
+                s.auto_approve.insert(real_asid, true);
+            }
+            if let Some(run_id) = payload.pointer("/run/id").and_then(|v| v.as_str()) {
+                s.orchestration.selected_run = Some(run_id.to_string());
+            }
+            s.status = "Running…".into();
+            s.sync_watch();
+        }
+    }
+
+    for (coder_asid, rev_asid) in newly_reviewing {
+        s.remember_subagent_context(&rev_asid, Some(&coder_asid));
+        s.timelines.entry(rev_asid.clone()).or_default();
+        if s.mode == Mode::Session
+            && s.selected.as_deref() == Some(coder_asid.as_str())
+            && coder_asid != rev_asid
+        {
+            s.open_detail(&coder_asid, &rev_asid);
+        }
+    }
+
     if changed {
         s.orchestration.runs.sort_by_key(|r| r.created_ms);
         if s.orchestration.selected_run.is_none() {
             s.orchestration.selected_run = s.orchestration.runs.last().map(|r| r.id.clone());
         }
+        s.sync_watch();
         persist_runs(s);
     }
 }
@@ -4725,16 +5095,14 @@ fn parse_gateway_model(model: Option<&str>, variant: Option<&str>) -> Option<Mod
     })
 }
 
-fn merge_gateway_run(s: &mut UiState, computer: &str, raw: &serde_json::Value) -> bool {
-    let Some(id) = raw.get("id").and_then(|v| v.as_str()) else {
-        return false;
-    };
-    let Some(req) = raw.get("request") else {
-        return false;
-    };
-    let Some(rev) = req.get("reviewer").filter(|v| !v.is_null()) else {
-        return false;
-    };
+fn merge_gateway_run(
+    s: &mut UiState,
+    computer: &str,
+    raw: &serde_json::Value,
+) -> Option<Option<(String, String)>> {
+    let id = raw.get("id").and_then(|v| v.as_str())?;
+    let req = raw.get("request")?;
+    let rev = req.get("reviewer").filter(|v| !v.is_null())?;
     let goal = req
         .get("goal")
         .and_then(|v| v.as_str())
@@ -4756,6 +5124,10 @@ fn merge_gateway_run(s: &mut UiState, computer: &str, raw: &serde_json::Value) -
             req.get("model").and_then(|v| v.as_str()),
             req.get("variant").and_then(|v| v.as_str()),
         ),
+        machine: req
+            .get("machine")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     };
     let reviewer = MaoRole {
         agent: rev
@@ -4767,6 +5139,10 @@ fn merge_gateway_run(s: &mut UiState, computer: &str, raw: &serde_json::Value) -
             rev.get("model").and_then(|v| v.as_str()),
             rev.get("variant").and_then(|v| v.as_str()),
         ),
+        machine: rev
+            .get("machine")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     };
     let created_ms = raw.get("created_ms").and_then(|v| v.as_u64()).unwrap_or(0);
     let st = raw.get("state");
@@ -4958,6 +5334,22 @@ fn merge_gateway_run(s: &mut UiState, computer: &str, raw: &serde_json::Value) -
         updated_ms,
     };
 
+    let rev_pair_if_local = (matches!(gw_run.phase, MaoPhase::Reviewing { .. })
+        && gw_run.reviewer.machine.is_none()
+        && !gw_run.coder_asid.is_empty())
+    .then(|| {
+        gw_run
+            .reviewer_asid
+            .as_ref()
+            .filter(|rev_id| !rev_id.is_empty())
+            .map(|rev_id| (gw_run.coder_asid.clone(), rev_id.clone()))
+    })
+    .flatten();
+
+    if !coder_asid.is_empty() {
+        s.orchestration.enabled_sessions.insert(coder_asid.clone());
+    }
+
     if let Some(existing) = s.orchestration.runs.iter_mut().find(|r| {
         r.id == id
             || (!coder_asid.is_empty()
@@ -4966,18 +5358,24 @@ fn merge_gateway_run(s: &mut UiState, computer: &str, raw: &serde_json::Value) -
                 && r.goal == goal)
     }) {
         if existing.steps.len() > gw_run.steps.len() && existing.is_active() {
-            return false;
+            return None;
         }
+        let was_same_rev = matches!(existing.phase, MaoPhase::Reviewing { .. })
+            && existing.reviewer_asid == gw_run.reviewer_asid;
         *existing = MaoRun {
             id: existing.id.clone(),
             expanded: existing.expanded,
             ..gw_run
         };
-        return true;
+        return Some(if was_same_rev {
+            None
+        } else {
+            rev_pair_if_local
+        });
     }
 
     s.orchestration.runs.push(gw_run);
-    true
+    Some(rev_pair_if_local)
 }
 
 // ---- Tests --------------------------------------------------------------------------------
@@ -5200,6 +5598,7 @@ MAO_VERDICT: CHANGES_REQUESTED";
                     model_id: "gpt-5.1-codex-mini".into(),
                     variant: Some("low".into()),
                 }),
+                machine: None,
             }),
             max_rounds: 2,
         };
@@ -5364,6 +5763,7 @@ MAO_VERDICT: CHANGES_REQUESTED";
                     model_id: "gpt-5.3-codex".into(),
                     variant: Some("high".into()),
                 }),
+                machine: None,
             }),
             max_rounds: 2,
         };
@@ -5511,5 +5911,124 @@ MAO_VERDICT: CHANGES_REQUESTED";
         on_session_submitted(&mut s, "existing-unrelated-1", "Implement feature Y");
         assert_eq!(s.orchestration.runs.len(), 1);
         assert_eq!(s.orchestration.runs[0].coder_asid, "existing-unrelated-1");
+    }
+
+    #[test]
+    fn gateway_dispatch_start_and_cross_machine_reviewer_control_actions() {
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.hub_label = "Local Gateway".into();
+        s.agents = vec![test_agent("claude", "Claude"), test_agent("codex", "Codex")];
+        s.cfg.ui.mao = MaoPrefs {
+            enabled: true,
+            reviewer: Some(MaoRoleConfig {
+                agent: "codex".into(),
+                model: Some(ModelRef {
+                    provider_id: "openai".into(),
+                    model_id: "gpt-5.6-luna".into(),
+                    variant: Some("low".into()),
+                }),
+                machine: Some("mac-studio".into()),
+            }),
+            max_rounds: 3,
+        };
+        s.pending_start = Some(("new-7".into(), 7));
+        s.selected = Some("new-7".into());
+
+        assert!(dispatch_gateway_start(
+            &mut s,
+            "new-7",
+            7,
+            "Cross-machine refactor",
+            "/tmp/repo",
+            "claude",
+            None,
+            None,
+            None,
+            &[],
+        ));
+
+        let mut start_ticket = None;
+        while let Ok(cmd) = rx.try_recv() {
+            if let Command::Orchestration {
+                ticket,
+                request: crate::hub::OrchestrationRequest::Start(body),
+                ..
+            } = cmd
+            {
+                assert_eq!(body["coordinator"], "claude");
+                assert_eq!(body["auto_approve"], true);
+                assert_eq!(body["reviewer"]["agent"], "codex");
+                assert_eq!(body["reviewer"]["machine"], "mac-studio");
+                assert_eq!(body["max_review_rounds"], 3);
+                start_ticket = Some(ticket);
+            }
+        }
+        let ticket = start_ticket.expect("gateway orchestration start dispatched");
+
+        // Simulate Gateway response adopting the created Coder session.
+        on_gateway_orchestration(
+            &mut s,
+            "local",
+            ticket,
+            Ok(serde_json::json!({
+                "run": {
+                    "id": "o_gw_99",
+                    "owner": "local",
+                    "created_ms": 1700000000000u64,
+                    "request": {
+                        "client_ref": "c99",
+                        "goal": "Cross-machine refactor",
+                        "cwd": "/tmp/repo",
+                        "coordinator": "claude",
+                        "reviewer": {
+                            "agent": "codex",
+                            "model": "openai/gpt-5.6-luna",
+                            "variant": "low",
+                            "machine": "mac-studio"
+                        },
+                        "max_review_rounds": 3
+                    },
+                    "state": {
+                        "round": 1,
+                        "max_rounds": 3,
+                        "mao_phase": "coding",
+                        "accepted": false,
+                        "coder_asid": "coder-gw-99",
+                        "steps": []
+                    }
+                },
+                "coder": { "agent": "claude", "asid": "coder-gw-99" }
+            })),
+        );
+        assert_eq!(s.selected.as_deref(), Some("coder-gw-99"));
+        assert!(s.orchestration.is_session_enabled("coder-gw-99"));
+        assert_eq!(
+            s.orchestration.runs[0].reviewer.machine.as_deref(),
+            Some("mac-studio")
+        );
+
+        // Control actions on o_* runs forward to Gateway endpoints.
+        continue_rework(&mut s, "o_gw_99");
+        mark_approved(&mut s, "o_gw_99");
+        cancel_run(&mut s, "o_gw_99");
+        let mut saw = (false, false, false);
+        while let Ok(cmd) = rx.try_recv() {
+            if let Command::Orchestration { request, .. } = cmd {
+                match request {
+                    crate::hub::OrchestrationRequest::Rework { run, .. } if run == "o_gw_99" => {
+                        saw.0 = true;
+                    }
+                    crate::hub::OrchestrationRequest::Approve(run) if run == "o_gw_99" => {
+                        saw.1 = true;
+                    }
+                    crate::hub::OrchestrationRequest::Cancel(run) if run == "o_gw_99" => {
+                        saw.2 = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(saw, (true, true, true));
     }
 }

@@ -601,6 +601,8 @@ pub struct MaoRoleConfig {
     pub agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<muqun_gateway::agents::ModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
 /// Persisted MAO preferences for the composer's Coder ⇄ Reviewer flow.

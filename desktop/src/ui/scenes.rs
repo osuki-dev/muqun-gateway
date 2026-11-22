@@ -1613,10 +1613,12 @@ fn mao_sample_runs(now: u64) -> Vec<super::orchestration::MaoRun> {
             coder: MaoRole {
                 agent: "opencode".into(),
                 model: None,
+                machine: None,
             },
             reviewer: MaoRole {
                 agent: "claude".into(),
                 model: None,
+                machine: None,
             },
             coder_asid: "s3".into(),
             reviewer_asid: Some("s3".into()),
@@ -1684,6 +1686,7 @@ fn mao_sample_runs(now: u64) -> Vec<super::orchestration::MaoRun> {
                     model_id: "claude-haiku-4-5".into(),
                     variant: Some("low".into()),
                 }),
+                machine: None,
             },
             reviewer: MaoRole {
                 agent: "codex".into(),
@@ -1692,6 +1695,7 @@ fn mao_sample_runs(now: u64) -> Vec<super::orchestration::MaoRun> {
                     model_id: "gpt-5.1-codex-mini".into(),
                     variant: Some("low".into()),
                 }),
+                machine: None,
             },
             coder_asid: "s1".into(),
             reviewer_asid: Some("s2".into()),
@@ -1790,6 +1794,7 @@ fn mao_session_scene(s: &mut UiState) {
                 model_id: "gpt-5.1-codex-mini".into(),
                 variant: Some("low".into()),
             }),
+            machine: None,
         }),
         max_rounds: 2,
     };

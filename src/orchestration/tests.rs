@@ -284,6 +284,7 @@ fn reviewer_spec_included_in_prompt_and_round_bounds_validated() {
         agent: "claude".into(),
         model: Some("anthropic/opus-4.6".into()),
         variant: Some("high".into()),
+        machine: Some("mac-studio".into()),
     });
     req.max_review_rounds = Some(3);
     let run = Run {
@@ -315,6 +316,7 @@ async fn mao_pipeline_exposes_universal_deliverables_gates_and_control_actions()
         agent: "opencode".into(),
         model: None,
         variant: None,
+        machine: None,
     });
     req.max_review_rounds = Some(2);
 
@@ -397,6 +399,7 @@ async fn round_two_rework_tracks_new_rework_task_rather_than_settled_root() {
         agent: "opencode".into(),
         model: None,
         variant: None,
+        machine: None,
     });
     let (mut run, _) = store::reserve(&state.db, "owner".into(), req)
         .await
@@ -606,6 +609,7 @@ async fn remote_peer_child_task_prevents_skipping_review_when_local_git_empty() 
         agent: "opencode".into(),
         model: None,
         variant: None,
+        machine: None,
     });
     let (status, created) = call(&state, "token", "POST", "/api/orchestrations", json!(req)).await;
     assert_eq!(status, StatusCode::OK, "{created}");

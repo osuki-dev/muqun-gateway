@@ -249,6 +249,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     let app = crate::fleet::peer_routes::mount(app);
     let app = crate::tasks::routes::mount(app);
     let app = crate::orchestration::mount(app);
+    crate::orchestration::spawn_reconciler(state.clone());
     let app = crate::search::routes::mount(app);
     let app = if state.config.mcp.enabled {
         crate::mcp::mount(app)

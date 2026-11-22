@@ -5,7 +5,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use routes::mount;
+pub(crate) use routes::{mount, spawn_reconciler};
 pub(crate) use store::MIGRATION;
 pub(crate) const CAPABILITY: &str = "agent_orchestration_preview_v1";
 
@@ -19,6 +19,8 @@ pub struct ReviewerSpec {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -591,6 +591,34 @@ impl SessionHub for RemoteHub {
                     self.call(Method::POST, &["api", "orchestrations"], &[], Some(body))
                         .await
                 }
+                super::OrchestrationRequest::Approve(id) => {
+                    self.call(
+                        Method::POST,
+                        &["api", "orchestrations", &id, "approve"],
+                        &[],
+                        None,
+                    )
+                    .await
+                }
+                super::OrchestrationRequest::Rework { run, feedback } => {
+                    let body = feedback.map(|f| json!({ "feedback": f }));
+                    self.call(
+                        Method::POST,
+                        &["api", "orchestrations", &run, "rework"],
+                        &[],
+                        body,
+                    )
+                    .await
+                }
+                super::OrchestrationRequest::Cancel(id) => {
+                    self.call(
+                        Method::POST,
+                        &["api", "orchestrations", &id, "cancel"],
+                        &[],
+                        None,
+                    )
+                    .await
+                }
                 super::OrchestrationRequest::CancelTask { run, task } => {
                     self.cancel_task(&task).await?;
                     self.call(Method::GET, &["api", "orchestrations", &run], &[], None)

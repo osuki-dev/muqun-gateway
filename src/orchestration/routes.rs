@@ -39,19 +39,44 @@ fn internal(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
 async fn list(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let mut runs = store::list(&state.db).await.map_err(internal)?;
-    for run in &mut runs {
+    reconcile_active_runs(&state, &mut runs).await;
+    Ok(Json(json!({"runs": runs})))
+}
+
+async fn reconcile_active_runs(state: &AppState, runs: &mut [Run]) {
+    for run in runs {
         if matches!(run.state.mao_phase.as_str(), "coding" | "reviewing") {
             if let Ok(recovered) = store::recover(&state.db, run.clone()).await {
                 *run = recovered;
             }
             if let Some(root) = run.task_id.clone() {
                 if let Ok(mut tasks) = state.tasks.tree(&TaskId(root.clone()), None, 1000).await {
-                    let _ = reconcile_pipeline(&state, run, &mut tasks, &root).await;
+                    let _ = reconcile_pipeline(state, run, &mut tasks, &root).await;
                 }
             }
         }
     }
-    Ok(Json(json!({"runs": runs})))
+}
+
+/// Autonomous background reconciler so Gateway-managed Coder ⇄ Reviewer runs
+/// keep advancing even when Desktop or mobile Apps are closed or disconnected.
+pub(crate) fn spawn_reconciler(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let Ok(mut runs) = store::list(&state.db).await else {
+                continue;
+            };
+            if runs
+                .iter()
+                .any(|r| matches!(r.state.mao_phase.as_str(), "coding" | "reviewing"))
+            {
+                reconcile_active_runs(&state, &mut runs).await;
+            }
+        }
+    });
 }
 
 async fn read(
@@ -531,7 +556,10 @@ async fn reconcile_pipeline(
                         delivery: Some(Delivery::Session),
                         computer_ids: run.request.computer_ids.clone(),
                         mode: None,
-                        machine: run.request.machine.clone(),
+                        machine: rev_spec
+                            .machine
+                            .clone()
+                            .or_else(|| run.request.machine.clone()),
                         mentions: run.request.mentions.clone(),
                         session_id: run.state.reviewer_asid.clone(),
                         attachments: vec![],
@@ -789,6 +817,7 @@ async fn view(state: &AppState, run: Run) -> ApiResult<Json<Value>> {
                 "agent": r.agent,
                 "model": r.model,
                 "variant": r.variant,
+                "machine": r.machine,
                 "asid": run.state.reviewer_asid,
             })),
             "deliverables": {
@@ -860,6 +889,7 @@ async fn view(state: &AppState, run: Run) -> ApiResult<Json<Value>> {
             "agent": r.agent,
             "model": r.model,
             "variant": r.variant,
+            "machine": r.machine,
             "asid": run.state.reviewer_asid,
         })),
         "deliverables": {
@@ -897,6 +927,7 @@ async fn start(
         valid_name(&rev.agent)
             && rev.model.as_deref().is_none_or(valid_name)
             && rev.variant.as_deref().is_none_or(valid_name)
+            && rev.machine.as_deref().is_none_or(valid_name)
     });
     let rounds_valid = request
         .max_review_rounds

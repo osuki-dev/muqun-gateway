@@ -166,6 +166,12 @@ impl SessionHub for LocalHub {
                         "accepted": false
                     }))
                 }
+                super::OrchestrationRequest::Approve(id)
+                | super::OrchestrationRequest::Cancel(id)
+                | super::OrchestrationRequest::Rework { run: id, .. } => {
+                    self.orchestration(super::OrchestrationRequest::Read(id))
+                        .await
+                }
                 super::OrchestrationRequest::CancelTask { run, task } => {
                     self.cancel_task(&task).await?;
                     self.orchestration(super::OrchestrationRequest::Read(run))

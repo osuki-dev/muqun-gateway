@@ -43,7 +43,16 @@ pub enum OrchestrationRequest {
     List,
     Read(String),
     Start(serde_json::Value),
-    CancelTask { run: String, task: String },
+    Approve(String),
+    Rework {
+        run: String,
+        feedback: Option<String>,
+    },
+    Cancel(String),
+    CancelTask {
+        run: String,
+        task: String,
+    },
 }
 
 #[derive(Debug, Clone)]

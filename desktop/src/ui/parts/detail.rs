@@ -395,6 +395,7 @@ mod tests {
             reviewer: crate::ui::orchestration::MaoRole {
                 agent: "codex".into(),
                 model: None,
+                machine: None,
             },
             reviewer_asid: Some("rev-multiline".into()),
             ..Default::default()

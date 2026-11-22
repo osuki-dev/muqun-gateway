@@ -2406,7 +2406,7 @@ impl UiState {
     }
 
     /// The composer's catalogue, branch and bypass state for a freshly opened session.
-    fn session_opened(&mut self, info: &AgentSessionInfo) {
+    pub(super) fn session_opened(&mut self, info: &AgentSessionInfo) {
         if self
             .pending_start
             .as_ref()
@@ -3801,7 +3801,7 @@ impl UiState {
         self.sessions.truncate(SESSIONS_KEPT);
     }
 
-    fn adopt_created_session(&mut self, asid: &str) {
+    pub(super) fn adopt_created_session(&mut self, asid: &str) {
         // Migrate optimistic pending session created from home composer if present.
         if let Some((pending_asid, _)) = self.pending_start.take() {
             self.sessions.retain(|s| s.asid.0 != pending_asid);

@@ -358,9 +358,6 @@ fn send_session(s: &mut UiState, queue: bool) {
     s.record_prompt_history(&text);
     let busy = s.busy();
     let is_mao_session = s.orchestration.is_session_enabled(&asid);
-    if !busy {
-        super::orchestration::on_session_submitted(s, &asid, &text);
-    }
     let attachments: Vec<String> = s.staged.iter().map(|f| f.path.clone()).collect();
     let deliver = deliver_of(catalog_of(s, Slot::Session), &text, !attachments.is_empty());
     note_skill_args(s, &deliver);
@@ -379,14 +376,46 @@ fn send_session(s: &mut UiState, queue: bool) {
         s.draft = fresh("");
         s.persist_draft(Slot::Session);
     }
-    s.send(Command::Compose(ComposeCommand::Submit {
-        token,
-        target: Target::Session(AgentSessionId(asid)),
-        deliver,
-        attachments,
-        delivery: delivery.map(super::echo::BusyDelivery::wire),
-        auto_approve: !busy && is_mao_session,
-    }));
+    let gateway_mao = if !busy && is_mao_session && matches!(&deliver, Deliver::Prompt(_)) {
+        let info = s.session_by_id(&asid).cloned();
+        let coder_agent = info
+            .as_ref()
+            .map(|i| i.agent_id.clone())
+            .unwrap_or_else(|| s.start_agent.clone());
+        let coder_model = info.as_ref().and_then(|i| i.model.clone());
+        let coder_mode = info.as_ref().and_then(|i| i.mode.clone());
+        let cwd = info
+            .as_ref()
+            .and_then(|i| i.directory.clone())
+            .unwrap_or_default();
+        super::orchestration::dispatch_gateway_start(
+            s,
+            &asid,
+            token,
+            &text,
+            &cwd,
+            &coder_agent,
+            coder_model.as_ref(),
+            coder_mode.as_deref(),
+            Some(&asid),
+            &attachments,
+        )
+    } else {
+        false
+    };
+    if !busy && !gateway_mao {
+        super::orchestration::on_session_submitted(s, &asid, &text);
+    }
+    if !gateway_mao {
+        s.send(Command::Compose(ComposeCommand::Submit {
+            token,
+            target: Target::Session(AgentSessionId(asid)),
+            deliver,
+            attachments,
+            delivery: delivery.map(super::echo::BusyDelivery::wire),
+            auto_approve: !busy && is_mao_session,
+        }));
+    }
 }
 
 fn draft_caret(edit: &TextEdit) -> usize {
