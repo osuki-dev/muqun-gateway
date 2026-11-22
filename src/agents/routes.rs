@@ -852,6 +852,7 @@ async fn do_create_agent_session(
     };
     refuse_remote_elevation(
         state,
+        headers,
         body.mode.as_deref().is_some_and(|mode| {
             crate::agents::auto_approve::is_elevating(manager.agent().kind(), mode)
         }),
@@ -1255,6 +1256,7 @@ async fn do_switch_mode(
     let manager = session_manager_or_err(state, asid).await?;
     refuse_remote_elevation(
         state,
+        headers,
         crate::agents::auto_approve::is_elevating(manager.agent().kind(), mode),
     )?;
 
@@ -1305,7 +1307,7 @@ async fn do_set_auto_approve(
     headers: &HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
-    refuse_remote_elevation(state, enabled)?;
+    refuse_remote_elevation(state, headers, enabled)?;
     let manager = session_manager_or_err(state, asid).await?;
     manager
         .agent()
@@ -1316,12 +1318,20 @@ async fn do_set_auto_approve(
 }
 
 /// Putting an agent into a mode where it stops asking is the owner's
-/// choice, made in config.json on this computer, never from a device.
+/// choice, made in config.json on this computer or through the local desktop app
+/// authenticated via `local-client.json`, never from a remote device.
 /// Every route that can select such a mode -- the auto-approve switch, the
 /// mode route and session creation -- passes its request through here;
 /// leaving such a mode is never refused.
-fn refuse_remote_elevation(state: &AppState, elevating: bool) -> ApiResult<()> {
-    if elevating && !state.config.allow_remote_auto_approve {
+fn refuse_remote_elevation(
+    state: &AppState,
+    headers: &HeaderMap,
+    elevating: bool,
+) -> ApiResult<()> {
+    if elevating
+        && !state.config.allow_remote_auto_approve
+        && crate::platform::local_client::caller(headers).is_none()
+    {
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "auto_approve_disabled",
