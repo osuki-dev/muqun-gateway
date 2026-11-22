@@ -3800,7 +3800,12 @@ impl UiState {
     }
 
     fn merge_sessions(&mut self, incoming: Vec<AgentSessionInfo>) {
-        for info in incoming {
+        for mut info in incoming {
+            if let Some(preserved) = self.orchestration.preserved_titles.get(&info.asid.0) {
+                if !preserved.trim().is_empty() {
+                    info.title = preserved.clone();
+                }
+            }
             self.remember_session_lineage(&info);
             match self.sessions.iter_mut().find(|s| s.asid.0 == info.asid.0) {
                 Some(slot) => *slot = info,

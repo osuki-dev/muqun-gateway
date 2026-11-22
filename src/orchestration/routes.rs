@@ -1759,6 +1759,7 @@ async fn start(
             }
         }
     }
+    let mut original_coder_title: Option<String> = None;
     if let Some(asid) = effective_asid.as_deref() {
         let manager = state
             .agent_runtime
@@ -1785,12 +1786,22 @@ async fn start(
                 "Wait for the current session to become idle",
             ));
         }
+        let existing_title = info.title.trim();
+        if !existing_title.is_empty()
+            && existing_title != asid
+            && !existing_title.starts_with("[MAO ")
+        {
+            original_coder_title = Some(existing_title.to_string());
+        }
     }
     let (mut run, fresh) = store::reserve(&state.db, owner.clone(), request.clone())
         .await
         .map_err(internal)?;
     if !fresh {
         return repeated(&state, run, request).await;
+    }
+    if original_coder_title.is_some() {
+        run.state.original_coder_title = original_coder_title;
     }
     if let Some((from_spec, to_spec, reason, agent_wide)) = pre_failover {
         mark_candidate_exhausted(&mut run.state.exhausted_candidates, &from_spec, agent_wide);

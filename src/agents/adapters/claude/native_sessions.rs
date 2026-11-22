@@ -530,10 +530,17 @@ impl Fields {
                         *slot = Some(value);
                     }
                 };
+                let keep_non_mao = |slot: &mut Option<String>, value: Option<String>| {
+                    if let Some(value) =
+                        value.filter(|v| !v.trim().is_empty() && !is_orchestration_prompt(v))
+                    {
+                        *slot = Some(value);
+                    }
+                };
                 keep(&mut fields.custom_title, record.custom_title);
                 keep(&mut fields.ai_title, record.ai_title);
-                keep(&mut fields.last_prompt, record.last_prompt);
-                keep(&mut fields.summary, record.summary);
+                keep_non_mao(&mut fields.last_prompt, record.last_prompt);
+                keep_non_mao(&mut fields.summary, record.summary);
                 continue;
             }
             if record.uuid.is_none() && record.cwd.is_none() {
@@ -585,6 +592,17 @@ fn prompt_text(content: &Value) -> Option<String> {
     };
     let text = text.trim();
     (!text.is_empty() && !text.starts_with('<')).then(|| text.to_owned())
+}
+
+fn is_orchestration_prompt(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("[MAO ")
+        || trimmed.starts_with("MAO Rework")
+        || trimmed.starts_with("MAO Automated Rework")
+        || trimmed.starts_with("MAO Manual Rework")
+        || trimmed.starts_with("MAO Code Review")
+        || trimmed.starts_with("Implement and verify the user goal carefully.")
+        || trimmed.starts_with("You are the designated **Read-Only Code Reviewer**")
 }
 
 fn clean_title(title: &str) -> String {

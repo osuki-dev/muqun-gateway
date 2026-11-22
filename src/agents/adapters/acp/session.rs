@@ -25,6 +25,17 @@ use crate::agents::ports::mirror::{AgentSessionSnapshot, SessionMirrorPort};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
+fn is_orchestration_title_noise(title: &str) -> bool {
+    let trimmed = title.trim_start();
+    trimmed.starts_with("[MAO ")
+        || trimmed.starts_with("MAO Rework")
+        || trimmed.starts_with("MAO Automated Rework")
+        || trimmed.starts_with("MAO Manual Rework")
+        || trimmed.starts_with("MAO Code Review")
+        || trimmed.starts_with("Implement and verify the user goal carefully.")
+        || trimmed.starts_with("You are the designated **Read-Only Code Reviewer**")
+}
+
 /// Native launch and verified differences; protocol lifecycle is shared.
 /// An agent whose bypass is a launch flag: the session's child is started
 /// again with `before` ahead of and `after` behind its arguments, and `env`
@@ -2302,8 +2313,12 @@ impl<P: AcpProvider> AcpDriver<P> {
                 let mut state = known.state.lock().await;
                 let mut changed = false;
                 if !known.busy.load(Ordering::Acquire) && row["title"].is_string() {
-                    changed = state.info.title != info.title;
-                    state.info.title = info.title;
+                    let has_real_title = !state.info.title.trim().is_empty()
+                        && state.info.title != state.info.asid.0;
+                    if !(has_real_title && is_orchestration_title_noise(&info.title)) {
+                        changed = state.info.title != info.title;
+                        state.info.title = info.title;
+                    }
                     state.info.updated_ms = state.info.updated_ms.max(info.updated_ms);
                 }
                 info = state.info.clone();
@@ -3109,7 +3124,11 @@ impl<P: AcpProvider> AcpDriver<P> {
         match update["sessionUpdate"].as_str() {
             Some("session_info_update") => {
                 if let Some(title) = update["title"].as_str() {
-                    state.info.title = title.into();
+                    let has_real_title = !state.info.title.trim().is_empty()
+                        && state.info.title != state.info.asid.0;
+                    if !(has_real_title && is_orchestration_title_noise(title)) {
+                        state.info.title = title.into();
+                    }
                 }
                 Ok(None)
             }

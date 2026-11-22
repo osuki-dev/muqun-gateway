@@ -312,6 +312,7 @@ pub struct View {
     pub enabled_sessions: HashSet<String>,
     pub gateway_start_tokens: HashMap<u64, (String, u64)>,
     pub pending_start_runs: HashMap<String, (String, u64)>,
+    pub preserved_titles: HashMap<String, String>,
     pub last_gateway_poll_ms: u64,
     pub rework_note: TextEdit,
     pub rework_note_run: Option<String>,
@@ -384,6 +385,7 @@ impl Default for View {
             enabled_sessions,
             gateway_start_tokens: HashMap::new(),
             pending_start_runs: HashMap::new(),
+            preserved_titles: HashMap::new(),
             last_gateway_poll_ms: 0,
             rework_note: TextEdit::new(""),
             rework_note_run: None,
@@ -1289,10 +1291,38 @@ pub fn on_start_submitted(
     persist_runs(s);
 }
 
+pub fn preserve_session_title(s: &mut UiState, asid: &str) {
+    if asid.is_empty()
+        || asid.starts_with("new-")
+        || s.orchestration.preserved_titles.contains_key(asid)
+    {
+        return;
+    }
+    if let Some(title) = s
+        .session_by_id(asid)
+        .map(|info| info.title.trim().to_string())
+        .filter(|t| !t.is_empty() && t != asid && !t.starts_with("[MAO "))
+    {
+        s.orchestration
+            .preserved_titles
+            .insert(asid.to_string(), title);
+    }
+}
+
+pub fn on_user_renamed_session(s: &mut UiState, asid: &str, title: &str) {
+    let trimmed = title.trim();
+    if !trimmed.is_empty() && s.orchestration.preserved_titles.contains_key(asid) {
+        s.orchestration
+            .preserved_titles
+            .insert(asid.to_string(), trimmed.to_string());
+    }
+}
+
 pub fn on_session_submitted(s: &mut UiState, asid: &str, prompt: &str) {
     if !is_session_mao_enabled(s, asid) {
         return;
     }
+    preserve_session_title(s, asid);
     // Manual prompts inside a dedicated Reviewer session should not fork nested MAO runs.
     if s.orchestration
         .runs
@@ -5763,6 +5793,7 @@ pub fn dispatch_gateway_start(
         body["mode"] = serde_json::json!(mode);
     }
     if let Some(asid) = existing_asid {
+        preserve_session_title(s, asid);
         body["asid"] = serde_json::json!(asid);
     }
 
@@ -6369,6 +6400,27 @@ fn merge_gateway_run(
     })
     .flatten();
 
+    if !coder_asid.is_empty() {
+        if let Some(orig) = st
+            .and_then(|v| v.get("original_coder_title"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && *t != coder_asid)
+        {
+            s.orchestration
+                .preserved_titles
+                .entry(coder_asid.clone())
+                .or_insert_with(|| orig.to_string());
+            if let Some(info) = s.sessions.iter_mut().find(|i| i.asid.0 == coder_asid) {
+                info.title = s
+                    .orchestration
+                    .preserved_titles
+                    .get(&coder_asid)
+                    .cloned()
+                    .unwrap_or_else(|| orig.to_string());
+            }
+        }
+    }
     if !coder_asid.is_empty()
         && gw_run.is_active()
         && s.cfg.ui.mao.session_overrides.get(&coder_asid) != Some(&false)
@@ -7599,5 +7651,48 @@ MAO_VERDICT: CHANGES_REQUESTED";
         // 2. Existing session failover created a new session stub and focused it!
         assert!(s.session_by_id("codex-fallback-2").is_some());
         assert_eq!(s.selected.as_deref(), Some("codex-fallback-2"));
+    }
+
+    #[test]
+    fn orchestration_preserves_original_session_title_while_allowing_manual_rename() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.hub_label = "gateway".into();
+        s.sessions
+            .push(test_session("orig-1", "claude", "我的原始会话标题"));
+        s.selected = Some("orig-1".into());
+        toggle_enabled(&mut s, Slot::Session);
+
+        assert!(dispatch_gateway_start(
+            &mut s,
+            "orig-1",
+            12,
+            "帮我修一下样式",
+            "/tmp",
+            "claude",
+            None,
+            None,
+            Some("orig-1"),
+            &[],
+        ));
+
+        // Agent/backend tries to overwrite the session title during MAO rework.
+        s.merge_sessions(vec![test_session(
+            "orig-1",
+            "claude",
+            "[MAO Automated Rework · Round 2/2] 帮我修一下样式",
+        )]);
+        assert_eq!(
+            s.session_by_id("orig-1").map(|i| i.title.as_str()),
+            Some("我的原始会话标题")
+        );
+
+        // Explicit manual user rename still updates the preserved title cleanly.
+        on_user_renamed_session(&mut s, "orig-1", "手动改的新标题");
+        s.merge_sessions(vec![test_session("orig-1", "claude", "任何自动生成标题")]);
+        assert_eq!(
+            s.session_by_id("orig-1").map(|i| i.title.as_str()),
+            Some("手动改的新标题")
+        );
     }
 }

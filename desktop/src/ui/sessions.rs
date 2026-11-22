@@ -429,6 +429,7 @@ fn commit_rename(s: &mut UiState, _: &mut Tx) {
     if let Some(info) = s.sessions.iter_mut().find(|i| i.asid.0 == asid) {
         info.title = title.clone();
     }
+    super::orchestration::on_user_renamed_session(s, &asid, &title);
     s.send(Command::RenameSession {
         asid: AgentSessionId(asid),
         title,

@@ -123,6 +123,8 @@ pub struct RunState {
     pub exhausted_candidates: Vec<String>,
     #[serde(default)]
     pub failover_count: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_coder_title: Option<String>,
 }
 
 impl Default for RunState {
@@ -150,6 +152,7 @@ impl Default for RunState {
             active_reviewer: None,
             exhausted_candidates: Vec::new(),
             failover_count: 0,
+            original_coder_title: None,
         }
     }
 }
@@ -951,6 +954,7 @@ impl RunState {
             active_reviewer,
             exhausted_candidates: Vec::new(),
             failover_count: 0,
+            original_coder_title: None,
         }
     }
 
