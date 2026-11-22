@@ -100,6 +100,8 @@ pub struct RunState {
     pub reviewed_round: u8,
     pub base_commit: Option<String>,
     pub base_commits: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub base_worktree_fingerprints: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_diff_fingerprint: Option<String>,
     pub files: Vec<ChangedFile>,
@@ -123,6 +125,7 @@ impl Default for RunState {
             reviewed_round: 0,
             base_commit: None,
             base_commits: std::collections::BTreeMap::new(),
+            base_worktree_fingerprints: std::collections::BTreeMap::new(),
             last_diff_fingerprint: None,
             files: Vec::new(),
             coder_summary: None,
@@ -231,6 +234,37 @@ pub fn discover_git_repos(cwd: &str, goal: &str) -> Vec<std::path::PathBuf> {
     repos
 }
 
+pub fn repo_worktree_fingerprint(repo_dir: &std::path::Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let head = run_git_cmd(repo_dir, &["rev-parse", "--verify", "HEAD"]).unwrap_or_default();
+    let status = run_git_cmd(repo_dir, &["status", "--porcelain"]).unwrap_or_default();
+    let diff = run_git_cmd(repo_dir, &["diff", "--no-color"]).unwrap_or_default();
+    let cached = run_git_cmd(repo_dir, &["diff", "--cached", "--no-color"]).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(head.trim().as_bytes());
+    hasher.update(b"\n--status--\n");
+    hasher.update(status.as_bytes());
+    hasher.update(b"\n--diff--\n");
+    hasher.update(diff.as_bytes());
+    hasher.update(b"\n--cached--\n");
+    hasher.update(cached.as_bytes());
+    let digest = hasher.finalize();
+    Some(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+pub fn capture_worktree_fingerprints(
+    cwd: &str,
+    goal: &str,
+) -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    for repo in discover_git_repos(cwd, goal) {
+        if let Some(fp) = repo_worktree_fingerprint(&repo) {
+            map.insert(repo.to_string_lossy().into_owned(), fp);
+        }
+    }
+    map
+}
+
 pub fn capture_base_commits(cwd: &str, goal: &str) -> std::collections::BTreeMap<String, String> {
     let mut map = std::collections::BTreeMap::new();
     for repo in discover_git_repos(cwd, goal) {
@@ -248,6 +282,17 @@ pub fn collect_local_repos_diff(
     cwd: &str,
     goal: &str,
     base_commits: &std::collections::BTreeMap<String, String>,
+    legacy_base: Option<&str>,
+) -> (Vec<ChangedFile>, String) {
+    let empty = std::collections::BTreeMap::new();
+    collect_local_repos_diff_since(cwd, goal, base_commits, &empty, legacy_base)
+}
+
+pub fn collect_local_repos_diff_since(
+    cwd: &str,
+    goal: &str,
+    base_commits: &std::collections::BTreeMap<String, String>,
+    base_worktree_fingerprints: &std::collections::BTreeMap<String, String>,
     legacy_base: Option<&str>,
 ) -> (Vec<ChangedFile>, String) {
     let mut repos: Vec<std::path::PathBuf> = Vec::new();
@@ -281,6 +326,13 @@ pub fn collect_local_repos_diff(
 
     for (idx, repo_dir) in repos.iter().enumerate() {
         let key = repo_dir.to_string_lossy();
+        if let Some(before_fp) = base_worktree_fingerprints.get(key.as_ref()) {
+            if repo_worktree_fingerprint(repo_dir).as_deref() == Some(before_fp.as_str()) {
+                // Repository working tree & HEAD are byte-for-byte identical to pre-turn
+                // snapshot: do not misattribute pre-existing uncommitted files to this turn.
+                continue;
+            }
+        }
         let base = base_commits
             .get(key.as_ref())
             .map(String::as_str)
@@ -637,6 +689,7 @@ impl RunState {
     fn for_request(request: &Start) -> Self {
         let now = crate::tasks::domain::now_ms();
         let base_commits = capture_base_commits(&request.cwd, &request.goal);
+        let base_worktree_fingerprints = capture_worktree_fingerprints(&request.cwd, &request.goal);
         let base_commit = resolve_repo_root(std::path::Path::new(&request.cwd))
             .and_then(|root| base_commits.get(&root.display().to_string()).cloned())
             .or_else(|| base_commits.values().next().cloned());
@@ -651,6 +704,7 @@ impl RunState {
             reviewed_round: 0,
             base_commit,
             base_commits,
+            base_worktree_fingerprints,
             last_diff_fingerprint: None,
             files: Vec::new(),
             coder_summary: None,
@@ -927,33 +981,7 @@ impl Run {
     }
 
     fn coding_prompt(&self) -> String {
-        let multi_repo_hint = if self.state.base_commits.len() > 1 {
-            let repos = self
-                .state
-                .base_commits
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n- ");
-            format!(
-                "\nMulti-repository workspace detected:\n- {repos}\nCoordinate interface contracts consistently across repositories and run verification checks in each modified repo.\n"
-            )
-        } else {
-            String::new()
-        };
-        let remote_hint = if !self.request.computer_ids.is_empty()
-            || !self.request.mentions.is_empty()
-            || self.request.machine.is_some()
-        {
-            "\nRemote/multi-computer execution context: use Muqun MCP tools (`tasks.delegate`, `exec.run`, `tasks.read`, `tasks.wait`) when delegating or verifying work on target remote computers.\n"
-        } else {
-            ""
-        };
-        format!(
-            "Implement and verify the user goal carefully. Honor repository instructions, run relevant checks/tests to confirm your changes work cleanly, and finish with changed files, commands executed, and results.{multi_repo_hint}{remote_hint}\n\n\
-             User goal:\n{}",
-            self.request.goal
-        )
+        self.request.goal.trim().to_string()
     }
 
     fn review_prompt(

@@ -376,7 +376,9 @@ fn send_session(s: &mut UiState, queue: bool) {
         s.draft = fresh("");
         s.persist_draft(Slot::Session);
     }
-    let gateway_mao = if !busy && is_mao_session && matches!(&deliver, Deliver::Prompt(_)) {
+    let run_mao_for_turn =
+        !busy && is_mao_session && !super::orchestration::is_conversational_query(&text);
+    let gateway_mao = if run_mao_for_turn && matches!(&deliver, Deliver::Prompt(_)) {
         let info = s.session_by_id(&asid).cloned();
         let coder_agent = info
             .as_ref()
@@ -403,7 +405,7 @@ fn send_session(s: &mut UiState, queue: bool) {
     } else {
         false
     };
-    if !busy && !gateway_mao {
+    if run_mao_for_turn && !gateway_mao {
         super::orchestration::on_session_submitted(s, &asid, &text);
     }
     if !gateway_mao {
@@ -413,7 +415,7 @@ fn send_session(s: &mut UiState, queue: bool) {
             deliver,
             attachments,
             delivery: delivery.map(super::echo::BusyDelivery::wire),
-            auto_approve: !busy && is_mao_session,
+            auto_approve: run_mao_for_turn,
         }));
     }
 }

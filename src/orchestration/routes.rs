@@ -224,6 +224,7 @@ async fn collect_deliverables(
     coder_summary: &str,
     base_commit: Option<&str>,
     base_commits: &std::collections::BTreeMap<String, String>,
+    base_worktree_fingerprints: &std::collections::BTreeMap<String, String>,
     tasks: &[TaskView],
     root_task_id: &str,
     run_task_ref: &str,
@@ -237,14 +238,22 @@ async fn collect_deliverables(
     };
     let discovered = super::discover_git_repos(cwd, &combined_goal);
     let has_local_git = !discovered.is_empty() || !base_commits.is_empty();
+    let had_local_baseline = !base_worktree_fingerprints.is_empty();
 
     if has_local_git {
         let dir = cwd.trim().to_string();
         let goal_owned = combined_goal;
         let base_map = base_commits.clone();
+        let fp_map = base_worktree_fingerprints.clone();
         let base = base_commit.map(str::to_string);
         if let Ok((local_files, local_summary)) = tokio::task::spawn_blocking(move || {
-            super::collect_local_repos_diff(&dir, &goal_owned, &base_map, base.as_deref())
+            super::collect_local_repos_diff_since(
+                &dir,
+                &goal_owned,
+                &base_map,
+                &fp_map,
+                base.as_deref(),
+            )
         })
         .await
         {
@@ -255,64 +264,12 @@ async fn collect_deliverables(
             }
         }
     }
+    let local_repos_changed = !files.is_empty() || !summary.trim().is_empty();
 
     let mut timeline_evidence = String::new();
+    let mut turn_had_file_edits = false;
     if let Some(asid) = asid {
         if let Some(manager) = state.agent_runtime.manager_for_agent(agent_id).await {
-            if let Ok(diffs) = manager
-                .sessions()
-                .get_vcs_diff(&AgentSessionId(asid.to_string()), "working")
-                .await
-            {
-                let non_empty: Vec<_> = diffs
-                    .iter()
-                    .filter(|item| !item.path.trim().is_empty())
-                    .collect();
-                if !non_empty.is_empty() {
-                    let prev_count = files.len();
-                    let vcs_files: Vec<ChangedFile> = non_empty
-                        .iter()
-                        .take(32)
-                        .map(|item| ChangedFile {
-                            path: item.path.clone(),
-                            additions: item.additions,
-                            deletions: item.deletions,
-                        })
-                        .collect();
-                    super::merge_changed_files(cwd, &mut files, vcs_files);
-                    if summary.is_empty() || files.len() > prev_count {
-                        if !summary.is_empty() {
-                            summary.push('\n');
-                        }
-                        summary.push_str("=== Changed files (session diff) ===\n");
-                        for item in non_empty.iter().take(32) {
-                            summary.push_str(&format!(
-                                "- {} (+{} -{})\n",
-                                super::normalize_changed_path(cwd, &item.path),
-                                item.additions,
-                                item.deletions
-                            ));
-                        }
-                        let mut patches = String::new();
-                        for item in non_empty {
-                            if item.patch.trim().is_empty() {
-                                continue;
-                            }
-                            let chunk = format!("\n--- {}\n{}", item.path, item.patch);
-                            if patches.len() + chunk.len() > 8000 {
-                                break;
-                            }
-                            patches.push_str(&chunk);
-                        }
-                        if !patches.is_empty() {
-                            summary.push_str("\nDiff excerpt:\n");
-                            summary.push_str(&patches);
-                            summary.push('\n');
-                        }
-                    }
-                }
-            }
-
             if let Ok(snapshot) = manager
                 .sessions()
                 .get_snapshot(&AgentSessionId(asid.to_string()))
@@ -326,8 +283,65 @@ async fn collect_deliverables(
                 let (tl_files, tl_summary) = super::extract_timeline_evidence(
                     snapshot.timeline[turn_start..].iter().map(|i| &i.part),
                 );
+                turn_had_file_edits = !tl_files.is_empty();
                 super::merge_changed_files(cwd, &mut files, tl_files);
                 timeline_evidence = tl_summary;
+            }
+
+            if local_repos_changed || turn_had_file_edits || !had_local_baseline {
+                if let Ok(diffs) = manager
+                    .sessions()
+                    .get_vcs_diff(&AgentSessionId(asid.to_string()), "working")
+                    .await
+                {
+                    let non_empty: Vec<_> = diffs
+                        .iter()
+                        .filter(|item| !item.path.trim().is_empty())
+                        .collect();
+                    if !non_empty.is_empty() {
+                        let prev_count = files.len();
+                        let vcs_files: Vec<ChangedFile> = non_empty
+                            .iter()
+                            .take(32)
+                            .map(|item| ChangedFile {
+                                path: item.path.clone(),
+                                additions: item.additions,
+                                deletions: item.deletions,
+                            })
+                            .collect();
+                        super::merge_changed_files(cwd, &mut files, vcs_files);
+                        if summary.is_empty() || files.len() > prev_count {
+                            if !summary.is_empty() {
+                                summary.push('\n');
+                            }
+                            summary.push_str("=== Changed files (session diff) ===\n");
+                            for item in non_empty.iter().take(32) {
+                                summary.push_str(&format!(
+                                    "- {} (+{} -{})\n",
+                                    super::normalize_changed_path(cwd, &item.path),
+                                    item.additions,
+                                    item.deletions
+                                ));
+                            }
+                            let mut patches = String::new();
+                            for item in non_empty {
+                                if item.patch.trim().is_empty() {
+                                    continue;
+                                }
+                                let chunk = format!("\n--- {}\n{}", item.path, item.patch);
+                                if patches.len() + chunk.len() > 8000 {
+                                    break;
+                                }
+                                patches.push_str(&chunk);
+                            }
+                            if !patches.is_empty() {
+                                summary.push_str("\nDiff excerpt:\n");
+                                summary.push_str(&patches);
+                                summary.push('\n');
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -454,6 +468,7 @@ async fn reconcile_pipeline(
                 &coder_summary,
                 run.state.base_commit.as_deref(),
                 &run.state.base_commits,
+                &run.state.base_worktree_fingerprints,
                 tasks,
                 root,
                 &run.task_ref(),

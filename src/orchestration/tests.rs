@@ -689,3 +689,62 @@ async fn remote_peer_child_task_prevents_skipping_review_when_local_git_empty() 
     drop(captured_prompts);
     let _ = std::fs::remove_dir_all(&ws);
 }
+
+#[test]
+fn preexisting_dirty_files_unchanged_during_turn_are_ignored_by_deliverables_gate() {
+    let ws = crate::test_state_dir().join(format!("dirty-preturn-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&ws).unwrap();
+    let run_git = |args: &[&str]| {
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&ws)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    };
+    run_git(&["init"]);
+    run_git(&["config", "user.email", "t@example.com"]);
+    run_git(&["config", "user.name", "T"]);
+    std::fs::write(ws.join("app.rs"), "fn main() {}\n").unwrap();
+    run_git(&["add", "."]);
+    run_git(&["commit", "-m", "init"]);
+
+    // Pre-existing dirty working tree BEFORE the turn begins.
+    std::fs::write(
+        ws.join("app.rs"),
+        "fn main() { println!(\"old dirty\"); }\n",
+    )
+    .unwrap();
+
+    let cwd = ws.to_string_lossy().into_owned();
+    let base_commits = super::capture_base_commits(&cwd, "Move cards to review");
+    let base_fps = super::capture_worktree_fingerprints(&cwd, "Move cards to review");
+
+    // Turn did NOT modify the repo -> pre-existing dirty file must NOT be misattributed!
+    let (files, summary) = super::collect_local_repos_diff_since(
+        &cwd,
+        "Move cards to review",
+        &base_commits,
+        &base_fps,
+        None,
+    );
+    assert!(
+        files.is_empty(),
+        "unchanged dirty repo should yield no diff: {files:?}"
+    );
+    assert!(summary.trim().is_empty());
+
+    // Once the turn actually modifies a file in the dirty repo, deliverables ARE collected!
+    std::fs::write(
+        ws.join("app.rs"),
+        "fn main() { println!(\"new edit in this turn\"); }\n",
+    )
+    .unwrap();
+    let (files2, summary2) =
+        super::collect_local_repos_diff_since(&cwd, "Fix main", &base_commits, &base_fps, None);
+    assert_eq!(files2.len(), 1);
+    assert!(summary2.contains("app.rs"));
+
+    let _ = std::fs::remove_dir_all(&ws);
+}

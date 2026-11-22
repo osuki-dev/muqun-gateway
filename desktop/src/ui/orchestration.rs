@@ -268,6 +268,7 @@ pub struct View {
     pub synced_computers: HashSet<String>,
     pub enabled_sessions: HashSet<String>,
     pub gateway_start_tokens: HashMap<u64, (String, u64)>,
+    pub pending_start_runs: HashMap<String, (String, u64)>,
     pub last_gateway_poll_ms: u64,
     pub rework_note: TextEdit,
     pub rework_note_run: Option<String>,
@@ -336,6 +337,7 @@ impl Default for View {
             synced_computers: HashSet::new(),
             enabled_sessions,
             gateway_start_tokens: HashMap::new(),
+            pending_start_runs: HashMap::new(),
             last_gateway_poll_ms: 0,
             rework_note: TextEdit::new(""),
             rework_note_run: None,
@@ -4908,6 +4910,71 @@ fn open_run_diff(s: &mut UiState, target: &str) {
     s.send(Command::RefreshDiff(AgentSessionId(target.to_string())));
 }
 
+pub fn is_conversational_query(prompt: &str) -> bool {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() || trimmed.len() > 260 {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    // Explicit imperative requests to edit/implement/fix should still use MAO.
+    const IMPERATIVE_EDIT_HINTS: &[&str] = &[
+        "帮我改",
+        "帮我修",
+        "去改",
+        "去修",
+        "修复",
+        "重构",
+        "实现",
+        "补齐",
+        "补全",
+        "加上",
+        "新增",
+        "删除",
+        "替换",
+        "优化一下",
+        "改造",
+        "please fix",
+        "can you fix",
+        "please implement",
+        "please add",
+        "please update",
+        "please refactor",
+    ];
+    if IMPERATIVE_EDIT_HINTS.iter().any(|k| lower.contains(k)) {
+        return false;
+    }
+    if trimmed.ends_with('?') || trimmed.ends_with('？') {
+        return true;
+    }
+    const QUERY_PREFIXES: &[&str] = &[
+        "你改了什么",
+        "改了什么",
+        "还差哪些",
+        "还有哪些",
+        "为什么",
+        "怎么",
+        "在哪里",
+        "在哪",
+        "哪里",
+        "什么问题",
+        "看看",
+        "查一下",
+        "是不是",
+        "会不会",
+        "有没有",
+        "权限管理做哪里",
+        "what ",
+        "why ",
+        "how ",
+        "where ",
+        "explain ",
+        "which ",
+    ];
+    QUERY_PREFIXES
+        .iter()
+        .any(|p| lower.starts_with(p) || lower.contains(p))
+}
+
 pub fn gateway_dispatch_available(s: &UiState) -> bool {
     !s.demo
         && !s.hub_label.is_empty()
@@ -5067,6 +5134,57 @@ pub fn request_gateway_sync(s: &mut UiState) {
     });
 }
 
+fn adopt_gateway_coder_session(
+    s: &mut UiState,
+    pending_asid: &str,
+    token: u64,
+    real_asid: &str,
+    agent_id: &str,
+    dir: Option<String>,
+    goal: Option<&str>,
+) {
+    if pending_asid.starts_with("new-") {
+        let title = goal
+            .map(|g| concise_excerpt(g, 40))
+            .unwrap_or_else(|| agent_id.to_string());
+        if s.session_by_id(real_asid).is_none() {
+            if let Ok(stub) = serde_json::from_value(serde_json::json!({
+                "asid": real_asid,
+                "agent_id": agent_id,
+                "title": title,
+                "directory": dir,
+                "status": "busy",
+                "updated_ms": now_ms(),
+            })) {
+                s.sessions.insert(0, stub);
+            }
+        }
+        if s.pending_start.as_ref().is_some_and(|(_, t)| *t == token) {
+            s.adopt_created_session(real_asid);
+        }
+        s.echo_submitted(token, true);
+        s.echo_rows(real_asid);
+        s.orchestration.enabled_sessions.remove(pending_asid);
+        s.orchestration
+            .enabled_sessions
+            .insert(real_asid.to_string());
+        s.auto_approve.insert(real_asid.to_string(), true);
+        s.send(Command::FocusSession(AgentSessionId(real_asid.to_string())));
+        if let Some(info) = s.session_by_id(real_asid).cloned() {
+            s.session_opened(&info);
+        }
+    } else {
+        s.echo_submitted(token, true);
+        s.echo_rows(real_asid);
+        s.orchestration
+            .enabled_sessions
+            .insert(real_asid.to_string());
+        s.auto_approve.insert(real_asid.to_string(), true);
+    }
+    s.status = "Running…".into();
+    s.sync_watch();
+}
+
 pub fn on_gateway_orchestration(
     s: &mut UiState,
     computer: &str,
@@ -5120,67 +5238,93 @@ pub fn on_gateway_orchestration(
     }
 
     if let Some((pending_asid, token)) = pending_start {
+        let run_id = payload
+            .pointer("/run/id")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
         let coder_asid = payload
             .pointer("/coder/asid")
             .or_else(|| payload.pointer("/run/state/coder_asid"))
             .and_then(|v| v.as_str())
             .filter(|id| !id.is_empty())
             .map(str::to_string);
-        if let Some(real_asid) = coder_asid {
-            if pending_asid.starts_with("new-") {
-                let agent_id = payload
-                    .pointer("/coder/agent")
-                    .or_else(|| payload.pointer("/run/request/coordinator"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&s.start_agent)
-                    .to_string();
-                let dir = payload
-                    .pointer("/run/request/cwd")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let title = payload
-                    .pointer("/run/request/goal")
-                    .and_then(|v| v.as_str())
-                    .map(|g| concise_excerpt(g, 40))
-                    .unwrap_or_else(|| agent_id.clone());
-                if s.session_by_id(&real_asid).is_none() {
-                    if let Ok(stub) = serde_json::from_value(serde_json::json!({
-                        "asid": real_asid,
-                        "agent_id": agent_id,
-                        "title": title,
-                        "directory": dir,
-                        "status": "busy",
-                        "updated_ms": now_ms(),
-                    })) {
-                        s.sessions.insert(0, stub);
-                    }
-                }
-                if s.pending_start.as_ref().is_some_and(|(_, t)| *t == token) {
-                    s.adopt_created_session(&real_asid);
-                }
-                s.echo_submitted(token, true);
-                s.echo_rows(&real_asid);
-                s.orchestration.enabled_sessions.remove(&pending_asid);
-                s.orchestration.enabled_sessions.insert(real_asid.clone());
-                s.auto_approve.insert(real_asid.clone(), true);
-                s.send(Command::FocusSession(AgentSessionId(real_asid.clone())));
-                if let Some(info) = s.session_by_id(&real_asid).cloned() {
-                    s.session_opened(&info);
-                }
-            } else {
-                s.echo_submitted(token, true);
-                s.echo_rows(&real_asid);
-                s.orchestration.enabled_sessions.insert(real_asid.clone());
-                s.auto_approve.insert(real_asid, true);
-            }
-            if let Some(run_id) = payload.pointer("/run/id").and_then(|v| v.as_str()) {
-                s.orchestration.selected_run = Some(run_id.to_string());
-            }
-            s.status = "Running…".into();
-            s.sync_watch();
-        } else {
-            s.echo_submitted(token, false);
+        if let Some(ref id) = run_id {
+            s.orchestration.selected_run = Some(id.clone());
         }
+        if let Some(real_asid) = coder_asid {
+            let agent_id = payload
+                .pointer("/coder/agent")
+                .or_else(|| payload.pointer("/run/request/coordinator"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(&s.start_agent)
+                .to_string();
+            let dir = payload
+                .pointer("/run/request/cwd")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let goal = payload
+                .pointer("/run/request/goal")
+                .and_then(|v| v.as_str());
+            adopt_gateway_coder_session(s, &pending_asid, token, &real_asid, &agent_id, dir, goal);
+        } else {
+            // Gateway accepted the orchestration request, even if the coder session
+            // binding is not yet in this response (e.g. LocalHub or async binding).
+            s.echo_submitted(token, true);
+            s.echo_rows(&pending_asid);
+            s.status = "Running…".into();
+            if let Some(id) = run_id {
+                s.orchestration
+                    .pending_start_runs
+                    .insert(id.clone(), (pending_asid, token));
+                request_gateway_read(s, &id);
+            }
+            s.sync_watch();
+        }
+    }
+
+    // Complete deferred session adoption for accepted starts once a subsequent Read/List
+    // delivers the canonical coder_asid.
+    struct DeferredCoderAdoption {
+        run_id: String,
+        pending_asid: String,
+        token: u64,
+        real_asid: String,
+        agent_id: String,
+        dir: Option<String>,
+        goal: String,
+    }
+    let resolved_pending: Vec<DeferredCoderAdoption> = s
+        .orchestration
+        .pending_start_runs
+        .iter()
+        .filter_map(|(run_id, (pending_asid, token))| {
+            let run = s.orchestration.runs.iter().find(|r| &r.id == run_id)?;
+            if run.coder_asid.is_empty() || run.coder_asid.starts_with("new-") {
+                return None;
+            }
+            Some(DeferredCoderAdoption {
+                run_id: run_id.clone(),
+                pending_asid: pending_asid.clone(),
+                token: *token,
+                real_asid: run.coder_asid.clone(),
+                agent_id: run.coder.agent.clone(),
+                dir: (!run.cwd.is_empty()).then(|| run.cwd.clone()),
+                goal: run.goal.clone(),
+            })
+        })
+        .collect();
+    for item in resolved_pending {
+        s.orchestration.pending_start_runs.remove(&item.run_id);
+        adopt_gateway_coder_session(
+            s,
+            &item.pending_asid,
+            item.token,
+            &item.real_asid,
+            &item.agent_id,
+            item.dir,
+            Some(&item.goal),
+        );
     }
 
     for (coder_asid, rev_asid) in newly_reviewing {
@@ -6215,5 +6359,181 @@ MAO_VERDICT: CHANGES_REQUESTED";
         assert_eq!(reads, 1);
         poll_active_gateway_runs(&mut s, false);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn gateway_start_without_coder_asid_marks_echo_sent_and_adopts_on_followup_sync() {
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.hub_label = "Local Gateway".into();
+        s.agents = vec![test_agent("claude", "Claude"), test_agent("codex", "Codex")];
+        s.cfg.ui.mao.enabled = true;
+        s.pending_start = Some(("new-11".into(), 11));
+        s.selected = Some("new-11".into());
+        s.echo_sent("new-11", 11, "Move ready cards to review".into(), &[], None);
+
+        assert!(dispatch_gateway_start(
+            &mut s,
+            "new-11",
+            11,
+            "Move ready cards to review",
+            "/tmp/repo",
+            "claude",
+            None,
+            None,
+            None,
+            &[],
+        ));
+        let mut start_ticket = None;
+        while let Ok(cmd) = rx.try_recv() {
+            if let Command::Orchestration {
+                ticket,
+                request: crate::hub::OrchestrationRequest::Start(_),
+                ..
+            } = cmd
+            {
+                start_ticket = Some(ticket);
+            }
+        }
+        let ticket = start_ticket.expect("start command dispatched");
+
+        // LocalHub / async response without `coder.asid` must still mark echo Sent (not Failed)
+        // and schedule a follow-up Read for deferred session adoption.
+        on_gateway_orchestration(
+            &mut s,
+            "local",
+            ticket,
+            Ok(serde_json::json!({
+                "run": {
+                    "id": "o_local_11",
+                    "owner": "local",
+                    "created_ms": 1700000000000u64,
+                    "request": {
+                        "client_ref": "c11",
+                        "goal": "Move ready cards to review",
+                        "cwd": "/tmp/repo",
+                        "coordinator": "claude",
+                        "reviewer": { "agent": "codex" }
+                    }
+                },
+                "phase": "working"
+            })),
+        );
+        assert_eq!(
+            s.echoes
+                .get("new-11")
+                .and_then(|list| list.first())
+                .map(|e| e.state),
+            Some(super::super::echo::EchoState::Sent)
+        );
+        assert!(s
+            .orchestration
+            .pending_start_runs
+            .contains_key("o_local_11"));
+        let mut saw_read = false;
+        while let Ok(cmd) = rx.try_recv() {
+            if let Command::Orchestration {
+                request: crate::hub::OrchestrationRequest::Read(id),
+                ..
+            } = cmd
+            {
+                if id == "o_local_11" {
+                    saw_read = true;
+                }
+            }
+        }
+        assert!(
+            saw_read,
+            "expected follow-up Read for deferred coder binding"
+        );
+
+        // Follow-up Read response delivers canonical coder_asid -> adopts session & migrates echo.
+        on_gateway_orchestration(
+            &mut s,
+            "local",
+            999,
+            Ok(serde_json::json!({
+                "run": {
+                    "id": "o_local_11",
+                    "owner": "local",
+                    "created_ms": 1700000000000u64,
+                    "request": {
+                        "client_ref": "c11",
+                        "goal": "Move ready cards to review",
+                        "cwd": "/tmp/repo",
+                        "coordinator": "claude",
+                        "reviewer": { "agent": "codex" }
+                    },
+                    "state": {
+                        "round": 1,
+                        "max_rounds": 2,
+                        "mao_phase": "coding",
+                        "accepted": false,
+                        "coder_asid": "coder-real-11",
+                        "steps": []
+                    }
+                }
+            })),
+        );
+        assert_eq!(s.selected.as_deref(), Some("coder-real-11"));
+        assert!(!s
+            .orchestration
+            .pending_start_runs
+            .contains_key("o_local_11"));
+        assert_eq!(
+            s.echoes
+                .get("coder-real-11")
+                .and_then(|list| list.first())
+                .map(|e| e.state),
+            Some(super::super::echo::EchoState::Sent)
+        );
+
+        // Canonical user row arrives -> echo reconciles cleanly.
+        s.timelines
+            .entry("coder-real-11".into())
+            .or_default()
+            .replace(vec![serde_json::from_value(serde_json::json!({
+                "id": "u11",
+                "message_id": "m_u11",
+                "role": "user",
+                "part": { "type": "text", "text": "Move ready cards to review" },
+                "seq": 1,
+                "updated_ms": 2,
+                "ordinal": 0
+            }))
+            .unwrap()]);
+        s.echo_rows("coder-real-11");
+        assert!(s
+            .echoes
+            .get("coder-real-11")
+            .is_none_or(|list| list.is_empty()));
+    }
+
+    #[test]
+    fn conversational_followups_bypass_mao_orchestration_creation() {
+        for q in [
+            "你改了什么？ 为什么现在发消息明明发出去了还显示发送中",
+            "还差哪些没有好的？ 你改了什么今天",
+            "权限管理做哪里了",
+            "那具体来说要怎样做？ 会不会把项目搞烂了",
+            "每个消息都走一遍流程么？？",
+            "what changed in this commit?",
+        ] {
+            assert!(
+                is_conversational_query(q),
+                "expected conversational query to bypass MAO: {q}"
+            );
+        }
+        for cmd in [
+            "修复 warm_agent 目录校验并补单测",
+            "帮我把这个按钮改一下，改成双行布局",
+            "把好了的card 移到 review里面",
+            "Implement rate limiting for /api/search",
+        ] {
+            assert!(
+                !is_conversational_query(cmd),
+                "expected actionable task to remain eligible for MAO: {cmd}"
+            );
+        }
     }
 }
