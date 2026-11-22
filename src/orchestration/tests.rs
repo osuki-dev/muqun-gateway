@@ -36,6 +36,8 @@ fn request() -> Start {
         mentions: vec![],
         machine: None,
         auto_approve: None,
+        agent_pool: vec![],
+        auto_failover: None,
     }
 }
 
@@ -745,6 +747,313 @@ fn preexisting_dirty_files_unchanged_during_turn_are_ignored_by_deliverables_gat
         super::collect_local_repos_diff_since(&cwd, "Fix main", &base_commits, &base_fps, None);
     assert_eq!(files2.len(), 1);
     assert!(summary2.contains("app.rs"));
+
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+#[tokio::test]
+async fn pre_dispatch_skips_quota_exhausted_coder_and_switches_to_configured_pool_agent() {
+    use crate::agents::domain::account_limits::{AccountLimit, AccountLimitWindow, AccountLimits};
+
+    let state = state();
+    let mut claude = FakeAgent::new("claude").with_sessions(&[("claude_s1", 1)]);
+    claude.account_limits = Some(AccountLimits {
+        status: "available",
+        reason: None,
+        observed_at_ms: 1,
+        ordinary_usage_allowed: Some(false),
+        reset_credits: None,
+        limits: vec![AccountLimit {
+            id: "primary".into(),
+            name: Some("5h window".into()),
+            plan_type: None,
+            model_id: None,
+            credits: None,
+            individual_limit: None,
+            spend_control_reached: None,
+            limit_reached_reason: Some("5-hour usage limit reached".into()),
+            windows: vec![AccountLimitWindow {
+                id: "5h".into(),
+                label: Some("5h".into()),
+                unit: "percent".into(),
+                used: Some(100.0),
+                limit: Some(100.0),
+                remaining: Some(0.0),
+                window_duration_minutes: Some(300),
+                resets_at_ms: None,
+            }],
+        }],
+    });
+    let claude_prompts = claude.prompts.clone();
+
+    let codex = FakeAgent::new("codex").with_sessions(&[("codex_s1", 1)]);
+    let codex_prompts = codex.prompts.clone();
+
+    state.agent_runtime.attach_for_test(claude.manager()).await;
+    state.agent_runtime.attach_for_test(codex.manager()).await;
+
+    let mut req = request();
+    req.client_ref = "pre-failover-1".into();
+    req.coordinator = "claude".into();
+    req.reviewer = Some(ReviewerSpec {
+        agent: "codex".into(),
+        model: None,
+        variant: None,
+        machine: None,
+    });
+    req.auto_failover = Some(true);
+    req.agent_pool = vec![
+        ReviewerSpec {
+            agent: "claude".into(),
+            model: None,
+            variant: None,
+            machine: None,
+        },
+        ReviewerSpec {
+            agent: "codex".into(),
+            model: Some("gpt-5.6".into()),
+            variant: None,
+            machine: None,
+        },
+    ];
+
+    let (status, body) = call(&state, "token", "POST", "/api/orchestrations", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["coder"]["agent"], "codex");
+    assert_eq!(body["coder"]["model"], "gpt-5.6");
+    assert_eq!(body["failover_count"], 1);
+    assert!(claude_prompts.lock().unwrap().is_empty());
+    assert_eq!(codex_prompts.lock().unwrap().len(), 1);
+    let steps = body["steps"].as_array().unwrap();
+    assert!(steps.iter().any(|s| s["kind"] == "failover"));
+}
+
+#[tokio::test]
+async fn runtime_coder_quota_failure_auto_switches_to_next_configured_agent() {
+    let state = state();
+    let claude = FakeAgent::new("claude").with_sessions(&[("claude_s1", 1)]);
+    let codex = FakeAgent::new("codex").with_sessions(&[("codex_s1", 1)]);
+    let codex_prompts = codex.prompts.clone();
+    state.agent_runtime.attach_for_test(claude.manager()).await;
+    state.agent_runtime.attach_for_test(codex.manager()).await;
+
+    let mut req = request();
+    req.client_ref = "runtime-coder-fo-1".into();
+    req.coordinator = "claude".into();
+    req.reviewer = Some(ReviewerSpec {
+        agent: "codex".into(),
+        model: None,
+        variant: None,
+        machine: None,
+    });
+    req.auto_failover = Some(true);
+    req.agent_pool = vec![
+        ReviewerSpec {
+            agent: "claude".into(),
+            model: None,
+            variant: None,
+            machine: None,
+        },
+        ReviewerSpec {
+            agent: "codex".into(),
+            model: Some("gpt-5.6".into()),
+            variant: None,
+            machine: None,
+        },
+    ];
+
+    let (status, started) = call(&state, "token", "POST", "/api/orchestrations", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let run_id = started["run"]["id"].as_str().unwrap().to_string();
+    let root_tid = started["run"]["task_id"].as_str().unwrap().to_string();
+
+    // Simulate primary Coder failing due to rate limit / quota exhaustion.
+    SqliteTaskStore::new(state.db.clone())
+        .transition(
+            &TaskId(root_tid),
+            crate::tasks::domain::TaskChange {
+                reopen: false,
+                reopen_count: None,
+                reopened_ms: None,
+                expected_seq: None,
+                to: TaskState::Failed,
+                source: "test".into(),
+                note: Some("HTTP 429 rate limit exceeded: quota exhausted".into()),
+                summary: Some(
+                    "HTTP 429 rate limit exceeded: usage limit reached for claude".into(),
+                ),
+                exit_code: None,
+                binding: None,
+                session_title: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (status, fetched) = call(
+        &state,
+        "token",
+        "GET",
+        &format!("/api/orchestrations/{run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    assert_eq!(fetched["mao_phase"], "coding");
+    assert_eq!(fetched["coder"]["agent"], "codex");
+    assert_eq!(fetched["coder"]["model"], "gpt-5.6");
+    assert_eq!(fetched["failover_count"], 1);
+    assert_eq!(codex_prompts.lock().unwrap().len(), 1);
+    assert!(fetched["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["kind"] == "failover"));
+}
+
+#[tokio::test]
+async fn runtime_reviewer_rate_limit_failure_auto_switches_to_next_configured_agent() {
+    let ws = crate::test_state_dir().join(format!("rev-fo-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&ws).unwrap();
+    let run_git = |args: &[&str]| {
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&ws)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    };
+    run_git(&["init"]);
+    run_git(&["config", "user.email", "t@example.com"]);
+    run_git(&["config", "user.name", "T"]);
+    std::fs::write(ws.join("lib.rs"), "pub fn a() {}\n").unwrap();
+    run_git(&["add", "."]);
+    run_git(&["commit", "-m", "init"]);
+
+    let state = state();
+    let claude = FakeAgent::new("claude").with_sessions(&[("claude_s1", 1)]);
+    let codex = FakeAgent::new("codex").with_sessions(&[("codex_s1", 1)]);
+    let antigravity = FakeAgent::new("antigravity").with_sessions(&[("ag_s1", 1)]);
+    let ag_prompts = antigravity.prompts.clone();
+    state.agent_runtime.attach_for_test(claude.manager()).await;
+    state.agent_runtime.attach_for_test(codex.manager()).await;
+    state
+        .agent_runtime
+        .attach_for_test(antigravity.manager())
+        .await;
+
+    let mut req = request();
+    req.client_ref = "runtime-rev-fo-1".into();
+    req.cwd = ws.to_string_lossy().into_owned();
+    req.coordinator = "claude".into();
+    req.reviewer = Some(ReviewerSpec {
+        agent: "codex".into(),
+        model: None,
+        variant: None,
+        machine: None,
+    });
+    req.auto_failover = Some(true);
+    req.agent_pool = vec![
+        ReviewerSpec {
+            agent: "codex".into(),
+            model: None,
+            variant: None,
+            machine: None,
+        },
+        ReviewerSpec {
+            agent: "antigravity".into(),
+            model: Some("gemini-4-neon".into()),
+            variant: None,
+            machine: None,
+        },
+    ];
+
+    let (status, started) = call(&state, "token", "POST", "/api/orchestrations", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let run_id = started["run"]["id"].as_str().unwrap().to_string();
+    let root_tid = started["run"]["task_id"].as_str().unwrap().to_string();
+
+    // Coder edits file and finishes.
+    std::fs::write(ws.join("lib.rs"), "pub fn a() -> i32 { 42 }\n").unwrap();
+    let task_store = SqliteTaskStore::new(state.db.clone());
+    task_store
+        .transition(
+            &TaskId(root_tid),
+            crate::tasks::domain::TaskChange {
+                reopen: false,
+                reopen_count: None,
+                reopened_ms: None,
+                expected_seq: None,
+                to: TaskState::Done,
+                source: "test".into(),
+                note: None,
+                summary: Some("Updated lib.rs".into()),
+                exit_code: Some(0),
+                binding: None,
+                session_title: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // First read dispatches Reviewer (codex).
+    let (status, reviewing) = call(
+        &state,
+        "token",
+        "GET",
+        &format!("/api/orchestrations/{run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reviewing}");
+    assert_eq!(reviewing["mao_phase"], "reviewing");
+    let rev_tid = reviewing["run"]["state"]["reviewer_task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Simulate Reviewer failing due to quota exhaustion.
+    task_store
+        .transition(
+            &TaskId(rev_tid),
+            crate::tasks::domain::TaskChange {
+                reopen: false,
+                reopen_count: None,
+                reopened_ms: None,
+                expected_seq: None,
+                to: TaskState::Failed,
+                source: "test".into(),
+                note: Some("insufficient_quota: model credits exhausted".into()),
+                summary: Some("insufficient_quota: model credits exhausted".into()),
+                exit_code: None,
+                binding: None,
+                session_title: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // Next read automatically switches Reviewer to antigravity!
+    let (status, switched) = call(
+        &state,
+        "token",
+        "GET",
+        &format!("/api/orchestrations/{run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{switched}");
+    assert_eq!(switched["mao_phase"], "reviewing");
+    assert_eq!(switched["reviewer"]["agent"], "antigravity");
+    assert_eq!(switched["reviewer"]["model"], "gemini-4-neon");
+    assert_eq!(switched["failover_count"], 1);
+    assert_eq!(ag_prompts.lock().unwrap().len(), 1);
+    assert!(switched["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["kind"] == "failover"));
 
     let _ = std::fs::remove_dir_all(&ws);
 }

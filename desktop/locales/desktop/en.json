@@ -1019,5 +1019,19 @@
   "Sync": "Sync",
   "repos": "repos",
   "Optional extra guidance for rework…": "Optional extra guidance for rework…",
-  "Failed to start orchestration": "Failed to start orchestration"
+  "Failed to start orchestration": "Failed to start orchestration",
+  "Auto-failover on quota limit": "Auto-failover on quota limit",
+  "Agent & model pool": "Agent & model pool",
+  "Not configured": "Not configured",
+  "+ Add Agent / Model": "+ Add Agent / Model",
+  "No connected agents available": "No connected agents available",
+  "Choose Agent & Model": "Choose Agent & Model",
+  "No agents in pool yet. Add preferred Agents & Models so the orchestrator can allocate tasks dynamically and auto-switch on quota limits.": "No agents in pool yet. Add preferred Agents & Models so the orchestrator can allocate tasks dynamically and auto-switch on quota limits.",
+  "Import connected agents": "Import connected agents",
+  "Orchestrator dynamically assigns tasks across your pool and automatically switches to the next configured Agent/Model when quota runs out.": "Orchestrator dynamically assigns tasks across your pool and automatically switches to the next configured Agent/Model when quota runs out.",
+  "Auto-failover: On": "Auto-failover: On",
+  "Auto-failover: Off": "Auto-failover: Off",
+  "Global default": "Global default",
+  "Session custom": "Session custom",
+  "Reset to global default": "Reset to global default"
 }

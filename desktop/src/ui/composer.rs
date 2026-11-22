@@ -357,7 +357,7 @@ fn send_session(s: &mut UiState, queue: bool) {
     }
     s.record_prompt_history(&text);
     let busy = s.busy();
-    let is_mao_session = s.orchestration.is_session_enabled(&asid);
+    let is_mao_session = super::orchestration::is_session_mao_enabled(s, &asid);
     let attachments: Vec<String> = s.staged.iter().map(|f| f.path.clone()).collect();
     let deliver = deliver_of(catalog_of(s, Slot::Session), &text, !attachments.is_empty());
     note_skill_args(s, &deliver);

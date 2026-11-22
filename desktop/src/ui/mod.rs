@@ -207,6 +207,8 @@ pub enum OpenMenu {
     TasksComputerPicker,
     /// MAO reviewer agent / model / effort / rounds menu.
     MaoReviewer(Slot),
+    /// Settings → Agents MAO candidate pool add-entry menu.
+    MaoPoolAdd,
 }
 
 /// The view state of one open session: what the timeline and composer read.

@@ -272,7 +272,7 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
         )];
     }
 
-    let mut elements: Vec<El> = Vec::new();
+    let mut elements: Vec<El> = vec![crate::ui::orchestration::settings_card(s, k, layer)];
 
     let agent_groups =
         crate::ui::agents::by_standing(&s.agents)

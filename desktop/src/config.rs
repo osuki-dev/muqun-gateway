@@ -605,6 +605,24 @@ pub struct MaoRoleConfig {
     pub machine: Option<String>,
 }
 
+/// Per-session MAO configuration override. Absent fields inherit from global `MaoPrefs`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MaoSessionOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<MaoRoleConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_failover: Option<bool>,
+}
+
+impl MaoSessionOverride {
+    pub fn is_empty(&self) -> bool {
+        self.reviewer.is_none() && self.max_rounds.is_none() && self.auto_failover.is_none()
+    }
+}
+
 /// Persisted MAO preferences for the composer's Coder ⇄ Reviewer flow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -614,11 +632,32 @@ pub struct MaoPrefs {
     pub reviewer: Option<MaoRoleConfig>,
     #[serde(default = "MaoPrefs::default_max_rounds")]
     pub max_rounds: u8,
+    /// Automatically switch to the next configured Agent/Model in `agent_pool`
+    /// when quota, credits, or rate limits are exhausted.
+    #[serde(default = "MaoPrefs::default_auto_failover")]
+    pub auto_failover: bool,
+    /// Ordered pool of user-approved Agents & Models available for dynamic
+    /// orchestrator allocation and automatic quota failover.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_pool: Vec<MaoRoleConfig>,
+    /// Explicit per-session MAO on/off choices keyed by `asid`, persisted so
+    /// disabling MAO on a session stays disabled across reopens and Gateway syncs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub session_overrides: BTreeMap<String, bool>,
+    /// Per-session MAO configuration overrides (reviewer, max_rounds, auto_failover)
+    /// keyed by `asid`. Absent fields inherit from global defaults without affecting
+    /// other sessions.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub session_configs: BTreeMap<String, MaoSessionOverride>,
 }
 
 impl MaoPrefs {
     pub const fn default_max_rounds() -> u8 {
         2
+    }
+
+    pub const fn default_auto_failover() -> bool {
+        true
     }
 }
 
@@ -628,6 +667,10 @@ impl Default for MaoPrefs {
             enabled: false,
             reviewer: None,
             max_rounds: Self::default_max_rounds(),
+            auto_failover: Self::default_auto_failover(),
+            agent_pool: Vec::new(),
+            session_overrides: BTreeMap::new(),
+            session_configs: BTreeMap::new(),
         }
     }
 }

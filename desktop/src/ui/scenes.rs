@@ -1797,6 +1797,7 @@ fn mao_session_scene(s: &mut UiState) {
             machine: None,
         }),
         max_rounds: 2,
+        ..Default::default()
     };
     let now = super::now_ms();
     s.orchestration.runs = mao_sample_runs(now);

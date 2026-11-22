@@ -1127,6 +1127,8 @@ pub(crate) struct FakeAgent {
     pub reply_permission_gone: bool,
     /// Same idea for forms.
     pub reply_form_gone: bool,
+    /// Optional canned `account_limits` response for orchestration failover tests.
+    pub account_limits: Option<agents::domain::account_limits::AccountLimits>,
 }
 
 /// A fake agent service's MCP registration.
@@ -1162,6 +1164,7 @@ impl FakeAgent {
             mcp: None,
             reply_permission_gone: false,
             reply_form_gone: false,
+            account_limits: None,
         }
     }
 
@@ -1559,6 +1562,18 @@ impl agents::ports::agent::AgentPort for FakeAgent {
                 .get(session_id)
                 .unwrap_or(&self.timeline)
                 .clone())
+        })
+    }
+    fn account_limits<'a>(
+        &'a self,
+    ) -> agents::ports::agent::AgentFuture<'a, agents::domain::account_limits::AccountLimits> {
+        Box::pin(async move {
+            match &self.account_limits {
+                Some(limits) => Ok(limits.clone()),
+                None => Err(agents::ports::agent::AgentError::Unsupported(
+                    "account limits".into(),
+                )),
+            }
         })
     }
 }

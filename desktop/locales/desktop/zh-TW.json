@@ -1019,5 +1019,19 @@
   "Sync": "同步狀態",
   "repos": "個倉庫",
   "Optional extra guidance for rework…": "追加修改意見（可選，按 Enter 直接修復）…",
-  "Failed to start orchestration": "啟動智能編排失敗"
+  "Failed to start orchestration": "啟動智能編排失敗",
+  "Auto-failover on quota limit": "額度耗盡自動切換備用 Agent",
+  "Agent & model pool": "編排與備用 Agent / 模型池",
+  "Not configured": "未配置",
+  "+ Add Agent / Model": "+ 新增 Agent / 模型",
+  "No connected agents available": "暫無已連線的可用 Agent",
+  "Choose Agent & Model": "選擇 Agent 與模型",
+  "No agents in pool yet. Add preferred Agents & Models so the orchestrator can allocate tasks dynamically and auto-switch on quota limits.": "尚未配置 Agent 池。新增你偏好的 Agent 與模型後，編排模型會依任務自動分配，並在額度耗盡或限流時自動切換至下一個備用項目。",
+  "Import connected agents": "一鍵匯入已連線 Agent",
+  "Orchestrator dynamically assigns tasks across your pool and automatically switches to the next configured Agent/Model when quota runs out.": "編排模型會依任務自動分配模型池中的 Agent/模型（無需手動指定前後端角色）；額度耗盡或限流時自動切換至下一個備用 Agent。",
+  "Auto-failover: On": "額度耗盡自動切換：已開啟",
+  "Auto-failover: Off": "額度耗盡自動切換：已關閉",
+  "Global default": "全域預設",
+  "Session custom": "目前會話自訂",
+  "Reset to global default": "恢復為全域預設"
 }

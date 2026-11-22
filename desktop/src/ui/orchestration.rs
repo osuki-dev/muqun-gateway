@@ -16,7 +16,7 @@ use rune_kit::{
     Placement, ScrollBar, SegmentedControl, TextInput,
 };
 
-use crate::config::{ConfigEdit, Language, MaoPrefs, MaoRoleConfig};
+use crate::config::{ConfigEdit, Language, MaoPrefs, MaoRoleConfig, MaoSessionOverride};
 use crate::hub::CatalogView;
 use crate::model::commands::Command;
 use crate::model::compose::{ComposeCommand, Deliver, Target};
@@ -54,6 +54,7 @@ pub enum MaoStepKind {
     Review,
     Rework,
     Verdict,
+    Failover,
     System,
 }
 
@@ -263,6 +264,7 @@ pub struct View {
     pub selected_run: Option<String>,
     pub filter: Filter,
     pub menu_section: Option<MenuSection>,
+    pub pool_add_agent: Option<String>,
     pub reviewer_catalogs: HashMap<String, Arc<CatalogView>>,
     pub catalog_requests: HashMap<u64, String>,
     pub synced_computers: HashSet<String>,
@@ -324,7 +326,9 @@ impl Default for View {
         let selected_run = runs.last().map(|r| r.id.clone());
         let enabled_sessions = runs
             .iter()
-            .filter(|r| !r.coder_asid.is_empty() && !r.coder_asid.starts_with("new-"))
+            .filter(|r| {
+                r.is_active() && !r.coder_asid.is_empty() && !r.coder_asid.starts_with("new-")
+            })
             .map(|r| r.coder_asid.clone())
             .collect();
         Self {
@@ -332,6 +336,7 @@ impl Default for View {
             selected_run,
             filter: Filter::default(),
             menu_section: None,
+            pool_add_agent: None,
             reviewer_catalogs: HashMap::new(),
             catalog_requests: HashMap::new(),
             synced_computers: HashSet::new(),
@@ -620,9 +625,40 @@ fn active_coder_agent(s: &UiState, slot: Slot) -> String {
     }
 }
 
-pub fn effective_reviewer(s: &UiState, coder_agent: &str) -> MaoRole {
+fn slot_asid(s: &UiState, slot: Slot) -> Option<&str> {
+    match slot {
+        Slot::Start => None,
+        Slot::Session => s
+            .selected
+            .as_deref()
+            .filter(|id| !id.is_empty() && !id.starts_with("new-")),
+    }
+}
+
+fn has_session_config_override(s: &UiState, asid: Option<&str>) -> bool {
+    asid.and_then(|id| s.cfg.ui.mao.session_configs.get(id))
+        .is_some_and(|ov| !ov.is_empty())
+}
+
+pub fn effective_max_rounds(s: &UiState, asid: Option<&str>) -> u8 {
+    asid.and_then(|id| s.cfg.ui.mao.session_configs.get(id))
+        .and_then(|ov| ov.max_rounds)
+        .unwrap_or(s.cfg.ui.mao.max_rounds)
+        .clamp(1, 5)
+}
+
+pub fn effective_auto_failover(s: &UiState, asid: Option<&str>) -> bool {
+    asid.and_then(|id| s.cfg.ui.mao.session_configs.get(id))
+        .and_then(|ov| ov.auto_failover)
+        .unwrap_or(s.cfg.ui.mao.auto_failover)
+}
+
+pub fn effective_reviewer_for(s: &UiState, coder_agent: &str, asid: Option<&str>) -> MaoRole {
     let usable = usable_agents(s);
-    if let Some(cfg) = &s.cfg.ui.mao.reviewer {
+    let session_cfg = asid
+        .and_then(|id| s.cfg.ui.mao.session_configs.get(id))
+        .and_then(|ov| ov.reviewer.as_ref());
+    if let Some(cfg) = session_cfg.or(s.cfg.ui.mao.reviewer.as_ref()) {
         let valid = usable.is_empty() || usable.iter().any(|a| a.id == cfg.agent);
         if valid {
             let model = match cfg.model.as_ref() {
@@ -643,6 +679,10 @@ pub fn effective_reviewer(s: &UiState, coder_agent: &str) -> MaoRole {
         model: None,
         machine: None,
     }
+}
+
+pub fn effective_reviewer(s: &UiState, coder_agent: &str) -> MaoRole {
+    effective_reviewer_for(s, coder_agent, None)
 }
 
 fn catalog_for_agent<'a>(s: &'a UiState, agent_id: &str) -> Option<&'a Arc<CatalogView>> {
@@ -869,13 +909,40 @@ fn save_mao_prefs(s: &mut UiState, prefs: MaoPrefs) {
     s.edit(ConfigEdit::Mao(prefs));
 }
 
+pub fn is_session_mao_enabled(s: &UiState, asid: &str) -> bool {
+    match s.cfg.ui.mao.session_overrides.get(asid) {
+        Some(&on) => on,
+        None => s.orchestration.is_session_enabled(asid),
+    }
+}
+
+fn set_session_mao_override(s: &mut UiState, asid: &str, enabled: bool) {
+    if asid.is_empty() || asid.starts_with("new-") {
+        return;
+    }
+    let mut next = s.cfg.ui.mao.clone();
+    next.session_overrides.insert(asid.to_string(), enabled);
+    while next.session_overrides.len() > 256 {
+        let Some(oldest) = next
+            .session_overrides
+            .keys()
+            .find(|k| k.as_str() != asid)
+            .cloned()
+        else {
+            break;
+        };
+        next.session_overrides.remove(&oldest);
+    }
+    save_mao_prefs(s, next);
+}
+
 pub fn is_slot_enabled(s: &UiState, slot: Slot) -> bool {
     match slot {
         Slot::Start => s.cfg.ui.mao.enabled,
         Slot::Session => s
             .selected
             .as_deref()
-            .is_some_and(|asid| s.orchestration.is_session_enabled(asid)),
+            .is_some_and(|asid| is_session_mao_enabled(s, asid)),
     }
 }
 
@@ -909,10 +976,10 @@ fn toggle_enabled(s: &mut UiState, slot: Slot) {
             let Some(asid) = s.selected.clone() else {
                 return;
             };
-            if s.orchestration.enabled_sessions.contains(&asid) {
-                s.orchestration.enabled_sessions.remove(&asid);
-            } else {
+            let next_on = !is_session_mao_enabled(s, &asid);
+            if next_on {
                 s.orchestration.enabled_sessions.insert(asid.clone());
+                set_session_mao_override(s, &asid, true);
                 ensure_default_reviewer_prefs(s, Slot::Session);
                 if !asid.starts_with("new-") {
                     s.auto_approve.insert(asid.clone(), true);
@@ -923,82 +990,150 @@ fn toggle_enabled(s: &mut UiState, slot: Slot) {
                         },
                     ));
                 }
+            } else {
+                s.orchestration.enabled_sessions.remove(&asid);
+                set_session_mao_override(s, &asid, false);
             }
         }
     }
 }
 
+enum SlotConfigTarget<'a> {
+    Global(&'a mut MaoPrefs),
+    Session(&'a mut MaoSessionOverride),
+}
+
+fn mutate_slot_config(s: &mut UiState, slot: Slot, f: impl FnOnce(SlotConfigTarget<'_>)) {
+    let asid = slot_asid(s, slot).map(str::to_string);
+    let mut next = s.cfg.ui.mao.clone();
+    if let Some(id) = asid {
+        let entry = next.session_configs.entry(id.clone()).or_default();
+        f(SlotConfigTarget::Session(entry));
+        if next
+            .session_configs
+            .get(&id)
+            .is_some_and(MaoSessionOverride::is_empty)
+        {
+            next.session_configs.remove(&id);
+        } else {
+            while next.session_configs.len() > 256 {
+                let Some(oldest) = next
+                    .session_configs
+                    .keys()
+                    .find(|k| k.as_str() != id)
+                    .cloned()
+                else {
+                    break;
+                };
+                next.session_configs.remove(&oldest);
+            }
+        }
+    } else {
+        f(SlotConfigTarget::Global(&mut next));
+    }
+    save_mao_prefs(s, next);
+}
+
+fn reset_session_mao_config(s: &mut UiState, slot: Slot) {
+    if let Some(asid) = slot_asid(s, slot).map(str::to_string) {
+        let mut next = s.cfg.ui.mao.clone();
+        if next.session_configs.remove(&asid).is_some() {
+            save_mao_prefs(s, next);
+        }
+    }
+    s.menu = Some(OpenMenu::MaoReviewer(slot));
+}
+
 fn set_reviewer_agent(s: &mut UiState, slot: Slot, agent_id: String) {
     ensure_reviewer_catalog(s, &agent_id);
-    let machine = s
-        .cfg
-        .ui
-        .mao
-        .reviewer
-        .as_ref()
-        .and_then(|r| r.machine.clone());
-    let mut next = s.cfg.ui.mao.clone();
-    next.reviewer = Some(MaoRoleConfig {
+    let coder = active_coder_agent(s, slot);
+    let asid = slot_asid(s, slot).map(str::to_string);
+    let machine = effective_reviewer_for(s, &coder, asid.as_deref()).machine;
+    let role = MaoRoleConfig {
         agent: agent_id,
         model: None,
         machine,
+    };
+    mutate_slot_config(s, slot, |target| match target {
+        SlotConfigTarget::Session(ov) => ov.reviewer = Some(role),
+        SlotConfigTarget::Global(global) => global.reviewer = Some(role),
     });
-    save_mao_prefs(s, next);
     s.orchestration.menu_section = Some(MenuSection::Model);
     s.menu = Some(OpenMenu::MaoReviewer(slot));
 }
 
 fn set_reviewer_model(s: &mut UiState, slot: Slot, provider_id: String, model_id: String) {
     let coder = active_coder_agent(s, slot);
-    let current = effective_reviewer(s, &coder);
+    let asid = slot_asid(s, slot).map(str::to_string);
+    let current = effective_reviewer_for(s, &coder, asid.as_deref());
     let catalog = catalog_for_agent(s, &current.agent).map(|arc| arc.as_ref());
     let picked = composer::choose_model(catalog, current.model.as_ref(), provider_id, model_id);
-    let mut next = s.cfg.ui.mao.clone();
-    next.reviewer = Some(MaoRoleConfig {
+    let role = MaoRoleConfig {
         agent: current.agent,
         model: Some(picked),
         machine: current.machine,
+    };
+    mutate_slot_config(s, slot, |target| match target {
+        SlotConfigTarget::Session(ov) => ov.reviewer = Some(role),
+        SlotConfigTarget::Global(global) => global.reviewer = Some(role),
     });
-    save_mao_prefs(s, next);
     s.orchestration.menu_section = Some(MenuSection::Effort);
     s.menu = Some(OpenMenu::MaoReviewer(slot));
 }
 
 fn set_reviewer_effort(s: &mut UiState, slot: Slot, variant: Option<String>) {
     let coder = active_coder_agent(s, slot);
-    let current = effective_reviewer(s, &coder);
+    let asid = slot_asid(s, slot).map(str::to_string);
+    let current = effective_reviewer_for(s, &coder, asid.as_deref());
     let (resolved, _) = resolved_reviewer_model(s, &current);
     let Some(mut model) = resolved else {
         return;
     };
     model.variant = variant;
-    let mut next = s.cfg.ui.mao.clone();
-    next.reviewer = Some(MaoRoleConfig {
+    let role = MaoRoleConfig {
         agent: current.agent,
         model: Some(model),
         machine: current.machine,
+    };
+    mutate_slot_config(s, slot, |target| match target {
+        SlotConfigTarget::Session(ov) => ov.reviewer = Some(role),
+        SlotConfigTarget::Global(global) => global.reviewer = Some(role),
     });
-    save_mao_prefs(s, next);
     s.menu = Some(OpenMenu::MaoReviewer(slot));
 }
 
 fn set_reviewer_machine(s: &mut UiState, slot: Slot, machine: Option<String>) {
     let coder = active_coder_agent(s, slot);
-    let current = effective_reviewer(s, &coder);
-    let mut next = s.cfg.ui.mao.clone();
-    next.reviewer = Some(MaoRoleConfig {
+    let asid = slot_asid(s, slot).map(str::to_string);
+    let current = effective_reviewer_for(s, &coder, asid.as_deref());
+    let role = MaoRoleConfig {
         agent: current.agent,
         model: current.model,
         machine,
+    };
+    mutate_slot_config(s, slot, |target| match target {
+        SlotConfigTarget::Session(ov) => ov.reviewer = Some(role),
+        SlotConfigTarget::Global(global) => global.reviewer = Some(role),
     });
-    save_mao_prefs(s, next);
     s.menu = Some(OpenMenu::MaoReviewer(slot));
 }
 
 fn set_max_rounds(s: &mut UiState, slot: Slot, rounds: u8) {
-    let mut next = s.cfg.ui.mao.clone();
-    next.max_rounds = rounds.clamp(1, 5);
-    save_mao_prefs(s, next);
+    let clamped = rounds.clamp(1, 5);
+    mutate_slot_config(s, slot, |target| match target {
+        SlotConfigTarget::Session(ov) => ov.max_rounds = Some(clamped),
+        SlotConfigTarget::Global(global) => global.max_rounds = clamped,
+    });
+    s.menu = Some(OpenMenu::MaoReviewer(slot));
+}
+
+fn toggle_auto_failover(s: &mut UiState, slot: Slot) {
+    let asid = slot_asid(s, slot).map(str::to_string);
+    let next_val = !effective_auto_failover(s, asid.as_deref());
+    mutate_slot_config(s, slot, |target| match target {
+        SlotConfigTarget::Session(ov) => ov.auto_failover = Some(next_val),
+        SlotConfigTarget::Global(global) => global.auto_failover = next_val,
+    });
     s.menu = Some(OpenMenu::MaoReviewer(slot));
 }
 
@@ -1102,7 +1237,7 @@ pub fn on_start_submitted(
 }
 
 pub fn on_session_submitted(s: &mut UiState, asid: &str, prompt: &str) {
-    if !s.orchestration.is_session_enabled(asid) {
+    if !is_session_mao_enabled(s, asid) {
         return;
     }
     // Manual prompts inside a dedicated Reviewer session should not fork nested MAO runs.
@@ -1116,16 +1251,21 @@ pub fn on_session_submitted(s: &mut UiState, asid: &str, prompt: &str) {
 
     let now = now_ms();
     let lang = s.cfg.general.language;
-    if let Some(existing) = s
+    if let Some(existing_idx) = s
         .orchestration
         .runs
-        .iter_mut()
-        .rfind(|r| r.coder_asid == asid)
+        .iter()
+        .rposition(|r| r.coder_asid == asid)
     {
-        if !existing.is_active() {
-            let coder_name = agents::name(&existing.coder.agent, &s.agents);
+        if !s.orchestration.runs[existing_idx].is_active() {
+            let existing_coder = s.orchestration.runs[existing_idx].coder.agent.clone();
+            let coder_name = agents::name(&existing_coder, &s.agents);
+            let session_reviewer = effective_reviewer_for(s, &existing_coder, Some(asid));
+            let session_rounds = effective_max_rounds(s, Some(asid));
+            let existing = &mut s.orchestration.runs[existing_idx];
+            existing.reviewer = session_reviewer;
             existing.round = 1;
-            existing.max_rounds = s.cfg.ui.mao.max_rounds.clamp(1, 5);
+            existing.max_rounds = session_rounds;
             existing.goal = prompt.trim().to_string();
             existing.phase = MaoPhase::Coding { round: 1 };
             existing.pending_review_diff = false;
@@ -1160,7 +1300,7 @@ pub fn on_session_submitted(s: &mut UiState, asid: &str, prompt: &str) {
             }
             persist_runs(s);
         } else {
-            existing.updated_ms = now;
+            s.orchestration.runs[existing_idx].updated_ms = now;
         }
         return;
     }
@@ -1175,8 +1315,9 @@ pub fn on_session_submitted(s: &mut UiState, asid: &str, prompt: &str) {
         .as_ref()
         .and_then(|i| i.directory.clone())
         .unwrap_or_default();
-    let reviewer = effective_reviewer(s, &coder_agent);
+    let reviewer = effective_reviewer_for(s, &coder_agent, Some(asid));
     ensure_reviewer_catalog(s, &reviewer.agent);
+    let max_rounds = effective_max_rounds(s, Some(asid));
     let seq = {
         s.orchestration.next_seq += 1;
         s.orchestration.next_seq
@@ -1205,7 +1346,7 @@ pub fn on_session_submitted(s: &mut UiState, asid: &str, prompt: &str) {
         last_diff_fingerprint: None,
         snapshot_retries: 0,
         round: 1,
-        max_rounds: s.cfg.ui.mao.max_rounds.clamp(1, 5),
+        max_rounds,
         phase: MaoPhase::Coding { round: 1 },
         files: Vec::new(),
         coder_summary: String::new(),
@@ -1239,8 +1380,12 @@ pub fn on_session_submitted(s: &mut UiState, asid: &str, prompt: &str) {
 pub fn on_session_created(s: &mut UiState, token: u64, info: &AgentSessionInfo) {
     let pending_id = format!("new-{token}");
     let real_id = info.asid.0.clone();
-    if s.orchestration.enabled_sessions.remove(&pending_id) {
+    let mut promoted_mao = false;
+    if s.orchestration.enabled_sessions.remove(&pending_id)
+        && s.cfg.ui.mao.session_overrides.get(&real_id) != Some(&false)
+    {
         s.orchestration.enabled_sessions.insert(real_id.clone());
+        promoted_mao = true;
     }
     let mut matched = false;
     let mut lineage_pairs: Vec<(String, String)> = Vec::new();
@@ -1250,7 +1395,10 @@ pub fn on_session_created(s: &mut UiState, token: u64, info: &AgentSessionInfo) 
     for run in &mut s.orchestration.runs {
         if run.coder_asid == pending_id {
             run.coder_asid = real_id.clone();
-            s.orchestration.enabled_sessions.insert(real_id.clone());
+            if s.cfg.ui.mao.session_overrides.get(&real_id) != Some(&false) {
+                s.orchestration.enabled_sessions.insert(real_id.clone());
+                promoted_mao = true;
+            }
             if run.cwd.is_empty() {
                 if let Some(dir) = &info.directory {
                     run.cwd = dir.clone();
@@ -1302,6 +1450,9 @@ pub fn on_session_created(s: &mut UiState, token: u64, info: &AgentSessionInfo) 
                 }
             }
         }
+    }
+    if promoted_mao {
+        set_session_mao_override(s, &real_id, true);
     }
     if matched {
         s.auto_approve.insert(real_id, true);
@@ -2296,8 +2447,9 @@ pub fn composer_bar(s: &UiState, k: &Kit, layer: &mut Vec<El>, slot: Slot) -> El
     let language = s.cfg.general.language;
     let enabled = is_slot_enabled(s, slot);
     let coder_id = active_coder_agent(s, slot);
-    let reviewer = effective_reviewer(s, &coder_id);
-    let max_rounds = s.cfg.ui.mao.max_rounds.clamp(1, 5);
+    let asid = slot_asid(s, slot);
+    let reviewer = effective_reviewer_for(s, &coder_id, asid);
+    let max_rounds = effective_max_rounds(s, asid);
 
     let icon_color = if enabled {
         k.c.bg_accent
@@ -2351,8 +2503,16 @@ pub fn composer_bar(s: &UiState, k: &Kit, layer: &mut Vec<El>, slot: Slot) -> El
         .child(toggle);
 
     if enabled {
-        let reviewer_menu =
-            reviewer_config_menu(s, k, layer, slot, &coder_id, &reviewer, max_rounds);
+        let reviewer_menu = reviewer_config_menu(
+            s,
+            k,
+            layer,
+            slot,
+            &coder_id,
+            &reviewer,
+            max_rounds,
+            Placement::TopStart,
+        );
         bar = bar.child(reviewer_menu);
     }
 
@@ -2391,6 +2551,7 @@ fn reviewer_summary_label(
     parts.join(" · ")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reviewer_config_menu(
     s: &UiState,
     k: &Kit,
@@ -2399,6 +2560,7 @@ fn reviewer_config_menu(
     coder_id: &str,
     reviewer: &MaoRole,
     max_rounds: u8,
+    placement: Placement,
 ) -> El {
     let language = s.cfg.general.language;
     let open = s.menu == Some(OpenMenu::MaoReviewer(slot));
@@ -2435,7 +2597,8 @@ fn reviewer_config_menu(
                 s.menu = None;
             } else {
                 let coder = active_coder_agent(s, slot);
-                let role = effective_reviewer(s, &coder);
+                let asid = slot_asid(s, slot).map(str::to_string);
+                let role = effective_reviewer_for(s, &coder, asid.as_deref());
                 ensure_reviewer_catalog(s, &role.agent);
                 s.orchestration.menu_section = Some(MenuSection::Agent);
                 s.menu = Some(OpenMenu::MaoReviewer(slot));
@@ -2460,15 +2623,22 @@ fn reviewer_config_menu(
         Slot::Start => "mao-reviewer-start",
         Slot::Session => "mao-reviewer-session",
     })
-    .placement(Placement::TopStart)
+    .placement(placement)
     .trigger(trigger)
     .open(open)
-    .min_width(250.0)
+    .min_width(280.0)
     .on_close(|s: &mut UiState| s.menu = None);
 
     let coder_name = s.agent_name(coder_id);
     let rev_name = s.agent_name(&reviewer.agent);
-    menu = menu.group_label(format!("{coder_name} ⇄ {rev_name}"));
+    let current_asid = slot_asid(s, slot);
+    let is_session_custom = has_session_config_override(s, current_asid);
+    let scope_note = match slot {
+        Slot::Session if is_session_custom => tr_ref(language, "Session custom"),
+        Slot::Session => tr_ref(language, "Global default"),
+        Slot::Start => tr_ref(language, "Global default"),
+    };
+    menu = menu.group_label(format!("{coder_name} ⇄ {rev_name} · {scope_note}"));
 
     // 1. Agent submenu
     let agent_entries: Vec<MenuEntry> = usable_agents(s)
@@ -2501,6 +2671,11 @@ fn reviewer_config_menu(
         .map(|m| format_model_name(m, "Default", model_display))
         .unwrap_or_else(|| tr(language, "Default"));
     let models = model_options(s, &reviewer.agent);
+    let distinct_providers = models
+        .iter()
+        .map(|(p, _, _, _)| p.as_str())
+        .collect::<HashSet<_>>()
+        .len();
     let mut model_entries: Vec<MenuEntry> = if models.is_empty() {
         vec![MenuEntry::item(
             MenuItem::new(tr_ref(language, "Agent default model"))
@@ -2508,23 +2683,25 @@ fn reviewer_config_menu(
                 .disabled(true),
         )]
     } else {
-        models
-            .into_iter()
-            .take(24)
-            .map(|(provider, model_id, display, _)| {
-                let is_on = resolved_model
-                    .as_ref()
-                    .is_some_and(|cur| cur.provider_id == provider && cur.model_id == model_id);
-                MenuEntry::item(
-                    MenuItem::new(display)
-                        .badge(provider.clone())
-                        .checked(is_on)
-                        .on_select(move |s: &mut UiState| {
-                            set_reviewer_model(s, slot, provider.clone(), model_id.clone());
-                        }),
-                )
-            })
-            .collect()
+        let mut entries = Vec::new();
+        let mut last_provider: Option<String> = None;
+        for (provider, model_id, display, _) in models.into_iter().take(24) {
+            if distinct_providers > 1 && last_provider.as_deref() != Some(provider.as_str()) {
+                entries.push(MenuEntry::Label(provider.clone()));
+                last_provider = Some(provider.clone());
+            }
+            let is_on = resolved_model
+                .as_ref()
+                .is_some_and(|cur| cur.provider_id == provider && cur.model_id == model_id);
+            entries.push(MenuEntry::item(
+                MenuItem::new(display)
+                    .checked(is_on)
+                    .on_select(move |s: &mut UiState| {
+                        set_reviewer_model(s, slot, provider.clone(), model_id.clone());
+                    }),
+            ));
+        }
+        entries
     };
     if reviewer.model.is_some() {
         model_entries.insert(
@@ -2534,14 +2711,17 @@ fn reviewer_config_menu(
                     .checked(false)
                     .on_select(move |s: &mut UiState| {
                         let coder = active_coder_agent(s, slot);
-                        let cur = effective_reviewer(s, &coder);
-                        let mut next = s.cfg.ui.mao.clone();
-                        next.reviewer = Some(MaoRoleConfig {
+                        let asid = slot_asid(s, slot).map(str::to_string);
+                        let cur = effective_reviewer_for(s, &coder, asid.as_deref());
+                        let role = MaoRoleConfig {
                             agent: cur.agent,
                             model: None,
                             machine: cur.machine,
+                        };
+                        mutate_slot_config(s, slot, |target| match target {
+                            SlotConfigTarget::Session(ov) => ov.reviewer = Some(role),
+                            SlotConfigTarget::Global(global) => global.reviewer = Some(role),
                         });
-                        save_mao_prefs(s, next);
                         s.menu = Some(OpenMenu::MaoReviewer(slot));
                     }),
             ),
@@ -2553,7 +2733,8 @@ fn reviewer_config_menu(
             .submenu(model_entries, section == MenuSection::Model)
             .on_select(move |s: &mut UiState| {
                 let coder = active_coder_agent(s, slot);
-                let role = effective_reviewer(s, &coder);
+                let asid = slot_asid(s, slot).map(str::to_string);
+                let role = effective_reviewer_for(s, &coder, asid.as_deref());
                 ensure_reviewer_catalog(s, &role.agent);
                 s.orchestration.menu_section = Some(MenuSection::Model);
                 s.menu = Some(OpenMenu::MaoReviewer(slot));
@@ -2676,6 +2857,33 @@ fn reviewer_config_menu(
             }),
     );
 
+    let effective_failover = effective_auto_failover(s, current_asid);
+    menu = menu
+        .separator()
+        .item(
+            MenuItem::new(tr_ref(language, "Auto-failover on quota limit"))
+                .checked(effective_failover)
+                .on_select(move |s: &mut UiState| toggle_auto_failover(s, slot)),
+        )
+        .item(
+            MenuItem::new(tr_ref(language, "Agent & model pool"))
+                .badge(if s.cfg.ui.mao.agent_pool.is_empty() {
+                    tr(language, "Not configured")
+                } else {
+                    format!("{}", s.cfg.ui.mao.agent_pool.len())
+                })
+                .on_select(|s: &mut UiState| {
+                    s.menu = None;
+                    s.settings_tab = super::SettingsTab::Agents;
+                    s.go(Mode::Settings);
+                }),
+        );
+    if slot == Slot::Session && is_session_custom {
+        menu = menu.item(
+            MenuItem::new(tr_ref(language, "Reset to global default"))
+                .on_select(move |s: &mut UiState| reset_session_mao_config(s, slot)),
+        );
+    }
     menu = menu.separator().item(
         MenuItem::new(tr_ref(language, "Open MAO dashboard"))
             .icon(&glyphs::WORKFLOW)
@@ -3591,7 +3799,6 @@ pub fn page_view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .unwrap_or(1080.0)
         .min(MAX_W);
     let stacked = card_w < STACK_AT;
-    let detail_w = (card_w * 0.52).clamp(380.0, 680.0);
 
     let list: Vec<&MaoRun> = s
         .orchestration
@@ -3621,10 +3828,12 @@ pub fn page_view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                     .a11y_hidden(),
             )
             .child(match selected {
-                Some(run) => page_detail(s, k, run, detail_w),
+                Some(run) => page_detail(s, k, run),
                 None => col()
                     .key("mao-detail-empty")
-                    .w(detail_w)
+                    .w(0.0)
+                    .grow(0.58)
+                    .min_w(0.0)
                     .h_full()
                     .center()
                     .child(
@@ -3660,8 +3869,16 @@ fn page_head(s: &UiState, k: &Kit, layer: &mut Vec<El>, stacked: bool) -> El {
     let coder_id = s.start_agent.clone();
     let reviewer = effective_reviewer(s, &coder_id);
     let max_rounds = s.cfg.ui.mao.max_rounds.clamp(1, 5);
-    let reviewer_menu =
-        reviewer_config_menu(s, k, layer, Slot::Start, &coder_id, &reviewer, max_rounds);
+    let reviewer_menu = reviewer_config_menu(
+        s,
+        k,
+        layer,
+        Slot::Start,
+        &coder_id,
+        &reviewer,
+        max_rounds,
+        Placement::BottomStart,
+    );
 
     let controls = row()
         .gap(8.0)
@@ -4023,8 +4240,8 @@ fn page_list(s: &UiState, k: &Kit, list: &[&MaoRun], selected_id: Option<&str>) 
     }
     col()
         .key("mao-list")
-        .grow(1.0)
-        .shrink()
+        .w(0.0)
+        .grow(0.42)
         .min_w(0.0)
         .h_full()
         .min_h(0.0)
@@ -4076,8 +4293,9 @@ fn agent_live_card(
 
     let mut card = col()
         .key(format!("mao-agent-card-{key_prefix}"))
+        .w(0.0)
         .grow(1.0)
-        .min_w(210.0)
+        .min_w(180.0)
         .padding(12.0)
         .gap(6.0)
         .radius(k.radius.md)
@@ -4152,7 +4370,7 @@ fn agent_live_card(
     card
 }
 
-fn page_detail(s: &UiState, k: &Kit, run: &MaoRun, width: f32) -> El {
+fn page_detail(s: &UiState, k: &Kit, run: &MaoRun) -> El {
     let language = s.cfg.general.language;
     let coder_name = s.agent_name(&run.coder.agent);
     let reviewer_name = s.agent_name(&run.reviewer.agent);
@@ -4587,7 +4805,9 @@ fn page_detail(s: &UiState, k: &Kit, run: &MaoRun, width: f32) -> El {
 
     col()
         .key(format!("mao-detail-{}", run.id))
-        .w(width)
+        .w(0.0)
+        .grow(0.58)
+        .min_w(0.0)
         .h_full()
         .min_h(0.0)
         .child(
@@ -4601,6 +4821,404 @@ fn page_detail(s: &UiState, k: &Kit, run: &MaoRun, width: f32) -> El {
                     stick_bottom: false,
                 })
                 .scroll_bar(k),
+        )
+}
+
+fn add_pool_entry(s: &mut UiState, entry: MaoRoleConfig) {
+    let mut next = s.cfg.ui.mao.clone();
+    let already_exists = next.agent_pool.iter().any(|item| {
+        item.agent == entry.agent && item.model == entry.model && item.machine == entry.machine
+    });
+    if !already_exists && next.agent_pool.len() < 12 {
+        next.agent_pool.push(entry);
+        save_mao_prefs(s, next);
+    }
+    s.menu = None;
+}
+
+fn import_connected_agents_to_pool(s: &mut UiState) {
+    let candidates: Vec<String> = usable_agents(s).into_iter().map(|a| a.id).collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let mut next = s.cfg.ui.mao.clone();
+    for id in candidates {
+        if next.agent_pool.len() >= 12 {
+            break;
+        }
+        if !next.agent_pool.iter().any(|item| item.agent == id) {
+            next.agent_pool.push(MaoRoleConfig {
+                agent: id,
+                model: None,
+                machine: None,
+            });
+        }
+    }
+    save_mao_prefs(s, next);
+}
+
+fn move_pool_entry(s: &mut UiState, idx: usize, delta: isize) {
+    let mut next = s.cfg.ui.mao.clone();
+    let target = idx as isize + delta;
+    if idx < next.agent_pool.len() && target >= 0 && (target as usize) < next.agent_pool.len() {
+        next.agent_pool.swap(idx, target as usize);
+        save_mao_prefs(s, next);
+    }
+}
+
+fn remove_pool_entry(s: &mut UiState, idx: usize) {
+    let mut next = s.cfg.ui.mao.clone();
+    if idx < next.agent_pool.len() {
+        next.agent_pool.remove(idx);
+        save_mao_prefs(s, next);
+    }
+}
+
+fn pool_add_menu(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+    let language = s.cfg.general.language;
+    let open = s.menu == Some(OpenMenu::MaoPoolAdd);
+    let active_agent = s.orchestration.pool_add_agent.clone();
+    let dark = s.dark;
+
+    let trigger = Button::new(tr_ref(language, "+ Add Agent / Model"))
+        .variant(ButtonVariant::Neutral)
+        .control_size(ControlSize::Small)
+        .expanded(open)
+        .on_press(move |s: &mut UiState| {
+            if open {
+                s.menu = None;
+            } else {
+                let first = usable_agents(s).first().map(|a| a.id.clone());
+                if let Some(ref aid) = first {
+                    ensure_reviewer_catalog(s, aid);
+                }
+                s.orchestration.pool_add_agent = first;
+                s.menu = Some(OpenMenu::MaoPoolAdd);
+            }
+        })
+        .build(k)
+        .key("settings-mao-pool-add-btn");
+
+    let mut menu = Menu::new("settings-mao-pool-add")
+        .placement(Placement::BottomStart)
+        .trigger(trigger)
+        .open(open)
+        .min_width(280.0)
+        .on_close(|s: &mut UiState| s.menu = None);
+
+    let agents_list = usable_agents(s);
+    if agents_list.is_empty() {
+        menu = menu
+            .item(MenuItem::new(tr_ref(language, "No connected agents available")).disabled(true));
+    } else {
+        menu = menu.group_label(tr_ref(language, "Choose Agent & Model"));
+        for agent in agents_list {
+            let aid = agent.id.clone();
+            let expanded = active_agent.as_deref() == Some(aid.as_str());
+            let models = model_options(s, &aid);
+            let distinct_providers = models
+                .iter()
+                .map(|(p, _, _, _)| p.as_str())
+                .collect::<HashSet<_>>()
+                .len();
+
+            let mut sub_entries = Vec::new();
+            let aid_default = aid.clone();
+            sub_entries.push(MenuEntry::item(
+                MenuItem::new(tr_ref(language, "Use agent default")).on_select(
+                    move |s: &mut UiState| {
+                        add_pool_entry(
+                            s,
+                            MaoRoleConfig {
+                                agent: aid_default.clone(),
+                                model: None,
+                                machine: None,
+                            },
+                        );
+                    },
+                ),
+            ));
+            let mut last_provider: Option<String> = None;
+            for (provider, model_id, display, _) in models.into_iter().take(24) {
+                if distinct_providers > 1 && last_provider.as_deref() != Some(provider.as_str()) {
+                    sub_entries.push(MenuEntry::Label(provider.clone()));
+                    last_provider = Some(provider.clone());
+                }
+                let aid_m = aid.clone();
+                sub_entries.push(MenuEntry::item(MenuItem::new(display).on_select(
+                    move |s: &mut UiState| {
+                        add_pool_entry(
+                            s,
+                            MaoRoleConfig {
+                                agent: aid_m.clone(),
+                                model: Some(ModelRef {
+                                    provider_id: provider.clone(),
+                                    model_id: model_id.clone(),
+                                    variant: None,
+                                }),
+                                machine: None,
+                            },
+                        );
+                    },
+                )));
+            }
+
+            let aid_select = aid.clone();
+            menu = menu.item(
+                MenuItem::new(s.agent_name(&aid))
+                    .lead(agents::mark(&aid, 14.0, dark))
+                    .submenu(sub_entries, expanded)
+                    .on_select(move |s: &mut UiState| {
+                        ensure_reviewer_catalog(s, &aid_select);
+                        s.orchestration.pool_add_agent = Some(aid_select.clone());
+                        s.menu = Some(OpenMenu::MaoPoolAdd);
+                    }),
+            );
+        }
+    }
+
+    menu.build(k, layer)
+}
+
+/// Settings → Agents configuration card for Smart Orchestration defaults,
+/// user-configured Agent/Model candidate pool, and automatic quota failover.
+pub fn settings_card(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+    let language = s.cfg.general.language;
+    let enabled = s.cfg.ui.mao.enabled;
+    let auto_failover = s.cfg.ui.mao.auto_failover;
+    let coder_id = s.start_agent.clone();
+    let reviewer = effective_reviewer(s, &coder_id);
+    let max_rounds = s.cfg.ui.mao.max_rounds.clamp(1, 5);
+    let reviewer_menu = reviewer_config_menu(
+        s,
+        k,
+        layer,
+        Slot::Start,
+        &coder_id,
+        &reviewer,
+        max_rounds,
+        Placement::BottomStart,
+    );
+    let add_pool_btn = pool_add_menu(s, k, layer);
+
+    let mut pool_list = col().w_full().gap(6.0);
+    if s.cfg.ui.mao.agent_pool.is_empty() {
+        pool_list = pool_list.child(
+            row()
+                .w_full()
+                .px(10.0)
+                .py(8.0)
+                .gap(8.0)
+                .center_y()
+                .flex_wrap()
+                .radius(k.radius.md)
+                .fill(k.c.layer_01)
+                .border(1.0, k.c.border_weak)
+                .child(
+                    text(tr_ref(
+                        language,
+                        "No agents in pool yet. Add preferred Agents & Models so the orchestrator can allocate tasks dynamically and auto-switch on quota limits.",
+                    ))
+                    .font(k.ty.small)
+                    .color(k.c.text_muted)
+                    .wrap()
+                    .grow(1.0)
+                    .min_w(180.0),
+                )
+                .child(
+                    Button::new(tr_ref(language, "Import connected agents"))
+                        .variant(ButtonVariant::Neutral)
+                        .control_size(ControlSize::Small)
+                        .on_press(import_connected_agents_to_pool)
+                        .build(k)
+                        .key("settings-mao-pool-import"),
+                ),
+        );
+    } else {
+        let total = s.cfg.ui.mao.agent_pool.len();
+        for (idx, item) in s.cfg.ui.mao.agent_pool.iter().enumerate() {
+            let agent_name = s.agent_name(&item.agent);
+            let model_label = item
+                .model
+                .as_ref()
+                .map(|m| format_model_name(m, "Default", None))
+                .unwrap_or_else(|| tr(language, "Agent default model"));
+            let mut sub_label = model_label;
+            if let Some(v) = item.model.as_ref().and_then(|m| m.variant.as_deref()) {
+                sub_label.push_str(" · ");
+                sub_label.push_str(&readable_catalog_id(v));
+            }
+            if let Some(machine) = item.machine.as_deref() {
+                sub_label.push_str(" @ ");
+                sub_label.push_str(machine);
+            }
+            pool_list = pool_list.child(
+                row()
+                    .key(format!("settings-mao-pool-row-{idx}"))
+                    .w_full()
+                    .px(10.0)
+                    .py(6.0)
+                    .gap(8.0)
+                    .center_y()
+                    .radius(k.radius.md)
+                    .fill(k.c.layer_01)
+                    .border(1.0, k.c.border_weak)
+                    .child(
+                        Badge::new(format!("#{}", idx + 1))
+                            .variant(BadgeVariant::Subtle)
+                            .build(k),
+                    )
+                    .child(agents::mark(&item.agent, 14.0, s.dark))
+                    .child(
+                        text(agent_name)
+                            .font(k.ty.small_medium)
+                            .color(k.c.text_base)
+                            .single_line(),
+                    )
+                    .child(
+                        text(sub_label)
+                            .font(k.ty.small)
+                            .color(k.c.text_muted)
+                            .truncate()
+                            .grow(1.0)
+                            .min_w(0.0),
+                    )
+                    .child(
+                        Button::new("↑")
+                            .variant(ButtonVariant::GhostMuted)
+                            .control_size(ControlSize::Small)
+                            .disabled(idx == 0)
+                            .on_press(move |s: &mut UiState| move_pool_entry(s, idx, -1))
+                            .build(k)
+                            .key(format!("settings-mao-pool-up-{idx}")),
+                    )
+                    .child(
+                        Button::new("↓")
+                            .variant(ButtonVariant::GhostMuted)
+                            .control_size(ControlSize::Small)
+                            .disabled(idx + 1 >= total)
+                            .on_press(move |s: &mut UiState| move_pool_entry(s, idx, 1))
+                            .build(k)
+                            .key(format!("settings-mao-pool-down-{idx}")),
+                    )
+                    .child(
+                        Button::new("×")
+                            .variant(ButtonVariant::GhostMuted)
+                            .control_size(ControlSize::Small)
+                            .on_press(move |s: &mut UiState| remove_pool_entry(s, idx))
+                            .build(k)
+                            .key(format!("settings-mao-pool-rm-{idx}")),
+                    ),
+            );
+        }
+    }
+
+    col()
+        .key("settings-mao-card")
+        .w_full()
+        .gap(12.0)
+        .px(16.0)
+        .py(16.0)
+        .radius(k.radius.lg)
+        .fill(k.c.layer_01.alpha(0.3))
+        .border(1.0, k.c.border_weak)
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .center_y()
+                .child(icon(&glyphs::WORKFLOW, 16.0).color(k.c.text_accent))
+                .child(
+                    text(tr_ref(language, "MAO · Orchestration"))
+                        .font(k.ty.ui_medium)
+                        .color(k.c.text_base)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate(),
+                )
+                .child(
+                    Button::new(if enabled {
+                        tr_ref(language, "MAO enabled")
+                    } else {
+                        tr_ref(language, "Enable MAO")
+                    })
+                    .variant(if enabled {
+                        ButtonVariant::Submit
+                    } else {
+                        ButtonVariant::Neutral
+                    })
+                    .control_size(ControlSize::Small)
+                    .on_press(|s: &mut UiState| toggle_enabled(s, Slot::Start))
+                    .build(k)
+                    .key("settings-mao-toggle"),
+                ),
+        )
+        .child(
+            text(tr_ref(
+                language,
+                "Orchestrator dynamically assigns tasks across your pool and automatically switches to the next configured Agent/Model when quota runs out.",
+            ))
+            .font(k.ty.small)
+            .color(k.c.text_muted)
+            .wrap()
+            .w_full(),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .center_y()
+                .flex_wrap()
+                .child(reviewer_menu)
+                .child(
+                    Button::new(if auto_failover {
+                        tr_ref(language, "Auto-failover: On")
+                    } else {
+                        tr_ref(language, "Auto-failover: Off")
+                    })
+                    .variant(if auto_failover {
+                        ButtonVariant::Neutral
+                    } else {
+                        ButtonVariant::GhostMuted
+                    })
+                    .control_size(ControlSize::Small)
+                    .on_press(|s: &mut UiState| {
+                        let mut next = s.cfg.ui.mao.clone();
+                        next.auto_failover = !next.auto_failover;
+                        save_mao_prefs(s, next);
+                    })
+                    .build(k)
+                    .key("settings-mao-failover-toggle"),
+                )
+                .child(
+                    Button::new(tr_ref(language, "Open MAO dashboard"))
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .on_press(|s: &mut UiState| s.go(Mode::Mao))
+                        .build(k)
+                        .key("settings-mao-open"),
+                ),
+        )
+        .child(
+            col()
+                .w_full()
+                .gap(8.0)
+                .pt(4.0)
+                .child(
+                    row()
+                        .w_full()
+                        .gap(8.0)
+                        .center_y()
+                        .child(
+                            text(tr_ref(language, "Agent & model pool"))
+                                .font(k.ty.small_medium)
+                                .color(k.c.text_base)
+                                .grow(1.0)
+                                .min_w(0.0),
+                        )
+                        .child(add_pool_btn),
+                )
+                .child(pool_list),
         )
 }
 
@@ -4685,6 +5303,7 @@ fn window_compact_view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             &coder_id,
             &reviewer,
             max_rounds,
+            Placement::BottomStart,
         ));
 
     if s.orchestration.runs.len() > 1 {
@@ -5014,9 +5633,10 @@ pub fn dispatch_gateway_start(
     if trimmed_cwd.is_empty() {
         return false;
     }
-    let reviewer = effective_reviewer(s, coder_agent);
+    let reviewer = effective_reviewer_for(s, coder_agent, existing_asid);
     ensure_reviewer_catalog(s, &reviewer.agent);
-    let max_rounds = s.cfg.ui.mao.max_rounds.clamp(1, 5);
+    let max_rounds = effective_max_rounds(s, existing_asid);
+    let auto_failover = effective_auto_failover(s, existing_asid);
     let now = now_ms();
     let client_ref = format!("desktop-{token}-{now}");
     let mut rev_obj = serde_json::json!({
@@ -5032,6 +5652,29 @@ pub fn dispatch_gateway_start(
         rev_obj["machine"] = serde_json::json!(machine);
     }
 
+    let pool_json: Vec<serde_json::Value> = s
+        .cfg
+        .ui
+        .mao
+        .agent_pool
+        .iter()
+        .filter(|entry| !entry.agent.trim().is_empty())
+        .take(12)
+        .map(|entry| {
+            let mut item = serde_json::json!({ "agent": entry.agent });
+            if let Some(m) = entry.model.as_ref() {
+                item["model"] = serde_json::json!(format_gateway_model_id(m));
+                if let Some(v) = m.variant.as_deref() {
+                    item["variant"] = serde_json::json!(v);
+                }
+            }
+            if let Some(machine) = entry.machine.as_deref() {
+                item["machine"] = serde_json::json!(machine);
+            }
+            item
+        })
+        .collect();
+
     let mut body = serde_json::json!({
         "client_ref": client_ref,
         "goal": prompt,
@@ -5043,7 +5686,11 @@ pub fn dispatch_gateway_start(
         "auto_approve": true,
         "reviewer": rev_obj,
         "max_review_rounds": max_rounds,
+        "auto_failover": auto_failover,
     });
+    if !pool_json.is_empty() {
+        body["agent_pool"] = serde_json::Value::Array(pool_json);
+    }
     if let Some(mode) = coder_mode {
         body["mode"] = serde_json::json!(mode);
     }
@@ -5165,9 +5812,12 @@ fn adopt_gateway_coder_session(
         s.echo_submitted(token, true);
         s.echo_rows(real_asid);
         s.orchestration.enabled_sessions.remove(pending_asid);
-        s.orchestration
-            .enabled_sessions
-            .insert(real_asid.to_string());
+        if s.cfg.ui.mao.session_overrides.get(real_asid) != Some(&false) {
+            s.orchestration
+                .enabled_sessions
+                .insert(real_asid.to_string());
+            set_session_mao_override(s, real_asid, true);
+        }
         s.auto_approve.insert(real_asid.to_string(), true);
         s.send(Command::FocusSession(AgentSessionId(real_asid.to_string())));
         if let Some(info) = s.session_by_id(real_asid).cloned() {
@@ -5176,9 +5826,11 @@ fn adopt_gateway_coder_session(
     } else {
         s.echo_submitted(token, true);
         s.echo_rows(real_asid);
-        s.orchestration
-            .enabled_sessions
-            .insert(real_asid.to_string());
+        if s.cfg.ui.mao.session_overrides.get(real_asid) != Some(&false) {
+            s.orchestration
+                .enabled_sessions
+                .insert(real_asid.to_string());
+        }
         s.auto_approve.insert(real_asid.to_string(), true);
     }
     s.status = "Running…".into();
@@ -5382,39 +6034,54 @@ fn merge_gateway_run(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let coordinator = req
-        .get("coordinator")
+    let st = raw.get("state");
+    let active_coder = st
+        .and_then(|v| v.get("active_coder"))
+        .filter(|v| !v.is_null());
+    let active_reviewer = st
+        .and_then(|v| v.get("active_reviewer"))
+        .filter(|v| !v.is_null());
+    let coordinator = active_coder
+        .and_then(|v| v.get("agent"))
+        .or_else(|| req.get("coordinator"))
         .and_then(|v| v.as_str())
         .unwrap_or("codex")
         .to_string();
     let coder = MaoRole {
         agent: coordinator,
         model: parse_gateway_model(
-            req.get("model").and_then(|v| v.as_str()),
-            req.get("variant").and_then(|v| v.as_str()),
+            active_coder
+                .and_then(|v| v.get("model"))
+                .or_else(|| req.get("model"))
+                .and_then(|v| v.as_str()),
+            active_coder
+                .and_then(|v| v.get("variant"))
+                .or_else(|| req.get("variant"))
+                .and_then(|v| v.as_str()),
         ),
-        machine: req
-            .get("machine")
+        machine: active_coder
+            .and_then(|v| v.get("machine"))
+            .or_else(|| req.get("machine"))
             .and_then(|v| v.as_str())
             .map(str::to_string),
     };
+    let eff_rev = active_reviewer.unwrap_or(rev);
     let reviewer = MaoRole {
-        agent: rev
+        agent: eff_rev
             .get("agent")
             .and_then(|v| v.as_str())
             .unwrap_or("codex")
             .to_string(),
         model: parse_gateway_model(
-            rev.get("model").and_then(|v| v.as_str()),
-            rev.get("variant").and_then(|v| v.as_str()),
+            eff_rev.get("model").and_then(|v| v.as_str()),
+            eff_rev.get("variant").and_then(|v| v.as_str()),
         ),
-        machine: rev
+        machine: eff_rev
             .get("machine")
             .and_then(|v| v.as_str())
             .map(str::to_string),
     };
     let created_ms = raw.get("created_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-    let st = raw.get("state");
     let round = st
         .and_then(|v| v.get("round"))
         .and_then(|v| v.as_u64())
@@ -5531,6 +6198,7 @@ fn merge_gateway_run(
                         "review" => MaoStepKind::Review,
                         "rework" => MaoStepKind::Rework,
                         "verdict" => MaoStepKind::Verdict,
+                        "failover" => MaoStepKind::Failover,
                         "system" => MaoStepKind::System,
                         _ => MaoStepKind::Coding,
                     };
@@ -5615,7 +6283,10 @@ fn merge_gateway_run(
     })
     .flatten();
 
-    if !coder_asid.is_empty() {
+    if !coder_asid.is_empty()
+        && gw_run.is_active()
+        && s.cfg.ui.mao.session_overrides.get(&coder_asid) != Some(&false)
+    {
         s.orchestration.enabled_sessions.insert(coder_asid.clone());
     }
 
@@ -5870,6 +6541,7 @@ MAO_VERDICT: CHANGES_REQUESTED";
                 machine: None,
             }),
             max_rounds: 2,
+            ..Default::default()
         };
 
         let picked = preferred_cheap_model(&s, "codex").expect("cheap model");
@@ -6035,6 +6707,7 @@ MAO_VERDICT: CHANGES_REQUESTED";
                 machine: None,
             }),
             max_rounds: 2,
+            ..Default::default()
         };
 
         // 1. User submits from Start composer -> pending run created.
@@ -6200,6 +6873,7 @@ MAO_VERDICT: CHANGES_REQUESTED";
                 machine: Some("mac-studio".into()),
             }),
             max_rounds: 3,
+            ..Default::default()
         };
         s.pending_start = Some(("new-7".into(), 7));
         s.selected = Some("new-7".into());
@@ -6535,5 +7209,256 @@ MAO_VERDICT: CHANGES_REQUESTED";
                 "expected actionable task to remain eligible for MAO: {cmd}"
             );
         }
+    }
+
+    #[test]
+    fn dispatch_gateway_start_includes_user_agent_pool_and_auto_failover() {
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.hub_label = "gateway".into();
+        s.cfg.ui.mao.auto_failover = true;
+        s.cfg.ui.mao.agent_pool = vec![
+            MaoRoleConfig {
+                agent: "claude".into(),
+                model: Some(ModelRef {
+                    provider_id: "anthropic".into(),
+                    model_id: "claude-opus-4-6".into(),
+                    variant: Some("high".into()),
+                }),
+                machine: None,
+            },
+            MaoRoleConfig {
+                agent: "codex".into(),
+                model: Some(ModelRef {
+                    provider_id: "openai".into(),
+                    model_id: "gpt-5.6".into(),
+                    variant: None,
+                }),
+                machine: Some("mini".into()),
+            },
+        ];
+
+        assert!(dispatch_gateway_start(
+            &mut s,
+            "new-99",
+            99,
+            "Refactor auth middleware",
+            "/tmp",
+            "claude",
+            None,
+            None,
+            None,
+            &[],
+        ));
+        let mut body = None;
+        while let Ok(cmd) = rx.try_recv() {
+            if let Command::Orchestration {
+                request: crate::hub::OrchestrationRequest::Start(payload),
+                ..
+            } = cmd
+            {
+                body = Some(payload);
+            }
+        }
+        let body = body.expect("expected orchestration start command");
+        assert_eq!(body["auto_failover"], true);
+        let pool = body["agent_pool"].as_array().expect("agent_pool array");
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool[0]["agent"], "claude");
+        assert_eq!(pool[0]["model"], "anthropic/claude-opus-4-6");
+        assert_eq!(pool[0]["variant"], "high");
+        assert_eq!(pool[1]["agent"], "codex");
+        assert_eq!(pool[1]["machine"], "mini");
+    }
+
+    #[test]
+    fn merge_gateway_run_reflects_active_failover_coder_and_step() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let raw = serde_json::json!({
+            "id": "o_fo_1",
+            "created_ms": 1000,
+            "request": {
+                "goal": "Implement pool",
+                "cwd": "/tmp",
+                "coordinator": "claude",
+                "reviewer": { "agent": "codex" }
+            },
+            "state": {
+                "mao_phase": "coding",
+                "round": 1,
+                "max_rounds": 2,
+                "coder_asid": "codex-fo-asid",
+                "active_coder": { "agent": "codex", "model": "openai/gpt-5.6" },
+                "failover_count": 1,
+                "steps": [
+                    {
+                        "kind": "failover",
+                        "round": 1,
+                        "title": "Auto-switched Coder: claude → codex (openai/gpt-5.6)",
+                        "detail": "rate limit reached",
+                        "status": "warning",
+                        "time_ms": 1001
+                    }
+                ]
+            }
+        });
+        assert!(merge_gateway_run(&mut s, "local", &raw).is_some());
+        let run = s.orchestration.runs.last().unwrap();
+        assert_eq!(run.coder.agent, "codex");
+        assert_eq!(
+            run.coder.model.as_ref().map(|m| m.model_id.as_str()),
+            Some("gpt-5.6")
+        );
+        assert_eq!(run.steps[0].kind, MaoStepKind::Failover);
+    }
+
+    #[test]
+    fn session_mao_toggle_off_persists_across_gateway_sync_and_reopen() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.agents = vec![test_agent("claude", "Claude"), test_agent("codex", "Codex")];
+        s.selected = Some("sess-keep-off".into());
+
+        // Turn ON for this session -> persisted in session_overrides.
+        toggle_enabled(&mut s, Slot::Session);
+        assert!(is_slot_enabled(&s, Slot::Session));
+        assert_eq!(
+            s.cfg.ui.mao.session_overrides.get("sess-keep-off"),
+            Some(&true)
+        );
+
+        // Turn OFF for this session -> persisted as false.
+        toggle_enabled(&mut s, Slot::Session);
+        assert!(!is_slot_enabled(&s, Slot::Session));
+        assert_eq!(
+            s.cfg.ui.mao.session_overrides.get("sess-keep-off"),
+            Some(&false)
+        );
+
+        // Gateway syncs an active or historical run for this session -> must NOT re-enable it!
+        let gw_run = serde_json::json!({
+            "id": "o_hist_1",
+            "created_ms": 1000,
+            "request": {
+                "goal": "Earlier task",
+                "cwd": "/tmp",
+                "coordinator": "claude",
+                "reviewer": { "agent": "codex" }
+            },
+            "state": {
+                "mao_phase": "coding",
+                "round": 1,
+                "max_rounds": 2,
+                "coder_asid": "sess-keep-off",
+                "steps": []
+            }
+        });
+        assert!(merge_gateway_run(&mut s, "local", &gw_run).is_some());
+        assert!(
+            !is_slot_enabled(&s, Slot::Session),
+            "Gateway sync must never flip a user-disabled session back to enabled"
+        );
+
+        // Switching to another session and coming back keeps it OFF.
+        s.selected = Some("sess-other".into());
+        assert!(!is_slot_enabled(&s, Slot::Session));
+        s.selected = Some("sess-keep-off".into());
+        assert!(!is_slot_enabled(&s, Slot::Session));
+    }
+
+    #[test]
+    fn session_custom_mao_config_overrides_global_without_affecting_other_sessions() {
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.hub_label = "gateway".into();
+        s.agents = vec![
+            test_agent("claude", "Claude"),
+            test_agent("codex", "Codex"),
+            test_agent("antigravity", "Antigravity"),
+        ];
+        // Global defaults: reviewer = codex, max_rounds = 2, auto_failover = true.
+        s.cfg.ui.mao.reviewer = Some(MaoRoleConfig {
+            agent: "codex".into(),
+            model: None,
+            machine: None,
+        });
+        s.cfg.ui.mao.max_rounds = 2;
+        s.cfg.ui.mao.auto_failover = true;
+
+        // Both Session A and Session B inherit global defaults initially.
+        assert_eq!(
+            effective_reviewer_for(&s, "claude", Some("sess-a")).agent,
+            "codex"
+        );
+        assert_eq!(effective_max_rounds(&s, Some("sess-a")), 2);
+        assert!(effective_auto_failover(&s, Some("sess-a")));
+
+        // Customize ONLY Session A via Slot::Session.
+        s.selected = Some("sess-a".into());
+        set_reviewer_agent(&mut s, Slot::Session, "antigravity".into());
+        set_max_rounds(&mut s, Slot::Session, 4);
+        toggle_auto_failover(&mut s, Slot::Session);
+
+        // Session A uses its own overrides; global & Session B are untouched!
+        assert!(has_session_config_override(&s, Some("sess-a")));
+        assert!(!has_session_config_override(&s, Some("sess-b")));
+        assert_eq!(
+            effective_reviewer_for(&s, "claude", Some("sess-a")).agent,
+            "antigravity"
+        );
+        assert_eq!(effective_max_rounds(&s, Some("sess-a")), 4);
+        assert!(!effective_auto_failover(&s, Some("sess-a")));
+
+        assert_eq!(
+            s.cfg.ui.mao.reviewer.as_ref().map(|r| r.agent.as_str()),
+            Some("codex")
+        );
+        assert_eq!(s.cfg.ui.mao.max_rounds, 2);
+        assert!(s.cfg.ui.mao.auto_failover);
+        assert_eq!(
+            effective_reviewer_for(&s, "claude", Some("sess-b")).agent,
+            "codex"
+        );
+        assert_eq!(effective_max_rounds(&s, Some("sess-b")), 2);
+        assert!(effective_auto_failover(&s, Some("sess-b")));
+
+        // Gateway dispatch for Session A carries Session A's custom config.
+        assert!(dispatch_gateway_start(
+            &mut s,
+            "sess-a",
+            101,
+            "Task on A",
+            "/tmp",
+            "claude",
+            None,
+            None,
+            Some("sess-a"),
+            &[],
+        ));
+        let mut body_a = None;
+        while let Ok(cmd) = rx.try_recv() {
+            if let Command::Orchestration {
+                request: crate::hub::OrchestrationRequest::Start(payload),
+                ..
+            } = cmd
+            {
+                body_a = Some(payload);
+            }
+        }
+        let body_a = body_a.expect("dispatch payload for A");
+        assert_eq!(body_a["reviewer"]["agent"], "antigravity");
+        assert_eq!(body_a["max_review_rounds"], 4);
+        assert_eq!(body_a["auto_failover"], false);
+
+        // Resetting Session A restores global inheritance.
+        reset_session_mao_config(&mut s, Slot::Session);
+        assert!(!has_session_config_override(&s, Some("sess-a")));
+        assert_eq!(
+            effective_reviewer_for(&s, "claude", Some("sess-a")).agent,
+            "codex"
+        );
+        assert_eq!(effective_max_rounds(&s, Some("sess-a")), 2);
+        assert!(effective_auto_failover(&s, Some("sess-a")));
     }
 }

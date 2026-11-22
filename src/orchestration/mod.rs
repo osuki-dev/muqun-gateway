@@ -50,6 +50,10 @@ struct Start {
     pub(crate) machine: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) auto_approve: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) agent_pool: Vec<ReviewerSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) auto_failover: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +114,14 @@ pub struct RunState {
     pub verdict: Option<String>,
     pub findings: Vec<ReviewFinding>,
     pub steps: Vec<PipelineStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_coder: Option<ReviewerSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_reviewer: Option<ReviewerSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exhausted_candidates: Vec<String>,
+    #[serde(default)]
+    pub failover_count: u8,
 }
 
 impl Default for RunState {
@@ -133,8 +145,209 @@ impl Default for RunState {
             verdict: None,
             findings: Vec::new(),
             steps: Vec::new(),
+            active_coder: None,
+            active_reviewer: None,
+            exhausted_candidates: Vec::new(),
+            failover_count: 0,
         }
     }
+}
+
+pub fn candidate_key(spec: &ReviewerSpec) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        spec.agent.trim().to_ascii_lowercase(),
+        spec.model
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase(),
+        spec.variant
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase(),
+        spec.machine
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase(),
+    )
+}
+
+pub fn candidate_display(spec: &ReviewerSpec) -> String {
+    let mut out = spec.agent.clone();
+    if let Some(model) = spec.model.as_deref().filter(|m| !m.trim().is_empty()) {
+        out.push_str(" (");
+        out.push_str(model.trim());
+        if let Some(variant) = spec.variant.as_deref().filter(|v| !v.trim().is_empty()) {
+            out.push_str(" · ");
+            out.push_str(variant.trim());
+        }
+        out.push(')');
+    }
+    if let Some(machine) = spec.machine.as_deref().filter(|m| !m.trim().is_empty()) {
+        out.push_str(" @ ");
+        out.push_str(machine.trim());
+    }
+    out
+}
+
+pub fn is_quota_or_capacity_error(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    const PATTERNS: &[&str] = &[
+        "rate limit",
+        "rate_limit",
+        "ratelimit",
+        "too many requests",
+        "http 429",
+        "status 429",
+        "error 429",
+        "429 ",
+        "quota",
+        "insufficient_quota",
+        "usage limit",
+        "limit reached",
+        "out of credits",
+        "no credits",
+        "credit balance",
+        "credits exhausted",
+        "exhausted",
+        "spend limit",
+        "spend control",
+        "billing limit",
+        "overloaded",
+        "capacity exceeded",
+        "at capacity",
+        "try again later",
+        "cooldown",
+        "额度",
+        "配额",
+        "限流",
+        "达到上限",
+        "用量已满",
+        "余额不足",
+        "次數上限",
+        "額度",
+        "配額",
+    ];
+    PATTERNS
+        .iter()
+        .any(|needle| lower.contains(needle) || trimmed.contains(needle))
+}
+
+fn bare_model_name(model: &str) -> &str {
+    model
+        .rsplit_once('/')
+        .map(|(_, tail)| tail)
+        .unwrap_or(model)
+        .trim()
+}
+
+pub fn is_account_limits_exhausted(
+    limits: &crate::agents::domain::account_limits::AccountLimits,
+    target_model: Option<&str>,
+) -> Option<String> {
+    if limits.status != "available" {
+        return None;
+    }
+    if limits.ordinary_usage_allowed == Some(false) {
+        return Some("account usage limit reached".into());
+    }
+    let target_bare = target_model
+        .map(bare_model_name)
+        .filter(|m| !m.is_empty())
+        .map(str::to_ascii_lowercase);
+    for limit in &limits.limits {
+        if let (Some(limit_model), Some(target)) = (
+            limit
+                .model_id
+                .as_deref()
+                .map(bare_model_name)
+                .filter(|m| !m.is_empty()),
+            target_bare.as_deref(),
+        ) {
+            let lm = limit_model.to_ascii_lowercase();
+            if lm != target && !lm.contains(target) && !target.contains(&lm) {
+                continue;
+            }
+        }
+        if limit.spend_control_reached == Some(true) {
+            return Some(
+                limit
+                    .limit_reached_reason
+                    .clone()
+                    .unwrap_or_else(|| "spend control limit reached".into()),
+            );
+        }
+        if let Some(reason) = limit
+            .limit_reached_reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+        {
+            return Some(reason.to_string());
+        }
+        if limit
+            .individual_limit
+            .as_ref()
+            .and_then(|il| il.remaining_percent)
+            .is_some_and(|pct| pct <= 0.5)
+        {
+            return Some("individual quota exhausted".into());
+        }
+        if limit
+            .credits
+            .as_ref()
+            .is_some_and(|c| c.has_credits == Some(false) && c.unlimited != Some(true))
+        {
+            return Some("account credits exhausted".into());
+        }
+        for w in &limit.windows {
+            let label = w.label.as_deref().unwrap_or(&w.id);
+            if w.remaining.is_some_and(|r| r <= 0.0) {
+                return Some(format!("rate window `{label}` exhausted"));
+            }
+            if let (Some(used), Some(cap)) = (w.used, w.limit) {
+                if cap > 0.0 && used >= cap {
+                    return Some(format!("rate window `{label}` reached 100%"));
+                }
+            }
+            if w.unit.eq_ignore_ascii_case("percent") && w.used.is_some_and(|u| u >= 99.5) {
+                return Some(format!("rate window `{label}` reached 100%"));
+            }
+        }
+    }
+    None
+}
+
+pub fn format_agent_pool_instruction(pool: &[ReviewerSpec]) -> String {
+    if pool.is_empty() {
+        return String::new();
+    }
+    let mut lines = Vec::with_capacity(pool.len() + 2);
+    lines.push(
+        "User-configured agent & model pool for dynamic task orchestration (no fixed frontend/backend/architect role labels — decide based on the task itself whether to execute directly or delegate bounded subtasks via Muqun MCP `tasks.delegate`, picking the best suited agent/model below; if any candidate hits a quota or rate limit, switch to another candidate from this pool):"
+            .to_string(),
+    );
+    for (idx, item) in pool.iter().take(12).enumerate() {
+        let mut parts = vec![format!("agent=`{}`", item.agent)];
+        if let Some(model) = item.model.as_deref().filter(|m| !m.trim().is_empty()) {
+            parts.push(format!("model=`{}`", model.trim()));
+        }
+        if let Some(variant) = item.variant.as_deref().filter(|v| !v.trim().is_empty()) {
+            parts.push(format!("variant=`{}`", variant.trim()));
+        }
+        if let Some(machine) = item.machine.as_deref().filter(|m| !m.trim().is_empty()) {
+            parts.push(format!("machine=`{}`", machine.trim()));
+        }
+        lines.push(format!("{}. {}", idx + 1, parts.join(", ")));
+    }
+    lines.join("\n")
 }
 
 pub fn diff_fingerprint(files: &[ChangedFile], diff_summary: &str) -> String {
@@ -693,6 +906,13 @@ impl RunState {
         let base_commit = resolve_repo_root(std::path::Path::new(&request.cwd))
             .and_then(|root| base_commits.get(&root.display().to_string()).cloned())
             .or_else(|| base_commits.values().next().cloned());
+        let active_coder = Some(ReviewerSpec {
+            agent: request.coordinator.clone(),
+            model: request.model.clone(),
+            variant: request.variant.clone(),
+            machine: request.machine.clone(),
+        });
+        let active_reviewer = request.reviewer.clone();
         Self {
             round: 1,
             max_rounds: request.max_review_rounds.unwrap_or(2).clamp(1, 5),
@@ -721,6 +941,10 @@ impl RunState {
                 task_id: None,
                 time_ms: now,
             }],
+            active_coder,
+            active_reviewer,
+            exhausted_candidates: Vec::new(),
+            failover_count: 0,
         }
     }
 
@@ -980,6 +1204,31 @@ impl Run {
         format!("orchestration:{}", self.id)
     }
 
+    fn effective_coder(&self) -> ReviewerSpec {
+        self.state
+            .active_coder
+            .clone()
+            .unwrap_or_else(|| ReviewerSpec {
+                agent: self.request.coordinator.clone(),
+                model: self.request.model.clone(),
+                variant: self.request.variant.clone(),
+                machine: self.request.machine.clone(),
+            })
+    }
+
+    fn effective_reviewer(&self) -> Option<ReviewerSpec> {
+        self.state
+            .active_reviewer
+            .clone()
+            .or_else(|| self.request.reviewer.clone())
+    }
+
+    fn auto_failover_enabled(&self) -> bool {
+        self.request
+            .auto_failover
+            .unwrap_or(!self.request.agent_pool.is_empty())
+    }
+
     fn coding_prompt(&self) -> String {
         self.request.goal.trim().to_string()
     }
@@ -1042,6 +1291,15 @@ impl Run {
             String::new()
         };
 
+        let pool_section = if !self.request.agent_pool.is_empty() {
+            format!(
+                "\n\n{}",
+                format_agent_pool_instruction(&self.request.agent_pool)
+            )
+        } else {
+            String::new()
+        };
+
         format!(
             "You coordinate this software task through the Muqun task tools.\n\
              Investigate before deciding whether to delegate. Dynamically choose the work, agents,\n\
@@ -1058,7 +1316,7 @@ impl Run {
              or repeat a submission whose delivery is uncertain. Honor repository instructions.\n\
              Stop repetitive failed approaches and explain the blocker instead of looping.\n\
              Finish with the changed files/revisions, verification task IDs, results, and remaining\n\
-             gaps. The host presents your result for review, not as automatically accepted.{reviewer_section}\n\n\
+             gaps. The host presents your result for review, not as automatically accepted.{reviewer_section}{pool_section}\n\n\
              User goal:\n{}",
             self.request.goal
         )
