@@ -285,6 +285,12 @@ pub enum Command {
     PluginPackage(uuid::Uuid, crate::plugin::packages::Operation, Vec<String>),
     /// Download and install a managed runtime (Bun or Herdr) on the background worker.
     InstallManagedRuntime(muqun_gateway::platform::runtimes::RuntimeKind),
+    /// Best-effort pre-warm of an ACP agent runtime while the user composes on Home.
+    WarmAgent {
+        agent: String,
+        directory: Option<String>,
+        auto_approve: bool,
+    },
     /// Capture baseline git commits asynchronously off the main UI thread when an MAO run starts.
     MaoCaptureBaseline {
         run_id: String,

@@ -10,10 +10,10 @@ use muqun_gateway::agents::{
     TimelineRole, ToolCallStatus,
 };
 use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
-use rune::{col, el, icon, row, text, Color, El, TextStyle, Tx};
+use rune::{col, el, icon, row, text, Color, El, TextEdit, TextStyle, Tx};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, Menu, MenuEntry, MenuItem,
-    Placement, ScrollBar, SegmentedControl,
+    Placement, ScrollBar, SegmentedControl, TextInput,
 };
 
 use crate::config::{ConfigEdit, Language, MaoPrefs, MaoRoleConfig};
@@ -268,6 +268,9 @@ pub struct View {
     pub synced_computers: HashSet<String>,
     pub enabled_sessions: HashSet<String>,
     pub gateway_start_tokens: HashMap<u64, (String, u64)>,
+    pub last_gateway_poll_ms: u64,
+    pub rework_note: TextEdit,
+    pub rework_note_run: Option<String>,
     pub next_seq: u64,
 }
 
@@ -333,6 +336,9 @@ impl Default for View {
             synced_computers: HashSet::new(),
             enabled_sessions,
             gateway_start_tokens: HashMap::new(),
+            last_gateway_poll_ms: 0,
+            rework_note: TextEdit::new(""),
+            rework_note_run: None,
             next_seq,
         }
     }
@@ -2061,9 +2067,40 @@ fn build_rework_prompt(
 }
 
 pub fn continue_rework(s: &mut UiState, run_id: &str) {
+    let extra_note = if s
+        .orchestration
+        .rework_note_run
+        .as_deref()
+        .is_none_or(|id| id == run_id)
+    {
+        let trimmed = s.orchestration.rework_note.text.trim().to_string();
+        if !trimmed.is_empty() {
+            s.orchestration.rework_note = TextEdit::new("");
+            s.orchestration.rework_note_run = None;
+            Some(trimmed)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     if run_id.starts_with("o_") {
         let computer = s.current_computer().to_string();
         if !computer.is_empty() && computer != "all" {
+            let feedback = extra_note.map(|note| {
+                let prior = s
+                    .orchestration
+                    .runs
+                    .iter()
+                    .find(|r| r.id == run_id)
+                    .map(|r| r.review_summary.trim())
+                    .filter(|summary| !summary.is_empty());
+                match prior {
+                    Some(prev) => format!("{prev}\n\nAdditional user guidance:\n{note}"),
+                    None => note,
+                }
+            });
             let ticket = s.next_token;
             s.next_token += 1;
             s.send(Command::Orchestration {
@@ -2071,7 +2108,7 @@ pub fn continue_rework(s: &mut UiState, run_id: &str) {
                 ticket,
                 request: crate::hub::OrchestrationRequest::Rework {
                     run: run_id.to_string(),
-                    feedback: None,
+                    feedback,
                 },
             });
             s.notify(
@@ -2093,7 +2130,13 @@ pub fn continue_rework(s: &mut UiState, run_id: &str) {
         else {
             return None;
         };
-        let feedback = feedback.clone();
+        let feedback = match extra_note.as_deref() {
+            Some(note) if !feedback.trim().is_empty() => {
+                format!("{feedback}\n\nAdditional user guidance:\n{note}")
+            }
+            Some(note) => note.to_string(),
+            None => feedback.clone(),
+        };
         let next_round = round.saturating_add(1);
         if next_round > run.max_rounds {
             run.max_rounds = next_round;
@@ -3234,6 +3277,28 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
         phase_summary_line(run, &coder_name, &reviewer_name, language)
     };
 
+    let rework_note_row = matches!(run.phase, MaoPhase::ChangesRequested { .. }).then(|| {
+        let note_run_edit = run.id.clone();
+        let note_run_submit = run.id.clone();
+        let placeholder = tr_ref(language, "Optional extra guidance for rework…");
+        row().w_full().pt(4.0).child(
+            TextInput::new(&s.orchestration.rework_note)
+                .placeholder(placeholder)
+                .width(None)
+                .on_edit(move |s: &mut UiState| {
+                    s.orchestration.rework_note_run = Some(note_run_edit.clone());
+                    &mut s.orchestration.rework_note
+                })
+                .on_submit(move |s: &mut UiState, _: &mut Tx| {
+                    s.orchestration.rework_note_run = Some(note_run_submit.clone());
+                    continue_rework(s, &note_run_submit);
+                })
+                .build(k)
+                .key("mao-banner-rework-note")
+                .w_full(),
+        )
+    });
+
     let mut inner = col()
         .w_full()
         .px(14.0)
@@ -3248,6 +3313,7 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
                 .single_line()
                 .truncate(),
         )
+        .children(rework_note_row)
         .child(
             el().w_full()
                 .h(1.0)
@@ -3570,18 +3636,20 @@ pub fn page_view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let page = col()
         .key("mao")
         .max_w(MAX_W)
+        .h_full()
+        .min_h(0.0)
         .child(page_head(s, k, layer, stacked))
         .children((!s.orchestration.runs.is_empty()).then(|| page_filters(s, k)))
         .child(body);
 
-    super::card_stage(
-        "mao",
-        row()
-            .key("mao-centre")
-            .child(el().grow(1.0))
-            .child(page.w_full())
-            .child(el().grow(1.0)),
-    )
+    row()
+        .key("mao-centre")
+        .w_full()
+        .h_full()
+        .min_h(0.0)
+        .child(el().grow(1.0))
+        .child(page.w_full())
+        .child(el().grow(1.0))
 }
 
 fn page_head(s: &UiState, k: &Kit, layer: &mut Vec<El>, stacked: bool) -> El {
@@ -4946,6 +5014,35 @@ pub fn request_gateway_read(s: &mut UiState, run_id: &str) {
     });
 }
 
+/// Automatically refresh active Gateway-managed orchestrations (including
+/// cross-machine Reviewers whose sessions do not emit local Idle events).
+pub fn poll_active_gateway_runs(s: &mut UiState, force: bool) {
+    if !gateway_dispatch_available(s) {
+        return;
+    }
+    let active_ids: Vec<String> = s
+        .orchestration
+        .runs
+        .iter()
+        .rev()
+        .filter(|r| r.id.starts_with("o_") && r.is_active())
+        .take(4)
+        .map(|r| r.id.clone())
+        .collect();
+    if active_ids.is_empty() {
+        return;
+    }
+    let now = now_ms();
+    let interval_ms = if force { 1_000 } else { 3_000 };
+    if now.saturating_sub(s.orchestration.last_gateway_poll_ms) < interval_ms {
+        return;
+    }
+    s.orchestration.last_gateway_poll_ms = now;
+    for id in active_ids {
+        request_gateway_read(s, &id);
+    }
+}
+
 pub fn ensure_gateway_synced(s: &mut UiState) {
     let computer = s.current_computer().to_string();
     if computer.is_empty() || computer == "all" {
@@ -6029,15 +6126,23 @@ MAO_VERDICT: CHANGES_REQUESTED";
             Some("mac-studio")
         );
 
-        // Control actions on o_* runs forward to Gateway endpoints.
+        // Control actions on o_* runs forward to Gateway endpoints (with optional extra rework note).
+        s.orchestration.rework_note = TextEdit::new("Also add a regression unit test.");
+        s.orchestration.rework_note_run = Some("o_gw_99".into());
         continue_rework(&mut s, "o_gw_99");
+        assert!(s.orchestration.rework_note.text.is_empty());
         mark_approved(&mut s, "o_gw_99");
         cancel_run(&mut s, "o_gw_99");
         let mut saw = (false, false, false);
         while let Ok(cmd) = rx.try_recv() {
             if let Command::Orchestration { request, .. } = cmd {
                 match request {
-                    crate::hub::OrchestrationRequest::Rework { run, .. } if run == "o_gw_99" => {
+                    crate::hub::OrchestrationRequest::Rework { run, feedback }
+                        if run == "o_gw_99" =>
+                    {
+                        assert!(feedback
+                            .as_deref()
+                            .is_some_and(|f| f.contains("regression unit test")));
                         saw.0 = true;
                     }
                     crate::hub::OrchestrationRequest::Approve(run) if run == "o_gw_99" => {
@@ -6051,5 +6156,24 @@ MAO_VERDICT: CHANGES_REQUESTED";
             }
         }
         assert_eq!(saw, (true, true, true));
+
+        // Active Gateway run polling emits Read(id) and throttles rapid repeats.
+        s.orchestration.runs[0].phase = MaoPhase::Reviewing { round: 1 };
+        s.orchestration.last_gateway_poll_ms = 0;
+        poll_active_gateway_runs(&mut s, false);
+        let mut reads = 0usize;
+        while let Ok(cmd) = rx.try_recv() {
+            if let Command::Orchestration {
+                request: crate::hub::OrchestrationRequest::Read(id),
+                ..
+            } = cmd
+            {
+                assert_eq!(id, "o_gw_99");
+                reads += 1;
+            }
+        }
+        assert_eq!(reads, 1);
+        poll_active_gateway_runs(&mut s, false);
+        assert!(rx.try_recv().is_err());
     }
 }

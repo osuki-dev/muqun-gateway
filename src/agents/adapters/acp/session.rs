@@ -600,6 +600,17 @@ impl Drop for Admission<'_> {
     }
 }
 
+const WARM_STANDBY_TTL: Duration = Duration::from_secs(90);
+
+struct WarmStandby {
+    directory: String,
+    bypass: bool,
+    client: Arc<AcpClient>,
+    events: broadcast::Receiver<AcpEvent>,
+    capabilities: Value,
+    created_at: tokio::time::Instant,
+}
+
 /// The sessions this Gateway created (or forked), kept across restarts in a
 /// small file so they stay deletable after the Gateway is upgraded. Without
 /// a file (tests, other providers) ownership lasts for the process.
@@ -719,6 +730,8 @@ pub struct AcpDriver<P: AcpProvider> {
     /// When `session/new` or `session/load` last answered ACP's
     /// `auth_required`; cleared by the next one that succeeds.
     signin_failure: StdMutex<Option<u64>>,
+    warm_standby: StdMutex<Option<WarmStandby>>,
+    warming: Mutex<()>,
     stop: CancellationToken,
 }
 
@@ -851,6 +864,8 @@ impl<P: AcpProvider> AcpDriver<P> {
             owned: StdMutex::new(OwnedSessions::default()),
             instructions: StdMutex::new(HashMap::new()),
             signin_failure: StdMutex::new(None),
+            warm_standby: StdMutex::new(None),
+            warming: Mutex::new(()),
             stop: CancellationToken::new(),
         })
     }
@@ -1811,12 +1826,53 @@ impl<P: AcpProvider> AcpDriver<P> {
     }
 
     /// `bypass`: start the child with the provider's launch bypass flag.
+    fn take_warm_standby(
+        &self,
+        directory: &str,
+        bypass: bool,
+    ) -> Option<(Arc<AcpClient>, broadcast::Receiver<AcpEvent>, Value)> {
+        let mut slot = self.warm_standby.lock().unwrap();
+        let entry = slot.take()?;
+        let valid = entry.created_at.elapsed() < WARM_STANDBY_TTL && entry.client.is_running();
+        if valid && entry.directory == directory && entry.bypass == bypass {
+            return Some((entry.client, entry.events, entry.capabilities));
+        }
+        if valid {
+            *slot = Some(entry);
+        } else {
+            tokio::spawn(async move {
+                entry.client.shutdown().await;
+            });
+        }
+        None
+    }
+
     async fn initialized_for(
         &self,
         directory: &str,
         bypass: bool,
     ) -> Result<(Arc<AcpClient>, broadcast::Receiver<AcpEvent>, Value), AgentError> {
         let _starting = self.starting.read().await;
+        if self.stop.is_cancelled() {
+            return Err(AgentError::NotAvailable("ACP runtime stopped".into()));
+        }
+        if let Some(warm) = self.take_warm_standby(directory, bypass) {
+            tracing::debug!(
+                provider = P::KIND,
+                directory,
+                bypass,
+                "reusing pre-warmed ACP child"
+            );
+            return Ok(warm);
+        }
+        self.spawn_initialized_for(directory, bypass).await
+    }
+
+    async fn spawn_initialized_for(
+        &self,
+        directory: &str,
+        bypass: bool,
+    ) -> Result<(Arc<AcpClient>, broadcast::Receiver<AcpEvent>, Value), AgentError> {
         if self.stop.is_cancelled() {
             return Err(AgentError::NotAvailable("ACP runtime stopped".into()));
         }
@@ -4652,6 +4708,78 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 sessions.truncate(limit);
             }
             Ok(sessions)
+        })
+    }
+    fn warm_session<'a>(
+        &'a self,
+        directory: Option<&'a str>,
+        auto_approve: bool,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let dir = directory.unwrap_or(&self.default_directory);
+            if !std::path::Path::new(dir).is_dir() {
+                return Ok(());
+            }
+            let bypass = P::LAUNCH_BYPASS.is_some() && auto_approve;
+            let Ok(_warming) = self.warming.try_lock() else {
+                return Ok(());
+            };
+            {
+                let slot = self.warm_standby.lock().unwrap();
+                if let Some(entry) = slot.as_ref() {
+                    if entry.directory == dir
+                        && entry.bypass == bypass
+                        && entry.created_at.elapsed() < WARM_STANDBY_TTL
+                        && entry.client.is_running()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            let _starting = self.starting.read().await;
+            let Ok((client, events, capabilities)) = self.spawn_initialized_for(dir, bypass).await
+            else {
+                return Ok(());
+            };
+            let warm_client = Arc::clone(&client);
+            let replaced = self.warm_standby.lock().unwrap().replace(WarmStandby {
+                directory: dir.to_string(),
+                bypass,
+                client,
+                events,
+                capabilities,
+                created_at: tokio::time::Instant::now(),
+            });
+            if let Some(prev) = replaced {
+                tokio::spawn(async move {
+                    prev.client.shutdown().await;
+                });
+            }
+            let me = self.me.clone();
+            let stop = self.stop.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(WARM_STANDBY_TTL + Duration::from_secs(5)) => {}
+                    _ = stop.cancelled() => {}
+                }
+                if let Some(driver) = me.upgrade() {
+                    let expired = {
+                        let mut slot = driver.warm_standby.lock().unwrap();
+                        if slot
+                            .as_ref()
+                            .is_some_and(|e| Arc::ptr_eq(&e.client, &warm_client))
+                        {
+                            slot.take()
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(entry) = expired {
+                        entry.client.shutdown().await;
+                    }
+                }
+            });
+            Ok(())
         })
     }
     fn create_session<'a>(

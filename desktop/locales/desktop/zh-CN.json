@@ -1017,5 +1017,7 @@
   "Skipped review (no code changes)": "无代码变更 · 已跳过审查",
   "Review findings": "结构化审查问题",
   "Sync": "同步状态",
-  "repos": "个仓库"
+  "repos": "个仓库",
+  "Optional extra guidance for rework…": "追加修改意见（可选，按回车直接修复）…",
+  "Failed to start orchestration": "启动智能编排失败"
 }

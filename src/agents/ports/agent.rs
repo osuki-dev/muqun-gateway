@@ -343,6 +343,16 @@ pub trait AgentPort: Send + Sync {
         })
     }
 
+    /// Optionally pre-warm an agent runtime for `directory` (and `auto_approve`)
+    /// so the next `create_session` starts immediately. No-op for persistent daemons.
+    fn warm_session<'a>(
+        &'a self,
+        _directory: Option<&'a str>,
+        _auto_approve: bool,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Prepare a shared session from supported native CLI choices. Unsupported
     /// is returned only before creating a session; other failures are ambiguous
     /// and must never trigger a second launch or prompt delivery.

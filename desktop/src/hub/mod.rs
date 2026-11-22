@@ -399,6 +399,15 @@ pub trait SessionHub: Send + Sync {
     /// Folders under a typed prefix, on the host the sessions run on.
     fn directories<'a>(&'a self, prefix: &'a str) -> HubFuture<'a, Completion>;
     fn create<'a>(&'a self, agent: &'a str, cwd: &'a Path) -> HubFuture<'a, AgentSessionInfo>;
+    /// Best-effort pre-warm of an agent runtime for `cwd` while the user composes a prompt.
+    fn warm_agent<'a>(
+        &'a self,
+        _agent: &'a str,
+        _cwd: Option<&'a str>,
+        _auto_approve: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
     /// Create a session and apply initial model, mode, and auto-approve in one
     /// round-trip where the backend supports it.
     fn create_with_options<'a>(

@@ -2207,7 +2207,14 @@ impl UiState {
             asid: None,
         }));
         if !cwd.is_empty() {
-            self.send(Command::Compose(C::Branch { cwd }));
+            self.send(Command::Compose(C::Branch { cwd: cwd.clone() }));
+            if !self.demo {
+                self.send(Command::WarmAgent {
+                    agent: self.start_agent.clone(),
+                    directory: Some(cwd),
+                    auto_approve: self.cfg.ui.mao.enabled,
+                });
+            }
         }
     }
 
@@ -3496,6 +3503,7 @@ impl UiState {
                     self.tasks = rows;
                     self.task_cwd = default_cwd;
                     tasks::listed(self);
+                    orchestration::poll_active_gateway_runs(self, true);
                 }
                 Update::TasksFailed(why) => self.tasks_view.error = Some(why),
                 Update::TaskHistory { id, steps } => {
@@ -3638,6 +3646,7 @@ impl UiState {
         }
         self.note_busy();
         inbox::note_waiting(self);
+        orchestration::poll_active_gateway_runs(self, false);
         self.sync_tray();
     }
 

@@ -118,6 +118,14 @@ impl UiState {
             }
         }
         let id = self.active_plugin_page.take();
+        if id.is_none() && self.mode == Mode::Mao {
+            self.go(if self.selected.is_some() {
+                Mode::Session
+            } else {
+                Mode::Home
+            });
+            return;
+        }
         if let Some(id) = id.as_deref() {
             self.release_plugin_view(id, "page");
         }
@@ -445,6 +453,13 @@ impl UiState {
             PluginSlot::Drawer => {
                 self.plugin_page_origin = None;
                 self.release_plugin_page();
+                if plugin_id == "mao" && self.mode == Mode::Mao {
+                    self.mode = if self.selected.is_some() {
+                        Mode::Session
+                    } else {
+                        Mode::Home
+                    };
+                }
                 if let Some(i) = self.tile_of_plugin(plugin_id) {
                     if self.in_split() {
                         self.close_tile(i);
@@ -457,6 +472,13 @@ impl UiState {
             PluginSlot::Tile => {
                 self.plugin_page_origin = None;
                 self.release_plugin_page();
+                if plugin_id == "mao" && self.mode == Mode::Mao {
+                    self.mode = if self.selected.is_some() {
+                        Mode::Session
+                    } else {
+                        Mode::Home
+                    };
+                }
                 if self.active_plugin_drawer.as_deref() == Some(plugin_id) {
                     self.close_plugin_drawer();
                 }

@@ -1017,5 +1017,7 @@
   "Skipped review (no code changes)": "無程式碼變更 · 已跳過審查",
   "Review findings": "結構化審查問題",
   "Sync": "同步狀態",
-  "repos": "個倉庫"
+  "repos": "個倉庫",
+  "Optional extra guidance for rework…": "追加修改意見（可選，按 Enter 直接修復）…",
+  "Failed to start orchestration": "啟動智能編排失敗"
 }

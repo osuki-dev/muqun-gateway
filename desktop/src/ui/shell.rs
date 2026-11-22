@@ -102,10 +102,12 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
                     scale,
                     surface: crate::plugin::PluginSlot::Page,
                 };
-                s.plugins
+                let content = s
+                    .plugins
                     .get("mao")
-                    .and_then(|p| p.render_surface(&ctx, layer))
-                    .unwrap_or_else(|| super::orchestration::page_view(s, k, layer))
+                    .and_then(|p| crate::plugin::window::render(p.as_ref(), &ctx, layer))
+                    .unwrap_or_else(|| super::orchestration::page_view(s, k, layer));
+                super::card_stage("mao", content.fill(k.c.bg_base))
             }
             Mode::Settings => {
                 let ctx = crate::plugin::PluginViewContext {

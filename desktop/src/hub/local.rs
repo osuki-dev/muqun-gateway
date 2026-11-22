@@ -248,6 +248,24 @@ impl SessionHub for LocalHub {
         )
     }
 
+    fn warm_agent<'a>(
+        &'a self,
+        agent: &'a str,
+        cwd: Option<&'a str>,
+        auto_approve: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            if let Ok(manager) = self.manager_for_agent(agent).await {
+                let directory = directories::expand_directory_param(cwd);
+                let _ = manager
+                    .agent()
+                    .warm_session(directory.as_deref(), auto_approve)
+                    .await;
+            }
+            Ok(())
+        })
+    }
+
     fn create<'a>(&'a self, agent: &'a str, cwd: &'a Path) -> HubFuture<'a, AgentSessionInfo> {
         self.create_with_options(agent, cwd, None, None, false)
     }

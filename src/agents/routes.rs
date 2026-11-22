@@ -247,6 +247,13 @@ impl SwitchModelBody {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct WarmAgentBody {
+    pub directory: Option<String>,
+    #[serde(default)]
+    pub auto_approve: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CreateAgentSessionBody {
     pub directory: Option<String>,
     pub model: Option<ModelRef>,
@@ -364,6 +371,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             "/api/agents/{agent_id}/account-limits",
             get(get_account_limits),
         )
+        .route("/api/agents/{agent_id}/warm", post(warm_agent))
         .route(
             "/api/agent-sessions/{asid}/audio-asset",
             get(message_images::audio_asset),
@@ -683,6 +691,40 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
 // ---------------------------------------------------------------------------
 // Core implementation functions (pure OpenCode, zero herdr/tmux dependency)
 // ---------------------------------------------------------------------------
+
+async fn warm_agent(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<WarmAgentBody>>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let body = body.map(|Json(b)| b).unwrap_or(WarmAgentBody {
+        directory: None,
+        auto_approve: None,
+    });
+    let manager = agent_manager_or_err(&state, &agent_id).await?;
+    let auto_approve = body.auto_approve == Some(true);
+    refuse_remote_elevation(&state, &headers, auto_approve)?;
+    let dir = expand_directory_param(body.directory.as_deref()).and_then(|d| {
+        let p = std::path::Path::new(d.trim());
+        if p.is_absolute() {
+            std::fs::canonicalize(p)
+                .ok()
+                .filter(|c| c.is_dir())
+                .map(|c| c.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    });
+    tokio::spawn(async move {
+        let _ = manager
+            .agent()
+            .warm_session(dir.as_deref(), auto_approve)
+            .await;
+    });
+    Ok(Json(json!({ "ok": true })))
+}
 
 async fn get_account_limits(
     State(state): State<AppState>,

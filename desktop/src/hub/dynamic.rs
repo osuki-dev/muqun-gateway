@@ -235,6 +235,16 @@ impl SessionHub for DynamicHub {
         Box::pin(async move { active.directories(prefix).await })
     }
 
+    fn warm_agent<'a>(
+        &'a self,
+        agent: &'a str,
+        cwd: Option<&'a str>,
+        auto_approve: bool,
+    ) -> HubFuture<'a, ()> {
+        let active = self.active();
+        Box::pin(async move { active.warm_agent(agent, cwd, auto_approve).await })
+    }
+
     fn create<'a>(&'a self, agent: &'a str, cwd: &'a Path) -> HubFuture<'a, AgentSessionInfo> {
         let active = self.active();
         Box::pin(async move { active.create(agent, cwd).await })

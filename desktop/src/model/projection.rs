@@ -1133,6 +1133,18 @@ impl Core {
                     inbox.push(Update::Runtimes(statuses));
                 });
             }
+            Command::WarmAgent {
+                agent,
+                directory,
+                auto_approve,
+            } => {
+                let hub = self.hub.clone();
+                tokio::spawn(async move {
+                    let _ = hub
+                        .warm_agent(&agent, directory.as_deref(), auto_approve)
+                        .await;
+                });
+            }
             Command::MaoCaptureBaseline { run_id, cwd, goal } => {
                 let inbox = self.inbox.clone();
                 tokio::task::spawn_blocking(move || {

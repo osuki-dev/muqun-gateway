@@ -745,6 +745,32 @@ impl SessionHub for RemoteHub {
         })
     }
 
+    fn warm_agent<'a>(
+        &'a self,
+        agent: &'a str,
+        cwd: Option<&'a str>,
+        auto_approve: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let mut body = json!({});
+            if let Some(dir) = cwd {
+                body["directory"] = json!(dir);
+            }
+            if auto_approve {
+                body["auto_approve"] = json!(true);
+            }
+            let _ = self
+                .call(
+                    Method::POST,
+                    &["api", "agents", agent, "warm"],
+                    &[],
+                    Some(body),
+                )
+                .await;
+            Ok(())
+        })
+    }
+
     fn create<'a>(&'a self, agent: &'a str, cwd: &'a Path) -> HubFuture<'a, AgentSessionInfo> {
         self.create_with_options(agent, cwd, None, None, false)
     }
