@@ -3022,11 +3022,11 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
         .border(1.0, v_border)
         .child(text(verdict_label).font(k.ty.small_medium).color(v_ink));
 
-    let mut actions = row().gap(6.0).center_y().flex_wrap();
+    let mut left_actions = row().gap(6.0).center_y().flex_wrap();
     if rev_live.waiting_attention {
         if let Some(ref rev_id) = run.reviewer_asid {
             let target = rev_id.clone();
-            actions = actions.child(
+            left_actions = left_actions.child(
                 Button::new(format!(
                     "{} · {reviewer_name}",
                     tr_ref(language, "Waiting for approval")
@@ -3044,7 +3044,7 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
         && !run.coder_asid.starts_with("new-")
     {
         let target = run.coder_asid.clone();
-        actions = actions.child(
+        left_actions = left_actions.child(
             Button::new(format!(
                 "{} · {coder_name}",
                 tr_ref(language, "Waiting for approval")
@@ -3062,7 +3062,7 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
         let (adds, dels) = diff_totals(&run.files);
         let diff_target = run.coder_asid.clone();
         let files_count = run.files.len();
-        actions = actions.child(
+        left_actions = left_actions.child(
             row()
                 .key("mao-banner-files-chip")
                 .h(24.0)
@@ -3102,7 +3102,7 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
 
     if is_reviewer_view && !run.coder_asid.starts_with("new-") {
         let target = run.coder_asid.clone();
-        actions = actions.child(
+        left_actions = left_actions.child(
             Button::new(tr_ref(language, "Switch to coder"))
                 .variant(ButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
@@ -3112,57 +3112,28 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
         );
     } else if let Some(ref rev_asid) = run.reviewer_asid {
         if !rev_asid.starts_with("new-") {
-            let target = rev_asid.clone();
-            actions = actions.child(
+            let coder_parent = run.coder_asid.clone();
+            let rev_target = rev_asid.clone();
+            left_actions = left_actions.child(
                 Button::new(tr_ref(language, "Switch to reviewer"))
                     .variant(ButtonVariant::GhostMuted)
                     .control_size(ControlSize::Small)
-                    .on_press(move |s: &mut UiState| s.open_session(&target))
+                    .on_press(move |s: &mut UiState| {
+                        if !coder_parent.starts_with("new-") && coder_parent != rev_target {
+                            s.open_detail(&coder_parent, &rev_target);
+                        } else {
+                            s.open_session(&rev_target);
+                        }
+                    })
                     .build(k)
                     .key("mao-jump-reviewer"),
             );
         }
     }
 
-    match &run.phase {
-        MaoPhase::Coding { .. } | MaoPhase::Reviewing { .. } => {
-            let id = run.id.clone();
-            actions = actions.child(
-                Button::new(tr_ref(language, "Stop"))
-                    .variant(ButtonVariant::GhostMuted)
-                    .control_size(ControlSize::Small)
-                    .on_press(move |s: &mut UiState| cancel_run(s, &id))
-                    .build(k)
-                    .key("mao-banner-stop"),
-            );
-        }
-        MaoPhase::ChangesRequested { .. } => {
-            let id_rework = run.id.clone();
-            let id_approve = run.id.clone();
-            actions = actions
-                .child(
-                    Button::new(tr_ref(language, "Continue rework"))
-                        .variant(ButtonVariant::Neutral)
-                        .control_size(ControlSize::Small)
-                        .on_press(move |s: &mut UiState| continue_rework(s, &id_rework))
-                        .build(k)
-                        .key("mao-banner-rework"),
-                )
-                .child(
-                    Button::new(tr_ref(language, "Mark approved"))
-                        .variant(ButtonVariant::GhostMuted)
-                        .control_size(ControlSize::Small)
-                        .on_press(move |s: &mut UiState| mark_approved(s, &id_approve))
-                        .build(k)
-                        .key("mao-banner-approve"),
-                );
-        }
-        _ => {}
-    }
-
     let toggle_id = run.id.clone();
     let expanded = run.expanded;
-    actions = actions
+    left_actions = left_actions
         .child(
             Button::new(if expanded {
                 tr_ref(language, "Hide details")
@@ -3188,24 +3159,66 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
                 .key("mao-banner-window"),
         );
 
+    let mut right_actions = row().gap(6.0).center_y();
+    match &run.phase {
+        MaoPhase::Coding { .. } | MaoPhase::Reviewing { .. } => {
+            let id = run.id.clone();
+            right_actions = right_actions.child(
+                Button::new(tr_ref(language, "Stop"))
+                    .variant(ButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
+                    .on_press(move |s: &mut UiState| cancel_run(s, &id))
+                    .build(k)
+                    .key("mao-banner-stop"),
+            );
+        }
+        MaoPhase::ChangesRequested { .. } => {
+            let id_rework = run.id.clone();
+            let id_approve = run.id.clone();
+            right_actions = right_actions
+                .child(
+                    Button::new(tr_ref(language, "Mark approved"))
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut UiState| mark_approved(s, &id_approve))
+                        .build(k)
+                        .key("mao-banner-approve"),
+                )
+                .child(
+                    Button::new(tr_ref(language, "Continue rework"))
+                        .variant(ButtonVariant::Submit)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut UiState| continue_rework(s, &id_rework))
+                        .build(k)
+                        .key("mao-banner-rework"),
+                );
+        }
+        _ => {}
+    }
+
+    // Row 1: Full-width pipeline stepper so stages stay on one clean horizontal line.
     let pipeline = row()
+        .w_full()
         .gap(6.0)
         .center_y()
         .flex_wrap()
         .child(icon(&glyphs::WORKFLOW, 14.0).color(accent))
         .child(coder_stage)
-        .child(text("→").font(k.ty.small).color(k.c.text_faint))
+        .child(text("›").font(k.ty.small_medium).color(k.c.text_faint))
         .child(review_stage)
-        .child(text("→").font(k.ty.small).color(k.c.text_faint))
+        .child(text("›").font(k.ty.small_medium).color(k.c.text_faint))
         .child(verdict_chip);
 
-    let top = row()
+    // Row 3: Separated action footer bar (left: diff/inspect/window, right: primary CTA).
+    let action_bar = row()
         .w_full()
-        .gap(10.0)
+        .pt(6.0)
+        .gap(8.0)
         .center_y()
         .flex_wrap()
-        .child(pipeline.grow(1.0).min_w(0.0))
-        .child(actions);
+        .child(left_actions)
+        .child(el().grow(1.0))
+        .child(right_actions);
 
     let active_activity = if matches!(run.phase, MaoPhase::Reviewing { .. }) {
         format!(
@@ -3223,17 +3236,25 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
 
     let mut inner = col()
         .w_full()
-        .px(16.0)
-        .py(8.0)
+        .px(14.0)
+        .py(10.0)
         .gap(6.0)
         .fill(k.c.layer_01)
-        .child(top)
+        .child(pipeline)
         .child(
             text(active_activity)
                 .font(k.ty.small)
                 .color(k.c.text_muted)
+                .single_line()
                 .truncate(),
-        );
+        )
+        .child(
+            el().w_full()
+                .h(1.0)
+                .fill(k.c.border_weak.alpha(0.55))
+                .a11y_hidden(),
+        )
+        .child(action_bar);
 
     if run.expanded {
         let mut gates_row = row().w_full().gap(6.0).flex_wrap();
