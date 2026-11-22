@@ -1288,6 +1288,7 @@ impl Core {
             deliver,
             attachments,
             delivery,
+            auto_approve,
         } = command
         else {
             let resync = match &command {
@@ -1374,7 +1375,7 @@ impl Core {
                 }
             }
         };
-        if self.config.get().ui.mao.enabled {
+        if auto_approve {
             let shown = match self.hub.set_auto_approve(&asid, true).await {
                 Ok(now) => Some(now),
                 Err(_) => self.hub.auto_approve(&asid).await.ok(),
@@ -2481,6 +2482,7 @@ mod tests {
                         deliver: Deliver::Prompt("must not be sent".into()),
                         attachments: Vec::new(),
                         delivery: None,
+                        auto_approve: false,
                     }))
                     .await;
             })

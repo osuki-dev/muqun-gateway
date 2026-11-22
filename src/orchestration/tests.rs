@@ -327,13 +327,24 @@ async fn mao_pipeline_exposes_universal_deliverables_gates_and_control_actions()
     assert_eq!(created["quality_gates"].as_array().unwrap().len(), 4);
 
     let approve_path = format!("/api/orchestrations/{run_id}/approve");
+    let rework_path = format!("/api/orchestrations/{run_id}/rework");
+    let cancel_path = format!("/api/orchestrations/{run_id}/cancel");
+
+    for forbidden_path in [&approve_path, &rework_path, &cancel_path] {
+        let (status, _) = call(&state, "other-token", "POST", forbidden_path, Value::Null).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-owner must be forbidden on {forbidden_path}"
+        );
+    }
+
     let (status, approved) = call(&state, "token", "POST", &approve_path, Value::Null).await;
     assert_eq!(status, StatusCode::OK, "{approved}");
     assert_eq!(approved["accepted"], true);
     assert_eq!(approved["mao_phase"], "approved");
     assert_eq!(approved["phase"], "completed");
 
-    let cancel_path = format!("/api/orchestrations/{run_id}/cancel");
     let (status, cancelled) = call(&state, "token", "POST", &cancel_path, Value::Null).await;
     assert_eq!(status, StatusCode::OK, "{cancelled}");
     assert_eq!(cancelled["accepted"], false);
@@ -492,7 +503,7 @@ fn discovers_and_tracks_multiple_git_repositories_in_workspace() {
 fn extract_timeline_evidence_captures_mcp_and_tool_file_changes() {
     use crate::agents::domain::{AgentPart, ToolCall, ToolCallStatus, ToolTime};
 
-    let parts = vec![
+    let parts = [
         AgentPart::Tool(ToolCall {
             id: "tc-1".into(),
             name: "edit".into(),

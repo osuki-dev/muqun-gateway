@@ -138,6 +138,7 @@ pub fn submit_start(s: &mut UiState) {
         deliver,
         attachments,
         delivery: None,
+        auto_approve: s.cfg.ui.mao.enabled,
     }));
 }
 

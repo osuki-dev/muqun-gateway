@@ -281,8 +281,14 @@ async fn collect_deliverables(
                 .get_snapshot(&AgentSessionId(asid.to_string()))
                 .await
             {
-                let (tl_files, tl_summary) =
-                    super::extract_timeline_evidence(snapshot.timeline.iter().map(|i| &i.part));
+                let turn_start = snapshot
+                    .timeline
+                    .iter()
+                    .rposition(|item| item.role == TimelineRole::User)
+                    .map_or(0, |idx| idx + 1);
+                let (tl_files, tl_summary) = super::extract_timeline_evidence(
+                    snapshot.timeline[turn_start..].iter().map(|i| &i.part),
+                );
                 super::merge_changed_files(cwd, &mut files, tl_files);
                 timeline_evidence = tl_summary;
             }
@@ -608,10 +614,11 @@ async fn reconcile_pipeline(
                             let next_round = round + 1;
                             run.state.round = next_round;
                             run.state.mao_phase = "coding".into();
+                            let issues_block = format_findings_for_rework(&run.state.findings);
                             let rework_goal = format!(
                                 "[MAO Automated Rework · Round {next_round}/{}]\n\n\
                                  Reviewer ({}) requested changes for task:\n{}\n\n\
-                                 Review feedback:\n{excerpt}\n\n\
+                                 Review feedback:\n{excerpt}{issues_block}\n\n\
                                  Fix every raised issue, re-run verification checks, and summarize your changes.",
                                 run.state.max_rounds, rev_spec.agent, run.request.goal
                             );
@@ -1015,11 +1022,32 @@ struct ReworkBody {
     feedback: Option<String>,
 }
 
+fn format_findings_for_rework(findings: &[super::ReviewFinding]) -> String {
+    if findings.is_empty() {
+        return String::new();
+    }
+    let items = findings
+        .iter()
+        .take(16)
+        .map(|f| {
+            format!(
+                "- [{}] {} | {}",
+                f.severity.to_ascii_uppercase(),
+                f.location,
+                f.message
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("\n\nStructured findings to fix:\n{items}")
+}
+
 async fn load_run_for_action(
     state: &AppState,
     id: String,
+    caller: &str,
 ) -> Result<Run, (StatusCode, Json<Value>)> {
-    store::read(&state.db, id)
+    let run = store::read(&state.db, id)
         .await
         .map_err(internal)?
         .ok_or_else(|| {
@@ -1028,7 +1056,15 @@ async fn load_run_for_action(
                 "orchestration_not_found",
                 "Orchestration not found",
             )
-        })
+        })?;
+    if run.owner != caller && caller != crate::platform::local_client::DEVICE_ID {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "orchestration_forbidden",
+            "Only the device that created this orchestration can modify it",
+        ));
+    }
+    Ok(run)
 }
 
 async fn approve(
@@ -1036,8 +1072,8 @@ async fn approve(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    require_device(&state, &headers)?;
-    let mut run = load_run_for_action(&state, id).await?;
+    let owner = require_device(&state, &headers)?;
+    let mut run = load_run_for_action(&state, id, &owner).await?;
     run.state.accepted = true;
     run.state.mao_phase = "approved".into();
     run.state.verdict = Some("approved".into());
@@ -1061,10 +1097,10 @@ async fn rework(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    body: Option<Json<ReworkBody>>,
+    body: Option<Json<Option<ReworkBody>>>,
 ) -> ApiResult<Json<Value>> {
     let owner = require_device(&state, &headers)?;
-    let mut run = load_run_for_action(&state, id).await?;
+    let mut run = load_run_for_action(&state, id, &owner).await?;
     let next_round = run.state.round.saturating_add(1);
     if next_round > run.state.max_rounds {
         run.state.max_rounds = next_round;
@@ -1074,11 +1110,13 @@ async fn rework(
     run.state.accepted = false;
 
     let feedback = body
-        .and_then(|Json(b)| b.feedback)
+        .and_then(|Json(b)| b)
+        .and_then(|b| b.feedback)
         .or_else(|| run.state.review_summary.clone())
         .unwrap_or_else(|| "Continue improving based on review findings.".into());
+    let issues_block = format_findings_for_rework(&run.state.findings);
     let rework_goal = format!(
-        "[MAO Manual Rework · Round {next_round}/{}]\n\nGoal:\n{}\n\nFeedback:\n{feedback}",
+        "[MAO Manual Rework · Round {next_round}/{}]\n\nGoal:\n{}\n\nFeedback:\n{feedback}{issues_block}",
         run.state.max_rounds, run.request.goal
     );
     let by = Requested {
@@ -1145,7 +1183,7 @@ async fn cancel(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let owner = require_device(&state, &headers)?;
-    let mut run = load_run_for_action(&state, id).await?;
+    let mut run = load_run_for_action(&state, id, &owner).await?;
     run.state.mao_phase = "cancelled".into();
     run.state.accepted = false;
     for step in &mut run.state.steps {

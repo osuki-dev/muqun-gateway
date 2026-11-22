@@ -1001,8 +1001,6 @@ pub fn on_session_submitted(s: &mut UiState, asid: &str, prompt: &str) {
         return;
     }
 
-    s.auto_approve.insert(asid.to_string(), true);
-
     let now = now_ms();
     let lang = s.cfg.general.language;
     if let Some(existing) = s
@@ -1406,10 +1404,12 @@ pub fn on_session_status(s: &mut UiState, asid: &str, status: AgentSessionStatus
                                 run.max_rounds,
                                 &reviewer_name,
                                 &feedback,
+                                &run.findings,
                             );
                             let echo = format!(
-                                "[MAO · Review Round {round} Feedback from {reviewer_name}]\n\n{}",
-                                concise_excerpt(&feedback, 900)
+                                "[MAO · Review Round {round} Feedback from {reviewer_name}]\n\n{}{}",
+                                concise_excerpt(&feedback, 600),
+                                format_findings_block(&run.findings)
                             );
                             outcomes.push(ReviewerOutcome::Rework {
                                 coder_asid: run.coder_asid.clone(),
@@ -1525,6 +1525,7 @@ pub fn on_session_status(s: &mut UiState, asid: &str, status: AgentSessionStatus
                     deliver: Deliver::Prompt(prompt),
                     attachments: Vec::new(),
                     delivery: None,
+                    auto_approve: true,
                 }));
                 if let Some(rev_id) = switching_from_reviewer {
                     s.open_session(&coder_asid);
@@ -1585,8 +1586,13 @@ pub fn on_review_ready(
         .collect();
     muqun_gateway::orchestration::merge_changed_files(&run_cwd_lookup, &mut merged, incoming_files);
     if let Some(tl) = s.timelines.get(&coder_id_lookup) {
+        let turn_start = tl
+            .items
+            .iter()
+            .rposition(|item| item.role == TimelineRole::User)
+            .map_or(0, |idx| idx + 1);
         let (tl_files, tl_evidence) = muqun_gateway::orchestration::extract_timeline_evidence(
-            tl.items.iter().map(|i| &i.part),
+            tl.items[turn_start..].iter().map(|i| &i.part),
         );
         muqun_gateway::orchestration::merge_changed_files(&run_cwd_lookup, &mut merged, tl_files);
         if !tl_evidence.trim().is_empty()
@@ -1793,6 +1799,7 @@ pub fn on_review_ready(
             deliver: Deliver::Prompt(prompt),
             attachments: Vec::new(),
             delivery: None,
+            auto_approve: true,
         }));
         if s.mode == Mode::Session && !coder_asid.starts_with("new-") && coder_asid != rev_asid {
             s.open_detail(&coder_asid, &rev_asid);
@@ -1810,6 +1817,7 @@ pub fn on_review_ready(
             deliver: Deliver::Prompt(prompt),
             attachments: Vec::new(),
             delivery: None,
+            auto_approve: true,
         }));
     }
     s.sync_watch();
@@ -1868,17 +1876,39 @@ fn build_review_prompt(
     )
 }
 
+fn format_findings_block(findings: &[MaoFinding]) -> String {
+    if findings.is_empty() {
+        return String::new();
+    }
+    let items = findings
+        .iter()
+        .take(16)
+        .map(|f| {
+            format!(
+                "- [{}] {} | {}",
+                f.severity.to_ascii_uppercase(),
+                f.location,
+                f.message
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("\n\nStructured findings to fix:\n{items}")
+}
+
 fn build_rework_prompt(
     goal: &str,
     round: u8,
     max_rounds: u8,
     reviewer_name: &str,
     feedback: &str,
+    findings: &[MaoFinding],
 ) -> String {
+    let issues_block = format_findings_block(findings);
     format!(
         "[MAO Automated Rework · Round {round}/{max_rounds}]\n\n\
          Code Reviewer ({reviewer_name}) requested the following changes for task:\n{goal}\n\n\
-         Review feedback:\n{feedback}\n\n\
+         Review feedback:\n{feedback}{issues_block}\n\n\
          Please address every issue raised above, re-run verification/tests to confirm they pass, and summarize the fixes."
     )
 }
@@ -1921,10 +1951,12 @@ pub fn continue_rework(s: &mut UiState, run_id: &str) {
             run.max_rounds,
             &reviewer_name,
             &feedback,
+            &run.findings,
         );
         let echo = format!(
-            "[MAO · Manual Rework Round {next_round}]\n\n{}",
-            concise_excerpt(&feedback, 900)
+            "[MAO · Manual Rework Round {next_round}]\n\n{}{}",
+            concise_excerpt(&feedback, 600),
+            format_findings_block(&run.findings)
         );
         Some((
             run.coder_asid.clone(),
@@ -1946,6 +1978,7 @@ pub fn continue_rework(s: &mut UiState, run_id: &str) {
         deliver: Deliver::Prompt(prompt),
         attachments: Vec::new(),
         delivery: None,
+        auto_approve: true,
     }));
     s.notify(
         ToastLevel::Info,

@@ -357,6 +357,7 @@ fn send_session(s: &mut UiState, queue: bool) {
     }
     s.record_prompt_history(&text);
     let busy = s.busy();
+    let was_mao_session = s.orchestration.is_tracked(&asid);
     if !busy {
         super::orchestration::on_session_submitted(s, &asid, &text);
     }
@@ -384,6 +385,7 @@ fn send_session(s: &mut UiState, queue: bool) {
         deliver,
         attachments,
         delivery: delivery.map(super::echo::BusyDelivery::wire),
+        auto_approve: !busy && s.cfg.ui.mao.enabled && was_mao_session,
     }));
 }
 

@@ -353,6 +353,7 @@ impl UiState {
             deliver: Deliver::Prompt(text),
             attachments: files,
             delivery,
+            auto_approve: false,
         }));
     }
 

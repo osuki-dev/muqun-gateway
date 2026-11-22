@@ -304,6 +304,9 @@ pub enum ComposeCommand {
         attachments: Vec<String>,
         /// `queue` when the agent is busy, else the agent's default.
         delivery: Option<String>,
+        /// Only enabled for explicit Smart Orchestration sessions so ordinary
+        /// user sessions are never silently elevated into bypass mode.
+        auto_approve: bool,
     },
     SwitchModel {
         asid: AgentSessionId,
