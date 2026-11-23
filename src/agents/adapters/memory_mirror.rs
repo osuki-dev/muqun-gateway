@@ -46,6 +46,29 @@ struct PendingOrigin {
     at: u64,
 }
 
+fn inbox_item_text(item: &serde_json::Value) -> Option<&str> {
+    if let Some(payload) = item.get("payload") {
+        if let Some(s) = payload.as_str() {
+            return Some(s);
+        }
+        if let Some(obj) = payload.as_object() {
+            for key in ["text", "prompt", "message", "content"] {
+                if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+                    return Some(s);
+                }
+            }
+            if let Some(parts) = obj.get("parts").and_then(|v| v.as_array()) {
+                for part in parts {
+                    if let Some(s) = part.get("text").and_then(|v| v.as_str()) {
+                        return Some(s);
+                    }
+                }
+            }
+        }
+    }
+    item.get("text").and_then(|v| v.as_str())
+}
+
 pub(crate) fn inbox_contains_prompt(
     items: &[serde_json::Value],
     text: &str,
@@ -58,9 +81,7 @@ pub(crate) fn inbox_contains_prompt(
                 return true;
             }
         }
-        item.get("text")
-            .and_then(|v| v.as_str())
-            .is_some_and(|t| prompt_digest(t) == digest)
+        inbox_item_text(item).is_some_and(|t| prompt_digest(t) == digest)
     })
 }
 
@@ -3821,13 +3842,34 @@ mod tests {
                 &asid,
                 vec![serde_json::json!({
                     "id": "inbox_123",
-                    "text": format!("{queued_text}\n\nAttached files (on this host):\n- /tmp/a.jpg\n"),
+                    "sessionID": asid.0,
+                    "type": "user",
+                    "payload": {
+                        "text": format!("{queued_text}\n\nAttached files (on this host):\n- /tmp/a.jpg\n"),
+                    },
                     "delivery": "steer",
                 })],
             )
             .await;
 
         assert!(mirror.has_queued_prompt(&asid, queued_text, None).await);
+        // Also verify OpenCode `payload.parts` and string `payload` shapes.
+        assert!(inbox_contains_prompt(
+            &[serde_json::json!({
+                "id": "inbox_parts",
+                "payload": { "parts": [{ "type": "text", "text": queued_text }] },
+            })],
+            queued_text,
+            None,
+        ));
+        assert!(inbox_contains_prompt(
+            &[serde_json::json!({
+                "id": "inbox_str",
+                "payload": queued_text,
+            })],
+            queued_text,
+            None,
+        ));
         mirror
             .record_queued_origin(&asid, queued_text, pixel())
             .await;

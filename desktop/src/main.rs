@@ -144,6 +144,9 @@ fn main() -> anyhow::Result<()> {
         )?;
     }
     commands::send(&tx, Command::Refresh);
+    if !tooling {
+        commands::send(&tx, Command::CheckDesktopUpdate);
+    }
     let _ = theme::install(&config_dir, &state_dir, &config.appearance);
 
     let mut ui_config = config.clone();

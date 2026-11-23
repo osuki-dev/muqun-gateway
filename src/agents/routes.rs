@@ -1577,14 +1577,24 @@ async fn do_send_agent_prompt(
     let mut queued_in_inbox = manager
         .mirror()
         .has_queued_prompt(&asid_id, &body.text, native_message_id.as_deref())
-        .await;
+        .await
+        || (text != body.text
+            && manager
+                .mirror()
+                .has_queued_prompt(&asid_id, &text, native_message_id.as_deref())
+                .await);
     if !queued_in_inbox && body.delivery.is_some() {
         if let Ok(live_inbox) = manager.agent().get_inbox(asid).await {
             queued_in_inbox = super::adapters::memory_mirror::inbox_contains_prompt(
                 &live_inbox,
                 &body.text,
                 native_message_id.as_deref(),
-            );
+            ) || (text != body.text
+                && super::adapters::memory_mirror::inbox_contains_prompt(
+                    &live_inbox,
+                    &text,
+                    native_message_id.as_deref(),
+                ));
         }
     }
     if queued_in_inbox {

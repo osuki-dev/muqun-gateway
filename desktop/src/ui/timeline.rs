@@ -211,6 +211,10 @@ impl SessionTimeline {
         self.inbox_ids.contains(id)
     }
 
+    pub(super) fn inbox_ids_snapshot(&self) -> HashSet<String> {
+        self.inbox_ids.clone()
+    }
+
     fn restore_sent_images(&self, item: &mut TimelineItem) {
         if item.role == TimelineRole::User && item.attachments.as_ref().is_none_or(Vec::is_empty) {
             if let Some(paths) = self.sent_images.get(&item.id) {

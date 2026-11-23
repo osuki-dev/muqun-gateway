@@ -72,6 +72,12 @@ fn words(text: &str) -> &str {
     let body = body
         .split_once("\n\nYou were started for a Muqun task:")
         .map_or(body, |(head, _)| head.trim());
+    let body = body
+        .split_once("\n\nLead Advisor mode — ")
+        .map_or(body, |(head, _)| head.trim());
+    let body = body
+        .split_once("\n\nAvailable agents in your pool:")
+        .map_or(body, |(head, _)| head.trim());
     if body.starts_with("Implement and verify the user goal carefully.") {
         if let Some((_, goal)) = body.rsplit_once("\nUser goal:\n") {
             return goal.trim();
@@ -145,6 +151,7 @@ fn reconcile(
     echoes: &mut Vec<Echo>,
     rows: &mut [TimelineItem],
     sent_images: &mut HashMap<String, Vec<String>>,
+    holds_inbox: impl Fn(&str) -> bool,
 ) -> bool {
     let before = echoes.len();
     let len = rows.len();
@@ -155,21 +162,21 @@ fn reconcile(
             continue;
         };
         let Some(at) = echoes.iter().position(|e| {
+            let content_matches = || {
+                e.says(&said)
+                    && row.attachments.as_ref().is_none_or(|files| {
+                        files.is_empty()
+                            || e.files.is_empty()
+                            || (files.len() == e.files.len()
+                                && e.files.iter().zip(files).all(|(staged, received)| {
+                                    same_attachment(asid, staged, received)
+                                }))
+                    })
+            };
             e.state != EchoState::Failed
-                && e.inbox_id.as_ref().map_or_else(
-                    || {
-                        e.says(&said)
-                            && row.attachments.as_ref().is_none_or(|files| {
-                                files.is_empty()
-                                    || e.files.is_empty()
-                                    || (files.len() == e.files.len()
-                                        && e.files.iter().zip(files).all(|(staged, received)| {
-                                            same_attachment(asid, staged, received)
-                                        }))
-                            })
-                    },
-                    |id| id == &row.message_id,
-                )
+                && e.inbox_id.as_ref().map_or_else(content_matches, |id| {
+                    id == &row.message_id || (!holds_inbox(id) && content_matches())
+                })
                 && !e.known.contains(&row.id)
                 && !e.known.contains(&row.message_id)
         }) else {
@@ -326,7 +333,10 @@ impl UiState {
         else {
             return;
         };
-        if reconcile(asid, echoes, &mut tl.items, &mut tl.sent_images) {
+        let inbox_ids = tl.inbox_ids_snapshot();
+        if reconcile(asid, echoes, &mut tl.items, &mut tl.sent_images, |id| {
+            inbox_ids.contains(id)
+        }) {
             tl.regroup();
             self.echo_rev += 1;
         }
@@ -532,18 +542,42 @@ mod tests {
             echo(2, "run the tests", &rows),
         ];
         // Re-reading what was already there (a snapshot) claims nothing.
-        assert!(!reconcile("s", &mut echoes, &mut rows, &mut HashMap::new()));
+        assert!(!reconcile(
+            "s",
+            &mut echoes,
+            &mut rows,
+            &mut HashMap::new(),
+            |_| false
+        ));
         // The first send's row arrives, its file list appended by the gateway.
         rows.push(user(
             "u1",
             "run the tests\n\nAttached files (on this host):\n- /up/a.png",
         ));
-        assert!(reconcile("s", &mut echoes, &mut rows, &mut HashMap::new()));
+        assert!(reconcile(
+            "s",
+            &mut echoes,
+            &mut rows,
+            &mut HashMap::new(),
+            |_| false
+        ));
         assert_eq!(echoes.iter().map(|e| e.token).collect::<Vec<_>>(), [2]);
         // The same rows again (a later snapshot) leave the second echo be.
-        assert!(!reconcile("s", &mut echoes, &mut rows, &mut HashMap::new()));
+        assert!(!reconcile(
+            "s",
+            &mut echoes,
+            &mut rows,
+            &mut HashMap::new(),
+            |_| false
+        ));
         rows.push(user("u2", "run the tests"));
-        assert!(reconcile("s", &mut echoes, &mut rows, &mut HashMap::new()));
+        assert!(reconcile(
+            "s",
+            &mut echoes,
+            &mut rows,
+            &mut HashMap::new(),
+            |_| false
+        ));
         assert!(echoes.is_empty());
     }
 
@@ -569,11 +603,16 @@ mod tests {
             "other-session",
             &mut echoes,
             &mut rows,
-            &mut images
+            &mut images,
+            |_| false
         ));
-        assert!(reconcile("s", &mut echoes, &mut rows, &mut images));
+        assert!(reconcile("s", &mut echoes, &mut rows, &mut images, |_| {
+            false
+        }));
         assert_eq!(echoes.iter().map(|e| e.token).collect::<Vec<_>>(), [1]);
-        assert!(!reconcile("s", &mut echoes, &mut rows, &mut images));
+        assert!(!reconcile("s", &mut echoes, &mut rows, &mut images, |_| {
+            false
+        }));
     }
 
     #[test]
@@ -774,5 +813,64 @@ mod tests {
         );
         assert_eq!(s.echoes_of(id)[0].delivery, Some(BusyDelivery::Steer));
         assert_eq!(s.echoes_of(id)[0].inbox_id.as_deref(), Some("inbox_99"));
+    }
+
+    #[test]
+    fn acp_delivered_queue_echo_and_mao_advisor_hint_reconcile_without_duplicates() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let id = "s-acp";
+        s.timelines.entry(id.into()).or_default().replace(vec![]);
+
+        // 1. Queued prompt adopted under `inbox_77`, then delivered by ACP under a fresh `acp-submission` id.
+        s.echo_sent(
+            id,
+            10,
+            "check duplicate".into(),
+            &[],
+            Some(BusyDelivery::Queue),
+        );
+        s.timelines.get_mut(id).unwrap().apply_inbox(
+            &[crate::model::compose::InboxItem {
+                id: "inbox_77".into(),
+                text: "check duplicate".into(),
+                steer: false,
+                files: vec![],
+            }],
+            1,
+        );
+        s.echo_inbox(
+            id,
+            &[crate::model::compose::InboxItem {
+                id: "inbox_77".into(),
+                text: "check duplicate".into(),
+                steer: false,
+                files: vec![],
+            }],
+        );
+        assert_eq!(s.pending_queue_echoes(id).count(), 0);
+        // Delivery removes item from inbox and inserts an ACP submission row with a different message_id.
+        s.timelines.get_mut(id).unwrap().apply_inbox(&[], 2);
+        s.timelines
+            .get_mut(id)
+            .unwrap()
+            .upsert(vec![user("00000003:acp-submission:abc", "check duplicate")]);
+        s.echo_rows(id);
+        assert!(
+            s.echoes_of(id).is_empty(),
+            "delivered ACP queued echo must reconcile once inbox receipt clears"
+        );
+
+        // 2. MAO Lead Advisor hint appended to user prompt must reconcile against the original echo.
+        s.echo_sent(id, 11, "refactor router".into(), &[], None);
+        s.timelines.get_mut(id).unwrap().upsert(vec![user(
+            "00000004:acp-submission:def",
+            "refactor router\n\nLead Advisor mode — Live healthy agents: [claude, codex].",
+        )]);
+        s.echo_rows(id);
+        assert!(
+            s.echoes_of(id).is_empty(),
+            "MAO advisor hint suffix must not leave duplicate echo bubble"
+        );
     }
 }
