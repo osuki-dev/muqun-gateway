@@ -1159,8 +1159,109 @@ pub(super) async fn reconcile_smart_pipeline(
                 }
                 TaskState::Failed => {
                     let reason = task_failure_reason(&rt);
-                    run.state.mao_phase = "failed".into();
-                    run.state.review_summary = Some(reason);
+                    let current_rev = run
+                        .effective_reviewer()
+                        .unwrap_or_else(|| run.effective_coder());
+                    let mut failed_over = false;
+                    if run.auto_failover_enabled() && run.state.failover_count < 6 {
+                        mark_candidate_exhausted(
+                            &mut run.state.exhausted_candidates,
+                            &current_rev,
+                            true,
+                        );
+                        let pool = effective_failover_pool(run);
+                        let coder_agent = run.effective_coder().agent;
+                        if let Some(next_rev) = select_fallback_candidate(
+                            state,
+                            &pool,
+                            &run.state.exhausted_candidates,
+                            Some(&coder_agent),
+                            false,
+                        )
+                        .await
+                        {
+                            let prev_label = candidate_display(&current_rev);
+                            let next_label = candidate_display(&next_rev);
+                            if let Some(step) = run
+                                .state
+                                .steps
+                                .iter_mut()
+                                .rev()
+                                .find(|s| s.kind == "review" && s.status == "running")
+                            {
+                                step.status = "warning".into();
+                                step.detail = concise_excerpt(
+                                    &format!(
+                                        "Reviewer failed ({reason}); switching to {next_label}"
+                                    ),
+                                    220,
+                                );
+                            }
+                            run.state.failover_count = run.state.failover_count.saturating_add(1);
+                            run.state.active_reviewer = Some(next_rev.clone());
+                            run.state.reviewer_asid = None;
+                            if let Some(ref mut p) = run.state.plan {
+                                p.reviewer = Some(next_rev.clone());
+                            }
+                            run.state.steps.push(PipelineStep {
+                                kind: "failover".into(),
+                                round: run.state.round,
+                                title: format!(
+                                    "Auto-switched Reviewer: {prev_label} → {next_label}"
+                                ),
+                                detail: concise_excerpt(&reason, 220),
+                                status: "warning".into(),
+                                asid: None,
+                                task_id: None,
+                                time_ms: now,
+                            });
+                            let (files, diff_summary) = super::collect_local_repos_diff_since(
+                                &run.request.cwd,
+                                &run.request.goal,
+                                &run.state.base_commits,
+                                &run.state.base_worktree_fingerprints,
+                                run.state.base_commit.as_deref(),
+                            );
+                            if !files.is_empty() {
+                                run.state.files = files;
+                            }
+                            dispatch_smart_reviewer(
+                                state,
+                                run,
+                                tasks,
+                                root,
+                                &run.request.cwd.clone(),
+                                &diff_summary,
+                            )
+                            .await?;
+                            failed_over = true;
+                        }
+                    }
+                    if !failed_over {
+                        if let Some(step) = run
+                            .state
+                            .steps
+                            .iter_mut()
+                            .rev()
+                            .find(|s| s.kind == "review" && s.status == "running")
+                        {
+                            step.status = "failed".into();
+                            step.detail = concise_excerpt(
+                                if reason.is_empty() {
+                                    "Reviewer task failed"
+                                } else {
+                                    &reason
+                                },
+                                220,
+                            );
+                        }
+                        run.state.mao_phase = "failed".into();
+                        run.state.review_summary = Some(if reason.is_empty() {
+                            "Reviewer task failed".into()
+                        } else {
+                            reason
+                        });
+                    }
                     dirty = true;
                 }
                 TaskState::Cancelled => {
@@ -1399,7 +1500,15 @@ async fn dispatch_smart_reviewer(
         name: None,
         server_id: None,
     };
-    let client_ref = format!("{}:review:{round}", run.task_ref());
+    let client_ref = if run.state.failover_count > 0 {
+        format!(
+            "{}:review:{round}:fo:{}",
+            run.task_ref(),
+            run.state.failover_count
+        )
+    } else {
+        format!("{}:review:{round}", run.task_ref())
+    };
     let delegated = state
         .tasks
         .delegate_in_session(

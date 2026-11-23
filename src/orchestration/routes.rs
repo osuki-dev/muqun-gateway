@@ -48,12 +48,38 @@ async fn list(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Js
     Ok(Json(json!({"runs": runs})))
 }
 
+fn reconcile_lock(run_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.len() > 256 {
+        guard.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+    guard
+        .entry(run_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 async fn reconcile_active_runs(state: &AppState, runs: &mut [Run]) {
     for run in runs {
         if matches!(
             run.state.mao_phase.as_str(),
             "analyzing" | "executing" | "integrating" | "coding" | "reviewing"
         ) {
+            let lock = reconcile_lock(&run.id);
+            let _guard = lock.lock().await;
+            if let Ok(Some(fresh)) = store::read(&state.db, run.id.clone()).await {
+                *run = fresh;
+            }
+            if !matches!(
+                run.state.mao_phase.as_str(),
+                "analyzing" | "executing" | "integrating" | "coding" | "reviewing"
+            ) {
+                continue;
+            }
             if let Ok(recovered) = store::recover(&state.db, run.clone()).await {
                 *run = recovered;
             }
@@ -1621,12 +1647,19 @@ async fn view(state: &AppState, run: Run) -> ApiResult<Json<Value>> {
             "accepted": false
         })));
     };
+    let lock = reconcile_lock(&run.id);
+    let _guard = lock.lock().await;
+    if let Ok(Some(fresh)) = store::read(&state.db, run.id.clone()).await {
+        run = fresh;
+    }
+    let root = run.task_id.clone().unwrap_or(root);
     let mut tasks = state
         .tasks
         .tree(&TaskId(root.clone()), None, 1000)
         .await
         .map_err(internal)?;
     reconcile_pipeline(state, &mut run, &mut tasks, &root).await?;
+    drop(_guard);
     let eff_coder = run.effective_coder();
     let eff_reviewer = run.effective_reviewer();
 
@@ -2114,10 +2147,13 @@ async fn execute_plan(
     body: Option<Json<Option<ExecutePlanBody>>>,
 ) -> ApiResult<Json<Value>> {
     let owner = require_device(&state, &headers)?;
+    let lock = reconcile_lock(&id);
+    let guard = lock.lock().await;
     let mut run = load_run_for_action(&state, id, &owner).await?;
     let req_body = body.and_then(|Json(b)| b).unwrap_or_default();
     super::dag::execute_plan_action(&state, &mut run, req_body.overrides, req_body.use_worktrees)
         .await?;
+    drop(guard);
     view(&state, run).await
 }
 
