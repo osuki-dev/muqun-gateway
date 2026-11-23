@@ -200,9 +200,18 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
         let current = s.current_computer() == id && saved;
         let target_id = id.clone();
         let action = if current {
-            text(tr_ref(lang, "Current"))
-                .font(k.ty.small_medium)
-                .color(k.c.text_muted)
+            rune::row()
+                .key("current-badge")
+                .px(8.0)
+                .py(3.0)
+                .radius(k.radius.sm)
+                .fill(k.c.bg_accent.alpha(0.18))
+                .border(1.0, k.c.bg_accent.alpha(0.45))
+                .child(
+                    text(tr_ref(lang, "Current"))
+                        .font(k.ty.small_medium)
+                        .color(k.c.text_accent),
+                )
         } else if saved {
             button(tr_ref(lang, "Switch computer"))
                 .on_press(move |s: &mut UiState| s.switch_computer(target_id.clone()))

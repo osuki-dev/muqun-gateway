@@ -60,6 +60,11 @@ fn hero(s: &UiState, k: &Kit) -> El {
         .w_full()
         .gap(18.0)
         .center_y()
+        .px(20.0)
+        .py(18.0)
+        .radius(k.radius.lg)
+        .fill(k.c.layer_01.alpha(0.65))
+        .border(1.0, k.c.border_weak.alpha(0.5))
         .child(look.glow(mark, k.c.bg_accent, 0.5).a11y_hidden())
         .child(
             col()

@@ -135,13 +135,44 @@ fn head(s: &UiState, k: &Kit, id: &str, standing: Standing, version: Option<&str
         .center()
         .child(crate::ui::agents::mark(id, 18.0, s.dark))
         .a11y_hidden();
-    let mut meta = hrow().key("meta").gap(8.0).center_y().child(
-        text(standing.word(language))
-            .font(k.ty.small)
-            .color(k.c.text_muted),
-    );
+    let (dot_color, standing_color) = match standing {
+        Standing::Usable => (k.c.success.icon, k.c.text_base),
+        Standing::NeedsSetup | Standing::NeedsUpdate | Standing::Checking => {
+            (k.c.bg_accent, k.c.text_base)
+        }
+        _ => (k.c.text_muted.alpha(0.6), k.c.text_muted),
+    };
+    let standing_pill = hrow()
+        .key("standing-pill")
+        .gap(6.0)
+        .px(8.0)
+        .py(2.0)
+        .radius(k.radius.sm)
+        .fill(k.c.layer_02)
+        .border(1.0, k.c.border_weak.alpha(0.5))
+        .center_y()
+        .child(
+            el().size(6.0, 6.0)
+                .radius(3.0)
+                .fill(dot_color)
+                .a11y_hidden(),
+        )
+        .child(
+            text(standing.word(language))
+                .font(k.ty.small)
+                .color(standing_color),
+        );
+    let mut meta = hrow().key("meta").gap(8.0).center_y().child(standing_pill);
     if let Some(v) = version {
-        meta = meta.child(text(format!("v{v}")).font(k.ty.small).color(k.c.text_faint));
+        meta = meta.child(
+            hrow()
+                .key("version-pill")
+                .px(6.0)
+                .py(2.0)
+                .radius(k.radius.sm)
+                .fill(k.c.layer_02.alpha(0.6))
+                .child(text(format!("v{v}")).font(k.ty.small).color(k.c.text_muted)),
+        );
     }
     let toggle_id = id.to_string();
     hrow()
@@ -319,10 +350,22 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                     .key(format!("agent-{}", a.id))
                     .w_full()
                     .gap(12.0)
-                    .px(16.0)
+                    .px(18.0)
                     .py(16.0)
                     .radius(k.radius.lg)
-                    .fill(k.c.layer_01.alpha(0.3))
+                    .fill(if enabled {
+                        k.c.layer_01.alpha(0.65)
+                    } else {
+                        k.c.layer_01.alpha(0.35)
+                    })
+                    .border(
+                        1.0,
+                        if enabled {
+                            k.c.border_weak.alpha(0.6)
+                        } else {
+                            k.c.border_weak.alpha(0.35)
+                        },
+                    )
                     .child(head(s, k, &a.id, standing, a.version.as_deref()))
                     .children(rows);
                 if enabled {

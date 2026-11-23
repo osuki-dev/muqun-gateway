@@ -253,8 +253,8 @@ pub(super) fn group_head(k: &Kit, title: &str, trailing: Option<El>) -> El {
         .center_y()
         .child(
             text(title.to_string())
-                .font(k.ty.small_medium)
-                .color(k.c.text_muted)
+                .font(k.ty.ui_medium)
+                .color(k.c.text_base)
                 .grow(1.0)
                 .shrink()
                 .min_w(0.0)
@@ -275,6 +275,11 @@ pub(super) fn group_with(k: &Kit, key: &str, head: El, rows: Vec<El>) -> El {
     col()
         .key(key.to_string())
         .w_full()
+        .px(18.0)
+        .py(16.0)
+        .radius(k.radius.lg)
+        .fill(k.c.layer_01.alpha(0.65))
+        .border(1.0, k.c.border_weak.alpha(0.5))
         .child(head.pb(8.0))
         .child(hairline(k, 0))
         .child(body)
@@ -284,7 +289,7 @@ fn hairline(k: &Kit, i: usize) -> El {
     el().key(format!("rule-{i}"))
         .w_full()
         .h(1.0)
-        .fill(k.c.border_weak)
+        .fill(k.c.border_weak.alpha(0.35))
         .a11y_hidden()
 }
 
@@ -699,11 +704,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .px(PAD_X)
         .pt(14.0)
         .pb(56.0)
-        .gap(if tab == SettingsTab::Agents {
-            16.0
-        } else {
-            40.0
-        });
+        .gap(16.0);
     for (i, child) in body.into_iter().enumerate() {
         page = page.child(look.arrive(child, i.min(4)));
     }

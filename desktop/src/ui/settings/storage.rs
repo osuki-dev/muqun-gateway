@@ -85,7 +85,12 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
     let summary = col()
         .key("storage-summary")
         .w_full()
-        .gap(12.0)
+        .gap(14.0)
+        .px(20.0)
+        .py(18.0)
+        .radius(k.radius.lg)
+        .fill(k.c.layer_01.alpha(0.65))
+        .border(1.0, k.c.border_weak.alpha(0.5))
         .child(
             hrow()
                 .key("storage-total")
