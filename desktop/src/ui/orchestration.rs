@@ -40,7 +40,10 @@ pub struct MaoRole {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MaoPhase {
+    Analyzing,
+    PlanReady,
     Coding { round: u8 },
+    Integrating,
     Reviewing { round: u8 },
     Approved { round: u8, summary: String },
     ChangesRequested { round: u8, feedback: String },
@@ -50,7 +53,9 @@ pub enum MaoPhase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MaoStepKind {
+    Plan,
     Coding,
+    Integrate,
     Review,
     Rework,
     Verdict,
@@ -118,6 +123,36 @@ pub struct MaoFinding {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct MaoPlannedTask {
+    pub id: String,
+    pub title: String,
+    pub goal: String,
+    pub agent: String,
+    pub model: Option<String>,
+    pub reason: String,
+    pub depends_on: Vec<String>,
+    pub owns_paths: Vec<String>,
+    pub read_only: bool,
+    pub use_worktree: bool,
+    pub status: String,
+    pub asid: Option<String>,
+    pub worktree_branch: Option<String>,
+    pub summary: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct MaoPlan {
+    pub complexity: String,
+    pub analysis: String,
+    pub tasks: Vec<MaoPlannedTask>,
+    pub verify_commands: Vec<String>,
+    pub reviewer_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct MaoRun {
@@ -144,6 +179,7 @@ pub struct MaoRun {
     pub review_summary: String,
     pub findings: Vec<MaoFinding>,
     pub steps: Vec<MaoStep>,
+    pub plan: Option<MaoPlan>,
     pub expanded: bool,
     pub created_ms: u64,
     pub updated_ms: u64,
@@ -183,6 +219,7 @@ impl Default for MaoRun {
             review_summary: String::new(),
             findings: Vec::new(),
             steps: Vec::new(),
+            plan: None,
             expanded: false,
             created_ms: 0,
             updated_ms: 0,
@@ -194,14 +231,17 @@ impl MaoRun {
     pub fn is_active(&self) -> bool {
         matches!(
             self.phase,
-            MaoPhase::Coding { .. } | MaoPhase::Reviewing { .. }
+            MaoPhase::Analyzing
+                | MaoPhase::Coding { .. }
+                | MaoPhase::Integrating
+                | MaoPhase::Reviewing { .. }
         )
     }
 
     pub fn needs_attention(&self) -> bool {
         matches!(
             self.phase,
-            MaoPhase::ChangesRequested { .. } | MaoPhase::Failed { .. }
+            MaoPhase::PlanReady | MaoPhase::ChangesRequested { .. } | MaoPhase::Failed { .. }
         )
     }
 }
@@ -316,6 +356,8 @@ pub struct View {
     pub last_gateway_poll_ms: u64,
     pub rework_note: TextEdit,
     pub rework_note_run: Option<String>,
+    pub plan_agent_overrides: HashMap<(String, String), String>,
+    pub excluded_findings: HashMap<String, HashSet<usize>>,
     pub next_seq: u64,
 }
 
@@ -389,6 +431,8 @@ impl Default for View {
             last_gateway_poll_ms: 0,
             rework_note: TextEdit::new(""),
             rework_note_run: None,
+            plan_agent_overrides: HashMap::new(),
+            excluded_findings: HashMap::new(),
             next_seq,
         }
     }
@@ -416,20 +460,42 @@ impl View {
                     }
                 }
             }
+            if let Some(ref plan) = run.plan {
+                for t in &plan.tasks {
+                    if let Some(ref a) = t.asid {
+                        if !a.is_empty() && !a.starts_with("new-") {
+                            let id = AgentSessionId(a.clone());
+                            if !out.contains(&id) {
+                                out.push(id);
+                            }
+                        }
+                    }
+                }
+            }
         }
         out
     }
 
     pub fn is_tracked(&self, asid: &str) -> bool {
-        self.runs
-            .iter()
-            .any(|run| run.coder_asid == asid || run.reviewer_asid.as_deref() == Some(asid))
+        self.runs.iter().any(|run| {
+            run.coder_asid == asid
+                || run.reviewer_asid.as_deref() == Some(asid)
+                || run
+                    .plan
+                    .as_ref()
+                    .is_some_and(|p| p.tasks.iter().any(|t| t.asid.as_deref() == Some(asid)))
+        })
     }
 
     pub fn run_for_session(&self, asid: &str) -> Option<&MaoRun> {
-        self.runs
-            .iter()
-            .rfind(|run| run.coder_asid == asid || run.reviewer_asid.as_deref() == Some(asid))
+        self.runs.iter().rfind(|run| {
+            run.coder_asid == asid
+                || run.reviewer_asid.as_deref() == Some(asid)
+                || run
+                    .plan
+                    .as_ref()
+                    .is_some_and(|p| p.tasks.iter().any(|t| t.asid.as_deref() == Some(asid)))
+        })
     }
 
     pub fn active_count(&self) -> usize {
@@ -443,9 +509,12 @@ impl View {
     pub fn row_status(&self, asid: &str, language: Language) -> Option<String> {
         let run = self.run_for_session(asid)?;
         let label = match &run.phase {
+            MaoPhase::Analyzing => tr(language, "MAO · Analyzing"),
+            MaoPhase::PlanReady => tr(language, "MAO · Plan ready"),
             MaoPhase::Coding { round } => {
                 format!("{} #{}", tr_ref(language, "MAO · Coding"), round)
             }
+            MaoPhase::Integrating => tr(language, "MAO · Integrating"),
             MaoPhase::Reviewing { round } => {
                 format!("{} #{}", tr_ref(language, "MAO · Reviewing"), round)
             }
@@ -1278,6 +1347,7 @@ pub fn on_start_submitted(
         expanded: false,
         created_ms: now,
         updated_ms: now,
+        ..Default::default()
     };
     s.orchestration.runs.push(run);
     s.orchestration.selected_run = Some(id.clone());
@@ -1447,6 +1517,7 @@ pub fn on_session_submitted(s: &mut UiState, asid: &str, prompt: &str) {
         expanded: false,
         created_ms: now,
         updated_ms: now,
+        ..Default::default()
     });
     if !cwd.trim().is_empty() {
         s.send(Command::MaoCaptureBaseline {
@@ -2324,18 +2395,25 @@ pub fn continue_rework(s: &mut UiState, run_id: &str) {
     if run_id.starts_with("o_") {
         let computer = s.current_computer().to_string();
         if !computer.is_empty() && computer != "all" {
+            let run_ref = s.orchestration.runs.iter().find(|r| r.id == run_id);
             let feedback = extra_note.map(|note| {
-                let prior = s
-                    .orchestration
-                    .runs
-                    .iter()
-                    .find(|r| r.id == run_id)
+                let prior = run_ref
                     .map(|r| r.review_summary.trim())
                     .filter(|summary| !summary.is_empty());
                 match prior {
                     Some(prev) => format!("{prev}\n\nAdditional user guidance:\n{note}"),
                     None => note,
                 }
+            });
+            let selected_findings = run_ref.and_then(|r| {
+                if r.findings.is_empty() {
+                    return None;
+                }
+                let excluded = s.orchestration.excluded_findings.get(run_id);
+                let indices: Vec<usize> = (0..r.findings.len())
+                    .filter(|i| excluded.is_none_or(|ex| !ex.contains(i)))
+                    .collect();
+                Some(indices)
             });
             let ticket = s.next_token;
             s.next_token += 1;
@@ -2345,6 +2423,7 @@ pub fn continue_rework(s: &mut UiState, run_id: &str) {
                 request: crate::hub::OrchestrationRequest::Rework {
                     run: run_id.to_string(),
                     feedback,
+                    selected_findings,
                 },
             });
             s.notify(
@@ -2434,6 +2513,82 @@ pub fn continue_rework(s: &mut UiState, run_id: &str) {
     );
     s.sync_watch();
     persist_runs(s);
+}
+
+pub fn execute_gateway_plan(s: &mut UiState, run_id: &str) {
+    let computer = s.current_computer().to_string();
+    if computer.is_empty() || computer == "all" {
+        return;
+    }
+    let overrides: Vec<serde_json::Value> = s
+        .orchestration
+        .plan_agent_overrides
+        .iter()
+        .filter(|((rid, _), _)| rid == run_id)
+        .map(|((_, tid), agent)| {
+            serde_json::json!({
+                "task_id": tid,
+                "agent": agent,
+            })
+        })
+        .collect();
+    s.orchestration
+        .plan_agent_overrides
+        .retain(|(rid, _), _| rid != run_id);
+    if let Some(run) = s.orchestration.runs.iter_mut().find(|r| r.id == run_id) {
+        run.phase = MaoPhase::Coding { round: run.round };
+    }
+    let ticket = s.next_token;
+    s.next_token += 1;
+    s.send(Command::Orchestration {
+        computer,
+        ticket,
+        request: crate::hub::OrchestrationRequest::ExecutePlan {
+            run: run_id.to_string(),
+            overrides: serde_json::Value::Array(overrides),
+            use_worktrees: Some(s.cfg.ui.mao.use_worktrees),
+        },
+    });
+    s.notify(
+        ToastLevel::Info,
+        tr(s.cfg.general.language, "Executing orchestration plan"),
+        None,
+    );
+    s.sync_watch();
+}
+
+fn cycle_planned_task_agent(s: &mut UiState, run_id: &str, task_id: &str, current_agent: &str) {
+    let mut pool_agents: Vec<String> = s
+        .agents
+        .iter()
+        .filter(|a| Standing::of(a) == Standing::Usable)
+        .map(|a| a.id.clone())
+        .collect();
+    if pool_agents.is_empty() {
+        pool_agents = s.agents.iter().map(|a| a.id.clone()).collect();
+    }
+    if pool_agents.len() <= 1 {
+        return;
+    }
+    let idx = pool_agents
+        .iter()
+        .position(|a| a.eq_ignore_ascii_case(current_agent))
+        .unwrap_or(0);
+    let next = pool_agents[(idx + 1) % pool_agents.len()].clone();
+    s.orchestration
+        .plan_agent_overrides
+        .insert((run_id.to_string(), task_id.to_string()), next);
+}
+
+fn toggle_finding_selected(s: &mut UiState, run_id: &str, index: usize) {
+    let entry = s
+        .orchestration
+        .excluded_findings
+        .entry(run_id.to_string())
+        .or_default();
+    if !entry.remove(&index) {
+        entry.insert(index);
+    }
 }
 
 pub fn mark_approved(s: &mut UiState, run_id: &str) {
@@ -2940,8 +3095,32 @@ fn reviewer_config_menu(
     );
 
     let effective_failover = effective_auto_failover(s, current_asid);
+    let confirm_plan = s.cfg.ui.mao.confirm_plan;
+    let use_worktrees = s.cfg.ui.mao.use_worktrees;
     menu = menu
         .separator()
+        .item(
+            MenuItem::new(tr_ref(language, "Confirm plan before execution"))
+                .checked(confirm_plan)
+                .on_select(move |s: &mut UiState| {
+                    let next = !s.cfg.ui.mao.confirm_plan;
+                    s.cfg.ui.mao.confirm_plan = next;
+                    let prefs = s.cfg.ui.mao.clone();
+                    s.edit(ConfigEdit::Mao(prefs));
+                    s.menu = Some(OpenMenu::MaoReviewer(anchor));
+                }),
+        )
+        .item(
+            MenuItem::new(tr_ref(language, "Isolate parallel tasks in Git worktrees"))
+                .checked(use_worktrees)
+                .on_select(move |s: &mut UiState| {
+                    let next = !s.cfg.ui.mao.use_worktrees;
+                    s.cfg.ui.mao.use_worktrees = next;
+                    let prefs = s.cfg.ui.mao.clone();
+                    s.edit(ConfigEdit::Mao(prefs));
+                    s.menu = Some(OpenMenu::MaoReviewer(anchor));
+                }),
+        )
         .item(
             MenuItem::new(tr_ref(language, "Auto-failover on quota limit"))
                 .checked(effective_failover)
@@ -3142,9 +3321,24 @@ struct QualityGate {
 
 fn quality_gates_for_run(run: &MaoRun, language: Language) -> [QualityGate; 4] {
     let coding_gate = match &run.phase {
+        MaoPhase::Analyzing => QualityGate {
+            title: tr_ref(language, "Gate: Coding"),
+            detail: tr(language, "Analyzing"),
+            status: "running",
+        },
+        MaoPhase::PlanReady => QualityGate {
+            title: tr_ref(language, "Gate: Coding"),
+            detail: tr(language, "Plan ready"),
+            status: "warning",
+        },
         MaoPhase::Coding { round } => QualityGate {
             title: tr_ref(language, "Gate: Coding"),
             detail: format!("{} #{round}", tr_ref(language, "Coding")),
+            status: "running",
+        },
+        MaoPhase::Integrating => QualityGate {
+            title: tr_ref(language, "Gate: Coding"),
+            detail: tr(language, "Integrating"),
             status: "running",
         },
         MaoPhase::Failed { .. } => QualityGate {
@@ -3245,7 +3439,11 @@ fn quality_gates_for_run(run: &MaoRun, language: Language) -> [QualityGate; 4] {
             detail: tr(language, "Stopped"),
             status: "idle",
         },
-        MaoPhase::Coding { .. } | MaoPhase::Reviewing { .. } => QualityGate {
+        MaoPhase::Analyzing
+        | MaoPhase::PlanReady
+        | MaoPhase::Coding { .. }
+        | MaoPhase::Integrating
+        | MaoPhase::Reviewing { .. } => QualityGate {
             title: tr_ref(language, "Gate: Quality"),
             detail: tr(language, "Pending review"),
             status: "idle",
@@ -3332,6 +3530,9 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
     );
 
     let verdict_label = match &run.phase {
+        MaoPhase::Analyzing => format!("1. {}", tr_ref(language, "Analyzing")),
+        MaoPhase::PlanReady => format!("1. {}", tr_ref(language, "Plan ready")),
+        MaoPhase::Integrating => format!("2. {}", tr_ref(language, "Integrating")),
         MaoPhase::Approved { .. } => format!("3. {}", tr_ref(language, "Quality passed")),
         MaoPhase::ChangesRequested { .. } => format!("3. {}", tr_ref(language, "Needs fix")),
         MaoPhase::Failed { .. } => format!("3. {}", tr_ref(language, "Failed")),
@@ -3342,7 +3543,8 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
     };
     let verdict_status = match &run.phase {
         MaoPhase::Approved { .. } => "completed",
-        MaoPhase::ChangesRequested { .. } => "warning",
+        MaoPhase::Analyzing | MaoPhase::Integrating => "running",
+        MaoPhase::PlanReady | MaoPhase::ChangesRequested { .. } => "warning",
         MaoPhase::Failed { .. } => "failed",
         _ => "idle",
     };
@@ -3496,7 +3698,10 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
 
     let mut right_actions = row().gap(6.0).center_y();
     match &run.phase {
-        MaoPhase::Coding { .. } | MaoPhase::Reviewing { .. } => {
+        MaoPhase::Analyzing
+        | MaoPhase::Coding { .. }
+        | MaoPhase::Integrating
+        | MaoPhase::Reviewing { .. } => {
             let id = run.id.clone();
             right_actions = right_actions.child(
                 Button::new(tr_ref(language, "Stop"))
@@ -3507,9 +3712,42 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
                     .key("mao-banner-stop"),
             );
         }
+        MaoPhase::PlanReady => {
+            let id_exec = run.id.clone();
+            let id_stop = run.id.clone();
+            right_actions = right_actions
+                .child(
+                    Button::new(tr_ref(language, "Stop"))
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut UiState| cancel_run(s, &id_stop))
+                        .build(k)
+                        .key("mao-banner-stop-plan"),
+                )
+                .child(
+                    Button::new(tr_ref(language, "Execute plan"))
+                        .variant(ButtonVariant::Submit)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut UiState| execute_gateway_plan(s, &id_exec))
+                        .build(k)
+                        .key("mao-banner-execute-plan"),
+                );
+        }
         MaoPhase::ChangesRequested { .. } => {
             let id_rework = run.id.clone();
             let id_approve = run.id.clone();
+            let excluded = s.orchestration.excluded_findings.get(&run.id);
+            let selected_count = run
+                .findings
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| excluded.is_none_or(|ex| !ex.contains(i)))
+                .count();
+            let rework_label = if run.findings.is_empty() {
+                tr(language, "Continue rework")
+            } else {
+                format!("{} ({selected_count})", tr_ref(language, "Fix selected"))
+            };
             right_actions = right_actions
                 .child(
                     Button::new(tr_ref(language, "Mark approved"))
@@ -3520,7 +3758,7 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
                         .key("mao-banner-approve"),
                 )
                 .child(
-                    Button::new(tr_ref(language, "Continue rework"))
+                    Button::new(rework_label)
                         .variant(ButtonVariant::Submit)
                         .control_size(ControlSize::Small)
                         .on_press(move |s: &mut UiState| continue_rework(s, &id_rework))
@@ -3547,7 +3785,12 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
         .child(left_actions);
     if matches!(
         run.phase,
-        MaoPhase::Coding { .. } | MaoPhase::Reviewing { .. } | MaoPhase::ChangesRequested { .. }
+        MaoPhase::Analyzing
+            | MaoPhase::PlanReady
+            | MaoPhase::Coding { .. }
+            | MaoPhase::Integrating
+            | MaoPhase::Reviewing { .. }
+            | MaoPhase::ChangesRequested { .. }
     ) {
         header_bar = header_bar.child(right_actions);
     }
@@ -3610,6 +3853,235 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
 
     if run.expanded {
         let mut drawer_body = col().w_full().gap(8.0).pt(6.0);
+        // 1. Smart Plan & DAG Subtask Board (PlanReady / Executing / Integrating / AwaitingMerge)
+        if let Some(ref plan) = run.plan {
+            let complexity_label = match plan.complexity.as_str() {
+                "direct" => tr_ref(language, "L1 · Direct"),
+                "parallel_dag" => tr_ref(language, "L3 · Parallel DAG"),
+                _ => tr_ref(language, "L2 · Single + Review"),
+            };
+            let any_wt = plan.tasks.iter().any(|t| t.use_worktree);
+            let mut plan_hdr = row().w_full().gap(6.0).center_y().flex_wrap().child(
+                Badge::new(complexity_label)
+                    .variant(BadgeVariant::Accent)
+                    .build(k),
+            );
+            if any_wt {
+                plan_hdr = plan_hdr.child(
+                    Badge::new(tr_ref(language, "Git Worktree"))
+                        .variant(BadgeVariant::Neutral)
+                        .build(k),
+                );
+            }
+            if !plan.analysis.trim().is_empty() {
+                plan_hdr = plan_hdr.child(
+                    text(clean_one_line(&plan.analysis))
+                        .font(k.ty.small)
+                        .color(k.c.text_muted)
+                        .single_line()
+                        .truncate()
+                        .grow(1.0)
+                        .min_w(0.0),
+                );
+            }
+            let mut plan_box = col()
+                .w_full()
+                .gap(5.0)
+                .px(10.0)
+                .py(8.0)
+                .radius(k.radius.md)
+                .fill(k.c.layer_02)
+                .border(1.0, k.c.border_weak)
+                .child(plan_hdr);
+
+            let editable_plan = matches!(run.phase, MaoPhase::PlanReady);
+            for (tidx, task) in plan.tasks.iter().enumerate() {
+                let effective_agent = s
+                    .orchestration
+                    .plan_agent_overrides
+                    .get(&(run.id.clone(), task.id.clone()))
+                    .map(String::as_str)
+                    .unwrap_or(task.agent.as_str());
+                let agent_display = s.agent_name(effective_agent);
+                let dot_color = match task.status.as_str() {
+                    "running" => k.c.text_accent,
+                    "completed" => k.c.success.icon,
+                    "failed" => k.c.danger.icon,
+                    _ => k.c.text_faint,
+                };
+                let run_id_for_swap = run.id.clone();
+                let task_id_for_swap = task.id.clone();
+                let cur_agent_owned = effective_agent.to_string();
+                let mut agent_pill = row()
+                    .key(format!("mao-plan-agent-{}-{tidx}", run.id))
+                    .h(22.0)
+                    .px(7.0)
+                    .gap(4.0)
+                    .center_y()
+                    .radius(k.radius.sm)
+                    .fill(k.c.layer_01)
+                    .border(
+                        1.0,
+                        if editable_plan {
+                            k.c.bg_accent.alpha(0.55)
+                        } else {
+                            k.c.border_weak
+                        },
+                    )
+                    .child(agents::mark(effective_agent, 11.0, s.dark))
+                    .child(
+                        text(if editable_plan {
+                            format!("{agent_display} ▾")
+                        } else {
+                            agent_display
+                        })
+                        .font(k.ty.small_medium)
+                        .color(k.c.text_base)
+                        .single_line(),
+                    );
+                if editable_plan {
+                    agent_pill = agent_pill.on_press(move |s: &mut UiState| {
+                        cycle_planned_task_agent(
+                            s,
+                            &run_id_for_swap,
+                            &task_id_for_swap,
+                            &cur_agent_owned,
+                        );
+                    });
+                }
+
+                let mut task_row = row()
+                    .key(format!("mao-plan-task-{}-{tidx}", run.id))
+                    .w_full()
+                    .h(28.0)
+                    .px(8.0)
+                    .gap(8.0)
+                    .center_y()
+                    .radius(k.radius.sm)
+                    .fill(k.c.layer_01)
+                    .border(1.0, k.c.border_weak.alpha(0.5))
+                    .child(el().size(6.0, 6.0).radius(3.0).fill(dot_color))
+                    .child(
+                        text(format!("[{}] {}", task.id, task.title))
+                            .font(k.ty.small_medium)
+                            .color(k.c.text_base)
+                            .single_line(),
+                    )
+                    .child(agent_pill);
+                if task.use_worktree {
+                    task_row = task_row.child(
+                        text("WT")
+                            .font(k.ty.small_medium)
+                            .color(k.c.info.fg)
+                            .single_line(),
+                    );
+                }
+                if !task.depends_on.is_empty() {
+                    task_row = task_row.child(
+                        text(format!("← {}", task.depends_on.join(",")))
+                            .font(k.ty.small)
+                            .color(k.c.text_faint)
+                            .single_line(),
+                    );
+                }
+                let hint_text = task
+                    .error
+                    .as_deref()
+                    .or(if task.reason.is_empty() {
+                        None
+                    } else {
+                        Some(task.reason.as_str())
+                    })
+                    .unwrap_or("");
+                if !hint_text.is_empty() {
+                    task_row = task_row.child(
+                        text(clean_one_line(hint_text))
+                            .font(k.ty.small)
+                            .color(if task.error.is_some() {
+                                k.c.danger.fg
+                            } else {
+                                k.c.text_muted
+                            })
+                            .single_line()
+                            .truncate()
+                            .grow(1.0)
+                            .min_w(0.0),
+                    );
+                }
+                if !editable_plan {
+                    if let Some(ref target_asid) = task.asid {
+                        if !target_asid.starts_with("new-") {
+                            let jump = target_asid.clone();
+                            task_row = task_row.on_press(move |s: &mut UiState| {
+                                s.open_session(&jump);
+                            });
+                        }
+                    }
+                }
+                plan_box = plan_box.child(task_row);
+            }
+            drawer_body = drawer_body.child(plan_box);
+        }
+
+        // 2. Selectable Findings List during ChangesRequested (review-in-the-loop)
+        if matches!(run.phase, MaoPhase::ChangesRequested { .. }) && !run.findings.is_empty() {
+            let excluded = s.orchestration.excluded_findings.get(&run.id);
+            let mut fbox = col().w_full().gap(4.0);
+            for (fidx, f) in run.findings.iter().take(8).enumerate() {
+                let is_checked = excluded.is_none_or(|ex| !ex.contains(&fidx));
+                let rid = run.id.clone();
+                let sev_color = match f.severity.as_str() {
+                    "high" => k.c.danger.fg,
+                    "medium" => k.c.warning.fg,
+                    _ => k.c.text_muted,
+                };
+                fbox = fbox.child(
+                    row()
+                        .key(format!("mao-finding-{}-{fidx}", run.id))
+                        .w_full()
+                        .h(26.0)
+                        .px(8.0)
+                        .gap(7.0)
+                        .center_y()
+                        .radius(k.radius.sm)
+                        .fill(k.c.layer_02)
+                        .border(1.0, k.c.border_weak.alpha(0.5))
+                        .on_press(move |s: &mut UiState| {
+                            toggle_finding_selected(s, &rid, fidx);
+                        })
+                        .child(
+                            text(if is_checked { "☑" } else { "☐" })
+                                .font(k.ty.small_medium)
+                                .color(if is_checked {
+                                    k.c.text_accent
+                                } else {
+                                    k.c.text_faint
+                                }),
+                        )
+                        .child(
+                            text(f.severity.to_ascii_uppercase())
+                                .font(k.ty.small_medium)
+                                .color(sev_color)
+                                .single_line(),
+                        )
+                        .child(
+                            text(format!("{} · {}", f.location, clean_one_line(&f.message)))
+                                .font(k.ty.small)
+                                .color(if is_checked {
+                                    k.c.text_base
+                                } else {
+                                    k.c.text_faint
+                                })
+                                .single_line()
+                                .truncate()
+                                .grow(1.0)
+                                .min_w(0.0),
+                        ),
+                );
+            }
+            drawer_body = drawer_body.child(fbox);
+        }
+
         let coder_clean = clean_summary_excerpt(&run.coder_summary, 220);
         let review_clean = clean_summary_excerpt(&run.review_summary, 220);
         let show_review_card = !review_clean.is_empty() && review_clean != active_activity;
@@ -3769,6 +4241,22 @@ fn phase_summary_line(
     language: Language,
 ) -> String {
     match &run.phase {
+        MaoPhase::Analyzing => tr(
+            language,
+            "Analyzing task & repository to route the best available agents…",
+        ),
+        MaoPhase::PlanReady => run
+            .plan
+            .as_ref()
+            .map(|p| {
+                format!(
+                    "{} ({}) · {}",
+                    tr_ref(language, "Plan ready"),
+                    p.tasks.len(),
+                    p.analysis
+                )
+            })
+            .unwrap_or_else(|| tr(language, "Orchestration plan ready for confirmation.")),
         MaoPhase::Coding { round } if *round == 1 => format!(
             "{} · {coder_name} {}",
             tr_ref(language, "Phase 1"),
@@ -3783,6 +4271,7 @@ fn phase_summary_line(
             run.max_rounds,
             tr_ref(language, "is fixing issues raised by code review.")
         ),
+        MaoPhase::Integrating => tr(language, "Integrating parallel worktree branches…"),
         MaoPhase::Reviewing { round } => format!(
             "{} #{round}/{} · {reviewer_name} {}",
             tr_ref(language, "Code review"),
@@ -3879,7 +4368,8 @@ fn step_row(k: &Kit, idx: usize, step: &MaoStep) -> El {
 
 fn phase_color(k: &Kit, phase: &MaoPhase) -> Color {
     match phase {
-        MaoPhase::Coding { .. } => k.c.text_accent,
+        MaoPhase::Analyzing | MaoPhase::Coding { .. } | MaoPhase::Integrating => k.c.text_accent,
+        MaoPhase::PlanReady => k.c.warning.icon,
         MaoPhase::Reviewing { .. } => k.c.info.icon,
         MaoPhase::Approved { .. } => k.c.success.icon,
         MaoPhase::ChangesRequested { .. } => k.c.warning.icon,
@@ -3890,10 +4380,13 @@ fn phase_color(k: &Kit, phase: &MaoPhase) -> Color {
 
 fn phase_badge(k: &Kit, phase: &MaoPhase, language: Language) -> El {
     let (label, variant) = match phase {
+        MaoPhase::Analyzing => (tr(language, "Analyzing"), BadgeVariant::Accent),
+        MaoPhase::PlanReady => (tr(language, "Plan ready"), BadgeVariant::Neutral),
         MaoPhase::Coding { round } => (
             format!("{} #{round}", tr_ref(language, "Coding")),
             BadgeVariant::Accent,
         ),
+        MaoPhase::Integrating => (tr(language, "Integrating"), BadgeVariant::Accent),
         MaoPhase::Reviewing { round } => (
             format!("{} #{round}", tr_ref(language, "Reviewing")),
             BadgeVariant::Neutral,
@@ -5820,6 +6313,9 @@ pub fn dispatch_gateway_start(
         "reviewer": rev_obj,
         "max_review_rounds": max_rounds,
         "auto_failover": auto_failover,
+        "strategy": "smart",
+        "confirm_plan": s.cfg.ui.mao.confirm_plan,
+        "use_worktrees": s.cfg.ui.mao.use_worktrees,
     });
     if !pool_json.is_empty() {
         body["agent_pool"] = serde_json::Value::Array(pool_json);
@@ -6164,7 +6660,14 @@ fn merge_gateway_run(
 ) -> Option<Option<(String, String)>> {
     let id = raw.get("id").and_then(|v| v.as_str())?;
     let req = raw.get("request")?;
-    let rev = req.get("reviewer").filter(|v| !v.is_null())?;
+    let is_smart = req
+        .get("strategy")
+        .and_then(|v| v.as_str())
+        .is_some_and(|st| st.eq_ignore_ascii_case("smart"));
+    let rev = req.get("reviewer").filter(|v| !v.is_null());
+    if rev.is_none() && !is_smart {
+        return None;
+    }
     let goal = req
         .get("goal")
         .and_then(|v| v.as_str())
@@ -6217,19 +6720,23 @@ fn merge_gateway_run(
                 .map(str::to_string),
         }
     };
-    let eff_rev = active_reviewer.unwrap_or(rev);
+    let eff_rev = active_reviewer.or(rev);
     let reviewer = MaoRole {
         agent: eff_rev
-            .get("agent")
+            .and_then(|r| r.get("agent"))
             .and_then(|v| v.as_str())
-            .unwrap_or("codex")
+            .unwrap_or(&coder.agent)
             .to_string(),
         model: parse_gateway_model(
-            eff_rev.get("model").and_then(|v| v.as_str()),
-            eff_rev.get("variant").and_then(|v| v.as_str()),
+            eff_rev
+                .and_then(|r| r.get("model"))
+                .and_then(|v| v.as_str()),
+            eff_rev
+                .and_then(|r| r.get("variant"))
+                .and_then(|v| v.as_str()),
         ),
         machine: eff_rev
-            .get("machine")
+            .and_then(|r| r.get("machine"))
             .and_then(|v| v.as_str())
             .map(str::to_string),
     };
@@ -6277,6 +6784,9 @@ fn merge_gateway_run(
         .and_then(|v| v.as_str())
         .unwrap_or("coding");
     let phase = match mao_phase {
+        "analyzing" => MaoPhase::Analyzing,
+        "plan_ready" => MaoPhase::PlanReady,
+        "integrating" => MaoPhase::Integrating,
         "approved" => MaoPhase::Approved {
             round,
             summary: review_summary.clone(),
@@ -6296,6 +6806,10 @@ fn merge_gateway_run(
         "cancelled" => MaoPhase::Cancelled,
         _ => MaoPhase::Coding { round },
     };
+    let plan: Option<MaoPlan> = st
+        .and_then(|v| v.get("plan"))
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
     let files: Vec<MaoDeliverableFile> = st
         .and_then(|v| v.get("files"))
         .and_then(|v| v.as_array())
@@ -6347,6 +6861,8 @@ fn merge_gateway_run(
                         .and_then(|v| v.as_str())
                         .unwrap_or("coding")
                     {
+                        "plan" => MaoStepKind::Plan,
+                        "integrate" => MaoStepKind::Integrate,
                         "review" => MaoStepKind::Review,
                         "rework" => MaoStepKind::Rework,
                         "verdict" => MaoStepKind::Verdict,
@@ -6394,6 +6910,10 @@ fn merge_gateway_run(
         .unwrap_or(created_ms)
         .max(created_ms);
 
+    let auto_expand = matches!(
+        phase,
+        MaoPhase::PlanReady | MaoPhase::ChangesRequested { .. }
+    );
     let gw_run = MaoRun {
         id: id.to_string(),
         computer: computer.to_string(),
@@ -6418,7 +6938,8 @@ fn merge_gateway_run(
         review_summary,
         findings,
         steps,
-        expanded: false,
+        plan,
+        expanded: auto_expand,
         created_ms,
         updated_ms,
     };
@@ -6475,9 +6996,14 @@ fn merge_gateway_run(
         }
         let was_same_rev = matches!(existing.phase, MaoPhase::Reviewing { .. })
             && existing.reviewer_asid == gw_run.reviewer_asid;
+        let entered_decision_phase = matches!(
+            gw_run.phase,
+            MaoPhase::PlanReady | MaoPhase::ChangesRequested { .. }
+        ) && std::mem::discriminant(&existing.phase)
+            != std::mem::discriminant(&gw_run.phase);
         *existing = MaoRun {
             id: existing.id.clone(),
-            expanded: existing.expanded,
+            expanded: existing.expanded || entered_decision_phase,
             ..gw_run
         };
         return Some(if was_same_rev {
@@ -7168,7 +7694,7 @@ MAO_VERDICT: CHANGES_REQUESTED";
         while let Ok(cmd) = rx.try_recv() {
             if let Command::Orchestration { request, .. } = cmd {
                 match request {
-                    crate::hub::OrchestrationRequest::Rework { run, feedback }
+                    crate::hub::OrchestrationRequest::Rework { run, feedback, .. }
                         if run == "o_gw_99" =>
                     {
                         assert!(feedback
@@ -7729,5 +8255,143 @@ MAO_VERDICT: CHANGES_REQUESTED";
             s.session_by_id("orig-1").map(|i| i.title.as_str()),
             Some("手动改的新标题")
         );
+    }
+
+    #[test]
+    fn smart_plan_override_execute_worktree_merge_and_selective_findings_rework() {
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.hub_label = "gateway".into();
+        s.agents = vec![
+            test_agent("claude", "Claude"),
+            test_agent("cursor", "Cursor"),
+            test_agent("codex", "Codex"),
+        ];
+
+        // 1. Merge a Gateway PlanReady payload -> auto-expands and parses DAG subtasks.
+        let plan_payload = serde_json::json!({
+            "run": {
+                "id": "o_smart_1",
+                "created_ms": 1000,
+                "request": {
+                    "goal": "Add API and UI",
+                    "cwd": "/tmp/repo",
+                    "coordinator": "claude",
+                    "strategy": "smart",
+                    "reviewer": { "agent": "codex" },
+                    "max_review_rounds": 2
+                },
+                "state": {
+                    "mao_phase": "plan_ready",
+                    "round": 1,
+                    "max_rounds": 2,
+                    "coder_asid": "sess-1",
+                    "plan": {
+                        "complexity": "parallel_dag",
+                        "analysis": "Split API and UI into parallel worktrees.",
+                        "tasks": [
+                            {
+                                "id": "api",
+                                "title": "Gateway API",
+                                "goal": "Add route",
+                                "agent": "claude",
+                                "reason": "Rust backend",
+                                "depends_on": [],
+                                "owns_paths": ["src/"],
+                                "read_only": false,
+                                "use_worktree": true,
+                                "status": "pending"
+                            },
+                            {
+                                "id": "ui",
+                                "title": "Desktop UI",
+                                "goal": "Add card",
+                                "agent": "cursor",
+                                "reason": "Fast UI",
+                                "depends_on": [],
+                                "owns_paths": ["desktop/"],
+                                "read_only": false,
+                                "use_worktree": true,
+                                "status": "pending"
+                            }
+                        ],
+                        "verify_commands": ["cargo test"],
+                        "reviewer_reason": "Cross-model check"
+                    },
+                    "steps": []
+                }
+            }
+        });
+        on_gateway_orchestration(&mut s, "local", 1, Ok(plan_payload));
+        assert_eq!(s.orchestration.runs.len(), 1);
+        assert_eq!(s.orchestration.runs[0].phase, MaoPhase::PlanReady);
+        assert!(s.orchestration.runs[0].expanded);
+        assert_eq!(
+            s.orchestration.runs[0].plan.as_ref().map(|p| p.tasks.len()),
+            Some(2)
+        );
+
+        // 2. Override subtask #1 agent and execute plan -> emits ExecutePlan with override.
+        cycle_planned_task_agent(&mut s, "o_smart_1", "api", "claude");
+        execute_gateway_plan(&mut s, "o_smart_1");
+        let mut saw_execute = false;
+        while let Ok(cmd) = rx.try_recv() {
+            if let Command::Orchestration {
+                request:
+                    crate::hub::OrchestrationRequest::ExecutePlan {
+                        run,
+                        overrides,
+                        use_worktrees,
+                    },
+                ..
+            } = cmd
+            {
+                assert_eq!(run, "o_smart_1");
+                assert_eq!(use_worktrees, Some(true));
+                assert_eq!(overrides.as_array().unwrap().len(), 1);
+                assert_eq!(overrides[0]["task_id"], "api");
+                assert_eq!(overrides[0]["agent"], "cursor");
+                saw_execute = true;
+            }
+        }
+        assert!(saw_execute);
+
+        // 3. Selective findings rework excludes unchecked finding index.
+        s.orchestration.runs[0].phase = MaoPhase::ChangesRequested {
+            round: 1,
+            feedback: "Fix issues".into(),
+        };
+        s.orchestration.runs[0].findings = vec![
+            MaoFinding {
+                severity: "high".into(),
+                location: "a.rs:1".into(),
+                message: "Bug 1".into(),
+            },
+            MaoFinding {
+                severity: "low".into(),
+                location: "b.rs:2".into(),
+                message: "Nit 2".into(),
+            },
+        ];
+        toggle_finding_selected(&mut s, "o_smart_1", 1);
+        continue_rework(&mut s, "o_smart_1");
+        let mut saw_rework = false;
+        while let Ok(cmd) = rx.try_recv() {
+            if let Command::Orchestration {
+                request:
+                    crate::hub::OrchestrationRequest::Rework {
+                        run,
+                        selected_findings,
+                        ..
+                    },
+                ..
+            } = cmd
+            {
+                assert_eq!(run, "o_smart_1");
+                assert_eq!(selected_findings, Some(vec![0]));
+                saw_rework = true;
+            }
+        }
+        assert!(saw_rework);
     }
 }

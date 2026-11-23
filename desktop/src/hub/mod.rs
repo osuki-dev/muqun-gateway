@@ -43,10 +43,16 @@ pub enum OrchestrationRequest {
     List,
     Read(String),
     Start(serde_json::Value),
+    ExecutePlan {
+        run: String,
+        overrides: serde_json::Value,
+        use_worktrees: Option<bool>,
+    },
     Approve(String),
     Rework {
         run: String,
         feedback: Option<String>,
+        selected_findings: Option<Vec<usize>>,
     },
     Cancel(String),
     CancelTask {

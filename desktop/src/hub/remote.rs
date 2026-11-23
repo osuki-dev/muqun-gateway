@@ -589,8 +589,8 @@ impl SessionHub for RemoteHub {
                 }
                 super::OrchestrationRequest::Start(mut body) => {
                     // Older Gateways running `agent_orchestration_preview_v1` use
-                    // `deny_unknown_fields` and reject `agent_pool`/`auto_failover`
-                    // unless they also advertise `agent_orchestration_pool_v1`.
+                    // `deny_unknown_fields` and reject newer fields unless they
+                    // advertise the corresponding capability.
                     if !self
                         .has_capability("agent_orchestration_pool_v1")
                         .await
@@ -601,8 +601,36 @@ impl SessionHub for RemoteHub {
                             obj.remove("auto_failover");
                         }
                     }
+                    if !self
+                        .has_capability("agent_orchestration_dag_v1")
+                        .await
+                        .unwrap_or(false)
+                    {
+                        if let Some(obj) = body.as_object_mut() {
+                            obj.remove("strategy");
+                            obj.remove("confirm_plan");
+                            obj.remove("use_worktrees");
+                        }
+                    }
                     self.call(Method::POST, &["api", "orchestrations"], &[], Some(body))
                         .await
+                }
+                super::OrchestrationRequest::ExecutePlan {
+                    run,
+                    overrides,
+                    use_worktrees,
+                } => {
+                    let mut body = json!({ "overrides": overrides });
+                    if let Some(wt) = use_worktrees {
+                        body["use_worktrees"] = json!(wt);
+                    }
+                    self.call(
+                        Method::POST,
+                        &["api", "orchestrations", &run, "execute"],
+                        &[],
+                        Some(body),
+                    )
+                    .await
                 }
                 super::OrchestrationRequest::Approve(id) => {
                     self.call(
@@ -613,8 +641,23 @@ impl SessionHub for RemoteHub {
                     )
                     .await
                 }
-                super::OrchestrationRequest::Rework { run, feedback } => {
-                    let body = feedback.map(|f| json!({ "feedback": f }));
+                super::OrchestrationRequest::Rework {
+                    run,
+                    feedback,
+                    selected_findings,
+                } => {
+                    let body = if feedback.is_some() || selected_findings.is_some() {
+                        let mut map = serde_json::Map::new();
+                        if let Some(f) = feedback {
+                            map.insert("feedback".into(), json!(f));
+                        }
+                        if let Some(indices) = selected_findings {
+                            map.insert("selected_findings".into(), json!(indices));
+                        }
+                        Some(Value::Object(map))
+                    } else {
+                        None
+                    };
                     self.call(
                         Method::POST,
                         &["api", "orchestrations", &run, "rework"],

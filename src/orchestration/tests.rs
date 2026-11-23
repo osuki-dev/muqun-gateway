@@ -38,6 +38,9 @@ fn request() -> Start {
         auto_approve: None,
         agent_pool: vec![],
         auto_failover: None,
+        strategy: None,
+        confirm_plan: None,
+        use_worktrees: None,
     }
 }
 
@@ -1401,4 +1404,281 @@ async fn rework_and_second_round_review_reuse_agent_session_without_terminal_ses
         "review #2 must dispatch cleanly without TerminalUnknown: {r2}"
     );
     let _ = std::fs::remove_dir_all(&ws);
+}
+
+#[tokio::test]
+async fn smart_dag_analyzes_routes_executes_parallel_worktrees_integrates_reviews_and_merges() {
+    let base = crate::test_state_dir().join(format!("smart-dag-{}", uuid::Uuid::new_v4()));
+    let repo_dir = base.join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    let run_git = |args: &[&str]| {
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo_dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    };
+    run_git(&["init"]);
+    run_git(&["config", "user.email", "t@example.com"]);
+    run_git(&["config", "user.name", "T"]);
+    std::fs::write(repo_dir.join("backend.rs"), "pub fn api() {}\n").unwrap();
+    std::fs::write(repo_dir.join("frontend.rs"), "pub fn ui() {}\n").unwrap();
+    run_git(&["add", "."]);
+    run_git(&["commit", "-m", "init"]);
+
+    let state = state();
+    let claude = FakeAgent::new("claude").with_sessions(&[("claude_new", 1)]);
+    let cursor = FakeAgent::new("cursor").with_sessions(&[("cursor_new", 1)]);
+    let antigravity = FakeAgent::new("antigravity").with_sessions(&[("antigravity_new", 1)]);
+    state.agent_runtime.attach_for_test(claude.manager()).await;
+    state.agent_runtime.attach_for_test(cursor.manager()).await;
+    state
+        .agent_runtime
+        .attach_for_test(antigravity.manager())
+        .await;
+
+    let mut req = request();
+    req.client_ref = "smart-dag-1".into();
+    req.cwd = repo_dir.to_string_lossy().into_owned();
+    req.goal = "Add API endpoint and Desktop UI button".into();
+    req.coordinator = "claude".into();
+    req.strategy = Some("smart".into());
+    req.confirm_plan = Some(true);
+    req.use_worktrees = Some(true);
+
+    // 1. Start enters `analyzing` (read-only Planner)
+    let (status, started) = call(&state, "token", "POST", "/api/orchestrations", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    assert_eq!(started["mao_phase"], "analyzing");
+    let run_id = started["run"]["id"].as_str().unwrap().to_string();
+    let planner_tid = started["run"]["task_id"].as_str().unwrap().to_string();
+
+    // 2. Planner returns a structured L3 parallel DAG plan
+    let plan_reply = r#"Analyzed scope.
+MAO_PLAN_JSON:
+```json
+{
+  "complexity": "parallel_dag",
+  "analysis": "Backend API and Desktop UI can be built concurrently in isolated worktrees.",
+  "tasks": [
+    {
+      "id": "api",
+      "title": "Implement API",
+      "goal": "Update backend.rs",
+      "agent": "cursor",
+      "reason": "Fast backend implementation",
+      "depends_on": [],
+      "owns_paths": ["backend.rs"],
+      "read_only": false
+    },
+    {
+      "id": "ui",
+      "title": "Implement UI",
+      "goal": "Update frontend.rs",
+      "agent": "claude",
+      "reason": "Strong UI implementation",
+      "depends_on": [],
+      "owns_paths": ["frontend.rs"],
+      "read_only": false
+    }
+  ],
+  "verify_commands": ["cargo test"],
+  "reviewer": {"agent": "antigravity"},
+  "reviewer_reason": "Independent cross-model verification"
+}
+```"#;
+
+    let task_store = SqliteTaskStore::new(state.db.clone());
+    task_store
+        .transition(
+            &TaskId(planner_tid),
+            crate::tasks::domain::TaskChange {
+                reopen: false,
+                reopen_count: None,
+                reopened_ms: None,
+                expected_seq: None,
+                to: TaskState::Done,
+                source: "test".into(),
+                note: None,
+                summary: Some(plan_reply.into()),
+                exit_code: Some(0),
+                binding: None,
+                session_title: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (status, planned) = call(
+        &state,
+        "token",
+        "GET",
+        &format!("/api/orchestrations/{run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{planned}");
+    assert_eq!(planned["mao_phase"], "plan_ready");
+    assert_eq!(planned["plan"]["complexity"], "parallel_dag");
+    assert_eq!(planned["plan"]["tasks"].as_array().unwrap().len(), 2);
+    assert_eq!(planned["plan"]["tasks"][0]["use_worktree"], true);
+    assert_eq!(planned["plan"]["tasks"][1]["use_worktree"], true);
+
+    // 3. User clicks Execute Plan -> both tasks dispatch in parallel into separate external worktrees!
+    let (status, exec) = call(
+        &state,
+        "token",
+        "POST",
+        &format!("/api/orchestrations/{run_id}/execute"),
+        json!({ "overrides": [] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{exec}");
+    assert_eq!(exec["mao_phase"], "executing");
+    let t0 = &exec["plan"]["tasks"][0];
+    let t1 = &exec["plan"]["tasks"][1];
+    assert_eq!(t0["status"], "running");
+    assert_eq!(t1["status"], "running");
+    let wt0 = t0["worktree_path"].as_str().unwrap().to_string();
+    let wt1 = t1["worktree_path"].as_str().unwrap().to_string();
+    assert_ne!(wt0, wt1);
+
+    // Simulate both parallel agents writing inside their isolated worktrees (repo_dir still untouched!)
+    std::fs::write(
+        std::path::Path::new(&wt0).join("backend.rs"),
+        "pub fn api() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        std::path::Path::new(&wt1).join("frontend.rs"),
+        "pub fn ui() -> i32 { 2 }\n",
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(repo_dir.join("backend.rs")).unwrap(),
+        "pub fn api() {}\n"
+    );
+
+    for tid in [
+        t0["task_id"].as_str().unwrap(),
+        t1["task_id"].as_str().unwrap(),
+    ] {
+        task_store
+            .transition(
+                &TaskId(tid.into()),
+                crate::tasks::domain::TaskChange {
+                    reopen: false,
+                    reopen_count: None,
+                    reopened_ms: None,
+                    expected_seq: None,
+                    to: TaskState::Done,
+                    source: "test".into(),
+                    note: None,
+                    summary: Some("Done".into()),
+                    exit_code: Some(0),
+                    binding: None,
+                    session_title: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // 4. Reconcile hands off both worktree branches to an Integrator Agent in `repo_dir`!
+    let (status, integrating) = call(
+        &state,
+        "token",
+        "GET",
+        &format!("/api/orchestrations/{run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{integrating}");
+    assert_eq!(integrating["mao_phase"], "integrating");
+    let int_tid = integrating["run"]["state"]["integration_task_id"]
+        .as_str()
+        .expect("integrator task_id")
+        .to_string();
+
+    // Simulate the Integrator Agent merging both branches into `repo_dir` and finishing.
+    std::fs::write(repo_dir.join("backend.rs"), "pub fn api() -> i32 { 1 }\n").unwrap();
+    std::fs::write(repo_dir.join("frontend.rs"), "pub fn ui() -> i32 { 2 }\n").unwrap();
+    task_store
+        .transition(
+            &TaskId(int_tid),
+            crate::tasks::domain::TaskChange {
+                reopen: false,
+                reopen_count: None,
+                reopened_ms: None,
+                expected_seq: None,
+                to: TaskState::Done,
+                source: "test".into(),
+                note: None,
+                summary: Some("Merged both worktree branches cleanly and ran tests.".into()),
+                exit_code: Some(0),
+                binding: None,
+                session_title: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // 5. Reconcile cleans up remaining temp worktrees and dispatches cross-model Reviewer!
+    let (status, reviewing) = call(
+        &state,
+        "token",
+        "GET",
+        &format!("/api/orchestrations/{run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reviewing}");
+    assert_eq!(reviewing["mao_phase"], "reviewing");
+    assert_eq!(reviewing["reviewer"]["agent"], "antigravity");
+    assert_eq!(
+        reviewing["deliverables"]["files"].as_array().unwrap().len(),
+        2
+    );
+    assert!(!std::path::Path::new(&wt0).exists());
+    assert!(!std::path::Path::new(&wt1).exists());
+
+    // 6. Reviewer approves -> directly `approved` (no manual merge step!)
+    let rev_tid = reviewing["run"]["state"]["reviewer_task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    task_store
+        .transition(
+            &TaskId(rev_tid),
+            crate::tasks::domain::TaskChange {
+                reopen: false,
+                reopen_count: None,
+                reopened_ms: None,
+                expected_seq: None,
+                to: TaskState::Done,
+                source: "test".into(),
+                note: None,
+                summary: Some("Integrated diff looks solid.\nMAO_VERDICT: APPROVED".into()),
+                exit_code: Some(0),
+                binding: None,
+                session_title: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (status, approved) = call(
+        &state,
+        "token",
+        "GET",
+        &format!("/api/orchestrations/{run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{approved}");
+    assert_eq!(approved["mao_phase"], "approved");
+    assert_eq!(approved["accepted"], true);
+    let _ = std::fs::remove_dir_all(&base);
 }

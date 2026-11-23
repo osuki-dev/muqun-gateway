@@ -26,12 +26,13 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/api/orchestrations", get(list).post(start))
         .route("/api/orchestrations/{id}", get(read))
+        .route("/api/orchestrations/{id}/execute", post(execute_plan))
         .route("/api/orchestrations/{id}/approve", post(approve))
         .route("/api/orchestrations/{id}/rework", post(rework))
         .route("/api/orchestrations/{id}/cancel", post(cancel))
 }
 
-fn internal(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+pub(super) fn internal(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     tracing::warn!(%error, "orchestration request failed");
     api_error(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -49,7 +50,10 @@ async fn list(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Js
 
 async fn reconcile_active_runs(state: &AppState, runs: &mut [Run]) {
     for run in runs {
-        if matches!(run.state.mao_phase.as_str(), "coding" | "reviewing") {
+        if matches!(
+            run.state.mao_phase.as_str(),
+            "analyzing" | "executing" | "integrating" | "coding" | "reviewing"
+        ) {
             if let Ok(recovered) = store::recover(&state.db, run.clone()).await {
                 *run = recovered;
             }
@@ -73,10 +77,12 @@ pub(crate) fn spawn_reconciler(state: AppState) {
             let Ok(mut runs) = store::list(&state.db).await else {
                 continue;
             };
-            if runs
-                .iter()
-                .any(|r| matches!(r.state.mao_phase.as_str(), "coding" | "reviewing"))
-            {
+            if runs.iter().any(|r| {
+                matches!(
+                    r.state.mao_phase.as_str(),
+                    "analyzing" | "executing" | "integrating" | "coding" | "reviewing"
+                )
+            }) {
                 reconcile_active_runs(&state, &mut runs).await;
             }
         }
@@ -102,7 +108,7 @@ async fn read(
     view(&state, run).await
 }
 
-fn agent_asid(binding: &TaskBinding) -> Option<(String, String)> {
+pub(super) fn agent_asid(binding: &TaskBinding) -> Option<(String, String)> {
     match binding {
         TaskBinding::AgentSession { agent_id, asid } => Some((agent_id.clone(), asid.clone())),
         _ => None,
@@ -121,7 +127,11 @@ fn candidate_agent_key(spec: &ReviewerSpec) -> String {
     )
 }
 
-fn mark_candidate_exhausted(exhausted: &mut Vec<String>, spec: &ReviewerSpec, agent_wide: bool) {
+pub(super) fn mark_candidate_exhausted(
+    exhausted: &mut Vec<String>,
+    spec: &ReviewerSpec,
+    agent_wide: bool,
+) {
     let key = candidate_key(spec);
     if !exhausted.contains(&key) {
         exhausted.push(key);
@@ -134,7 +144,7 @@ fn mark_candidate_exhausted(exhausted: &mut Vec<String>, spec: &ReviewerSpec, ag
     }
 }
 
-fn is_candidate_exhausted(exhausted: &[String], spec: &ReviewerSpec) -> bool {
+pub(super) fn is_candidate_exhausted(exhausted: &[String], spec: &ReviewerSpec) -> bool {
     let key = candidate_key(spec);
     let akey = candidate_agent_key(spec);
     if exhausted.contains(&key) || exhausted.contains(&akey) {
@@ -162,7 +172,7 @@ fn is_candidate_exhausted(exhausted: &[String], spec: &ReviewerSpec) -> bool {
 
 /// Returns `Err((reason, agent_wide))` if the candidate is disconnected, missing
 /// required MCP tools, or has exhausted its account/model rate window.
-async fn check_candidate_quota(
+pub(super) async fn check_candidate_quota(
     state: &AppState,
     spec: &ReviewerSpec,
     require_mcp: bool,
@@ -191,7 +201,7 @@ async fn check_candidate_quota(
     Ok(())
 }
 
-async fn select_fallback_candidate(
+pub(super) async fn select_fallback_candidate(
     state: &AppState,
     pool: &[ReviewerSpec],
     exhausted: &[String],
@@ -230,7 +240,7 @@ fn pool_instruction_for(run: &Run) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn task_failure_reason(task: &TaskView) -> String {
+pub(super) fn task_failure_reason(task: &TaskView) -> String {
     let mut parts = Vec::new();
     if let Some(summary) = task
         .summary
@@ -258,7 +268,11 @@ fn task_failure_reason(task: &TaskView) -> String {
     parts.join(" · ")
 }
 
-async fn latest_assistant_text(state: &AppState, agent_id: &str, asid: &str) -> Option<String> {
+pub(super) async fn latest_assistant_text(
+    state: &AppState,
+    agent_id: &str,
+    asid: &str,
+) -> Option<String> {
     let manager = state.agent_runtime.manager_for_agent(agent_id).await?;
     let snapshot = manager
         .sessions()
@@ -533,6 +547,9 @@ async fn reconcile_pipeline(
     tasks: &mut Vec<TaskView>,
     root: &str,
 ) -> Result<(), (StatusCode, Json<Value>)> {
+    if super::dag::is_smart_run(run) {
+        return super::dag::reconcile_smart_pipeline(state, run, tasks, root).await;
+    }
     let mut dirty = false;
     let now = now_ms();
     let root_task = tasks.iter().find(|t| t.task_id == root).cloned();
@@ -1565,12 +1582,15 @@ async fn view(state: &AppState, run: Run) -> ApiResult<Json<Value>> {
         return Ok(Json(json!({
             "run": run,
             "phase": "dispatch_unconfirmed",
+            "strategy": run.state.strategy,
             "mao_phase": run.state.mao_phase,
             "round": run.state.round,
             "max_review_rounds": run.state.max_rounds,
             "auto_failover": run.auto_failover_enabled(),
             "failover_count": run.state.failover_count,
             "agent_pool": run.request.agent_pool,
+            "candidate_statuses": run.state.candidate_statuses,
+            "plan": run.state.plan,
             "exhausted_candidates": run.state.exhausted_candidates,
             "coder": {
                 "agent": eff_coder.agent,
@@ -1644,12 +1664,15 @@ async fn view(state: &AppState, run: Run) -> ApiResult<Json<Value>> {
     Ok(Json(json!({
         "run": run,
         "phase": phase,
+        "strategy": run.state.strategy,
         "mao_phase": run.state.mao_phase,
         "round": run.state.round,
         "max_review_rounds": run.state.max_rounds,
         "auto_failover": run.auto_failover_enabled(),
         "failover_count": run.state.failover_count,
         "agent_pool": run.request.agent_pool,
+        "candidate_statuses": run.state.candidate_statuses,
+        "plan": run.state.plan,
         "exhausted_candidates": run.state.exhausted_candidates,
         "coder": {
             "agent": eff_coder.agent,
@@ -1749,6 +1772,30 @@ async fn start(
         })?
         .to_string_lossy()
         .into_owned();
+    if request
+        .strategy
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("smart"))
+    {
+        let mut original_coder_title: Option<String> = None;
+        if let Some(asid) = request.asid.as_deref() {
+            if let Some(manager) = state
+                .agent_runtime
+                .manager_for_agent(&request.coordinator)
+                .await
+            {
+                if let Ok(info) = manager.sessions().get_session(asid).await {
+                    let t = info.title.trim();
+                    if !t.is_empty() && t != asid && !t.starts_with("[MAO ") {
+                        original_coder_title = Some(t.to_string());
+                    }
+                }
+            }
+        }
+        let run =
+            super::dag::start_smart(&state, owner, request, cwd, original_coder_title).await?;
+        return view(&state, run).await;
+    }
     let requires_mcp = request.reviewer.is_none();
     let auto_failover = request
         .auto_failover
@@ -2048,6 +2095,30 @@ async fn start(
 struct ReworkBody {
     #[serde(default)]
     feedback: Option<String>,
+    #[serde(default)]
+    selected_findings: Option<Vec<usize>>,
+}
+
+#[derive(Deserialize, Default)]
+struct ExecutePlanBody {
+    #[serde(default)]
+    overrides: Vec<super::plan::TaskAssignmentOverride>,
+    #[serde(default)]
+    use_worktrees: Option<bool>,
+}
+
+async fn execute_plan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Option<Json<Option<ExecutePlanBody>>>,
+) -> ApiResult<Json<Value>> {
+    let owner = require_device(&state, &headers)?;
+    let mut run = load_run_for_action(&state, id, &owner).await?;
+    let req_body = body.and_then(|Json(b)| b).unwrap_or_default();
+    super::dag::execute_plan_action(&state, &mut run, req_body.overrides, req_body.use_worktrees)
+        .await?;
+    view(&state, run).await
 }
 
 fn format_findings_for_rework(findings: &[super::ReviewFinding]) -> String {
@@ -2137,12 +2208,19 @@ async fn rework(
     run.state.mao_phase = "coding".into();
     run.state.accepted = false;
 
-    let feedback = body
-        .and_then(|Json(b)| b)
-        .and_then(|b| b.feedback)
+    let rework_body = body.and_then(|Json(b)| b).unwrap_or_default();
+    let feedback = rework_body
+        .feedback
         .or_else(|| run.state.review_summary.clone())
         .unwrap_or_else(|| "Continue improving based on review findings.".into());
-    let issues_block = format_findings_for_rework(&run.state.findings);
+    let chosen_findings: Vec<super::ReviewFinding> = match rework_body.selected_findings {
+        Some(indices) => indices
+            .into_iter()
+            .filter_map(|i| run.state.findings.get(i).cloned())
+            .collect(),
+        None => run.state.findings.clone(),
+    };
+    let issues_block = format_findings_for_rework(&chosen_findings);
     let rework_goal = format!(
         "[MAO Manual Rework · Round {next_round}/{}]\n\nGoal:\n{}\n\nFeedback:\n{feedback}{issues_block}",
         run.state.max_rounds, run.request.goal
@@ -2190,6 +2268,34 @@ async fn rework(
         )
         .await;
     let rework_tid = delegated.as_ref().ok().map(|t| t.task_id.clone());
+    if super::dag::is_smart_run(&run) {
+        if let Ok(ref task) = delegated {
+            if let Some(ref mut plan_obj) = run.state.plan {
+                run.state.mao_phase = "executing".into();
+                plan_obj.tasks.push(super::plan::PlannedTask {
+                    id: format!("rework_{next_round}"),
+                    title: format!("Rework #{next_round}"),
+                    goal: feedback.clone(),
+                    agent: active_coder.agent.clone(),
+                    model: active_coder.model.clone(),
+                    variant: active_coder.variant.clone(),
+                    machine: active_coder.machine.clone(),
+                    reason: "Targeted rework for selected review findings.".into(),
+                    depends_on: vec![],
+                    owns_paths: vec![],
+                    read_only: false,
+                    use_worktree: false,
+                    status: "running".into(),
+                    task_id: Some(task.task_id.clone()),
+                    asid: agent_asid(&task.binding).map(|(_, a)| a),
+                    worktree_path: None,
+                    worktree_branch: None,
+                    summary: None,
+                    error: None,
+                });
+            }
+        }
+    }
     run.state.steps.push(PipelineStep {
         kind: "rework".into(),
         round: next_round,
@@ -2250,6 +2356,17 @@ async fn cancel(
             .cancel(&state, &principal, &TaskId(rtid.clone()))
             .await;
     }
+    if let Some(ref plan_obj) = run.state.plan {
+        for t in &plan_obj.tasks {
+            if let Some(ref tid) = t.task_id {
+                let _ = state
+                    .tasks
+                    .cancel(&state, &principal, &TaskId(tid.clone()))
+                    .await;
+            }
+        }
+    }
+    super::dag::cleanup_all_run_worktrees(&run);
     store::save_state(&state.db, run.id.clone(), run.state.clone())
         .await
         .map_err(internal)?;

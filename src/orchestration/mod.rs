@@ -1,14 +1,18 @@
 //! Goal-driven coordination over the existing task runtime. The coordinator
 //! chooses its own work; execution observations never imply accepted quality.
+mod dag;
+pub mod plan;
 mod routes;
 mod store;
 #[cfg(test)]
 mod tests;
+pub mod worktree;
 
 pub(crate) use routes::{mount, spawn_reconciler};
 pub(crate) use store::MIGRATION;
 pub(crate) const CAPABILITY: &str = "agent_orchestration_preview_v1";
 pub(crate) const POOL_CAPABILITY: &str = "agent_orchestration_pool_v1";
+pub(crate) const DAG_CAPABILITY: &str = "agent_orchestration_dag_v1";
 
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +59,17 @@ struct Start {
     pub(crate) agent_pool: Vec<ReviewerSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) auto_failover: Option<bool>,
+    /// Execution strategy: `Some("smart")` enables read-only analysis, dynamic
+    /// agent routing, DAG parallelization, and worktree isolation (`agent_orchestration_dag_v1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) strategy: Option<String>,
+    /// When `Some(true)` (default in smart mode), L2/L3 plans pause at `plan_ready`
+    /// so the user can inspect or adjust agent assignments before execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) confirm_plan: Option<bool>,
+    /// Whether parallel write subtasks should use isolated external git worktrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) use_worktrees: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +140,24 @@ pub struct RunState {
     pub failover_count: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_coder_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner_asid: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_statuses: Vec<plan::CandidateStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<plan::OrchestrationPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_base_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_asid: Option<String>,
 }
 
 impl Default for RunState {
@@ -153,6 +186,15 @@ impl Default for RunState {
             exhausted_candidates: Vec::new(),
             failover_count: 0,
             original_coder_title: None,
+            strategy: None,
+            planner_task_id: None,
+            planner_asid: None,
+            candidate_statuses: Vec::new(),
+            plan: None,
+            repo_root: None,
+            integration_base_sha: None,
+            integration_task_id: None,
+            integration_asid: None,
         }
     }
 }
@@ -922,10 +964,41 @@ impl RunState {
             machine: request.machine.clone(),
         });
         let active_reviewer = request.reviewer.clone();
+        let is_smart = request
+            .strategy
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("smart"));
+        let initial_step = if is_smart {
+            PipelineStep {
+                kind: "plan".into(),
+                round: 1,
+                title: format!("Analyze & plan · {}", request.coordinator),
+                detail: concise_excerpt(&request.goal, 180),
+                status: "running".into(),
+                asid: None,
+                task_id: None,
+                time_ms: now,
+            }
+        } else {
+            PipelineStep {
+                kind: "coding".into(),
+                round: 1,
+                title: format!("Coding #1 · {}", request.coordinator),
+                detail: concise_excerpt(&request.goal, 180),
+                status: "running".into(),
+                asid: request.asid.clone(),
+                task_id: None,
+                time_ms: now,
+            }
+        };
         Self {
             round: 1,
             max_rounds: request.max_review_rounds.unwrap_or(2).clamp(1, 5),
-            mao_phase: "coding".into(),
+            mao_phase: if is_smart {
+                "analyzing".into()
+            } else {
+                "coding".into()
+            },
             accepted: false,
             coder_asid: request.asid.clone(),
             reviewer_asid: None,
@@ -940,21 +1013,14 @@ impl RunState {
             review_summary: None,
             verdict: None,
             findings: Vec::new(),
-            steps: vec![PipelineStep {
-                kind: "coding".into(),
-                round: 1,
-                title: format!("Coding #1 · {}", request.coordinator),
-                detail: concise_excerpt(&request.goal, 180),
-                status: "running".into(),
-                asid: request.asid.clone(),
-                task_id: None,
-                time_ms: now,
-            }],
+            steps: vec![initial_step],
             active_coder,
             active_reviewer,
             exhausted_candidates: Vec::new(),
             failover_count: 0,
             original_coder_title: None,
+            strategy: request.strategy.clone(),
+            ..Default::default()
         }
     }
 

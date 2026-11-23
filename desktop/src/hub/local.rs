@@ -168,6 +168,7 @@ impl SessionHub for LocalHub {
                 }
                 super::OrchestrationRequest::Approve(id)
                 | super::OrchestrationRequest::Cancel(id)
+                | super::OrchestrationRequest::ExecutePlan { run: id, .. }
                 | super::OrchestrationRequest::Rework { run: id, .. } => {
                     self.orchestration(super::OrchestrationRequest::Read(id))
                         .await

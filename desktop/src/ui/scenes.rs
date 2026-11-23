@@ -1673,6 +1673,7 @@ fn mao_sample_runs(now: u64) -> Vec<super::orchestration::MaoRun> {
             expanded: false,
             created_ms: now.saturating_sub(680_000),
             updated_ms: now.saturating_sub(580_000),
+            ..Default::default()
         },
         MaoRun {
             id: "mao-1".into(),
@@ -1776,6 +1777,7 @@ fn mao_sample_runs(now: u64) -> Vec<super::orchestration::MaoRun> {
             expanded: false,
             created_ms: now.saturating_sub(200_000),
             updated_ms: now.saturating_sub(15_000),
+            ..Default::default()
         },
     ]
 }
