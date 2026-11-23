@@ -2402,7 +2402,7 @@ async fn cancel(
             }
         }
     }
-    super::dag::cleanup_all_run_worktrees(&run);
+    super::dag::cleanup_all_run_worktrees(&state, &run).await;
     store::save_state(&state.db, run.id.clone(), run.state.clone())
         .await
         .map_err(internal)?;

@@ -832,6 +832,36 @@ async fn read_agent_attention(
     Ok(Json(content_envelope(json!(pending))))
 }
 
+fn session_directory_is_missing(info: &crate::agents::domain::AgentSessionInfo) -> bool {
+    if matches!(
+        info.status,
+        crate::agents::domain::AgentSessionStatus::Busy
+            | crate::agents::domain::AgentSessionStatus::Retry
+    ) {
+        return false;
+    }
+    let Some(dir) = info
+        .directory
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    else {
+        return false;
+    };
+    let path = std::path::Path::new(dir);
+    path.is_absolute() && !path.is_dir()
+}
+
+fn drop_missing_directory_sessions(
+    sessions: &mut Vec<crate::agents::domain::AgentSessionInfo>,
+    explicit_directory: Option<&str>,
+) {
+    if cfg!(test) || explicit_directory.is_some() {
+        return;
+    }
+    sessions.retain(|s| !session_directory_is_missing(s));
+}
+
 async fn do_list_agent_sessions(
     state: &AppState,
     query: &SessionQuery,
@@ -890,6 +920,10 @@ async fn do_list_agent_sessions(
             return Err(agent_error(err));
         }
     }
+
+    // Hide dead sessions whose working directory no longer exists on disk
+    // (e.g. deleted temporary worktrees or /tmp folders that cannot spawn ACP).
+    drop_missing_directory_sessions(&mut sessions, query.directory.as_deref());
 
     // Sort newest first
     sessions.sort_by_key(|b| std::cmp::Reverse(b.updated_ms));
@@ -2282,11 +2316,12 @@ async fn list_agent_sessions_page(
     })?;
     let session_query = query.to_page_query()?;
     let manager = agent_manager_or_err(&state, query.agent_id.as_deref().unwrap()).await?;
-    let page = manager
+    let mut page = manager
         .sessions()
         .list_sessions_page(&session_query)
         .await
         .map_err(agent_error)?;
+    drop_missing_directory_sessions(&mut page.data, query.directory.as_deref());
     for session in &page.data {
         state
             .agent_runtime

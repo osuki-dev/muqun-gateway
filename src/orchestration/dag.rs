@@ -1022,8 +1022,8 @@ pub(super) async fn reconcile_smart_pipeline(
                     if !int_summary.trim().is_empty() {
                         run.state.coder_summary = Some(concise_excerpt(&int_summary, 1200));
                     }
-                    // Safety-net cleanup for any temporary worktrees/branches the agent didn't remove yet.
-                    cleanup_all_run_worktrees(run);
+                    // Safety-net cleanup for any temporary worktrees/branches and ephemeral worktree sessions.
+                    cleanup_all_run_worktrees(state, run).await;
                     if let Some(step) = run
                         .state
                         .steps
@@ -1629,21 +1629,31 @@ pub(super) async fn execute_plan_action(
     Ok(())
 }
 
-pub(super) fn cleanup_all_run_worktrees(run: &Run) {
-    let Some(ref repo_root) = run.state.repo_root else {
-        return;
-    };
+pub(super) async fn cleanup_all_run_worktrees(state: &AppState, run: &Run) {
     let mut paths = Vec::new();
     let mut branches = Vec::new();
+    let mut ephemeral_sessions: Vec<(String, String)> = Vec::new();
     if let Some(ref plan) = run.state.plan {
         for t in &plan.tasks {
             if let Some(ref p) = t.worktree_path {
                 paths.push(p.clone());
+                if let Some(ref asid) = t.asid {
+                    ephemeral_sessions.push((t.agent.clone(), asid.clone()));
+                }
             }
             if let Some(ref b) = t.worktree_branch {
                 branches.push(b.clone());
             }
         }
     }
-    worktree::cleanup_worktrees(Path::new(repo_root), &paths, &branches);
+    if let Some(ref repo_root) = run.state.repo_root {
+        worktree::cleanup_worktrees(Path::new(repo_root), &paths, &branches);
+    }
+    // Best-effort remove ephemeral worktree-bound sessions so deleted worktrees
+    // never linger as unopenable ghost sessions in Recent Sessions.
+    for (agent, asid) in ephemeral_sessions {
+        if let Some(mgr) = state.agent_runtime.manager_for_agent(&agent).await {
+            let _ = mgr.agent().delete_session(&asid).await;
+        }
+    }
 }
