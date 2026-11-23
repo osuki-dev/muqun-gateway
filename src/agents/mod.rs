@@ -23,6 +23,6 @@ pub(crate) mod ws_routes;
 
 pub use domain::*;
 pub use runtime::{
-    AgentRuntime, AntigravityConfig, ClaudeConfig, CodexConfig, CursorConfig, DeepseekConfig,
-    FxConfig, OpencodeConfig, PiConfig, QoderConfig, SessionOwnerMiss, T3Config,
+    AgentRuntime, AntigravityConfig, ClaudeConfig, CodexConfig, CopilotConfig, CursorConfig,
+    DeepseekConfig, FxConfig, OpencodeConfig, PiConfig, QoderConfig, SessionOwnerMiss, T3Config,
 };

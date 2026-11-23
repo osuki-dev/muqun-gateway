@@ -330,10 +330,10 @@ pub(crate) fn turn_usage(
         cache_write: optional(write)?,
         reasoning: optional(reasoning)?,
     };
-    // FX Codex, AI Gateway and Grok responses include cache/reasoning within
+    // FX and Copilot responses include cache/reasoning within
     // their parent counters; custom chat-completions provides no breakdown.
     // The Gateway contract uses disjoint parts, so preserve the actual total.
-    if provider == "fx" {
+    if matches!(provider, "fx" | "copilot") {
         tokens.input = tokens
             .input
             .checked_sub(tokens.cache_read.unwrap_or(0))?

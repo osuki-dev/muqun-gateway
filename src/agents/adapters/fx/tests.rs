@@ -168,6 +168,11 @@ if '--acp' in sys.argv:
     config['configOptions']=[option for option in config['configOptions'] if option['id']!='provider']
     for option in config['configOptions']:
         if option['id']=='effort':option['id']='reasoning_effort'
+if '--no-auto-update' in sys.argv:
+    config['configOptions'].extend([
+        {'id':'mode','currentValue':'https://agentclientprotocol.com/protocol/session-modes#agent','options':[{'value':'https://agentclientprotocol.com/protocol/session-modes#agent','name':'Agent'}]},
+        {'id':'allow_all','currentValue':'off','options':[{'value':'on','name':'On'},{'value':'off','name':'Off'}]}
+    ])
 active=None
 pending=None
 turn=0
@@ -200,7 +205,8 @@ for line in sys.stdin:
         reply(message['id'],dict(config,sessionId=active))
         if '--acp' in sys.argv:
             time.sleep(0.03)
-            update(active,{'sessionUpdate':'available_commands_update','availableCommands':[{'name':'goal','description':'Set goal'}]})
+            names=['context','usage'] if '--no-auto-update' in sys.argv else ['goal']
+            update(active,{'sessionUpdate':'available_commands_update','availableCommands':[{'name':name,'description':name} for name in names]})
     elif method=='session/load':
         if os.path.exists('busy-load'):
             send({'jsonrpc':'2.0','id':message['id'],'error':{'code':-32603,'message':'Session is busy'}});continue
@@ -229,6 +235,9 @@ for line in sys.stdin:
         if os.path.exists('wrong-provider') and params['configId']=='model':
             for option in config['configOptions']:
                 if option['id']=='provider':option['currentValue']='other-provider'
+        if os.path.exists('normalize-allow-all') and params['configId']=='allow_all':
+            for option in config['configOptions']:
+                if option['id']=='allow_all':option['currentValue']='off'
         reply(message['id'],config)
     elif method=='session/set_mode':
         reply(message['id'],{})
@@ -252,7 +261,11 @@ for line in sys.stdin:
             text(active,'assistant-'+str(turn),'A');text(active,'assistant-'+str(turn),'B')
             data=read();data[active].append(['assistant-'+str(turn),'AB',False])
             write(data)
-            reply(message['id'],{'stopReason':'end_turn','usage':{'inputTokens':17,'outputTokens':7,'cacheReadTokens':5,'cacheWriteTokens':2,'reasoningTokens':3}})
+            usage={'inputTokens':17,'outputTokens':7,'cacheReadTokens':5,'cacheWriteTokens':2,'reasoningTokens':3}
+            if '--no-auto-update' in sys.argv:
+                update(active,{'sessionUpdate':'usage_update','used':20482,'size':128000})
+                usage={'inputTokens':21608,'outputTokens':73,'totalTokens':21681,'thoughtTokens':53,'cachedReadTokens':0,'cachedWriteTokens':21598}
+            reply(message['id'],{'stopReason':'end_turn','usage':usage})
     elif method=='_session/steering':
         if pending is None:reply(message['id'],{'outcome':'promptRequired'});continue
         data=read(); data[active].append(['steer-'+str(turn),params['prompt'][0]['text'],True])

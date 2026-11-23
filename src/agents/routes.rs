@@ -1344,8 +1344,8 @@ async fn do_switch_mode(
     Ok(Json(content_envelope(json!({ "ok": true }))))
 }
 
-/// `{enabled, native}`: whether the session runs in the agent's own bypass
-/// mode, and that mode's native name. A bypass is never remembered as a
+/// `{enabled, native}`: the agent's own session permission bypass setting
+/// and its native name. A bypass is never remembered as a
 /// session default (`session_defaults::ELEVATING_MODES`).
 async fn auto_approve_state(
     manager: &super::manager::AgentManager,
@@ -4710,6 +4710,59 @@ mod tests {
                 "create allowed={allowed} {mode}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn copilot_autopilot_requires_owner_consent_for_creation_and_mode_switches() {
+        let mut state = state_with(vec![FakeAgent::new("copilot")]).await;
+        state.config.allow_remote_auto_approve = false;
+        let body = |mode: Option<&str>| CreateAgentSessionBody {
+            directory: None,
+            model: None,
+            mode: mode.map(str::to_owned),
+            agent_id: Some("copilot".into()),
+            auto_approve: None,
+        };
+        let asid = do_create_agent_session(&state, body(None), &device_headers())
+            .await
+            .unwrap()
+            .0["data"]["asid"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let autopilot = "https://agentclientprotocol.com/protocol/session-modes#autopilot";
+        assert_eq!(
+            do_set_auto_approve(&state, &asid, true, &device_headers())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_ne!(
+            do_set_auto_approve(&state, &asid, false, &device_headers())
+                .await
+                .err()
+                .map(|refusal| refusal.0),
+            Some(StatusCode::FORBIDDEN)
+        );
+        let refusal = do_switch_mode(&state, &asid, autopilot, &device_headers())
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            do_create_agent_session(&state, body(Some(autopilot)), &device_headers())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        state.config.allow_remote_auto_approve = true;
+        let _ = do_switch_mode(&state, &asid, autopilot, &device_headers())
+            .await
+            .unwrap();
+        let _ = do_create_agent_session(&state, body(Some(autopilot)), &device_headers())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

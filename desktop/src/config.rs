@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use muqun_gateway::agents::compose::RuntimeSettings;
 use muqun_gateway::agents::runtime::LocalAgentConfigs;
 use muqun_gateway::agents::{
-    AntigravityConfig, ClaudeConfig, CodexConfig, CursorConfig, DeepseekConfig, FxConfig,
-    OpencodeConfig, PiConfig, QoderConfig, T3Config,
+    AntigravityConfig, ClaudeConfig, CodexConfig, CopilotConfig, CursorConfig, DeepseekConfig,
+    FxConfig, OpencodeConfig, PiConfig, QoderConfig, T3Config,
 };
 use serde::{Deserialize, Serialize};
 
@@ -249,6 +249,7 @@ pub struct AgentConfigs {
     pub t3: T3Config,
     pub fx: FxConfig,
     pub qoder: QoderConfig,
+    pub copilot: CopilotConfig,
     pub pi: PiConfig,
     pub claude: ClaudeConfig,
     pub antigravity: AntigravityConfig,
@@ -263,6 +264,7 @@ impl AgentConfigs {
             deepseek: self.deepseek.clone(),
             t3: self.t3.clone(),
             local: LocalAgentConfigs {
+                copilot: self.copilot.clone(),
                 codex: self.codex.clone(),
                 fx: self.fx.clone(),
                 qoder: self.qoder.clone(),
