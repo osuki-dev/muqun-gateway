@@ -388,11 +388,7 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
             }
         }
         super::TileContent::Terminal => {
-            head = head.child(
-                rune::icon(&super::terminal_panel::TERMINAL_WINDOW, 16.0)
-                    .color(k.c.icon_muted)
-                    .help(tr_ref(language, "Drag to move")),
-            );
+            head = head.child(super::terminal_panel::tile_header_tabs(s, k, Some(i)));
         }
         super::TileContent::Diff(path) => {
             head = head
@@ -478,16 +474,13 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
     };
     let mut head = row()
         .key("tile-head")
+        .w_full()
         .h(HEAD_H)
         .pr(6.0)
         .gap(4.0)
         .center_y()
-        .hover_group();
-    head = if matches!(content, super::TileContent::Terminal) {
-        head.child(drag_area.w(28.0).grow(0.0).pl(4.0))
-    } else {
-        head.w_full().child(drag_area)
-    };
+        .hover_group()
+        .child(drag_area);
     // Move and close: visible under the pointer, always reachable by menu.
     let menu_open = s.menu == Some(OpenMenu::Tile(i));
     let mut menu = Menu::new(format!("tile-menu-{i}"))
@@ -549,20 +542,64 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
             ));
         }
         super::TileContent::Terminal => {
-            menu = menu.item(MenuItem::new(tr(language, "Show only this one")).on_select(
-                move |s: &mut UiState| {
-                    if i < s.tiles.len() {
-                        s.focus_tile(i);
-                    }
-                    let mut j = s.tiles.len();
-                    while j > 0 {
-                        j -= 1;
-                        if j != s.focus && s.tiles.len() > 1 {
-                            s.close_tile(j);
+            menu = menu
+                .item(
+                    MenuItem::new(tr(language, "New terminal tab"))
+                        .icon(&super::icons::PLUS)
+                        .shortcut("Ctrl+Shift+T")
+                        .on_select_tx(move |s: &mut UiState, tx: &mut Tx| {
+                            s.focus_terminal_tile_tx(Some(i), tx);
+                            s.term_new_tab();
+                            s.focus_terminal_tx(tx);
+                        }),
+                )
+                .item(
+                    MenuItem::new(tr(language, "Switch terminal to session folder"))
+                        .icon(&rune_kit::glyphs::FOLDER)
+                        .on_select_tx(move |s: &mut UiState, tx: &mut Tx| {
+                            s.focus_terminal_tile_tx(Some(i), tx);
+                            s.term_sync_cwd();
+                            s.focus_terminal_tx(tx);
+                        }),
+                )
+                .item(
+                    MenuItem::new(tr(language, "Restart terminal"))
+                        .icon(&super::icons::REFRESH)
+                        .on_select_tx(move |s: &mut UiState, tx: &mut Tx| {
+                            s.focus_terminal_tile_tx(Some(i), tx);
+                            s.restart_terminal();
+                            s.focus_terminal_tx(tx);
+                        }),
+                )
+                .separator()
+                .item(
+                    MenuItem::new(tr(language, "Open as Full-Screen Page")).on_select(
+                        move |s: &mut UiState| {
+                            s.switch_plugin_surface("terminal", crate::plugin::PluginSlot::Page);
+                        },
+                    ),
+                )
+                .item(
+                    MenuItem::new(tr(language, "Move to Right Drawer")).on_select(
+                        move |s: &mut UiState| {
+                            s.switch_plugin_surface("terminal", crate::plugin::PluginSlot::Drawer);
+                        },
+                    ),
+                )
+                .item(MenuItem::new(tr(language, "Show only this one")).on_select(
+                    move |s: &mut UiState| {
+                        if i < s.tiles.len() {
+                            s.focus_tile(i);
                         }
-                    }
-                },
-            ));
+                        let mut j = s.tiles.len();
+                        while j > 0 {
+                            j -= 1;
+                            if j != s.focus && s.tiles.len() > 1 {
+                                s.close_tile(j);
+                            }
+                        }
+                    },
+                ));
         }
         super::TileContent::Custom { kind, .. } => {
             let kind_page = kind.clone();
@@ -653,7 +690,7 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
                 .on_select(|s: &mut UiState| s.unsplit()),
         );
     let menu = menu.build(k, layer);
-    head = head.child(if menu_open {
+    head = head.child(if menu_open || popped {
         menu
     } else {
         menu.group_opacity(0.0, 1.0)
@@ -661,6 +698,7 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
     let plugin_id = match content {
         super::TileContent::Custom { kind, .. } => Some(kind.as_str()),
         super::TileContent::Diff(_) => Some("diff"),
+        super::TileContent::Terminal => Some("terminal"),
         _ => None,
     };
     if let Some(plugin_id) = plugin_id {
@@ -1111,15 +1149,13 @@ fn tile(
             }
         });
     body = look.panel(k, body, radius);
-    if !t.is_terminal() {
-        body = body.child(header(s, k, look, i, place, layer)).child(
-            el().key("tile-rule")
-                .w_full()
-                .h(1.0)
-                .fill(k.c.border_muted)
-                .a11y_hidden(),
-        );
-    }
+    body = body.child(header(s, k, look, i, place, layer)).child(
+        el().key("tile-rule")
+            .w_full()
+            .h(1.0)
+            .fill(k.c.border_muted)
+            .a11y_hidden(),
+    );
     match (&t.content, focused) {
         (super::TileContent::Empty, _) => body = body.child(picker(s, k, look, i)),
         (super::TileContent::Terminal, _) => {
@@ -1128,15 +1164,13 @@ fn tile(
             } else {
                 crate::theme::color_scheme::ColorScheme::Light
             };
-            let controls = header(s, k, look, i, place, layer);
-            body = body.child(super::terminal_panel::tile_body_with_controls(
+            body = body.child(super::terminal_panel::tile_body_only(
                 s,
                 k,
                 scheme,
                 scale,
                 layer,
                 Some(i),
-                Some(controls),
             ));
         }
         (super::TileContent::Custom { id, kind, .. }, _) => {

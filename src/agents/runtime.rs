@@ -685,6 +685,10 @@ impl AgentRuntime {
         let _ = self.route_store.set(db);
     }
 
+    pub(super) fn store(&self) -> Option<Arc<crate::platform::store::sqlite::SqliteStore>> {
+        self.route_store.get().cloned()
+    }
+
     async fn store_route(&self, asid: &str, agent_id: Option<&str>) {
         let Some(db) = self.route_store.get() else {
             return;

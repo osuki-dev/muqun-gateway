@@ -1570,15 +1570,34 @@ async fn do_send_agent_prompt(
         device_id: caller.device_id,
         name: caller.name,
     };
-    manager
+    let asid_id = AgentSessionId(asid.to_string());
+    // If the prompt was held in the session's Steer/Queue inbox rather than
+    // delivered immediately, record only its pending origin so we never emit
+    // a premature user bubble in the timeline while the item is still queued.
+    let mut queued_in_inbox = manager
         .mirror()
-        .present_user_prompt(
-            &AgentSessionId(asid.to_string()),
-            &body.text,
-            origin,
-            native_message_id.as_deref(),
-        )
+        .has_queued_prompt(&asid_id, &body.text, native_message_id.as_deref())
         .await;
+    if !queued_in_inbox && body.delivery.is_some() {
+        if let Ok(live_inbox) = manager.agent().get_inbox(asid).await {
+            queued_in_inbox = super::adapters::memory_mirror::inbox_contains_prompt(
+                &live_inbox,
+                &body.text,
+                native_message_id.as_deref(),
+            );
+        }
+    }
+    if queued_in_inbox {
+        manager
+            .mirror()
+            .record_queued_origin(&asid_id, &body.text, origin)
+            .await;
+    } else {
+        manager
+            .mirror()
+            .present_user_prompt(&asid_id, &body.text, origin, native_message_id.as_deref())
+            .await;
+    }
 
     let mut accepted = json!({ "submitted": true });
     if let Some(client_ref) = body.client_ref {

@@ -716,11 +716,13 @@ pub struct AcpDriver<P: AcpProvider> {
     skills_observed: AtomicBool,
     launch: StdMutex<Option<AcpLaunch>>,
     /// Sessions whose child is launched with the provider's bypass flag
-    /// (`P::LAUNCH_BYPASS`). In memory: a restart of the Gateway forgets it.
+    /// (`P::LAUNCH_BYPASS`). Backed by `acp_launch_bypass` in SQLite when
+    /// `persist_launch_bypass` is attached so per-session choices survive restarts.
     launch_bypass: StdMutex<HashSet<String>>,
+    launch_bypass_store: std::sync::OnceLock<Arc<crate::platform::store::sqlite::SqliteStore>>,
     /// App-facing asid → current ACP `sessionId` after an empty launch-bypass
     /// rebind. Later `session/load`s must use the native id; the App keeps
-    /// the original asid. Forgotten when the Gateway restarts.
+    /// the original asid.
     native_ids: StdMutex<HashMap<String, String>>,
     mcp_servers: StdMutex<Value>,
     terminal: StdMutex<Option<Arc<dyn TerminalBridge>>>,
@@ -751,6 +753,23 @@ pub struct AcpDriver<P: AcpProvider> {
 fn is_auth_required(error: &str) -> bool {
     error.contains("ACP request rejected (code -32000)")
 }
+
+/// Maximum remembered per-session launch-bypass flags per ACP agent.
+const MAX_LAUNCH_BYPASS: usize = 4096;
+
+/// Persisted per-session launch-bypass flags (`P::LAUNCH_BYPASS`), so enabling
+/// auto-approve on an existing Antigravity/Cursor/FX session survives Gateway
+/// and Desktop restarts without altering defaults for newly created sessions.
+pub(crate) const LAUNCH_BYPASS_MIGRATION: crate::platform::store::sqlite::Migration =
+    crate::platform::store::sqlite::Migration {
+        namespace: "acp_launch_bypass",
+        steps: &["CREATE TABLE acp_launch_bypass (
+            agent_id TEXT NOT NULL,
+            asid TEXT NOT NULL,
+            updated_ms INTEGER NOT NULL,
+            PRIMARY KEY (agent_id, asid)
+        );"],
+    };
 
 fn unsupported<'a, T: Send + 'a>(feature: &'static str) -> AgentFuture<'a, T> {
     Box::pin(async move { Err(AgentError::Unsupported(feature.into())) })
@@ -865,6 +884,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             skills_observed: AtomicBool::new(false),
             launch: StdMutex::new(None),
             launch_bypass: StdMutex::new(HashSet::new()),
+            launch_bypass_store: std::sync::OnceLock::new(),
             native_ids: StdMutex::new(HashMap::new()),
             mcp_servers: StdMutex::new(json!([])),
             terminal: StdMutex::new(None),
@@ -890,6 +910,80 @@ impl<P: AcpProvider> AcpDriver<P> {
     /// Keep the ids of Gateway-created sessions in `path` across restarts.
     pub fn set_owned_store(&self, path: std::path::PathBuf) {
         *self.owned.lock().unwrap() = OwnedSessions::load(path);
+    }
+
+    /// Load persisted per-session launch-bypass flags from SQLite and remember
+    /// `db` so subsequent toggles survive restarts.
+    pub(crate) async fn persist_launch_bypass(
+        &self,
+        db: Arc<crate::platform::store::sqlite::SqliteStore>,
+    ) {
+        if P::LAUNCH_BYPASS.is_none() {
+            return;
+        }
+        let agent = P::KIND;
+        let loaded = db
+            .call(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT asid FROM acp_launch_bypass WHERE agent_id=?1 ORDER BY updated_ms DESC LIMIT ?2",
+                )?;
+                let ids: Vec<String> = stmt
+                    .query_map(rusqlite::params![agent, MAX_LAUNCH_BYPASS as i64], |row| {
+                        row.get(0)
+                    })?
+                    .collect::<Result<_, _>>()?;
+                Ok(ids)
+            })
+            .await;
+        match loaded {
+            Ok(ids) => {
+                let mut flags = self.launch_bypass.lock().unwrap();
+                for id in ids {
+                    flags.insert(id);
+                }
+            }
+            Err(error) => tracing::warn!(
+                agent = P::KIND,
+                "ACP launch-bypass flags could not be loaded: {error:#}"
+            ),
+        }
+        let _ = self.launch_bypass_store.set(db);
+    }
+
+    async fn save_launch_bypass(&self, id: &str, enabled: bool) {
+        let Some(db) = self.launch_bypass_store.get() else {
+            return;
+        };
+        let agent = P::KIND;
+        let asid = id.to_owned();
+        let written = db
+            .call(move |conn| {
+                if enabled {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO acp_launch_bypass(agent_id, asid, updated_ms) VALUES(?1, ?2, ?3)",
+                        rusqlite::params![agent, asid, crate::tasks::domain::now_ms() as i64],
+                    )?;
+                    conn.execute(
+                        "DELETE FROM acp_launch_bypass WHERE agent_id=?1 AND asid NOT IN (SELECT asid FROM acp_launch_bypass WHERE agent_id=?1 ORDER BY updated_ms DESC LIMIT ?2)",
+                        rusqlite::params![agent, MAX_LAUNCH_BYPASS as i64],
+                    )?;
+                } else {
+                    conn.execute(
+                        "DELETE FROM acp_launch_bypass WHERE agent_id=?1 AND asid=?2",
+                        rusqlite::params![agent, asid],
+                    )?;
+                }
+                Ok(())
+            })
+            .await;
+        if let Err(error) = written {
+            tracing::warn!(
+                agent = P::KIND,
+                asid = id,
+                enabled,
+                "ACP launch-bypass flag could not be saved: {error:#}"
+            );
+        }
     }
 
     fn launch_bypassed(&self, id: &str) -> bool {
@@ -919,6 +1013,16 @@ impl<P: AcpProvider> AcpDriver<P> {
         let Some(session) = live else {
             // No child to change: the flag applies to the next launch.
             set(enabled);
+            let mapped = self.native_ids.lock().unwrap().get(id).cloned();
+            if enabled {
+                let disk_id = mapped.as_deref().unwrap_or(id);
+                self.save_launch_bypass(disk_id, true).await;
+            } else {
+                self.save_launch_bypass(id, false).await;
+                if let Some(native) = mapped.filter(|n| n != id) {
+                    self.save_launch_bypass(&native, false).await;
+                }
+            }
             return Ok(());
         };
         let busy = || {
@@ -983,6 +1087,20 @@ impl<P: AcpProvider> AcpDriver<P> {
             };
         if restarted.is_err() {
             set(!enabled);
+        } else {
+            let mapped = self.native_ids.lock().unwrap().get(id).cloned();
+            if enabled {
+                let disk_id = mapped.as_deref().unwrap_or(id);
+                self.save_launch_bypass(disk_id, true).await;
+                if disk_id != id {
+                    self.save_launch_bypass(id, false).await;
+                }
+            } else {
+                self.save_launch_bypass(id, false).await;
+                if let Some(native) = mapped.filter(|n| n != id) {
+                    self.save_launch_bypass(&native, false).await;
+                }
+            }
         }
         restarted
     }
@@ -1004,10 +1122,25 @@ impl<P: AcpProvider> AcpDriver<P> {
             state.owned_mutations = true;
             native
         };
-        self.native_ids
+        let previous_native = self
+            .native_ids
             .lock()
             .unwrap()
             .insert(app_id.to_owned(), native_id.clone());
+        if let Some(prev) = previous_native.filter(|p| p != &native_id) {
+            self.save_launch_bypass(&prev, false).await;
+        }
+        if self.launch_bypassed(app_id) {
+            self.save_launch_bypass(&native_id, true).await;
+            if native_id != app_id {
+                self.save_launch_bypass(app_id, false).await;
+            }
+        } else {
+            self.save_launch_bypass(&native_id, false).await;
+            if native_id != app_id {
+                self.save_launch_bypass(app_id, false).await;
+            }
+        }
         if native_id != app_id {
             {
                 let mut sessions = self.sessions.lock().unwrap();
@@ -4837,7 +4970,8 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             let session = opened?;
             if launch_bypass {
                 let id = session.state.lock().await.info.asid.0.clone();
-                self.launch_bypass.lock().unwrap().insert(id);
+                self.launch_bypass.lock().unwrap().insert(id.clone());
+                self.save_launch_bypass(&id, true).await;
             }
             if let Some(model) = model {
                 if let Err(error) = self.select_model(&session, model).await {
@@ -5322,6 +5456,13 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             self.dormant.lock().unwrap().remove(id);
             self.owned.lock().unwrap().forget(id);
             self.instructions.lock().unwrap().remove(id);
+            self.launch_bypass.lock().unwrap().remove(id);
+            let mapped_native = self.native_ids.lock().unwrap().remove(id);
+            self.save_launch_bypass(id, false).await;
+            if let Some(native) = mapped_native.filter(|n| n != id) {
+                self.launch_bypass.lock().unwrap().remove(&native);
+                self.save_launch_bypass(&native, false).await;
+            }
             if let Some(metadata) = self.session_metadata.lock().await.as_mut() {
                 metadata.sessions.remove(id);
             }

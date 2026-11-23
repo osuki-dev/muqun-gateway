@@ -258,7 +258,7 @@ impl UiState {
                 BusyDelivery::Queue
             };
             if let Some(index) = echoes.iter().position(|e| {
-                e.delivery == Some(mode)
+                (e.delivery == Some(mode) || e.delivery.is_none())
                     && e.inbox_id.is_none()
                     && e.state != EchoState::Failed
                     && e.says(words(&item.text))
@@ -269,6 +269,7 @@ impl UiState {
                             .map(String::as_str)
                             .eq(item.files.iter().map(|f| f.path.as_str())))
             }) {
+                echoes[index].delivery = Some(mode);
                 echoes[index].inbox_id = Some(item.id.clone());
                 for (other, echo) in echoes.iter_mut().enumerate() {
                     if other != index {
@@ -745,5 +746,33 @@ mod tests {
         s.on_composer(ComposerUpdate::Submitted { token, ok: false });
         assert_eq!(s.echoes_of("s1")[0].state, EchoState::Failed);
         assert_eq!(s.draft.text, "next thought");
+    }
+
+    #[test]
+    fn stale_non_busy_echo_is_adopted_into_inbox_and_removed_from_timeline_echoes() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let id = "s-stale";
+        s.timelines.entry(id.into()).or_default().replace(vec![]);
+        // Sent while local `busy` flag lagged behind (`delivery: None`).
+        s.echo_sent(id, 1, "wait your turn".into(), &[], None);
+        assert_eq!(s.timeline_echoes(id).count(), 1);
+        // Gateway announces the item is actually queued in the Steer inbox.
+        s.echo_inbox(
+            id,
+            &[crate::model::compose::InboxItem {
+                id: "inbox_99".into(),
+                text: "wait your turn".into(),
+                steer: true,
+                files: vec![],
+            }],
+        );
+        assert_eq!(
+            s.timeline_echoes(id).count(),
+            0,
+            "once held in inbox, echo must not stay in timeline_echoes"
+        );
+        assert_eq!(s.echoes_of(id)[0].delivery, Some(BusyDelivery::Steer));
+        assert_eq!(s.echoes_of(id)[0].inbox_id.as_deref(), Some("inbox_99"));
     }
 }

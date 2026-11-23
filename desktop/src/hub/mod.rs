@@ -43,10 +43,10 @@ pub enum OrchestrationRequest {
     List,
     Read(String),
     Start(serde_json::Value),
-    ExecutePlan {
+    AskAdvisor {
         run: String,
-        overrides: serde_json::Value,
-        use_worktrees: Option<bool>,
+        question: Option<String>,
+        agent: Option<String>,
     },
     Approve(String),
     Rework {

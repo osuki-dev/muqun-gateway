@@ -122,6 +122,9 @@ impl FxState {
         driver.set_idle_timeout(std::time::Duration::from_secs(
             self.config.idle_timeout_secs.max(1),
         ));
+        if let Some(db) = runtime.store() {
+            driver.persist_launch_bypass(db).await;
+        }
         let _ = self.driver.set(driver);
         runtime.install("fx", manager, AgentOrigin::None).await;
         true

@@ -36,6 +36,15 @@ fn default_surface(plugin: &dyn DesktopPlugin) -> Option<PluginSlot> {
         .find(|slot| plugin.supports_surface(*slot))
 }
 
+fn surface_label(slot: PluginSlot, language: Language) -> &'static str {
+    match slot {
+        PluginSlot::Page => tr_ref(language, "Page"),
+        PluginSlot::Drawer => tr_ref(language, "Dock"),
+        PluginSlot::Tile => tr_ref(language, "Tile"),
+        _ => "",
+    }
+}
+
 fn card(s: &UiState, k: &Kit, plugin: &dyn DesktopPlugin, width: f32) -> El {
     let language = s.cfg.general.language;
     let id = plugin.id();
@@ -44,135 +53,140 @@ fn card(s: &UiState, k: &Kit, plugin: &dyn DesktopPlugin, width: f32) -> El {
     let category = plugin.category();
     let toggle_id = id.to_owned();
     let title = plugin.title(language);
-    let mut identity = row().w_full().min_w(0.0).gap(6.0).center_y().child(
-        text(id.to_owned())
-            .font(k.ty.mono)
-            .color(k.c.text_faint)
-            .grow(1.0)
-            .shrink()
-            .min_w(0.0)
-            .truncate()
-            .help_when_truncated(id),
-    );
-    if let Some(version) = s.plugins.managed_versions.get(id) {
-        identity = identity.child(
-            text(format!("v{version}"))
-                .font(k.ty.small)
-                .color(k.c.text_faint),
-        );
+    let version = s.plugins.managed_versions.get(id);
+
+    let mut sub_parts = vec![category.label(language).to_owned()];
+    if let Some(v) = version {
+        sub_parts.push(format!("v{v}"));
+    } else {
+        sub_parts.push(id.to_owned());
     }
-    let mut body = col()
-        .key(format!("plugin-{id}"))
-        .w(width)
+    let subtitle_line = sub_parts.join(" · ");
+
+    let icon_badge = el()
+        .size(34.0, 34.0)
+        .radius(k.radius.md)
+        .fill(if enabled {
+            k.c.bg_accent.alpha(0.11)
+        } else {
+            k.c.layer_02
+        })
+        .border(
+            1.0,
+            if enabled {
+                k.c.bg_accent.alpha(0.28)
+            } else {
+                k.c.border_weak
+            },
+        )
+        .center()
+        .child(plugin.render_icon(
+            s,
+            17.0,
+            if enabled {
+                k.c.text_accent
+            } else {
+                k.c.icon_muted
+            },
+        ));
+
+    let header = row()
+        .w_full()
         .min_w(0.0)
-        .min_h(230.0)
-        .px(16.0)
-        .py(16.0)
         .gap(10.0)
-        .radius(k.radius.lg)
-        .fill(k.c.layer_01)
-        .border(1.0, k.c.border_weak)
+        .center_y()
+        .child(icon_badge)
         .child(
-            row()
-                .w_full()
+            col()
+                .grow(1.0)
+                .shrink()
                 .min_w(0.0)
-                .gap(10.0)
-                .items_start()
-                .child(plugin.render_icon(s, 22.0, k.c.icon_muted))
+                .gap(2.0)
                 .child(
                     text(&title)
                         .font(k.ty.ui_medium)
-                        .color(k.c.text_base)
-                        .grow(1.0)
-                        .shrink()
-                        .min_w(0.0)
-                        .wrap(),
+                        .color(if enabled {
+                            k.c.text_base
+                        } else {
+                            k.c.text_muted
+                        })
+                        .single_line()
+                        .truncate()
+                        .help_when_truncated(&title),
                 )
-                .child(super::super::flag_disabled(
-                    k,
-                    &format!("plugin-{id}"),
-                    enabled,
-                    &format!(
-                        "{}: {}",
-                        title,
-                        tr_ref(language, if always { "Always on" } else { "Enabled" })
-                    ),
-                    always,
-                    move |s| {
-                        s.edit(ConfigEdit::PluginEnabled {
-                            plugin: toggle_id.clone(),
-                            on: !is_enabled(&toggle_id, &s.cfg.plugins_disabled),
-                        });
-                    },
-                )),
+                .child(
+                    text(subtitle_line)
+                        .font(k.ty.small)
+                        .color(k.c.text_faint)
+                        .single_line()
+                        .truncate(),
+                ),
         )
-        .child(identity);
-    if let Some(description) = plugin
+        .child(super::super::flag_disabled(
+            k,
+            &format!("plugin-{id}"),
+            enabled,
+            &format!(
+                "{}: {}",
+                title,
+                tr_ref(language, if always { "Always on" } else { "Enabled" })
+            ),
+            always,
+            move |s| {
+                s.edit(ConfigEdit::PluginEnabled {
+                    plugin: toggle_id.clone(),
+                    on: !is_enabled(&toggle_id, &s.cfg.plugins_disabled),
+                });
+            },
+        ));
+
+    let desc_text = plugin
         .description(language)
         .filter(|text| !text.trim().is_empty())
-    {
-        body = body.child(
-            text(description)
-                .font(k.ty.small)
-                .color(k.c.text_muted)
-                .w_full()
-                .wrap(),
-        );
+        .unwrap_or_default();
+
+    let mut tags = row().gap(4.0).center_y().flex_wrap().grow(1.0).min_w(0.0);
+    let kw = plugin.keywords();
+    if !kw.is_empty() {
+        for (index, keyword) in kw.iter().take(2).enumerate() {
+            tags = tags.child(
+                el().key(format!("plugin-keyword-{id}-{index}"))
+                    .px(6.0)
+                    .py(2.0)
+                    .radius(k.radius.sm)
+                    .fill(k.c.layer_02)
+                    .child(
+                        text(keyword)
+                            .font(k.ty.small)
+                            .color(k.c.text_muted)
+                            .single_line()
+                            .truncate(),
+                    ),
+            );
+        }
+    } else {
+        for slot in [PluginSlot::Page, PluginSlot::Drawer, PluginSlot::Tile] {
+            if plugin.supports_surface(slot) {
+                let lbl = surface_label(slot, language);
+                if !lbl.is_empty() {
+                    tags = tags.child(
+                        el().px(6.0)
+                            .py(2.0)
+                            .radius(k.radius.sm)
+                            .fill(k.c.layer_02)
+                            .child(
+                                text(lbl)
+                                    .font(k.ty.small)
+                                    .color(k.c.text_faint)
+                                    .single_line(),
+                            ),
+                    );
+                }
+            }
+        }
     }
-    let mut metadata = row()
-        .w_full()
-        .min_w(0.0)
-        .gap(4.0)
-        .flex_wrap()
-        .center_y()
-        .child(
-            super::super::button(category.label(language))
-                .variant(ButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .on_press(move |s: &mut UiState| s.plugin_category = Some(category))
-                .build(k)
-                .key(format!("plugin-category-{id}")),
-        );
-    for (index, keyword) in plugin.keywords().iter().take(3).enumerate() {
-        metadata = metadata.child(
-            col()
-                .key(format!("plugin-keyword-{id}-{index}"))
-                .max_w((width - 32.0).clamp(0.0, 140.0))
-                .px(6.0)
-                .py(3.0)
-                .radius(k.radius.sm)
-                .fill(k.c.text_base.alpha(0.05))
-                .child(
-                    text(keyword)
-                        .font(k.ty.small)
-                        .color(k.c.text_muted)
-                        .min_w(0.0)
-                        .shrink()
-                        .truncate()
-                        .help_when_truncated(keyword),
-                ),
-        );
-    }
-    if plugin.keywords().len() > 3 {
-        metadata = metadata.child(
-            text(format!("+{}", plugin.keywords().len() - 3))
-                .font(k.ty.small)
-                .color(k.c.text_faint)
-                .help(plugin.keywords()[3..].join(", ")),
-        );
-    }
-    body = body.child(metadata).child(el().grow(1.0));
-    let mut actions = row().w_full().min_w(0.0).gap(6.0).center_y().flex_wrap();
-    if let Some(slot) = default_surface(plugin) {
-        let open_id = id.to_owned();
-        actions = actions.child(
-            super::super::button(tr_ref(language, "Open"))
-                .disabled(!enabled)
-                .on_press(move |s: &mut UiState| s.switch_plugin_surface(&open_id, slot))
-                .build(k)
-                .key(format!("plugin-open-{id}")),
-        );
-    }
+
+    let mut actions = row().gap(4.0).center_y();
     if let Some(repository) = plugin.repository() {
         let url = repository.source_url();
         let help = repository
@@ -182,6 +196,7 @@ fn card(s: &UiState, k: &Kit, plugin: &dyn DesktopPlugin, width: f32) -> El {
         actions = actions.child(
             super::super::button(tr_ref(language, "Source"))
                 .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
                 .help(help)
                 .on_press_tx(move |_: &mut UiState, tx| {
                     let _ = tx.open_url(&url);
@@ -198,6 +213,7 @@ fn card(s: &UiState, k: &Kit, plugin: &dyn DesktopPlugin, width: f32) -> El {
             actions = actions.child(
                 super::super::button(tr_ref(language, label))
                     .variant(ButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
                     .disabled(s.plugin_packages.busy())
                     .on_press(move |s: &mut UiState| s.change_plugin_package(operation.clone()))
                     .build(k)
@@ -205,10 +221,92 @@ fn card(s: &UiState, k: &Kit, plugin: &dyn DesktopPlugin, width: f32) -> El {
             );
         }
     }
+    if let Some(slot) = default_surface(plugin) {
+        let open_id = id.to_owned();
+        actions = actions.child(
+            super::super::button(tr_ref(language, "Open"))
+                .variant(ButtonVariant::Neutral)
+                .control_size(ControlSize::Small)
+                .disabled(!enabled)
+                .on_press(move |s: &mut UiState| s.switch_plugin_surface(&open_id, slot))
+                .build(k)
+                .key(format!("plugin-open-{id}")),
+        );
+    }
+
+    let mut body = col()
+        .key(format!("plugin-{id}"))
+        .w(width)
+        .min_w(0.0)
+        .px(14.0)
+        .py(13.0)
+        .gap(10.0)
+        .radius(k.radius.lg)
+        .fill(if enabled {
+            k.c.layer_01
+        } else {
+            k.c.layer_01.alpha(0.55)
+        })
+        .border(
+            1.0,
+            if enabled {
+                k.c.border_weak
+            } else {
+                k.c.border_weak.alpha(0.6)
+            },
+        )
+        .child(header);
+
+    if !desc_text.is_empty() {
+        body = body.child(
+            text(desc_text)
+                .font(k.ty.small)
+                .color(k.c.text_muted)
+                .w_full()
+                .min_h(32.0)
+                .wrap(),
+        );
+    }
     if let Some(progress) = super::progress::package_progress(s, k, id) {
         body = body.child(progress);
     }
-    body.child(actions)
+    body.child(el().grow(1.0))
+        .child(el().w_full().h(1.0).fill(k.c.border_weak.alpha(0.55)))
+        .child(
+            row()
+                .w_full()
+                .min_w(0.0)
+                .gap(8.0)
+                .center_y()
+                .child(tags)
+                .child(actions),
+        )
+}
+
+fn section_grid(
+    s: &UiState,
+    k: &Kit,
+    key: &str,
+    items: &[&std::sync::Arc<dyn DesktopPlugin>],
+    columns: usize,
+    card_width: f32,
+) -> El {
+    let mut grid = col().key(key).w_full().min_w(0.0).gap(GAP);
+    for (index, line) in items.chunks(columns).enumerate() {
+        grid = grid.child(
+            row()
+                .key(format!("{key}-row-{index}"))
+                .w_full()
+                .min_w(0.0)
+                .gap(GAP)
+                .items_stretch()
+                .children(
+                    line.iter()
+                        .map(|plugin| card(s, k, plugin.as_ref(), card_width)),
+                ),
+        );
+    }
+    grid
 }
 
 pub(super) fn catalog(s: &UiState, k: &Kit) -> El {
@@ -216,7 +314,7 @@ pub(super) fn catalog(s: &UiState, k: &Kit) -> El {
     let width = rune::memo::layout_with("plugins-grid", |rect| rect[2])
         .unwrap_or(super::super::INNER_W.get())
         .max(0.0);
-    let columns = if width >= 1180.0 {
+    let columns = if width >= 1060.0 {
         3
     } else if width >= 620.0 {
         2
@@ -231,14 +329,19 @@ pub(super) fn catalog(s: &UiState, k: &Kit) -> El {
             plugin.title(language).to_lowercase(),
         )
     });
-    let visible: Vec<_> = plugins
+    let search_matched: Vec<_> = plugins
         .iter()
+        .filter(|plugin| matches_search(plugin.as_ref(), language, &s.plugin_query.text))
+        .collect();
+    let visible: Vec<_> = search_matched
+        .iter()
+        .copied()
         .filter(|plugin| {
             s.plugin_category
                 .is_none_or(|category| plugin.category() == category)
-                && matches_search(plugin.as_ref(), language, &s.plugin_query.text)
         })
         .collect();
+
     let mut search = TextInput::new(&s.plugin_query)
         .label(tr_ref(language, "Search plugins"))
         .placeholder(tr_ref(language, "Search plugins"))
@@ -249,14 +352,24 @@ pub(super) fn catalog(s: &UiState, k: &Kit) -> El {
     if !s.plugin_query.text.is_empty() {
         search = search.clear_button();
     }
-    let mut filters = row().w_full().gap(4.0).flex_wrap().center_y();
+
+    let mut filters = row().gap(4.0).flex_wrap().center_y();
     for category in std::iter::once(None).chain(PluginCategory::ALL.into_iter().map(Some)) {
         let selected = s.plugin_category == category;
-        let label = category.map_or(tr_ref(language, "All"), |category| category.label(language));
+        let count = search_matched
+            .iter()
+            .filter(|p| category.is_none_or(|c| p.category() == c))
+            .count();
+        let base_label = category.map_or(tr_ref(language, "All"), |c| c.label(language));
+        let label = if count > 0 {
+            format!("{base_label} · {count}")
+        } else {
+            base_label.to_owned()
+        };
         filters = filters.child(
-            super::super::button(label)
+            super::super::button(&label)
                 .variant(if selected {
-                    ButtonVariant::Outline
+                    ButtonVariant::Neutral
                 } else {
                     ButtonVariant::GhostMuted
                 })
@@ -270,23 +383,25 @@ pub(super) fn catalog(s: &UiState, k: &Kit) -> El {
                 )),
         );
     }
-    let mut grid = col().key("plugins-grid").w_full().min_w(0.0).gap(GAP);
-    for (index, line) in visible.chunks(columns).enumerate() {
-        grid = grid.child(
-            row()
-                .key(format!("plugins-grid-row-{index}"))
-                .w_full()
-                .min_w(0.0)
-                .gap(GAP)
-                .items_stretch()
-                .children(
-                    line.iter()
-                        .map(|plugin| card(s, k, plugin.as_ref(), card_width)),
-                ),
-        );
-    }
+
+    // Unified single-row filter & search toolbar.
+    let toolbar = row()
+        .w_full()
+        .min_w(0.0)
+        .gap(10.0)
+        .center_y()
+        .flex_wrap()
+        .child(
+            el().grow(1.0)
+                .min_w(200.0)
+                .max_w(320.0)
+                .child(search.build(k).w_full().key("plugin-search")),
+        )
+        .child(filters);
+
+    let mut content = col().key("plugins-grid").w_full().min_w(0.0).gap(16.0);
     if visible.is_empty() {
-        grid = grid.child(super::super::empty(
+        content = content.child(super::super::empty(
             k,
             "plugins-empty",
             tr_ref(
@@ -306,7 +421,78 @@ pub(super) fn catalog(s: &UiState, k: &Kit) -> El {
                 },
             ),
         ));
+    } else if s.plugin_category.is_none() {
+        let extensions: Vec<_> = visible
+            .iter()
+            .copied()
+            .filter(|p| {
+                matches!(p.category(), PluginCategory::Extensions)
+                    || s.plugins.managed_versions.contains_key(p.id())
+            })
+            .collect();
+        let builtins: Vec<_> = visible
+            .iter()
+            .copied()
+            .filter(|p| {
+                !matches!(p.category(), PluginCategory::Extensions)
+                    && !s.plugins.managed_versions.contains_key(p.id())
+            })
+            .collect();
+        if !extensions.is_empty() {
+            content = content
+                .child(super::super::group_head(
+                    k,
+                    tr_ref(language, "Extensions"),
+                    Some(
+                        text(format!("{}", extensions.len()))
+                            .font(k.ty.small)
+                            .color(k.c.text_faint),
+                    ),
+                ))
+                .child(section_grid(
+                    s,
+                    k,
+                    "plugins-grid-ext",
+                    &extensions,
+                    columns,
+                    card_width,
+                ));
+        }
+        if !builtins.is_empty() {
+            content = content
+                .child(super::super::group_head(
+                    k,
+                    tr_ref(language, "Built-in modules"),
+                    Some(
+                        text(format!("{}", builtins.len()))
+                            .font(k.ty.small)
+                            .color(k.c.text_faint),
+                    ),
+                ))
+                .child(section_grid(
+                    s,
+                    k,
+                    "plugins-grid-builtin",
+                    &builtins,
+                    columns,
+                    card_width,
+                ));
+        }
+    } else {
+        content = content.child(section_grid(
+            s,
+            k,
+            "plugins-grid-cat",
+            &visible,
+            columns,
+            card_width,
+        ));
     }
+
+    let enabled_count = plugins
+        .iter()
+        .filter(|p| is_enabled(p.id(), &s.cfg.plugins_disabled))
+        .count();
     col()
         .key("plugins-list")
         .w_full()
@@ -316,14 +502,17 @@ pub(super) fn catalog(s: &UiState, k: &Kit) -> El {
             k,
             tr_ref(language, "Installed"),
             Some(
-                text(format!("{} / {}", visible.len(), plugins.len()))
-                    .font(k.ty.small)
-                    .color(k.c.text_muted),
+                text(format!(
+                    "{enabled_count} / {} {}",
+                    plugins.len(),
+                    tr_ref(language, "Enabled")
+                ))
+                .font(k.ty.small)
+                .color(k.c.text_muted),
             ),
         ))
-        .child(search.build(k).w_full().key("plugin-search"))
-        .child(filters)
-        .child(grid)
+        .child(toolbar)
+        .child(content)
 }
 
 #[cfg(test)]

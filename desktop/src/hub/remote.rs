@@ -601,34 +601,31 @@ impl SessionHub for RemoteHub {
                             obj.remove("auto_failover");
                         }
                     }
-                    if !self
-                        .has_capability("agent_orchestration_dag_v1")
-                        .await
-                        .unwrap_or(false)
-                    {
-                        if let Some(obj) = body.as_object_mut() {
-                            obj.remove("strategy");
-                            obj.remove("confirm_plan");
-                            obj.remove("use_worktrees");
-                        }
-                    }
                     self.call(Method::POST, &["api", "orchestrations"], &[], Some(body))
                         .await
                 }
-                super::OrchestrationRequest::ExecutePlan {
+                super::OrchestrationRequest::AskAdvisor {
                     run,
-                    overrides,
-                    use_worktrees,
+                    question,
+                    agent,
                 } => {
-                    let mut body = json!({ "overrides": overrides });
-                    if let Some(wt) = use_worktrees {
-                        body["use_worktrees"] = json!(wt);
+                    if !self.has_capability("agent_orchestration_router_v1").await? {
+                        return Err(HubError::Agent(AgentError::Unsupported(
+                            "This Gateway needs the intelligent orchestration router update".into(),
+                        )));
+                    }
+                    let mut map = serde_json::Map::new();
+                    if let Some(q) = question.filter(|q| !q.trim().is_empty()) {
+                        map.insert("question".into(), json!(q));
+                    }
+                    if let Some(a) = agent.filter(|a| !a.trim().is_empty()) {
+                        map.insert("agent".into(), json!(a));
                     }
                     self.call(
                         Method::POST,
-                        &["api", "orchestrations", &run, "execute"],
+                        &["api", "orchestrations", &run, "advisor"],
                         &[],
-                        Some(body),
+                        Some(Value::Object(map)),
                     )
                     .await
                 }

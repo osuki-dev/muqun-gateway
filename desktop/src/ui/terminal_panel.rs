@@ -43,18 +43,6 @@ pub static TERMINAL_WINDOW: rune::Icon = rune::Icon {
     ),
 };
 
-static RESTART: rune::Icon = rune::Icon {
-    name: "refresh",
-    view: 24.0,
-    body: r#"<path d="M4 9a8 8 0 0 1 14-3l3 3M3 15l3 3a8 8 0 0 0 14-3M21 4v5h-5M3 20v-5h5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-
-static PLUS: rune::Icon = rune::Icon {
-    name: "plus",
-    view: 24.0,
-    body: r#"<path d="M12 5v14m-7-7h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-
 /// One tab within the terminal panel.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -2002,7 +1990,7 @@ impl GridView<'static> {
 
 impl UiState {
     /// Take the keyboard into terminal tile `tile_idx` (its shell becomes active).
-    fn focus_terminal_tile_tx(&mut self, tile_idx: Option<usize>, tx: &mut Tx) {
+    pub(super) fn focus_terminal_tile_tx(&mut self, tile_idx: Option<usize>, tx: &mut Tx) {
         if let Some(i) = tile_idx {
             if i < self.tiles.len() && self.focus != i {
                 self.focus_tile(i);
@@ -2025,21 +2013,12 @@ pub fn tile_body_for(
     tile_body_with_controls(s, k, scheme, scale, layer, tile_idx, None)
 }
 
-pub fn tile_body_with_controls(
-    s: &UiState,
-    k: &Kit,
-    scheme: ColorScheme,
-    scale: f32,
-    layer: &mut Vec<El>,
-    tile_idx: Option<usize>,
-    controls: Option<El>,
-) -> El {
+/// Compact shell tab pills rendered directly inside the unified `tiles::header()`
+/// leading drag area so Terminal tiles/floating windows have a single full-width
+/// draggable header with identical right-side window chrome.
+pub fn tile_header_tabs(s: &UiState, k: &Kit, tile_idx: Option<usize>) -> El {
     let language = s.cfg.general.language;
-    let colors = colors(k, scheme);
-    s.term.want.set(Some(colors));
-    let m = metrics();
     let live = tile_idx.is_none_or(|i| s.tile_of_terminal() == Some(i));
-    // The first terminal tile keeps the plain keys; others get a suffix.
     let first = tile_idx.is_none_or(|i| !s.tiles.iter().take(i).any(|t| t.is_terminal()));
     let sfx = match tile_idx {
         Some(i) if !first => format!("-{i}"),
@@ -2050,37 +2029,13 @@ pub fn tile_body_with_controls(
     } else {
         tile_idx.and_then(|i| s.tile_terminal_tab(i))
     };
-    let bg_tab = if live {
-        None
-    } else {
-        shown_tab.and_then(|t| s.term.tabs.get(t))
-    };
-    let frame = if live {
-        s.term.frame.as_ref()
-    } else {
-        bg_tab.and_then(|t| t.frame.as_ref())
-    };
-    let bg = color(frame.map_or(colors.bg, |f| f.bg));
-    let ended = if live {
-        s.term
-            .session
-            .as_ref()
-            .and_then(Session::ended)
-            .or(s.term.fixture_ended)
-    } else {
-        bg_tab
-            .and_then(|t| t.session.as_ref())
-            .and_then(Session::ended)
-    };
-
     let tab_count = s.term.tabs.len().max(1);
     let mut tabs_strip = row()
         .key(format!("tile-terminal-tabs-strip{sfx}"))
         .gap(4.0)
         .center_y()
         .shrink()
-        .min_w(0.0)
-        .grow(1.0);
+        .min_w(0.0);
 
     for i in 0..tab_count {
         let is_active = Some(i) == shown_tab;
@@ -2148,69 +2103,60 @@ pub fn tile_body_with_controls(
         tabs_strip = tabs_strip.child(tab_pill);
     }
 
-    let add_tab_btn = IconButton::new(&PLUS)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
-        .label(tr_ref(language, "New tab (Ctrl+Shift+T)"))
-        .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
-            s.focus_terminal_tile_tx(tile_idx, tx);
-            s.term_new_tab();
-            s.focus_terminal_tx(tx);
-        })
-        .build(k)
-        .key(format!("tile-terminal-new-tab{sfx}"));
-
-    let sync_cwd_btn = IconButton::new(&rune_kit::glyphs::FOLDER)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
-        .label(super::copy::t_ref(language, "Sync directory with session"))
-        .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
-            s.focus_terminal_tile_tx(tile_idx, tx);
-            s.term_sync_cwd();
-            s.focus_terminal_tx(tx);
-        })
-        .build(k)
-        .key(format!("tile-terminal-sync-cwd{sfx}"));
-
-    let mut subheader = row()
-        .key(format!("tile-terminal-subhead{sfx}"))
-        .w_full()
-        .h(HEAD)
-        .pl(8.0)
-        .pr(8.0)
-        .gap(6.0)
-        .center_y()
-        .fill(k.alpha(k.c.layer_01, 0.45))
-        .preserve_focus_on_press(true)
-        .child(
-            el().key("shell-tabs-viewport")
-                .scroll_x()
-                .h(34.0)
-                .grow(1.0)
-                .shrink()
-                .min_w(0.0)
-                .child(tabs_strip),
-        )
-        .child(add_tab_btn)
-        .child(sync_cwd_btn);
     if live && s.term.is_prefix_armed() {
-        subheader = subheader.child(prefix_badge(k, &sfx));
+        tabs_strip = tabs_strip.child(prefix_badge(k, &sfx));
     }
-    let subheader = subheader.child(
-        IconButton::new(&RESTART)
-            .variant(IconButtonVariant::GhostMuted)
-            .control_size(ControlSize::Small)
-            .label(tr_ref(language, "Restart shell"))
-            .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
-                s.focus_terminal_tile_tx(tile_idx, tx);
-                s.restart_terminal();
-                s.focus_terminal_tx(tx);
-            })
-            .build(k)
-            .key(format!("tile-terminal-restart{sfx}")),
-    );
 
-    let subheader = subheader.children(controls);
+    tabs_strip
+}
+
+/// Terminal body without its own header bar (used inside `tiles::tile`, where the
+/// unified `tiles::header()` owns dragging, tabs, actions, surface switcher, and close).
+pub fn tile_body_only(
+    s: &UiState,
+    k: &Kit,
+    scheme: ColorScheme,
+    scale: f32,
+    layer: &mut Vec<El>,
+    tile_idx: Option<usize>,
+) -> El {
+    let language = s.cfg.general.language;
+    let colors = colors(k, scheme);
+    s.term.want.set(Some(colors));
+    let m = metrics();
+    let live = tile_idx.is_none_or(|i| s.tile_of_terminal() == Some(i));
+    let first = tile_idx.is_none_or(|i| !s.tiles.iter().take(i).any(|t| t.is_terminal()));
+    let sfx = match tile_idx {
+        Some(i) if !first => format!("-{i}"),
+        _ => String::new(),
+    };
+    let shown_tab = if live {
+        Some(s.term.active_tab)
+    } else {
+        tile_idx.and_then(|i| s.tile_terminal_tab(i))
+    };
+    let bg_tab = if live {
+        None
+    } else {
+        shown_tab.and_then(|t| s.term.tabs.get(t))
+    };
+    let frame = if live {
+        s.term.frame.as_ref()
+    } else {
+        bg_tab.and_then(|t| t.frame.as_ref())
+    };
+    let bg = color(frame.map_or(colors.bg, |f| f.bg));
+    let ended = if live {
+        s.term
+            .session
+            .as_ref()
+            .and_then(Session::ended)
+            .or(s.term.fixture_ended)
+    } else {
+        bg_tab
+            .and_then(|t| t.session.as_ref())
+            .and_then(Session::ended)
+    };
     let view = GridView {
         tile_idx,
         live,
@@ -2262,9 +2208,54 @@ pub fn tile_body_with_controls(
         .grow(1.0)
         .min_h(0.0)
         .preserve_focus_on_press(true)
+        .child(body)
+}
+
+pub fn tile_body_with_controls(
+    s: &UiState,
+    k: &Kit,
+    scheme: ColorScheme,
+    scale: f32,
+    layer: &mut Vec<El>,
+    tile_idx: Option<usize>,
+    controls: Option<El>,
+) -> El {
+    let first = tile_idx.is_none_or(|i| !s.tiles.iter().take(i).any(|t| t.is_terminal()));
+    let sfx = match tile_idx {
+        Some(i) if !first => format!("-{i}"),
+        _ => String::new(),
+    };
+    let tabs_strip = tile_header_tabs(s, k, tile_idx);
+    let subheader = row()
+        .key(format!("tile-terminal-subhead{sfx}"))
+        .w_full()
+        .h(HEAD)
+        .pl(8.0)
+        .pr(8.0)
+        .gap(6.0)
+        .center_y()
+        .fill(k.alpha(k.c.layer_01, 0.45))
+        .preserve_focus_on_press(true)
+        .child(
+            el().key("shell-tabs-viewport")
+                .scroll_x()
+                .h(34.0)
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .child(tabs_strip),
+        )
+        .children(controls);
+
+    col()
+        .key(format!("tile-terminal-page{sfx}"))
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .preserve_focus_on_press(true)
         .child(subheader)
         .child(el().w_full().h(1.0).fill(k.alpha(k.c.border_weak, 0.25)))
-        .child(body)
+        .child(tile_body_only(s, k, scheme, scale, layer, tile_idx))
 }
 
 fn terminal_search_bar(s: &UiState, k: &Kit) -> El {

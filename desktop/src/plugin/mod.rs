@@ -119,6 +119,10 @@ pub fn surface_switcher(
         .open(open)
         .min_width(180.0)
         .on_close(|s: &mut UiState| s.menu = None);
+    let is_popped = active == PluginSlot::Tile
+        && s.tile_of_plugin(plugin_id)
+            .and_then(|i| s.tiles.get(i))
+            .is_some_and(|t| t.popped);
     for kind in WindowKind::ALL {
         let slot = kind.slot();
         if !s
@@ -131,12 +135,23 @@ pub fn surface_switcher(
         let pid = plugin_id.to_string();
         menu = menu.item(
             rune_kit::MenuItem::new(tr_ref(lang, kind.label()))
-                .checked(active == slot)
+                .checked(active == slot && (slot != PluginSlot::Tile || !is_popped))
                 .on_select(move |s: &mut UiState| {
                     s.menu = None;
                     s.switch_plugin_surface(&pid, slot);
                 }),
         );
+        if slot == PluginSlot::Tile {
+            let pid_float = plugin_id.to_string();
+            menu = menu.item(
+                rune_kit::MenuItem::new(tr_ref(lang, "Floating window"))
+                    .checked(is_popped)
+                    .on_select(move |s: &mut UiState| {
+                        s.menu = None;
+                        s.open_plugin_float(&pid_float);
+                    }),
+            );
+        }
     }
     let mut bar = row()
         .key(format!("surface-switcher-{plugin_id}-{active:?}"))
@@ -485,14 +500,20 @@ impl DesktopPlugin for TerminalPlugin {
         } else {
             ColorScheme::Light
         };
-        let controls = Some(surface_switcher(
-            ctx.s,
-            ctx.k,
-            ctx.s.cfg.general.language,
-            "terminal",
-            ctx.surface,
-            layer,
-        ));
+        let controls = Some(
+            row()
+                .gap(4.0)
+                .center_y()
+                .child(window::dock_actions(ctx.s, ctx.k, true, layer))
+                .child(surface_switcher(
+                    ctx.s,
+                    ctx.k,
+                    ctx.s.cfg.general.language,
+                    "terminal",
+                    ctx.surface,
+                    layer,
+                )),
+        );
         Some(terminal_panel::tile_body_with_controls(
             ctx.s, ctx.k, scheme, ctx.scale, layer, None, controls,
         ))
@@ -1560,6 +1581,14 @@ impl DesktopPlugin for MaoPlugin {
 
     fn can_move_view(&self, _from: &str) -> bool {
         true
+    }
+
+    fn window_title(&self, s: &UiState) -> Option<String> {
+        Some(tr_ref(s.cfg.general.language, "MAO · Orchestration").to_string())
+    }
+
+    fn window_actions(&self, s: &UiState, k: &Kit) -> Option<El> {
+        Some(crate::ui::orchestration::window_header_actions(s, k))
     }
 
     fn commands(&self) -> Vec<PluginCommand> {

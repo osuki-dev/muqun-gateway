@@ -288,6 +288,34 @@ impl UiState {
         self.remove_dock_tab(&closing, true);
     }
 
+    /// Open or pop out a plugin into a draggable floating window tile.
+    pub fn open_plugin_float(&mut self, plugin_id: &str) {
+        self.release_plugin_page();
+        if self.selected_dock_tab() == Some(plugin_id) {
+            if plugin_id == "terminal" {
+                self.close_terminal();
+            } else {
+                self.close_plugin_drawer();
+            }
+        }
+        self.remove_dock_tab(plugin_id, false);
+        if let Some(i) = self.tile_of_plugin(plugin_id) {
+            self.mode = Mode::Session;
+            if !self.tiles.get(i).is_some_and(|t| t.popped) {
+                self.toggle_tile_pop_at(i);
+            } else {
+                self.focus_tile(i);
+            }
+            return;
+        }
+        self.open_plugin_tile(plugin_id);
+        if let Some(i) = self.tile_of_plugin(plugin_id) {
+            if !self.tiles.get(i).is_some_and(|t| t.popped) {
+                self.toggle_tile_pop_at(i);
+            }
+        }
+    }
+
     /// Find the tile index currently hosting `plugin_id`, if any.
     pub fn tile_of_plugin(&self, plugin_id: &str) -> Option<usize> {
         if plugin_id == "terminal" {
@@ -304,7 +332,14 @@ impl UiState {
     pub fn open_plugin_tile(&mut self, plugin_id: &str) {
         if plugin_id == "terminal" {
             self.release_plugin_page();
-            self.open_terminal_tile();
+            if let Some(i) = self.tile_of_terminal() {
+                if self.tiles.get(i).is_some_and(|t| t.popped) {
+                    self.toggle_tile_pop_at(i);
+                }
+                self.focus_tile(i);
+            } else {
+                self.open_terminal_tile();
+            }
             return;
         }
         if self
@@ -321,6 +356,9 @@ impl UiState {
         self.remove_dock_tab(plugin_id, false);
         if let Some(i) = self.tile_of_plugin(plugin_id) {
             self.mode = Mode::Session;
+            if self.tiles.get(i).is_some_and(|t| t.popped) {
+                self.toggle_tile_pop_at(i);
+            }
             self.focus_tile(i);
             return;
         }

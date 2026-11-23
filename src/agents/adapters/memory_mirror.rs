@@ -46,6 +46,24 @@ struct PendingOrigin {
     at: u64,
 }
 
+pub(crate) fn inbox_contains_prompt(
+    items: &[serde_json::Value],
+    text: &str,
+    native_message_id: Option<&str>,
+) -> bool {
+    let digest = prompt_digest(text);
+    items.iter().any(|item| {
+        if let Some(native) = native_message_id {
+            if item.get("id").and_then(|v| v.as_str()) == Some(native) {
+                return true;
+            }
+        }
+        item.get("text")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| prompt_digest(t) == digest)
+    })
+}
+
 fn prompt_digest(text: &str) -> String {
     use sha2::{Digest, Sha256};
     let (body, _) = crate::agents::ports::agent::split_attachment_paths(text);
@@ -252,8 +270,10 @@ impl SessionState {
         if item.origin.is_none() {
             item.origin = Some(pending.origin);
         }
-        (item.id != pending.presented_id && self.timeline.remove(&pending.presented_id).is_some())
-            .then_some(pending.presented_id)
+        (!pending.presented_id.is_empty()
+            && item.id != pending.presented_id
+            && self.timeline.remove(&pending.presented_id).is_some())
+        .then_some(pending.presented_id)
     }
 
     fn reconcile_user_echoes(
@@ -522,6 +542,52 @@ impl MemoryMirror {
         let event = state.timeline_upsert(asid, items);
         state.push_event(event.clone());
         event
+    }
+
+    /// True when the mirror's current inbox holds a queued/steered item matching
+    /// `text` or `native_message_id` (meaning the prompt has NOT been delivered
+    /// into the conversation timeline yet).
+    pub(crate) async fn has_queued_prompt(
+        &self,
+        asid: &AgentSessionId,
+        text: &str,
+        native_message_id: Option<&str>,
+    ) -> bool {
+        self.sessions
+            .read()
+            .await
+            .get(asid)
+            .is_some_and(|s| inbox_contains_prompt(&s.inbox, text, native_message_id))
+    }
+
+    /// Remember the sending device's `origin` for a queued/steered prompt without
+    /// synthesizing a premature timeline bubble while the item is still in the inbox.
+    /// When the agent later delivers the prompt and echoes its real user row,
+    /// `reconcile_user_echoes` will attach `origin` to that row.
+    pub(crate) async fn record_queued_origin(
+        &self,
+        asid: &AgentSessionId,
+        text: &str,
+        origin: MessageOrigin,
+    ) {
+        let now = now_ms();
+        let digest = prompt_digest(text);
+        let mut sessions = self.sessions.write().await;
+        let state = Self::entry(
+            &self.agent_id,
+            &mut sessions,
+            asid,
+            AgentSessionStatus::Busy,
+        );
+        state.pending_origins.push(PendingOrigin {
+            origin,
+            text_digest: digest,
+            presented_id: String::new(),
+            at: now,
+        });
+        if state.pending_origins.len() > MAX_PENDING_ORIGINS {
+            state.pending_origins.remove(0);
+        }
     }
 
     /// Show a prompt a paired device sent through the Gateway, labelled with
@@ -3741,5 +3807,51 @@ mod tests {
         assert_eq!(snapshot.timeline.len(), 1);
         assert_eq!(snapshot.timeline[0].id, "msg-1:t0");
         assert_eq!(snapshot.timeline[0].origin, Some(pixel()));
+    }
+
+    #[tokio::test]
+    async fn queued_prompt_records_origin_without_premature_timeline_row() {
+        let mirror = MemoryMirror::new();
+        let asid = AgentSessionId("ses-queued-origin".to_string());
+        mirror.update_session(info(&asid, "Queued")).await;
+
+        let queued_text = "[Image #1] follow up while busy";
+        mirror
+            .set_inbox(
+                &asid,
+                vec![serde_json::json!({
+                    "id": "inbox_123",
+                    "text": format!("{queued_text}\n\nAttached files (on this host):\n- /tmp/a.jpg\n"),
+                    "delivery": "steer",
+                })],
+            )
+            .await;
+
+        assert!(mirror.has_queued_prompt(&asid, queued_text, None).await);
+        mirror
+            .record_queued_origin(&asid, queued_text, pixel())
+            .await;
+
+        // While queued in inbox, timeline must NOT contain any premature `presented:` row.
+        let while_queued = mirror.get_snapshot(&asid).await.unwrap();
+        assert!(
+            while_queued.timeline.is_empty(),
+            "queued prompt must not emit a premature timeline row: {:?}",
+            while_queued.timeline
+        );
+
+        // Once delivered and echoed by the agent, the real user row receives `origin`
+        // without emitting a bogus `TimelineRemoved`.
+        let mut delivered = text_item("acp-submission:2", "00000002:sub", queued_text);
+        delivered.updated_ms = now_ms();
+        let event = mirror.record_timeline_upsert(&asid, vec![delivered]).await;
+        assert!(
+            !matches!(event, AgentDomainEvent::TimelineRemoved { .. }),
+            "queued origin reconciliation must not emit TimelineRemoved"
+        );
+        let after = mirror.get_snapshot(&asid).await.unwrap();
+        assert_eq!(after.timeline.len(), 1);
+        assert_eq!(after.timeline[0].id, "acp-submission:2");
+        assert_eq!(after.timeline[0].origin, Some(pixel()));
     }
 }

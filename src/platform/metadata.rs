@@ -40,7 +40,7 @@ pub(crate) const GATEWAY_API_MAJOR: u64 = 1;
 pub(crate) const API_CAPABILITIES: &[&str] = &[
     crate::orchestration::CAPABILITY,
     crate::orchestration::POOL_CAPABILITY,
-    crate::orchestration::DAG_CAPABILITY,
+    crate::orchestration::ROUTER_CAPABILITY,
     "agent_catalog",
     // `visibility`/`picker` on discovery agents and
     // `PUT /api/agents/{kind}/visibility`.

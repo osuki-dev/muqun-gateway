@@ -26,7 +26,7 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/api/orchestrations", get(list).post(start))
         .route("/api/orchestrations/{id}", get(read))
-        .route("/api/orchestrations/{id}/execute", post(execute_plan))
+        .route("/api/orchestrations/{id}/advisor", post(ask_advisor))
         .route("/api/orchestrations/{id}/approve", post(approve))
         .route("/api/orchestrations/{id}/rework", post(rework))
         .route("/api/orchestrations/{id}/cancel", post(cancel))
@@ -63,21 +63,20 @@ fn reconcile_lock(run_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+fn run_needs_reconcile(run: &Run) -> bool {
+    matches!(run.state.mao_phase.as_str(), "coding" | "reviewing")
+        || run.state.advisor_task_id.is_some()
+}
+
 async fn reconcile_active_runs(state: &AppState, runs: &mut [Run]) {
     for run in runs {
-        if matches!(
-            run.state.mao_phase.as_str(),
-            "analyzing" | "executing" | "integrating" | "coding" | "reviewing"
-        ) {
+        if run_needs_reconcile(run) {
             let lock = reconcile_lock(&run.id);
             let _guard = lock.lock().await;
             if let Ok(Some(fresh)) = store::read(&state.db, run.id.clone()).await {
                 *run = fresh;
             }
-            if !matches!(
-                run.state.mao_phase.as_str(),
-                "analyzing" | "executing" | "integrating" | "coding" | "reviewing"
-            ) {
+            if !run_needs_reconcile(run) {
                 continue;
             }
             if let Ok(recovered) = store::recover(&state.db, run.clone()).await {
@@ -103,12 +102,7 @@ pub(crate) fn spawn_reconciler(state: AppState) {
             let Ok(mut runs) = store::list(&state.db).await else {
                 continue;
             };
-            if runs.iter().any(|r| {
-                matches!(
-                    r.state.mao_phase.as_str(),
-                    "analyzing" | "executing" | "integrating" | "coding" | "reviewing"
-                )
-            }) {
+            if runs.iter().any(run_needs_reconcile) {
                 reconcile_active_runs(&state, &mut runs).await;
             }
         }
@@ -259,6 +253,17 @@ pub(super) async fn select_fallback_candidate(
 }
 
 fn pool_instruction_for(run: &Run) -> Option<String> {
+    if let Some(ref rd) = run.state.route_decision {
+        if !rd.candidates.is_empty() {
+            let text = super::router::format_advisor_coordinator_instruction(
+                &rd.candidates,
+                run.effective_reviewer().as_ref(),
+            );
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
     if run.request.agent_pool.is_empty() {
         return None;
     }
@@ -328,18 +333,57 @@ pub(super) async fn latest_assistant_text(
     (!text.trim().is_empty()).then_some(text)
 }
 
-fn collect_task_tree_evidence(tasks: &[TaskView], root_id: &str, run_task_ref: &str) -> String {
+fn is_internal_step_task(task: &TaskView, run_task_ref: &str) -> bool {
     let review_prefix = format!("{run_task_ref}:review:");
     let rework_prefix = format!("{run_task_ref}:rework:");
     let failover_prefix = format!("{run_task_ref}:failover:");
+    let advisor_prefix = format!("{run_task_ref}:advisor:");
+    task.client_ref.as_deref().is_some_and(|cref| {
+        cref.starts_with(&review_prefix)
+            || cref.starts_with(&rework_prefix)
+            || cref.starts_with(&failover_prefix)
+            || cref.starts_with(&advisor_prefix)
+    })
+}
+
+fn extract_subtasks_view(tasks: &[TaskView], root_id: &str, run_task_ref: &str) -> Vec<Value> {
+    tasks
+        .iter()
+        .filter(|task| task.task_id != root_id && !is_internal_step_task(task, run_task_ref))
+        .take(32)
+        .map(|task| {
+            let (agent_id, asid, machine) = match &task.binding {
+                TaskBinding::AgentSession { agent_id, asid } => {
+                    (Some(agent_id.clone()), Some(asid.clone()), None)
+                }
+                TaskBinding::Peer { peer_name, .. } => (None, None, Some(peer_name.clone())),
+                TaskBinding::Pane { agent_id, .. } => (agent_id.clone(), None, None),
+                TaskBinding::None => (None, None, None),
+            };
+            json!({
+                "task_id": task.task_id,
+                "title": task.title,
+                "goal": concise_excerpt(&task.goal, 180),
+                "kind": match task.kind {
+                    TaskKind::Delegation => "delegation",
+                    TaskKind::Command => "command",
+                },
+                "state": task.state,
+                "agent_id": agent_id,
+                "asid": asid,
+                "machine": machine,
+                "summary": task.summary.as_deref().map(|s| concise_excerpt(s, 220)),
+                "progress": task.progress,
+                "updated_ms": task.updated_ms,
+            })
+        })
+        .collect()
+}
+
+fn collect_task_tree_evidence(tasks: &[TaskView], root_id: &str, run_task_ref: &str) -> String {
     let mut lines = Vec::new();
     for task in tasks {
-        let is_internal_step = task.client_ref.as_deref().is_some_and(|cref| {
-            cref.starts_with(&review_prefix)
-                || cref.starts_with(&rework_prefix)
-                || cref.starts_with(&failover_prefix)
-        });
-        if is_internal_step {
+        if is_internal_step_task(task, run_task_ref) {
             continue;
         }
         if task.task_id == root_id && !matches!(task.binding, TaskBinding::Peer { .. }) {
@@ -573,11 +617,82 @@ async fn reconcile_pipeline(
     tasks: &mut Vec<TaskView>,
     root: &str,
 ) -> Result<(), (StatusCode, Json<Value>)> {
-    if super::dag::is_smart_run(run) {
-        return super::dag::reconcile_smart_pipeline(state, run, tasks, root).await;
-    }
     let mut dirty = false;
     let now = now_ms();
+
+    // Reconcile any active on-demand Advisor consultation (runs independently so the
+    // Sticky Parent keeps its warm prompt cache undisturbed).
+    if let Some(adv_tid) = run.state.advisor_task_id.clone() {
+        let adv_task = tasks.iter().find(|t| t.task_id == adv_tid).cloned();
+        if let Some(at) = adv_task {
+            if let Some((_, ref asid)) = agent_asid(&at.binding) {
+                if run.state.advisor_asid.as_deref() != Some(asid.as_str()) {
+                    run.state.advisor_asid = Some(asid.clone());
+                    dirty = true;
+                }
+            }
+            match at.state {
+                TaskState::Done | TaskState::IdleUnconfirmed => {
+                    let adv_agent = run
+                        .state
+                        .advisor_agent
+                        .clone()
+                        .or_else(|| agent_asid(&at.binding).map(|(a, _)| a))
+                        .unwrap_or_default();
+                    let reply = if let Some(ref asid) = run.state.advisor_asid {
+                        latest_assistant_text(state, &adv_agent, asid)
+                            .await
+                            .or_else(|| at.summary.clone())
+                            .unwrap_or_default()
+                    } else {
+                        at.summary.clone().unwrap_or_default()
+                    };
+                    let clean_summary = if reply.trim().is_empty() {
+                        "Advisor completed without text summary.".to_string()
+                    } else {
+                        concise_excerpt(&reply, 1200)
+                    };
+                    run.state.advisor_summary = Some(clean_summary.clone());
+                    if let Some(step) = run
+                        .state
+                        .steps
+                        .iter_mut()
+                        .rev()
+                        .find(|s| s.kind == "advisor" && s.status == "running")
+                    {
+                        step.status = "completed".into();
+                        step.detail = concise_excerpt(&clean_summary, 220);
+                        step.asid = run.state.advisor_asid.clone();
+                    }
+                    run.state.advisor_task_id = None;
+                    dirty = true;
+                }
+                TaskState::Failed | TaskState::Cancelled => {
+                    let reason = task_failure_reason(&at);
+                    if let Some(step) = run
+                        .state
+                        .steps
+                        .iter_mut()
+                        .rev()
+                        .find(|s| s.kind == "advisor" && s.status == "running")
+                    {
+                        step.status = if at.state == TaskState::Failed {
+                            "failed"
+                        } else {
+                            "cancelled"
+                        }
+                        .into();
+                        if !reason.is_empty() {
+                            step.detail = concise_excerpt(&reason, 220);
+                        }
+                    }
+                    run.state.advisor_task_id = None;
+                    dirty = true;
+                }
+                _ => {}
+            }
+        }
+    }
     let root_task = tasks.iter().find(|t| t.task_id == root).cloned();
     let active_coder_task = run
         .state
@@ -902,35 +1017,44 @@ async fn reconcile_pipeline(
                 &run.task_ref(),
             )
             .await;
-            let review_prefix = format!("{}:review:", run.task_ref());
-            let rework_prefix = format!("{}:rework:", run.task_ref());
-            let failover_prefix = format!("{}:failover:", run.task_ref());
             let has_child_or_peer_tasks = tasks.iter().any(|t| {
-                let is_internal = t.client_ref.as_deref().is_some_and(|c| {
-                    c.starts_with(&review_prefix)
-                        || c.starts_with(&rework_prefix)
-                        || c.starts_with(&failover_prefix)
-                });
-                !is_internal && (t.task_id != root || matches!(t.binding, TaskBinding::Peer { .. }))
+                !is_internal_step_task(t, &run.task_ref())
+                    && (t.task_id != root || matches!(t.binding, TaskBinding::Peer { .. }))
             });
-            if files.is_empty()
-                && diff_summary.trim().is_empty()
+            let fast_path_no_edits = run.state.skip_review
+                && files.is_empty()
                 && run.state.files.is_empty()
-                && !has_child_or_peer_tasks
+                && !has_child_or_peer_tasks;
+            if fast_path_no_edits
+                || (files.is_empty()
+                    && diff_summary.trim().is_empty()
+                    && run.state.files.is_empty()
+                    && !has_child_or_peer_tasks)
             {
                 let round = run.state.round;
                 run.state.reviewed_round = round;
                 run.state.mao_phase = "approved".into();
                 run.state.accepted = true;
                 run.state.verdict = Some("approved".into());
-                run.state.review_summary =
-                    Some("No code changes detected; skipped code review.".into());
+                run.state.review_summary = Some(if fast_path_no_edits {
+                    "Lightweight Q&A fast path; skipped independent code review.".into()
+                } else {
+                    "No code changes detected; skipped code review.".into()
+                });
                 run.state.steps.push(PipelineStep {
                     kind: "verdict".into(),
                     round,
-                    title: "Skipped review (no code changes)".into(),
-                    detail: "No workspace diff detected after coder finished; accepted directly."
-                        .into(),
+                    title: if fast_path_no_edits {
+                        "Fast path · skipped review".into()
+                    } else {
+                        "Skipped review (no code changes)".into()
+                    },
+                    detail: if fast_path_no_edits {
+                        "Lightweight read-only query with no file edits; completed in 1 warm session."
+                            .into()
+                    } else {
+                        "No workspace diff detected after coder finished; accepted directly.".into()
+                    },
                     status: "completed".into(),
                     asid: coder_asid.clone(),
                     task_id: root_task.as_ref().map(|t| t.task_id.clone()),
@@ -1604,19 +1728,25 @@ async fn view(state: &AppState, run: Run) -> ApiResult<Json<Value>> {
     let mut run = store::recover(&state.db, run).await.map_err(internal)?;
     let eff_coder = run.effective_coder();
     let eff_reviewer = run.effective_reviewer();
+    let candidates = run
+        .state
+        .route_decision
+        .as_ref()
+        .map(|d| d.candidates.clone())
+        .unwrap_or_default();
     let Some(root) = run.task_id.clone() else {
         return Ok(Json(json!({
             "run": run,
             "phase": "dispatch_unconfirmed",
-            "strategy": run.state.strategy,
             "mao_phase": run.state.mao_phase,
             "round": run.state.round,
             "max_review_rounds": run.state.max_rounds,
             "auto_failover": run.auto_failover_enabled(),
             "failover_count": run.state.failover_count,
+            "skip_review": run.state.skip_review,
             "agent_pool": run.request.agent_pool,
-            "candidate_statuses": run.state.candidate_statuses,
-            "plan": run.state.plan,
+            "route_decision": run.state.route_decision,
+            "candidate_statuses": candidates,
             "exhausted_candidates": run.state.exhausted_candidates,
             "coder": {
                 "agent": eff_coder.agent,
@@ -1632,6 +1762,14 @@ async fn view(state: &AppState, run: Run) -> ApiResult<Json<Value>> {
                 "machine": r.machine,
                 "asid": run.state.reviewer_asid,
             })),
+            "advisor": {
+                "agent": run.state.advisor_agent,
+                "asid": run.state.advisor_asid,
+                "task_id": run.state.advisor_task_id,
+                "summary": run.state.advisor_summary,
+                "running": run.state.advisor_task_id.is_some(),
+            },
+            "subtasks": [],
             "deliverables": {
                 "files": run.state.files,
                 "total_additions": 0,
@@ -1662,6 +1800,13 @@ async fn view(state: &AppState, run: Run) -> ApiResult<Json<Value>> {
     drop(_guard);
     let eff_coder = run.effective_coder();
     let eff_reviewer = run.effective_reviewer();
+    let candidates = run
+        .state
+        .route_decision
+        .as_ref()
+        .map(|d| d.candidates.clone())
+        .unwrap_or_default();
+    let subtasks = extract_subtasks_view(&tasks, &root, &run.task_ref());
 
     let phase = if run.state.accepted {
         "completed"
@@ -1697,15 +1842,15 @@ async fn view(state: &AppState, run: Run) -> ApiResult<Json<Value>> {
     Ok(Json(json!({
         "run": run,
         "phase": phase,
-        "strategy": run.state.strategy,
         "mao_phase": run.state.mao_phase,
         "round": run.state.round,
         "max_review_rounds": run.state.max_rounds,
         "auto_failover": run.auto_failover_enabled(),
         "failover_count": run.state.failover_count,
+        "skip_review": run.state.skip_review,
         "agent_pool": run.request.agent_pool,
-        "candidate_statuses": run.state.candidate_statuses,
-        "plan": run.state.plan,
+        "route_decision": run.state.route_decision,
+        "candidate_statuses": candidates,
         "exhausted_candidates": run.state.exhausted_candidates,
         "coder": {
             "agent": eff_coder.agent,
@@ -1721,6 +1866,14 @@ async fn view(state: &AppState, run: Run) -> ApiResult<Json<Value>> {
             "machine": r.machine,
             "asid": run.state.reviewer_asid,
         })),
+        "advisor": {
+            "agent": run.state.advisor_agent,
+            "asid": run.state.advisor_asid,
+            "task_id": run.state.advisor_task_id,
+            "summary": run.state.advisor_summary,
+            "running": run.state.advisor_task_id.is_some(),
+        },
+        "subtasks": subtasks,
         "deliverables": {
             "files": run.state.files,
             "total_additions": total_additions,
@@ -1805,30 +1958,6 @@ async fn start(
         })?
         .to_string_lossy()
         .into_owned();
-    if request
-        .strategy
-        .as_deref()
-        .is_some_and(|s| s.eq_ignore_ascii_case("smart"))
-    {
-        let mut original_coder_title: Option<String> = None;
-        if let Some(asid) = request.asid.as_deref() {
-            if let Some(manager) = state
-                .agent_runtime
-                .manager_for_agent(&request.coordinator)
-                .await
-            {
-                if let Ok(info) = manager.sessions().get_session(asid).await {
-                    let t = info.title.trim();
-                    if !t.is_empty() && t != asid && !t.starts_with("[MAO ") {
-                        original_coder_title = Some(t.to_string());
-                    }
-                }
-            }
-        }
-        let run =
-            super::dag::start_smart(&state, owner, request, cwd, original_coder_title).await?;
-        return view(&state, run).await;
-    }
     let requires_mcp = request.reviewer.is_none();
     let auto_failover = request
         .auto_failover
@@ -1840,53 +1969,90 @@ async fn start(
         variant: request.variant.clone(),
         machine: request.machine.clone(),
     };
-    let mut effective_coder = primary_coder.clone();
-    let mut effective_asid = request.asid.clone();
-    let mut pre_failover: Option<(ReviewerSpec, ReviewerSpec, String, bool)> = None;
-    let primary_health = check_candidate_quota(&state, &primary_coder, requires_mcp).await;
-    if let Err((reason, agent_wide)) = primary_health {
-        if auto_failover {
-            let mut exhausted = Vec::new();
-            mark_candidate_exhausted(&mut exhausted, &primary_coder, agent_wide);
-            if let Some(fallback) = select_fallback_candidate(
-                &state,
-                &request.agent_pool,
-                &exhausted,
-                Some(&primary_coder.agent),
-                requires_mcp,
-            )
+    // Probe existing session timestamp for Sticky-Parent warm-cache affinity.
+    let mut session_updated_ms: Option<u64> = None;
+    let mut original_coder_title: Option<String> = None;
+    if let Some(asid) = request.asid.as_deref() {
+        if let Some(manager) = state
+            .agent_runtime
+            .manager_for_agent(&primary_coder.agent)
             .await
-            {
-                pre_failover = Some((primary_coder.clone(), fallback.clone(), reason, agent_wide));
-                effective_coder = fallback;
-                effective_asid = None;
-            }
-        }
-        if pre_failover.is_none() {
-            let manager = state
-                .agent_runtime
-                .manager_for_agent(&request.coordinator)
-                .await;
-            if manager.is_none()
-                || (requires_mcp
-                    && (!crate::mcp::inject::enabled(&state.config)
-                        || manager
-                            .as_ref()
-                            .is_none_or(|m| !m.agent().adds_mcp_servers())))
-            {
-                return Err(api_error(
-                    StatusCode::CONFLICT,
-                    "coordinator_unavailable",
-                    if requires_mcp {
-                        "Coordinator requires a connected native agent with Muqun MCP tools"
-                    } else {
-                        "Coordinator agent is not connected"
-                    },
-                ));
+        {
+            if let Ok(info) = manager.sessions().get_session(asid).await {
+                session_updated_ms = Some(info.updated_ms);
+                let existing_title = info.title.trim();
+                if !existing_title.is_empty()
+                    && existing_title != asid
+                    && !existing_title.starts_with("[MAO ")
+                {
+                    original_coder_title = Some(existing_title.to_string());
+                }
             }
         }
     }
-    let mut original_coder_title: Option<String> = None;
+
+    // Run 2-layer Signal-Cascade Router (0ms hard signals + warm cache affinity + optional fail-open System 1).
+    let (chosen_coder, decision) = super::router::decide_route(
+        &state,
+        &request,
+        &primary_coder,
+        session_updated_ms,
+        now_ms(),
+        &[],
+        requires_mcp,
+    )
+    .await;
+
+    let mut effective_coder = chosen_coder.clone();
+    let switched = candidate_key(&effective_coder) != candidate_key(&primary_coder);
+    let effective_asid = if switched { None } else { request.asid.clone() };
+    let primary_candidate_status = decision
+        .candidates
+        .iter()
+        .find(|c| candidate_key(&c.spec) == candidate_key(&primary_coder))
+        .or_else(|| {
+            decision
+                .candidates
+                .iter()
+                .find(|c| c.spec.agent.eq_ignore_ascii_case(&primary_coder.agent))
+        });
+    let primary_was_healthy = primary_candidate_status.is_some_and(|c| c.health == "healthy");
+
+    let pre_failover: Option<(ReviewerSpec, ReviewerSpec, String, bool)> =
+        if switched && !primary_was_healthy {
+            let reason = primary_candidate_status
+                .and_then(|c| c.reason.clone())
+                .unwrap_or_else(|| decision.reason.clone());
+            Some((primary_coder.clone(), effective_coder.clone(), reason, true))
+        } else {
+            None
+        };
+
+    // If we stayed on primary, verify coordinator is actually connected (and MCP-capable if required).
+    if !switched {
+        let manager = state
+            .agent_runtime
+            .manager_for_agent(&effective_coder.agent)
+            .await;
+        if manager.is_none()
+            || (requires_mcp
+                && (!crate::mcp::inject::enabled(&state.config)
+                    || manager
+                        .as_ref()
+                        .is_none_or(|m| !m.agent().adds_mcp_servers())))
+        {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "coordinator_unavailable",
+                if requires_mcp {
+                    "Coordinator requires a connected native agent with Muqun MCP tools"
+                } else {
+                    "Coordinator agent is not connected"
+                },
+            ));
+        }
+    }
+
     if let Some(asid) = effective_asid.as_deref() {
         let manager = state
             .agent_runtime
@@ -1913,12 +2079,14 @@ async fn start(
                 "Wait for the current session to become idle",
             ));
         }
-        let existing_title = info.title.trim();
-        if !existing_title.is_empty()
-            && existing_title != asid
-            && !existing_title.starts_with("[MAO ")
-        {
-            original_coder_title = Some(existing_title.to_string());
+        if original_coder_title.is_none() {
+            let existing_title = info.title.trim();
+            if !existing_title.is_empty()
+                && existing_title != asid
+                && !existing_title.starts_with("[MAO ")
+            {
+                original_coder_title = Some(existing_title.to_string());
+            }
         }
     }
     let (mut run, fresh) = store::reserve(&state.db, owner.clone(), request.clone())
@@ -1930,6 +2098,8 @@ async fn start(
     if original_coder_title.is_some() {
         run.state.original_coder_title = original_coder_title;
     }
+    run.state.route_decision = Some(decision.clone());
+    run.state.skip_review = decision.skip_review;
     if let Some((from_spec, to_spec, reason, agent_wide)) = pre_failover {
         mark_candidate_exhausted(&mut run.state.exhausted_candidates, &from_spec, agent_wide);
         run.state.active_coder = Some(to_spec.clone());
@@ -1956,6 +2126,30 @@ async fn start(
                 time_ms: now_ms(),
             },
         );
+    } else if switched {
+        run.state.active_coder = Some(effective_coder.clone());
+        run.state.coder_asid = None;
+        if let Some(first) = run.state.steps.first_mut() {
+            first.title = format!("Coding #1 · {}", effective_coder.agent);
+            first.asid = None;
+        }
+        run.state.steps.insert(
+            0,
+            PipelineStep {
+                kind: "route".into(),
+                round: 1,
+                title: format!(
+                    "System-1 routed: {} → {}",
+                    candidate_display(&primary_coder),
+                    candidate_display(&effective_coder)
+                ),
+                detail: concise_excerpt(&decision.reason, 220),
+                status: "completed".into(),
+                asid: None,
+                task_id: None,
+                time_ms: now_ms(),
+            },
+        );
     }
     let by = Requested {
         forwarding: ForwardingContext::Unknown,
@@ -1973,15 +2167,19 @@ async fn start(
     } else {
         run.prompt()
     };
-    // Deliver the user's configured candidate pool BEFORE turn 1 via
-    // `delegate_in_session` (uses invisible `SESSION_INSTRUCTION_KEY` when
-    // supported, or prompt suffix while keeping `display_goal` clean).
-    let extra_pool_inst = run
-        .request
-        .reviewer
-        .is_some()
-        .then(|| pool_instruction_for(&run))
-        .flatten();
+    // Deliver a compact (<150 token) invisible Advisor/Coordinator hint BEFORE turn 1
+    // via `delegate_in_session` (uses invisible `SESSION_INSTRUCTION_KEY` when supported).
+    let extra_pool_inst = if run.request.reviewer.is_some()
+        && (!run.request.agent_pool.is_empty() || decision.candidates.len() >= 2)
+    {
+        let inst = super::router::format_advisor_coordinator_instruction(
+            &decision.candidates,
+            run.effective_reviewer().as_ref(),
+        );
+        (!inst.is_empty()).then_some(inst)
+    } else {
+        None
+    };
     let start_auto_approve = request.auto_approve.unwrap_or(true);
     let mut delegated = state
         .tasks
@@ -2133,26 +2331,165 @@ struct ReworkBody {
 }
 
 #[derive(Deserialize, Default)]
-struct ExecutePlanBody {
+struct AdvisorBody {
     #[serde(default)]
-    overrides: Vec<super::plan::TaskAssignmentOverride>,
+    question: Option<String>,
     #[serde(default)]
-    use_worktrees: Option<bool>,
+    agent: Option<String>,
 }
 
-async fn execute_plan(
+/// On-demand Advisor consultation (`POST /api/orchestrations/{id}/advisor`):
+/// asks a different strong healthy agent for concise read-only advice without
+/// breaking the Sticky Parent's warm prompt cache.
+async fn ask_advisor(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    body: Option<Json<Option<ExecutePlanBody>>>,
+    body: Option<Json<Option<AdvisorBody>>>,
 ) -> ApiResult<Json<Value>> {
     let owner = require_device(&state, &headers)?;
     let lock = reconcile_lock(&id);
     let guard = lock.lock().await;
     let mut run = load_run_for_action(&state, id, &owner).await?;
+    if run.state.advisor_task_id.is_some() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "advisor_busy",
+            "An advisor consultation is already running for this orchestration",
+        ));
+    }
     let req_body = body.and_then(|Json(b)| b).unwrap_or_default();
-    super::dag::execute_plan_action(&state, &mut run, req_body.overrides, req_body.use_worktrees)
-        .await?;
+    let active_coder = run.effective_coder();
+    let candidates = super::router::probe_pool(&state, &run.request, false).await;
+    let healthy: Vec<&super::router::CandidateStatus> = candidates
+        .iter()
+        .filter(|c| c.health == "healthy")
+        .collect();
+
+    let advisor_spec = if let Some(ref requested_agent) = req_body.agent {
+        healthy
+            .iter()
+            .find(|c| c.spec.agent.eq_ignore_ascii_case(requested_agent))
+            .map(|c| c.spec.clone())
+    } else {
+        // Prefer a healthy reviewer or a different healthy agent from the pool so we get
+        // a genuine second opinion without duplicating the active coder model.
+        run.effective_reviewer()
+            .filter(|r| {
+                !r.agent.eq_ignore_ascii_case(&active_coder.agent)
+                    && healthy
+                        .iter()
+                        .any(|c| c.spec.agent.eq_ignore_ascii_case(&r.agent))
+            })
+            .or_else(|| {
+                healthy
+                    .iter()
+                    .find(|c| !c.spec.agent.eq_ignore_ascii_case(&active_coder.agent))
+                    .map(|c| c.spec.clone())
+            })
+            .or_else(|| healthy.first().map(|c| c.spec.clone()))
+    }
+    .ok_or_else(|| {
+        api_error(
+            StatusCode::CONFLICT,
+            "advisor_unavailable",
+            "No healthy advisor agent is currently available",
+        )
+    })?;
+
+    let (_, diff_summary) = if !run.state.base_commits.is_empty() {
+        let dir = run.request.cwd.clone();
+        let goal = run.request.goal.clone();
+        let bases = run.state.base_commits.clone();
+        let fps = run.state.base_worktree_fingerprints.clone();
+        let legacy = run.state.base_commit.clone();
+        tokio::task::spawn_blocking(move || {
+            super::collect_local_repos_diff_since(&dir, &goal, &bases, &fps, legacy.as_deref())
+        })
+        .await
+        .unwrap_or_default()
+    } else {
+        (Vec::new(), String::new())
+    };
+
+    let prompt = super::router::build_advisor_prompt(
+        &run.request.goal,
+        req_body.question.as_deref(),
+        run.state.coder_summary.as_deref(),
+        &diff_summary,
+    );
+    let now = now_ms();
+    let by = Requested {
+        forwarding: ForwardingContext::Unknown,
+        by: TaskPrincipal {
+            kind: PrincipalKind::Device,
+            id: owner,
+        },
+        origin: TaskOrigin::Device,
+        parent: run.task_id.clone().map(TaskId),
+        name: None,
+        server_id: None,
+    };
+    let delegated = state
+        .tasks
+        .delegate_in_session(
+            &state,
+            by,
+            DelegateRequest {
+                goal: prompt,
+                cwd: Some(run.request.cwd.clone()),
+                agent_id: Some(advisor_spec.agent.clone()),
+                model: advisor_spec.model.clone(),
+                variant: advisor_spec.variant.clone(),
+                client_ref: Some(format!("{}:advisor:{now}", run.task_ref())),
+                label: Some("Advisor".into()),
+                delivery: Some(Delivery::Session),
+                computer_ids: run.request.computer_ids.clone(),
+                mode: None,
+                machine: advisor_spec
+                    .machine
+                    .clone()
+                    .or_else(|| run.request.machine.clone()),
+                mentions: run.request.mentions.clone(),
+                session_id: None,
+                attachments: vec![],
+            },
+            run.state.advisor_asid.as_deref(),
+            Some("MAO Advisor"),
+            true,
+            None,
+        )
+        .await
+        .map_err(|err| {
+            api_error(
+                StatusCode::CONFLICT,
+                "advisor_dispatch_failed",
+                &format!("Could not dispatch advisor: {err}"),
+            )
+        })?;
+
+    if let Some((_, asid)) = agent_asid(&delegated.binding) {
+        run.state.advisor_asid = Some(asid);
+    }
+    run.state.advisor_agent = Some(advisor_spec.agent.clone());
+    run.state.advisor_task_id = Some(delegated.task_id.clone());
+    run.state.steps.push(PipelineStep {
+        kind: "advisor".into(),
+        round: run.state.round,
+        title: format!("Advisor · {}", candidate_display(&advisor_spec)),
+        detail: req_body
+            .question
+            .as_deref()
+            .map(|q| concise_excerpt(q, 200))
+            .unwrap_or_else(|| "Consulting read-only advisor for second opinion…".into()),
+        status: "running".into(),
+        asid: run.state.advisor_asid.clone(),
+        task_id: Some(delegated.task_id.clone()),
+        time_ms: now,
+    });
+    store::save_state(&state.db, run.id.clone(), run.state.clone())
+        .await
+        .map_err(internal)?;
     drop(guard);
     view(&state, run).await
 }
@@ -2304,34 +2641,6 @@ async fn rework(
         )
         .await;
     let rework_tid = delegated.as_ref().ok().map(|t| t.task_id.clone());
-    if super::dag::is_smart_run(&run) {
-        if let Ok(ref task) = delegated {
-            if let Some(ref mut plan_obj) = run.state.plan {
-                run.state.mao_phase = "executing".into();
-                plan_obj.tasks.push(super::plan::PlannedTask {
-                    id: format!("rework_{next_round}"),
-                    title: format!("Rework #{next_round}"),
-                    goal: feedback.clone(),
-                    agent: active_coder.agent.clone(),
-                    model: active_coder.model.clone(),
-                    variant: active_coder.variant.clone(),
-                    machine: active_coder.machine.clone(),
-                    reason: "Targeted rework for selected review findings.".into(),
-                    depends_on: vec![],
-                    owns_paths: vec![],
-                    read_only: false,
-                    use_worktree: false,
-                    status: "running".into(),
-                    task_id: Some(task.task_id.clone()),
-                    asid: agent_asid(&task.binding).map(|(_, a)| a),
-                    worktree_path: None,
-                    worktree_branch: None,
-                    summary: None,
-                    error: None,
-                });
-            }
-        }
-    }
     run.state.steps.push(PipelineStep {
         kind: "rework".into(),
         round: next_round,
@@ -2392,17 +2701,12 @@ async fn cancel(
             .cancel(&state, &principal, &TaskId(rtid.clone()))
             .await;
     }
-    if let Some(ref plan_obj) = run.state.plan {
-        for t in &plan_obj.tasks {
-            if let Some(ref tid) = t.task_id {
-                let _ = state
-                    .tasks
-                    .cancel(&state, &principal, &TaskId(tid.clone()))
-                    .await;
-            }
-        }
+    if let Some(ref atid) = run.state.advisor_task_id.take() {
+        let _ = state
+            .tasks
+            .cancel(&state, &principal, &TaskId(atid.clone()))
+            .await;
     }
-    super::dag::cleanup_all_run_worktrees(&state, &run).await;
     store::save_state(&state.db, run.id.clone(), run.state.clone())
         .await
         .map_err(internal)?;

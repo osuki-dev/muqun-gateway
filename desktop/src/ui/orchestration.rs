@@ -40,10 +40,7 @@ pub struct MaoRole {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MaoPhase {
-    Analyzing,
-    PlanReady,
     Coding { round: u8 },
-    Integrating,
     Reviewing { round: u8 },
     Approved { round: u8, summary: String },
     ChangesRequested { round: u8, feedback: String },
@@ -53,9 +50,11 @@ pub enum MaoPhase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MaoStepKind {
-    Plan,
+    #[serde(alias = "Plan")]
+    Route,
     Coding,
-    Integrate,
+    #[serde(alias = "Integrate")]
+    Advisor,
     Review,
     Rework,
     Verdict,
@@ -125,32 +124,41 @@ pub struct MaoFinding {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
-pub struct MaoPlannedTask {
-    pub id: String,
-    pub title: String,
-    pub goal: String,
+pub struct MaoCandidateStatus {
     pub agent: String,
     pub model: Option<String>,
-    pub reason: String,
-    pub depends_on: Vec<String>,
-    pub owns_paths: Vec<String>,
-    pub read_only: bool,
-    pub use_worktree: bool,
-    pub status: String,
-    pub asid: Option<String>,
-    pub worktree_branch: Option<String>,
-    pub summary: Option<String>,
-    pub error: Option<String>,
+    pub health: String,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
-pub struct MaoPlan {
-    pub complexity: String,
-    pub analysis: String,
-    pub tasks: Vec<MaoPlannedTask>,
-    pub verify_commands: Vec<String>,
-    pub reviewer_reason: Option<String>,
+pub struct MaoRouteDecision {
+    pub engine: String,
+    pub action: String,
+    pub cache_warm: bool,
+    pub skip_review: bool,
+    pub chosen_agent: String,
+    pub chosen_model: Option<String>,
+    pub reason: String,
+    pub latency_ms: u64,
+    pub candidates: Vec<MaoCandidateStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct MaoSubtaskView {
+    pub task_id: String,
+    pub title: String,
+    pub goal: String,
+    pub kind: String,
+    pub state: String,
+    pub agent_id: Option<String>,
+    pub asid: Option<String>,
+    pub machine: Option<String>,
+    pub summary: Option<String>,
+    pub progress: Option<String>,
+    pub updated_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -179,7 +187,13 @@ pub struct MaoRun {
     pub review_summary: String,
     pub findings: Vec<MaoFinding>,
     pub steps: Vec<MaoStep>,
-    pub plan: Option<MaoPlan>,
+    pub route_decision: Option<MaoRouteDecision>,
+    pub skip_review: bool,
+    pub advisor_agent: Option<String>,
+    pub advisor_asid: Option<String>,
+    pub advisor_running: bool,
+    pub advisor_summary: String,
+    pub subtasks: Vec<MaoSubtaskView>,
     pub expanded: bool,
     pub created_ms: u64,
     pub updated_ms: u64,
@@ -219,7 +233,13 @@ impl Default for MaoRun {
             review_summary: String::new(),
             findings: Vec::new(),
             steps: Vec::new(),
-            plan: None,
+            route_decision: None,
+            skip_review: false,
+            advisor_agent: None,
+            advisor_asid: None,
+            advisor_running: false,
+            advisor_summary: String::new(),
+            subtasks: Vec::new(),
             expanded: false,
             created_ms: 0,
             updated_ms: 0,
@@ -231,18 +251,23 @@ impl MaoRun {
     pub fn is_active(&self) -> bool {
         matches!(
             self.phase,
-            MaoPhase::Analyzing
-                | MaoPhase::Coding { .. }
-                | MaoPhase::Integrating
-                | MaoPhase::Reviewing { .. }
-        )
+            MaoPhase::Coding { .. } | MaoPhase::Reviewing { .. }
+        ) || self.advisor_running
     }
 
     pub fn needs_attention(&self) -> bool {
         matches!(
             self.phase,
-            MaoPhase::PlanReady | MaoPhase::ChangesRequested { .. } | MaoPhase::Failed { .. }
+            MaoPhase::ChangesRequested { .. } | MaoPhase::Failed { .. }
         )
+    }
+
+    pub fn session_group_key(&self) -> &str {
+        if !self.coder_asid.is_empty() && !self.coder_asid.starts_with("new-") {
+            self.coder_asid.as_str()
+        } else {
+            self.id.as_str()
+        }
     }
 }
 
@@ -356,7 +381,6 @@ pub struct View {
     pub last_gateway_poll_ms: u64,
     pub rework_note: TextEdit,
     pub rework_note_run: Option<String>,
-    pub plan_agent_overrides: HashMap<(String, String), String>,
     pub excluded_findings: HashMap<String, HashSet<usize>>,
     pub dismissed_runs: HashSet<String>,
     pub next_seq: u64,
@@ -432,7 +456,6 @@ impl Default for View {
             last_gateway_poll_ms: 0,
             rework_note: TextEdit::new(""),
             rework_note_run: None,
-            plan_agent_overrides: HashMap::new(),
             excluded_findings: HashMap::new(),
             dismissed_runs: HashSet::new(),
             next_seq,
@@ -447,45 +470,63 @@ impl View {
 
     pub fn tracked_asids(&self) -> Vec<AgentSessionId> {
         let mut out = Vec::new();
-        for run in &self.runs {
-            if !run.coder_asid.is_empty() && !run.coder_asid.starts_with("new-") {
-                let id = AgentSessionId(run.coder_asid.clone());
+        let mut push_id = |raw: &str| {
+            if !raw.is_empty() && !raw.starts_with("new-") {
+                let id = AgentSessionId(raw.to_string());
                 if !out.contains(&id) {
                     out.push(id);
                 }
             }
+        };
+        for run in &self.runs {
+            push_id(&run.coder_asid);
             if let Some(ref rev) = run.reviewer_asid {
-                if !rev.is_empty() && !rev.starts_with("new-") {
-                    let id = AgentSessionId(rev.clone());
-                    if !out.contains(&id) {
-                        out.push(id);
-                    }
-                }
+                push_id(rev);
             }
-            if let Some(ref plan) = run.plan {
-                for t in &plan.tasks {
-                    if let Some(ref a) = t.asid {
-                        if !a.is_empty() && !a.starts_with("new-") {
-                            let id = AgentSessionId(a.clone());
-                            if !out.contains(&id) {
-                                out.push(id);
-                            }
-                        }
-                    }
+            if let Some(ref adv) = run.advisor_asid {
+                push_id(adv);
+            }
+            for sub in &run.subtasks {
+                if let Some(ref a) = sub.asid {
+                    push_id(a);
                 }
             }
         }
         out
     }
 
+    /// True when `asid` is an internal MAO child session (Reviewer, Advisor, or
+    /// delegated MAO subtask) and NOT a user's primary orchestrated session.
+    /// Used by the sidebar to keep Recent Sessions focused on primary sessions.
+    pub fn is_internal_child_session(&self, asid: &str) -> bool {
+        if asid.is_empty() {
+            return false;
+        }
+        if self.runs.iter().any(|r| r.coder_asid == asid) {
+            return false;
+        }
+        self.runs.iter().any(|r| {
+            r.reviewer_asid.as_deref() == Some(asid)
+                || r.advisor_asid.as_deref() == Some(asid)
+                || r.subtasks
+                    .iter()
+                    .any(|sub| sub.asid.as_deref() == Some(asid))
+                || r.steps.iter().any(|st| {
+                    matches!(st.kind, MaoStepKind::Review | MaoStepKind::Advisor)
+                        && st.asid.as_deref() == Some(asid)
+                })
+        })
+    }
+
     pub fn is_tracked(&self, asid: &str) -> bool {
         self.runs.iter().any(|run| {
             run.coder_asid == asid
                 || run.reviewer_asid.as_deref() == Some(asid)
+                || run.advisor_asid.as_deref() == Some(asid)
                 || run
-                    .plan
-                    .as_ref()
-                    .is_some_and(|p| p.tasks.iter().any(|t| t.asid.as_deref() == Some(asid)))
+                    .subtasks
+                    .iter()
+                    .any(|sub| sub.asid.as_deref() == Some(asid))
         })
     }
 
@@ -493,15 +534,43 @@ impl View {
         self.runs.iter().rfind(|run| {
             run.coder_asid == asid
                 || run.reviewer_asid.as_deref() == Some(asid)
+                || run.advisor_asid.as_deref() == Some(asid)
                 || run
-                    .plan
-                    .as_ref()
-                    .is_some_and(|p| p.tasks.iter().any(|t| t.asid.as_deref() == Some(asid)))
+                    .subtasks
+                    .iter()
+                    .any(|sub| sub.asid.as_deref() == Some(asid))
         })
     }
 
+    /// Group runs by primary session (`coder_asid`), newest session first.
+    /// Each entry returns `(latest_run, total_turns_in_session)`.
+    pub fn grouped_sessions(&self, filter: Filter) -> Vec<(&MaoRun, usize)> {
+        let mut seen: Vec<(&str, &MaoRun, usize)> = Vec::new();
+        for run in self.runs.iter().rev() {
+            let key = run.session_group_key();
+            if let Some(entry) = seen.iter_mut().find(|(k, _, _)| *k == key) {
+                entry.2 += 1;
+            } else {
+                seen.push((key, run, 1));
+            }
+        }
+        seen.into_iter()
+            .filter(|(_, latest, _)| filter.keeps(latest))
+            .map(|(_, latest, count)| (latest, count))
+            .collect()
+    }
+
+    /// All historical runs belonging to the same primary session as `run`, newest first.
+    pub fn turns_for_group<'a>(&'a self, group_key: &str) -> Vec<&'a MaoRun> {
+        self.runs
+            .iter()
+            .rev()
+            .filter(|r| r.session_group_key() == group_key)
+            .collect()
+    }
+
     pub fn active_count(&self) -> usize {
-        self.runs.iter().filter(|r| r.is_active()).count()
+        self.grouped_sessions(Filter::Active).len()
     }
 
     pub fn row_working(&self, asid: &str) -> bool {
@@ -511,12 +580,9 @@ impl View {
     pub fn row_status(&self, asid: &str, language: Language) -> Option<String> {
         let run = self.run_for_session(asid)?;
         let label = match &run.phase {
-            MaoPhase::Analyzing => tr(language, "MAO · Analyzing"),
-            MaoPhase::PlanReady => tr(language, "MAO · Plan ready"),
             MaoPhase::Coding { round } => {
                 format!("{} #{}", tr_ref(language, "MAO · Coding"), round)
             }
-            MaoPhase::Integrating => tr(language, "MAO · Integrating"),
             MaoPhase::Reviewing { round } => {
                 format!("{} #{}", tr_ref(language, "MAO · Reviewing"), round)
             }
@@ -2517,69 +2583,32 @@ pub fn continue_rework(s: &mut UiState, run_id: &str) {
     persist_runs(s);
 }
 
-pub fn execute_gateway_plan(s: &mut UiState, run_id: &str) {
+pub fn ask_gateway_advisor(s: &mut UiState, run_id: &str, question: Option<String>) {
     let computer = s.current_computer().to_string();
     if computer.is_empty() || computer == "all" {
         return;
     }
-    let overrides: Vec<serde_json::Value> = s
-        .orchestration
-        .plan_agent_overrides
-        .iter()
-        .filter(|((rid, _), _)| rid == run_id)
-        .map(|((_, tid), agent)| {
-            serde_json::json!({
-                "task_id": tid,
-                "agent": agent,
-            })
-        })
-        .collect();
-    s.orchestration
-        .plan_agent_overrides
-        .retain(|(rid, _), _| rid != run_id);
     if let Some(run) = s.orchestration.runs.iter_mut().find(|r| r.id == run_id) {
-        run.phase = MaoPhase::Coding { round: run.round };
+        run.advisor_running = true;
+        run.expanded = true;
     }
     let ticket = s.next_token;
     s.next_token += 1;
     s.send(Command::Orchestration {
         computer,
         ticket,
-        request: crate::hub::OrchestrationRequest::ExecutePlan {
+        request: crate::hub::OrchestrationRequest::AskAdvisor {
             run: run_id.to_string(),
-            overrides: serde_json::Value::Array(overrides),
-            use_worktrees: Some(s.cfg.ui.mao.use_worktrees),
+            question,
+            agent: None,
         },
     });
     s.notify(
         ToastLevel::Info,
-        tr(s.cfg.general.language, "Executing orchestration plan"),
+        tr(s.cfg.general.language, "Advisor consultation started"),
         None,
     );
     s.sync_watch();
-}
-
-fn cycle_planned_task_agent(s: &mut UiState, run_id: &str, task_id: &str, current_agent: &str) {
-    let mut pool_agents: Vec<String> = s
-        .agents
-        .iter()
-        .filter(|a| Standing::of(a) == Standing::Usable)
-        .map(|a| a.id.clone())
-        .collect();
-    if pool_agents.is_empty() {
-        pool_agents = s.agents.iter().map(|a| a.id.clone()).collect();
-    }
-    if pool_agents.len() <= 1 {
-        return;
-    }
-    let idx = pool_agents
-        .iter()
-        .position(|a| a.eq_ignore_ascii_case(current_agent))
-        .unwrap_or(0);
-    let next = pool_agents[(idx + 1) % pool_agents.len()].clone();
-    s.orchestration
-        .plan_agent_overrides
-        .insert((run_id.to_string(), task_id.to_string()), next);
 }
 
 fn toggle_finding_selected(s: &mut UiState, run_id: &str, index: usize) {
@@ -3097,32 +3126,8 @@ fn reviewer_config_menu(
     );
 
     let effective_failover = effective_auto_failover(s, current_asid);
-    let confirm_plan = s.cfg.ui.mao.confirm_plan;
-    let use_worktrees = s.cfg.ui.mao.use_worktrees;
     menu = menu
         .separator()
-        .item(
-            MenuItem::new(tr_ref(language, "Confirm plan before execution"))
-                .checked(confirm_plan)
-                .on_select(move |s: &mut UiState| {
-                    let next = !s.cfg.ui.mao.confirm_plan;
-                    s.cfg.ui.mao.confirm_plan = next;
-                    let prefs = s.cfg.ui.mao.clone();
-                    s.edit(ConfigEdit::Mao(prefs));
-                    s.menu = Some(OpenMenu::MaoReviewer(anchor));
-                }),
-        )
-        .item(
-            MenuItem::new(tr_ref(language, "Isolate parallel tasks in Git worktrees"))
-                .checked(use_worktrees)
-                .on_select(move |s: &mut UiState| {
-                    let next = !s.cfg.ui.mao.use_worktrees;
-                    s.cfg.ui.mao.use_worktrees = next;
-                    let prefs = s.cfg.ui.mao.clone();
-                    s.edit(ConfigEdit::Mao(prefs));
-                    s.menu = Some(OpenMenu::MaoReviewer(anchor));
-                }),
-        )
         .item(
             MenuItem::new(tr_ref(language, "Auto-failover on quota limit"))
                 .checked(effective_failover)
@@ -3323,24 +3328,9 @@ struct QualityGate {
 
 fn quality_gates_for_run(run: &MaoRun, language: Language) -> [QualityGate; 4] {
     let coding_gate = match &run.phase {
-        MaoPhase::Analyzing => QualityGate {
-            title: tr_ref(language, "Gate: Coding"),
-            detail: tr(language, "Analyzing"),
-            status: "running",
-        },
-        MaoPhase::PlanReady => QualityGate {
-            title: tr_ref(language, "Gate: Coding"),
-            detail: tr(language, "Plan ready"),
-            status: "warning",
-        },
         MaoPhase::Coding { round } => QualityGate {
             title: tr_ref(language, "Gate: Coding"),
             detail: format!("{} #{round}", tr_ref(language, "Coding")),
-            status: "running",
-        },
-        MaoPhase::Integrating => QualityGate {
-            title: tr_ref(language, "Gate: Coding"),
-            detail: tr(language, "Integrating"),
             status: "running",
         },
         MaoPhase::Failed { .. } => QualityGate {
@@ -3400,7 +3390,11 @@ fn quality_gates_for_run(run: &MaoRun, language: Language) -> [QualityGate; 4] {
         },
         MaoPhase::Approved { round, .. } => QualityGate {
             title: tr_ref(language, "Gate: Review"),
-            detail: format!("{} #{round}", tr_ref(language, "Approved")),
+            detail: if run.skip_review && run.files.is_empty() {
+                tr(language, "Fast path")
+            } else {
+                format!("{} #{round}", tr_ref(language, "Approved"))
+            },
             status: "completed",
         },
         MaoPhase::ChangesRequested { round, .. } => QualityGate {
@@ -3441,11 +3435,7 @@ fn quality_gates_for_run(run: &MaoRun, language: Language) -> [QualityGate; 4] {
             detail: tr(language, "Stopped"),
             status: "idle",
         },
-        MaoPhase::Analyzing
-        | MaoPhase::PlanReady
-        | MaoPhase::Coding { .. }
-        | MaoPhase::Integrating
-        | MaoPhase::Reviewing { .. } => QualityGate {
+        MaoPhase::Coding { .. } | MaoPhase::Reviewing { .. } => QualityGate {
             title: tr_ref(language, "Gate: Quality"),
             detail: tr(language, "Pending review"),
             status: "idle",
@@ -3453,6 +3443,275 @@ fn quality_gates_for_run(run: &MaoRun, language: Language) -> [QualityGate; 4] {
     };
 
     [coding_gate, diff_gate, review_gate, quality_gate]
+}
+
+fn session_display_title(s: &UiState, run: &MaoRun) -> String {
+    if !run.coder_asid.is_empty() && !run.coder_asid.starts_with("new-") {
+        if let Some(preserved) = s
+            .orchestration
+            .preserved_titles
+            .get(&run.coder_asid)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && *t != run.coder_asid)
+        {
+            return preserved.to_string();
+        }
+        if let Some(info) = s.session_by_id(&run.coder_asid) {
+            let t = info.title.trim();
+            if !t.is_empty() && t != run.coder_asid && !t.starts_with("[MAO ") {
+                return t.to_string();
+            }
+        }
+    }
+    concise_excerpt(&run.goal, 64)
+}
+
+fn route_badge_el(k: &Kit, decision: &MaoRouteDecision, language: Language) -> Option<El> {
+    let (label, fg) = if decision.action == "switch" {
+        (tr_ref(language, "Auto-switched"), k.c.warning.fg)
+    } else if decision.skip_review || decision.action == "direct_fast" {
+        (tr_ref(language, "Fast path"), k.c.success.fg)
+    } else if decision.cache_warm {
+        (tr_ref(language, "Warm cache"), k.c.info.fg)
+    } else {
+        return None;
+    };
+    Some(
+        row()
+            .h(20.0)
+            .px(6.0)
+            .center_y()
+            .radius(k.radius.sm)
+            .fill(k.c.layer_02)
+            .border(1.0, k.c.border_weak.alpha(0.6))
+            .child(text(label).font(k.ty.small_medium).color(fg).single_line()),
+    )
+}
+
+fn candidate_health_strip(
+    s: &UiState,
+    k: &Kit,
+    candidates: &[MaoCandidateStatus],
+    key_prefix: &str,
+) -> Option<El> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut strip = row()
+        .key(format!("mao-health-{key_prefix}"))
+        .w_full()
+        .gap(6.0)
+        .flex_wrap()
+        .center_y();
+    for (idx, c) in candidates.iter().take(6).enumerate() {
+        let dot = match c.health.as_str() {
+            "healthy" => k.c.success.icon,
+            "exhausted" => k.c.warning.icon,
+            _ => k.c.text_faint,
+        };
+        let label = s.agent_name(&c.agent);
+        strip = strip.child(
+            row()
+                .key(format!("mao-cand-{key_prefix}-{idx}"))
+                .h(20.0)
+                .px(6.0)
+                .gap(4.0)
+                .center_y()
+                .radius(k.radius.sm)
+                .fill(k.c.layer_02)
+                .border(1.0, k.c.border_weak.alpha(0.5))
+                .child(el().size(6.0, 6.0).radius(3.0).fill(dot))
+                .child(agents::mark(&c.agent, 11.0, s.dark))
+                .child(
+                    text(label)
+                        .font(k.ty.small)
+                        .color(if c.health == "healthy" {
+                            k.c.text_base
+                        } else {
+                            k.c.text_faint
+                        })
+                        .single_line(),
+                ),
+        );
+    }
+    Some(strip)
+}
+
+fn subtasks_box_el(
+    s: &UiState,
+    k: &Kit,
+    run: &MaoRun,
+    language: Language,
+    key_prefix: &str,
+) -> Option<El> {
+    if run.subtasks.is_empty() {
+        return None;
+    }
+    let mut box_col = col()
+        .key(format!("mao-subtasks-{key_prefix}"))
+        .w_full()
+        .px(10.0)
+        .py(8.0)
+        .gap(5.0)
+        .radius(k.radius.md)
+        .fill(k.c.layer_02)
+        .border(1.0, k.c.border_weak.alpha(0.6))
+        .child(
+            row()
+                .w_full()
+                .gap(6.0)
+                .center_y()
+                .child(
+                    text(tr_ref(language, "Delegated subtasks"))
+                        .font(k.ty.small_medium)
+                        .color(k.c.text_faint)
+                        .grow(1.0),
+                )
+                .child(
+                    Badge::new(run.subtasks.len().to_string())
+                        .variant(BadgeVariant::Subtle)
+                        .build(k),
+                ),
+        );
+    for (idx, sub) in run.subtasks.iter().take(8).enumerate() {
+        let dot = match sub.state.as_str() {
+            "working" | "queued" | "dispatching" => k.c.text_accent,
+            "done" | "idle_unconfirmed" => k.c.success.icon,
+            "failed" => k.c.danger.icon,
+            "waiting" => k.c.warning.icon,
+            _ => k.c.text_faint,
+        };
+        let agent_label = sub
+            .agent_id
+            .as_deref()
+            .map(|a| s.agent_name(a))
+            .or_else(|| sub.machine.clone())
+            .unwrap_or_else(|| sub.kind.clone());
+        let detail = sub
+            .progress
+            .as_deref()
+            .or(sub.summary.as_deref())
+            .unwrap_or(&sub.goal);
+        let mut r = row()
+            .key(format!("mao-sub-{key_prefix}-{idx}"))
+            .w_full()
+            .h(24.0)
+            .px(6.0)
+            .gap(6.0)
+            .center_y()
+            .radius(k.radius.sm)
+            .fill(k.c.layer_01)
+            .child(el().size(6.0, 6.0).radius(3.0).fill(dot))
+            .children(
+                sub.agent_id
+                    .as_deref()
+                    .map(|a| agents::mark(a, 11.0, s.dark)),
+            )
+            .child(
+                text(format!(
+                    "{agent_label} · {}",
+                    concise_excerpt(&sub.title, 36)
+                ))
+                .font(k.ty.small_medium)
+                .color(k.c.text_base)
+                .single_line(),
+            )
+            .child(
+                text(clean_one_line(detail))
+                    .font(k.ty.small)
+                    .color(k.c.text_muted)
+                    .single_line()
+                    .truncate()
+                    .grow(1.0)
+                    .min_w(0.0),
+            );
+        if let Some(ref target_asid) = sub.asid {
+            if !target_asid.is_empty() && !target_asid.starts_with("new-") {
+                let jump = target_asid.clone();
+                r = r.on_press(move |s: &mut UiState| s.open_session(&jump));
+            }
+        }
+        box_col = box_col.child(r);
+    }
+    Some(box_col)
+}
+
+fn advisor_box_el(
+    s: &UiState,
+    k: &Kit,
+    run: &MaoRun,
+    language: Language,
+    key_prefix: &str,
+) -> Option<El> {
+    if !run.advisor_running && run.advisor_summary.is_empty() {
+        return None;
+    }
+    let adv_name = run
+        .advisor_agent
+        .as_deref()
+        .map(|a| s.agent_name(a))
+        .unwrap_or_else(|| tr(language, "Advisor"));
+    let mut header = row()
+        .w_full()
+        .gap(6.0)
+        .center_y()
+        .child(
+            el().size(6.0, 6.0)
+                .radius(3.0)
+                .fill(if run.advisor_running {
+                    k.c.text_accent
+                } else {
+                    k.c.info.icon
+                }),
+        )
+        .children(
+            run.advisor_agent
+                .as_deref()
+                .map(|a| agents::mark(a, 12.0, s.dark)),
+        )
+        .child(
+            text(format!("{} · {adv_name}", tr_ref(language, "Advisor")))
+                .font(k.ty.small_medium)
+                .color(k.c.text_base)
+                .grow(1.0),
+        );
+    if let Some(ref adv_asid) = run.advisor_asid {
+        if !adv_asid.is_empty() && !adv_asid.starts_with("new-") {
+            let jump = adv_asid.clone();
+            header = header.child(
+                Button::new(tr_ref(language, "Enter session"))
+                    .variant(ButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
+                    .on_press(move |s: &mut UiState| s.open_session(&jump))
+                    .build(k)
+                    .key(format!("mao-adv-open-{key_prefix}")),
+            );
+        }
+    }
+    Some(
+        col()
+            .key(format!("mao-advisor-{key_prefix}"))
+            .w_full()
+            .px(10.0)
+            .py(8.0)
+            .gap(5.0)
+            .radius(k.radius.md)
+            .fill(k.c.layer_02)
+            .border(1.0, k.c.info.icon.alpha(0.35))
+            .child(header)
+            .child(
+                text(if run.advisor_running && run.advisor_summary.is_empty() {
+                    tr(language, "Advisor consulting…")
+                } else {
+                    run.advisor_summary.clone()
+                })
+                .font(k.ty.small)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full(),
+            ),
+    )
 }
 
 // ---- Session Pipeline Banner --------------------------------------------------------------
@@ -3486,57 +3745,21 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
 
     // Dynamic single phase pill (replaces rigid 3-pill Coder > Review > Verdict chain).
     let (pill_label, pill_status, pill_agent) = match &run.phase {
-        MaoPhase::Analyzing => (
-            tr(language, "Analyzing"),
-            "running",
-            run.coder.agent.as_str(),
-        ),
-        MaoPhase::PlanReady => {
-            let count = run.plan.as_ref().map_or(0, |p| p.tasks.len());
-            (
-                if count > 0 {
-                    format!("{} · {count}", tr_ref(language, "Plan ready"))
-                } else {
-                    tr(language, "Plan ready")
-                },
-                "warning",
-                run.coder.agent.as_str(),
-            )
-        }
-        MaoPhase::Coding { round } => {
-            if let Some(ref plan) = run.plan {
-                if plan.tasks.len() > 1 {
-                    let done = plan
-                        .tasks
-                        .iter()
-                        .filter(|t| t.status == "completed")
-                        .count();
-                    (
-                        format!(
-                            "{} · {done}/{}",
-                            tr_ref(language, "Coding"),
-                            plan.tasks.len()
-                        ),
-                        "running",
-                        run.coder.agent.as_str(),
-                    )
-                } else {
-                    (
-                        format!("{} · {coder_name}", tr_ref(language, "Coding")),
-                        "running",
-                        run.coder.agent.as_str(),
-                    )
-                }
-            } else {
-                (
-                    format!("{} #{round} · {coder_name}", tr_ref(language, "Coding")),
-                    "running",
-                    run.coder.agent.as_str(),
+        MaoPhase::Coding { round } => (
+            if !run.subtasks.is_empty() {
+                let done = run
+                    .subtasks
+                    .iter()
+                    .filter(|t| matches!(t.state.as_str(), "done" | "idle_unconfirmed"))
+                    .count();
+                format!(
+                    "{} · {coder_name} ({done}/{})",
+                    tr_ref(language, "Coding"),
+                    run.subtasks.len()
                 )
-            }
-        }
-        MaoPhase::Integrating => (
-            tr(language, "Integrating"),
+            } else {
+                format!("{} #{round} · {coder_name}", tr_ref(language, "Coding"))
+            },
             "running",
             run.coder.agent.as_str(),
         ),
@@ -3552,7 +3775,11 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
         MaoPhase::Approved { .. } => (
             tr(language, "Approved"),
             "completed",
-            run.reviewer.agent.as_str(),
+            if run.skip_review && run.files.is_empty() {
+                run.coder.agent.as_str()
+            } else {
+                run.reviewer.agent.as_str()
+            },
         ),
         MaoPhase::ChangesRequested { round, .. } => (
             format!(
@@ -3587,22 +3814,35 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
                 .color(p_ink)
                 .single_line(),
         );
+    let route_chip = run
+        .route_decision
+        .as_ref()
+        .and_then(|d| route_badge_el(k, d, language));
 
-    let active_activity = clean_one_line(&if matches!(run.phase, MaoPhase::Reviewing { .. }) {
+    let active_activity = clean_one_line(&if run.advisor_running {
+        let adv_name = run
+            .advisor_agent
+            .as_deref()
+            .map(|a| s.agent_name(a))
+            .unwrap_or_else(|| tr(language, "Advisor"));
+        format!("{adv_name}: {}", tr_ref(language, "Advisor consulting…"))
+    } else if matches!(run.phase, MaoPhase::Reviewing { .. }) {
         format!(
             "{reviewer_name}: {} · {}",
             rev_live.status_label, rev_live.activity_line
         )
     } else if matches!(run.phase, MaoPhase::Coding { .. }) {
-        if let Some(ref plan) = run.plan {
-            if let Some(running) = plan.tasks.iter().find(|t| t.status == "running") {
-                format!("{}: {}", s.agent_name(&running.agent), running.title)
-            } else {
-                format!(
-                    "{coder_name}: {} · {}",
-                    coder_live.status_label, coder_live.activity_line
-                )
-            }
+        if let Some(running) = run
+            .subtasks
+            .iter()
+            .find(|t| matches!(t.state.as_str(), "working" | "dispatching"))
+        {
+            let name = running
+                .agent_id
+                .as_deref()
+                .map(|a| s.agent_name(a))
+                .unwrap_or_else(|| running.kind.clone());
+            format!("{name}: {}", running.title)
         } else {
             format!(
                 "{coder_name}: {} · {}",
@@ -3688,11 +3928,26 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
         );
     }
 
+    if run.id.starts_with("o_")
+        && !run.advisor_running
+        && matches!(
+            run.phase,
+            MaoPhase::Coding { .. } | MaoPhase::ChangesRequested { .. } | MaoPhase::Failed { .. }
+        )
+    {
+        let id_adv = run.id.clone();
+        right_actions = right_actions.child(
+            Button::new(tr_ref(language, "Ask Advisor"))
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut UiState| ask_gateway_advisor(s, &id_adv, None))
+                .build(k)
+                .key("mao-banner-advisor"),
+        );
+    }
+
     match &run.phase {
-        MaoPhase::Analyzing
-        | MaoPhase::Coding { .. }
-        | MaoPhase::Integrating
-        | MaoPhase::Reviewing { .. } => {
+        MaoPhase::Coding { .. } | MaoPhase::Reviewing { .. } => {
             let id = run.id.clone();
             right_actions = right_actions.child(
                 Button::new(tr_ref(language, "Stop"))
@@ -3702,27 +3957,6 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
                     .build(k)
                     .key("mao-banner-stop"),
             );
-        }
-        MaoPhase::PlanReady => {
-            let id_exec = run.id.clone();
-            let id_stop = run.id.clone();
-            right_actions = right_actions
-                .child(
-                    Button::new(tr_ref(language, "Stop"))
-                        .variant(ButtonVariant::GhostMuted)
-                        .control_size(ControlSize::Small)
-                        .on_press(move |s: &mut UiState| cancel_run(s, &id_stop))
-                        .build(k)
-                        .key("mao-banner-stop-plan"),
-                )
-                .child(
-                    Button::new(tr_ref(language, "Execute plan"))
-                        .variant(ButtonVariant::Submit)
-                        .control_size(ControlSize::Small)
-                        .on_press(move |s: &mut UiState| execute_gateway_plan(s, &id_exec))
-                        .build(k)
-                        .key("mao-banner-execute-plan"),
-                );
         }
         MaoPhase::ChangesRequested { .. } => {
             let id_rework = run.id.clone();
@@ -3793,13 +4027,14 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
         );
     }
 
-    // Ultra-slim 1-line header bar (36px collapsed): icon + phase pill + inline summary + right controls.
+    // Ultra-slim 1-line header bar (36px collapsed): icon + phase pill + route badge + inline summary + right controls.
     let header_bar = row()
         .w_full()
         .gap(8.0)
         .center_y()
         .child(icon(&glyphs::WORKFLOW, 13.0).color(accent))
         .child(phase_pill)
+        .children(route_chip)
         .child(
             text(active_activity.clone())
                 .font(k.ty.small)
@@ -3848,171 +4083,41 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
 
     if run.expanded {
         let mut drawer_body = col().w_full().gap(6.0).pt(4.0);
-        // 1. Smart Plan & DAG Subtask Board (PlanReady / Executing / Integrating)
-        if let Some(ref plan) = run.plan {
-            let complexity_label = match plan.complexity.as_str() {
-                "direct" => tr_ref(language, "L1 · Direct"),
-                "parallel_dag" => tr_ref(language, "L3 · Parallel DAG"),
-                _ => tr_ref(language, "L2 · Single + Review"),
-            };
-            let any_wt = plan.tasks.iter().any(|t| t.use_worktree);
-            let mut plan_hdr = row().w_full().gap(6.0).center_y().flex_wrap().child(
-                Badge::new(complexity_label)
-                    .variant(BadgeVariant::Accent)
-                    .build(k),
-            );
-            if any_wt {
-                plan_hdr = plan_hdr.child(
-                    Badge::new(tr_ref(language, "Git Worktree"))
-                        .variant(BadgeVariant::Neutral)
-                        .build(k),
-                );
-            }
-            if !plan.analysis.trim().is_empty() {
-                plan_hdr = plan_hdr.child(
-                    text(clean_one_line(&plan.analysis))
+        // 1. Signal-Cascade Routing & Live Quota Health Strip
+        if let Some(ref rd) = run.route_decision {
+            if !rd.reason.is_empty() || !rd.candidates.is_empty() {
+                let mut route_box = col()
+                    .w_full()
+                    .gap(5.0)
+                    .px(10.0)
+                    .py(7.0)
+                    .radius(k.radius.md)
+                    .fill(k.c.layer_02)
+                    .border(1.0, k.c.border_weak.alpha(0.55));
+                if !rd.reason.is_empty() {
+                    route_box = route_box.child(
+                        text(format!(
+                            "{} ({}ms)",
+                            clean_one_line(&rd.reason),
+                            rd.latency_ms
+                        ))
                         .font(k.ty.small)
                         .color(k.c.text_muted)
                         .single_line()
-                        .truncate()
-                        .grow(1.0)
-                        .min_w(0.0),
-                );
+                        .truncate(),
+                    );
+                }
+                if let Some(strip) = candidate_health_strip(s, k, &rd.candidates, "banner") {
+                    route_box = route_box.child(strip);
+                }
+                drawer_body = drawer_body.child(route_box);
             }
-            let mut plan_box = col()
-                .w_full()
-                .gap(4.0)
-                .px(10.0)
-                .py(7.0)
-                .radius(k.radius.md)
-                .fill(k.c.layer_02)
-                .border(1.0, k.c.border_weak.alpha(0.6))
-                .child(plan_hdr);
-
-            let editable_plan = matches!(run.phase, MaoPhase::PlanReady);
-            for (tidx, task) in plan.tasks.iter().enumerate() {
-                let effective_agent = s
-                    .orchestration
-                    .plan_agent_overrides
-                    .get(&(run.id.clone(), task.id.clone()))
-                    .map(String::as_str)
-                    .unwrap_or(task.agent.as_str());
-                let agent_display = s.agent_name(effective_agent);
-                let dot_color = match task.status.as_str() {
-                    "running" => k.c.text_accent,
-                    "completed" => k.c.success.icon,
-                    "failed" => k.c.danger.icon,
-                    _ => k.c.text_faint,
-                };
-                let run_id_for_swap = run.id.clone();
-                let task_id_for_swap = task.id.clone();
-                let cur_agent_owned = effective_agent.to_string();
-                let mut agent_pill = row()
-                    .key(format!("mao-plan-agent-{}-{tidx}", run.id))
-                    .h(20.0)
-                    .px(6.0)
-                    .gap(4.0)
-                    .center_y()
-                    .radius(k.radius.sm)
-                    .fill(k.c.layer_01)
-                    .border(
-                        1.0,
-                        if editable_plan {
-                            k.c.bg_accent.alpha(0.55)
-                        } else {
-                            k.c.border_weak.alpha(0.6)
-                        },
-                    )
-                    .child(agents::mark(effective_agent, 11.0, s.dark))
-                    .child(
-                        text(if editable_plan {
-                            format!("{agent_display} ▾")
-                        } else {
-                            agent_display
-                        })
-                        .font(k.ty.small_medium)
-                        .color(k.c.text_base)
-                        .single_line(),
-                    );
-                if editable_plan {
-                    agent_pill = agent_pill.on_press(move |s: &mut UiState| {
-                        cycle_planned_task_agent(
-                            s,
-                            &run_id_for_swap,
-                            &task_id_for_swap,
-                            &cur_agent_owned,
-                        );
-                    });
-                }
-
-                let mut task_row = row()
-                    .key(format!("mao-plan-task-{}-{tidx}", run.id))
-                    .w_full()
-                    .h(24.0)
-                    .px(4.0)
-                    .gap(7.0)
-                    .center_y()
-                    .child(el().size(6.0, 6.0).radius(3.0).fill(dot_color))
-                    .child(
-                        text(format!("[{}] {}", task.id, task.title))
-                            .font(k.ty.small_medium)
-                            .color(k.c.text_base)
-                            .single_line(),
-                    )
-                    .child(agent_pill);
-                if task.use_worktree {
-                    task_row = task_row.child(
-                        text("WT")
-                            .font(k.ty.small_medium)
-                            .color(k.c.info.fg)
-                            .single_line(),
-                    );
-                }
-                if !task.depends_on.is_empty() {
-                    task_row = task_row.child(
-                        text(format!("← {}", task.depends_on.join(",")))
-                            .font(k.ty.small)
-                            .color(k.c.text_faint)
-                            .single_line(),
-                    );
-                }
-                let hint_text = task
-                    .error
-                    .as_deref()
-                    .or(if task.reason.is_empty() {
-                        None
-                    } else {
-                        Some(task.reason.as_str())
-                    })
-                    .unwrap_or("");
-                if !hint_text.is_empty() {
-                    task_row = task_row.child(
-                        text(clean_one_line(hint_text))
-                            .font(k.ty.small)
-                            .color(if task.error.is_some() {
-                                k.c.danger.fg
-                            } else {
-                                k.c.text_muted
-                            })
-                            .single_line()
-                            .truncate()
-                            .grow(1.0)
-                            .min_w(0.0),
-                    );
-                }
-                if !editable_plan {
-                    if let Some(ref target_asid) = task.asid {
-                        if !target_asid.starts_with("new-") {
-                            let jump = target_asid.clone();
-                            task_row = task_row.on_press(move |s: &mut UiState| {
-                                s.open_session(&jump);
-                            });
-                        }
-                    }
-                }
-                plan_box = plan_box.child(task_row);
-            }
-            drawer_body = drawer_body.child(plan_box);
+        }
+        if let Some(adv) = advisor_box_el(s, k, run, language, "banner") {
+            drawer_body = drawer_body.child(adv);
+        }
+        if let Some(subs) = subtasks_box_el(s, k, run, language, "banner") {
+            drawer_body = drawer_body.child(subs);
         }
 
         // 2. Selectable Findings List during ChangesRequested (review-in-the-loop)
@@ -4237,22 +4342,6 @@ fn phase_summary_line(
     language: Language,
 ) -> String {
     match &run.phase {
-        MaoPhase::Analyzing => tr(
-            language,
-            "Analyzing task & repository to route the best available agents…",
-        ),
-        MaoPhase::PlanReady => run
-            .plan
-            .as_ref()
-            .map(|p| {
-                format!(
-                    "{} ({}) · {}",
-                    tr_ref(language, "Plan ready"),
-                    p.tasks.len(),
-                    p.analysis
-                )
-            })
-            .unwrap_or_else(|| tr(language, "Orchestration plan ready for confirmation.")),
         MaoPhase::Coding { round } if *round == 1 => format!(
             "{} · {coder_name} {}",
             tr_ref(language, "Phase 1"),
@@ -4267,7 +4356,6 @@ fn phase_summary_line(
             run.max_rounds,
             tr_ref(language, "is fixing issues raised by code review.")
         ),
-        MaoPhase::Integrating => tr(language, "Integrating parallel worktree branches…"),
         MaoPhase::Reviewing { round } => format!(
             "{} #{round}/{} · {reviewer_name} {}",
             tr_ref(language, "Code review"),
@@ -4359,8 +4447,7 @@ fn step_row(k: &Kit, idx: usize, step: &MaoStep) -> El {
 
 fn phase_color(k: &Kit, phase: &MaoPhase) -> Color {
     match phase {
-        MaoPhase::Analyzing | MaoPhase::Coding { .. } | MaoPhase::Integrating => k.c.text_accent,
-        MaoPhase::PlanReady => k.c.warning.icon,
+        MaoPhase::Coding { .. } => k.c.text_accent,
         MaoPhase::Reviewing { .. } => k.c.info.icon,
         MaoPhase::Approved { .. } => k.c.success.icon,
         MaoPhase::ChangesRequested { .. } => k.c.warning.icon,
@@ -4371,13 +4458,10 @@ fn phase_color(k: &Kit, phase: &MaoPhase) -> Color {
 
 fn phase_badge(k: &Kit, phase: &MaoPhase, language: Language) -> El {
     let (label, variant) = match phase {
-        MaoPhase::Analyzing => (tr(language, "Analyzing"), BadgeVariant::Accent),
-        MaoPhase::PlanReady => (tr(language, "Plan ready"), BadgeVariant::Neutral),
         MaoPhase::Coding { round } => (
             format!("{} #{round}", tr_ref(language, "Coding")),
             BadgeVariant::Accent,
         ),
-        MaoPhase::Integrating => (tr(language, "Integrating"), BadgeVariant::Accent),
         MaoPhase::Reviewing { round } => (
             format!("{} #{round}", tr_ref(language, "Reviewing")),
             BadgeVariant::Neutral,
@@ -4401,26 +4485,28 @@ pub fn page_view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .min(MAX_W);
     let stacked = card_w < STACK_AT;
 
-    let list: Vec<&MaoRun> = s
-        .orchestration
-        .runs
-        .iter()
-        .rev()
-        .filter(|r| s.orchestration.filter.keeps(r))
-        .collect();
+    // Session-centric grouping: 1 row per primary orchestrated session (`coder_asid`),
+    // rather than creating a separate list row for every chat message.
+    let groups = s.orchestration.grouped_sessions(s.orchestration.filter);
     let selected = s
         .orchestration
         .selected_run
         .as_deref()
-        .and_then(|id| list.iter().copied().find(|r| r.id == id))
-        .or_else(|| list.first().copied());
+        .and_then(|id| s.orchestration.runs.iter().find(|r| r.id == id))
+        .filter(|sel| {
+            groups
+                .iter()
+                .any(|(latest, _)| latest.session_group_key() == sel.session_group_key())
+        })
+        .or_else(|| groups.first().map(|(latest, _)| *latest));
+    let selected_group_key = selected.map(|r| r.session_group_key());
 
     let mut body = row().key("mao-body").w_full().grow(1.0).min_h(0.0);
     if s.orchestration.runs.is_empty() {
         body = body.child(page_empty(s, k));
     } else {
         body = body
-            .child(page_list(s, k, &list, selected.map(|r| r.id.as_str())))
+            .child(page_list(s, k, &groups, selected_group_key))
             .child(
                 el().key("mao-rule")
                     .w(1.0)
@@ -4558,7 +4644,7 @@ fn page_head(s: &UiState, k: &Kit, layer: &mut Vec<El>, stacked: bool) -> El {
                 .child(
                     text(tr_ref(
                         language,
-                        "Automated Coder ⇄ Reviewer delivery & code-review loop.",
+                        "Session-centric orchestration: Sticky Lead Advisor, zero-token signal routing, on-demand Advisor, and automated code review.",
                     ))
                     .key("page-subtitle")
                     .font(k.ty.small)
@@ -4575,7 +4661,7 @@ fn page_filters(s: &UiState, k: &Kit) -> El {
     let labels: Vec<String> = Filter::ALL
         .iter()
         .map(|f| {
-            let n = s.orchestration.runs.iter().filter(|r| f.keeps(r)).count();
+            let n = s.orchestration.grouped_sessions(*f).len();
             if *f == Filter::All || n == 0 {
                 f.word(language).to_string()
             } else {
@@ -4604,26 +4690,26 @@ fn page_empty(s: &UiState, k: &Kit) -> El {
     let steps = [
         (
             "1",
-            tr_ref(language, "Coder executes task"),
+            tr_ref(language, "Sticky Lead Advisor & fast path"),
             tr_ref(
                 language,
-                "Your primary agent + model + effort implements and verifies changes.",
+                "Primary session stays warm to preserve prompt cache; lightweight Q&A finishes directly with zero extra review tokens.",
             ),
         ),
         (
             "2",
-            tr_ref(language, "Auto diff & Reviewer pass"),
+            tr_ref(language, "Dynamic delegation & Advisor"),
             tr_ref(
                 language,
-                "When Coder finishes, MAO gathers workspace diff and hands it to your Reviewer.",
+                "Delegates subtasks only when beneficial and lets you consult a different healthy Advisor in one click.",
             ),
         ),
         (
             "3",
-            tr_ref(language, "Auto-rework or acceptance"),
+            tr_ref(language, "Quota failover & review gate"),
             tr_ref(
                 language,
-                "Issues are routed back automatically up to your round limit, then flagged clearly.",
+                "Auto-switches on rate limits and triggers independent code review only when workspace changes are produced.",
             ),
         ),
     ];
@@ -4707,13 +4793,19 @@ fn page_empty(s: &UiState, k: &Kit) -> El {
         )
 }
 
-fn page_list(s: &UiState, k: &Kit, list: &[&MaoRun], selected_id: Option<&str>) -> El {
+fn page_list(
+    s: &UiState,
+    k: &Kit,
+    groups: &[(&MaoRun, usize)],
+    selected_group_key: Option<&str>,
+) -> El {
     let language = s.cfg.general.language;
     let now = now_ms();
     let mut rows = col().key("mao-rows").w_full().padding(16.0).gap(10.0);
-    for run in list {
-        let is_selected = selected_id == Some(run.id.as_str());
+    for &(run, turn_count) in groups {
+        let is_selected = selected_group_key == Some(run.session_group_key());
         let id = run.id.clone();
+        let session_title = session_display_title(s, run);
         let coder_name = s.agent_name(&run.coder.agent);
         let rev_name = s.agent_name(&run.reviewer.agent);
         let accent = phase_color(k, &run.phase);
@@ -4732,6 +4824,10 @@ fn page_list(s: &UiState, k: &Kit, list: &[&MaoRun], selected_id: Option<&str>) 
             language,
         );
         let (adds, dels) = diff_totals(&run.files);
+        let route_chip = run
+            .route_decision
+            .as_ref()
+            .and_then(|d| route_badge_el(k, d, language));
 
         let header = row()
             .w_full()
@@ -4739,14 +4835,26 @@ fn page_list(s: &UiState, k: &Kit, list: &[&MaoRun], selected_id: Option<&str>) 
             .center_y()
             .child(el().size(8.0, 8.0).radius(4.0).fill(accent))
             .child(
-                text(concise_excerpt(&run.goal, 96))
+                text(session_title)
                     .font(k.ty.ui_medium)
                     .color(k.c.text_base)
                     .truncate()
                     .grow(1.0)
                     .min_w(0.0),
             )
+            .children((turn_count > 1).then(|| {
+                Badge::new(format!("{turn_count} {}", tr_ref(language, "turns")))
+                    .variant(BadgeVariant::Subtle)
+                    .build(k)
+            }))
             .child(phase_badge(k, &run.phase, language));
+
+        let goal_line = text(concise_excerpt(&run.goal, 92))
+            .font(k.ty.small)
+            .color(k.c.text_muted)
+            .single_line()
+            .truncate()
+            .w_full();
 
         let coder_pill = row()
             .px(8.0)
@@ -4800,24 +4908,29 @@ fn page_list(s: &UiState, k: &Kit, list: &[&MaoRun], selected_id: Option<&str>) 
             .flex_wrap()
             .child(coder_pill)
             .child(rev_pill)
+            .children(route_chip)
+            .children((!run.subtasks.is_empty()).then(|| {
+                Badge::new(format!(
+                    "{} {}",
+                    run.subtasks.len(),
+                    tr_ref(language, "Delegated subtasks")
+                ))
+                .variant(BadgeVariant::Subtle)
+                .build(k)
+            }))
             .child(el().grow(1.0))
             .child(
-                text(format!(
-                    "{}/{} · {}",
-                    run.round,
-                    run.max_rounds,
-                    ago(run.updated_ms, now, language)
-                ))
-                .font(k.ty.small)
-                .color(k.c.text_faint),
+                text(ago(run.updated_ms, now, language))
+                    .font(k.ty.small)
+                    .color(k.c.text_faint),
             );
 
         rows = rows.child(
             col()
-                .key(format!("mao-row-{}", run.id))
+                .key(format!("mao-row-{}", run.session_group_key()))
                 .w_full()
                 .padding(14.0)
-                .gap(8.0)
+                .gap(7.0)
                 .radius(k.radius.lg)
                 .fill(if is_selected {
                     k.c.layer_02
@@ -4836,6 +4949,7 @@ fn page_list(s: &UiState, k: &Kit, list: &[&MaoRun], selected_id: Option<&str>) 
                     s.orchestration.selected_run = Some(id.clone());
                 })
                 .child(header)
+                .child(goal_line)
                 .child(meta),
         );
     }
@@ -4988,6 +5102,17 @@ fn page_detail(s: &UiState, k: &Kit, run: &MaoRun) -> El {
     );
 
     let mut actions = row().w_full().gap(8.0).flex_wrap();
+    if run.id.starts_with("o_") && !run.advisor_running {
+        let id_adv = run.id.clone();
+        actions = actions.child(
+            Button::new(tr_ref(language, "Ask Advisor"))
+                .variant(ButtonVariant::Neutral)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut UiState| ask_gateway_advisor(s, &id_adv, None))
+                .build(k)
+                .key("mao-detail-advisor"),
+        );
+    }
     if !run.coder_asid.starts_with("new-") {
         let diff_target = run.coder_asid.clone();
         actions = actions.child(
@@ -5314,17 +5439,90 @@ fn page_detail(s: &UiState, k: &Kit, run: &MaoRun) -> El {
         steps_col = steps_col.child(step_row(k, idx, step));
     }
 
+    let session_turns = s.orchestration.turns_for_group(run.session_group_key());
+    let turn_switcher = (session_turns.len() > 1).then(|| {
+        let mut strip = row().w_full().gap(6.0).center_y().flex_wrap().child(
+            text(tr_ref(language, "Session turns"))
+                .font(k.ty.small_medium)
+                .color(k.c.text_faint),
+        );
+        for (idx, item) in session_turns.iter().take(6).enumerate() {
+            let active = item.id == run.id;
+            let id = item.id.clone();
+            strip = strip.child(
+                Button::new(concise_excerpt(&item.goal, 26))
+                    .variant(if active {
+                        ButtonVariant::Neutral
+                    } else {
+                        ButtonVariant::GhostMuted
+                    })
+                    .control_size(ControlSize::Small)
+                    .on_press(move |s: &mut UiState| {
+                        s.orchestration.selected_run = Some(id.clone());
+                    })
+                    .build(k)
+                    .key(format!("mao-turn-pick-{idx}-{}", item.id)),
+            );
+        }
+        strip
+    });
+
+    let route_panel = run.route_decision.as_ref().and_then(|rd| {
+        if rd.reason.is_empty() && rd.candidates.is_empty() {
+            return None;
+        }
+        let mut box_col = col()
+            .key("mao-detail-route")
+            .w_full()
+            .padding(10.0)
+            .gap(6.0)
+            .radius(k.radius.md)
+            .fill(k.c.layer_01)
+            .border(1.0, k.c.border_weak);
+        if !rd.reason.is_empty() {
+            box_col = box_col.child(
+                row()
+                    .w_full()
+                    .gap(6.0)
+                    .center_y()
+                    .children(route_badge_el(k, rd, language))
+                    .child(
+                        text(format!(
+                            "{} ({}ms)",
+                            clean_one_line(&rd.reason),
+                            rd.latency_ms
+                        ))
+                        .font(k.ty.small)
+                        .color(k.c.text_muted)
+                        .truncate()
+                        .grow(1.0)
+                        .min_w(0.0),
+                    ),
+            );
+        }
+        if let Some(strip) = candidate_health_strip(s, k, &rd.candidates, "detail") {
+            box_col = box_col.child(strip);
+        }
+        Some(box_col)
+    });
+
     let content = col()
         .key(format!("mao-detail-body-{}", run.id))
         .w_full()
         .padding(20.0)
         .gap(14.0)
+        .children(turn_switcher)
         .child(
             row()
                 .w_full()
                 .gap(8.0)
                 .center_y()
                 .child(phase_badge(k, &run.phase, language))
+                .children(
+                    run.route_decision
+                        .as_ref()
+                        .and_then(|d| route_badge_el(k, d, language)),
+                )
                 .child(
                     text(format!(
                         "{} {}/{}",
@@ -5357,6 +5555,9 @@ fn page_detail(s: &UiState, k: &Kit, run: &MaoRun) -> El {
             .wrap()
             .w_full(),
         )
+        .children(route_panel)
+        .children(advisor_box_el(s, k, run, language, "detail"))
+        .children(subtasks_box_el(s, k, run, language, "detail"))
         .child(
             col()
                 .w_full()
@@ -5644,8 +5845,31 @@ pub fn settings_card(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         );
     } else {
         let total = s.cfg.ui.mao.agent_pool.len();
+        let latest_candidates = s
+            .orchestration
+            .runs
+            .iter()
+            .rev()
+            .find_map(|r| r.route_decision.as_ref().map(|d| d.candidates.as_slice()))
+            .unwrap_or(&[]);
         for (idx, item) in s.cfg.ui.mao.agent_pool.iter().enumerate() {
             let agent_name = s.agent_name(&item.agent);
+            let live_health = latest_candidates
+                .iter()
+                .find(|c| c.agent.eq_ignore_ascii_case(&item.agent))
+                .map(|c| c.health.as_str());
+            let connected = s
+                .agents
+                .iter()
+                .find(|a| a.id.eq_ignore_ascii_case(&item.agent))
+                .is_some_and(|a| Standing::of(a) == Standing::Usable);
+            let health_dot = match live_health {
+                Some("exhausted") => k.c.warning.icon,
+                Some("unavailable") => k.c.text_faint,
+                Some("healthy") => k.c.success.icon,
+                _ if connected => k.c.success.icon,
+                _ => k.c.text_faint,
+            };
             let model_label = item
                 .model
                 .as_ref()
@@ -5659,6 +5883,10 @@ pub fn settings_card(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             if let Some(machine) = item.machine.as_deref() {
                 sub_label.push_str(" @ ");
                 sub_label.push_str(machine);
+            }
+            if live_health == Some("exhausted") {
+                sub_label.push_str(" · ");
+                sub_label.push_str(tr_ref(language, "Quota limited"));
             }
             pool_list = pool_list.child(
                 row()
@@ -5676,6 +5904,7 @@ pub fn settings_card(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                             .variant(BadgeVariant::Subtle)
                             .build(k),
                     )
+                    .child(el().size(6.0, 6.0).radius(3.0).fill(health_dot))
                     .child(agents::mark(&item.agent, 14.0, s.dark))
                     .child(
                         text(agent_name)
@@ -5686,7 +5915,11 @@ pub fn settings_card(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                     .child(
                         text(sub_label)
                             .font(k.ty.small)
-                            .color(k.c.text_muted)
+                            .color(if live_health == Some("exhausted") {
+                                k.c.warning.fg
+                            } else {
+                                k.c.text_muted
+                            })
                             .truncate()
                             .grow(1.0)
                             .min_w(0.0),
@@ -5764,12 +5997,34 @@ pub fn settings_card(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .child(
             text(tr_ref(
                 language,
-                "Orchestrator dynamically assigns tasks across your pool and automatically switches to the next configured Agent/Model when quota runs out.",
+                "Keeps your primary session cache warm as Lead Advisor, fast-paths lightweight Q&A, supports one-click Advisor escalation, and auto-switches on quota limits.",
             ))
             .font(k.ty.small)
             .color(k.c.text_muted)
             .wrap()
             .w_full(),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(6.0)
+                .flex_wrap()
+                .center_y()
+                .child(
+                    Badge::new(tr_ref(language, "0-token signal router"))
+                        .variant(BadgeVariant::Subtle)
+                        .build(k),
+                )
+                .child(
+                    Badge::new(tr_ref(language, "Warm cache affinity"))
+                        .variant(BadgeVariant::Subtle)
+                        .build(k),
+                )
+                .child(
+                    Badge::new(tr_ref(language, "On-demand Advisor"))
+                        .variant(BadgeVariant::Subtle)
+                        .build(k),
+                ),
         )
         .child(
             row()
@@ -5843,7 +6098,9 @@ pub fn window_view(
     }
 }
 
-fn window_compact_view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+/// Compact enable toggle rendered inside the unified Desktop Window header
+/// (`MaoPlugin::window_actions`) so MAO windows share the same header bar as every other window.
+pub fn window_header_actions(s: &UiState, k: &Kit) -> El {
     let language = s.cfg.general.language;
     let toggle_slot = if s.selected.is_some() {
         Slot::Session
@@ -5851,6 +6108,29 @@ fn window_compact_view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         Slot::Start
     };
     let enabled = is_slot_enabled(s, toggle_slot);
+    Button::new(if enabled {
+        tr_ref(language, "MAO enabled")
+    } else {
+        tr_ref(language, "Enable MAO")
+    })
+    .variant(if enabled {
+        ButtonVariant::Submit
+    } else {
+        ButtonVariant::Neutral
+    })
+    .control_size(ControlSize::Small)
+    .on_press(move |s: &mut UiState| toggle_enabled(s, toggle_slot))
+    .build(k)
+    .key("mao-window-toggle")
+}
+
+fn window_compact_view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+    let language = s.cfg.general.language;
+    let toggle_slot = if s.selected.is_some() {
+        Slot::Session
+    } else {
+        Slot::Start
+    };
     let coder_id = active_coder_agent(s, toggle_slot);
     let toggle_asid = slot_asid(s, toggle_slot);
     let reviewer = effective_reviewer_for(s, &coder_id, toggle_asid);
@@ -5871,39 +6151,7 @@ fn window_compact_view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .key("mao-window-body")
         .w_full()
         .padding(14.0)
-        .gap(12.0);
-    content = content
-        .child(
-            row()
-                .w_full()
-                .gap(8.0)
-                .center_y()
-                .child(icon(&glyphs::WORKFLOW, 15.0).color(k.c.text_accent))
-                .child(
-                    text(tr_ref(language, "MAO · Orchestration"))
-                        .font(k.ty.ui_medium)
-                        .color(k.c.text_base)
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .truncate(),
-                )
-                .child(
-                    Button::new(if enabled {
-                        tr_ref(language, "MAO enabled")
-                    } else {
-                        tr_ref(language, "Enable MAO")
-                    })
-                    .variant(if enabled {
-                        ButtonVariant::Submit
-                    } else {
-                        ButtonVariant::Neutral
-                    })
-                    .control_size(ControlSize::Small)
-                    .on_press(move |s: &mut UiState| toggle_enabled(s, toggle_slot))
-                    .build(k)
-                    .key("mao-window-toggle"),
-                ),
-        )
+        .gap(12.0)
         .child(reviewer_config_menu(
             s,
             k,
@@ -5915,30 +6163,8 @@ fn window_compact_view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             Placement::BottomStart,
         ));
 
-    if s.orchestration.runs.len() > 1 {
-        let mut switcher = row().w_full().gap(6.0).flex_wrap();
-        for item in s.orchestration.runs.iter().rev().take(6) {
-            let active = run.is_some_and(|cur| cur.id == item.id);
-            let id = item.id.clone();
-            switcher = switcher.child(
-                Button::new(concise_excerpt(&item.goal, 22))
-                    .variant(if active {
-                        ButtonVariant::Neutral
-                    } else {
-                        ButtonVariant::GhostMuted
-                    })
-                    .control_size(ControlSize::Small)
-                    .on_press(move |s: &mut UiState| {
-                        s.orchestration.selected_run = Some(id.clone());
-                    })
-                    .build(k)
-                    .key(format!("mao-win-pick-{}", item.id)),
-            );
-        }
-        content = content.child(switcher);
-    }
-
     if let Some(run) = run {
+        let session_title = session_display_title(s, run);
         let coder_name = s.agent_name(&run.coder.agent);
         let reviewer_name = s.agent_name(&run.reviewer.agent);
         let coder_live = inspect_agent_live(
@@ -5980,39 +6206,67 @@ fn window_compact_view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             steps_col = steps_col.child(step_row(k, idx, step));
         }
 
+        let mut win_header = row()
+            .w_full()
+            .gap(6.0)
+            .center_y()
+            .flex_wrap()
+            .child(phase_badge(k, &run.phase, language))
+            .children(
+                run.route_decision
+                    .as_ref()
+                    .and_then(|d| route_badge_el(k, d, language)),
+            )
+            .child(el().grow(1.0));
+        if run.id.starts_with("o_") && !run.advisor_running {
+            let id_adv = run.id.clone();
+            win_header = win_header.child(
+                Button::new(tr_ref(language, "Ask Advisor"))
+                    .variant(ButtonVariant::Neutral)
+                    .control_size(ControlSize::Small)
+                    .on_press(move |s: &mut UiState| ask_gateway_advisor(s, &id_adv, None))
+                    .build(k)
+                    .key("mao-win-advisor"),
+            );
+        }
+        win_header = win_header.child(
+            Button::new(tr_ref(language, "Overview"))
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .on_press(|s: &mut UiState| {
+                    s.switch_plugin_surface("mao", crate::plugin::PluginSlot::Page)
+                })
+                .build(k)
+                .key("mao-win-full"),
+        );
+
+        let health_strip = run
+            .route_decision
+            .as_ref()
+            .and_then(|rd| candidate_health_strip(s, k, &rd.candidates, "win"));
+
         content = content
+            .child(win_header)
             .child(
-                row()
+                col()
                     .w_full()
-                    .gap(8.0)
-                    .center_y()
-                    .child(phase_badge(k, &run.phase, language))
+                    .gap(2.0)
                     .child(
                         text(format!(
-                            "{} {}/{}",
-                            tr_ref(language, "Review round"),
-                            run.round,
-                            run.max_rounds
+                            "{} · {session_title}",
+                            tr_ref(language, "Lead session")
                         ))
                         .font(k.ty.small_medium)
-                        .color(k.c.text_muted),
+                        .color(k.c.text_faint)
+                        .truncate(),
                     )
-                    .child(el().grow(1.0))
                     .child(
-                        Button::new(tr_ref(language, "Overview"))
-                            .variant(ButtonVariant::GhostMuted)
-                            .control_size(ControlSize::Small)
-                            .on_press(|s: &mut UiState| s.go(Mode::Mao))
-                            .build(k)
-                            .key("mao-win-full"),
+                        text(run.goal.clone())
+                            .font(k.ty.ui_medium)
+                            .color(k.c.text_base)
+                            .wrap()
+                            .w_full(),
                     ),
-            )
-            .child(
-                text(run.goal.clone())
-                    .font(k.ty.ui_medium)
-                    .color(k.c.text_base)
-                    .wrap()
-                    .w_full(),
             )
             .child(
                 text(phase_summary_line(
@@ -6026,6 +6280,9 @@ fn window_compact_view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .wrap()
                 .w_full(),
             )
+            .children(health_strip)
+            .children(advisor_box_el(s, k, run, language, "win"))
+            .children(subtasks_box_el(s, k, run, language, "win"))
             .child(
                 col()
                     .w_full()
@@ -6304,9 +6561,6 @@ pub fn dispatch_gateway_start(
         "reviewer": rev_obj,
         "max_review_rounds": max_rounds,
         "auto_failover": auto_failover,
-        "strategy": "smart",
-        "confirm_plan": s.cfg.ui.mao.confirm_plan,
-        "use_worktrees": s.cfg.ui.mao.use_worktrees,
     });
     if !pool_json.is_empty() {
         body["agent_pool"] = serde_json::Value::Array(pool_json);
@@ -6501,7 +6755,7 @@ pub fn on_gateway_orchestration(
     let mut newly_reviewing: Vec<(String, String)> = Vec::new();
     if let Some(runs) = payload.get("runs").and_then(|v| v.as_array()) {
         for raw in runs {
-            if let Some(pair) = merge_gateway_run(s, computer, raw) {
+            if let Some(pair) = merge_gateway_run(s, computer, raw, None) {
                 changed = true;
                 if let Some(rev_pair) = pair {
                     newly_reviewing.push(rev_pair);
@@ -6509,7 +6763,8 @@ pub fn on_gateway_orchestration(
             }
         }
     } else if let Some(single) = payload.get("run") {
-        if let Some(pair) = merge_gateway_run(s, computer, single) {
+        let top_subtasks = payload.get("subtasks").and_then(|v| v.as_array());
+        if let Some(pair) = merge_gateway_run(s, computer, single, top_subtasks) {
             changed = true;
             if let Some(rev_pair) = pair {
                 newly_reviewing.push(rev_pair);
@@ -6644,19 +6899,85 @@ fn parse_gateway_model(model: Option<&str>, variant: Option<&str>) -> Option<Mod
     })
 }
 
+fn parse_route_decision(val: &serde_json::Value) -> Option<MaoRouteDecision> {
+    if val.is_null() {
+        return None;
+    }
+    let candidates = val
+        .get("candidates")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let spec = c.get("spec")?;
+                    Some(MaoCandidateStatus {
+                        agent: spec.get("agent")?.as_str()?.to_string(),
+                        model: spec
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        health: c
+                            .get("health")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("healthy")
+                            .to_string(),
+                        reason: c.get("reason").and_then(|v| v.as_str()).map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(MaoRouteDecision {
+        engine: val
+            .get("engine")
+            .and_then(|v| v.as_str())
+            .unwrap_or("signal_cascade")
+            .to_string(),
+        action: val
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("stay")
+            .to_string(),
+        cache_warm: val
+            .get("cache_warm")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        skip_review: val
+            .get("skip_review")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        chosen_agent: val
+            .get("chosen_agent")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        chosen_model: val
+            .get("chosen_model")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        reason: val
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        latency_ms: val.get("latency_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+        candidates,
+    })
+}
+
 fn merge_gateway_run(
     s: &mut UiState,
     computer: &str,
     raw: &serde_json::Value,
+    top_subtasks: Option<&Vec<serde_json::Value>>,
 ) -> Option<Option<(String, String)>> {
     let id = raw.get("id").and_then(|v| v.as_str())?;
     let req = raw.get("request")?;
-    let is_smart = req
-        .get("strategy")
-        .and_then(|v| v.as_str())
-        .is_some_and(|st| st.eq_ignore_ascii_case("smart"));
     let rev = req.get("reviewer").filter(|v| !v.is_null());
-    if rev.is_none() && !is_smart {
+    let has_route = raw
+        .pointer("/state/route_decision")
+        .is_some_and(|v| !v.is_null());
+    if rev.is_none() && !has_route {
         return None;
     }
     let goal = req
@@ -6775,9 +7096,6 @@ fn merge_gateway_run(
         .and_then(|v| v.as_str())
         .unwrap_or("coding");
     let phase = match mao_phase {
-        "analyzing" => MaoPhase::Analyzing,
-        "plan_ready" => MaoPhase::PlanReady,
-        "integrating" => MaoPhase::Integrating,
         "approved" => MaoPhase::Approved {
             round,
             summary: review_summary.clone(),
@@ -6797,10 +7115,37 @@ fn merge_gateway_run(
         "cancelled" => MaoPhase::Cancelled,
         _ => MaoPhase::Coding { round },
     };
-    let plan: Option<MaoPlan> = st
-        .and_then(|v| v.get("plan"))
-        .filter(|v| !v.is_null())
-        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let route_decision = st
+        .and_then(|v| v.get("route_decision"))
+        .and_then(parse_route_decision);
+    let skip_review = st
+        .and_then(|v| v.get("skip_review"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or_else(|| route_decision.as_ref().is_some_and(|d| d.skip_review));
+    let advisor_agent = st
+        .and_then(|v| v.get("advisor_agent"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let advisor_asid = st
+        .and_then(|v| v.get("advisor_asid"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let advisor_running = st
+        .and_then(|v| v.get("advisor_task_id"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| !t.is_empty());
+    let advisor_summary = st
+        .and_then(|v| v.get("advisor_summary"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let subtasks: Vec<MaoSubtaskView> = top_subtasks
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
     let files: Vec<MaoDeliverableFile> = st
         .and_then(|v| v.get("files"))
         .and_then(|v| v.as_array())
@@ -6852,8 +7197,8 @@ fn merge_gateway_run(
                         .and_then(|v| v.as_str())
                         .unwrap_or("coding")
                     {
-                        "plan" => MaoStepKind::Plan,
-                        "integrate" => MaoStepKind::Integrate,
+                        "route" | "plan" => MaoStepKind::Route,
+                        "advisor" | "integrate" => MaoStepKind::Advisor,
                         "review" => MaoStepKind::Review,
                         "rework" => MaoStepKind::Rework,
                         "verdict" => MaoStepKind::Verdict,
@@ -6901,10 +7246,7 @@ fn merge_gateway_run(
         .unwrap_or(created_ms)
         .max(created_ms);
 
-    let auto_expand = matches!(
-        phase,
-        MaoPhase::PlanReady | MaoPhase::ChangesRequested { .. }
-    );
+    let auto_expand = matches!(phase, MaoPhase::ChangesRequested { .. }) || advisor_running;
     let gw_run = MaoRun {
         id: id.to_string(),
         computer: computer.to_string(),
@@ -6929,7 +7271,13 @@ fn merge_gateway_run(
         review_summary,
         findings,
         steps,
-        plan,
+        route_decision,
+        skip_review,
+        advisor_agent,
+        advisor_asid,
+        advisor_running,
+        advisor_summary,
+        subtasks,
         expanded: auto_expand,
         created_ms,
         updated_ms,
@@ -6968,7 +7316,7 @@ fn merge_gateway_run(
             }
         }
     }
-    if gw_run.is_active() || matches!(gw_run.phase, MaoPhase::PlanReady) {
+    if gw_run.is_active() {
         s.orchestration.dismissed_runs.remove(id);
     }
     if !coder_asid.is_empty()
@@ -6990,13 +7338,18 @@ fn merge_gateway_run(
         }
         let was_same_rev = matches!(existing.phase, MaoPhase::Reviewing { .. })
             && existing.reviewer_asid == gw_run.reviewer_asid;
-        let entered_decision_phase = matches!(
-            gw_run.phase,
-            MaoPhase::PlanReady | MaoPhase::ChangesRequested { .. }
-        ) && std::mem::discriminant(&existing.phase)
-            != std::mem::discriminant(&gw_run.phase);
+        let entered_decision_phase = matches!(gw_run.phase, MaoPhase::ChangesRequested { .. })
+            && std::mem::discriminant(&existing.phase) != std::mem::discriminant(&gw_run.phase);
+        // Preserve previously fetched `subtasks` on `GET /api/orchestrations` list syncs
+        // (which don't include per-run task trees).
+        let merged_subtasks = if top_subtasks.is_some() {
+            gw_run.subtasks
+        } else {
+            existing.subtasks.clone()
+        };
         *existing = MaoRun {
             id: existing.id.clone(),
+            subtasks: merged_subtasks,
             expanded: existing.expanded || entered_decision_phase,
             ..gw_run
         };
@@ -7996,7 +8349,7 @@ MAO_VERDICT: CHANGES_REQUESTED";
                 ]
             }
         });
-        assert!(merge_gateway_run(&mut s, "local", &raw).is_some());
+        assert!(merge_gateway_run(&mut s, "local", &raw, None).is_some());
         let run = s.orchestration.runs.last().unwrap();
         assert_eq!(run.coder.agent, "codex");
         assert_eq!(
@@ -8047,7 +8400,7 @@ MAO_VERDICT: CHANGES_REQUESTED";
                 "steps": []
             }
         });
-        assert!(merge_gateway_run(&mut s, "local", &gw_run).is_some());
+        assert!(merge_gateway_run(&mut s, "local", &gw_run, None).is_some());
         assert!(
             !is_slot_enabled(&s, Slot::Session),
             "Gateway sync must never flip a user-disabled session back to enabled"
@@ -8252,7 +8605,7 @@ MAO_VERDICT: CHANGES_REQUESTED";
     }
 
     #[test]
-    fn smart_plan_override_execute_worktree_merge_and_selective_findings_rework() {
+    fn signal_cascade_session_grouping_hidden_children_advisor_and_selective_rework() {
         let (tx, mut rx) = crate::model::commands::channel();
         let mut s = UiState::new(tx);
         s.hub_label = "gateway".into();
@@ -8262,100 +8615,129 @@ MAO_VERDICT: CHANGES_REQUESTED";
             test_agent("codex", "Codex"),
         ];
 
-        // 1. Merge a Gateway PlanReady payload -> auto-expands and parses DAG subtasks.
-        let plan_payload = serde_json::json!({
+        // 1. Two turns in the same primary session (`sess-1`) group into 1 primary session row,
+        //    while internal reviewer/advisor/subtask sessions are marked hidden from Recent Sessions.
+        let turn1 = serde_json::json!({
             "run": {
-                "id": "o_smart_1",
+                "id": "o_turn_1",
                 "created_ms": 1000,
                 "request": {
-                    "goal": "Add API and UI",
+                    "goal": "First turn",
                     "cwd": "/tmp/repo",
                     "coordinator": "claude",
-                    "strategy": "smart",
-                    "reviewer": { "agent": "codex" },
+                    "reviewer": { "agent": "cursor" },
                     "max_review_rounds": 2
                 },
                 "state": {
-                    "mao_phase": "plan_ready",
+                    "mao_phase": "approved",
                     "round": 1,
                     "max_rounds": 2,
                     "coder_asid": "sess-1",
-                    "plan": {
-                        "complexity": "parallel_dag",
-                        "analysis": "Split API and UI into parallel worktrees.",
-                        "tasks": [
-                            {
-                                "id": "api",
-                                "title": "Gateway API",
-                                "goal": "Add route",
-                                "agent": "claude",
-                                "reason": "Rust backend",
-                                "depends_on": [],
-                                "owns_paths": ["src/"],
-                                "read_only": false,
-                                "use_worktree": true,
-                                "status": "pending"
-                            },
-                            {
-                                "id": "ui",
-                                "title": "Desktop UI",
-                                "goal": "Add card",
-                                "agent": "cursor",
-                                "reason": "Fast UI",
-                                "depends_on": [],
-                                "owns_paths": ["desktop/"],
-                                "read_only": false,
-                                "use_worktree": true,
-                                "status": "pending"
-                            }
-                        ],
-                        "verify_commands": ["cargo test"],
-                        "reviewer_reason": "Cross-model check"
+                    "reviewer_asid": "rev-1",
+                    "skip_review": true,
+                    "route_decision": {
+                        "engine": "signal_cascade",
+                        "action": "direct_fast",
+                        "cache_warm": true,
+                        "skip_review": true,
+                        "chosen_agent": "claude",
+                        "reason": "Warm session cache on claude · lightweight query",
+                        "latency_ms": 1,
+                        "candidates": [
+                            { "spec": { "agent": "claude" }, "health": "healthy" },
+                            { "spec": { "agent": "codex" }, "health": "exhausted", "reason": "rate limit" }
+                        ]
                     },
                     "steps": []
                 }
-            }
+            },
+            "subtasks": []
         });
-        on_gateway_orchestration(&mut s, "local", 1, Ok(plan_payload));
-        assert_eq!(s.orchestration.runs.len(), 1);
-        assert_eq!(s.orchestration.runs[0].phase, MaoPhase::PlanReady);
-        assert!(s.orchestration.runs[0].expanded);
-        assert_eq!(
-            s.orchestration.runs[0].plan.as_ref().map(|p| p.tasks.len()),
-            Some(2)
-        );
+        let turn2 = serde_json::json!({
+            "run": {
+                "id": "o_turn_2",
+                "created_ms": 2000,
+                "request": {
+                    "goal": "Implement lean router",
+                    "cwd": "/tmp/repo",
+                    "coordinator": "claude",
+                    "reviewer": { "agent": "cursor" },
+                    "max_review_rounds": 2
+                },
+                "state": {
+                    "mao_phase": "coding",
+                    "round": 1,
+                    "max_rounds": 2,
+                    "coder_asid": "sess-1",
+                    "reviewer_asid": "rev-2",
+                    "advisor_asid": "adv-2",
+                    "steps": []
+                }
+            },
+            "subtasks": [
+                {
+                    "task_id": "t_sub_1",
+                    "title": "Run tests",
+                    "goal": "cargo test",
+                    "kind": "delegation",
+                    "state": "working",
+                    "agent_id": "cursor",
+                    "asid": "sub-asid-1",
+                    "updated_ms": 2005
+                }
+            ]
+        });
+        on_gateway_orchestration(&mut s, "local", 1, Ok(turn1));
+        on_gateway_orchestration(&mut s, "local", 2, Ok(turn2));
 
-        // 2. Override subtask #1 agent and execute plan -> emits ExecutePlan with override.
-        cycle_planned_task_agent(&mut s, "o_smart_1", "api", "claude");
-        execute_gateway_plan(&mut s, "o_smart_1");
-        let mut saw_execute = false;
+        let groups = s.orchestration.grouped_sessions(Filter::All);
+        assert_eq!(
+            groups.len(),
+            1,
+            "two turns in one primary session must collapse into 1 row"
+        );
+        assert_eq!(groups[0].0.id, "o_turn_2");
+        assert_eq!(groups[0].1, 2);
+        assert!(!s.orchestration.is_internal_child_session("sess-1"));
+        assert!(s.orchestration.is_internal_child_session("rev-1"));
+        assert!(s.orchestration.is_internal_child_session("rev-2"));
+        assert!(s.orchestration.is_internal_child_session("adv-2"));
+        assert!(s.orchestration.is_internal_child_session("sub-asid-1"));
+
+        // 2. Ask Advisor emits `OrchestrationRequest::AskAdvisor`.
+        ask_gateway_advisor(&mut s, "o_turn_2", Some("Check edge cases".into()));
+        let mut saw_advisor = false;
         while let Ok(cmd) = rx.try_recv() {
             if let Command::Orchestration {
                 request:
-                    crate::hub::OrchestrationRequest::ExecutePlan {
+                    crate::hub::OrchestrationRequest::AskAdvisor {
                         run,
-                        overrides,
-                        use_worktrees,
+                        question,
+                        agent,
                     },
                 ..
             } = cmd
             {
-                assert_eq!(run, "o_smart_1");
-                assert_eq!(use_worktrees, Some(true));
-                assert_eq!(overrides.as_array().unwrap().len(), 1);
-                assert_eq!(overrides[0]["task_id"], "api");
-                assert_eq!(overrides[0]["agent"], "cursor");
-                saw_execute = true;
+                assert_eq!(run, "o_turn_2");
+                assert_eq!(question.as_deref(), Some("Check edge cases"));
+                assert_eq!(agent, None);
+                saw_advisor = true;
             }
         }
-        assert!(saw_execute);
+        assert!(saw_advisor);
 
         // 3. Selective findings rework excludes unchecked finding index.
-        s.orchestration.runs[0].phase = MaoPhase::ChangesRequested {
+        let run2 = s
+            .orchestration
+            .runs
+            .iter_mut()
+            .find(|r| r.id == "o_turn_2")
+            .unwrap();
+        run2.phase = MaoPhase::ChangesRequested {
             round: 1,
             feedback: "Fix issues".into(),
         };
-        s.orchestration.runs[0].findings = vec![
+        run2.findings = vec![
             MaoFinding {
                 severity: "high".into(),
                 location: "a.rs:1".into(),
@@ -8367,8 +8749,8 @@ MAO_VERDICT: CHANGES_REQUESTED";
                 message: "Nit 2".into(),
             },
         ];
-        toggle_finding_selected(&mut s, "o_smart_1", 1);
-        continue_rework(&mut s, "o_smart_1");
+        toggle_finding_selected(&mut s, "o_turn_2", 1);
+        continue_rework(&mut s, "o_turn_2");
         let mut saw_rework = false;
         while let Ok(cmd) = rx.try_recv() {
             if let Command::Orchestration {
@@ -8381,7 +8763,7 @@ MAO_VERDICT: CHANGES_REQUESTED";
                 ..
             } = cmd
             {
-                assert_eq!(run, "o_smart_1");
+                assert_eq!(run, "o_turn_2");
                 assert_eq!(selected_findings, Some(vec![0]));
                 saw_rework = true;
             }

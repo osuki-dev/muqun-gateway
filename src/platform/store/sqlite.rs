@@ -21,6 +21,7 @@ pub(crate) struct Migration {
 pub(crate) const ALL_MIGRATIONS: &[Migration] = &[
     crate::agents::adapters::codex::native_sessions::MIGRATION,
     crate::agents::adapters::codex::native_sessions::PRESENTATION_MIGRATION,
+    crate::agents::adapters::acp::session::LAUNCH_BYPASS_MIGRATION,
     crate::agents::runtime::SESSION_ROUTES_MIGRATION,
     crate::connectivity::replay_store::MIGRATION,
     crate::tasks::store_sqlite::MIGRATION,

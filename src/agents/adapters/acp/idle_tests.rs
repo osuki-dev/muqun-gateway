@@ -1200,3 +1200,85 @@ async fn launch_scoped_auto_approve_relaunches_the_session_and_refuses_a_busy_on
         .is_empty());
     driver.shutdown().await;
 }
+
+#[tokio::test]
+async fn launch_bypass_auto_approve_persists_across_driver_restart() {
+    let fixture = Fixture::new().await;
+    let binary = fixture.directory.join("mock-fx");
+    let script = std::fs::read_to_string(&binary).unwrap().replace(
+        "    if method=='initialize':\n",
+        "    if method=='initialize':\n        open('launches.log','a').write(' '.join(sys.argv[1:])+'|'+os.environ.get('FX_PERMISSION_MODE','-')+'\\n')\n",
+    );
+    std::fs::write(&binary, script).unwrap();
+    let db_path = fixture.directory.join("bypass-state.sqlite3");
+    let db = crate::platform::store::sqlite::SqliteStore::open(
+        &db_path,
+        None,
+        &[LAUNCH_BYPASS_MIGRATION],
+    )
+    .unwrap();
+
+    let make_driver = |db: Arc<crate::platform::store::sqlite::SqliteStore>| {
+        let drv = AcpDriver::<LaunchBypassFixture>::new(
+            fixture.driver.binary.clone(),
+            fixture.driver.default_directory.clone(),
+            Arc::new(MemoryMirror::for_agent("cursor")),
+            broadcast::channel(256).0,
+        );
+        drv.set_idle_timeout(Duration::from_secs(10));
+        async move {
+            drv.persist_launch_bypass(db).await;
+            drv
+        }
+    };
+
+    // 1. Create empty session, enable auto-approve (triggers empty rebind to native_id),
+    //    then send a turn so the native session is saved under its rebound native_id.
+    let drv1 = make_driver(db.clone()).await;
+    let info = drv1.create_session(None, None, None).await.unwrap();
+    let app_id = info.asid.0.clone();
+    drv1.set_auto_approve(&app_id, true).await.unwrap();
+    assert_eq!(drv1.auto_approve(&app_id).await.unwrap(), Some(true));
+    let rebound_native_id = drv1
+        .native_ids
+        .lock()
+        .unwrap()
+        .get(&app_id)
+        .cloned()
+        .unwrap_or_else(|| app_id.clone());
+    drv1.send_prompt(&app_id, "hello", &[], None).await.unwrap();
+    idle(&drv1, &app_id).await.unwrap();
+    drv1.shutdown().await;
+
+    // 2. Simulate Gateway restart: brand-new driver attached to the same SQLite DB.
+    //    Persisted flag must restore under `rebound_native_id` and relaunch with LAUNCH_BYPASS!
+    let drv2 = make_driver(db.clone()).await;
+    assert_eq!(
+        drv2.auto_approve(&rebound_native_id).await.unwrap(),
+        Some(true),
+        "auto_approve must survive restart for launch-bypass ACP sessions"
+    );
+    drv2.load_once(&rebound_native_id).await.unwrap();
+    assert_eq!(
+        launches(&fixture).last().unwrap(),
+        "--force acp --after|full-access"
+    );
+
+    // 3. Disabling auto_approve clears persistence across a subsequent restart.
+    drv2.set_auto_approve(&rebound_native_id, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        drv2.auto_approve(&rebound_native_id).await.unwrap(),
+        Some(false)
+    );
+    drv2.shutdown().await;
+
+    let drv3 = make_driver(db).await;
+    assert_eq!(
+        drv3.auto_approve(&rebound_native_id).await.unwrap(),
+        Some(false),
+        "disabling auto_approve must clear the persisted flag"
+    );
+    drv3.shutdown().await;
+}

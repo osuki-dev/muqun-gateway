@@ -649,13 +649,6 @@ pub struct MaoPrefs {
     /// other sessions.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub session_configs: BTreeMap<String, MaoSessionOverride>,
-    /// Pause L2/L3 smart orchestration plans for user confirmation & agent tweaking
-    /// before dispatching subtasks.
-    #[serde(default = "MaoPrefs::default_confirm_plan")]
-    pub confirm_plan: bool,
-    /// Isolate parallel write subtasks in external git worktrees before merging.
-    #[serde(default = "MaoPrefs::default_use_worktrees")]
-    pub use_worktrees: bool,
 }
 
 impl MaoPrefs {
@@ -664,14 +657,6 @@ impl MaoPrefs {
     }
 
     pub const fn default_auto_failover() -> bool {
-        true
-    }
-
-    pub const fn default_confirm_plan() -> bool {
-        true
-    }
-
-    pub const fn default_use_worktrees() -> bool {
         true
     }
 }
@@ -686,8 +671,6 @@ impl Default for MaoPrefs {
             agent_pool: Vec::new(),
             session_overrides: BTreeMap::new(),
             session_configs: BTreeMap::new(),
-            confirm_plan: Self::default_confirm_plan(),
-            use_worktrees: Self::default_use_worktrees(),
         }
     }
 }

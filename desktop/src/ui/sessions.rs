@@ -27,11 +27,22 @@ const PER_PROJECT: usize = 8;
 const RECENT_LIMIT: usize = 8;
 const RECENT_AGE_MS: u64 = 3 * 24 * 60 * 60 * 1000;
 
+fn is_hidden_sidebar_session(s: &UiState, info: &muqun_gateway::agents::AgentSessionInfo) -> bool {
+    if s.is_subagent_session(info) {
+        return true;
+    }
+    let id = info.asid.0.as_str();
+    if s.selected.as_deref() == Some(id) || s.cfg.general.pinned.iter().any(|p| p == id) {
+        return false;
+    }
+    s.orchestration.is_internal_child_session(id)
+}
+
 fn recent_sessions(s: &UiState, now: u64) -> Vec<&muqun_gateway::agents::AgentSessionInfo> {
     let mut sessions: Vec<_> = s
         .sessions
         .iter()
-        .filter(|info| !s.is_subagent_session(info))
+        .filter(|info| !is_hidden_sidebar_session(s, info))
         .collect();
     let last_worked = |info: &muqun_gateway::agents::AgentSessionInfo| {
         info.updated_ms.max(info.time_viewed.unwrap_or(0)).max(
@@ -110,7 +121,7 @@ fn projects(s: &UiState) -> Vec<Project> {
     } else {
         s.sessions
             .iter()
-            .filter(|info| !s.is_subagent_session(info))
+            .filter(|info| !is_hidden_sidebar_session(s, info))
             .collect()
     };
     let listed: Vec<ListedSession> = sessions

@@ -2439,13 +2439,15 @@ impl UiState {
 
     // ---- split tiles ---------------------------------------------------------------
 
-    /// Render the tile workspace, including a standalone plugin window.
+    /// Render the tile workspace, including a standalone plugin or terminal window.
     pub fn in_split(&self) -> bool {
         self.tiles.len() >= 2
-            || self
-                .tiles
-                .first()
-                .is_some_and(|tile| matches!(tile.content, TileContent::Custom { .. }))
+            || self.tiles.first().is_some_and(|tile| {
+                matches!(
+                    tile.content,
+                    TileContent::Custom { .. } | TileContent::Terminal
+                )
+            })
     }
 
     pub fn tile_of(&self, asid: &str) -> Option<usize> {

@@ -131,6 +131,9 @@ impl CursorState {
         if let Some(servers) = runtime.cursor_mcp_servers().await {
             driver.set_mcp_servers(servers);
         }
+        if let Some(db) = runtime.store() {
+            driver.persist_launch_bypass(db).await;
+        }
         let _ = self.driver.set(driver);
         runtime.install("cursor", manager, AgentOrigin::None).await;
         true
