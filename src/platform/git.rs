@@ -2916,7 +2916,15 @@ mod tests {
         let merge = std::process::Command::new("git")
             .arg("-C")
             .arg(&repo)
-            .args(["merge", "-q", "other"])
+            .args([
+                "-c",
+                "merge.ff=true",
+                "-c",
+                "rerere.enabled=false",
+                "merge",
+                "-q",
+                "other",
+            ])
             .output()
             .unwrap();
         assert!(!merge.status.success(), "the merge should conflict");

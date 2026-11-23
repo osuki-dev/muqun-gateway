@@ -537,9 +537,13 @@ pub(super) fn empty(k: &Kit, key: &str, title: &str, detail: &str) -> El {
     col()
         .key(key.to_string())
         .w_full()
-        .py(48.0)
+        .px(20.0)
+        .py(40.0)
         .gap(6.0)
         .items_center()
+        .radius(k.radius.lg)
+        .fill(k.c.layer_01.alpha(0.45))
+        .border(1.0, k.c.border_weak.alpha(0.4))
         .child(
             text(title.to_string())
                 .font(k.ty.ui_medium)
@@ -754,6 +758,13 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             .pl(lead)
             .pr(trail)
             .child(nav(s, k, rail))
+            .child(
+                el().key("settings-nav-divider")
+                    .w(1.0)
+                    .h_full()
+                    .fill(k.c.border_weak.alpha(0.35))
+                    .a11y_hidden(),
+            )
             .child(content),
     )
 }
