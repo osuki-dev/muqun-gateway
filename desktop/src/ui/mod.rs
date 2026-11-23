@@ -4030,22 +4030,40 @@ impl UiState {
             } => self.finish_computer_unpair(computer, request, result),
             UiAction::LocalPairingRevoked { id, result } => self.finish_local_revoke(id, result),
             UiAction::LocalInvite(id, result) => self.receive_local_invite(id, result),
-            UiAction::DesktopUpdate(status) => self.desktop_update = status,
+            UiAction::DesktopUpdate(status) => {
+                if let crate::platform::update::Status::Available(version) = &status {
+                    let language = self.cfg.general.language;
+                    self.notify(
+                        ToastLevel::Info,
+                        copy::tr(language, "Updates"),
+                        Some(format!("{} v{}", copy::tr(language, "Update to"), version)),
+                    );
+                }
+                self.desktop_update = status;
+            }
             UiAction::LocalPairings(devices) => {
                 self.local_revoke.cancel_confirmation();
                 self.local_pairings = devices;
             }
             UiAction::LocalGatewayStatus(status) => {
                 let language = self.cfg.general.language;
-                self.notify(
-                    if status == crate::platform::gateway_bootstrap::Status::Failed {
-                        ToastLevel::Error
-                    } else {
-                        ToastLevel::Info
-                    },
-                    copy::tr(language, "Local Gateway setup"),
-                    Some(copy::tr(language, status.message())),
-                );
+                if matches!(
+                    status,
+                    crate::platform::gateway_bootstrap::Status::Failed
+                        | crate::platform::gateway_bootstrap::Status::MissingBackend
+                ) {
+                    self.notify(
+                        ToastLevel::Error,
+                        copy::tr(language, "Local Gateway setup"),
+                        Some(copy::tr(language, status.message())),
+                    );
+                } else if status == crate::platform::gateway_bootstrap::Status::Ready {
+                    self.notify(
+                        ToastLevel::Info,
+                        copy::tr(language, "Local Gateway setup"),
+                        Some(copy::tr(language, status.message())),
+                    );
+                }
             }
             UiAction::LocalGatewayReady => {
                 // Never displace a remote computer, open session, terminal or
