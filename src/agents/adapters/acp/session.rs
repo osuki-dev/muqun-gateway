@@ -1029,8 +1029,10 @@ impl<P: AcpProvider> AcpDriver<P> {
             set(enabled);
             let mapped = self.native_ids.lock().unwrap().get(id).cloned();
             if enabled {
-                let disk_id = mapped.as_deref().unwrap_or(id);
-                self.save_launch_bypass(disk_id, true).await;
+                self.save_launch_bypass(id, true).await;
+                if let Some(native) = mapped.as_deref().filter(|n| *n != id) {
+                    self.save_launch_bypass(native, true).await;
+                }
             } else {
                 self.save_launch_bypass(id, false).await;
                 if let Some(native) = mapped.filter(|n| n != id) {
@@ -1104,10 +1106,9 @@ impl<P: AcpProvider> AcpDriver<P> {
         } else {
             let mapped = self.native_ids.lock().unwrap().get(id).cloned();
             if enabled {
-                let disk_id = mapped.as_deref().unwrap_or(id);
-                self.save_launch_bypass(disk_id, true).await;
-                if disk_id != id {
-                    self.save_launch_bypass(id, false).await;
+                self.save_launch_bypass(id, true).await;
+                if let Some(native) = mapped.as_deref().filter(|n| *n != id) {
+                    self.save_launch_bypass(native, true).await;
                 }
             } else {
                 self.save_launch_bypass(id, false).await;
@@ -1145,15 +1146,11 @@ impl<P: AcpProvider> AcpDriver<P> {
             self.save_launch_bypass(&prev, false).await;
         }
         if self.launch_bypassed(app_id) {
+            self.save_launch_bypass(app_id, true).await;
             self.save_launch_bypass(&native_id, true).await;
-            if native_id != app_id {
-                self.save_launch_bypass(app_id, false).await;
-            }
         } else {
+            self.save_launch_bypass(app_id, false).await;
             self.save_launch_bypass(&native_id, false).await;
-            if native_id != app_id {
-                self.save_launch_bypass(app_id, false).await;
-            }
         }
         if native_id != app_id {
             {
@@ -2821,9 +2818,17 @@ impl<P: AcpProvider> AcpDriver<P> {
         directory: &str,
         existing: Option<AgentSessionInfo>,
     ) -> Result<Arc<Session>, AgentError> {
-        let bypass = existing
-            .as_ref()
-            .is_some_and(|info| self.launch_bypassed(&info.asid.0));
+        let bypass = existing.as_ref().is_some_and(|info| {
+            self.launch_bypassed(&info.asid.0)
+                || (!info.backend_session_id.is_empty()
+                    && self.launch_bypassed(&info.backend_session_id))
+                || self
+                    .native_ids
+                    .lock()
+                    .unwrap()
+                    .get(&info.asid.0)
+                    .is_some_and(|native| self.launch_bypassed(native))
+        });
         self.open_launch(directory, existing, bypass).await
     }
 
@@ -5677,7 +5682,10 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 };
             }
             if P::LAUNCH_BYPASS.is_some() {
-                return Ok(Some(self.launch_bypassed(id)));
+                let mapped = self.native_ids.lock().unwrap().get(id).cloned();
+                let bypassed = self.launch_bypassed(id)
+                    || mapped.as_deref().is_some_and(|m| self.launch_bypassed(m));
+                return Ok(Some(bypassed));
             }
             if P::BYPASS_MODES.is_empty() {
                 return Ok(None);

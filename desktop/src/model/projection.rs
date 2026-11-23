@@ -1807,6 +1807,19 @@ impl Core {
 
     async fn open(self: &Arc<Self>, asid: &AgentSessionId) {
         let started = std::time::Instant::now();
+        let hub_auto = Arc::clone(&self.hub);
+        let auto_asid = asid.clone();
+        let inbox_auto = Arc::clone(&self.inbox);
+        crate::hub::spawn_connected(async move {
+            if let Ok(enabled) = hub_auto.auto_approve(&auto_asid).await {
+                inbox_auto.push(Update::Composer(Box::new(
+                    crate::model::compose::ComposerUpdate::AutoApprove {
+                        asid: auto_asid.0,
+                        enabled: Some(enabled),
+                    },
+                )));
+            }
+        });
         // Warm path: paint retained history now, wake the agent in the
         // background. Cold path still prepares, while the UI already shows
         // the opening placeholder or a desktop-cached timeline.

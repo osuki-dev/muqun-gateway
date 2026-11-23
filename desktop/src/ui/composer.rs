@@ -947,6 +947,16 @@ fn queued_chip(
 }
 
 pub(super) fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
+    if s.mode == super::Mode::Home {
+        if s.staged.is_empty() {
+            return None;
+        }
+        let mut files = row().w_full().gap(6.0).flex_wrap();
+        for (i, file) in s.staged.iter().enumerate() {
+            files = files.child(staged_chip(s, k, i, file));
+        }
+        return Some(col().key("chips").w_full().gap(8.0).child(files));
+    }
     let queue = &s.queue;
     let mut sending = s
         .pending_queue_echoes(s.selected.as_deref().unwrap_or_default())
@@ -2856,6 +2866,41 @@ mod tests {
             }
         }
         assert!(cancelled);
+    }
+
+    #[test]
+    fn queued_and_steered_prompts_from_session_never_leak_to_home_chips() {
+        use crate::model::compose::{InboxItem, StagedFile};
+        use crate::ui::Mode;
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.selected = Some("session-1".into());
+        s.queue.push(InboxItem {
+            id: "pending-steer".into(),
+            text: "Steer prompt".into(),
+            steer: true,
+            files: Vec::new(),
+        });
+        let k = Kit::neutral(true);
+        let mut layer = Vec::new();
+
+        // In session mode, chips displays the queued/steered items
+        s.mode = Mode::Session;
+        assert!(chips(&s, &k, &mut layer).is_some());
+
+        // In Home mode, chips NEVER displays queued/steered items from background sessions
+        s.mode = Mode::Home;
+        assert!(chips(&s, &k, &mut layer).is_none());
+
+        // Adding staged files in Home mode displays only those staged files
+        s.staged.push(StagedFile {
+            draft_token: None,
+            path: "/path/to/file.txt".into(),
+            name: "file.txt".into(),
+            size: 12,
+            image: false,
+        });
+        assert!(chips(&s, &k, &mut layer).is_some());
     }
 
     #[test]
