@@ -358,6 +358,7 @@ pub struct View {
     pub rework_note_run: Option<String>,
     pub plan_agent_overrides: HashMap<(String, String), String>,
     pub excluded_findings: HashMap<String, HashSet<usize>>,
+    pub dismissed_runs: HashSet<String>,
     pub next_seq: u64,
 }
 
@@ -433,6 +434,7 @@ impl Default for View {
             rework_note_run: None,
             plan_agent_overrides: HashMap::new(),
             excluded_findings: HashMap::new(),
+            dismissed_runs: HashSet::new(),
             next_seq,
         }
     }
@@ -3458,6 +3460,9 @@ fn quality_gates_for_run(run: &MaoRun, language: Language) -> [QualityGate; 4] {
 pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
     let current_asid = s.selected.as_deref()?;
     let run = s.orchestration.run_for_session(current_asid)?;
+    if !run.is_active() && s.orchestration.dismissed_runs.contains(&run.id) {
+        return None;
+    }
     let language = s.cfg.general.language;
     let is_reviewer_view = run.reviewer_asid.as_deref() == Some(current_asid);
     let accent = phase_color(k, &run.phase);
@@ -3479,91 +3484,140 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
         language,
     );
 
-    let coder_clickable = !run.coder_asid.starts_with("new-") && is_reviewer_view;
-
-    let coder_stage = stage_chip(
-        k,
-        format!("1. {} · {coder_name}", tr_ref(language, "Coding")),
-        &run.coder.agent,
-        coder_live.dot_color,
-        matches!(run.phase, MaoPhase::Coding { .. }),
-        matches!(
-            run.phase,
-            MaoPhase::Reviewing { .. }
-                | MaoPhase::Approved { .. }
-                | MaoPhase::ChangesRequested { .. }
+    // Dynamic single phase pill (replaces rigid 3-pill Coder > Review > Verdict chain).
+    let (pill_label, pill_status, pill_agent) = match &run.phase {
+        MaoPhase::Analyzing => (
+            tr(language, "Analyzing"),
+            "running",
+            run.coder.agent.as_str(),
         ),
-        coder_clickable.then(|| run.coder_asid.clone()),
-        s.dark,
-    );
-
-    let review_label = format!(
-        "2. {} {}/{} · {reviewer_name}",
-        tr_ref(language, "Review"),
-        run.round,
-        run.max_rounds
-    );
-    let review_stage = stage_chip(
-        k,
-        review_label,
-        &run.reviewer.agent,
-        rev_live.dot_color,
-        matches!(run.phase, MaoPhase::Reviewing { .. }),
-        matches!(run.phase, MaoPhase::Approved { .. }),
-        run.reviewer_asid
-            .as_ref()
-            .filter(|id| !id.starts_with("new-"))
-            .map(|rev| {
-                if !is_reviewer_view
-                    && !run.coder_asid.starts_with("new-")
-                    && run.coder_asid != *rev
-                {
-                    let coder_parent = run.coder_asid.clone();
-                    let rev_child = rev.clone();
-                    // Clicking Stage 2 while watching Coder opens/focuses the Reviewer window directly.
-                    format!("detail:{coder_parent}:{rev_child}")
+        MaoPhase::PlanReady => {
+            let count = run.plan.as_ref().map_or(0, |p| p.tasks.len());
+            (
+                if count > 0 {
+                    format!("{} · {count}", tr_ref(language, "Plan ready"))
                 } else {
-                    rev.clone()
-                }
-            }),
-        s.dark,
-    );
-
-    let verdict_label = match &run.phase {
-        MaoPhase::Analyzing => format!("1. {}", tr_ref(language, "Analyzing")),
-        MaoPhase::PlanReady => format!("1. {}", tr_ref(language, "Plan ready")),
-        MaoPhase::Integrating => format!("2. {}", tr_ref(language, "Integrating")),
-        MaoPhase::Approved { .. } => format!("3. {}", tr_ref(language, "Quality passed")),
-        MaoPhase::ChangesRequested { .. } => format!("3. {}", tr_ref(language, "Needs fix")),
-        MaoPhase::Failed { .. } => format!("3. {}", tr_ref(language, "Failed")),
-        MaoPhase::Cancelled => format!("3. {}", tr_ref(language, "Stopped")),
-        MaoPhase::Coding { .. } | MaoPhase::Reviewing { .. } => {
-            format!("3. {}", tr_ref(language, "Pending review"))
+                    tr(language, "Plan ready")
+                },
+                "warning",
+                run.coder.agent.as_str(),
+            )
         }
+        MaoPhase::Coding { round } => {
+            if let Some(ref plan) = run.plan {
+                if plan.tasks.len() > 1 {
+                    let done = plan
+                        .tasks
+                        .iter()
+                        .filter(|t| t.status == "completed")
+                        .count();
+                    (
+                        format!(
+                            "{} · {done}/{}",
+                            tr_ref(language, "Coding"),
+                            plan.tasks.len()
+                        ),
+                        "running",
+                        run.coder.agent.as_str(),
+                    )
+                } else {
+                    (
+                        format!("{} · {coder_name}", tr_ref(language, "Coding")),
+                        "running",
+                        run.coder.agent.as_str(),
+                    )
+                }
+            } else {
+                (
+                    format!("{} #{round} · {coder_name}", tr_ref(language, "Coding")),
+                    "running",
+                    run.coder.agent.as_str(),
+                )
+            }
+        }
+        MaoPhase::Integrating => (
+            tr(language, "Integrating"),
+            "running",
+            run.coder.agent.as_str(),
+        ),
+        MaoPhase::Reviewing { round } => (
+            format!(
+                "{} {round}/{} · {reviewer_name}",
+                tr_ref(language, "Review"),
+                run.max_rounds
+            ),
+            "running",
+            run.reviewer.agent.as_str(),
+        ),
+        MaoPhase::Approved { .. } => (
+            tr(language, "Approved"),
+            "completed",
+            run.reviewer.agent.as_str(),
+        ),
+        MaoPhase::ChangesRequested { round, .. } => (
+            format!(
+                "{} {round}/{}",
+                tr_ref(language, "Needs fix"),
+                run.max_rounds
+            ),
+            "warning",
+            run.reviewer.agent.as_str(),
+        ),
+        MaoPhase::Failed { .. } => (
+            tr(language, "Failed"),
+            "failed",
+            run.reviewer.agent.as_str(),
+        ),
+        MaoPhase::Cancelled => (tr(language, "Stopped"), "idle", run.coder.agent.as_str()),
     };
-    let verdict_status = match &run.phase {
-        MaoPhase::Approved { .. } => "completed",
-        MaoPhase::Analyzing | MaoPhase::Integrating => "running",
-        MaoPhase::PlanReady | MaoPhase::ChangesRequested { .. } => "warning",
-        MaoPhase::Failed { .. } => "failed",
-        _ => "idle",
-    };
-    let (v_fill, v_border, v_ink) = gate_status_colors(k, verdict_status);
-    let verdict_chip = row()
-        .h(24.0)
-        .px(8.0)
+    let (p_fill, p_border, p_ink) = gate_status_colors(k, pill_status);
+    let phase_pill = row()
+        .h(22.0)
+        .px(7.0)
         .center_y()
         .gap(5.0)
-        .radius(k.radius.md)
-        .fill(v_fill)
-        .border(1.0, v_border)
-        .child(text(verdict_label).font(k.ty.small_medium).color(v_ink));
+        .radius(k.radius.sm)
+        .fill(p_fill)
+        .border(1.0, p_border)
+        .child(el().size(6.0, 6.0).radius(3.0).fill(accent))
+        .child(agents::mark(pill_agent, 11.0, s.dark))
+        .child(
+            text(pill_label)
+                .font(k.ty.small_medium)
+                .color(p_ink)
+                .single_line(),
+        );
 
-    let mut left_actions = row().gap(6.0).center_y().flex_wrap();
+    let active_activity = clean_one_line(&if matches!(run.phase, MaoPhase::Reviewing { .. }) {
+        format!(
+            "{reviewer_name}: {} · {}",
+            rev_live.status_label, rev_live.activity_line
+        )
+    } else if matches!(run.phase, MaoPhase::Coding { .. }) {
+        if let Some(ref plan) = run.plan {
+            if let Some(running) = plan.tasks.iter().find(|t| t.status == "running") {
+                format!("{}: {}", s.agent_name(&running.agent), running.title)
+            } else {
+                format!(
+                    "{coder_name}: {} · {}",
+                    coder_live.status_label, coder_live.activity_line
+                )
+            }
+        } else {
+            format!(
+                "{coder_name}: {} · {}",
+                coder_live.status_label, coder_live.activity_line
+            )
+        }
+    } else {
+        phase_summary_line(run, &coder_name, &reviewer_name, language)
+    });
+
+    let mut right_actions = row().gap(5.0).center_y();
     if rev_live.waiting_attention {
         if let Some(ref rev_id) = run.reviewer_asid {
             let target = rev_id.clone();
-            left_actions = left_actions.child(
+            right_actions = right_actions.child(
                 Button::new(format!(
                     "{} · {reviewer_name}",
                     tr_ref(language, "Waiting for approval")
@@ -3581,7 +3635,7 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
         && !run.coder_asid.starts_with("new-")
     {
         let target = run.coder_asid.clone();
-        left_actions = left_actions.child(
+        right_actions = right_actions.child(
             Button::new(format!(
                 "{} · {coder_name}",
                 tr_ref(language, "Waiting for approval")
@@ -3599,14 +3653,14 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
         let (adds, dels) = diff_totals(&run.files);
         let diff_target = run.coder_asid.clone();
         let files_count = run.files.len();
-        left_actions = left_actions.child(
+        right_actions = right_actions.child(
             row()
                 .key("mao-banner-files-chip")
-                .h(24.0)
-                .px(8.0)
-                .gap(5.0)
+                .h(22.0)
+                .px(7.0)
+                .gap(4.0)
                 .center_y()
-                .radius(k.radius.md)
+                .radius(k.radius.sm)
                 .fill(k.c.layer_02)
                 .border(1.0, k.c.border_weak)
                 .on_press(move |s: &mut UiState| {
@@ -3617,12 +3671,9 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
                     s.send(Command::RefreshDiff(AgentSessionId(diff_target.clone())));
                 })
                 .child(
-                    text(format!(
-                        "{files_count} {}",
-                        tr_ref(language, "changed files")
-                    ))
-                    .font(k.ty.small_medium)
-                    .color(k.c.text_muted),
+                    text(format!("{files_count}"))
+                        .font(k.ty.small_medium)
+                        .color(k.c.text_muted),
                 )
                 .child(
                     text(format!("+{adds}"))
@@ -3637,66 +3688,6 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
         );
     }
 
-    if is_reviewer_view && !run.coder_asid.starts_with("new-") {
-        let target = run.coder_asid.clone();
-        left_actions = left_actions.child(
-            Button::new(tr_ref(language, "Switch to coder"))
-                .variant(ButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .on_press(move |s: &mut UiState| s.open_session(&target))
-                .build(k)
-                .key("mao-jump-coder"),
-        );
-    } else if let Some(ref rev_asid) = run.reviewer_asid {
-        if !rev_asid.starts_with("new-") {
-            let coder_parent = run.coder_asid.clone();
-            let rev_target = rev_asid.clone();
-            left_actions = left_actions.child(
-                Button::new(tr_ref(language, "Switch to reviewer"))
-                    .variant(ButtonVariant::GhostMuted)
-                    .control_size(ControlSize::Small)
-                    .on_press(move |s: &mut UiState| {
-                        if !coder_parent.starts_with("new-") && coder_parent != rev_target {
-                            s.open_detail(&coder_parent, &rev_target);
-                        } else {
-                            s.open_session(&rev_target);
-                        }
-                    })
-                    .build(k)
-                    .key("mao-jump-reviewer"),
-            );
-        }
-    }
-
-    let toggle_id = run.id.clone();
-    let expanded = run.expanded;
-    left_actions = left_actions
-        .child(
-            Button::new(if expanded {
-                tr_ref(language, "Hide details")
-            } else {
-                tr_ref(language, "Details")
-            })
-            .variant(ButtonVariant::GhostMuted)
-            .control_size(ControlSize::Small)
-            .on_press(move |s: &mut UiState| {
-                if let Some(r) = s.orchestration.runs.iter_mut().find(|r| r.id == toggle_id) {
-                    r.expanded = !r.expanded;
-                }
-            })
-            .build(k)
-            .key("mao-banner-expand"),
-        )
-        .child(
-            Button::new(tr_ref(language, "MAO window"))
-                .variant(ButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .on_press(|s: &mut UiState| s.open_plugin_drawer("mao"))
-                .build(k)
-                .key("mao-banner-window"),
-        );
-
-    let mut right_actions = row().gap(6.0).center_y();
     match &run.phase {
         MaoPhase::Analyzing
         | MaoPhase::Coding { .. }
@@ -3769,45 +3760,60 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
         _ => {}
     }
 
-    // Single compact header bar: pipeline stepper on the left, actions on the right.
-    let mut header_bar = row()
-        .w_full()
-        .gap(6.0)
-        .center_y()
-        .flex_wrap()
-        .child(icon(&glyphs::WORKFLOW, 14.0).color(accent))
-        .child(coder_stage)
-        .child(text("›").font(k.ty.small_medium).color(k.c.text_faint))
-        .child(review_stage)
-        .child(text("›").font(k.ty.small_medium).color(k.c.text_faint))
-        .child(verdict_chip)
-        .child(el().grow(1.0).min_w(8.0))
-        .child(left_actions);
-    if matches!(
-        run.phase,
-        MaoPhase::Analyzing
-            | MaoPhase::PlanReady
-            | MaoPhase::Coding { .. }
-            | MaoPhase::Integrating
-            | MaoPhase::Reviewing { .. }
-            | MaoPhase::ChangesRequested { .. }
-    ) {
-        header_bar = header_bar.child(right_actions);
+    let toggle_id = run.id.clone();
+    let expanded = run.expanded;
+    right_actions = right_actions.child(
+        Button::new(if expanded {
+            format!("{} ▴", tr_ref(language, "Hide details"))
+        } else {
+            format!("{} ▾", tr_ref(language, "Details"))
+        })
+        .variant(ButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .on_press(move |s: &mut UiState| {
+            if let Some(r) = s.orchestration.runs.iter_mut().find(|r| r.id == toggle_id) {
+                r.expanded = !r.expanded;
+            }
+        })
+        .build(k)
+        .key("mao-banner-expand"),
+    );
+
+    if !run.is_active() {
+        let dismiss_id = run.id.clone();
+        right_actions = right_actions.child(
+            Button::new("×")
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut UiState| {
+                    s.orchestration.dismissed_runs.insert(dismiss_id.clone());
+                })
+                .build(k)
+                .key("mao-banner-dismiss"),
+        );
     }
 
-    let active_activity = clean_one_line(&if matches!(run.phase, MaoPhase::Reviewing { .. }) {
-        format!(
-            "{reviewer_name}: {} · {}",
-            rev_live.status_label, rev_live.activity_line
+    // Ultra-slim 1-line header bar (36px collapsed): icon + phase pill + inline summary + right controls.
+    let header_bar = row()
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .child(icon(&glyphs::WORKFLOW, 13.0).color(accent))
+        .child(phase_pill)
+        .child(
+            text(active_activity.clone())
+                .font(k.ty.small)
+                .color(if matches!(run.phase, MaoPhase::Failed { .. }) {
+                    k.c.danger.fg
+                } else {
+                    k.c.text_muted
+                })
+                .single_line()
+                .truncate()
+                .grow(1.0)
+                .min_w(40.0),
         )
-    } else if matches!(run.phase, MaoPhase::Coding { .. }) {
-        format!(
-            "{coder_name}: {} · {}",
-            coder_live.status_label, coder_live.activity_line
-        )
-    } else {
-        phase_summary_line(run, &coder_name, &reviewer_name, language)
-    });
+        .child(right_actions);
 
     let rework_note_row = matches!(run.phase, MaoPhase::ChangesRequested { .. }).then(|| {
         let note_run_edit = run.id.clone();
@@ -3833,27 +3839,16 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
 
     let mut inner = col()
         .w_full()
-        .px(14.0)
-        .py(8.0)
-        .gap(6.0)
+        .px(12.0)
+        .py(6.0)
+        .gap(5.0)
         .fill(k.c.layer_01)
         .child(header_bar)
-        .children((!active_activity.is_empty()).then(|| {
-            text(active_activity.clone())
-                .font(k.ty.small)
-                .color(if matches!(run.phase, MaoPhase::Failed { .. }) {
-                    k.c.danger.fg
-                } else {
-                    k.c.text_muted
-                })
-                .single_line()
-                .truncate()
-        }))
         .children(rework_note_row);
 
     if run.expanded {
-        let mut drawer_body = col().w_full().gap(8.0).pt(6.0);
-        // 1. Smart Plan & DAG Subtask Board (PlanReady / Executing / Integrating / AwaitingMerge)
+        let mut drawer_body = col().w_full().gap(6.0).pt(4.0);
+        // 1. Smart Plan & DAG Subtask Board (PlanReady / Executing / Integrating)
         if let Some(ref plan) = run.plan {
             let complexity_label = match plan.complexity.as_str() {
                 "direct" => tr_ref(language, "L1 · Direct"),
@@ -3886,12 +3881,12 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
             }
             let mut plan_box = col()
                 .w_full()
-                .gap(5.0)
+                .gap(4.0)
                 .px(10.0)
-                .py(8.0)
+                .py(7.0)
                 .radius(k.radius.md)
                 .fill(k.c.layer_02)
-                .border(1.0, k.c.border_weak)
+                .border(1.0, k.c.border_weak.alpha(0.6))
                 .child(plan_hdr);
 
             let editable_plan = matches!(run.phase, MaoPhase::PlanReady);
@@ -3914,8 +3909,8 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
                 let cur_agent_owned = effective_agent.to_string();
                 let mut agent_pill = row()
                     .key(format!("mao-plan-agent-{}-{tidx}", run.id))
-                    .h(22.0)
-                    .px(7.0)
+                    .h(20.0)
+                    .px(6.0)
                     .gap(4.0)
                     .center_y()
                     .radius(k.radius.sm)
@@ -3925,7 +3920,7 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
                         if editable_plan {
                             k.c.bg_accent.alpha(0.55)
                         } else {
-                            k.c.border_weak
+                            k.c.border_weak.alpha(0.6)
                         },
                     )
                     .child(agents::mark(effective_agent, 11.0, s.dark))
@@ -3953,13 +3948,10 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
                 let mut task_row = row()
                     .key(format!("mao-plan-task-{}-{tidx}", run.id))
                     .w_full()
-                    .h(28.0)
-                    .px(8.0)
-                    .gap(8.0)
+                    .h(24.0)
+                    .px(4.0)
+                    .gap(7.0)
                     .center_y()
-                    .radius(k.radius.sm)
-                    .fill(k.c.layer_01)
-                    .border(1.0, k.c.border_weak.alpha(0.5))
                     .child(el().size(6.0, 6.0).radius(3.0).fill(dot_color))
                     .child(
                         text(format!("[{}] {}", task.id, task.title))
@@ -4026,7 +4018,14 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
         // 2. Selectable Findings List during ChangesRequested (review-in-the-loop)
         if matches!(run.phase, MaoPhase::ChangesRequested { .. }) && !run.findings.is_empty() {
             let excluded = s.orchestration.excluded_findings.get(&run.id);
-            let mut fbox = col().w_full().gap(4.0);
+            let mut fbox = col()
+                .w_full()
+                .gap(2.0)
+                .px(8.0)
+                .py(5.0)
+                .radius(k.radius.md)
+                .fill(k.c.layer_02)
+                .border(1.0, k.c.border_weak.alpha(0.55));
             for (fidx, f) in run.findings.iter().take(8).enumerate() {
                 let is_checked = excluded.is_none_or(|ex| !ex.contains(&fidx));
                 let rid = run.id.clone();
@@ -4039,13 +4038,10 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
                     row()
                         .key(format!("mao-finding-{}-{fidx}", run.id))
                         .w_full()
-                        .h(26.0)
-                        .px(8.0)
-                        .gap(7.0)
+                        .h(22.0)
+                        .px(4.0)
+                        .gap(6.0)
                         .center_y()
-                        .radius(k.radius.sm)
-                        .fill(k.c.layer_02)
-                        .border(1.0, k.c.border_weak.alpha(0.5))
                         .on_press(move |s: &mut UiState| {
                             toggle_finding_selected(s, &rid, fidx);
                         })
@@ -4082,84 +4078,85 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
             drawer_body = drawer_body.child(fbox);
         }
 
-        let coder_clean = clean_summary_excerpt(&run.coder_summary, 220);
-        let review_clean = clean_summary_excerpt(&run.review_summary, 220);
-        let show_review_card = !review_clean.is_empty() && review_clean != active_activity;
-        if !coder_clean.is_empty() || show_review_card {
-            let mut summary_row = row().w_full().gap(8.0).flex_wrap();
-            if !coder_clean.is_empty() {
-                summary_row = summary_row.child(
-                    col()
-                        .w(0.0)
-                        .grow(1.0)
-                        .min_w(220.0)
-                        .px(10.0)
-                        .py(8.0)
-                        .gap(4.0)
-                        .radius(k.radius.md)
-                        .fill(k.c.layer_02)
-                        .border(1.0, k.c.border_weak)
-                        .child(
-                            text(tr_ref(language, "Coder summary"))
-                                .font(k.ty.small_medium)
-                                .color(k.c.text_faint),
-                        )
-                        .child(
-                            text(coder_clean)
-                                .font(k.ty.small)
-                                .color(k.c.text_base)
-                                .wrap()
-                                .w_full(),
-                        ),
-                );
-            }
-            if show_review_card {
-                summary_row = summary_row.child(
-                    col()
-                        .w(0.0)
-                        .grow(1.0)
-                        .min_w(220.0)
-                        .px(10.0)
-                        .py(8.0)
-                        .gap(4.0)
-                        .radius(k.radius.md)
-                        .fill(k.c.layer_02)
-                        .border(1.0, k.c.border_weak)
-                        .child(
-                            text(tr_ref(language, "Review report"))
-                                .font(k.ty.small_medium)
-                                .color(k.c.text_faint),
-                        )
-                        .child(
-                            text(review_clean)
-                                .font(k.ty.small)
-                                .color(k.c.text_base)
-                                .wrap()
-                                .w_full(),
-                        ),
-                );
-            }
-            drawer_body = drawer_body.child(summary_row);
-        }
+        // 3. Lightweight borderless timeline inside one subtle container (no duplicate Coder summary box!).
         if !run.steps.is_empty() {
-            let mut steps_box = col().w_full().gap(4.0);
-            for (idx, step) in run.steps.iter().rev().take(4).rev().enumerate() {
-                steps_box = steps_box.child(step_row(k, idx, step));
+            let mut timeline_box = col()
+                .w_full()
+                .gap(2.0)
+                .px(10.0)
+                .py(6.0)
+                .radius(k.radius.md)
+                .fill(k.c.layer_02)
+                .border(1.0, k.c.border_weak.alpha(0.45));
+            let mut prev_detail: Option<String> = None;
+            for (idx, step) in run.steps.iter().rev().take(5).rev().enumerate() {
+                let title = format_step_title(s, &step.title);
+                let mut detail = clean_one_line(&step.detail);
+                if prev_detail.as_deref() == Some(detail.as_str()) {
+                    detail.clear();
+                } else if !detail.is_empty() {
+                    prev_detail = Some(detail.clone());
+                }
+                timeline_box =
+                    timeline_box.child(compact_timeline_row(k, idx, step, title, detail));
             }
-            drawer_body = drawer_body.child(steps_box);
+            drawer_body = drawer_body.child(timeline_box);
         }
+
+        // 4. Compact drawer footer with secondary navigation links (keeps main top bar clean).
+        let mut footer_links = row().w_full().gap(6.0).center_y();
+        if is_reviewer_view && !run.coder_asid.starts_with("new-") {
+            let target = run.coder_asid.clone();
+            footer_links = footer_links.child(
+                Button::new(tr_ref(language, "Switch to coder"))
+                    .variant(ButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
+                    .on_press(move |s: &mut UiState| s.open_session(&target))
+                    .build(k)
+                    .key("mao-jump-coder"),
+            );
+        } else if let Some(ref rev_asid) = run.reviewer_asid {
+            if !rev_asid.starts_with("new-") {
+                let coder_parent = run.coder_asid.clone();
+                let rev_target = rev_asid.clone();
+                footer_links = footer_links.child(
+                    Button::new(tr_ref(language, "Switch to reviewer"))
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut UiState| {
+                            if !coder_parent.starts_with("new-") && coder_parent != rev_target {
+                                s.open_detail(&coder_parent, &rev_target);
+                            } else {
+                                s.open_session(&rev_target);
+                            }
+                        })
+                        .build(k)
+                        .key("mao-jump-reviewer"),
+                );
+            }
+        }
+        footer_links = footer_links.child(el().grow(1.0)).child(
+            Button::new(tr_ref(language, "MAO window"))
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .on_press(|s: &mut UiState| s.open_plugin_drawer("mao"))
+                .build(k)
+                .key("mao-banner-window"),
+        );
+        drawer_body = drawer_body.child(footer_links);
+
         inner = inner
             .child(
                 el().w_full()
                     .h(1.0)
-                    .fill(k.c.border_weak.alpha(0.55))
+                    .fill(k.c.border_weak.alpha(0.45))
                     .a11y_hidden(),
             )
             .child(
                 col()
                     .key("mao-banner-drawer-scroll")
                     .w_full()
-                    .max_h(220.0)
+                    .max_h(210.0)
                     .child(drawer_body)
                     .scroll(rune::ScrollSpec {
                         stick_bottom: false,
@@ -4177,61 +4174,60 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn stage_chip(
-    k: &Kit,
-    label: String,
-    agent_id: &str,
-    dot_color: Color,
-    active: bool,
-    done: bool,
-    jump_to: Option<String>,
-    dark: bool,
-) -> El {
-    let fill = if active {
-        k.c.bg_accent.alpha(0.14)
-    } else if done {
-        k.c.success.icon.alpha(0.12)
-    } else {
-        k.c.layer_02
-    };
-    let border = if active {
-        k.c.bg_accent.alpha(0.55)
-    } else if done {
-        k.c.success.icon.alpha(0.4)
-    } else {
-        k.c.border_weak
-    };
-    let ink = if active {
-        k.c.text_base
-    } else if done {
-        k.c.success.fg
-    } else {
-        k.c.text_muted
-    };
-    let mut chip = row()
-        .h(24.0)
-        .px(8.0)
-        .center_y()
-        .gap(5.0)
-        .radius(k.radius.md)
-        .fill(fill)
-        .border(1.0, border)
-        .child(el().size(6.0, 6.0).radius(3.0).fill(dot_color))
-        .child(agents::mark(agent_id, 12.0, dark))
-        .child(text(label).font(k.ty.small_medium).color(ink).single_line());
-    if let Some(target) = jump_to {
-        chip = chip.on_press(move |s: &mut UiState| {
-            if let Some(rest) = target.strip_prefix("detail:") {
-                if let Some((parent, child)) = rest.split_once(':') {
-                    s.open_detail(parent, child);
-                    return;
-                }
-            }
-            s.open_session(&target);
-        });
+fn format_step_title(s: &UiState, raw: &str) -> String {
+    if let Some((prefix, tail)) = raw.rsplit_once(" · ") {
+        let trimmed = tail.trim();
+        if s.agents.iter().any(|a| a.id.eq_ignore_ascii_case(trimmed)) {
+            return format!("{prefix} · {}", s.agent_name(trimmed));
+        }
     }
-    chip
+    raw.to_string()
+}
+
+fn compact_timeline_row(k: &Kit, idx: usize, step: &MaoStep, title: String, detail: String) -> El {
+    let dot_color = match step.status {
+        "running" => k.c.text_accent,
+        "completed" => k.c.success.icon,
+        "warning" => k.c.warning.icon,
+        "failed" => k.c.danger.icon,
+        _ => k.c.text_faint,
+    };
+    let mut item = row()
+        .key(format!("mao-step-compact-{idx}-{}", step.round))
+        .w_full()
+        .h(22.0)
+        .px(2.0)
+        .gap(7.0)
+        .center_y()
+        .child(el().size(6.0, 6.0).radius(3.0).fill(dot_color))
+        .child(
+            text(title)
+                .font(k.ty.small_medium)
+                .color(k.c.text_base)
+                .single_line(),
+        );
+    if !detail.is_empty() {
+        item = item.child(
+            text(detail)
+                .font(k.ty.small)
+                .color(if step.status == "failed" {
+                    k.c.danger.fg
+                } else {
+                    k.c.text_muted
+                })
+                .single_line()
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0),
+        );
+    }
+    if let Some(asid) = &step.asid {
+        if !asid.starts_with("new-") {
+            let target = asid.clone();
+            item = item.on_press(move |s: &mut UiState| s.open_session(&target));
+        }
+    }
+    item
 }
 
 fn phase_summary_line(
@@ -4315,11 +4311,6 @@ fn clean_one_line(raw: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn clean_summary_excerpt(raw: &str, max_chars: usize) -> String {
-    let cleaned = clean_one_line(raw);
-    concise_excerpt(&cleaned, max_chars)
 }
 
 fn step_row(k: &Kit, idx: usize, step: &MaoStep) -> El {
@@ -6976,6 +6967,9 @@ fn merge_gateway_run(
                     .unwrap_or_else(|| orig.to_string());
             }
         }
+    }
+    if gw_run.is_active() || matches!(gw_run.phase, MaoPhase::PlanReady) {
+        s.orchestration.dismissed_runs.remove(id);
     }
     if !coder_asid.is_empty()
         && gw_run.is_active()
