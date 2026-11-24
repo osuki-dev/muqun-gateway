@@ -583,8 +583,10 @@ pub fn format_advisor_coordinator_instruction(
     format!(
         "Lead Advisor mode — Live healthy agents: [{}].{skip_note}{rev_note} \
          Keep simple/local work in this warm session (0 extra overhead). \
-         Only delegate bounded or parallel subtasks via `tasks.delegate` when genuinely beneficial \
-         (keep disjoint files in the same workspace; only use a git worktree if parallel edits risk conflicting on the same files).",
+         You decide when to delegate: call `fleet.describe` for full models/quotas across local & linked computers, \
+         `tasks.delegate` (or pass `reuse_task_id` to continue a warm child session), \
+         and batch `tasks.wait(task_ids=[...])` to collect parallel subtasks in one call \
+         (keep disjoint files in the same workspace; only use a git worktree if parallel edits risk conflicting).",
         healthy.join(", ")
     )
 }

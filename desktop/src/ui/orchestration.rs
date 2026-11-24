@@ -833,6 +833,12 @@ pub fn effective_auto_failover(s: &UiState, asid: Option<&str>) -> bool {
         .unwrap_or(s.cfg.ui.mao.auto_failover)
 }
 
+pub fn effective_auto_review(s: &UiState, asid: Option<&str>) -> bool {
+    asid.and_then(|id| s.cfg.ui.mao.session_configs.get(id))
+        .and_then(|ov| ov.auto_review)
+        .unwrap_or(s.cfg.ui.mao.auto_review)
+}
+
 pub fn effective_reviewer_for(s: &UiState, coder_agent: &str, asid: Option<&str>) -> MaoRole {
     let usable = usable_agents(s);
     let session_cfg = asid
@@ -1325,6 +1331,17 @@ fn toggle_auto_failover(s: &mut UiState, anchor: MaoMenuAnchor) {
     mutate_slot_config(s, slot, |target| match target {
         SlotConfigTarget::Session(ov) => ov.auto_failover = Some(next_val),
         SlotConfigTarget::Global(global) => global.auto_failover = next_val,
+    });
+    s.menu = Some(OpenMenu::MaoReviewer(anchor));
+}
+
+fn toggle_auto_review(s: &mut UiState, anchor: MaoMenuAnchor) {
+    let slot = anchor.slot();
+    let asid = slot_asid(s, slot).map(str::to_string);
+    let next_val = !effective_auto_review(s, asid.as_deref());
+    mutate_slot_config(s, slot, |target| match target {
+        SlotConfigTarget::Session(ov) => ov.auto_review = Some(next_val),
+        SlotConfigTarget::Global(global) => global.auto_review = next_val,
     });
     s.menu = Some(OpenMenu::MaoReviewer(anchor));
 }
@@ -3126,8 +3143,14 @@ fn reviewer_config_menu(
     );
 
     let effective_failover = effective_auto_failover(s, current_asid);
+    let effective_review = effective_auto_review(s, current_asid);
     menu = menu
         .separator()
+        .item(
+            MenuItem::new(tr_ref(language, "Auto code review"))
+                .checked(effective_review)
+                .on_select(move |s: &mut UiState| toggle_auto_review(s, anchor)),
+        )
         .item(
             MenuItem::new(tr_ref(language, "Auto-failover on quota limit"))
                 .checked(effective_failover)
@@ -6034,6 +6057,26 @@ pub fn settings_card(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .flex_wrap()
                 .child(reviewer_menu)
                 .child(
+                    Button::new(if s.cfg.ui.mao.auto_review {
+                        tr_ref(language, "Auto review: On")
+                    } else {
+                        tr_ref(language, "Auto review: Off")
+                    })
+                    .variant(if s.cfg.ui.mao.auto_review {
+                        ButtonVariant::Neutral
+                    } else {
+                        ButtonVariant::GhostMuted
+                    })
+                    .control_size(ControlSize::Small)
+                    .on_press(|s: &mut UiState| {
+                        let mut next = s.cfg.ui.mao.clone();
+                        next.auto_review = !next.auto_review;
+                        save_mao_prefs(s, next);
+                    })
+                    .build(k)
+                    .key("settings-mao-review-toggle"),
+                )
+                .child(
                     Button::new(if auto_failover {
                         tr_ref(language, "Auto-failover: On")
                     } else {
@@ -6509,6 +6552,7 @@ pub fn dispatch_gateway_start(
     ensure_reviewer_catalog(s, &reviewer.agent);
     let max_rounds = effective_max_rounds(s, existing_asid);
     let auto_failover = effective_auto_failover(s, existing_asid);
+    let auto_review = effective_auto_review(s, existing_asid);
     let now = now_ms();
     let client_ref = format!("desktop-{token}-{now}");
     let (resolved_rev_model, _) = resolved_reviewer_model(s, &reviewer);
@@ -6561,6 +6605,7 @@ pub fn dispatch_gateway_start(
         "reviewer": rev_obj,
         "max_review_rounds": max_rounds,
         "auto_failover": auto_failover,
+        "auto_review": auto_review,
     });
     if !pool_json.is_empty() {
         body["agent_pool"] = serde_json::Value::Array(pool_json);

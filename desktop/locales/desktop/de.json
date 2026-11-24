@@ -1033,5 +1033,8 @@
   "Auto-failover: Off": "Auto-failover: Off",
   "Global default": "Global default",
   "Session custom": "Session custom",
-  "Reset to global default": "Reset to global default"
+  "Reset to global default": "Reset to global default",
+  "Auto code review": "Auto code review",
+  "Auto review: On": "Auto review: On",
+  "Auto review: Off": "Auto review: Off (Model-led)"
 }

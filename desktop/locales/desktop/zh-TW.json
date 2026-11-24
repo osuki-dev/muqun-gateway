@@ -1083,5 +1083,8 @@
   "On-demand Advisor": "按需顧問諮詢",
   "Quota limited": "額度受限",
   "Floating window": "浮動視窗",
-  "Built-in modules": "內建模組"
+  "Built-in modules": "內建模組",
+  "Auto code review": "每輪結束後自動程式碼審查",
+  "Auto review: On": "自動程式碼審查：已開啟",
+  "Auto review: Off": "自動程式碼審查：已關閉（模型主導）"
 }

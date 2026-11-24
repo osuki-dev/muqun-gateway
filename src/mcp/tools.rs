@@ -284,7 +284,7 @@ fn reply<T: Serialize>(result: Result<T, TaskError>) -> Result<CallToolResult, E
     })
 }
 
-/// What `exec.run` answers: the handle, the output so far, and the pane.
+/// What `exec.run` answers: the handle, redacted/reduced output, and the pane.
 fn command_result(handle: RunHandle) -> Value {
     let pane = match &handle.task.binding {
         TaskBinding::Pane {
@@ -294,14 +294,48 @@ fn command_result(handle: RunHandle) -> Value {
         } => json!({ "session_id": session_id, "pane_id": pane_id }),
         _ => Value::Null,
     };
-    json!({
+    let reduced =
+        super::reducer::reduce_command_output(&handle.stdout_tail, handle.exit_code, 10 * 1024);
+    let mut out = json!({
         "task_id": handle.task.id.0,
         "state": handle.task.state,
         "exit_code": handle.exit_code,
-        "stdout_tail": handle.stdout_tail,
+        "stdout_tail": reduced.stdout_tail,
         "duration_ms": handle.duration_ms,
         "pane": pane,
-    })
+    });
+    if !reduced.key_errors.is_empty() {
+        out["key_errors"] = json!(reduced.key_errors);
+    }
+    if reduced.omitted_lines > 0 {
+        out["omitted_lines"] = json!(reduced.omitted_lines);
+        out["original_bytes"] = json!(reduced.original_bytes);
+    }
+    if reduced.redacted {
+        out["redacted"] = json!(true);
+    }
+    out
+}
+
+fn sanitize_waited(waited: &mut crate::tasks::service::Waited) -> Vec<String> {
+    let mut key_errors = Vec::new();
+    if let Some(ref mut tail) = waited.stdout_tail {
+        let reduced = super::reducer::reduce_command_output(tail, waited.task.exit_code, 8 * 1024);
+        *tail = reduced.stdout_tail;
+        key_errors.extend(reduced.key_errors);
+    }
+    if let Some(ref mut answer) = waited.answer {
+        let (clean, _) = super::reducer::redact_secrets(answer);
+        if key_errors.is_empty() {
+            key_errors.extend(super::reducer::extract_key_errors(&clean, 6));
+        }
+        *answer = clean;
+    }
+    if let Some(ref mut summary) = waited.task.summary {
+        let (clean, _) = super::reducer::redact_secrets(summary);
+        *summary = clean;
+    }
+    key_errors
 }
 
 /// An absolute, existing directory, canonicalized.
@@ -377,6 +411,9 @@ pub(crate) struct DelegateArgs {
     /// For a terminal agent: the terminal session to start it in, by its id on that computer (e.g. "default" for tmux, or a Herdr session's id). Default: the first that answers.
     #[serde(default)]
     pub terminal: Option<String>,
+    /// Optional task_id of a previous completed/idle sub-task you created: sends this goal as a follow-up in that same warm agent session instead of cold-starting a new session.
+    #[serde(default)]
+    pub reuse_task_id: Option<String>,
 }
 
 impl DelegateArgs {
@@ -429,11 +466,26 @@ impl DelegateArgs {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WaitFor {
+    #[default]
+    All,
+    Any,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct WaitArgs {
-    /// A task_id from tasks.delegate or exec.run.
-    pub task_id: String,
-    /// Seconds to wait (1..=45, default 30). Call again while it is working.
+    /// A single task_id from tasks.delegate or exec.run.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Batch parallel wait: up to 16 task_ids to wait on concurrently in one call (avoids multi-turn polling loops).
+    #[serde(default)]
+    pub task_ids: Option<Vec<String>>,
+    /// With task_ids: "all" (default) waits until every task settles or timeout; "any" returns as soon as the first task settles.
+    #[serde(default)]
+    pub wait_for: Option<WaitFor>,
+    /// Seconds to wait (1..=45, default 30). Call again while work is still running.
     #[serde(default)]
     pub timeout_s: Option<u64>,
 }
@@ -548,7 +600,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "fleet.describe",
-        description = "What a computer offers: its agents (status, version, modes, model count), terminal backends, toolchains with versions, task counts and what it is suitable for. Without machine, this computer plus a short entry per linked computer (peers)."
+        description = "What a computer offers: its agents (status, version, modes, available models, live quota health), terminal backends, toolchains with versions, task counts and what it is suitable for. Without machine, this computer plus a short entry per linked computer (peers)."
     )]
     async fn fleet_describe(
         &self,
@@ -724,17 +776,34 @@ impl MuqunMcp {
             TaskBinding::Peer { peer_server_id, .. } => peer_server_id.as_str(),
             _ => "",
         };
+        let reduced = run
+            .stdout_tail
+            .as_deref()
+            .map(|raw| super::reducer::reduce_command_output(raw, run.exit_code, 10 * 1024));
+        let stdout_tail = reduced.as_ref().map(|r| r.stdout_tail.as_str());
         let mut result = json!({
             "task_id": run.task.task_id, "state":run.task.state,
-            "exit_code":run.exit_code, "stdout_tail":run.stdout_tail, "machine":machine,
+            "exit_code":run.exit_code, "stdout_tail":stdout_tail, "machine":machine,
         });
+        if let Some(ref reduced) = reduced {
+            if !reduced.key_errors.is_empty() {
+                result["key_errors"] = json!(reduced.key_errors);
+            }
+            if reduced.omitted_lines > 0 {
+                result["omitted_lines"] = json!(reduced.omitted_lines);
+                result["original_bytes"] = json!(reduced.original_bytes);
+            }
+            if reduced.redacted {
+                result["redacted"] = json!(true);
+            }
+        }
         super::files::attach_output(&mut result, server_id, &machine, false);
         Ok(ok(result))
     }
 
     #[tool(
         name = "tasks.delegate",
-        description = "Start a sub-task on an agent, on this computer or (machine) on a linked one: a new native agent session in cwd with your goal as the first prompt (an agent with no native adapter here starts in a new terminal pane). Returns task_id. If the work will take long, end your turn after delegating; you will be told when it finishes. Use tasks.wait only for short jobs. One hop only: a task another computer handed here cannot hand work to a linked computer (delegation_loop)."
+        description = "Start a sub-task on an agent, on this computer or (machine) on a linked one: a new native agent session in cwd with your goal as the first prompt (or pass reuse_task_id to continue an existing warm child session you created). Returns task_id. If the work will take long, end your turn after delegating; you will be told when it finishes. Use tasks.wait (with task_ids for parallel fan-in) for short jobs. One hop only: a task another computer handed here cannot hand work to a linked computer (delegation_loop)."
     )]
     async fn tasks_delegate(
         &self,
@@ -742,9 +811,15 @@ impl MuqunMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let goal = args.goal.clone();
         let machine = args.machine.clone();
+        let reuse_task_id = args
+            .reuse_task_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         let config = &self.state.config;
         let peers = self.state.peers.selectors();
-        let request = match args.request(&config.server_id, &config.label, &peers) {
+        let mut request = match args.request(&config.server_id, &config.label, &peers) {
             Ok(request) => request,
             Err(refused) => return Ok(refused),
         };
@@ -765,9 +840,38 @@ impl MuqunMcp {
             lineage::requested(&self.state, &self.session, &call).await
         };
         let caller = lineage::caller_session(&self.state, &self.session, &call).await;
-        let view = match self.state.tasks.delegate(&self.state, by, request).await {
-            Ok(view) => view,
-            Err(error) => return Ok(task_error(error)),
+        let view = if let Some(reuse_id) = reuse_task_id {
+            if remote {
+                return Ok(invalid(
+                    "reuse_task_id is only supported for sub-tasks on this computer",
+                ));
+            }
+            let prev = match self.state.tasks.owned(&self.by(), &TaskId(reuse_id)).await {
+                Ok(task) => task,
+                Err(error) => return Ok(task_error(error)),
+            };
+            let TaskBinding::AgentSession { agent_id, asid } = prev.binding else {
+                return Ok(invalid(
+                    "reuse_task_id must refer to an agent session sub-task",
+                ));
+            };
+            if request.agent_id.is_none() {
+                request.agent_id = Some(agent_id);
+            }
+            match self
+                .state
+                .tasks
+                .delegate_in_session(&self.state, by, request, Some(&asid), None, false, None)
+                .await
+            {
+                Ok(view) => view,
+                Err(error) => return Ok(task_error(error)),
+            }
+        } else {
+            match self.state.tasks.delegate(&self.state, by, request).await {
+                Ok(view) => view,
+                Err(error) => return Ok(task_error(error)),
+            }
         };
         let id = TaskId(view.task_id.clone());
         if let Some(caller) = caller {
@@ -801,13 +905,148 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.wait",
-        description = "Wait up to timeout_s (max 45) for a task to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing: read its answer and decide; do not call again while it says idle_unconfirmed). Returns the current state and summary. If the work will take long, end your turn after delegating; you will be told when it finishes. Use tasks.wait only for short jobs."
+        description = "Wait up to timeout_s (max 45) for a task (task_id) or a batch of parallel tasks (task_ids, up to 16, wait_for: \"all\" or \"any\") to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing: read its answer and decide; do not call again while it says idle_unconfirmed). Returns compact redacted state, summary, and key_errors. If the work will take long, end your turn after delegating; you will be told when it finishes."
     )]
     async fn tasks_wait(
         &self,
         Parameters(args): Parameters<WaitArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (id, slice) = (TaskId(args.task_id), wait_slice(args.timeout_s));
+        let slice = wait_slice(args.timeout_s);
+        let batch_ids: Vec<String> = args
+            .task_ids
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+            .fold(Vec::new(), |mut acc, id| {
+                if !acc.contains(&id) {
+                    acc.push(id);
+                }
+                acc
+            });
+
+        if !batch_ids.is_empty() {
+            if batch_ids.len() > 16 {
+                return Ok(invalid("task_ids accepts at most 16 tasks per call"));
+            }
+            let wait_for = args.wait_for.unwrap_or_default();
+            let by = self.by();
+            let tasks = &self.state.tasks;
+            let results: Vec<(String, Result<crate::tasks::service::Waited, TaskError>)> =
+                match wait_for {
+                    WaitFor::All => {
+                        let futs = batch_ids.iter().map(|raw_id| {
+                            let id = TaskId(raw_id.clone());
+                            let raw = raw_id.clone();
+                            let by = by.clone();
+                            async move {
+                                let res = tasks.wait(&self.state, &by, &id, slice).await;
+                                (raw, res)
+                            }
+                        });
+                        futures::future::join_all(futs).await
+                    }
+                    WaitFor::Any => {
+                        let mut futs: Vec<_> = batch_ids
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, raw_id)| {
+                                let id = TaskId(raw_id.clone());
+                                let raw = raw_id.clone();
+                                let by = by.clone();
+                                Box::pin(async move {
+                                    let res = tasks.wait(&self.state, &by, &id, slice).await;
+                                    (idx, raw, res)
+                                })
+                            })
+                            .collect();
+                        let ((winner_idx, winner_id, winner_res), _, _rest) =
+                            futures::future::select_all(futs.drain(..)).await;
+                        // Snapshot the other tasks immediately without waiting further.
+                        let mut ordered: Vec<
+                            Option<(String, Result<crate::tasks::service::Waited, TaskError>)>,
+                        > = (0..batch_ids.len()).map(|_| None).collect();
+                        ordered[winner_idx] = Some((winner_id, winner_res));
+                        for (idx, raw_id) in batch_ids.iter().enumerate() {
+                            if ordered[idx].is_some() {
+                                continue;
+                            }
+                            let id = TaskId(raw_id.clone());
+                            let snap = tasks
+                                .wait(&self.state, &by, &id, Duration::from_millis(1))
+                                .await;
+                            ordered[idx] = Some((raw_id.clone(), snap));
+                        }
+                        ordered.into_iter().flatten().collect()
+                    }
+                };
+
+            let mut entries = Vec::with_capacity(results.len());
+            let mut settled_count = 0usize;
+            for (raw_id, res) in results {
+                match res {
+                    Ok(mut waited) => {
+                        let id = TaskId(raw_id.clone());
+                        tasks.told(&id, waited.task.state).await;
+                        let key_errors = sanitize_waited(&mut waited);
+                        let settled = waited.task.state.is_terminal()
+                            || matches!(
+                                waited.task.state,
+                                crate::tasks::domain::TaskState::Waiting
+                                    | crate::tasks::domain::TaskState::IdleUnconfirmed
+                            );
+                        if settled {
+                            settled_count += 1;
+                        }
+                        let mut entry = json!({
+                            "task_id": waited.task.task_id,
+                            "state": waited.task.state,
+                            "summary": waited.task.summary,
+                        });
+                        if let Some(code) = waited.task.exit_code {
+                            entry["exit_code"] = json!(code);
+                        }
+                        if let Some(answer) = waited.answer {
+                            entry["answer"] = json!(answer);
+                        }
+                        if let Some(tail) = waited.stdout_tail {
+                            entry["stdout_tail"] = json!(tail);
+                        }
+                        if !key_errors.is_empty() {
+                            entry["key_errors"] = json!(key_errors);
+                        }
+                        entries.push(entry);
+                    }
+                    Err(err) => {
+                        entries.push(json!({
+                            "task_id": raw_id,
+                            "error": err.to_string(),
+                        }));
+                    }
+                }
+            }
+            let total = entries.len();
+            return Ok(ok(json!({
+                "wait_for": match wait_for {
+                    WaitFor::All => "all",
+                    WaitFor::Any => "any",
+                },
+                "all_settled": settled_count == total,
+                "settled_count": settled_count,
+                "total": total,
+                "tasks": entries,
+            })));
+        }
+
+        let Some(raw_id) = args
+            .task_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(invalid("either task_id or task_ids must be provided"));
+        };
+        let id = TaskId(raw_id.to_owned());
         let tasks = &self.state.tasks;
         let waited = tasks.wait(&self.state, &self.by(), &id, slice).await;
         // What a wait answers is not told again into the caller's session.
@@ -815,7 +1054,14 @@ impl MuqunMcp {
             tasks.told(&id, waited.task.state).await;
         }
         Ok(match waited {
-            Ok(waited) => ok(with_reminder(&self.state, json!(waited), &id).await),
+            Ok(mut waited) => {
+                let key_errors = sanitize_waited(&mut waited);
+                let mut payload = json!(waited);
+                if !key_errors.is_empty() {
+                    payload["key_errors"] = json!(key_errors);
+                }
+                ok(with_reminder(&self.state, payload, &id).await)
+            }
             Err(error) => task_error(error),
         })
     }
@@ -854,7 +1100,10 @@ impl MuqunMcp {
             .await
         {
             Err(TaskError::NotYours) => {}
-            Ok(read) => return Ok(ok(with_reminder(state, read, &id).await)),
+            Ok(mut read) => {
+                redact_json_strings(&mut read);
+                return Ok(ok(with_reminder(state, read, &id).await));
+            }
             read => return reply(read),
         }
         // Not one it created: the task this session works on, if it is that.
@@ -867,7 +1116,13 @@ impl MuqunMcp {
             args: vec![("what", what_text), ("task_id", &id.0)],
         };
         match lineage::own_task(state, &self.session, &call, Some(&id)).await {
-            Some(own) => reply(state.tasks.read_own(state, &own, what, args.cursor).await),
+            Some(own) => match state.tasks.read_own(state, &own, what, args.cursor).await {
+                Ok(mut val) => {
+                    redact_json_strings(&mut val);
+                    Ok(ok(val))
+                }
+                Err(error) => Ok(task_error(error)),
+            },
             None => Ok(task_error(TaskError::NotFound)),
         }
     }
@@ -929,6 +1184,28 @@ impl MuqunMcp {
             }
         }
         reply(cancelled)
+    }
+}
+
+fn redact_json_strings(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            let (clean, redacted) = super::reducer::redact_secrets(text);
+            if redacted {
+                *text = clean;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_json_strings(item);
+            }
+        }
+        Value::Object(map) => {
+            for (_, v) in map.iter_mut() {
+                redact_json_strings(v);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1105,6 +1382,7 @@ pub(crate) mod tests_support {
             variant: None,
             machine: Some(machine.into()),
             terminal: None,
+            reuse_task_id: None,
         };
         let result = MuqunMcp::new(state.clone(), session)
             .tasks_delegate(Parameters(args))
@@ -1183,6 +1461,7 @@ mod tests {
             variant: None,
             machine: None,
             terminal: None,
+            reuse_task_id: None,
         };
         let (error, _, body) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(!error, "{body}");
@@ -1231,6 +1510,7 @@ mod tests {
             variant: None,
             machine: None,
             terminal: None,
+            reuse_task_id: None,
         };
         let (error, _, task) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(!error, "{task}");
@@ -1275,6 +1555,7 @@ mod tests {
             variant: None,
             machine: None,
             terminal: Some("nope".into()),
+            reuse_task_id: None,
         };
         let (error, text, _) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(error, "{text}");
@@ -1391,6 +1672,7 @@ mod tests {
             variant: None,
             machine: None,
             terminal: None,
+            reuse_task_id: None,
         }
         .request("srv-coding", "coding", &[])
         .unwrap();
@@ -1406,6 +1688,7 @@ mod tests {
             variant: None,
             machine: None,
             terminal: None,
+            reuse_task_id: None,
         };
         let (error, _, body) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(error, "{body}");
@@ -1721,7 +2004,9 @@ mod tests {
             .unwrap();
         assert_eq!(opencode["modelCount"], 3000, "{opencode}");
         assert_eq!(opencode["modes"], json!(["build", "plan"]));
-        assert!(opencode.get("models").is_none());
+        let listed_models = opencode["models"].as_array().expect("top models summary");
+        assert_eq!(listed_models.len(), 10, "{opencode}");
+        assert_eq!(listed_models[0], "p/model-0");
     }
 
     #[test]
@@ -2048,5 +2333,122 @@ for line in sys.stdin:
             }
             driver.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn tasks_wait_batch_all_and_any_returns_compact_redacted_summary() {
+        use crate::tasks::domain::{
+            now_ms, PrincipalKind, Task, TaskBinding, TaskId, TaskKind, TaskOrigin, TaskPrincipal,
+            TaskState,
+        };
+        let state = test_state("admin", Vec::new());
+        let sess = session("%1");
+        let owner = sess.binding.owner_key();
+        let now = now_ms();
+        let make_task = |goal: &str, state_val: TaskState, summary: Option<&str>| Task {
+            id: TaskId::new(),
+            kind: TaskKind::Delegation,
+            goal: goal.into(),
+            cwd: None,
+            binding: TaskBinding::None,
+            state: state_val,
+            summary: summary.map(str::to_owned),
+            exit_code: None,
+            created_by: TaskPrincipal {
+                kind: PrincipalKind::Assistant,
+                id: owner.clone(),
+            },
+            created_ms: now,
+            updated_ms: now,
+            seq: 0,
+            parent: None,
+            origin: TaskOrigin::Agent,
+            label: None,
+            requester_name: None,
+            session_title: None,
+            mentions: Vec::new(),
+            client_ref: None,
+            requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
+        };
+        let done_id = state
+            .tasks
+            .insert_for_test(&make_task(
+                "task one",
+                TaskState::Done,
+                Some("Finished with token ghp_1234567890abcdefghijklmnop1234567890"),
+            ))
+            .await;
+        let working_id = state
+            .tasks
+            .insert_for_test(&make_task("task two", TaskState::Working, None))
+            .await;
+        let mcp = MuqunMcp::new(state, sess);
+
+        // wait_for = "any" returns immediately as soon as the done task settles.
+        let (error, _, body) = answer(
+            mcp.tasks_wait(Parameters(WaitArgs {
+                task_id: None,
+                task_ids: Some(vec![working_id.0.clone(), done_id.0.clone()]),
+                wait_for: Some(WaitFor::Any),
+                timeout_s: Some(5),
+            }))
+            .await,
+        );
+        assert!(!error, "{body}");
+        assert_eq!(body["wait_for"], "any");
+        assert_eq!(body["total"], 2);
+        assert_eq!(body["settled_count"], 1);
+        assert_eq!(body["all_settled"], false);
+        let done_entry = body["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["task_id"] == done_id.0)
+            .unwrap();
+        let summary_str = done_entry["summary"].as_str().unwrap();
+        assert!(!summary_str.contains("ghp_1234567890"), "{summary_str}");
+        assert!(summary_str.contains("[REDACTED]"), "{summary_str}");
+
+        // wait_for = "all" with two already-settled tasks returns all_settled = true.
+        let (error, _, body_all) = answer(
+            mcp.tasks_wait(Parameters(WaitArgs {
+                task_id: None,
+                task_ids: Some(vec![done_id.0.clone(), done_id.0.clone()]),
+                wait_for: Some(WaitFor::All),
+                timeout_s: Some(1),
+            }))
+            .await,
+        );
+        assert!(!error, "{body_all}");
+        assert_eq!(body_all["wait_for"], "all");
+        assert_eq!(body_all["total"], 1, "duplicate task_ids are deduplicated");
+        assert_eq!(body_all["all_settled"], true);
+    }
+
+    #[tokio::test]
+    async fn tasks_delegate_reuse_task_id_continues_warm_session() {
+        let mcp = MuqunMcp::new(test_state("admin", Vec::new()), session("%1"));
+        let first_id = delegated(FakeAgent::new("opencode"), &mcp).await;
+
+        let (error, _, second) = answer(
+            mcp.tasks_delegate(Parameters(DelegateArgs {
+                goal: "apply the follow-up fix".into(),
+                cwd: None,
+                agent_id: None,
+                mode: None,
+                model: None,
+                variant: None,
+                machine: None,
+                terminal: None,
+                reuse_task_id: Some(first_id.clone()),
+            }))
+            .await,
+        );
+        assert!(!error, "{second}");
+        assert_ne!(second["task_id"].as_str().unwrap(), first_id);
+        assert_eq!(second["binding"]["kind"], "agent_session");
+        assert_eq!(second["binding"]["asid"], ASID);
     }
 }

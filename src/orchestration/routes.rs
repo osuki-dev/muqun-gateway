@@ -608,6 +608,7 @@ async fn collect_deliverables(
         summary.push('\n');
     }
 
+    let (summary, _) = crate::mcp::reducer::redact_secrets(&summary);
     (files, summary)
 }
 
@@ -974,7 +975,73 @@ async fn reconcile_pipeline(
     }
     active_coder = run.effective_coder();
 
-    if let Some(mut rev_spec) = run.effective_reviewer() {
+    if run.request.auto_review == Some(false) {
+        let coder_settled = active_coder_task
+            .as_ref()
+            .is_some_and(|t| matches!(t.state, TaskState::Done | TaskState::IdleUnconfirmed));
+        if run.state.mao_phase == "coding" && coder_settled {
+            if let Some(step) = run
+                .state
+                .steps
+                .iter_mut()
+                .rev()
+                .find(|s| (s.kind == "coding" || s.kind == "rework") && s.status == "running")
+            {
+                step.status = "completed".into();
+            }
+            let coder_asid = run.state.coder_asid.clone();
+            let coder_reply = if let Some(ref asid) = coder_asid {
+                latest_assistant_text(state, &active_coder.agent, asid).await
+            } else {
+                None
+            };
+            let coder_summary = coder_reply
+                .or_else(|| active_coder_task.as_ref().and_then(|t| t.summary.clone()))
+                .unwrap_or_else(|| "(No summary recorded yet.)".into());
+            run.state.coder_summary = Some(concise_excerpt(&coder_summary, 600));
+            let (files, _) = collect_deliverables(
+                state,
+                &active_coder.agent,
+                coder_asid.as_deref(),
+                &run.request.cwd,
+                &run.request.goal,
+                &coder_summary,
+                run.state.base_commit.as_deref(),
+                &run.state.base_commits,
+                &run.state.base_worktree_fingerprints,
+                tasks,
+                root,
+                &run.task_ref(),
+            )
+            .await;
+            if !files.is_empty() {
+                run.state.files = files;
+            }
+            let round = run.state.round;
+            run.state.reviewed_round = round;
+            run.state.mao_phase = "approved".into();
+            run.state.accepted = true;
+            run.state.verdict = Some("model_led".into());
+            run.state.review_summary = Some(
+                "Completed by Lead Model (model-led orchestration; use Ask Advisor anytime for a second opinion)."
+                    .into(),
+            );
+            run.state.steps.push(PipelineStep {
+                kind: "verdict".into(),
+                round,
+                title: "Completed by Lead Model".into(),
+                detail: concise_excerpt(&coder_summary, 220),
+                status: "completed".into(),
+                asid: coder_asid,
+                task_id: root_task.as_ref().map(|t| t.task_id.clone()),
+                time_ms: now,
+            });
+            store::save_state(&state.db, run.id.clone(), run.state.clone())
+                .await
+                .map_err(internal)?;
+            return Ok(());
+        }
+    } else if let Some(mut rev_spec) = run.effective_reviewer() {
         let coder_settled = active_coder_task
             .as_ref()
             .is_some_and(|t| matches!(t.state, TaskState::Done | TaskState::IdleUnconfirmed));
@@ -1742,6 +1809,7 @@ async fn view(state: &AppState, run: Run) -> ApiResult<Json<Value>> {
             "round": run.state.round,
             "max_review_rounds": run.state.max_rounds,
             "auto_failover": run.auto_failover_enabled(),
+            "auto_review": run.auto_review_enabled(),
             "failover_count": run.state.failover_count,
             "skip_review": run.state.skip_review,
             "agent_pool": run.request.agent_pool,
@@ -1846,6 +1914,7 @@ async fn view(state: &AppState, run: Run) -> ApiResult<Json<Value>> {
         "round": run.state.round,
         "max_review_rounds": run.state.max_rounds,
         "auto_failover": run.auto_failover_enabled(),
+        "auto_review": run.auto_review_enabled(),
         "failover_count": run.state.failover_count,
         "skip_review": run.state.skip_review,
         "agent_pool": run.request.agent_pool,
@@ -1958,7 +2027,7 @@ async fn start(
         })?
         .to_string_lossy()
         .into_owned();
-    let requires_mcp = request.reviewer.is_none();
+    let requires_mcp = request.reviewer.is_none() && request.auto_review.is_none();
     let auto_failover = request
         .auto_failover
         .unwrap_or(!request.agent_pool.is_empty())
@@ -2162,14 +2231,16 @@ async fn start(
         name: None,
         server_id: None,
     };
-    let dispatch_goal = if run.request.reviewer.is_some() {
+    let dispatch_goal = if run.request.reviewer.is_some() || run.request.auto_review == Some(false)
+    {
         run.coding_prompt()
     } else {
         run.prompt()
     };
     // Deliver a compact (<150 token) invisible Advisor/Coordinator hint BEFORE turn 1
     // via `delegate_in_session` (uses invisible `SESSION_INSTRUCTION_KEY` when supported).
-    let extra_pool_inst = if run.request.reviewer.is_some()
+    let extra_pool_inst = if (run.request.reviewer.is_some()
+        || run.request.auto_review == Some(false))
         && (!run.request.agent_pool.is_empty() || decision.candidates.len() >= 2)
     {
         let inst = super::router::format_advisor_coordinator_instruction(

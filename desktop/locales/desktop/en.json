@@ -1083,5 +1083,8 @@
   "On-demand Advisor": "On-demand Advisor",
   "Quota limited": "Quota limited",
   "Floating window": "Floating window",
-  "Built-in modules": "Built-in modules"
+  "Built-in modules": "Built-in modules",
+  "Auto code review": "Auto code review",
+  "Auto review: On": "Auto review: On",
+  "Auto review: Off": "Auto review: Off (Model-led)"
 }

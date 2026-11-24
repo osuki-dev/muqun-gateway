@@ -41,6 +41,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     crate::orchestration::CAPABILITY,
     crate::orchestration::POOL_CAPABILITY,
     crate::orchestration::ROUTER_CAPABILITY,
+    crate::orchestration::MODEL_LED_CAPABILITY,
     "agent_catalog",
     // `visibility`/`picker` on discovery agents and
     // `PUT /api/agents/{kind}/visibility`.

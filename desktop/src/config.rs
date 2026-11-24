@@ -617,15 +617,20 @@ pub struct MaoSessionOverride {
     pub max_rounds: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_failover: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_review: Option<bool>,
 }
 
 impl MaoSessionOverride {
     pub fn is_empty(&self) -> bool {
-        self.reviewer.is_none() && self.max_rounds.is_none() && self.auto_failover.is_none()
+        self.reviewer.is_none()
+            && self.max_rounds.is_none()
+            && self.auto_failover.is_none()
+            && self.auto_review.is_none()
     }
 }
 
-/// Persisted MAO preferences for the composer's Coder ⇄ Reviewer flow.
+/// Persisted MAO preferences for the composer's orchestration flow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MaoPrefs {
@@ -638,6 +643,11 @@ pub struct MaoPrefs {
     /// when quota, credits, or rate limits are exhausted.
     #[serde(default = "MaoPrefs::default_auto_failover")]
     pub auto_failover: bool,
+    /// Automatically run an independent Reviewer after every turn with code edits.
+    /// Defaults to `false` (Model-led orchestration: the Lead Model decides whether
+    /// to delegate or review, and the user can invoke Ask Advisor anytime).
+    #[serde(default)]
+    pub auto_review: bool,
     /// Ordered pool of user-approved Agents & Models available for dynamic
     /// orchestrator allocation and automatic quota failover.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -670,6 +680,7 @@ impl Default for MaoPrefs {
             reviewer: None,
             max_rounds: Self::default_max_rounds(),
             auto_failover: Self::default_auto_failover(),
+            auto_review: false,
             agent_pool: Vec::new(),
             session_overrides: BTreeMap::new(),
             session_configs: BTreeMap::new(),

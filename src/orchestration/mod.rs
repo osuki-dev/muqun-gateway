@@ -11,6 +11,7 @@ pub(crate) use store::MIGRATION;
 pub(crate) const CAPABILITY: &str = "agent_orchestration_preview_v1";
 pub(crate) const POOL_CAPABILITY: &str = "agent_orchestration_pool_v1";
 pub(crate) const ROUTER_CAPABILITY: &str = "agent_orchestration_router_v1";
+pub(crate) const MODEL_LED_CAPABILITY: &str = "agent_orchestration_model_led_v1";
 
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +57,11 @@ struct Start {
     pub(crate) agent_pool: Vec<ReviewerSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) auto_failover: Option<bool>,
+    /// When explicitly `false`, the Lead Model orchestrates freely via MCP tools
+    /// without Gateway forcing an automatic cold-start Reviewer after every turn.
+    /// Defaults to `reviewer.is_some()` for backward compatibility with older Apps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) auto_review: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1040,7 +1046,11 @@ impl RunState {
             "approved" => QualityGateView {
                 id: "review".into(),
                 status: "completed".into(),
-                detail: format!("Approved #{}", self.round),
+                detail: if self.verdict.as_deref() == Some("model_led") {
+                    "Model-led".into()
+                } else {
+                    format!("Approved #{}", self.round)
+                },
             },
             "changes_requested" => QualityGateView {
                 id: "review".into(),
@@ -1258,6 +1268,13 @@ impl Run {
         self.request
             .auto_failover
             .unwrap_or(!self.request.agent_pool.is_empty())
+    }
+
+    fn auto_review_enabled(&self) -> bool {
+        self.request
+            .auto_review
+            .unwrap_or(self.request.reviewer.is_some())
+            && self.effective_reviewer().is_some()
     }
 
     fn coding_prompt(&self) -> String {

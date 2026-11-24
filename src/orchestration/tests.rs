@@ -38,6 +38,7 @@ fn request() -> Start {
         auto_approve: None,
         agent_pool: vec![],
         auto_failover: None,
+        auto_review: None,
     }
 }
 
@@ -1559,4 +1560,72 @@ async fn on_demand_advisor_consults_different_healthy_agent_without_touching_sti
         .unwrap()
         .iter()
         .any(|s| s["kind"] == "advisor" && s["status"] == "completed"));
+}
+
+#[tokio::test]
+async fn model_led_orchestration_completes_without_forcing_cold_reviewer() {
+    let state = state();
+    let now = crate::tasks::domain::now_ms();
+    let claude = FakeAgent::new("claude").with_sessions(&[("lead_main", now)]);
+    let codex = FakeAgent::new("codex").with_sessions(&[("codex_rev", now)]);
+    let codex_prompts = codex.prompts.clone();
+    state.agent_runtime.attach_for_test(claude.manager()).await;
+    state.agent_runtime.attach_for_test(codex.manager()).await;
+
+    let mut req = request();
+    req.client_ref = "model-led-1".into();
+    req.goal = "Implement batch wait support cleanly".into();
+    req.coordinator = "claude".into();
+    req.asid = Some("lead_main".into());
+    req.reviewer = Some(ReviewerSpec {
+        agent: "codex".into(),
+        model: None,
+        variant: None,
+        machine: None,
+    });
+    req.auto_review = Some(false);
+
+    let (status, started) = call(&state, "token", "POST", "/api/orchestrations", json!(req)).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    assert_eq!(started["auto_review"], false);
+    let run_id = started["run"]["id"].as_str().unwrap().to_string();
+    let root_tid = started["run"]["task_id"].as_str().unwrap().to_string();
+
+    // Mark the Lead Model task Done.
+    SqliteTaskStore::new(state.db.clone())
+        .transition(
+            &TaskId(root_tid),
+            crate::tasks::domain::TaskChange {
+                reopen: false,
+                reopen_count: None,
+                reopened_ms: None,
+                expected_seq: None,
+                to: TaskState::Done,
+                source: "test".into(),
+                note: None,
+                summary: Some("Implemented batch wait and verified tests.".into()),
+                exit_code: Some(0),
+                binding: None,
+                session_title: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (status, finished) = call(
+        &state,
+        "token",
+        "GET",
+        &format!("/api/orchestrations/{run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{finished}");
+    assert_eq!(finished["mao_phase"], "approved");
+    assert_eq!(finished["accepted"], true);
+    assert_eq!(finished["deliverables"]["verdict"], "model_led");
+    assert!(
+        codex_prompts.lock().unwrap().is_empty(),
+        "Gateway must NOT spawn a cold Reviewer when auto_review is false"
+    );
 }

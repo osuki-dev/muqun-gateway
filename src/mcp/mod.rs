@@ -15,6 +15,7 @@ pub(crate) mod hosts;
 pub(crate) mod inject;
 pub(crate) mod issue;
 pub(crate) mod lineage;
+pub(crate) mod reducer;
 pub(crate) mod token_routes;
 pub(crate) mod tokens;
 pub(crate) mod tokens_sqlite;
