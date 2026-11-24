@@ -2718,6 +2718,7 @@ impl TaskService {
             ),
             _ => (None, None),
         };
+        let label = effective_label(task);
         TaskView {
             task_id: task.id.0.clone(),
             state: task.state,
@@ -2732,8 +2733,8 @@ impl TaskService {
             reopen_count: task.reopen_count,
             parent_task_id: task.parent.as_ref().map(|id| id.0.clone()),
             origin: task.origin,
-            label: effective_label(task).map(str::to_owned),
-            title: pane_agent::title(task.label.as_deref(), None, &task.goal),
+            label: label.map(str::to_owned),
+            title: pane_agent::title(label, None, &task.goal),
             requested_by,
             children,
             progress: None,
@@ -5977,6 +5978,51 @@ mod tests {
             .await;
         assert_eq!(ended.label, None);
         assert_eq!(ended.title, "Venue api & mini");
+
+        // Even when a legacy orchestration task ended with no persisted session_title,
+        // `view.title` must fall back to the goal instead of showing "Orchestration".
+        let untitled = TaskId::new();
+        state
+            .tasks
+            .store()
+            .insert(&Task {
+                id: untitled.clone(),
+                kind: TaskKind::Delegation,
+                goal: "Check legacy fallback title".into(),
+                cwd: None,
+                binding: TaskBinding::AgentSession {
+                    agent_id: "claude".into(),
+                    asid: "orch-untitled-1".into(),
+                },
+                state: TaskState::Failed,
+                summary: None,
+                exit_code: None,
+                created_by: TaskPrincipal {
+                    kind: PrincipalKind::Device,
+                    id: "d1".into(),
+                },
+                created_ms: now,
+                updated_ms: now,
+                seq: 0,
+                parent: None,
+                origin: TaskOrigin::Device,
+                label: Some("Orchestration".into()),
+                requester_name: None,
+                session_title: None,
+                mentions: vec![],
+                client_ref: Some("orchestration:o_legacy_untitled".into()),
+                requester_server_id: None,
+                reopened_ms: None,
+                reopen_count: 0,
+            })
+            .await
+            .unwrap();
+        let untitled_view = state
+            .tasks
+            .present(&state.tasks.get_for_test(&untitled).await)
+            .await;
+        assert_eq!(untitled_view.label, None);
+        assert_eq!(untitled_view.title, "Check legacy fallback title");
     }
 
     #[test]
