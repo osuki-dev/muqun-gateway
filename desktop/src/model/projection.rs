@@ -2209,11 +2209,29 @@ impl Core {
             }
         };
         let reread = !target_asids.is_empty();
+        let named_target = named.cloned();
         if reread && self.state().reread.begin() {
             let core = self.clone();
             crate::hub::spawn_connected(async move {
                 loop {
-                    for asid in &target_asids {
+                    // Re-read the currently open sessions on every coalesced pass so a
+                    // reconnect or session switch mid-flight never misses the visible pane.
+                    let mut current_targets = Vec::new();
+                    if let Some(ref target) = named_target {
+                        if core.is_open(target) {
+                            current_targets.push(target.clone());
+                        }
+                    } else {
+                        if let Some(a) = core.state().active.lock().unwrap().clone() {
+                            current_targets.push(a);
+                        }
+                        for w in core.state().watched.lock().unwrap().iter() {
+                            if !current_targets.contains(w) {
+                                current_targets.push(w.clone());
+                            }
+                        }
+                    }
+                    for asid in &current_targets {
                         if !core.is_open(asid) {
                             continue;
                         }

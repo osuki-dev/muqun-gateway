@@ -35,6 +35,11 @@ use super::{
 const EVENT_CAPACITY: usize = 4096;
 const BACKOFF_START: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(15);
+/// Gateway pings every 25 s; after 35 s of total silence we probe with an
+/// application-level `{"t":"ping"}` and reconnect if still silent after grace.
+const WS_PING_AFTER: Duration = Duration::from_secs(35);
+const WS_PONG_GRACE: Duration = Duration::from_secs(15);
+const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long an answer about the gateway's capabilities holds: a gateway
 /// upgraded under a running desktop is noticed within this.
 const CAPABILITIES_FRESH: Duration = Duration::from_secs(60);
@@ -599,6 +604,15 @@ impl SessionHub for RemoteHub {
                         if let Some(obj) = body.as_object_mut() {
                             obj.remove("agent_pool");
                             obj.remove("auto_failover");
+                        }
+                    }
+                    if !self
+                        .has_capability("agent_orchestration_model_led_v1")
+                        .await
+                        .unwrap_or(false)
+                    {
+                        if let Some(obj) = body.as_object_mut() {
+                            obj.remove("auto_review");
                         }
                     }
                     self.call(Method::POST, &["api", "orchestrations"], &[], Some(body))
@@ -1869,15 +1883,41 @@ impl ClientCodec {
 // Event socket
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy)]
+struct SocketTimings {
+    ping_after: Duration,
+    pong_grace: Duration,
+    write_timeout: Duration,
+}
+
+impl Default for SocketTimings {
+    fn default() -> Self {
+        Self {
+            ping_after: WS_PING_AFTER,
+            pong_grace: WS_PONG_GRACE,
+            write_timeout: WS_WRITE_TIMEOUT,
+        }
+    }
+}
+
 /// One `/api/ws` connection after another, for the life of the process. After
 /// every reconnect the projection is told to read again (an unnamed
 /// `agent.resync`): the open session's snapshot and every list, which covers
 /// whatever the socket missed.
 async fn event_socket(
     weak: std::sync::Weak<RemoteHub>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut backoff = BACKOFF_START;
+    event_socket_with_timings(weak, shutdown, SocketTimings::default(), BACKOFF_START).await;
+}
+
+async fn event_socket_with_timings(
+    weak: std::sync::Weak<RemoteHub>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    timings: SocketTimings,
+    backoff_start: Duration,
+) {
+    let mut backoff = backoff_start;
     loop {
         if *shutdown.borrow() {
             return;
@@ -1886,7 +1926,7 @@ async fn event_socket(
             return;
         };
         let started = tokio::time::Instant::now();
-        let why = match run_socket(hub, &mut shutdown).await {
+        let why = match run_socket(hub, &mut shutdown, timings).await {
             Ok(()) => {
                 tracing::info!("event socket closed");
                 "the gateway closed the connection".to_string()
@@ -1906,7 +1946,7 @@ async fn event_socket(
         }
 
         if started.elapsed() > Duration::from_secs(30) {
-            backoff = BACKOFF_START;
+            backoff = backoff_start;
         }
         tokio::select! {
             _ = shutdown.changed() => return,
@@ -1919,6 +1959,7 @@ async fn event_socket(
 async fn run_socket(
     hub: Arc<RemoteHub>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    timings: SocketTimings,
 ) -> Result<(), String> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
     use tokio_tungstenite::tungstenite::Message;
@@ -2012,16 +2053,19 @@ async fn run_socket(
         let sub = client_codec
             .seal(r#"{"t":"subscribe_all"}"#)
             .map_err(|e| format!("seal subscribe: {e}"))?;
-        socket
-            .send(Message::text(sub))
+        tokio::time::timeout(timings.write_timeout, socket.send(Message::text(sub)))
             .await
+            .map_err(|_| "event socket subscribe timed out".to_string())?
             .map_err(|e| e.to_string())?;
         codec = Some(client_codec);
     } else {
-        socket
-            .send(Message::text(r#"{"t":"subscribe_all"}"#))
-            .await
-            .map_err(|e| e.to_string())?;
+        tokio::time::timeout(
+            timings.write_timeout,
+            socket.send(Message::text(r#"{"t":"subscribe_all"}"#)),
+        )
+        .await
+        .map_err(|_| "event socket subscribe timed out".to_string())?
+        .map_err(|e| e.to_string())?;
     }
 
     tracing::info!("event socket connected");
@@ -2040,17 +2084,45 @@ async fn run_socket(
     let weak = Arc::downgrade(&hub);
     drop(hub);
 
+    let mut last_rx = tokio::time::Instant::now();
+    let mut pinged = false;
+
     loop {
+        let deadline = last_rx
+            + if pinged {
+                timings.pong_grace
+            } else {
+                timings.ping_after
+            };
         tokio::select! {
             _ = shutdown.changed() => {
-                let _ = socket.close(None).await;
+                let _ = tokio::time::timeout(Duration::from_secs(2), socket.close(None)).await;
                 return Ok(());
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                if pinged {
+                    return Err("event socket timed out".to_string());
+                }
+                let ping_wire = if let Some(c) = codec.as_mut() {
+                    c.seal(r#"{"t":"ping"}"#)
+                        .map_err(|e| format!("seal ping: {e}"))?
+                } else {
+                    r#"{"t":"ping"}"#.to_string()
+                };
+                tokio::time::timeout(timings.write_timeout, socket.send(Message::text(ping_wire)))
+                    .await
+                    .map_err(|_| "event socket ping timed out".to_string())?
+                    .map_err(|e| format!("event socket ping failed: {e}"))?;
+                last_rx = tokio::time::Instant::now();
+                pinged = true;
             }
             item = socket.next() => {
                 let Some(message) = item else {
                     return Ok(());
                 };
                 let msg = message.map_err(|e| e.to_string())?;
+                last_rx = tokio::time::Instant::now();
+                pinged = false;
                 let text = match msg {
                     Message::Text(text) => {
                         if let Some(c) = codec.as_mut() {
@@ -2063,9 +2135,13 @@ async fn run_socket(
                     }
                     Message::Close(_) => return Ok(()),
                     Message::Ping(payload) => {
-                        let _ = socket.send(Message::Pong(payload)).await;
+                        tokio::time::timeout(timings.write_timeout, socket.send(Message::Pong(payload)))
+                            .await
+                            .map_err(|_| "event socket pong timed out".to_string())?
+                            .map_err(|e| format!("event socket pong failed: {e}"))?;
                         continue;
                     }
+                    Message::Pong(_) => continue,
                     _ => continue,
                 };
                 match parse_frame(text.as_str()) {
@@ -2079,6 +2155,9 @@ async fn run_socket(
                             let _ = hub.task_events.send(event);
                         }
                     }
+                    Some(Frame::Error(code)) => {
+                        return Err(format!("gateway socket error: {code}"));
+                    }
                     None => {}
                 }
             }
@@ -2086,17 +2165,19 @@ async fn run_socket(
     }
 }
 
-/// What one server frame carries: a session event, or a task change.
+/// What one server frame carries: a session event, a task change, or a fatal error.
 #[derive(Debug, PartialEq)]
 enum Frame {
     Agent(Box<AgentDomainEvent>),
     Task(TaskHubEvent),
+    Error(String),
 }
 
 /// One server frame. `event` frames carry the event's own JSON in `data`: a
 /// session event, or -- named `task.updated` / `task.deleted` -- the task as
 /// `GET /api/tasks` shows it. `resync` asks for a re-read, of the tasks when
-/// it says `tasks: true`. Everything else (hello, subscribed) is neither's.
+/// it says `tasks: true`. `error` ends the connection so it reconnects cleanly.
+/// Everything else (hello, subscribed, pong) is neither's.
 fn parse_frame(text: &str) -> Option<Frame> {
     let frame: Value = serde_json::from_str(text).ok()?;
     match frame.get("t")?.as_str()? {
@@ -2117,6 +2198,13 @@ fn parse_frame(text: &str) -> Option<Frame> {
             asid: AgentSessionId(frame.get("asid")?.as_str()?.to_string()),
             reason: "gateway".into(),
         }))),
+        "error" => Some(Frame::Error(
+            frame
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+        )),
         _ => None,
     }
 }
@@ -2488,5 +2576,70 @@ mod tests {
         });
         let event_plain = client_codec.open(&event_frame).unwrap();
         assert_eq!(event_plain, r#"{"t":"event"}"#);
+    }
+
+    #[tokio::test]
+    async fn silent_socket_pings_times_out_and_reconnects_to_resume_events() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let hub = RemoteHub::client(
+                LocalGateway {
+                    url: format!("http://{}", listener.local_addr().unwrap()),
+                    token: "isolated-test".into(),
+                    device_id: None,
+                    transport_key: None,
+                },
+                reqwest::redirect::Policy::default(),
+            )
+            .unwrap();
+            let timings = SocketTimings {
+                ping_after: Duration::from_millis(80),
+                pong_grace: Duration::from_millis(80),
+                write_timeout: Duration::from_secs(1),
+            };
+            tokio::spawn(event_socket_with_timings(
+                Arc::downgrade(&hub),
+                hub.shutdown.subscribe(),
+                timings,
+                Duration::from_millis(20),
+            ));
+            let mut events = hub.events();
+            let mut stalled_socket = accept_subscription(&listener).await;
+            assert!(matches!(
+                events.recv().await.unwrap(),
+                AgentDomainEvent::Resync { .. }
+            ));
+
+            // Keep the first socket open without replying: the client must send
+            // `{"t":"ping"}` and then drop and reconnect after pong_grace.
+            let ping = stalled_socket.next().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(ping.to_text().unwrap()).unwrap(),
+                json!({"t":"ping"})
+            );
+
+            // Second connection succeeds, resyncs, and delivers live events again.
+            let mut healthy_socket = accept_subscription(&listener).await;
+            assert!(matches!(
+                events.recv().await.unwrap(),
+                AgentDomainEvent::Resync { .. }
+            ));
+            healthy_socket
+                .send(tokio_tungstenite::tungstenite::Message::text(
+                    json!({"t":"event","event":"agent.permission.resolved","data":{
+                        "type":"agent.permission.resolved","asid":"remote-live","request_id":"r9","seq":7
+                    }})
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                events.recv().await.unwrap(),
+                AgentDomainEvent::PermissionResolved { asid, .. } if asid.0 == "remote-live"
+            ));
+            drop(stalled_socket);
+        })
+        .await
+        .expect("silent half-open socket recovers via ping timeout and reconnect");
     }
 }

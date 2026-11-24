@@ -1499,6 +1499,12 @@ impl<P: AcpProvider> AcpDriver<P> {
                     continue;
                 }
                 seen = modified;
+                // Keep following as long as the terminal transcript is actively advancing;
+                // otherwise a long-running conversation would silently stop streaming after
+                // TERMINAL_FOLLOW elapsed since the initial prepare.
+                if let Some(deadline) = driver.followers.lock().unwrap().get_mut(&id) {
+                    *deadline = tokio::time::Instant::now() + TERMINAL_FOLLOW;
+                }
                 let Some(live) = driver.terminal_live(&id).await else {
                     driver.followers.lock().unwrap().remove(&id);
                     return;
