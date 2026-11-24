@@ -136,25 +136,24 @@ fn option_pill(k: &Kit, key: String, label: &str, description: Option<&str>, cho
                 .wrap(),
         );
     }
+    let [c0, c1, _] = crate::theme::look::highlight_colors_for(k, k.dark);
     let mut pill = row()
         .key(key)
         .gap(6.0)
         .px(10.0)
         .py(5.0)
         .radius(k.radius.md)
-        .border(
-            1.0,
-            if chosen {
-                k.c.border_focus
-            } else {
-                k.c.border_base
-            },
-        )
+        .border(0.0, c0.alpha(0.0))
         .max_w(360.0);
     if chosen {
         pill = pill
-            .fill(k.alpha(k.c.info.icon, 0.12))
-            .child(icon(&glyphs::DONE, 12.0).color(k.c.info.icon).mt(2.0));
+            .linear_gradient(
+                std::f32::consts::FRAC_PI_2,
+                [(0.0, c0.alpha(0.18)), (1.0, c1.alpha(0.12))],
+            )
+            .child(icon(&glyphs::DONE, 12.0).color(c0).mt(2.0));
+    } else {
+        pill = pill.fill(k.c.layer_01.alpha(0.45));
     }
     pill.child(copy)
 }

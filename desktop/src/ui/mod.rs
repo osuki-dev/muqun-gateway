@@ -4534,7 +4534,8 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     let mut k =
         crate::theme::apply::palette(scheme).map_or_else(|| Kit::neutral(dark), |p| p.kit());
     crate::theme::look::tune_kit(&mut k, &s.cfg.appearance);
-    cx.focus_ring(2.0, 1.5, k.c.border_focus);
+    let [ring, _, _] = crate::theme::look::highlight_colors_for(&k, dark);
+    cx.focus_ring(2.0, 1.5, ring.alpha(0.65));
     if s.cfg.appearance.reduced_motion {
         cx.reduced_motion(true);
     }

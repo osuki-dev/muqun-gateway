@@ -2769,14 +2769,16 @@ pub fn composer_bar(s: &UiState, k: &Kit, layer: &mut Vec<El>, slot: Slot) -> El
             Slot::Session => "mao-toggle-session",
         })
         .radius(k.radius.lg)
-        .border(
-            1.0,
-            if enabled {
-                k.c.border_focus.alpha(0.65)
-            } else {
-                k.c.border_weak
-            },
-        );
+        .border(0.0, k.c.bg_accent.alpha(0.0));
+    let toggle = if enabled {
+        let [c0, c1, _] = crate::theme::look::highlight_colors_for(k, k.dark);
+        toggle.linear_gradient(
+            std::f32::consts::FRAC_PI_2,
+            [(0.0, c0.alpha(0.20)), (1.0, c1.alpha(0.14))],
+        )
+    } else {
+        toggle.fill(k.c.layer_01.alpha(0.38))
+    };
 
     let mut bar = row()
         .key(match slot {
@@ -2898,14 +2900,16 @@ fn reviewer_config_menu(
         .build(k)
         .key(anchor.pill_key())
         .radius(k.radius.lg)
-        .border(
-            1.0,
-            if open {
-                k.c.border_focus
-            } else {
-                k.c.border_weak
-            },
-        );
+        .border(0.0, k.c.bg_accent.alpha(0.0));
+    let trigger = if open {
+        let [c0, c1, _] = crate::theme::look::highlight_colors_for(k, k.dark);
+        trigger.linear_gradient(
+            std::f32::consts::FRAC_PI_2,
+            [(0.0, c0.alpha(0.20)), (1.0, c1.alpha(0.14))],
+        )
+    } else {
+        trigger.fill(k.c.layer_01.alpha(0.38))
+    };
 
     let mut menu = Menu::new(anchor.menu_key())
         .placement(placement)
@@ -4948,33 +4952,29 @@ fn page_list(
                     .color(k.c.text_faint),
             );
 
-        rows = rows.child(
-            col()
-                .key(format!("mao-row-{}", run.session_group_key()))
-                .w_full()
-                .padding(14.0)
-                .gap(7.0)
-                .radius(k.radius.lg)
-                .fill(if is_selected {
-                    k.c.layer_02
-                } else {
-                    k.c.layer_01
-                })
-                .border(
-                    1.0,
-                    if is_selected {
-                        k.c.border_focus
-                    } else {
-                        k.c.border_weak
-                    },
-                )
-                .on_press(move |s: &mut UiState| {
-                    s.orchestration.selected_run = Some(id.clone());
-                })
-                .child(header)
-                .child(goal_line)
-                .child(meta),
-        );
+        let [c0, c1, _] = crate::theme::look::highlight_colors_for(k, k.dark);
+        let mut row_card = col()
+            .key(format!("mao-row-{}", run.session_group_key()))
+            .w_full()
+            .padding(14.0)
+            .gap(7.0)
+            .radius(k.radius.lg)
+            .border(0.0, c0.alpha(0.0))
+            .on_press(move |s: &mut UiState| {
+                s.orchestration.selected_run = Some(id.clone());
+            })
+            .child(header)
+            .child(goal_line)
+            .child(meta);
+        if is_selected {
+            row_card = row_card.linear_gradient(
+                std::f32::consts::FRAC_PI_2,
+                [(0.0, c0.alpha(0.18)), (1.0, c1.alpha(0.10))],
+            );
+        } else {
+            row_card = row_card.fill(k.c.layer_01.alpha(0.55));
+        }
+        rows = rows.child(row_card);
     }
     col()
         .key("mao-list")

@@ -502,22 +502,15 @@ fn filters(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             Some(Some(m)) => (&super::parts::glyphs::COMPUTER, m.clone()),
         };
 
-        let trigger = rune::row()
+        let [c0, c1, _] = crate::theme::look::highlight_colors_for(k, k.dark);
+        let mut trigger = rune::row()
             .key("tasks-computer-picker-trigger")
             .h(32.0)
             .px(10.0)
             .gap(8.0)
             .center_y()
             .radius(k.radius.md)
-            .fill(k.c.layer_01)
-            .border(
-                1.0,
-                if open {
-                    k.c.border_focus
-                } else {
-                    k.c.border_weak
-                },
-            )
+            .border(0.0, c0.alpha(0.0))
             .cursor(rune::Cursor::Pointer)
             .role("button")
             .label(tr_ref(language, "Filter by computer"))
@@ -542,6 +535,14 @@ fn filters(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 let open = s.menu == Some(super::OpenMenu::TasksComputerPicker);
                 s.menu = (!open).then_some(super::OpenMenu::TasksComputerPicker);
             });
+        if open {
+            trigger = trigger.linear_gradient(
+                std::f32::consts::FRAC_PI_2,
+                [(0.0, c0.alpha(0.18)), (1.0, c1.alpha(0.12))],
+            );
+        } else {
+            trigger = trigger.fill(k.c.layer_01.alpha(0.55));
+        }
 
         let mut menu = Menu::new("tasks-computer-picker-menu")
             .trigger(trigger)
@@ -585,7 +586,8 @@ fn filters(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             );
         }
 
-        bar = bar.child(menu.build(k, layer).key("tasks-machine"));
+        // Keep Menu::build's own anchor key intact so the popup anchors below the trigger.
+        bar = bar.child(menu.build(k, layer));
     }
     bar.child(el().grow(1.0)).child(
         IconButton::new(&super::icons::REFRESH)
