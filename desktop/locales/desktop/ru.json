@@ -1036,5 +1036,10 @@
   "Reset to global default": "Reset to global default",
   "Auto code review": "Auto code review",
   "Auto review: On": "Auto review: On",
-  "Auto review: Off": "Auto review: Off (Model-led)"
+  "Auto review: Off": "Auto review: Off (Model-led)",
+  "Permissions": "Разрешения",
+  "Ask": "Спрашивать",
+  "Ask before acting": "Спрашивать перед действием",
+  "Ask before running tools or editing files": "Запрашивать подтверждение перед запуском инструментов или правкой файлов",
+  "Wait for the current turn to finish": "Дождитесь завершения текущего ответа"
 }

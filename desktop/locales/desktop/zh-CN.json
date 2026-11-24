@@ -1086,5 +1086,10 @@
   "Built-in modules": "内置模块",
   "Auto code review": "每轮结束后自动代码审查",
   "Auto review: On": "自动代码审查：已开启",
-  "Auto review: Off": "自动代码审查：已关闭（模型主导）"
+  "Auto review: Off": "自动代码审查：已关闭（模型主导）",
+  "Permissions": "权限",
+  "Ask": "询问",
+  "Ask before acting": "执行前询问",
+  "Ask before running tools or editing files": "执行命令或修改文件前先征求确认",
+  "Wait for the current turn to finish": "请等待当前回复结束后切换"
 }

@@ -1036,5 +1036,10 @@
   "Reset to global default": "Reset to global default",
   "Auto code review": "Auto code review",
   "Auto review: On": "Auto review: On",
-  "Auto review: Off": "Auto review: Off (Model-led)"
+  "Auto review: Off": "Auto review: Off (Model-led)",
+  "Permissions": "Permisos",
+  "Ask": "Preguntar",
+  "Ask before acting": "Preguntar antes de actuar",
+  "Ask before running tools or editing files": "Preguntar antes de ejecutar herramientas o editar archivos",
+  "Wait for the current turn to finish": "Espera a que termine la respuesta actual"
 }

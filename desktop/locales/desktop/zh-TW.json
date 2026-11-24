@@ -1086,5 +1086,10 @@
   "Built-in modules": "內建模組",
   "Auto code review": "每輪結束後自動程式碼審查",
   "Auto review: On": "自動程式碼審查：已開啟",
-  "Auto review: Off": "自動程式碼審查：已關閉（模型主導）"
+  "Auto review: Off": "自動程式碼審查：已關閉（模型主導）",
+  "Permissions": "權限",
+  "Ask": "詢問",
+  "Ask before acting": "執行前詢問",
+  "Ask before running tools or editing files": "執行指令或修改檔案前先徵求確認",
+  "Wait for the current turn to finish": "請等待目前回覆結束後切換"
 }

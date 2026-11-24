@@ -1036,5 +1036,10 @@
   "Reset to global default": "Reset to global default",
   "Auto code review": "Auto code review",
   "Auto review: On": "Auto review: On",
-  "Auto review: Off": "Auto review: Off (Model-led)"
+  "Auto review: Off": "Auto review: Off (Model-led)",
+  "Permissions": "権限",
+  "Ask": "確認する",
+  "Ask before acting": "実行前に確認する",
+  "Ask before running tools or editing files": "ツール実行やファイル編集の前に確認します",
+  "Wait for the current turn to finish": "現在の応答が完了するまでお待ちください"
 }

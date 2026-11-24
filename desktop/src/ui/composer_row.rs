@@ -113,7 +113,6 @@ struct Fold {
     mode_icon: bool,
     branch_icon: bool,
     more_branch: bool,
-    more_auto: bool,
     more_mode: bool,
     more_agent: bool,
 }
@@ -121,18 +120,17 @@ struct Fold {
 const FULL: Fold = Fold {
     agent_icon: false,
     model: ModelLook::Split,
-    mode_icon: true,
+    mode_icon: false,
     branch_icon: false,
     more_branch: false,
-    more_auto: false,
     more_mode: false,
     more_agent: false,
 };
 
 /// The steps, in the order the row gives them up: words before meaning;
-/// the permission mode (a bypass is worth seeing) is the last to leave, after
-/// the agent, which the pane's header names anyway.
-const FOLDS: [fn(&mut Fold); 11] = [
+/// the permission control (a bypass or auto-approve is worth seeing) is the
+/// last to leave, after the agent, which the pane's header names anyway.
+const FOLDS: [fn(&mut Fold); 10] = [
     |f| f.agent_icon = true,
     |f| f.model = ModelLook::Joined,
     |f| f.mode_icon = true,
@@ -141,7 +139,6 @@ const FOLDS: [fn(&mut Fold); 11] = [
     |f| f.model = ModelLook::Short,
     |f| f.more_branch = true,
     |f| f.model = ModelLook::Icon,
-    |f| f.more_auto = true,
     |f| f.more_agent = true,
     |f| f.more_mode = true,
 ];
@@ -164,6 +161,19 @@ struct ModelChip {
     current: Option<(String, String)>,
 }
 
+struct ModeChoice {
+    id: String,
+    label: String,
+    description: Option<String>,
+}
+
+struct PermissionSummary {
+    glyph: &'static Icon,
+    label: String,
+    warn: bool,
+    help: String,
+}
+
 /// The open session's controls, read once per frame.
 pub struct Controls {
     language: Language,
@@ -172,7 +182,7 @@ pub struct Controls {
     agent_name: String,
     model: Option<ModelChip>,
     branch: Option<(String, BranchInfo)>,
-    modes: Vec<(String, String)>,
+    modes: Vec<ModeChoice>,
     mode: Option<String>,
     asid: muqun_gateway::agents::AgentSessionId,
     auto_on: bool,
@@ -181,17 +191,17 @@ pub struct Controls {
     busy: bool,
 }
 
-/// Show a separate toggle only when discovery offers a live session control
-/// that is not already represented by the session's mode menu.
-fn standalone_approval(feature: Option<&serde_json::Value>, modes: &[(String, String)]) -> bool {
+/// Show a separate approval toggle section only when discovery offers a live
+/// session control that is not already represented by the session's mode menu.
+fn standalone_approval(feature: Option<&serde_json::Value>, modes: &[ModeChoice]) -> bool {
     let Some(feature) = feature.filter(|f| f["scope"] == "session") else {
         return false;
     };
     let Some(native) = feature["native"].as_str().filter(|s| !s.is_empty()) else {
         return false;
     };
-    !modes.iter().any(|(id, _)| {
-        let id = bare_catalog_id(id);
+    !modes.iter().any(|choice| {
+        let id = bare_catalog_id(&choice.id);
         id == native
             || feature["modeIds"]
                 .as_array()
@@ -244,13 +254,22 @@ impl Controls {
                 .filter(|b| b.current.is_some())
                 .map(|b| (cwd.clone(), b.clone()))
         });
-        let modes: Vec<(String, String)> = catalog
+        let modes: Vec<ModeChoice> = catalog
             .map(|c| {
                 c.catalog
                     .modes
                     .iter()
                     .filter(|m| !m.hidden)
-                    .map(|m| (m.id.clone(), mode_label(&m.id, Some(m.name.as_str()))))
+                    .map(|m| ModeChoice {
+                        id: m.id.clone(),
+                        label: mode_label(&m.id, Some(m.name.as_str())),
+                        description: m
+                            .description
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|d| !d.is_empty())
+                            .map(str::to_owned),
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -291,10 +310,65 @@ impl Controls {
         Some(
             self.modes
                 .iter()
-                .find(|(id, _)| id == mode || bare_catalog_id(id) == mode.as_str())
-                .cloned()
+                .find(|m| m.id == *mode || bare_catalog_id(&m.id) == mode.as_str())
+                .map(|m| (m.id.clone(), m.label.clone()))
                 .unwrap_or_else(|| (mode.clone(), mode_label(mode, None))),
         )
+    }
+
+    fn has_permission_control(&self) -> bool {
+        self.auto_visible || self.modes.len() > 1 || self.mode.is_some()
+    }
+
+    fn permission_interactive(&self) -> bool {
+        self.auto_visible || self.modes.len() > 1
+    }
+
+    fn permission_summary(&self) -> PermissionSummary {
+        if self.auto_visible {
+            let mode_prefix = (self.modes.len() > 1)
+                .then(|| self.current_mode().map(|(_, label)| label))
+                .flatten();
+            if self.auto_on {
+                let help = match &mode_prefix {
+                    Some(mode) => format!("{mode} · {}", auto_help(self)),
+                    None => auto_help(self),
+                };
+                return PermissionSummary {
+                    glyph: &AUTO_APPROVE,
+                    label: self.tr("Auto-approve").to_string(),
+                    warn: true,
+                    help,
+                };
+            }
+            if self.modes.len() < 2 {
+                return PermissionSummary {
+                    glyph: &SHIELD,
+                    label: self.tr("Ask").to_string(),
+                    warn: false,
+                    help: auto_help(self),
+                };
+            }
+        }
+        let (id, label) = self
+            .current_mode()
+            .unwrap_or_else(|| (String::new(), self.tr("Mode").to_string()));
+        let (glyph, warn) = mode_glyph(&id);
+        let help = if self.auto_visible {
+            format!(
+                "{} {label} · {}",
+                self.tr("Permission mode:"),
+                auto_help(self)
+            )
+        } else {
+            format!("{} {label}", self.tr("Permission mode:"))
+        };
+        PermissionSummary {
+            glyph,
+            label,
+            warn,
+            help,
+        }
     }
 
     fn branch_label(&self) -> Option<String> {
@@ -305,8 +379,7 @@ impl Controls {
     /// Whether anything goes into the "…" menu at `f`.
     fn has_more(&self, f: Fold) -> bool {
         (f.more_branch && self.branch.is_some())
-            || (f.more_auto && self.auto_visible)
-            || (f.more_mode && (self.mode.is_some() || self.modes.len() > 1))
+            || (f.more_mode && self.has_permission_control())
             || f.more_agent
     }
 
@@ -342,20 +415,13 @@ impl Controls {
                 text_w(&label, small) + PILL_PAD
             });
         }
-        if !f.more_mode {
+        if !f.more_mode && self.has_permission_control() {
             if f.mode_icon {
-                if self.mode.is_some() || self.modes.len() > 1 {
-                    items.push(ICON_PILL);
-                }
-            } else if self.mode.is_some() || self.modes.len() > 1 {
-                let label = self
-                    .current_mode()
-                    .map_or_else(|| self.tr("Mode").to_string(), |(_, l)| l);
-                items.push(GLYPH + 4.0 + text_w(&label, small) + PILL_PAD);
+                items.push(ICON_PILL);
+            } else {
+                let summary = self.permission_summary();
+                items.push(GLYPH + 4.0 + text_w(&summary.label, small) + PILL_PAD);
             }
-        }
-        if !f.more_auto && self.auto_visible {
-            items.push(ICON_PILL);
         }
         if self.has_more(f) {
             items.push(ICON_PILL);
@@ -610,18 +676,20 @@ fn model_chips(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold,
 fn mode_items(menu: Menu, c: &Controls, k: &Kit) -> Menu {
     let current = c.current_mode().map(|(id, _)| id);
     let mut menu = menu;
-    for (id, label) in &c.modes {
-        let (glyph, warn) = mode_glyph(id);
-        let pick = id.clone();
-        let mut item = MenuItem::new(label.clone())
+    for choice in &c.modes {
+        let (glyph, warn) = mode_glyph(&choice.id);
+        let pick = choice.id.clone();
+        let mut item = MenuItem::new(choice.label.clone())
             .lead(icon(glyph, GLYPH).color(if warn {
                 k.c.warning.icon
             } else {
                 k.c.icon_muted
             }))
-            .checked(current.as_deref() == Some(id.as_str()))
+            .checked(current.as_deref() == Some(choice.id.as_str()))
             .on_select(move |s: &mut UiState| switch_mode(s, pick.clone()));
-        if warn {
+        if let Some(desc) = &choice.description {
+            item = item.description(desc.clone());
+        } else if warn {
             item = item.description(c.tr("Nothing asks first"));
         }
         menu = menu.item(item);
@@ -629,61 +697,152 @@ fn mode_items(menu: Menu, c: &Controls, k: &Kit) -> Menu {
     menu
 }
 
-fn mode_control(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -> Option<El> {
-    let (id, label) = c
-        .current_mode()
-        .unwrap_or_else(|| (String::new(), c.tr("Mode").to_string()));
-    let (glyph, warn) = mode_glyph(&id);
-    let tone = warn.then_some(k.c.warning.icon);
-    let help = format!("{} {label}", c.tr("Permission mode:"));
-    if c.modes.len() < 2 {
-        // Nothing to switch to: say what it is.
-        c.mode.as_ref()?;
+fn auto_timing(c: &Controls) -> &'static str {
+    match c.auto_applies.as_str() {
+        "next_turn" => c.tr("Applies to the next turn"),
+        "restart_when_idle" => c.tr("Restarts this session when idle"),
+        _ => c.tr("Applies to this session"),
+    }
+}
+
+fn auto_items(menu: Menu, c: &Controls, k: &Kit) -> Menu {
+    let (on, asid) = (c.auto_on, c.asid.clone());
+    let asid_off = asid.clone();
+    let restart_blocked = c.busy && c.auto_applies == "restart_when_idle";
+    let ask_desc = if restart_blocked {
+        c.tr("Wait for the current turn to finish").to_string()
+    } else {
+        c.tr("Ask before running tools or editing files")
+            .to_string()
+    };
+    let auto_desc = if restart_blocked {
+        format!(
+            "{} · {}",
+            c.tr("Wait for the current turn to finish"),
+            auto_timing(c)
+        )
+    } else {
+        format!("{} · {}", c.tr("Nothing asks first"), auto_timing(c))
+    };
+    menu.item(
+        MenuItem::new(c.tr("Ask before acting"))
+            .lead(icon(&SHIELD, GLYPH).color(k.c.icon_muted))
+            .description(ask_desc)
+            .checked(!on)
+            .disabled(restart_blocked)
+            .on_select(move |s: &mut UiState| {
+                s.menu = None;
+                if on {
+                    set_auto(s, &asid_off, false);
+                }
+            }),
+    )
+    .item(
+        MenuItem::new(c.tr("Auto-approve"))
+            .lead(icon(&AUTO_APPROVE, GLYPH).color(k.c.warning.icon))
+            .description(auto_desc)
+            .checked(on)
+            .disabled(restart_blocked)
+            .on_select(move |s: &mut UiState| {
+                s.menu = None;
+                if !on {
+                    set_auto(s, &asid, true);
+                }
+            }),
+    )
+}
+
+fn permission_items(menu: Menu, c: &Controls, k: &Kit) -> Menu {
+    let mut menu = menu;
+    let has_modes = c.modes.len() > 1;
+    if has_modes {
+        menu = mode_items(menu.group_label(c.tr("Permission mode")), c, k);
+        if c.auto_visible {
+            menu = menu.separator();
+        }
+    }
+    if c.auto_visible {
+        menu = auto_items(menu.group_label(c.tr("Permissions")), c, k);
+    }
+    menu
+}
+
+fn permission_control(
+    s: &UiState,
+    c: &Controls,
+    k: &Kit,
+    layer: &mut Vec<El>,
+    f: Fold,
+) -> Option<El> {
+    if !c.has_permission_control() {
+        return None;
+    }
+    let summary = c.permission_summary();
+    let icon_tone = summary.warn.then_some(k.c.warning.icon);
+    let text_tone = summary.warn.then_some(k.c.warning.fg);
+    if !c.permission_interactive() {
+        // Nothing to switch to: show the read-only mode clearly.
         let chip = row()
             .key("mode")
             .role("image")
-            .label(help.clone())
-            .help(help)
+            .label(summary.help.clone())
+            .help(summary.help)
             .h(32.0)
             .center_y()
             .child(
-                icon(glyph, GLYPH)
-                    .color(tone.unwrap_or(k.c.icon_muted))
+                icon(summary.glyph, GLYPH)
+                    .color(icon_tone.unwrap_or(k.c.icon_muted))
                     .a11y_hidden(),
             );
         return Some(if f.mode_icon {
             chip.w(ICON_PILL).center()
         } else {
             chip.gap(4.0).px(6.0).child(
-                text(label)
+                text(summary.label)
                     .font(k.ty.small)
-                    .color(tone.unwrap_or(k.c.text_muted))
+                    .color(text_tone.unwrap_or(k.c.text_muted))
                     .a11y_hidden(),
             )
         });
     }
     let open = s.menu == Some(OpenMenu::Mode);
     let face = if f.mode_icon {
-        Face::Glyph(glyph, tone)
+        Face::Glyph(summary.glyph, icon_tone)
     } else {
-        Face::Labelled(glyph, tone, label)
+        Face::Labelled(summary.glyph, text_tone.or(icon_tone), summary.label)
     };
-    let trigger = pill_button(
+    let mut trigger = pill_button(
         k,
         "mode-pill",
         face,
-        help.clone(),
-        Some(help),
+        summary.help.clone(),
+        Some(summary.help),
         open,
         OpenMenu::Mode,
     );
+    if summary.warn {
+        trigger = trigger
+            .fill(if open {
+                k.c.warning.icon.alpha(0.20)
+            } else {
+                k.c.warning.icon.alpha(0.14)
+            })
+            .border(
+                0.5,
+                if open {
+                    k.c.warning.icon.alpha(0.65)
+                } else {
+                    k.c.warning.icon.alpha(0.45)
+                },
+            );
+    }
     let menu = Menu::new(format!("mode-{}", c.asid.0))
         .placement(rune_kit::Placement::TopStart)
         .trigger(trigger)
         .open(open)
-        .min_width(200.0)
+        .min_width(240.0)
         .on_close(|s: &mut UiState| s.menu = None);
-    Some(mode_items(menu, c, k).build(k, layer))
+    Some(permission_items(menu, c, k).build(k, layer))
 }
 
 fn set_auto(s: &mut UiState, asid: &muqun_gateway::agents::AgentSessionId, on: bool) {
@@ -694,11 +853,6 @@ fn set_auto(s: &mut UiState, asid: &muqun_gateway::agents::AgentSessionId, on: b
 }
 
 fn auto_help(c: &Controls) -> String {
-    let timing = match c.auto_applies.as_str() {
-        "next_turn" => c.tr("Applies to the next turn"),
-        "restart_when_idle" => c.tr("Restarts this session when idle"),
-        _ => c.tr("Applies to this session"),
-    };
     format!(
         "{} · {} · {} · {}",
         c.agent_name,
@@ -708,39 +862,8 @@ fn auto_help(c: &Controls) -> String {
         } else {
             c.tr("Disabled")
         },
-        timing
+        auto_timing(c)
     )
-}
-
-fn auto_control(c: &Controls, k: &Kit) -> El {
-    let (on, asid) = (c.auto_on, c.asid.clone());
-    rune_kit::IconButton::new(&AUTO_APPROVE)
-        .variant(rune_kit::IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Large)
-        .label(format!("{} · {}", c.agent_name, c.tr("Auto-approve")))
-        .help(auto_help(c))
-        .disabled(c.busy && c.auto_applies == "restart_when_idle")
-        .on_press(move |s: &mut UiState| set_auto(s, &asid, !on))
-        .build(k)
-        .key("auto-approve")
-        .size(ICON_PILL, ICON_PILL)
-        .min_w(ICON_PILL)
-        .radius(ICON_PILL / 2.0)
-        .fill(if on {
-            k.c.bg_accent.alpha(0.16)
-        } else {
-            k.c.layer_01.alpha(0.35)
-        })
-        .border(
-            0.5,
-            if on {
-                k.c.bg_accent.alpha(0.5)
-            } else {
-                k.c.border_muted.alpha(0.3)
-            },
-        )
-        .role("switch")
-        .checked(on)
 }
 
 fn branch_control(
@@ -800,8 +923,8 @@ fn more_menu(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -
                 .disabled(true),
         );
     }
-    if f.more_mode && c.modes.len() > 1 {
-        menu = mode_items(section(menu).group_label(c.tr("Permission mode")), c, k);
+    if f.more_mode && c.permission_interactive() {
+        menu = permission_items(section(menu), c, k);
     } else if f.more_mode {
         if let Some((id, label)) = c.current_mode() {
             let (glyph, warn) = mode_glyph(&id);
@@ -815,19 +938,6 @@ fn more_menu(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -
                     .disabled(true),
             );
         }
-    }
-    if f.more_auto && c.auto_visible {
-        let (on, asid) = (c.auto_on, c.asid.clone());
-        menu = section(menu).item(
-            MenuItem::new(c.tr("Auto-approve"))
-                .lead(icon(&AUTO_APPROVE, GLYPH).color(k.c.icon_muted))
-                .checked(on)
-                .disabled(c.busy && c.auto_applies == "restart_when_idle")
-                .on_select(move |s: &mut UiState| {
-                    s.menu = None;
-                    set_auto(s, &asid, !on);
-                }),
-        );
     }
     if let (true, Some((_, info))) = (f.more_branch, c.branch.as_ref()) {
         menu = section(menu).item(
@@ -855,12 +965,9 @@ fn build(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -> El
         }
     }
     if !f.more_mode {
-        if let Some(m) = mode_control(s, c, k, layer, f) {
+        if let Some(m) = permission_control(s, c, k, layer, f) {
             line = line.child(m);
         }
-    }
-    if !f.more_auto && c.auto_visible {
-        line = line.child(auto_control(c, k));
     }
     if c.has_more(f) {
         line = line.child(more_menu(s, c, k, layer, f));
@@ -878,16 +985,24 @@ pub fn own_line(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, room: f
 mod tests {
     use super::*;
 
+    fn choice(id: &str, label: &str) -> ModeChoice {
+        ModeChoice {
+            id: id.into(),
+            label: label.into(),
+            description: None,
+        }
+    }
+
     #[test]
     fn approval_control_requires_capability_and_deduplicates_offered_modes() {
         use serde_json::json;
-        let modes = vec![("bypassPermissions[]".into(), "Bypass".into())];
+        let modes = vec![choice("bypassPermissions[]", "Bypass")];
         let feature =
             json!({"scope":"session", "native":"yolo", "modeIds":["yolo","bypassPermissions"]});
         assert!(!standalone_approval(Some(&feature), &modes));
         assert!(standalone_approval(
             Some(&feature),
-            &[("plan".into(), "Plan".into())]
+            &[choice("plan", "Plan")]
         ));
         assert!(!standalone_approval(None, &[]));
         assert!(!standalone_approval(
@@ -932,7 +1047,7 @@ mod tests {
                 "bypassPermissions",
             ]
             .iter()
-            .map(|m| (m.to_string(), readable_catalog_id(m)))
+            .map(|m| choice(m, &readable_catalog_id(m)))
             .collect(),
             mode: Some("bypassPermissions".into()),
             asid: muqun_gateway::agents::AgentSessionId("s".into()),
@@ -943,12 +1058,44 @@ mod tests {
         }
     }
 
+    fn antigravity(auto_on: bool) -> Controls {
+        Controls {
+            language: Language::En,
+            dark: false,
+            agent_id: "antigravity".into(),
+            agent_name: "Antigravity".into(),
+            model: None,
+            branch: None,
+            modes: vec![],
+            mode: Some("default".into()),
+            asid: muqun_gateway::agents::AgentSessionId("ag".into()),
+            auto_on,
+            auto_visible: true,
+            auto_applies: "restart_when_idle".into(),
+            busy: false,
+        }
+    }
+
     /// Less room never shows more: each fold is no wider than the one
     /// before, so the row only ever folds further as a pane narrows.
     #[test]
     fn narrower_room_never_unfolds() {
-        let (k, c) = (Kit::neutral(false), claude());
-        let widths: Vec<f32> = (0..=FOLDS.len()).map(|l| c.width(&k, fold_at(l))).collect();
-        assert!(widths.windows(2).all(|w| w[1] <= w[0]), "{widths:?}");
+        let k = Kit::neutral(false);
+        for c in [claude(), antigravity(false), antigravity(true)] {
+            let widths: Vec<f32> = (0..=FOLDS.len()).map(|l| c.width(&k, fold_at(l))).collect();
+            assert!(widths.windows(2).all(|w| w[1] <= w[0]), "{widths:?}");
+        }
+    }
+
+    #[test]
+    fn single_mode_auto_approve_agent_shows_clear_unified_permission_label() {
+        let off = antigravity(false).permission_summary();
+        assert_eq!(off.label, "Ask");
+        assert!(!off.warn);
+
+        let on = antigravity(true).permission_summary();
+        assert_eq!(on.label, "Auto-approve");
+        assert!(on.warn);
+        assert!(on.help.contains("Restarts this session when idle"));
     }
 }

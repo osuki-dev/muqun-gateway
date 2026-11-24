@@ -1036,5 +1036,10 @@
   "Reset to global default": "Reset to global default",
   "Auto code review": "Auto code review",
   "Auto review: On": "Auto review: On",
-  "Auto review: Off": "Auto review: Off (Model-led)"
+  "Auto review: Off": "Auto review: Off (Model-led)",
+  "Permissions": "Quyền",
+  "Ask": "Hỏi trước",
+  "Ask before acting": "Hỏi trước khi thực hiện",
+  "Ask before running tools or editing files": "Hỏi trước khi chạy công cụ hoặc chỉnh sửa tệp",
+  "Wait for the current turn to finish": "Đợi lượt trả lời hiện tại hoàn tất"
 }
