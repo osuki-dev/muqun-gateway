@@ -2732,7 +2732,7 @@ impl TaskService {
             reopen_count: task.reopen_count,
             parent_task_id: task.parent.as_ref().map(|id| id.0.clone()),
             origin: task.origin,
-            label: task.label.clone(),
+            label: effective_label(task).map(str::to_owned),
             title: pane_agent::title(task.label.as_deref(), None, &task.goal),
             requested_by,
             children,
@@ -5955,6 +5955,7 @@ mod tests {
             .tasks
             .present(&state.tasks.get_for_test(&id).await)
             .await;
+        assert_eq!(view.label, None);
         assert_eq!(view.title, "Casual Greeting");
 
         state.tasks.session_named(ASID, "Venue api & mini").await;
@@ -5962,6 +5963,7 @@ mod tests {
             .tasks
             .present(&state.tasks.get_for_test(&id).await)
             .await;
+        assert_eq!(view.label, None);
         assert_eq!(view.title, "Venue api & mini");
 
         state
@@ -5973,6 +5975,7 @@ mod tests {
             .tasks
             .present(&state.tasks.get_for_test(&id).await)
             .await;
+        assert_eq!(ended.label, None);
         assert_eq!(ended.title, "Venue api & mini");
     }
 
