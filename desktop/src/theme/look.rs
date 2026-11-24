@@ -175,13 +175,12 @@ impl Look {
         let e = e
             .radius(radius)
             .clip_rounded(radius)
-            .fill(self.panel_fill(k));
-        if self.glass {
-            let (top, bottom) = self.rim(k);
-            let e = if self.blur { e.backdrop_blur(18.0) } else { e };
-            e.border_gradient(1.0, top, bottom)
+            .fill(self.panel_fill(k))
+            .border(0.0, k.c.bg_accent.alpha(0.0));
+        if self.glass && self.blur {
+            e.backdrop_blur(18.0)
         } else {
-            e.border(1.0, k.c.border_base)
+            e
         }
     }
 
@@ -273,46 +272,55 @@ impl Look {
         }
     }
 
-    /// Lit glass chrome shared by workspace windows and the input deck.
+    /// Borderless lit glass chrome shared by workspace windows and the input
+    /// deck: zero hard outline; active focus is carried by ambient accent
+    /// luminescence and depth shadow.
     pub fn luminous(&self, k: &Kit, e: El, active: bool) -> El {
         let accent = k.c.bg_accent;
-        let e = e
-            .border_gradient(
-                1.0,
-                if active {
-                    accent.alpha(0.95)
-                } else {
-                    k.c.border_base
-                },
-                if active {
-                    k.c.info.icon.alpha(0.45)
-                } else {
-                    k.c.border_muted
-                },
-            )
-            .box_shadow(Shadow {
-                x: 0.0,
-                y: 14.0,
-                blur: 40.0,
-                spread: -6.0,
-                color: k.c.black.alpha(if self.dark { 0.5 } else { 0.12 }),
-                inset: false,
-            });
-        self.glow(e, accent, if active { 0.8 } else { 0.0 })
+        let e = e.border(0.0, accent.alpha(0.0)).box_shadow(Shadow {
+            x: 0.0,
+            y: 12.0,
+            blur: 36.0,
+            spread: -8.0,
+            color: k.c.black.alpha(if self.dark { 0.48 } else { 0.10 }),
+            inset: false,
+        });
+        self.glow(e, accent, if active { 0.85 } else { 0.0 })
     }
 
-    /// A two-tone edge light; only a busy surface breathes.
+    /// A borderless top aurora wash tinted with the theme's accent and info
+    /// highlights, fading smoothly to transparent without any outline stroke.
+    pub fn focus_aurora(&self, k: &Kit, key: &str, active: bool) -> El {
+        let top = k.c.bg_accent.alpha(if self.dark { 0.24 } else { 0.16 });
+        let mid = k.c.info.icon.alpha(if self.dark { 0.10 } else { 0.07 });
+        let clear = k.c.bg_accent.alpha(0.0);
+        let wash = el()
+            .key(key.to_string())
+            .h(84.0)
+            .linear_gradient(0.28, [(0.0, top), (0.48, mid), (1.0, clear)])
+            .opacity(if active { 1.0 } else { 0.0 })
+            .opacity_motion(self.focus_fade())
+            .a11y_hidden();
+        if active && self.motion {
+            self.breathe(wash)
+        } else {
+            wash
+        }
+    }
+
+    /// A two-tone edge light; glows smoothly in the theme's accent gradient.
     pub fn energy_line(&self, k: &Kit, key: &str, busy: bool) -> El {
         let line = el()
             .key(key.to_string())
-            .h(2.0)
+            .h(2.5)
             .linear_gradient(
                 std::f32::consts::FRAC_PI_2,
                 [
                     (0.0, k.c.bg_accent.alpha(0.0)),
-                    (0.2, k.c.bg_accent),
-                    (0.65, k.c.info.icon),
-                    (1.0, k.c.info.icon.alpha(0.0)),
+                    (0.18, k.c.bg_accent),
+                    (0.55, k.c.info.icon),
+                    (0.82, k.c.bg_accent),
+                    (1.0, k.c.bg_accent.alpha(0.0)),
                 ],
             )
             .a11y_hidden();

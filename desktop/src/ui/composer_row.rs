@@ -506,20 +506,22 @@ fn pill_button(
     if square {
         e = e.w(ICON_PILL).min_w(ICON_PILL).px(0.0);
     }
-    let chip_fill = if open {
-        k.c.bg_accent.alpha(0.14)
-    } else {
-        k.c.layer_01.alpha(0.35)
-    };
-    let chip_border = if open {
-        k.c.bg_accent.alpha(0.55)
-    } else {
-        k.c.border_muted.alpha(0.30)
-    };
-    e.h(32.0)
+    let mut e = e
+        .h(32.0)
         .radius(if square { ICON_PILL / 2.0 } else { k.radius.lg })
-        .fill(chip_fill)
-        .border(0.5, chip_border)
+        .border(0.0, k.c.bg_accent.alpha(0.0));
+    if open {
+        e = e.linear_gradient(
+            0.8,
+            [
+                (0.0, k.c.bg_accent.alpha(0.20)),
+                (1.0, k.c.info.icon.alpha(0.14)),
+            ],
+        );
+    } else {
+        e = e.fill(k.c.layer_01.alpha(0.38));
+    }
+    e
 }
 
 fn agent_chip(c: &Controls, k: &Kit, f: Fold) -> El {
@@ -531,8 +533,7 @@ fn agent_chip(c: &Controls, k: &Kit, f: Fold) -> El {
         .center_y()
         .h(32.0)
         .radius(k.radius.lg)
-        .fill(k.c.layer_01.alpha(0.35))
-        .border(0.5, k.c.border_muted.alpha(0.30))
+        .fill(k.c.layer_01.alpha(0.38))
         .child(mark);
     if f.agent_icon {
         return chip
@@ -821,20 +822,17 @@ fn permission_control(
         OpenMenu::Mode,
     );
     if summary.warn {
+        let a = if open { 0.24 } else { 0.16 };
+        let b = if open { 0.14 } else { 0.08 };
         trigger = trigger
-            .fill(if open {
-                k.c.warning.icon.alpha(0.20)
-            } else {
-                k.c.warning.icon.alpha(0.14)
-            })
-            .border(
-                0.5,
-                if open {
-                    k.c.warning.icon.alpha(0.65)
-                } else {
-                    k.c.warning.icon.alpha(0.45)
-                },
-            );
+            .linear_gradient(
+                0.85,
+                [
+                    (0.0, k.c.warning.icon.alpha(a)),
+                    (1.0, k.c.bg_accent.alpha(b)),
+                ],
+            )
+            .border(0.0, k.c.warning.icon.alpha(0.0));
     }
     let menu = Menu::new(format!("mode-{}", c.asid.0))
         .placement(rune_kit::Placement::TopStart)

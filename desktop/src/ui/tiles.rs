@@ -1124,14 +1124,6 @@ fn tile(
         .min_h(0.0)
         .radius(radius)
         .clip_rounded(radius)
-        .border(
-            1.0,
-            if focused {
-                k.c.bg_accent.alpha(0.65)
-            } else {
-                k.c.border_muted
-            },
-        )
         .motion(layout_motion(s))
         .transition(if look.motion {
             rune::Transition::scale(0.92).combined(rune::Transition::offset(0.0, 18.0))
@@ -1256,10 +1248,16 @@ fn tile(
             .opacity_motion(look.focus_fade())
             .a11y_hidden(),
     );
+    body = body.child(look.focus_aurora(k, "tile-focus-aurora", focused).pin(
+        Some(0.0),
+        Some(0.0),
+        Some(0.0),
+        None,
+    ));
     body = body.child(
-        look.energy_line(k, "window-energy", false)
-            .pin(Some(12.0), Some(0.0), Some(12.0), None)
-            .opacity(if focused { 1.0 } else { 0.12 })
+        look.energy_line(k, "window-energy", focused)
+            .pin(Some(0.0), Some(0.0), Some(0.0), None)
+            .opacity(if focused { 1.0 } else { 0.0 })
             .opacity_motion(look.focus_fade()),
     );
     look.luminous(k, body, focused)
@@ -1376,8 +1374,14 @@ fn drop_preview_overlay(s: &UiState, k: &Kit) -> Option<El> {
             .w(pw)
             .h(ph)
             .radius(k.radius.md)
-            .fill(k.c.bg_accent.alpha(0.22))
-            .border(1.0, k.c.bg_accent.alpha(0.55))
+            .linear_gradient(
+                0.65,
+                [
+                    (0.0, k.c.bg_accent.alpha(0.28)),
+                    (0.55, k.c.info.icon.alpha(0.18)),
+                    (1.0, k.c.bg_accent.alpha(0.12)),
+                ],
+            )
             .a11y_hidden(),
     )
 }

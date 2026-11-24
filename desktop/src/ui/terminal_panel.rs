@@ -129,6 +129,15 @@ pub struct TermHoverLink {
     pub col_end: u16,
 }
 
+/// Tracks an embedded terminal tab opened as a per-workspace editor so opening
+/// additional files in the same working directory reuses one editor instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorTabMeta {
+    pub workspace: PathBuf,
+    pub editor_kind: String,
+    pub ipc: Option<String>,
+}
+
 /// What the panel keeps between frames.
 pub struct TermPanel {
     pub open: bool,
@@ -136,6 +145,7 @@ pub struct TermPanel {
     pub tabs: Vec<TermTab>,
     pub active_tab: usize,
     pub next_tab_id: u64,
+    pub editor_tabs: std::collections::HashMap<u64, EditorTabMeta>,
     pub session: Option<Session>,
     pub frame: Option<Frame>,
     /// The keyboard sink on the cursor cell (see the module docs).
@@ -184,6 +194,7 @@ impl TermPanel {
             tabs: Vec::new(),
             active_tab: 0,
             next_tab_id: 1,
+            editor_tabs: std::collections::HashMap::new(),
             session: None,
             frame: None,
             sink: TextEdit::new(""),
@@ -688,23 +699,230 @@ impl UiState {
             self.remove_dock_tab("terminal", true);
         }
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn normalized_editor_kind(editor: &str) -> String {
+    let first = editor.split_whitespace().next().unwrap_or(editor);
+    std::path::Path::new(first)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(first)
+        .to_ascii_lowercase()
+}
+
+fn canonical_or_self(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn find_git_root(path: &std::path::Path) -> Option<PathBuf> {
+    let start = if path.is_dir() { path } else { path.parent()? };
+    start
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(canonical_or_self)
+}
+
+fn nvim_socket_path(tab_id: u64) -> String {
+    let path =
+        std::env::temp_dir().join(format!("muqun-nvim-{}-{tab_id}.sock", std::process::id()));
+    path.to_string_lossy().into_owned()
+}
+
+fn spawn_detached(program: &str, args: &[&str], cwd: &std::path::Path) -> bool {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    match cmd.spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn append_file_to_pending_command(pending: &mut String, escaped_path: &str) {
+    let trimmed = pending.trim_end_matches('\n');
+    let mut updated = String::with_capacity(trimmed.len() + escaped_path.len() + 2);
+    updated.push_str(trimmed);
+    updated.push(' ');
+    updated.push_str(escaped_path);
+    updated.push('\n');
+    *pending = updated;
+}
+
+impl UiState {
+    fn editor_workspace_for(&self, path: &std::path::Path) -> PathBuf {
+        let abs = canonical_or_self(path);
+        let session_dir = self
+            .current()
+            .and_then(|s| s.directory.as_deref())
+            .map(PathBuf::from);
+        for candidate in [session_dir, Some(self.terminal_cwd())]
+            .into_iter()
+            .flatten()
+        {
+            if candidate.is_dir() {
+                let root = canonical_or_self(&candidate);
+                if abs.starts_with(&root) {
+                    return root;
+                }
+            }
+        }
+        if let Some(git_root) = find_git_root(&abs) {
+            return git_root;
+        }
+        path.parent()
+            .filter(|p| p.is_dir())
+            .map(canonical_or_self)
+            .unwrap_or_else(|| canonical_or_self(&self.terminal_cwd()))
+    }
+
+    fn cleanup_editor_tab_meta(&mut self, tab_id: u64) {
+        if let Some(meta) = self.term.editor_tabs.remove(&tab_id) {
+            if meta.editor_kind == "nvim" {
+                if let Some(sock) = meta.ipc {
+                    let _ = std::fs::remove_file(sock);
+                }
+            }
+        }
+    }
 
     /// Open a file in the embedded terminal using a terminal editor (e.g. nvim).
+    /// Reuses one editor tab/instance per working directory instead of spawning
+    /// multiple editor tabs for files inside the same workspace.
     pub fn open_file_in_terminal(&mut self, path: &std::path::Path, editor: &str) {
         self.close_viewer();
 
+        let workspace = self.editor_workspace_for(path);
+        let editor_kind = normalized_editor_kind(editor);
         let path_str = path.to_string_lossy();
-        let escaped_shell = format!("'{}'", path_str.replace('\'', "'\\''"));
-        let cmd = format!("{editor} {escaped_shell}\n");
-        let cwd = path
-            .parent()
-            .filter(|p| p.is_dir())
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| self.terminal_cwd());
+        let escaped_path = shell_quote(&path_str);
 
-        self.term_new_tab_in(cwd, Some(cmd));
+        // Reuse an existing live editor tab for the same workspace & editor.
+        let existing_idx = self.term.tabs.iter().enumerate().find_map(|(idx, tab)| {
+            let meta = self.term.editor_tabs.get(&tab.id)?;
+            if meta.workspace != workspace || meta.editor_kind != editor_kind {
+                return None;
+            }
+            let alive = tab.session.as_ref().is_none_or(|s| s.ended().is_none());
+            alive.then_some(idx)
+        });
+
+        if let Some(idx) = existing_idx {
+            let tab_id = self.term.tabs[idx].id;
+            let meta = self.term.editor_tabs.get(&tab_id).cloned();
+            if let Some(pending) = self.term.tabs[idx].pending_command.as_mut() {
+                append_file_to_pending_command(pending, &escaped_path);
+                self.reveal_terminal_tab(idx);
+                return;
+            }
+            self.reveal_terminal_tab(idx);
+            let session = self.term.tabs[idx]
+                .session
+                .clone()
+                .or_else(|| self.term.session.clone());
+            match editor_kind.as_str() {
+                "nvim" => {
+                    let sock = meta
+                        .and_then(|m| m.ipc)
+                        .unwrap_or_else(|| nvim_socket_path(tab_id));
+                    if std::path::Path::new(&sock).exists()
+                        && spawn_detached(
+                            "nvim",
+                            &["--server", &sock, "--remote-silent", path_str.as_ref()],
+                            &workspace,
+                        )
+                    {
+                        return;
+                    }
+                    // Neovim exited back to the shell prompt in this tab: relaunch inside the same tab.
+                    let _ = std::fs::remove_file(&sock);
+                    let cmd = format!("{editor} --listen {} {escaped_path}\n", shell_quote(&sock));
+                    if let Some(s) = session {
+                        s.send(Msg::Text(cmd));
+                    }
+                    return;
+                }
+                "vim" => {
+                    if let Some(server) = meta.and_then(|m| m.ipc) {
+                        if spawn_detached(
+                            "vim",
+                            &[
+                                "--servername",
+                                &server,
+                                "--remote-silent",
+                                path_str.as_ref(),
+                            ],
+                            &workspace,
+                        ) {
+                            return;
+                        }
+                    }
+                }
+                "emacs" => {
+                    if spawn_detached("emacsclient", &["-n", path_str.as_ref()], &workspace) {
+                        return;
+                    }
+                }
+                "hx" | "helix" => {
+                    if let Some(s) = session {
+                        s.send(Msg::Text(format!("\x1b:open {escaped_path}\r")));
+                        return;
+                    }
+                }
+                _ => {}
+            }
+            if let Some(s) = session {
+                s.send(Msg::Text(format!("{editor} {escaped_path}\n")));
+            }
+            return;
+        }
+
+        let next_id = self.term.next_tab_id;
+        let (cmd, ipc) = match editor_kind.as_str() {
+            "nvim" => {
+                let sock = nvim_socket_path(next_id);
+                let _ = std::fs::remove_file(&sock);
+                (
+                    format!("{editor} --listen {} {escaped_path}\n", shell_quote(&sock)),
+                    Some(sock),
+                )
+            }
+            "vim" => {
+                let server = format!("MUQUN_{}_{next_id}", std::process::id());
+                (
+                    format!("{editor} --servername {server} {escaped_path}\n"),
+                    Some(server),
+                )
+            }
+            _ => (format!("{editor} {escaped_path}\n"), None),
+        };
+
+        self.term_new_tab_in(workspace.clone(), Some(cmd));
+        if let Some(tab) = self.term.tabs.get(self.term.active_tab) {
+            self.term.editor_tabs.insert(
+                tab.id,
+                EditorTabMeta {
+                    workspace,
+                    editor_kind,
+                    ipc,
+                },
+            );
+        }
     }
+}
 
+impl UiState {
     /// Open a new terminal tab in `cwd`, optionally executing `command`.
     pub fn term_new_tab(&mut self) {
         let cwd = self.terminal_cwd();
@@ -892,7 +1110,9 @@ impl UiState {
                 session.close_remote();
                 session.send(Msg::Shutdown);
             }
-            for tab in self.term.tabs.drain(..) {
+            let drained = std::mem::take(&mut self.term.tabs);
+            for tab in drained {
+                self.cleanup_editor_tab_meta(tab.id);
                 if let Some(s) = tab.session {
                     s.close_remote();
                     s.send(Msg::Shutdown);
@@ -904,6 +1124,7 @@ impl UiState {
         }
         if index == self.term.active_tab {
             let tab = self.term.tabs.remove(index);
+            self.cleanup_editor_tab_meta(tab.id);
             if let Some(s) = tab.session {
                 s.close_remote();
                 s.send(Msg::Shutdown);
@@ -929,6 +1150,7 @@ impl UiState {
             }
         } else {
             let tab = self.term.tabs.remove(index);
+            self.cleanup_editor_tab_meta(tab.id);
             if let Some(s) = tab.session {
                 s.close_remote();
                 s.send(Msg::Shutdown);
@@ -3282,12 +3504,35 @@ mod tests {
         assert!(state.term.open);
         assert!(state.term.sink.focused);
         assert!(state.viewer.is_none());
-        assert_eq!(
-            state.term.tabs[state.term.active_tab]
-                .pending_command
-                .as_deref(),
-            Some("nvim '/tmp/test_file.rs'\n")
+        let pending = state.term.tabs[state.term.active_tab]
+            .pending_command
+            .as_deref()
+            .unwrap();
+        assert!(
+            pending.starts_with("nvim --listen '") && pending.ends_with(" '/tmp/test_file.rs'\n"),
+            "{pending}"
         );
+    }
+
+    #[test]
+    fn open_file_in_terminal_reuses_single_editor_tab_for_same_workspace() {
+        let (tx, _rx) = commands::channel();
+        let mut state = UiState::new(tx);
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let file_a = repo.join("src/config.rs");
+        let file_b = repo.join("src/ui/tiles.rs");
+
+        state.open_file_in_terminal(&file_a, "nvim");
+        assert_eq!(state.term.tabs.len(), 1);
+        state.open_file_in_terminal(&file_b, "nvim");
+        assert_eq!(
+            state.term.tabs.len(),
+            1,
+            "second file in the same workspace must reuse the single editor tab"
+        );
+        let pending = state.term.tabs[0].pending_command.as_deref().unwrap();
+        assert!(pending.contains(&file_a.to_string_lossy().to_string()));
+        assert!(pending.contains(&file_b.to_string_lossy().to_string()));
     }
 
     #[cfg(unix)]
@@ -3321,11 +3566,14 @@ mod tests {
 
         assert_eq!(state.term.tabs.len(), 2);
         assert_eq!(state.term.active_tab, 1);
-        assert_eq!(
-            state.term.tabs[state.term.active_tab]
-                .pending_command
-                .as_deref(),
-            Some("nvim '/tmp/another_file.rs'\n")
+        let pending = state.term.tabs[state.term.active_tab]
+            .pending_command
+            .as_deref()
+            .unwrap();
+        assert!(
+            pending.starts_with("nvim --listen '")
+                && pending.ends_with(" '/tmp/another_file.rs'\n"),
+            "{pending}"
         );
     }
 

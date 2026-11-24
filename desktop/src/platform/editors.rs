@@ -354,6 +354,30 @@ pub fn resolve_terminal_editor(
     None
 }
 
+fn is_vscode_family(program: &str) -> bool {
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    let stem = name
+        .strip_suffix(".cmd")
+        .or_else(|| name.strip_suffix(".exe"))
+        .unwrap_or(&name);
+    matches!(
+        stem,
+        "code" | "code-insiders" | "cursor" | "codium" | "windsurf" | "antigravity"
+    )
+}
+
+fn workspace_root_for(path: &Path) -> Option<std::path::PathBuf> {
+    let start = if path.is_dir() { path } else { path.parent()? };
+    start
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
 pub fn try_custom_command(cmd: &str, path: &Path) -> std::io::Result<bool> {
     let path_str = path.to_string_lossy();
     let full = if cmd.contains("{}") {
@@ -365,7 +389,18 @@ pub fn try_custom_command(cmd: &str, path: &Path) -> std::io::Result<bool> {
     let Some(prog) = parts.first() else {
         return Ok(false);
     };
-    let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+    let mut args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+    // Reuse the existing window for VS Code-family editors unless explicitly overridden.
+    if is_vscode_family(prog)
+        && !args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "-r" | "--reuse-window" | "-n" | "--new-window"
+            )
+        })
+    {
+        args.insert(0, "--reuse-window".into());
+    }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     if is_terminal_editor(prog) {
@@ -374,7 +409,10 @@ pub fn try_custom_command(cmd: &str, path: &Path) -> std::io::Result<bool> {
 
     let mut command = Command::new(prog);
     command.args(&args);
-    if let Some(dir) = path.parent() {
+    if let Some(dir) = workspace_root_for(path)
+        .as_deref()
+        .or_else(|| path.parent())
+    {
         command.current_dir(dir);
     }
     command
@@ -393,37 +431,55 @@ pub fn try_custom_command(cmd: &str, path: &Path) -> std::io::Result<bool> {
 }
 
 pub fn try_editor_choice(editor: Editor, path: &Path) -> std::io::Result<bool> {
-    let p = path.to_string_lossy();
-    let cmds: Vec<(&str, Vec<&str>)> = if cfg!(target_os = "macos") {
+    let p = path.to_string_lossy().into_owned();
+    let workspace = workspace_root_for(path).map(|w| w.to_string_lossy().into_owned());
+    let zed_args: Vec<String> = match &workspace {
+        Some(ws) => vec![ws.clone(), p.clone()],
+        None => vec![p.clone()],
+    };
+    let cmds: Vec<(&str, Vec<String>)> = if cfg!(target_os = "macos") {
         match editor {
-            Editor::VsCode => vec![("open", vec!["-a", "Visual Studio Code", p.as_ref()])],
-            Editor::Zed => vec![("open", vec!["-a", "Zed", p.as_ref()])],
-            Editor::Cursor => vec![("open", vec!["-a", "Cursor", p.as_ref()])],
-            Editor::Neovim => vec![("nvim", vec![p.as_ref()])],
+            Editor::VsCode => vec![
+                ("code", vec!["--reuse-window".into(), p.clone()]),
+                (
+                    "open",
+                    vec!["-a".into(), "Visual Studio Code".into(), p.clone()],
+                ),
+            ],
+            Editor::Zed => vec![
+                ("zed", zed_args.clone()),
+                ("open", vec!["-a".into(), "Zed".into(), p.clone()]),
+            ],
+            Editor::Cursor => vec![
+                ("cursor", vec!["--reuse-window".into(), p.clone()]),
+                ("open", vec!["-a".into(), "Cursor".into(), p.clone()]),
+            ],
+            Editor::Neovim => vec![("nvim", vec![p.clone()])],
             _ => Vec::new(),
         }
     } else if cfg!(target_os = "windows") {
         match editor {
-            Editor::VsCode => vec![("code.cmd", vec![p.as_ref()])],
-            Editor::Zed => vec![("zed", vec![p.as_ref()])],
-            Editor::Cursor => vec![("cursor.cmd", vec![p.as_ref()])],
-            Editor::Neovim => vec![("nvim", vec![p.as_ref()])],
+            Editor::VsCode => vec![("code.cmd", vec!["--reuse-window".into(), p.clone()])],
+            Editor::Zed => vec![("zed", zed_args.clone())],
+            Editor::Cursor => vec![("cursor.cmd", vec!["--reuse-window".into(), p.clone()])],
+            Editor::Neovim => vec![("nvim", vec![p.clone()])],
             _ => Vec::new(),
         }
     } else {
         match editor {
-            Editor::VsCode => vec![("code", vec![p.as_ref()])],
-            Editor::Zed => vec![("zed", vec![p.as_ref()]), ("zeditor", vec![p.as_ref()])],
-            Editor::Cursor => vec![("cursor", vec![p.as_ref()])],
-            Editor::Neovim => vec![("nvim", vec![p.as_ref()])],
+            Editor::VsCode => vec![("code", vec!["--reuse-window".into(), p.clone()])],
+            Editor::Zed => vec![("zed", zed_args.clone()), ("zeditor", zed_args.clone())],
+            Editor::Cursor => vec![("cursor", vec!["--reuse-window".into(), p.clone()])],
+            Editor::Neovim => vec![("nvim", vec![p.clone()])],
             _ => Vec::new(),
         }
     };
 
+    let cwd = workspace_root_for(path).or_else(|| path.parent().map(Path::to_path_buf));
     for (bin, args) in cmds {
         let mut cmd = Command::new(bin);
         cmd.args(&args);
-        if let Some(dir) = path.parent() {
+        if let Some(dir) = cwd.as_deref() {
             cmd.current_dir(dir);
         }
         cmd.stdin(Stdio::null())

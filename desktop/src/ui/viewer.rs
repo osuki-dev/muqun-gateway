@@ -1104,9 +1104,14 @@ mod tests {
         assert!(s.viewer.is_none());
         assert!(s.tile_of_plugin("files").is_none());
         assert!(s.term.open && s.term.sink.focused);
-        assert_eq!(
-            s.term.tabs[s.term.active_tab].pending_command.as_deref(),
-            Some(format!("nvim '{}'\n", path.display()).as_str())
+        let pending = s.term.tabs[s.term.active_tab]
+            .pending_command
+            .as_deref()
+            .unwrap();
+        assert!(
+            pending.starts_with("nvim --listen '")
+                && pending.ends_with(&format!(" '{}'\n", path.display())),
+            "{pending}"
         );
     }
 
