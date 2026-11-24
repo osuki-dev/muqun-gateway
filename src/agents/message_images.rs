@@ -945,6 +945,10 @@ fn generated_images_root() -> Option<PathBuf> {
 }
 
 /// `file://` paths written in prose, such as `Saved to: file:///…/page.pdf`.
+/// Markdown inline links `[label](file://…)` / `[label](<file://…>)` are
+/// skipped so code citations in Markdown do not turn into attachment rows
+/// beneath the message; Markdown images `![alt](file://…)` are handled
+/// separately by [`image_sources`].
 /// Balanced path parentheses are retained; unmatched closing parentheses and
 /// sentence punctuation delimit prose. Encode literal punctuation in filenames
 /// with `%XX` to distinguish it from the surrounding sentence.
@@ -953,6 +957,11 @@ fn file_uris(text: &str) -> Vec<String> {
     for_each_prose_segment(text, |segment| {
         let mut rest = segment;
         while let Some(index) = rest.find("file://") {
+            let before = rest[..index].trim_end();
+            let in_markdown_link = before.ends_with("](")
+                || before
+                    .strip_suffix('<')
+                    .is_some_and(|prefix| prefix.trim_end().ends_with("]("));
             let after = &rest[index + "file://".len()..];
             let mut parens = 0usize;
             let mut end = after.len();
@@ -984,7 +993,7 @@ fn file_uris(text: &str) -> Vec<String> {
                 }
             }
             let path = after[..end].trim_end_matches(['.', ',', ';', ':', '!', '?']);
-            if path.starts_with('/') && !path.chars().any(char::is_control) {
+            if !in_markdown_link && path.starts_with('/') && !path.chars().any(char::is_control) {
                 out.push(format!("file://{path}"));
             }
             rest = &after[end..];
@@ -1941,6 +1950,31 @@ mod tests {
         assert_eq!(
             asset_id_from_api("/api/agent-images/ai_abc/thumbnail"),
             Some("ai_abc".into())
+        );
+    }
+
+    #[test]
+    fn markdown_inline_file_links_are_not_attached_as_prose_files() {
+        let (_dir, root) = workspace();
+        let notes = root.join("notes.md");
+        let flow = root.join("out/flow.png");
+        let notes_uri = format!("file://{}", notes.display());
+        let flow_uri = format!("file://{}", flow.display());
+
+        let linked_only = format!(
+            "Updated [notes.md]({notes_uri}), [`notes.md`]({notes_uri}), and [notes](<{notes_uri}>)."
+        );
+        assert!(attached(&root, &linked_only).is_empty());
+
+        let mixed =
+            format!("See [`notes.md`]({notes_uri}) and ![flow]({flow_uri})\nSaved to: {notes_uri}");
+        let assets = attached(&root, &mixed);
+        assert_eq!(
+            assets
+                .iter()
+                .map(|asset| asset.src.as_str())
+                .collect::<Vec<_>>(),
+            vec![flow_uri.as_str(), notes_uri.as_str()]
         );
     }
 }

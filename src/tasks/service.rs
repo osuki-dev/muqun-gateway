@@ -1545,14 +1545,19 @@ impl TaskService {
                 )
                 .await
         };
-        let asid = match created {
-            Ok(session) => session.asid,
+        let (asid, initial_title) = match created {
+            Ok(session) => (session.asid, session.title),
             Err(error) => {
                 let error = TaskError::from(error);
                 self.record_failure(&task, noted(TaskState::Failed, error.to_string()))
                     .await;
                 return Err(error);
             }
+        };
+        let initial_session_title = {
+            let trimmed = initial_title.trim();
+            (!trimmed.is_empty() && !untitled_placeholder(&asid.0, trimmed))
+                .then(|| trimmed.to_owned())
         };
         state
             .agent_runtime
@@ -1648,10 +1653,14 @@ impl TaskService {
             let dispatching = TaskChange {
                 binding: Some(binding.clone()),
                 note: unannounced.clone(),
+                session_title: initial_session_title.clone(),
                 ..change(TaskState::Dispatching)
             };
             self.store().transition(&task.id, dispatching).await?;
             self.bind_session(&asid.0, &task.id);
+            if let Some(title) = initial_session_title.as_deref() {
+                self.session_named(&asid.0, title).await;
+            }
             // The goal alone: how to say it ended is the MCP server's, which
             // the agent's service is given now if it does not have it.
             let context = crate::agents::computer_context::context(state, &request.computer_ids)
@@ -2748,12 +2757,14 @@ impl TaskService {
             TaskBinding::Peer { .. } => "",
             _ => return None,
         };
-        if task.label.is_some() {
+        if effective_label(task).is_some() {
             return None;
         }
         let name = match task.state.is_terminal() {
             true => task.session_title.clone()?,
-            false => self.live_title(&task.id)?,
+            false => self
+                .live_title(&task.id)
+                .or_else(|| task.session_title.clone())?,
         };
         let name = one_line(&name, usize::MAX);
         let short = name.trim_end_matches(['…', '.']).trim_end();
@@ -3318,6 +3329,21 @@ pub fn untitled_placeholder(asid: &str, title: &str) -> bool {
     title == asid
         || title == crate::agents::adapters::t3::driver::NEW_THREAD_TITLE
         || title == crate::agents::adapters::deepseek::mapper::UNTITLED
+}
+
+/// Generic `"Orchestration"` labels written by earlier builds on top-level
+/// orchestration tasks should not hide the bound session's real title.
+fn effective_label(task: &Task) -> Option<&str> {
+    let label = task.label.as_deref()?;
+    if label == "Orchestration"
+        && task
+            .client_ref
+            .as_deref()
+            .is_some_and(|client_ref| client_ref.starts_with("orchestration:"))
+    {
+        return None;
+    }
+    Some(label)
 }
 
 /// A parent's progress while a child works: `Waiting for mini · 3 min`.
@@ -5881,6 +5907,73 @@ mod tests {
         assert_eq!(ended.session_title.as_deref(), Some("Fix the CI build"));
         assert_eq!(state.tasks.live_title(&id), None);
         assert_eq!(title().await, "Fix the CI build");
+    }
+
+    #[tokio::test]
+    async fn legacy_orchestration_label_yields_to_session_title() {
+        const ASID: &str = "orch-titled-1";
+        let state = crate::test_state("admin", vec![]);
+        let now = now_ms();
+        let id = TaskId::new();
+        state
+            .tasks
+            .store()
+            .insert(&Task {
+                id: id.clone(),
+                kind: TaskKind::Delegation,
+                goal: "Implement and verify the user goal carefully.".into(),
+                cwd: None,
+                binding: TaskBinding::AgentSession {
+                    agent_id: "antigravity".into(),
+                    asid: ASID.into(),
+                },
+                state: TaskState::Working,
+                summary: None,
+                exit_code: None,
+                created_by: TaskPrincipal {
+                    kind: PrincipalKind::Device,
+                    id: "d1".into(),
+                },
+                created_ms: now,
+                updated_ms: now,
+                seq: 0,
+                parent: None,
+                origin: TaskOrigin::Device,
+                label: Some("Orchestration".into()),
+                requester_name: None,
+                session_title: Some("Casual Greeting".into()),
+                mentions: vec![],
+                client_ref: Some("orchestration:o_legacy".into()),
+                requester_server_id: None,
+                reopened_ms: None,
+                reopen_count: 0,
+            })
+            .await
+            .unwrap();
+
+        let view = state
+            .tasks
+            .present(&state.tasks.get_for_test(&id).await)
+            .await;
+        assert_eq!(view.title, "Casual Greeting");
+
+        state.tasks.session_named(ASID, "Venue api & mini").await;
+        let view = state
+            .tasks
+            .present(&state.tasks.get_for_test(&id).await)
+            .await;
+        assert_eq!(view.title, "Venue api & mini");
+
+        state
+            .tasks
+            .move_to(&id, change(TaskState::Done))
+            .await
+            .unwrap();
+        let ended = state
+            .tasks
+            .present(&state.tasks.get_for_test(&id).await)
+            .await;
+        assert_eq!(ended.title, "Venue api & mini");
     }
 
     #[test]
