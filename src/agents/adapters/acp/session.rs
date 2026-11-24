@@ -200,6 +200,9 @@ pub trait AcpProvider: Send + Sync + 'static {
     /// Whether [`Self::preview_timeline`] can read recent messages directly
     /// from the native store without spawning an ACP child.
     const PREVIEW_TIMELINE: bool = false;
+    /// Whether [`Self::preview_timeline`] requires the session's working
+    /// directory to locate the transcript on disk (true for Claude Code).
+    const PREVIEW_NEEDS_DIRECTORY: bool = false;
     fn preview_timeline<'a>(
         _directory: &'a str,
         _id: &'a str,
@@ -5415,15 +5418,24 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             if !P::PREVIEW_TIMELINE {
                 return Ok(None);
             }
-            let info = match self.mirror.session_info(&AgentSessionId::from(id)).await {
-                Some(info) => info,
-                None => match self.native_session_info(id).await {
-                    Ok(info) => info,
-                    Err(_) => return Ok(None),
-                },
-            };
-            let Some(directory) = info.directory.as_deref() else {
-                return Ok(None);
+            let directory = if P::PREVIEW_NEEDS_DIRECTORY {
+                let info = match self.mirror.session_info(&AgentSessionId::from(id)).await {
+                    Some(info) => info,
+                    None => match self.native_session_info(id).await {
+                        Ok(info) => info,
+                        Err(_) => return Ok(None),
+                    },
+                };
+                let Some(directory) = info.directory else {
+                    return Ok(None);
+                };
+                directory
+            } else {
+                self.mirror
+                    .session_info(&AgentSessionId::from(id))
+                    .await
+                    .and_then(|info| info.directory)
+                    .unwrap_or_default()
             };
             let native_id = self
                 .native_ids
@@ -5432,7 +5444,7 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 .get(id)
                 .cloned()
                 .unwrap_or_else(|| id.to_owned());
-            let items = P::preview_timeline(directory, &native_id, limit, &self.stop).await?;
+            let items = P::preview_timeline(&directory, &native_id, limit, &self.stop).await?;
             Ok((!items.is_empty()).then_some(items))
         })
     }

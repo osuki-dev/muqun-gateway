@@ -192,6 +192,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         ws_connections: Arc::new(agents::ws_routes::WsRegistry::default()),
         generation: crate::new_generation(),
         message_images: Arc::default(),
+        preview_cache: Arc::default(),
         mcp_tokens: Arc::new(crate::mcp::tokens_sqlite::SqliteTokenStore::new(db.clone())),
         fleet: Arc::default(),
         peers,

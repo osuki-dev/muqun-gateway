@@ -12,10 +12,182 @@ use crate::agents::adapters::acp::recovery::NativeSnapshot;
 use crate::agents::ports::agent::AgentError;
 
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
+const PREVIEW_TAIL_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RECORDS: usize = 100_000;
 
 fn unavailable() -> AgentError {
     AgentError::NotAvailable("Qoder native recovery history is incomplete or unsupported".into())
+}
+
+/// Fast tail preview of a Qoder `.jsonl` transcript directly from disk without
+/// starting `qodercli --acp`.
+pub(super) async fn tail_timeline(
+    id: &str,
+    limit: usize,
+    stop: &CancellationToken,
+) -> Result<Vec<crate::agents::domain::TimelineItem>, AgentError> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Ok(Vec::new());
+    }
+    let Some(root) = dirs::home_dir().map(|home| home.join(".qoder/projects")) else {
+        return Ok(Vec::new());
+    };
+    let id = id.to_owned();
+    let stop = stop.clone();
+    tokio::task::spawn_blocking(move || {
+        let Ok(path) = find_exact(&root, &id, &stop) else {
+            return Ok(Vec::new());
+        };
+        Ok(tail_timeline_file(&path, &id, limit, &stop).unwrap_or_default())
+    })
+    .await
+    .map_err(|_| unavailable())?
+}
+
+fn tail_timeline_file(
+    path: &Path,
+    id: &str,
+    limit: usize,
+    stop: &CancellationToken,
+) -> Result<Vec<crate::agents::domain::TimelineItem>, AgentError> {
+    use std::io::{BufRead, Seek, SeekFrom};
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).map_err(|_| unavailable())?;
+    let meta = file.metadata().map_err(|_| unavailable())?;
+    if !meta.is_file() {
+        return Ok(Vec::new());
+    }
+    let len = meta.len();
+    let skip_first = len > PREVIEW_TAIL_BYTES;
+    if skip_first {
+        file.seek(SeekFrom::Start(len - PREVIEW_TAIL_BYTES))
+            .map_err(|_| unavailable())?;
+    }
+    let mut reader = std::io::BufReader::with_capacity(256 * 1024, &file);
+    let mut line = String::new();
+    if skip_first {
+        let _ = reader.read_line(&mut line);
+        line.clear();
+    }
+    let mut nodes: HashMap<String, (Option<String>, Value)> = HashMap::new();
+    let mut leaf = None;
+    let mut count = 0usize;
+    while count < MAX_RECORDS {
+        if stop.is_cancelled() {
+            break;
+        }
+        line.clear();
+        let Ok(read) = reader.read_line(&mut line) else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        count += 1;
+        let Ok(record) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if record["sessionId"]
+            .as_str()
+            .is_some_and(|native| native != id)
+            || record["isSidechain"].as_bool() == Some(true)
+        {
+            continue;
+        }
+        let Some(uuid) = record["uuid"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        let parent = record["parentUuid"].as_str().map(str::to_owned);
+        nodes.insert(uuid.clone(), (parent, record));
+        leaf = Some(uuid);
+    }
+    let Some(mut next) = leaf else {
+        return Ok(Vec::new());
+    };
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
+    while seen.insert(next.clone()) {
+        let Some((parent, record)) = nodes.remove(&next) else {
+            break;
+        };
+        chain.push(record);
+        match parent {
+            Some(parent) => next = parent,
+            None => break,
+        }
+    }
+    chain.reverse();
+    let mut projection = crate::agents::adapters::acp::mapper::Projection::new(false);
+    for record in chain {
+        if is_human(&record) {
+            if let Some(text) = message_text(&record).filter(|t| !t.is_empty()) {
+                let _ = projection.update(&serde_json::json!({
+                    "sessionUpdate": "user_message_chunk",
+                    "content": { "type": "text", "text": text },
+                }));
+            }
+        } else if record["type"].as_str() == Some("assistant") {
+            let msg_id = record
+                .pointer("/message/id")
+                .and_then(Value::as_str)
+                .or_else(|| record["uuid"].as_str())
+                .unwrap_or_default();
+            if let Some(parts) = record.pointer("/message/content").and_then(Value::as_array) {
+                for part in parts {
+                    match part["type"].as_str() {
+                        Some("text") => {
+                            let _ = projection.update(&serde_json::json!({
+                                "sessionUpdate": "agent_message_chunk",
+                                "messageId": msg_id,
+                                "content": { "type": "text", "text": part["text"] },
+                            }));
+                        }
+                        Some("thinking")
+                            if part["thinking"].as_str().is_some_and(|t| !t.is_empty()) =>
+                        {
+                            let _ = projection.update(&serde_json::json!({
+                                "sessionUpdate": "agent_thought_chunk",
+                                "messageId": msg_id,
+                                "content": { "type": "text", "text": part["thinking"] },
+                            }));
+                        }
+                        Some("tool_use") => {
+                            let _ = projection.update(&serde_json::json!({
+                                "sessionUpdate": "tool_call",
+                                "toolCallId": part["id"],
+                                "title": part["name"],
+                                "name": part["name"],
+                                "status": "completed",
+                                "rawInput": part["input"],
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    let mut items = projection.timeline();
+    if limit > 0 && items.len() > limit {
+        items.drain(..items.len() - limit);
+    }
+    Ok(items)
 }
 
 pub(super) async fn inspect(

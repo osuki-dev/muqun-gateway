@@ -32,6 +32,7 @@ pub(crate) const ALL_MIGRATIONS: &[Migration] = &[
     crate::terminal::history_sqlite::MIGRATION,
     super::t3_credentials::MIGRATION,
     crate::agents::session_defaults::MIGRATION,
+    crate::agents::preview_cache::MIGRATION,
 ];
 
 type Boxed = Box<dyn Any + Send>;

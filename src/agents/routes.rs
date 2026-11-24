@@ -1044,6 +1044,7 @@ async fn socket_read_agent_session(
     message_images::attach_to_items(state, asid, directory.as_deref(), &mut snapshot.timeline)
         .await;
     message_images::attach_to_inbox(state, asid, &mut snapshot.inbox).await;
+    state.preview_cache.maybe_save(&state.db, &snapshot);
 
     // A session the reader is sitting on is polled and mostly unchanged; the
     // whole snapshot is the expensive thing to send twice.
@@ -1137,6 +1138,7 @@ async fn socket_history_window(
         .history_window(&AgentSessionId(asid.to_owned()), cursor, refresh)
         .await
         .map_err(agent_error)?;
+    state.preview_cache.maybe_save(&state.db, &window.snapshot);
     project_history_window(state, asid, window).await
 }
 
@@ -1159,17 +1161,20 @@ async fn retained_history_window(
     {
         Some(window) => window,
         None if cursor.is_none() => {
-            let snapshot = manager
-                .sessions()
-                .preview_snapshot(&session_id)
-                .await
-                .ok_or_else(|| {
-                    api_error(
-                        StatusCode::NOT_FOUND,
-                        "not_retained",
-                        "The Gateway holds no history for this session",
-                    )
-                })?;
+            let snapshot = match state.preview_cache.load(&state.db, asid).await {
+                Some(snapshot) => snapshot,
+                None => manager
+                    .sessions()
+                    .preview_snapshot(&session_id)
+                    .await
+                    .ok_or_else(|| {
+                        api_error(
+                            StatusCode::NOT_FOUND,
+                            "not_retained",
+                            "The Gateway holds no history for this session",
+                        )
+                    })?,
+            };
             super::adapters::memory_mirror::history_window::HistoryWindow {
                 snapshot,
                 history_cursor: None,
@@ -3174,6 +3179,7 @@ async fn do_delete_agent_session(
         .mirror()
         .remove_session(&AgentSessionId(asid.to_owned()))
         .await;
+    state.preview_cache.delete(&state.db, asid).await;
     // A deleted session can no longer be resumed, so it stops withholding the
     // agent's runtime credential (see `store_sqlite::RuntimeBlock`).
     let (kind, gone) = (manager.agent().kind().to_owned(), asid.to_owned());

@@ -246,6 +246,116 @@ pub(super) async fn live_timeline(
     .await
 }
 
+/// Fast bounded tail preview of a Cursor conversation's local SQLite store
+/// without starting `agent acp` or running `cursor_login`.
+pub(super) async fn tail_timeline(
+    id: &str,
+    limit: usize,
+    stop: &CancellationToken,
+) -> Result<Vec<crate::agents::domain::TimelineItem>, AgentError> {
+    let Some(path) = terminal_store(id).filter(|p| p.is_file()) else {
+        return Ok(Vec::new());
+    };
+    let id = id.to_owned();
+    blocking(stop, move |stop| {
+        let Ok(snapshot) = tail_snapshot_of(&path, &id, 200, &stop) else {
+            return Ok(Vec::new());
+        };
+        let mut items = timeline_of(&snapshot);
+        if limit > 0 && items.len() > limit {
+            items.drain(..items.len() - limit);
+        }
+        Ok(items)
+    })
+    .await
+}
+
+fn tail_snapshot_of(
+    path: &Path,
+    id: &str,
+    max_tail_messages: usize,
+    stop: &CancellationToken,
+) -> Result<NativeSnapshot, AgentError> {
+    use rusqlite::OpenFlags;
+    let stat = std::fs::symlink_metadata(path).map_err(|_| unavailable())?;
+    if !stat.is_file() {
+        return Err(unavailable());
+    }
+    let db = rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| unavailable())?;
+    let meta: String = db
+        .query_row("SELECT value FROM meta WHERE key = '0'", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| unavailable())?;
+    let meta: Value = hex::decode(meta.trim())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(unavailable)?;
+    let root_id = meta["latestRootBlobId"].as_str().ok_or_else(unavailable)?;
+    let mut blob = db
+        .prepare("SELECT data FROM blobs WHERE id = ?1")
+        .map_err(|_| unavailable())?;
+    let mut read = |blob_id: &str| -> Result<Vec<u8>, AgentError> {
+        blob.query_row([blob_id], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|_| unavailable())
+    };
+    let root_blob = read(root_id)?;
+    let mut message_ids = repeated_bytes(&root_blob, 1).ok_or_else(unavailable)?;
+    if message_ids.len() > max_tail_messages {
+        message_ids.drain(..message_ids.len() - max_tail_messages);
+    }
+    let mut snapshot = NativeSnapshot::empty(id);
+    let mut turn: Option<Turn> = None;
+    for message_id in message_ids {
+        if stop.is_cancelled() {
+            break;
+        }
+        let Ok(raw) = read(&hex::encode(message_id)) else {
+            continue;
+        };
+        let Ok(message) = serde_json::from_slice::<Value>(&raw) else {
+            continue;
+        };
+        let role = message["role"].as_str().unwrap_or_default().to_owned();
+        if role == "user" {
+            if let Some(query) = user_query(&message["content"]) {
+                if let Some(done) = turn.take() {
+                    snapshot.entries.push(entry(done));
+                }
+                let attachments = materialize_user_images(id, &message["content"]);
+                snapshot.last_user = Some(query.clone());
+                snapshot.last_assistant = None;
+                turn = Some(Turn {
+                    user: query,
+                    replies: Vec::new(),
+                    roles: vec![role],
+                    attachments,
+                });
+                continue;
+            }
+        }
+        let Some(open) = turn.as_mut() else {
+            continue;
+        };
+        open.roles.push(role.clone());
+        if role == "assistant" {
+            let text = text_parts(&message["content"]);
+            if !text.is_empty() {
+                snapshot.last_assistant = Some(text.clone());
+                open.replies.push(json!(text));
+            }
+        }
+    }
+    if let Some(done) = turn {
+        snapshot.entries.push(entry(done));
+    }
+    Ok(snapshot)
+}
+
 pub(super) fn timeline_of(snapshot: &NativeSnapshot) -> Vec<crate::agents::domain::TimelineItem> {
     let mut projection = crate::agents::adapters::acp::mapper::Projection::new(false);
     for entry in &snapshot.entries {

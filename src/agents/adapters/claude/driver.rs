@@ -58,6 +58,7 @@ impl AcpProvider for ClaudeProvider {
         Box::pin(super::recovery::live_timeline(directory, id, stop))
     }
     const PREVIEW_TIMELINE: bool = true;
+    const PREVIEW_NEEDS_DIRECTORY: bool = true;
     fn preview_timeline<'a>(
         directory: &'a str,
         id: &'a str,

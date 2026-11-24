@@ -35,6 +35,16 @@ impl AcpProvider for QoderProvider {
     > {
         Box::pin(super::recovery::inspect(id, stop))
     }
+    const PREVIEW_TIMELINE: bool = true;
+    fn preview_timeline<'a>(
+        _directory: &'a str,
+        id: &'a str,
+        limit: usize,
+        stop: &'a tokio_util::sync::CancellationToken,
+    ) -> crate::agents::ports::agent::AgentFuture<'a, Vec<crate::agents::domain::TimelineItem>>
+    {
+        Box::pin(super::recovery::tail_timeline(id, limit, stop))
+    }
     // Every `qodercli` launch leaves a native log session behind, so the
     // model list is reused longer; failures still retry within seconds.
     const CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(600);

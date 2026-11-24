@@ -113,6 +113,7 @@ pub(crate) struct AppState {
     /// resolved for a client, so the asset content route can serve them. See
     /// `agents::message_images`.
     pub(crate) message_images: Arc<agents::message_images::MessageImages>,
+    pub(crate) preview_cache: Arc<agents::preview_cache::PreviewCache>,
     /// The shared SQLite store, including durable transport replay identities.
     pub(crate) db: Arc<platform::store::sqlite::SqliteStore>,
     /// The assistant tokens `/mcp` accepts, kept in `db`. See `mcp::tokens`.

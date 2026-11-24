@@ -164,6 +164,92 @@ fn percent_decode(text: &str) -> Option<String> {
         .filter(|path| !path.contains('\0'))
 }
 
+/// Fast tail preview of an Antigravity conversation directly from its local
+/// SQLite steps database, avoiding the ~2.5s OAuth `authenticate` cold-start
+/// delay before showing recent messages.
+pub(super) async fn tail_timeline(
+    id: &str,
+    limit: usize,
+    stop: &CancellationToken,
+) -> Result<Vec<crate::agents::domain::TimelineItem>, AgentError> {
+    if !valid_id(id) {
+        return Ok(Vec::new());
+    }
+    let Some(root) = root() else {
+        return Ok(Vec::new());
+    };
+    let id = id.to_owned();
+    blocking(stop, move |stop| {
+        Ok(tail_timeline_at(&root, &id, limit, &stop).unwrap_or_default())
+    })
+    .await
+}
+
+pub(super) fn tail_timeline_at(
+    root: &Path,
+    id: &str,
+    limit: usize,
+    stop: &CancellationToken,
+) -> Result<Vec<crate::agents::domain::TimelineItem>, AgentError> {
+    let path = root.join("conversations").join(format!("{id}.db"));
+    let stat = std::fs::symlink_metadata(&path).map_err(|_| unavailable())?;
+    if !stat.is_file() {
+        return Ok(Vec::new());
+    }
+    let db = open(&path)?;
+    let row_limit = (limit.clamp(1, 200) * 2) as i64;
+    let mut query = db
+        .prepare(
+            "SELECT step_type, step_payload FROM steps \
+             WHERE step_type IN (?1, ?2) ORDER BY idx DESC LIMIT ?3",
+        )
+        .map_err(|_| unavailable())?;
+    let mut rows: Vec<(i64, Vec<u8>)> = query
+        .query_map(
+            rusqlite::params![USER_INPUT, PLANNER_RESPONSE, row_limit],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default(),
+                ))
+            },
+        )
+        .map_err(|_| unavailable())?
+        .filter_map(Result::ok)
+        .collect();
+    rows.reverse();
+    let mut projection = crate::agents::adapters::acp::mapper::Projection::new(false);
+    for (kind, payload) in rows {
+        if stop.is_cancelled() {
+            break;
+        }
+        match kind {
+            USER_INPUT => {
+                if let Some(text) = field_text(&payload, &[19, 2]).filter(|t| !t.is_empty()) {
+                    let _ = projection.update(&json!({
+                        "sessionUpdate": "user_message_chunk",
+                        "content": { "type": "text", "text": text },
+                    }));
+                }
+            }
+            PLANNER_RESPONSE => {
+                if let Some(text) = field_text(&payload, &[20, 1]).filter(|t| !t.is_empty()) {
+                    let _ = projection.update(&json!({
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": text },
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut items = projection.timeline();
+    if limit > 0 && items.len() > limit {
+        items.drain(..items.len() - limit);
+    }
+    Ok(items)
+}
+
 /// One entry per user turn: its text, then each reply's text and every
 /// step's kind. The last reply's text is what the live stream showed last.
 pub(super) async fn recovery_snapshot(

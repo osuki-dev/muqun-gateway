@@ -12,6 +12,7 @@ pub mod domain;
 pub mod manager;
 pub mod message_images;
 pub mod ports;
+pub(crate) mod preview_cache;
 pub(crate) mod routes;
 pub mod runtime;
 pub(crate) mod session_defaults;
