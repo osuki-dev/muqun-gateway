@@ -42,6 +42,7 @@ const VIEW_HEARTBEAT: Duration = Duration::from_secs(30);
 /// and, for reading and the last write at exit, the main thread.
 pub struct ConfigStore {
     path: PathBuf,
+    writes: Mutex<()>,
     state: Mutex<(DesktopConfig, bool)>,
 }
 
@@ -49,6 +50,7 @@ impl ConfigStore {
     pub fn new(path: PathBuf, config: DesktopConfig) -> Arc<Self> {
         Arc::new(Self {
             path,
+            writes: Mutex::new(()),
             state: Mutex::new((config, false)),
         })
     }
@@ -77,18 +79,26 @@ impl ConfigStore {
     /// Write the file if anything changed since the last write. Blocks on
     /// the disk: call it off the async threads (or at exit).
     pub fn flush(&self) {
+        if let Err(err) = self.flush_checked() {
+            tracing::warn!("{err:#}");
+        }
+    }
+
+    fn flush_checked(&self) -> anyhow::Result<()> {
+        let _write = self.writes.lock().unwrap();
         let snapshot = {
             let mut state = self.state.lock().unwrap();
             if !std::mem::take(&mut state.1) {
-                return;
+                return Ok(());
             }
             state.0.clone()
         };
         if let Err(err) = snapshot.save(&self.path) {
             // Keep it dirty so the next change or exit tries again.
             self.state.lock().unwrap().1 = true;
-            tracing::warn!("{err:#}");
+            return Err(err);
         }
+        Ok(())
     }
 }
 
@@ -254,6 +264,18 @@ pub fn spawn(
         &config,
     );
     tokio::spawn(fleet.clone().maintain(config.clone(), inbox.clone()));
+    if crate::platform::update::installed_package() {
+        let inbox = inbox.clone();
+        tokio::spawn(async move {
+            // The first tick runs immediately. Skip missed ticks after sleep.
+            let mut checks = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+            checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                checks.tick().await;
+                inbox.push(Update::Ui(super::inbox::UiAction::CheckDesktopUpdateIfIdle));
+            }
+        });
+    }
     let core = Arc::new(Core {
         fleet,
         local_state_dir: Some(local_state_dir),
@@ -347,6 +369,15 @@ impl Core {
                 }
                 // In this loop, not a task: edits must apply in the order sent.
                 Command::Edit(edit) => self.edit(edit),
+                Command::CheckpointForUpdateRestart => {
+                    let store = self.config.clone();
+                    let saved = tokio::task::spawn_blocking(move || store.flush_checked())
+                        .await
+                        .is_ok_and(|r| r.is_ok());
+                    self.inbox.push(Update::Ui(
+                        super::inbox::UiAction::DesktopRestartCheckpoint(saved),
+                    ));
+                }
                 Command::SwitchComputer(target) => {
                     if let Some(stale) = search.take() {
                         stale.abort();
@@ -406,6 +437,7 @@ impl Core {
                     | Command::UnpairComputer { .. }
                     | Command::RevokeLocalPairing(_)
                     | Command::ReadLocalInvite(_)
+                    | Command::InstallDesktopUpdate(_)
                     | Command::CheckDesktopUpdate
                     | Command::RefreshLocalPairings
                     | Command::ScanStorage
@@ -852,6 +884,27 @@ impl Core {
                     .push(Update::Ui(crate::model::inbox::UiAction::LocalInvite(
                         id, invite,
                     )));
+            }
+            Command::CheckpointForUpdateRestart => {
+                unreachable!("handled in the ordered command loop")
+            }
+            Command::InstallDesktopUpdate(version) => {
+                let inbox = self.inbox.clone();
+                let target = version.clone();
+                let status = tokio::task::spawn_blocking(move || {
+                    crate::platform::update::install(version.clone(), |phase| {
+                        inbox.push(Update::Ui(super::inbox::UiAction::DesktopUpdate(
+                            crate::platform::update::Status::Installing {
+                                version: version.clone(),
+                                phase: Some(phase),
+                            },
+                        )));
+                    })
+                })
+                .await
+                .unwrap_or(crate::platform::update::Status::InstallFailed(target));
+                self.inbox
+                    .push(Update::Ui(super::inbox::UiAction::DesktopUpdate(status)));
             }
             Command::CheckDesktopUpdate => {
                 let status = crate::platform::update::check().await;

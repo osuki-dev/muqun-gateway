@@ -14,8 +14,11 @@ use crate::ui::copy::{tr, tr_ref};
 use crate::ui::UiState;
 
 impl UiState {
-    pub(super) fn check_desktop_update(&mut self) {
-        if self.desktop_update != Status::Checking {
+    pub(in crate::ui) fn check_desktop_update(&mut self) {
+        if !matches!(
+            self.desktop_update,
+            Status::Checking | Status::Ready { .. } | Status::Installing { .. }
+        ) {
             self.desktop_update = Status::Checking;
             self.send(crate::model::commands::Command::CheckDesktopUpdate);
         }
@@ -174,10 +177,18 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
         Status::Checking => tr(language, "Checking…"),
         Status::Current => tr(language, "Up to date"),
         Status::NoRelease => tr(language, "No published version in this channel"),
-        Status::Available(version) => {
+        Status::Available(version) | Status::Manual(version) => {
             format!("{} {version}", tr_ref(language, "New version available:"))
         }
         Status::Failed => tr(language, "Check failed"),
+        Status::InstallFailed(_) => tr(language, "Desktop update failed"),
+        Status::Installing { phase, .. } => {
+            tr(language, crate::ui::desktop_update::phase_label(*phase))
+        }
+        Status::Ready { version, .. } => format!(
+            "{} · {version}",
+            tr_ref(language, "Restart to use the installed update.")
+        ),
     };
     let update_row = row(
         k,
@@ -190,18 +201,32 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
             .center_y()
             .flex_wrap()
             .child(
-                button(tr_ref(
-                    language,
-                    if matches!(s.desktop_update, Status::Idle | Status::Checking) {
-                        "Check for updates"
-                    } else {
-                        "Check again"
-                    },
-                ))
-                .disabled(s.desktop_update == Status::Checking)
-                .on_press(UiState::check_desktop_update)
+                match &s.desktop_update {
+                    Status::Available(_) | Status::InstallFailed(_) => button(tr_ref(
+                        language,
+                        if matches!(s.desktop_update, Status::InstallFailed(_)) {
+                            "Retry"
+                        } else {
+                            "Download & install"
+                        },
+                    ))
+                    .on_press(UiState::start_desktop_update),
+                    Status::Installing { .. } | Status::Ready { .. } => {
+                        button(tr_ref(language, "Details")).on_press(UiState::show_desktop_update)
+                    }
+                    other => button(tr_ref(
+                        language,
+                        if matches!(other, Status::Idle | Status::Checking) {
+                            "Check for updates"
+                        } else {
+                            "Check again"
+                        },
+                    ))
+                    .disabled(*other == Status::Checking)
+                    .on_press(UiState::check_desktop_update),
+                }
                 .build(k)
-                .key("check-desktop-update"),
+                .key("desktop-update-action"),
             )
             .child(link_button(
                 k,
@@ -369,4 +394,63 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
             ],
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        model::commands::{self, Command},
+        platform::installer::Phase,
+    };
+
+    #[test]
+    fn about_download_can_be_backgrounded_and_ready_never_restarts_by_itself() {
+        fn view(s: &UiState, _: &mut rune::Cx<UiState>) -> El {
+            let kit = Kit::neutral(true);
+            let mut layer = Vec::new();
+            crate::ui::desktop_update::mount(s, &kit, &mut layer);
+            rune_kit::root(col().w_full().children(page(s, &kit)), layer)
+        }
+        let (sender, mut receiver) = commands::channel();
+        let mut s = UiState::new(sender);
+        s.splash = None;
+        s.desktop_update = Status::Available("1.2.0".into());
+        while receiver.try_recv().is_ok() {} // Ignore startup discovery and keychain reads.
+        let mut rt = rune::Runtime::new(s, view, (1100.0, 900.0), rune::Env::new(true, 1.0));
+        let mut time = 0.0;
+        let mut click = |rt: &mut rune::Runtime<UiState>, key: &str| {
+            for _ in 0..25 {
+                time += 1.0 / 60.0;
+                rt.frame(time);
+            }
+            let (x, y) = rt.find(key).unwrap();
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+            time += 1.0 / 60.0;
+            rt.frame(time);
+        };
+        click(&mut rt, "desktop-update-action");
+        assert!(
+            matches!(receiver.try_recv(),Ok(Command::InstallDesktopUpdate(version)) if version=="1.2.0")
+        );
+        rt.state.desktop_update = Status::Installing {
+            version: "1.2.0".into(),
+            phase: Some(Phase::Downloading {
+                received: 12,
+                total: 20,
+            }),
+        };
+        click(&mut rt, "desktop-update-hide");
+        assert!(!rt.state.desktop_update_panel);
+        click(&mut rt, "desktop-update-action");
+        assert!(rt.state.desktop_update_panel);
+        rt.state.desktop_update = Status::Ready {
+            version: "1.2.0".into(),
+            executable: "/fixture/unused".into(),
+        };
+        click(&mut rt, "desktop-update-hide");
+        assert!(receiver.try_recv().is_err());
+        assert!(!rt.state.restart_on_frame);
+    }
 }

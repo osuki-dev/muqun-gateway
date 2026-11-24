@@ -49,6 +49,7 @@ impl AcpProvider for RecoverableFixture {
             Ok(NativeSnapshot {
                 session_id: id.into(),
                 entries,
+                streamed: None,
                 last_user,
                 last_assistant,
             })

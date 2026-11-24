@@ -22,8 +22,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::platform::pty::{self, Child, Exit, Pty, WinSize};
 
-/// Default socket filename placed in the user configuration directory.
-pub const DEFAULT_SOCKET_NAME: &str = "term.sock";
+pub use muqun_gateway::desktop_terminal_socket as default_socket_path;
 
 /// Default scrollback buffer capacity per session (1 MiB).
 pub const DEFAULT_SCROLLBACK_CAPACITY: usize = 1024 * 1024;
@@ -40,22 +39,6 @@ fn default_cols() -> u16 {
 
 fn default_rows() -> u16 {
     DEFAULT_ROWS
-}
-
-/// Returns the platform default socket path:
-/// `~/.config/muqun-desktop/term.sock` on Linux.
-pub fn default_socket_path() -> PathBuf {
-    if let Some(config_dir) = dirs::config_dir() {
-        config_dir
-            .join(crate::platform::DIR_NAME)
-            .join(DEFAULT_SOCKET_NAME)
-    } else {
-        std::env::temp_dir().join(format!(
-            "{}-{}",
-            crate::platform::DIR_NAME,
-            DEFAULT_SOCKET_NAME
-        ))
-    }
 }
 
 // ============================================================================
@@ -1394,12 +1377,19 @@ pub fn ensure_daemon_running_at(socket_path: Option<PathBuf>) -> io::Result<Path
         return Ok(path);
     }
 
-    if path.exists() {
-        let _ = std::fs::remove_file(&path);
-    }
-
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
+    }
+    // Setup and a first terminal tab can request the same daemon concurrently.
+    // Hold the startup lock until its socket accepts clients.
+    let startup = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("startup.lock"))?;
+    startup.lock()?;
+    if is_socket_alive(&path) {
+        return Ok(path);
     }
 
     let exe = std::env::current_exe()?;

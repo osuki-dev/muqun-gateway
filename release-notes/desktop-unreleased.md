@@ -1,68 +1,23 @@
 # Muqun Desktop preview
 
-This is an early Desktop preview, published separately from Muqun Gateway. It does not replace the stable Gateway release.
+## Changes and fixes
 
-## Changes
+- **Model-led Multi-Agent Orchestration (MAO) in Desktop**: Configure a dynamic agent/model pool, per-session MAO overrides, automatic quota failover, optional `Auto code review` toggle (off by default for Lead-Model orchestration), and on-demand `Ask Advisor` directly from the composer and Settings.
+- **Unified composer permission pill & queued image editing**: Permission modes and Auto-approve are consolidated into one labeled permission pill (`Ask` / `Auto-approve` / mode name) with one unified menu. Editing a queued message with image attachments preserves the real host upload path so thumbnails and re-sending work reliably.
+- **Borderless animated GPU theme-aura focus & UI polish**: Replaced hard 1 px focus outlines across panels, split panes, composers, pills, and selectors with a borderless `rune-fx` animated theme-gradient aura that extracts vivid theme highlight stops (including light ink-primary themes such as `scene-voyager`). Fixed the Tasks computer-picker dropdown anchor so its menu opens directly beneath the trigger.
+- **Single editor instance per workspace**: Opening multiple files from the same workspace reuses one editor tab/window (`nvim --listen` / `--server --remote-silent`, `vim --servername`, `hx`, `emacsclient`, and `--reuse-window` for VS Code/Cursor/etc.).
+- **Synced Rune UI engine to `anomalyco/rune@46f334ef`**: Picks up 618 upstream fixes including native Wayland file drops (`#1808`/`#1866`/`#1872`), CJK `.ttc` fallback registration, >4 backdrop-blur slots (`#1800`), Wayland IME (`#1782`), and faster text shaping.
+- Installed Desktop now checks its own release channel on startup and every six hours while running, and relaunches the verified package cleanly through Rune's normal quit hook. A notification opens the update page. You choose when to download and restart. To get this update from preview.27, open Settings → About.
+- Search the model picker on Home and in sessions by model name, ID, or provider. Model and reasoning effort selections stay visible, including when working in split panes.
+- The sidebar now uses the active theme's surface and artwork. On macOS the main workspace lets the desktop show through, and Reduce transparency restores an opaque background.
+- Installing Bun or Herdr gives a newly downloaded binary time for its first startup. Herdr now downloads from its official release location.
 
-- The Desktop installer downloads a versioned package from muqun.dev and displays its verified SHA-256 before extracting it. Use `--channel preview` to select a preview.
+## Compatibility and installation
 
-- Plugin split panes place their display-mode menu in the pane title bar beside the close control, removing the extra toolbar row above plugin content.
-- Full-page plugins retain a themed reading surface over the wallpaper without limiting their content width. Native plugins can reuse the conversation Markdown palette for headings, emphasis and tables.
+Linux x86_64 packages target the Ubuntu 24.04 glibc 2.39 baseline. macOS packages target Apple Silicon. The Linux embedded browser needs WebKitGTK 4.1. The macOS archive contains a Developer ID signed, notarized and stapled application. Existing users can install the verified preview with:
 
-- Paired computers keep their approval and question notifications active even while another workspace is selected. Desktop notifications and Inbox entries name the computer and open the correct session; answered requests are withdrawn, and identical session IDs on different computers remain isolated. The new `agent_attention_v1` Gateway capability restores retained pending requests after reconnect without transferring transcripts or waking an agent. Older Gateways retain live notifications and show an upgrade notice for reconnect recovery.
+```sh
+curl -fsSL https://muqun.dev/desktop.sh | sh -s -- --channel preview
+```
 
-- Terminal settings now offer docked, split, or floating placement for new opens. Normally exited shells remove their empty terminal tiles, including background tabs, without stealing focus from another conversation; failed startups retain their error view.
-
-- Delegated task details use readable line spacing and a bounded scroll area, so a single long instruction cannot expand across the whole conversation. Full instructions remain selectable and copyable.
-
-- Compact composer footers keep delivery controls on one line in narrow split panes; controls and bottom spacing remain consistent when focus changes. Icon-only controls use matching circular hit areas instead of narrow ovals.
-
-- Upgrade bundled SQLCipher to 4.20.0 / SQLite 3.54.1 through rusqlite 0.42, addressing RUSTSEC-2026-0502 (crafted database/WAL memory disclosure). Existing encryption remains enabled.
-- CI validation and Desktop builds use Rust 1.99.1 consistently; Rust 1.100 support remains pending an async-stream compatibility fix.
-
-- Split-pane composer controls keep their positions on hover. Returning from the timeline to the composer restores paste focus without an extra click. The default launch icon uses the full-resolution asset with rounded corners.
-
-- Inline image markers and attachment chips now delete together. Removed images stay removed when an upload finishes late, and image uploads finish in their original split pane.
-
-- Hover activates split panes without requiring a click. Clicking text in an already active pane no longer refocuses the composer and clears the selected word.
-
-- Command, shortcuts, pairing and welcome dialogs share a single entrance/exit motion and reduced-motion fallback. Pane action menus reserve room for keyboard shortcuts and translate directional swap actions.
-
-
-- Native desktop panels, theme-aware message rendering, and a compact composer with separate controls below the input.
-- All-computers navigation routes existing sessions to their owning computer. The aggregate start page asks which computer to use instead of reporting that no agents are installed.
-- Model catalogs stay with the session that requested them when switching split panes. Unavailable catalogs can be requested again from the model control.
-- Enter sends and Shift+Enter inserts a newline by default. Custom shortcuts remain supported.
-- Git and context controls are available below the session composer.
-- Sidebar search shares a row with the recent-session filter. Focusing search expands it across the row; an active query remains visible until cleared.
-- Running command rows keep their position while output arrives and commands finish. Activity folds together after the reply ends, reducing jumps between tool summaries.
-- Split-pane composers share the same controls and footer sizing when focus moves between sessions.
-- In-session search highlights matching message text, code and command output; matched folded groups open when navigating results.
-- On Omarchy Linux, Appearance offers an optional system-palette theme. It reads Omarchy's colours without changing system files and refreshes when the palette changes.
-
-- Message-level fork actions now require an explicit agent capability; whole-session fork support no longer exposes an unsupported “Fork from here” button or menu item.
-
-- Context details open in a compact, scrollable popover above their own session button. Composer menus use session-specific anchors so split panes no longer open menus over another conversation.
-
-## Platforms and compatibility
-
-- Linux x86_64 with a graphical desktop; the CI installation smoke check uses X11 and software rendering.
-- macOS Apple Silicon; public preview archives must be Developer ID signed, notarized, and stapled.
-- Windows and Intel macOS packages are not included in this preview.
-- Desktop and Gateway are separate executables. Headless servers need only Gateway. Remote Desktop connections require a paired Gateway with the agent-session APIs; optional features depend on the connected Gateway and agent capabilities.
-- The App does not need an update to install Desktop. Herdr is optional for coding-agent sessions; terminal features using Herdr require Gateway's supported protocol 17 backend.
-
-## Installation
-
-Close the Desktop application before replacing it, then reopen it. Do not delete existing configuration or conversation data. No database migration is required by this Desktop preview. Updating the UI does not require restarting the shared agent backend.
-
-## Preview limitations
-
-This is not a stable release. Windows packaging and a complete cross-platform visual and interaction acceptance pass remain outside the current verified scope. Do not treat successful CI compilation as proof that every desktop workflow has been manually validated.
-
-- File drops now activate the destination split composer, including inactive panes. Documents and images stay with that draft if focus changes while uploading, and the UI no longer announces success before the upload completes. Restart Desktop; no Gateway or App update is required.
-
-- Fix native Wayland file-manager drops into Composer by receiving file URI offers and preserving target coordinates. Clipboard selection is unchanged; cancelled and unsupported transfers do not attach files. Restart Desktop after installing the update.
-
-- The launcher and splash use the transparent Muqun mark. Busy indicators use two theme-colored ribbons and respect reduced motion.
-- Escape dismisses the current pane's inspector. On Wayland, copy-capable file-manager drops also attach when the compositor announces the drag action before the pointer enters the window.
+When updating from Settings, Desktop stays open until you choose to restart. Existing settings, pairing and conversations are retained. Installing the Desktop preview does not require a mobile App update. When you approve Gateway setup on a fresh computer, Desktop starts its built-in terminal in the background and connects Gateway to it. Existing tmux and Herdr installations remain supported, including Herdr protocol 17. Remote features depend on the paired Gateway and agent capabilities. A separately updated Gateway requires its own restart; active agent work should finish first.

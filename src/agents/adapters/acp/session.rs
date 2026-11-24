@@ -62,6 +62,7 @@ pub trait AcpProvider: Send + Sync + 'static {
     const REQUIRE_MESSAGE_ID: bool;
     const MODEL_SELECTION: bool;
     const SESSION_NOTICES: bool = false;
+    const TRANSCRIPT_USAGE: bool = false;
     const IDLE_RETIREMENT: bool = false;
     /// How long a child stays warm after its last turn or explicit open
     /// before idle retirement is considered, unless the agent's
@@ -579,6 +580,7 @@ struct Session {
     prompt_capabilities: PromptCapabilities,
     finished: CancellationToken,
     retirement: Mutex<()>,
+    usage_read: Mutex<()>,
     /// Prompts sent while a turn runs, handed over when it ends normally.
     inbox: StdMutex<Inbox<QueuedPrompt>>,
     /// Serializes queueing against a turn's end and a queued delivery, so
@@ -2784,8 +2786,18 @@ impl<P: AcpProvider> AcpDriver<P> {
             }
             self.dormant.lock().unwrap().remove(id);
         }
-        if let Some(tokens) = Self::transcript_tokens(&session).await {
-            Self::publish_tokens(&session, &self.mirror, &self.tx, Some(tokens)).await;
+        if P::TRANSCRIPT_USAGE {
+            // Restoring the conversation must not wait for a lifetime usage
+            // scan. Publish its result through the ordinary session event.
+            let (session, mirror, tx) = (session.clone(), self.mirror.clone(), self.tx.clone());
+            tokio::spawn(async move {
+                let _read = session.usage_read.lock().await;
+                if let Some(tokens) = Self::transcript_tokens(&session).await {
+                    if session.connected.load(Ordering::Acquire) {
+                        Self::publish_tokens(&session, &mirror, &tx, Some(tokens)).await;
+                    }
+                }
+            });
         }
         Ok(session)
     }
@@ -3144,6 +3156,7 @@ impl<P: AcpProvider> AcpDriver<P> {
             commands_observed: self.commands_observed.clone(),
             finished: CancellationToken::new(),
             retirement: Mutex::new(()),
+            usage_read: Mutex::new(()),
             inbox: StdMutex::new(Inbox::default()),
             turn_gate: Arc::new(Mutex::new(())),
         });
@@ -3769,6 +3782,7 @@ impl<P: AcpProvider> AcpDriver<P> {
         if session.state.lock().await.ignore_turn_usage {
             return;
         }
+        let _read = session.usage_read.lock().await;
         let recorded = Self::transcript_tokens(session).await;
         let total = {
             let mut state = session.state.lock().await;
@@ -4428,7 +4442,7 @@ impl<P: AcpProvider> AcpDriver<P> {
 
     fn snapshot_matches_projection(snapshot: &NativeSnapshot, projection: &Projection) -> bool {
         if projection.is_empty() {
-            return snapshot.entries.is_empty();
+            return snapshot.is_empty();
         }
         snapshot.last_user.as_deref() == projection.latest_text(TimelineRole::User)
             && snapshot.last_assistant.as_deref().is_some_and(|text| {

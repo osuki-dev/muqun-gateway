@@ -551,7 +551,7 @@ for line in sys.stdin:
         let service = SessionService::with_memory_mirror(driver.clone(), mirror);
         service.prepare_session(&info.asid).await.unwrap();
         let opening = service
-            .history_window(&info.asid, None, false)
+            .history_window(&info.asid, None, false, 100, None)
             .await
             .unwrap();
         assert_eq!(opening.snapshot.timeline.len(), 100);
@@ -610,7 +610,10 @@ for line in sys.stdin:
         let service =
             SessionService::with_memory_mirror(fixture.driver.clone(), fixture.mirror.clone());
         service.prepare_session(&asid).await.unwrap();
-        let opening = service.history_window(&asid, None, false).await.unwrap();
+        let opening = service
+            .history_window(&asid, None, false, 100, None)
+            .await
+            .unwrap();
         assert_eq!(opening.snapshot.timeline.len(), 100);
         let newest = &opening.snapshot.timeline.last().unwrap().part;
         assert!(

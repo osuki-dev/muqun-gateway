@@ -915,7 +915,13 @@ mod tests {
                     mirror,
                 );
             let window = service
-                .history_window(&crate::agents::domain::AgentSessionId(id), None, true)
+                .history_window(
+                    &crate::agents::domain::AgentSessionId(id),
+                    None,
+                    true,
+                    100,
+                    None,
+                )
                 .await
                 .expect("selected child full history window");
             eprintln!("selected window rows: {}", window.snapshot.timeline.len());

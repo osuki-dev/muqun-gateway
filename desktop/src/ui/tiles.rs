@@ -2092,30 +2092,21 @@ mod tests {
         for _ in 0..30 {
             rt.frame(1.0 / 60.0);
         }
-        let choice_key = format!("model-{asid}-item1");
         let choice = rt
             .elements()
             .into_iter()
-            .find(|n| n.key.as_deref() == Some(&choice_key))
-            .unwrap_or_else(|| {
-                panic!(
-                    "rect {:?}, focus {}, menu {:?}, keys {:?}",
-                    [x, y, w, h],
-                    rt.state.focus,
-                    rt.state.menu,
-                    rt.elements()
-                        .iter()
-                        .filter_map(|n| n.key.clone())
-                        .filter(|k| k.contains("model") || k.contains("item"))
-                        .collect::<Vec<_>>()
-                )
-            });
+            .find(|n| n.role == "menuitemradio" && n.label.as_deref() == Some("Test model"))
+            .expect("the active split exposes its catalog option");
         assert!(
             choice.rect[0] > 720.0,
             "model menu anchored to the other session: {:?}",
             choice.rect
         );
         assert_eq!(rt.state.selected.as_deref(), Some(asid.as_str()));
+        rt.update(|s, _| s.focus_tile(0));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.menu.is_none());
+        assert!(rt.find("model-filter").is_none());
     }
 
     #[test]

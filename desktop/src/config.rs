@@ -315,6 +315,8 @@ pub struct General {
     pub welcomed: bool,
     /// Use Desktop without automatically provisioning a local Gateway.
     pub gateway_local_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub announced_desktop_update: Option<String>,
 }
 
 /// The draft key of the start page.
@@ -910,6 +912,7 @@ pub enum ConfigEdit {
     /// The first-run welcome was dismissed.
     Welcomed,
     GatewayLocalOnly(bool),
+    AnnouncedDesktopUpdate(String),
     ReducedMotion(bool),
     ReducedTransparency(bool),
     Notifications(bool),
@@ -1019,6 +1022,9 @@ impl DesktopConfig {
             ConfigEdit::Density(density) => self.appearance.density = density,
             ConfigEdit::TextScale(scale) => self.appearance.text_scale = scale,
             ConfigEdit::Shape(shape) => self.appearance.shape = shape,
+            ConfigEdit::AnnouncedDesktopUpdate(version) => {
+                self.general.announced_desktop_update = Some(version);
+            }
             ConfigEdit::Welcomed => self.general.welcomed = true,
             ConfigEdit::GatewayLocalOnly(on) => self.general.gateway_local_only = on,
             ConfigEdit::ReducedMotion(on) => self.appearance.reduced_motion = on,

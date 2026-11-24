@@ -10,9 +10,12 @@ pub(crate) mod art;
 mod composer;
 mod composer_row;
 pub mod copy;
+mod desktop_update;
+mod download_panel;
 mod dwindle;
 mod echo;
 pub mod fx;
+mod gateway_setup;
 mod home;
 pub mod i18n;
 pub(crate) mod icons;
@@ -20,6 +23,7 @@ pub(crate) mod inbox;
 pub(crate) mod inspector;
 pub mod keymap;
 mod labels;
+mod model_picker;
 mod notifications;
 pub(crate) mod orchestration;
 mod package_activity;
@@ -573,6 +577,7 @@ pub struct UiState {
     pub busy_since: HashMap<String, u64>,
     /// The start card's folder picker filter (`ui/home.rs`).
     pub folder_query: TextEdit,
+    pub model_query: TextEdit,
     pub full_projects: HashSet<String>,
 
     /// Pending prompts per session, from snapshots and events.
@@ -606,6 +611,10 @@ pub struct UiState {
     forgotten_computers: HashSet<String>,
     pub local_revoke: settings::revoke_device::State,
     pub(crate) local_invite: Option<settings::local_devices::InvitePanel>,
+    pub gateway_setup: Option<crate::platform::gateway_bootstrap::Status>,
+    desktop_update_panel: bool,
+    restart_checkpoint_pending: bool,
+    restart_on_frame: bool,
     pub desktop_update: crate::platform::update::Status,
     pub local_pairings: crate::platform::paired_devices::List,
     pub(crate) plugin_packages: package_activity::PackageActivity,
@@ -840,6 +849,7 @@ impl UiState {
             open_projects: HashMap::new(),
             busy_since: HashMap::new(),
             folder_query: TextEdit::new(""),
+            model_query: TextEdit::new(""),
             full_projects: HashSet::new(),
             waiting_perms: HashMap::new(),
             waiting_forms: HashMap::new(),
@@ -862,6 +872,10 @@ impl UiState {
             plugin_fields: HashMap::new(),
             diagnostic_filter: Default::default(),
             local_invite: None,
+            gateway_setup: gateway_setup::required(crate::platform::gateway_bootstrap::status()),
+            desktop_update_panel: false,
+            restart_checkpoint_pending: false,
+            restart_on_frame: false,
             desktop_update: Default::default(),
             local_pairings: Default::default(),
             local_revoke: Default::default(),
@@ -975,6 +989,10 @@ impl UiState {
     /// Keep the window waking while the splash is animating.
     /// Every frame Rune asks: the splash and a recording's waveform animate.
     pub fn poll_frame(&mut self, t: f64, tx: &mut Tx) -> bool {
+        if std::mem::take(&mut self.restart_on_frame) {
+            tx.quit();
+            return true;
+        }
         let mut plugins = false;
         for plugin in self.plugins.all() {
             plugins |= plugin.poll(self, tx);
@@ -1705,6 +1723,11 @@ impl UiState {
     }
 
     pub fn open_notification(&mut self, key: &str) {
+        if key == "desktop-update" {
+            self.go(Mode::Settings);
+            settings::open(self, SettingsTab::About);
+            return;
+        }
         if let Some(target) = key.strip_prefix("plugin:") {
             if let Ok((id, action)) = serde_json::from_str::<(String, String)>(target) {
                 if let Some(plugin) = self.plugins.get_enabled(&id, &self.cfg.plugins_disabled) {
@@ -4030,41 +4053,21 @@ impl UiState {
             } => self.finish_computer_unpair(computer, request, result),
             UiAction::LocalPairingRevoked { id, result } => self.finish_local_revoke(id, result),
             UiAction::LocalInvite(id, result) => self.receive_local_invite(id, result),
-            UiAction::DesktopUpdate(status) => {
-                if let crate::platform::update::Status::Available(version) = &status {
-                    let language = self.cfg.general.language;
-                    self.notify(
-                        ToastLevel::Info,
-                        copy::tr(language, "Updates"),
-                        Some(format!("{} v{}", copy::tr(language, "Update to"), version)),
-                    );
+            UiAction::DesktopRestartCheckpoint(saved) => self.restart_checkpoint_completed(saved),
+            UiAction::CheckDesktopUpdateIfIdle => {
+                if !matches!(
+                    self.desktop_update,
+                    crate::platform::update::Status::InstallFailed(_)
+                ) {
+                    self.check_desktop_update();
                 }
-                self.desktop_update = status;
             }
+            UiAction::DesktopUpdate(status) => self.receive_desktop_update(status),
             UiAction::LocalPairings(devices) => {
                 self.local_revoke.cancel_confirmation();
                 self.local_pairings = devices;
             }
-            UiAction::LocalGatewayStatus(status) => {
-                let language = self.cfg.general.language;
-                if matches!(
-                    status,
-                    crate::platform::gateway_bootstrap::Status::Failed
-                        | crate::platform::gateway_bootstrap::Status::MissingBackend
-                ) {
-                    self.notify(
-                        ToastLevel::Error,
-                        copy::tr(language, "Local Gateway setup"),
-                        Some(copy::tr(language, status.message())),
-                    );
-                } else if status == crate::platform::gateway_bootstrap::Status::Ready {
-                    self.notify(
-                        ToastLevel::Info,
-                        copy::tr(language, "Local Gateway setup"),
-                        Some(copy::tr(language, status.message())),
-                    );
-                }
-            }
+            UiAction::LocalGatewayStatus(status) => self.receive_gateway_setup(status),
             UiAction::LocalGatewayReady => {
                 // Never displace a remote computer, open session, terminal or
                 // pending/unfinished work when background setup completes.
@@ -4327,6 +4330,7 @@ impl UiState {
             &self.start_draft,
             &self.search,
             &self.folder_query,
+            &self.model_query,
             &self.task_goal,
             &self.theme_url,
             &self.plugin_source,
@@ -4495,6 +4499,9 @@ pub fn activity_mark(
 use copy::tr;
 
 pub fn on_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if s.gateway_setup.is_some() {
+        return false;
+    }
     if keymap::dispatch(s, ev, tx) {
         return true;
     }
@@ -4540,6 +4547,18 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
         cx.reduced_motion(true);
     }
     let mut layer: Vec<El> = Vec::new();
+    if s.gateway_setup.is_some() {
+        gateway_setup::mount(s, &k, &mut layer);
+        let background = rune::el().w_full().h_full().linear_gradient(
+            0.8,
+            [
+                (0.0, k.c.bg_base),
+                (0.55, k.c.bg_base.mix(k.c.icon_accent, 0.035)),
+                (1.0, k.c.bg_base),
+            ],
+        );
+        return rune_kit::root(background, layer);
+    }
     let body = shell::view(s, cx, &k, &mut layer);
     viewer::image_overlay(s, &k, cx.env().scale, &mut layer);
     if let Some(selection) = s.row_menu.as_ref().and_then(|m| m.selection.as_ref()) {
@@ -4561,6 +4580,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>) -> El {
     palette::mount(s, &k, &mut layer);
     shortcuts::mount(s, &k, &mut layer);
     pair_computer::mount(s, &k, &mut layer);
+    desktop_update::mount(s, &k, &mut layer);
     if s.error.is_some() || !s.toasts.is_empty() {
         layer.push(notifications::region(s, &k));
     }
@@ -4604,8 +4624,12 @@ pub fn spawn_inbox_pump(inbox: Arc<Inbox>, handle: rune::AppHandle<UiState>) {
                         .unwrap_or_default()
                 };
                 let before = questions(s);
+                let previous = s.gateway_setup.clone();
                 s.apply_updates(batch);
-                if !s.cfg.appearance.reduced_motion && before != questions(s) {
+                if !s.cfg.appearance.reduced_motion
+                    && !s.system_reduced_motion.get()
+                    && (before != questions(s) || previous != s.gateway_setup)
+                {
                     tx.animated();
                 }
             });

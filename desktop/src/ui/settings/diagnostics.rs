@@ -32,27 +32,6 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
     let now = diagnostics::now();
     let mut rows = Vec::new();
     let gateway = crate::platform::gateway_bootstrap::status();
-    let local_only = s.cfg.general.gateway_local_only
-        || gateway == crate::platform::gateway_bootstrap::Status::Disabled;
-    rows.push(super::row(
-        k,
-        "gateway-local-only",
-        tr("Local-only mode"),
-        tr("Use Desktop without automatically installing a local Gateway."),
-        super::flag(
-            k,
-            "gateway-local-only",
-            local_only,
-            tr("Local-only mode"),
-            |s| {
-                let disabled = !(s.cfg.general.gateway_local_only
-                    || crate::platform::gateway_bootstrap::status()
-                        == crate::platform::gateway_bootstrap::Status::Disabled);
-                s.edit(crate::config::ConfigEdit::GatewayLocalOnly(disabled));
-                crate::platform::gateway_bootstrap::set_local_only(disabled);
-            },
-        ),
-    ));
     rows.push(super::row(
         k,
         "gateway-setup",
@@ -62,8 +41,10 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
             .gap(8.0)
             .child(
                 super::button(tr("Retry Gateway setup"))
-                    .disabled(local_only || !gateway.retryable() || s.current_computer() != "local")
-                    .on_press(|s: &mut UiState| crate::platform::gateway_bootstrap::retry(&s.cfg))
+                    .disabled(!gateway.retryable())
+                    .on_press(|s: &mut UiState| {
+                        s.show_gateway_setup(crate::platform::gateway_bootstrap::status())
+                    })
                     .build(k),
             )
             .child(

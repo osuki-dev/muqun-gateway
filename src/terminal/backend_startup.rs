@@ -46,6 +46,10 @@ fn herdr_roots() -> Vec<PathBuf> {
 }
 
 pub(crate) fn validate(session: &SessionConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !session.is_desktop_terminal(),
+        "Muqun Desktop manages its built-in terminal daemon"
+    );
     if session.backend == BackendKind::Herdr {
         herdr_session(Path::new(&session.socket_path), &herdr_roots())?;
     }

@@ -1022,6 +1022,17 @@ fn base_scenes() -> &'static [Scene] {
                 a.enabled = false;
             }
         }),
+        ("gateway-install-consent", |s| {
+            home_first(s);
+            s.show_gateway_setup(crate::platform::gateway_bootstrap::Status::NeedsConsent);
+        }),
+        ("gateway-install-download", |s| {
+            home_first(s);
+            s.show_gateway_setup(crate::platform::gateway_bootstrap::Status::Downloading {
+                received: 18_700_000,
+                total: 32_000_000,
+            });
+        }),
         ("welcome", |s| {
             home_first(s);
             s.cfg.general.welcomed = false;

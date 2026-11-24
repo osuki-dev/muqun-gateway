@@ -152,6 +152,10 @@ pub(crate) struct HistoryRequest {
     pub request_id: String,
     pub asid: String,
     pub operation: String,
+    pub limit: Option<usize>,
+    pub if_seq: Option<u64>,
+    #[serde(default)]
+    pub retained: bool,
     #[serde(default)]
     pub refresh: bool,
     #[serde(default)]
@@ -946,7 +950,7 @@ impl Connection {
                         let request = request.clone();
                         let state = state.clone();
                         history_workers.spawn(async move {
-                            let result = tokio::time::timeout(Duration::from_secs(30), super::routes::socket_history(&state, &request.asid, &request.operation, request.refresh, request.after, request.cursor.as_deref())).await;
+                            let result = tokio::time::timeout(Duration::from_secs(30), super::routes::socket_history(&state, &request)).await;
                             let (mut status, mut body) = match result {
                                 Ok(Ok(axum::Json(body))) => (200, body),
                                 Ok(Err((status, axum::Json(body)))) => (status.as_u16(), body),

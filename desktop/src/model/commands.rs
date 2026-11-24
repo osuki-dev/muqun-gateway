@@ -224,6 +224,8 @@ pub enum Command {
     /// Re-read the delegated task list (and the default folder).
     RefreshTasks,
     CheckDesktopUpdate,
+    InstallDesktopUpdate(String),
+    CheckpointForUpdateRestart,
     RefreshLocalPairings,
     ReadLocalInvite(u64),
     RevokeLocalPairing(String),

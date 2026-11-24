@@ -9,6 +9,7 @@ use crate::agents::ports::agent::AgentFuture;
 
 pub struct ClaudeProvider;
 impl AcpProvider for ClaudeProvider {
+    const TRANSCRIPT_USAGE: bool = true;
     const KIND: &'static str = "claude";
     const LABEL: &'static str = "Claude Code";
     // Replaced by the runner's arguments (see `runtime::claude::launch`).

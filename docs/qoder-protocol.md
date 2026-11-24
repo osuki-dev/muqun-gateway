@@ -82,8 +82,13 @@ foreground preparation before another prompt.
 
 Native compacted/repaired/sidechain formats or unknown record kinds currently
 fail recovery inspection rather than being mistaken for a simple active
-branch. Missing, ambiguous, changing or oversized journals leave the live
-process intact. A `session/close` acknowledgement alone is never a persistence
+branch. Recovery streams newline-terminated records and indexes their locations
+to verify the complete active branch, including tool payloads. The 64 MiB
+budget applies to each record and the final assistant text. Larger indexes spill
+record IDs, links and file positions to a private temporary directory that is
+removed when inspection ends. Record count alone does not limit recovery.
+Missing, ambiguous, changing or incomplete journals and exceeded byte budgets
+leave the live process intact. A `session/close` acknowledgement alone is never a persistence
 guarantee.
 
 A separately opened Qoder terminal or IDE is not a shared live ACP connection.

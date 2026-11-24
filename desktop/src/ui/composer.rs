@@ -1970,7 +1970,7 @@ pub fn pill(k: &Kit, key: &str, label: String, open: bool, menu: OpenMenu) -> El
         .variant(ButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
         .expanded(open)
-        .on_press(move |s: &mut UiState| s.menu = (!open).then(|| menu.clone()))
+        .on_press(move |s: &mut UiState| s.toggle_composer_menu(menu.clone()))
         .build(k)
         .key(key.to_string())
         .radius(k.radius.lg)
@@ -1985,6 +1985,7 @@ pub fn pill(k: &Kit, key: &str, label: String, open: bool, menu: OpenMenu) -> El
 /// `on_pick(state, provider, model)` runs on a choice.
 #[allow(clippy::too_many_arguments)]
 pub fn model_menu(
+    s: &UiState,
     k: &Kit,
     layer: &mut Vec<El>,
     kind: OpenMenu,
@@ -2000,28 +2001,10 @@ pub fn model_menu(
         _ => "model",
     };
     let key = format!("{key}-{scope}");
-    // Each split composer owns its anchor, including inactive previews.
-    let mut menu = Menu::new(&key)
-        .placement(rune_kit::Placement::TopStart)
-        .trigger(pill(k, &format!("{key}-pill"), label, open, kind))
-        .open(open)
-        .min_width(220.0)
-        .on_close(|s: &mut UiState| s.menu = None);
-    let mut last: Option<&str> = None;
-    for (provider, id, name) in models {
-        if last != Some(provider.as_str()) {
-            menu = menu.group_label(provider.clone());
-            last = Some(provider.as_str());
-        }
-        let on = current == Some((provider.as_str(), id.as_str()));
-        let (p, m, pick) = (provider.clone(), id.clone(), on_pick.clone());
-        menu = menu.item(
-            MenuItem::new(name.clone())
-                .checked(on)
-                .on_select(move |s: &mut UiState| pick(s, p.clone(), m.clone())),
-        );
-    }
-    menu.build(k, layer)
+    let trigger = pill(k, &format!("{key}-pill"), label, open, kind);
+    super::model_picker::popup(
+        s, k, layer, &key, trigger, open, models, current, None, on_pick,
+    )
 }
 
 /// The branch menu: the folder's local branches, the checked-out one ticked.

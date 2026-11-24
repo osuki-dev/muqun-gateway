@@ -647,6 +647,11 @@ pub fn applied_from(
         .flat_map(|slot| [false, true].map(|dark| manifest.slot_asset(slot, dark)))
         .flatten()
         .collect();
+    wanted.extend(
+        [false, true]
+            .into_iter()
+            .filter_map(|dark| manifest.sidebar_cover_asset(dark)),
+    );
     if let Some(logo) = manifest
         .home_identity
         .as_ref()

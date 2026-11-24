@@ -57,7 +57,7 @@ pub(crate) fn status() -> anyhow::Result<()> {
         println!(
             "session {}: backend={} endpoint={endpoint} {}",
             session.id,
-            session.backend.as_str(),
+            session.backend_display_name(),
             backend_program_state(&session, service_path.as_deref())
         );
     }
@@ -540,7 +540,11 @@ pub(crate) fn confirm_remove_backend(session: &SessionConfig) -> anyhow::Result<
     confirm_action(
         "Remove terminal backend?",
         &[
-            format!("Selected: {} ({})", session.label, session.backend.as_str()),
+            format!(
+                "Selected: {} ({})",
+                session.label,
+                session.backend_display_name()
+            ),
             String::from("Only this Gateway's backend configuration is removed."),
             String::from("Terminal servers, sessions, and running tasks stay running."),
             String::from("Restart Gateway after this change."),
@@ -2039,6 +2043,9 @@ fn print_manage_screen(
                 &std::env::var("PATH").unwrap_or_default(),
                 service_path.as_deref(),
             ),
+            BackendKind::Herdr if session.is_desktop_terminal() => {
+                String::from("Muqun Desktop terminal configured")
+            }
             BackendKind::Herdr => String::from("Herdr socket configured"),
         })
         .collect::<Vec<_>>();

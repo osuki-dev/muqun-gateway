@@ -7,6 +7,7 @@ pub mod editors;
 pub mod filesearch;
 pub mod fonts;
 pub mod gateway_bootstrap;
+pub mod installer;
 pub mod instance;
 pub mod keys;
 pub mod media;
@@ -17,6 +18,7 @@ pub mod pairing;
 pub mod pairing_invite;
 #[cfg(target_os = "linux")]
 mod plugin_picker_linux;
+pub(crate) mod plugin_webview;
 pub mod pty;
 pub mod secrets;
 pub mod shell;

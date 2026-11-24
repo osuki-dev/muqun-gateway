@@ -682,36 +682,81 @@ struct UsageScan {
     file: Option<(u64, u64)>,
     offset: u64,
     messages: HashMap<String, MessageUsage>,
+    observed: Option<(u64, std::time::SystemTime)>,
+    cached_total: Option<TokensUsage>,
 }
 
 impl UsageScan {
-    fn read(&mut self, reader: &mut impl BufRead) -> std::io::Result<()> {
+    const USAGE_BUFFER: u64 = 2 * 1024 * 1024;
+
+    /// Keep the small common case in a reusable buffer. Claude also writes
+    /// request blobs and tool results of arbitrary size. Skip metadata in
+    /// place and stream JSON for exceptional chat records.
+    fn read(&mut self, reader: &mut (impl BufRead + std::io::Seek)) -> std::io::Result<()> {
+        use std::io::{Read, SeekFrom};
         let mut line = Vec::new();
+        let mut start = reader.stream_position()?;
         loop {
             line.clear();
-            let read = reader.read_until(b'\n', &mut line)?;
-            if read == 0 || line.last() != Some(&b'\n') {
-                // A record still being appended is read next time.
-                return Ok(());
+            let prefix = reader
+                .take(Self::USAGE_BUFFER)
+                .read_until(b'\n', &mut line)? as u64;
+            if prefix == 0 {
+                break;
             }
-            self.offset += read as u64;
-            if metadata_type(&line).is_some() {
-                continue;
-            }
-            let Ok(spent) = serde_json::from_slice::<Spent>(&line) else {
-                continue;
+            let kind = metadata_type(&line);
+            let chat = kind.is_none() || kind == Some("assistant");
+            let (spent, consumed) = if line.last() == Some(&b'\n') {
+                (
+                    chat.then(|| serde_json::from_slice::<Spent>(&line).ok())
+                        .flatten(),
+                    prefix,
+                )
+            } else {
+                if prefix < Self::USAGE_BUFFER {
+                    break;
+                }
+                let mut consumed = prefix;
+                loop {
+                    let bytes = reader.fill_buf()?;
+                    if bytes.is_empty() {
+                        return Ok(());
+                    }
+                    let newline = bytes.iter().position(|&b| b == b'\n');
+                    let n = newline.map_or(bytes.len(), |at| at + 1);
+                    reader.consume(n);
+                    consumed += n as u64;
+                    if newline.is_some() {
+                        break;
+                    }
+                }
+                let spent = if chat {
+                    reader.seek(SeekFrom::Start(start))?;
+                    let spent = serde_json::from_reader::<_, Spent>(reader.take(consumed)).ok();
+                    reader.seek(SeekFrom::Start(start + consumed))?;
+                    spent
+                } else {
+                    None
+                };
+                (spent, consumed)
             };
-            if spent.kind.as_deref() != Some("assistant") {
-                continue;
-            }
-            if let Some(SpentMessage {
-                id: Some(id),
-                usage: Some(usage),
-            }) = spent.message
+            self.offset += consumed;
+            start += consumed;
+            if let Some(Spent {
+                kind: Some(kind),
+                message:
+                    Some(SpentMessage {
+                        id: Some(id),
+                        usage: Some(usage),
+                    }),
+            }) = spent
             {
-                self.messages.insert(id, usage);
+                if kind == "assistant" {
+                    self.messages.insert(id, usage);
+                }
             }
         }
+        Ok(())
     }
 
     /// Disjoint counters, as the neutral shape has them: thinking is
@@ -741,7 +786,7 @@ impl UsageScan {
     }
 }
 
-type UsageCache = std::sync::Mutex<HashMap<PathBuf, UsageScan>>;
+type UsageCache = std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<UsageScan>>>>;
 const MAX_USAGE_SCANS: usize = 64;
 
 /// The session's cumulative token usage from its transcript. A transcript
@@ -760,15 +805,32 @@ pub(super) async fn transcript_usage(
     };
     let (directory, id) = (directory.to_owned(), id.to_owned());
     Ok(tokio::task::spawn_blocking(move || {
-        use std::io::{Seek, SeekFrom};
         let path = find_exact(&root, &directory, &id).ok()?;
-        let mut file = std::fs::File::open(&path).ok()?;
-        let stat = file.metadata().ok()?;
-        if stat.len() > MAX_BYTES {
-            return None;
-        }
         let cache = CACHE.get_or_init(Default::default);
-        let mut scan = cache.lock().unwrap().remove(&path).unwrap_or_default();
+        let entry = {
+            let mut entries = cache.lock().ok()?;
+            if !entries.contains_key(&path) && entries.len() >= MAX_USAGE_SCANS {
+                let evict = entries
+                    .iter()
+                    .find(|(_, entry)| std::sync::Arc::strong_count(entry) == 1)
+                    .map(|(key, _)| key.clone())?;
+                entries.remove(&evict);
+            }
+            entries.entry(path.clone()).or_default().clone()
+        };
+        let mut scan = entry.lock().ok()?;
+        scan.read_file(&path).ok()?
+    })
+    .await
+    .ok()
+    .flatten())
+}
+
+impl UsageScan {
+    fn read_file(&mut self, path: &Path) -> std::io::Result<Option<TokensUsage>> {
+        use std::io::{Seek, SeekFrom};
+        let mut file = std::fs::File::open(path)?;
+        let stat = file.metadata()?;
         #[cfg(unix)]
         let identity = {
             use std::os::unix::fs::MetadataExt as _;
@@ -776,25 +838,27 @@ pub(super) async fn transcript_usage(
         };
         #[cfg(not(unix))]
         let identity = None;
-        if scan.file != identity || stat.len() < scan.offset {
-            scan = UsageScan {
+        let stamp = stat.modified().ok().map(|mtime| (stat.len(), mtime));
+        if self.file == identity && stamp.is_some() && self.observed == stamp {
+            return Ok(self.cached_total.clone());
+        }
+        if self.file != identity
+            || stat.len() < self.offset
+            || self
+                .observed
+                .is_some_and(|(size, _)| size == stat.len() && stamp.is_some())
+        {
+            *self = UsageScan {
                 file: identity,
-                ..UsageScan::default()
+                ..Default::default()
             };
         }
-        file.seek(SeekFrom::Start(scan.offset)).ok()?;
-        scan.read(&mut std::io::BufReader::new(file)).ok()?;
-        let total = scan.total();
-        let mut cache = cache.lock().unwrap();
-        if cache.len() >= MAX_USAGE_SCANS {
-            cache.clear();
-        }
-        cache.insert(path, scan);
-        Some(total)
-    })
-    .await
-    .ok()
-    .flatten())
+        file.seek(SeekFrom::Start(self.offset))?;
+        self.read(&mut std::io::BufReader::with_capacity(128 * 1024, file))?;
+        self.cached_total = (!self.messages.is_empty()).then(|| self.total());
+        self.observed = stamp;
+        Ok(self.cached_total.clone())
+    }
 }
 
 /// The transcript's modification time, to notice that a terminal wrote to it.
@@ -914,6 +978,33 @@ mod tests {
             (total.input, total.output, total.reasoning),
             (4, 60, Some(20))
         );
+    }
+
+    #[test]
+    fn usage_streams_long_records_and_discards_rotated_totals() {
+        use std::io::Write;
+        let (dir, path) = write(&[], "");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"api-request-blob","body":"x".repeat(UsageScan::USAGE_BUFFER as usize + 1)})
+        )
+        .unwrap();
+        let assistant = |n| {
+            json!({"type":"assistant", "message":{"id":"response",
+            "content":"x".repeat(UsageScan::USAGE_BUFFER as usize + 1), "usage":{"input_tokens":n,"output_tokens":2}}})
+        };
+        writeln!(file, "{}", assistant(7)).unwrap();
+        let mut scan = UsageScan::default();
+        assert_eq!(scan.read_file(&path).unwrap().unwrap().input, 7);
+        writeln!(file, "{}", assistant(9)).unwrap();
+        assert_eq!(scan.read_file(&path).unwrap().unwrap().input, 9);
+        let replacement = dir.join("new.jsonl");
+        std::fs::write(&replacement, "{}\n").unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        assert!(scan.read_file(&path).unwrap().is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The whole-transcript read is the one operation that still has a

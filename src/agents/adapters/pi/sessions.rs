@@ -28,9 +28,10 @@ pub(super) const MAX_SESSION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_SESSION_FILES: usize = 4096;
 const MAX_SESSION_DIRS: usize = 1024;
-const MAX_SUMMARY_SCAN_BYTES: usize = 128 * 1024 * 1024;
 const MAX_SUMMARY_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SUMMARY_ENTRIES: usize = 32_768;
+
+mod summary_index;
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
@@ -208,54 +209,33 @@ impl SessionStore {
             info.status = status;
             return Ok(info);
         }
-        let mut reader = BufReader::new(input.take((MAX_SUMMARY_SCAN_BYTES + 1) as u64));
-        let mut line = Vec::new();
-        let mut entries = Vec::new();
-        let mut retained = 0usize;
-        let mut incomplete = file_bytes > MAX_SUMMARY_SCAN_BYTES as u64;
-        loop {
-            match super::rpc::read_line(&mut reader, &mut line, MAX_SUMMARY_RECORD_BYTES)
-                .await
-                .map_err(io_err)?
-            {
-                super::rpc::Line::Eof => break,
-                super::rpc::Line::TooLong => {
+        let input = input.into_std().await;
+        let source = file.clone();
+        let (mut info, incomplete) = tokio::task::spawn_blocking(move || {
+            use super::records::{scan, Record};
+            let mut entries = summary_index::SummaryIndex::default();
+            let mut incomplete = false;
+            let mut index_result = Ok(());
+            scan(input, MAX_SUMMARY_RECORD_BYTES, |_, _, record| {
+                let entry = match record {
+                    Record::Raw(line) if line.iter().all(u8::is_ascii_whitespace) => return true,
+                    Record::Raw(line) => serde_json::from_slice::<SummaryEntry>(line).ok(),
+                    Record::Large(value) => serde_json::from_value::<SummaryEntry>(value).ok(),
+                    Record::Malformed => None,
+                };
+                if let Some(entry) = entry {
+                    index_result = entries.push(entry.project());
+                } else {
                     incomplete = true;
-                    // Consume the rest without retaining it; otherwise a
-                    // suffix could be mistaken for another JSONL entry.
-                    loop {
-                        let available = reader.fill_buf().await.map_err(io_err)?;
-                        if available.is_empty() {
-                            break;
-                        }
-                        let end = available.iter().position(|b| *b == b'\n');
-                        let used = end.map_or(available.len(), |n| n + 1);
-                        reader.consume(used);
-                        if end.is_some() {
-                            break;
-                        }
-                    }
-                    continue;
                 }
-                super::rpc::Line::Record => {}
-            }
-            if let Ok(entry) = serde_json::from_slice::<SummaryEntry>(&line) {
-                let projected = entry.project();
-                retained = retained.saturating_add(super::mapper::value_bytes(&projected));
-                if retained > MAX_SESSION_BYTES {
-                    incomplete = true;
-                    break;
-                }
-                entries.push(projected);
-            } else if !line.is_empty() {
-                incomplete = true;
-            }
-            if entries.len() >= MAX_SUMMARY_ENTRIES {
-                incomplete = true;
-                break;
-            }
-        }
-        let mut info = session_info(file, &entries, status);
+                index_result.is_ok()
+            })?;
+            index_result?;
+            std::io::Result::Ok((entries.finish(&source, status)?, incomplete))
+        })
+        .await
+        .map_err(|e| AgentError::RequestFailed(format!("pi metadata scan: {e}")))?
+        .map_err(io_err)?;
         if incomplete {
             info.model = None;
             info.tokens = None;
@@ -299,26 +279,28 @@ impl SessionStore {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SummaryEntry {
     #[serde(rename = "type")]
     kind: String,
-    #[serde(flatten)]
-    fields: SummaryFields,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     message: Option<SummaryMessage>,
-}
-
-#[derive(Deserialize, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SummaryFields {
+    #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     parent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     timestamp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     thinking_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     parent_session: Option<String>,
 }
 
@@ -333,7 +315,7 @@ struct SummaryMessage {
 
 #[derive(Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SummaryUsage {
+pub(super) struct SummaryUsage {
     input: Option<u64>,
     output: Option<u64>,
     reasoning: Option<u64>,
@@ -398,10 +380,10 @@ fn summary_content<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<
 }
 
 impl SummaryEntry {
-    fn project(self) -> Value {
-        let mut entry = serde_json::to_value(self.fields).unwrap_or(Value::Null);
-        entry["type"] = self.kind.into();
-        if let Some(message) = self.message {
+    fn project(mut self) -> Value {
+        let message = self.message.take();
+        let mut entry = serde_json::to_value(self).unwrap_or(Value::Null);
+        if let Some(message) = message {
             entry["message"] = serde_json::json!({"role":message.role,"content":if message.role == "user" { message.content } else { String::new() },"usage":message.usage});
         }
         entry
@@ -542,55 +524,44 @@ pub fn active_branch(entries: &[Value]) -> Vec<Value> {
     chain.into_iter().rev().cloned().collect()
 }
 
-/// Title: the latest `session_info` name, else the first user text, else a
-/// placeholder.
-fn title_of(branch: &[Value]) -> String {
-    let named = branch
-        .iter()
-        .rev()
-        .filter(|e| e.get("type").and_then(Value::as_str) == Some("session_info"))
-        .filter_map(|e| e.get("name")?.as_str())
-        .map(str::trim)
-        .find(|n| !n.is_empty());
-    if let Some(n) = named {
-        return n.to_string();
-    }
-    let first_user = branch.iter().find_map(|e| {
-        let m = e.get("message")?;
-        if e.get("type")?.as_str()? != "message" || m.get("role")?.as_str()? != "user" {
-            return None;
-        }
-        let text = match m.get("content")? {
-            Value::String(s) => s.clone(),
-            Value::Array(blocks) => blocks
-                .iter()
-                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-                .filter_map(|b| b.get("text")?.as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            _ => return None,
-        };
-        let text = text.trim();
-        (!text.is_empty()).then(|| text.chars().take(TITLE_CHARS).collect::<String>())
-    });
-    first_user.unwrap_or_else(|| UNTITLED.to_string())
+/// Consume the active branch in native order. The same fold runs over a small
+/// in-memory history and a cursor over the private spill database.
+#[derive(Default)]
+struct BranchSummary {
+    first_user: Option<String>,
+    name: Option<String>,
+    model: Option<ModelRef>,
+    variant: Option<String>,
+    usage: super::mapper::UsageTotals,
 }
 
-fn model_of(branch: &[Value]) -> Option<ModelRef> {
-    let last_of = |ty: &str| {
-        branch
-            .iter()
-            .rev()
-            .find(|e| e.get("type").and_then(Value::as_str) == Some(ty))
-    };
-    let change = last_of("model_change")?;
-    Some(ModelRef {
-        provider_id: change.get("provider")?.as_str()?.to_string(),
-        model_id: change.get("modelId")?.as_str()?.to_string(),
-        variant: last_of("thinking_level_change")
-            .and_then(|e| e.get("thinkingLevel")?.as_str())
-            .map(str::to_string),
-    })
+impl BranchSummary {
+    fn observe(&mut self, row: &Value) {
+        match row["type"].as_str() {
+            Some("session_info") => {
+                if let Some(name) = row["name"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    self.name = Some(name.into());
+                }
+            }
+            Some("model_change") => self.model = super::mapper::model_ref(row),
+            Some("thinking_level_change") => {
+                self.variant = row["thinkingLevel"].as_str().map(str::to_string)
+            }
+            Some("message") if self.first_user.is_none() && row["message"]["role"] == "user" => {
+                let text = super::mapper::content_text(row.pointer("/message/content"));
+                let text = text.trim();
+                if !text.is_empty() {
+                    self.first_user = Some(text.chars().take(TITLE_CHARS).collect());
+                }
+            }
+            _ => {}
+        }
+        self.usage.observe(row);
+    }
 }
 
 /// Session summary from the file plus its entries. `agent_id` stays empty: the
@@ -600,15 +571,33 @@ pub fn session_info(
     entries: &[Value],
     status: AgentSessionStatus,
 ) -> AgentSessionInfo {
-    let branch = active_branch(entries);
-    let usage = super::mapper::usage_from_entries(&branch);
+    let mut summary = BranchSummary::default();
+    for row in active_branch(entries) {
+        summary.observe(&row);
+    }
+    summarize(file, entries.first(), status, summary)
+}
+
+fn summarize(
+    file: &SessionFile,
+    header: Option<&Value>,
+    status: AgentSessionStatus,
+    mut summary: BranchSummary,
+) -> AgentSessionInfo {
+    if let Some(model) = &mut summary.model {
+        model.variant = summary.variant;
+    }
+    let usage = summary.usage;
     AgentSessionInfo {
         asid: AgentSessionId(file.id.clone()),
         agent_id: String::new(),
         backend_session_id: String::new(),
-        title: title_of(&branch),
+        title: summary
+            .name
+            .or(summary.first_user)
+            .unwrap_or_else(|| UNTITLED.into()),
         mode: None,
-        model: model_of(&branch),
+        model: summary.model,
         status,
         runtime: None,
         context_usage: None,
@@ -624,8 +613,7 @@ pub fn session_info(
         outcome: None,
         error: None,
         revert: None,
-        fork: entries
-            .first()
+        fork: header
             .and_then(|header| header.get("parentSession"))
             .and_then(Value::as_str)
             .and_then(|path| Path::new(path).file_stem())
@@ -929,23 +917,54 @@ mod tests {
             "Updated title"
         );
         writeln!(append, "{}", json!({"type":"message","id":"too-large","parentId":"name","message":{"role":"user","content":[{"type":"image","data":"x".repeat(MAX_SUMMARY_RECORD_BYTES + 1)}]}})).unwrap();
-        let incomplete = store
+        // The large assistant belongs to a new leaf: counters from the abandoned
+        // sibling must be excluded, even when the usage follows a huge payload.
+        writeln!(append, "{}", json!({"type":"message","id":"abandoned","parentId":"too-large","message":{"role":"assistant","content":[],"usage":{"input":9000,"totalTokens":9000}}})).unwrap();
+        writeln!(append, "{}", json!({"type":"message","id":"active","parentId":"too-large","message":{"role":"assistant","content":[{"type":"text","text":"quoted \"line\"".repeat(MAX_SUMMARY_RECORD_BYTES/8)}],"usage":{"input":12,"output":4,"totalTokens":16,"cost":{"total":0.02}}}})).unwrap();
+        let oversized = store
             .read_summary(
                 &store.find("large").await.unwrap(),
                 AgentSessionStatus::Idle,
             )
             .await
             .unwrap();
-        assert!(incomplete.error.is_some());
-        assert!(incomplete.model.is_none());
-        assert!(
-            incomplete.tokens.is_none(),
-            "partial token totals must remain unknown"
+        assert!(oversized.error.is_none());
+        assert_eq!(oversized.model.unwrap().variant.as_deref(), Some("low"));
+        assert_eq!(oversized.tokens.unwrap().input, 22);
+        assert_eq!(oversized.cost, Some(0.03));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn long_lineage_spills_and_excludes_abandoned_usage() {
+        use std::io::{BufWriter, Write};
+        let root = std::env::temp_dir().join(format!("muqun-pi-deep-{}", uuid::Uuid::new_v4()));
+        let path = write(
+            &root,
+            "2026-10-14T06-51-18-225Z_deep.jsonl",
+            &[
+                header("deep", "/workspace"),
+                user("0", None, "Long conversation"),
+            ],
         );
-        assert!(
-            incomplete.cost.is_none(),
-            "partial costs must remain unknown"
-        );
+        let mut log = BufWriter::new(std::fs::OpenOptions::new().append(true).open(path).unwrap());
+        let count = MAX_SUMMARY_ENTRIES + 3;
+        for i in 1..=count {
+            writeln!(log,r#"{{"id":"{i}","parentId":"{}","type":"message","message":{{"role":"assistant","usage":{{"input":1,"totalTokens":1}}}}}}"#, i-1).unwrap();
+        }
+        writeln!(log,r#"{{"id":"abandoned","parentId":"{count}","type":"message","message":{{"role":"assistant","usage":{{"input":1000000,"totalTokens":1000000}}}}}}"#).unwrap();
+        writeln!(log,r#"{{"id":"chosen","parentId":"{count}","type":"model_change","provider":"pi","modelId":"selected"}}"#).unwrap();
+        drop(log);
+        let store = SessionStore::new(root.clone());
+        let file = store.find("deep").await.unwrap();
+        let info = store
+            .read_summary(&file, AgentSessionStatus::Idle)
+            .await
+            .unwrap();
+        assert!(info.error.is_none());
+        assert_eq!(info.tokens.unwrap().input, count as u64);
+        assert_eq!(info.title, "Long conversation");
+        assert_eq!(info.model.unwrap().model_id, "selected");
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -963,6 +982,10 @@ mod tests {
                 .read_summary(file, AgentSessionStatus::Idle)
                 .await
                 .unwrap();
+            if std::fs::metadata(&file.path).unwrap().len() > MAX_SESSION_BYTES as u64 {
+                eprintln!("Large native Pi usage: {:?}", info.tokens);
+                assert!(info.error.is_none(), "native Pi metadata scan incomplete");
+            }
             assert_eq!(info.asid.0, file.id);
             assert!(!info.title.is_empty());
         }

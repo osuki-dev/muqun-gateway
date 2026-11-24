@@ -1004,6 +1004,21 @@ impl AgentRuntime {
         out
     }
 
+    /// Resolve only from local routing and initialized mirrors. A cache probe
+    /// must never discover ownership by contacting providers.
+    pub(crate) async fn retained_manager(&self, asid: &str) -> Option<Arc<AgentManager>> {
+        if let Some(owner) = self.session_routes.read().await.map.get(asid).cloned() {
+            return self.manager_for_agent(&owner).await;
+        }
+        let id = super::domain::AgentSessionId(asid.to_owned());
+        for (_, manager) in self.attached_in_order().await {
+            if manager.mirror().history_initialized(&id).await {
+                return Some(manager);
+            }
+        }
+        None
+    }
+
     /// The manager that owns a session: the recorded route, else whichever
     /// attached agent says it has the session (and that is then recorded).
     /// `None` when nothing owns it.

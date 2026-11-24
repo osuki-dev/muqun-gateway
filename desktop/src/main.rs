@@ -53,6 +53,10 @@ fn main() -> anyhow::Result<()> {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--plugin-pick-path")) {
         return platform::dialogs::plugin_pick_path(std::env::args_os().skip(2));
     }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--ensure-term-daemon")) {
+        println!("{}", term::daemon::ensure_daemon_running()?.display());
+        return Ok(());
+    }
     if let Some(pos) = std::env::args().position(|a| a == "--term-daemon") {
         let socket_path = std::env::args()
             .nth(pos + 1)
@@ -128,12 +132,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         theme::omarchy::watch(inbox.clone(), store.clone());
         if !tooling {
-            platform::gateway_bootstrap::initialize(
-                &config,
-                config_dir.clone(),
-                state_dir.clone(),
-                inbox.clone(),
-            );
+            platform::gateway_bootstrap::initialize(state_dir.clone(), inbox.clone());
         }
         start_core(
             settings,
@@ -195,7 +194,7 @@ fn main() -> anyhow::Result<()> {
     // icon is up to come back through; otherwise it quits as before.
     .keep_running()
     .on_close(|s, tx| {
-        if !(s.cfg.general.close_to_tray && platform::tray::active()) {
+        if s.gateway_setup.is_some() || !(s.cfg.general.close_to_tray && platform::tray::active()) {
             tx.quit();
         }
     });
@@ -260,9 +259,11 @@ fn main() -> anyhow::Result<()> {
     // A failed start or a panic leaves through the same door: unwinding out
     // of `main` would run the libraries' exit handlers under the core's
     // threads (OpenSSL's cleanup under a SQLite open crashed that way).
+    // Rune normally exits from its event loop, before try_run returns.
+    rune::fast_exit(finish_normal_exit);
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.try_run()));
     platform::shutdown::deadline();
-    instance::release();
+    platform::gateway_bootstrap::shutdown();
     store.flush();
     let code = match ran {
         Ok(Ok(())) => 0,
@@ -274,7 +275,19 @@ fn main() -> anyhow::Result<()> {
     };
     tracing::info!(code, "muqun-desktop stopped");
     diagnostics::flush();
+    if code == 0 {
+        finish_normal_exit();
+    } else {
+        instance::release();
+    }
     platform::shutdown::leave(code)
+}
+
+fn finish_normal_exit() {
+    instance::release();
+    if let Err(error) = platform::update::relaunch_if_requested() {
+        tracing::error!(%error, "could not restart updated Desktop");
+    }
 }
 
 fn init_tracing() {
@@ -327,6 +340,7 @@ fn start_core(
     std::thread::Builder::new()
         .name("muqun-core-main".into())
         .spawn(move || {
+            platform::gateway_bootstrap::wait_for_setup();
             runtime.block_on(async move {
                 let (hub, connected) = select_hub(settings, &state_dir, &store.get()).await;
                 let dynamic_hub = hub::DynamicHub::new(hub);

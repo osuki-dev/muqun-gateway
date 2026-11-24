@@ -92,6 +92,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "home_overview_sections_v1",
     "agent_history_ws_v1",
     "agent_history_window_v1",
+    "agent_history_window_options_v1",
     "agent_computer_context_v1",
     "agent_discovery",
     "agent_spawn",
