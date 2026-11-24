@@ -1768,6 +1768,63 @@ impl SessionHub for RemoteHub {
         self.events.subscribe()
     }
 
+    fn read_file<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        path: &'a str,
+    ) -> HubFuture<'a, super::RemoteFile> {
+        Box::pin(async move {
+            let json = self
+                .session_call(Method::GET, asid, &["file-asset"], &[("uri", path)], None)
+                .await?;
+            let asset = json.pointer("/data/asset").ok_or_else(|| {
+                HubError::Agent(AgentError::Protocol("missing asset metadata".into()))
+            })?;
+            let id = asset
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| HubError::Agent(AgentError::Protocol("missing asset id".into())))?;
+            let name = asset
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    Path::new(path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.to_owned())
+                });
+            let mime = asset
+                .get("mime")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let size = asset.get("size").and_then(Value::as_u64);
+            let (status, bytes) = self
+                .call_bytes(
+                    Method::GET,
+                    &["api", "assets", id, "content"],
+                    &[],
+                    None,
+                    None,
+                )
+                .await?;
+            if !(200..300).contains(&status) {
+                let raw = String::from_utf8_lossy(&bytes);
+                let body_json: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+                return Err(map_error(status, &body_json, &asid.0, &raw));
+            }
+            Ok(super::RemoteFile {
+                name,
+                mime,
+                size,
+                bytes,
+            })
+        })
+    }
+
     fn task_events(&self) -> Option<broadcast::Receiver<TaskHubEvent>> {
         Some(self.task_events.subscribe())
     }
@@ -1802,18 +1859,20 @@ fn intern(mime: &str) -> &'static str {
     leaked
 }
 
-struct ClientCodec {
+pub(crate) struct WsClientCodec {
     server_key: [u8; 32],
     client_key: [u8; 32],
     connection_id: String,
+    request_aad: String,
     recv_seq: u64,
     send_seq: u64,
 }
 
-impl ClientCodec {
-    fn open_first(
+impl WsClientCodec {
+    pub(crate) fn open_first(
         first: &Value,
         material: &[u8],
+        request_aad: &str,
         request_nonce: &str,
     ) -> anyhow::Result<(Self, String)> {
         let connection_id = first["cid"]
@@ -1832,6 +1891,7 @@ impl ClientCodec {
                 request_nonce,
             )?,
             connection_id,
+            request_aad: request_aad.to_owned(),
             recv_seq: 0,
             send_seq: 0,
         };
@@ -1840,10 +1900,10 @@ impl ClientCodec {
     }
 
     fn aad(&self, seq: u64) -> String {
-        format!("GET /api/ws\n{}\n{seq}", self.connection_id)
+        format!("{}\n{}\n{seq}", self.request_aad, self.connection_id)
     }
 
-    fn open(&mut self, frame: &Value) -> anyhow::Result<String> {
+    pub(crate) fn open(&mut self, frame: &Value) -> anyhow::Result<String> {
         let seq = frame["seq"]
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("no seq in frame"))?;
@@ -1866,7 +1926,7 @@ impl ClientCodec {
         Ok(String::from_utf8(plaintext)?)
     }
 
-    fn seal(&mut self, plaintext: &str) -> anyhow::Result<String> {
+    pub(crate) fn seal(&mut self, plaintext: &str) -> anyhow::Result<String> {
         let seq = self.send_seq;
         let c = muqun_gateway::connectivity::transport::seal_stream_event(
             &self.client_key,
@@ -1877,6 +1937,95 @@ impl ClientCodec {
         self.send_seq += 1;
         Ok(format!(r#"{{"seq":{seq},"c":"{c}"}}"#))
     }
+}
+
+pub(crate) struct WsUpgradeRequest {
+    pub(crate) request: tokio_tungstenite::tungstenite::http::Request<()>,
+    pub(crate) material: Option<Vec<u8>>,
+    pub(crate) nonce: Option<String>,
+}
+
+/// Build an authenticated (and optionally E2EE v2 sealed) WebSocket upgrade
+/// request for `gateway` at `segments`.
+pub(crate) fn build_ws_request(
+    gateway: &LocalGateway,
+    segments: &[&str],
+    request_aad: &str,
+) -> Result<WsUpgradeRequest, String> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    let mut ws_url = reqwest::Url::parse(gateway.url.trim_end_matches('/'))
+        .map_err(|e| format!("bad gateway url: {e}"))?;
+    if let Ok(mut path) = ws_url.path_segments_mut() {
+        path.clear().extend(segments);
+    }
+    ws_url
+        .set_scheme(if ws_url.scheme() == "https" {
+            "wss"
+        } else {
+            "ws"
+        })
+        .map_err(|_| "bad gateway url".to_string())?;
+    let mut request = ws_url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| e.to_string())?;
+
+    let material = gateway
+        .transport_key
+        .as_deref()
+        .and_then(|k| muqun_gateway::connectivity::transport::decode_key(k).ok());
+    let mut nonce = None;
+    if let (Some(material_bytes), Some(device_id)) = (&material, &gateway.device_id) {
+        let payload = EncryptedRequestPayload {
+            token: gateway.token.clone(),
+            content_type: None,
+            body: String::new(),
+        };
+        let envelope = muqun_gateway::connectivity::transport::seal_version(
+            muqun_gateway::connectivity::transport::VERSION_V2,
+            material_bytes,
+            muqun_gateway::connectivity::transport::Direction::Request,
+            request_aad.as_bytes(),
+            &serde_json::to_vec(&payload).map_err(|e| e.to_string())?,
+            now_unix_ms(),
+        )
+        .map_err(|e| format!("seal ws: {e}"))?;
+        let sealed = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&envelope).map_err(|e| e.to_string())?);
+
+        let headers = request.headers_mut();
+        headers.insert(
+            "x-muqun-transport",
+            "1".parse()
+                .map_err(|e: reqwest::header::InvalidHeaderValue| e.to_string())?,
+        );
+        headers.insert(
+            "x-muqun-device",
+            device_id
+                .parse()
+                .map_err(|e: reqwest::header::InvalidHeaderValue| e.to_string())?,
+        );
+        headers.insert(
+            "x-muqun-envelope",
+            sealed
+                .parse()
+                .map_err(|e: reqwest::header::InvalidHeaderValue| e.to_string())?,
+        );
+        nonce = Some(envelope.nonce);
+    } else {
+        request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {}", gateway.token)
+                .parse()
+                .map_err(|_| "bad token".to_string())?,
+        );
+    }
+    Ok(WsUpgradeRequest {
+        request,
+        material,
+        nonce,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2032,7 +2181,7 @@ async fn run_socket(
     .map_err(|_| "event socket handshake timed out".to_string())?
     .map_err(|e| e.to_string())?;
 
-    let mut codec: Option<ClientCodec> = None;
+    let mut codec: Option<WsClientCodec> = None;
     if let (Some(material), Some(request_nonce)) = (&hub.material, nonce) {
         let first_msg = tokio::select! {
             _ = shutdown.changed() => return Ok(()),
@@ -2048,7 +2197,7 @@ async fn run_socket(
         let first_val: Value =
             serde_json::from_str(&first_text).map_err(|e| format!("invalid hello json: {e}"))?;
         let (mut client_codec, _hello) =
-            ClientCodec::open_first(&first_val, material, &request_nonce)
+            WsClientCodec::open_first(&first_val, material, "GET /api/ws", &request_nonce)
                 .map_err(|e| format!("hello open failed: {e}"))?;
         let sub = client_codec
             .seal(r#"{"t":"subscribe_all"}"#)
@@ -2533,7 +2682,8 @@ mod tests {
 
         // Client opens first frame
         let (mut client_codec, hello_plain) =
-            ClientCodec::open_first(&first_frame, material, request_nonce).unwrap();
+            WsClientCodec::open_first(&first_frame, material, "GET /api/ws", request_nonce)
+                .unwrap();
         assert_eq!(hello_plain, r#"{"t":"hello"}"#);
 
         // Client seals subscribe frame at send_seq 0

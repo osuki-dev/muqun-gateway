@@ -729,6 +729,8 @@ fn viewer_with(s: &mut UiState, name: &str, kind: crate::model::viewer::FileKind
             modified: Some(std::time::SystemTime::now() - std::time::Duration::from_secs(720)),
         },
         body: text_body(body.into(), false),
+        remote_path: None,
+        remote_computer: None,
         zoom: None,
         image_viewport: [0.0; 2],
         image_pan_start: None,

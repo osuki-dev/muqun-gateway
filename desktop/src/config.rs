@@ -519,6 +519,10 @@ pub struct Appearance {
     pub text_scale: f32,
     /// Corner profile of panels, cards and controls.
     pub shape: Shape,
+    /// Custom global opacity across the entire desktop (`0.35..=1.0`).
+    /// `None` uses the theme / platform default translucency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_opacity: Option<f32>,
 }
 
 /// How rounded the surfaces are.
@@ -544,6 +548,8 @@ impl Shape {
 
 impl Appearance {
     pub const TEXT_SCALES: [f32; 4] = [0.9, 1.0, 1.1, 1.2];
+    pub const MIN_OPACITY: f32 = 0.35;
+    pub const DEFAULT_OPACITY: f32 = 0.86;
 
     /// The stored text scale, forced into range (a hand-edited value never
     /// yields unreadable text).
@@ -553,6 +559,13 @@ impl Appearance {
         } else {
             1.0
         }
+    }
+
+    /// The user's custom global desktop opacity, clamped to a readable range.
+    pub fn custom_opacity(&self) -> Option<f32> {
+        self.window_opacity
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(Self::MIN_OPACITY, 1.0))
     }
 }
 
@@ -566,6 +579,7 @@ impl Default for Appearance {
             density: Density::Comfortable,
             text_scale: 1.0,
             shape: Shape::Soft,
+            window_opacity: None,
         }
     }
 }
@@ -915,6 +929,7 @@ pub enum ConfigEdit {
     AnnouncedDesktopUpdate(String),
     ReducedMotion(bool),
     ReducedTransparency(bool),
+    WindowOpacity(Option<f32>),
     Notifications(bool),
     CloseToTray(bool),
     /// The command palette's recent commands, newest first.
@@ -1029,6 +1044,11 @@ impl DesktopConfig {
             ConfigEdit::GatewayLocalOnly(on) => self.general.gateway_local_only = on,
             ConfigEdit::ReducedMotion(on) => self.appearance.reduced_motion = on,
             ConfigEdit::ReducedTransparency(on) => self.appearance.reduced_transparency = on,
+            ConfigEdit::WindowOpacity(opacity) => {
+                self.appearance.window_opacity = opacity
+                    .filter(|v| v.is_finite())
+                    .map(|v| v.clamp(Appearance::MIN_OPACITY, 1.0));
+            }
             ConfigEdit::Notifications(on) => self.notifications.enabled = on,
             ConfigEdit::CloseToTray(on) => self.general.close_to_tray = on,
             ConfigEdit::RecentCommands(list) => self.ui.recent_commands = list,

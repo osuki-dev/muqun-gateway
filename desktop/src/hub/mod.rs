@@ -26,8 +26,20 @@ use tokio::sync::broadcast;
 
 pub use dynamic::{connection_origin, spawn_connected, ConnectionContext, DynamicHub};
 pub use local::LocalHub;
-pub(crate) use remote::local_gateway_credential;
+pub(crate) use remote::{
+    build_ws_request, local_gateway_credential, WsClientCodec, WsUpgradeRequest,
+};
 pub use remote::{discover_local_gateway, LocalGateway, RemoteHub};
+
+/// One file read over a remote Gateway (`/api/agent-sessions/{asid}/file-asset`
+/// + `/api/assets/{id}/content`).
+#[derive(Debug, Clone)]
+pub struct RemoteFile {
+    pub name: String,
+    pub mime: Option<String>,
+    pub size: Option<u64>,
+    pub bytes: Vec<u8>,
+}
 
 /// The agent a fresh install suggests first.
 pub const OPENCODE: &str = "opencode";
@@ -698,6 +710,19 @@ pub trait SessionHub: Send + Sync {
     /// `session_search_v1`.
     fn search<'a>(&'a self, _query: &'a SearchQuery) -> HubFuture<'a, SearchPage> {
         Box::pin(async { Err(HubError::Agent(AgentError::Unsupported("search".into()))) })
+    }
+    /// Read one file owned by a remote session through its Gateway
+    /// (`GET /api/agent-sessions/{asid}/file-asset` + asset content).
+    fn read_file<'a>(
+        &'a self,
+        _asid: &'a AgentSessionId,
+        _path: &'a str,
+    ) -> HubFuture<'a, RemoteFile> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "remote file read".into(),
+            )))
+        })
     }
     /// Every session event of every agent, in the order the runtime saw them.
     fn events(&self) -> broadcast::Receiver<AgentDomainEvent>;

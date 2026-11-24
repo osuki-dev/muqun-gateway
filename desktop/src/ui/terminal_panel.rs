@@ -146,6 +146,8 @@ pub struct TermPanel {
     pub active_tab: usize,
     pub next_tab_id: u64,
     pub editor_tabs: std::collections::HashMap<u64, EditorTabMeta>,
+    /// Maps terminal tab ID → remote computer ID when that tab runs a remote PTY.
+    pub remote_tabs: std::collections::HashMap<u64, String>,
     pub session: Option<Session>,
     pub frame: Option<Frame>,
     /// The keyboard sink on the cursor cell (see the module docs).
@@ -195,6 +197,7 @@ impl TermPanel {
             active_tab: 0,
             next_tab_id: 1,
             editor_tabs: std::collections::HashMap::new(),
+            remote_tabs: std::collections::HashMap::new(),
             session: None,
             frame: None,
             sink: TextEdit::new(""),
@@ -788,6 +791,7 @@ impl UiState {
     }
 
     fn cleanup_editor_tab_meta(&mut self, tab_id: u64) {
+        self.term.remote_tabs.remove(&tab_id);
         if let Some(meta) = self.term.editor_tabs.remove(&tab_id) {
             if meta.editor_kind == "nvim" {
                 if let Some(sock) = meta.ipc {
@@ -795,6 +799,32 @@ impl UiState {
                 }
             }
         }
+    }
+
+    /// Open a remote file in an embedded terminal running a remote PTY on
+    /// `computer` (via `GET /api/pty/ws`), launching `editor` (e.g. `nvim`).
+    pub fn open_remote_file_in_terminal(
+        &mut self,
+        computer: &str,
+        remote_path: &str,
+        editor: &str,
+    ) {
+        self.close_viewer();
+        let workspace = self
+            .current()
+            .and_then(|info| info.directory.clone())
+            .filter(|d| !d.trim().is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::path::Path::new(remote_path)
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_else(|| PathBuf::from("~"));
+        let escaped_path = shell_quote(remote_path);
+        let cmd = format!("{editor} {escaped_path}\n");
+        self.term_new_tab_on(Some(computer.to_owned()), workspace, Some(cmd));
     }
 
     /// Open a file in the embedded terminal using a terminal editor (e.g. nvim).
@@ -956,6 +986,17 @@ impl UiState {
     }
 
     pub fn term_new_tab_in(&mut self, cwd: PathBuf, command: Option<String>) {
+        let comp = self.active_session_computer();
+        let remote = Self::is_remote_computer_id(&comp).then_some(comp);
+        self.term_new_tab_on(remote, cwd, command);
+    }
+
+    pub fn term_new_tab_on(
+        &mut self,
+        remote_computer: Option<String>,
+        cwd: PathBuf,
+        command: Option<String>,
+    ) {
         // Select the existing surface before changing the active tab: focusing
         // it afterwards could restore its old tab over the newly created shell.
         if let Some(i) = self.tile_of_terminal() {
@@ -970,6 +1011,9 @@ impl UiState {
 
         let id = self.term.next_tab_id;
         self.term.next_tab_id += 1;
+        if let Some(comp) = &remote_computer {
+            self.term.remote_tabs.insert(id, comp.clone());
+        }
         self.term.tabs.push(TermTab {
             id,
             session: None,
@@ -984,7 +1028,7 @@ impl UiState {
         }
         self.term.session = None;
         self.term.frame = None;
-        self.start_terminal_in(cwd);
+        self.start_terminal_on(remote_computer, cwd);
         self.open_terminal_default();
     }
 
@@ -1261,18 +1305,35 @@ impl UiState {
         }
         self.term.frame = None;
         self.term.error = None;
-        let cwd = self
+        let (cwd, remote) = self
             .term
             .tabs
             .get(self.term.active_tab)
-            .map(|t| t.cwd.clone())
-            .unwrap_or_else(|| self.terminal_cwd());
-        self.start_terminal_in(cwd);
+            .map(|t| (t.cwd.clone(), self.term.remote_tabs.get(&t.id).cloned()))
+            .unwrap_or_else(|| {
+                let comp = self.active_session_computer();
+                (
+                    self.terminal_cwd(),
+                    Self::is_remote_computer_id(&comp).then_some(comp),
+                )
+            });
+        self.start_terminal_on(remote, cwd);
         self.focus_terminal();
     }
 
     /// Where a new shell starts: the focused session's folder, else home.
+    /// On a remote computer, preserve the remote session's folder verbatim
+    /// without testing against the local filesystem.
     pub fn terminal_cwd(&self) -> PathBuf {
+        let comp = self.active_session_computer();
+        if Self::is_remote_computer_id(&comp) {
+            return self
+                .current()
+                .and_then(|info| info.directory.clone())
+                .filter(|d| !d.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("~"));
+        }
         self.current()
             .and_then(|info| info.directory.clone())
             .map(PathBuf::from)
@@ -1282,8 +1343,13 @@ impl UiState {
     }
 
     pub fn term_active_title(&self) -> String {
-        let frame = self.term.frame.as_ref();
-        if let Some(t) = frame.map(|f| f.title.clone()).filter(|t| !t.is_empty()) {
+        let base = if let Some(t) = self
+            .term
+            .frame
+            .as_ref()
+            .map(|f| f.title.clone())
+            .filter(|t| !t.is_empty())
+        {
             t
         } else {
             let cwd = self
@@ -1293,6 +1359,21 @@ impl UiState {
                 .map(|x| x.cwd.clone())
                 .unwrap_or_else(|| self.terminal_cwd());
             short_path(&cwd)
+        };
+        let remote = self
+            .term
+            .session
+            .as_ref()
+            .and_then(|s| s.remote_computer.as_deref())
+            .or_else(|| {
+                self.term
+                    .tabs
+                    .get(self.term.active_tab)
+                    .and_then(|t| self.term.remote_tabs.get(&t.id).map(String::as_str))
+            });
+        match remote {
+            Some(comp) => format!("[{}] {base}", self.computer_name(comp)),
+            None => base,
         }
     }
 
@@ -1305,17 +1386,34 @@ impl UiState {
             .tile_terminal_tab(tile_idx)
             .and_then(|tab| self.term.tabs.get(tab))
         {
-            Some(tab) => tab
-                .frame
-                .as_ref()
-                .map(|f| f.title.clone())
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| short_path(&tab.cwd)),
+            Some(tab) => {
+                let base = tab
+                    .frame
+                    .as_ref()
+                    .map(|f| f.title.clone())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| short_path(&tab.cwd));
+                let remote = tab
+                    .session
+                    .as_ref()
+                    .and_then(|s| s.remote_computer.as_deref())
+                    .or_else(|| self.term.remote_tabs.get(&tab.id).map(String::as_str));
+                match remote {
+                    Some(comp) => format!("[{}] {base}", self.computer_name(comp)),
+                    None => base,
+                }
+            }
             None => short_path(&self.terminal_cwd()),
         }
     }
 
     pub(crate) fn start_terminal(&mut self) {
+        let comp = self.active_session_computer();
+        if Self::is_remote_computer_id(&comp) {
+            let cwd = self.terminal_cwd();
+            self.start_terminal_on(Some(comp), cwd);
+            return;
+        }
         #[cfg(unix)]
         if self.term.fixture.is_none()
             && self.term.session.is_none()
@@ -1377,6 +1475,12 @@ impl UiState {
     }
 
     fn start_terminal_in(&mut self, cwd: PathBuf) {
+        let comp = self.active_session_computer();
+        let remote = Self::is_remote_computer_id(&comp).then_some(comp);
+        self.start_terminal_on(remote, cwd);
+    }
+
+    fn start_terminal_on(&mut self, remote_computer: Option<String>, cwd: PathBuf) {
         if self.term.fixture.is_some() || self.term.session.is_some() {
             return;
         }
@@ -1399,12 +1503,27 @@ impl UiState {
                 },
             )
         });
-        match Session::start(cwd.clone(), size, colors, waker) {
+        let started = if let Some(comp) = remote_computer.clone() {
+            match self.remote_gateway_for(&comp) {
+                Some(gateway) => {
+                    Session::start_remote(comp, gateway, cwd.clone(), size, colors, waker)
+                }
+                None => Err(std::io::Error::other(
+                    "This remote computer is not paired or has no saved URL.",
+                )),
+            }
+        } else {
+            Session::start(cwd.clone(), size, colors, waker)
+        };
+        match started {
             Ok(session) => {
                 self.term.session = Some(session.clone());
                 if self.term.tabs.is_empty() {
                     let id = self.term.next_tab_id;
                     self.term.next_tab_id += 1;
+                    if let Some(comp) = remote_computer {
+                        self.term.remote_tabs.insert(id, comp);
+                    }
                     self.term.tabs.push(TermTab {
                         id,
                         session: Some(session),
@@ -1415,6 +1534,9 @@ impl UiState {
                     });
                     self.term.active_tab = 0;
                 } else if let Some(active) = self.term.tabs.get_mut(self.term.active_tab) {
+                    if let Some(comp) = remote_computer {
+                        self.term.remote_tabs.insert(active.id, comp);
+                    }
                     active.session = Some(session);
                     active.cwd = cwd;
                 }

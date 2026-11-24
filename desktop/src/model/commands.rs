@@ -64,6 +64,11 @@ pub enum Command {
     /// Read a session's snapshot for a read-only look (a subagent's detail
     /// sheet): never prepares it, never makes it the active one.
     ReadDetail(AgentSessionId),
+    /// Read one file from the active remote computer through its Gateway.
+    ReadRemoteFile {
+        asid: AgentSessionId,
+        path: String,
+    },
     /// An agent's account rate windows (`Update::AccountLimits`).
     LoadAccountLimits {
         agent: String,

@@ -190,6 +190,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
         agent_runtime: agent_runtime.clone(),
         ws_connections: Arc::new(agents::ws_routes::WsRegistry::default()),
+        pty_connections: Arc::new(terminal::pty_ws::PtyRegistry::default()),
         generation: crate::new_generation(),
         message_images: Arc::default(),
         preview_cache: Arc::default(),

@@ -15,6 +15,7 @@ pub(crate) mod history_sqlite;
 pub(crate) mod lazygit;
 pub mod login_env;
 pub mod native;
+pub(crate) mod pty_ws;
 pub mod routes;
 pub mod scrollback;
 #[cfg(test)]

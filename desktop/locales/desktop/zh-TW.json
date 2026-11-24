@@ -1112,5 +1112,8 @@
   "Ask": "詢問",
   "Ask before acting": "執行前詢問",
   "Ask before running tools or editing files": "執行指令或修改檔案前先徵求確認",
-  "Wait for the current turn to finish": "請等待目前回覆結束後切換"
+  "Wait for the current turn to finish": "請等待目前回覆結束後切換",
+  "Window opacity": "視窗透明度",
+  "Adjust transparency across the entire desktop.": "統一調整整個桌面視窗與面板的透明度。",
+  "Solid (100%)": "純色 (100%)"
 }

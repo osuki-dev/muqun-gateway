@@ -43,7 +43,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         let content = if pid == "terminal" {
             content
         } else {
-            content.fill(k.c.bg_base)
+            content.fill(k.c.bg_base.alpha(look.surface_alpha(1.0)))
         };
         super::card_stage("plugin-page", content)
     } else {
@@ -184,7 +184,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     let mut right_w = 0.0;
     // Each right-hand pane floats in its own panel, as the sidebar does.
     let wash = if look.see_through {
-        SEE_THROUGH_FLOOR[usize::from(look.dark)]
+        look.surface_alpha(SEE_THROUGH_FLOOR[usize::from(look.dark)])
     } else {
         0.0
     };
@@ -202,9 +202,9 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         // The terminal's own background is its panel's floor, corner to
         // corner, a breath of the desktop through it as the card has.
         let alpha = if look.see_through {
-            SEE_THROUGH_CARD[usize::from(look.dark)]
+            look.surface_alpha(SEE_THROUGH_CARD[usize::from(look.dark)])
         } else {
-            1.0
+            look.surface_alpha(1.0)
         };
         let surface = super::terminal_panel::surface(s, k, scheme).alpha(alpha);
         let controls = crate::plugin::surface_switcher(
@@ -228,14 +228,14 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         split = split.inspector(
             &s.term.pane,
             super::terminal_pane,
-            right_panel(k, wash, look.dark, Some(surface), view),
+            right_panel(k, &look, wash, Some(surface), view),
         );
     } else if let Some(pane) = details {
         right_w = s.inspect_pane.shown_width();
         split = split.inspector(
             &s.inspect_pane,
             super::inspect_pane,
-            right_panel(k, wash, look.dark, None, pane),
+            right_panel(k, &look, wash, None, pane),
         );
     } else if inspector_here {
         right_w = s.right.shown_width();
@@ -256,7 +256,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         split = split.inspector(
             &s.right,
             super::right_pane,
-            right_panel(k, wash, look.dark, None, drawer_content),
+            right_panel(k, &look, wash, None, drawer_content),
         );
     }
     let mut split = split
@@ -303,7 +303,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             .child(sidebar_panel(
                 s,
                 k,
-                SEE_THROUGH_FLOOR[usize::from(look.dark)],
+                look.surface_alpha(SEE_THROUGH_FLOOR[usize::from(look.dark)]),
                 window,
             ))
             .children(
@@ -319,7 +319,11 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
     if let Some((backdrop, wash)) = backdrop(s, k, &look, window) {
         // The main card lets a breath of the wallpaper through (Home draws
         // its own stage over a clear card).
-        chrome.c.bg_base = k.c.bg_base.alpha(if home { 0.0 } else { CARD_ALPHA });
+        chrome.c.bg_base = k.c.bg_base.alpha(if home {
+            0.0
+        } else {
+            look.surface_alpha(CARD_ALPHA)
+        });
         stage = stage.child(backdrop);
         if home {
             // Home keeps the wallpaper whole; the sidebar's lists read over
@@ -390,7 +394,10 @@ fn card_floor(
         .pin(Some(left), Some(frame), Some(right), Some(frame))
         .radius(k.radius.lg)
         .clip_rounded(k.radius.lg)
-        .fill(k.c.bg_base.alpha(SEE_THROUGH_CARD[usize::from(look.dark)]))
+        .fill(
+            k.c.bg_base
+                .alpha(look.surface_alpha(SEE_THROUGH_CARD[usize::from(look.dark)])),
+        )
         .motion(super::panes::SPRING)
         .a11y_hidden();
     let wall = s.images.as_ref().and_then(|images| {
@@ -431,9 +438,10 @@ fn sidebar_panel(s: &UiState, k: &Kit, wash: f32, window: Option<[f32; 2]>) -> E
         .fill(k.c.layer_01.alpha(if !look.glass {
             1.0
         } else if look.see_through {
-            SIDEBAR_TINT[usize::from(look.dark)]
+            look.sidebar_alpha(SIDEBAR_TINT[usize::from(look.dark)])
         } else {
-            (wash + (1.0 - wash) * SIDEBAR_TINT[usize::from(look.dark)]).min(1.0)
+            let tint = look.sidebar_alpha(SIDEBAR_TINT[usize::from(look.dark)]);
+            (wash + (1.0 - wash) * tint).min(1.0)
         }))
         .radius(k.radius.lg)
         .clip_rounded(k.radius.lg)
@@ -477,8 +485,8 @@ fn sidebar_panel(s: &UiState, k: &Kit, wash: f32, window: Option<[f32; 2]>) -> E
 
 /// A side panel's surface: the window floor at `wash`, the page colour over
 /// it at the sidebar's tint, with the main card's radius and hairline.
-fn panel_surface(k: &Kit, key: &str, wash: f32, dark: bool) -> El {
-    let tint = SIDEBAR_TINT[usize::from(dark)];
+fn panel_surface(k: &Kit, look: &Look, key: &str, wash: f32) -> El {
+    let tint = look.sidebar_alpha(SIDEBAR_TINT[usize::from(look.dark)]);
     col()
         .key(key.to_string())
         .radius(k.radius.lg)
@@ -498,9 +506,9 @@ fn panel_surface(k: &Kit, key: &str, wash: f32, dark: bool) -> El {
 /// on its own floor (the sidebar's, or `surface` when the pane brings its
 /// own), its content held inside the rounded corners. The slot already
 /// starts a frame down, under the title strip.
-fn right_panel(k: &Kit, wash: f32, dark: bool, surface: Option<Color>, content: El) -> El {
+fn right_panel(k: &Kit, look: &Look, wash: f32, surface: Option<Color>, content: El) -> El {
     let frame = super::panes::FRAME;
-    let mut panel = panel_surface(k, "right-panel", wash, dark);
+    let mut panel = panel_surface(k, look, "right-panel", wash);
     if let Some(surface) = surface {
         panel = col()
             .key("right-panel")

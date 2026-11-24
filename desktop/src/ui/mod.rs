@@ -1274,6 +1274,44 @@ impl UiState {
         None
     }
 
+    /// The computer that owns the active session (or the currently selected computer).
+    pub fn active_session_computer(&self) -> String {
+        if let Some(asid) = self.selected.as_deref() {
+            if let Some(comp) = self.computer_of_session(asid) {
+                return comp;
+            }
+        }
+        self.current_computer().to_string()
+    }
+
+    /// Whether `computer_id` names a paired remote computer rather than this machine.
+    pub fn is_remote_computer_id(computer_id: &str) -> bool {
+        !matches!(computer_id, "" | "local" | "self" | "all")
+    }
+
+    /// Build a [`crate::hub::LocalGateway`] credential for a saved remote computer.
+    pub fn remote_gateway_for(&self, computer_id: &str) -> Option<crate::hub::LocalGateway> {
+        if !Self::is_remote_computer_id(computer_id) {
+            return None;
+        }
+        let profile = self.cfg.computers.get(computer_id)?;
+        let token = profile
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())?;
+        let url = self
+            .peer_url(computer_id)
+            .map(|u| u.trim().to_owned())
+            .filter(|u| !u.is_empty())?;
+        Some(crate::hub::LocalGateway {
+            url,
+            token: token.to_owned(),
+            device_id: profile.device_id.clone(),
+            transport_key: profile.transport_key.clone(),
+        })
+    }
+
     fn route_session(&mut self, asid: &str) {
         if let Some(computer) = self.computer_of_session(asid) {
             if computer != self.current_computer() {
@@ -3072,6 +3110,13 @@ impl UiState {
             self.focus -= 1;
         }
         if let Some(asid) = gone.asid.as_deref() {
+            // Closing a pane/window must never cause its session to vanish from
+            // the Recent sessions sidebar: bump its recent-opened timestamp so
+            // it stays right at the top for immediate re-entry.
+            if let Some(root) = self.sidebar_root(asid).map(str::to_owned) {
+                let key = format!("{}:{root}", self.current_computer());
+                self.sidebar_opened.insert(key, now_ms());
+            }
             if self.selected.as_deref() != Some(asid) {
                 self.timelines.remove(asid);
             }
@@ -3230,9 +3275,18 @@ impl UiState {
             self.open_session(&first_asid);
             // Watching only subscribes to future events. Every restored pane
             // needs its initial snapshot, including panes nobody has clicked.
-            for asid in self.tiles.iter().filter_map(|tile| tile.asid.as_ref()) {
-                if asid != &first_asid && !asid.starts_with("new-") {
-                    self.send(Command::OpenTile(AgentSessionId(asid.clone())));
+            for asid in self
+                .tiles
+                .iter()
+                .filter_map(|tile| tile.asid.clone())
+                .collect::<Vec<_>>()
+            {
+                if let Some(root) = self.sidebar_root(&asid).map(str::to_owned) {
+                    let key = format!("{}:{root}", self.current_computer());
+                    self.sidebar_opened.insert(key, now_ms());
+                }
+                if asid != first_asid && !asid.starts_with("new-") {
+                    self.send(Command::OpenTile(AgentSessionId(asid)));
                 }
             }
         }
@@ -3403,9 +3457,23 @@ impl UiState {
                             .filter(|info| self.is_subagent_session(info))
                             .map(|info| info.asid.0.clone())
                             .collect();
+                        let keep_active: HashSet<String> = self
+                            .sessions
+                            .iter()
+                            .filter(|s| {
+                                s.agent_id == agent
+                                    && (matches!(
+                                        self.activity(s),
+                                        Activity::Working | Activity::NeedsYou
+                                    ) || self.selected.as_deref() == Some(s.asid.0.as_str())
+                                        || self.tile_of(&s.asid.0).is_some())
+                            })
+                            .map(|s| s.asid.0.clone())
+                            .collect();
                         self.sessions.retain(|s| {
                             s.agent_id != agent
                                 || children.contains(&s.asid.0)
+                                || keep_active.contains(&s.asid.0)
                                 || self
                                     .pending_start
                                     .as_ref()
@@ -3481,6 +3549,7 @@ impl UiState {
                 }
                 Update::Ui(action) => self.on_action(action),
                 Update::Detail { asid, result } => self.on_detail(asid, result),
+                Update::RemoteFileLoaded { path, result } => self.remote_file_loaded(&path, result),
                 Update::AccountLimits { agent, limits } => {
                     self.account_limits.insert(agent, limits);
                 }

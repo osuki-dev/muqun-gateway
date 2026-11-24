@@ -47,7 +47,7 @@ type GatewayEventStream =
 
 /// Terminal plane routes: sessions, workspaces, tabs, panes, and their views.
 pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
-    router
+    super::pty_ws::mount(router)
         .route("/api/sessions", get(sessions))
         .route("/api/sessions/{session_id}/events", get(events))
         .route("/api/sessions/{session_id}/snapshot", get(snapshot))

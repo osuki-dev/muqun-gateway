@@ -99,6 +99,8 @@ pub struct Session {
     ended: Arc<Mutex<Option<Ended>>>,
     pub cwd: PathBuf,
     pub session_id: Option<String>,
+    /// Remote computer ID when backed by `GET /api/pty/ws`, else `None` (local).
+    pub remote_computer: Option<String>,
     /// When the shell started.
     pub started: Instant,
 }
@@ -108,6 +110,7 @@ impl std::fmt::Debug for Session {
         f.debug_struct("Session")
             .field("cwd", &self.cwd)
             .field("session_id", &self.session_id)
+            .field("remote_computer", &self.remote_computer)
             .field("started", &self.started)
             .finish()
     }
@@ -388,6 +391,431 @@ impl Session {
             ended,
             cwd,
             session_id: Some(id),
+            remote_computer: None,
+            started: Instant::now(),
+        })
+    }
+
+    /// Connect an interactive terminal session to a remote computer's Gateway
+    /// over `GET /api/pty/ws` (using the same E2EE v2 sealing as `/api/ws`).
+    pub fn start_remote(
+        computer: String,
+        gateway: crate::hub::LocalGateway,
+        cwd: PathBuf,
+        size: Size,
+        colors: Colors,
+        wake: rune::Waker,
+    ) -> std::io::Result<Self> {
+        enum RemoteOut {
+            Input(Vec<u8>),
+            Resize(Size),
+            Close,
+        }
+
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let (ws_out_tx, mut ws_out_rx) = tokio::sync::mpsc::unbounded_channel::<RemoteOut>();
+        let latest = Arc::new(Mutex::new(None));
+        let ended = Arc::new(Mutex::new(None));
+        let in_flight = Arc::new(InFlight::default());
+
+        // Background tokio thread driving the WebSocket connection to /api/pty/ws.
+        {
+            let tx = tx.clone();
+            let in_flight = in_flight.clone();
+            let cwd_str = cwd.to_string_lossy().into_owned();
+            std::thread::Builder::new()
+                .name("muqun-term-remote".into())
+                .spawn(move || {
+                    use base64::Engine as _;
+                    use futures::{SinkExt as _, StreamExt as _};
+                    use serde_json::{json, Value};
+                    use tokio_tungstenite::tungstenite::Message;
+
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(err) => {
+                            let msg = format!("\r\n[Remote terminal runtime error: {err}]\r\n");
+                            let _ = tx.send(Msg::Bytes(msg.into_bytes()));
+                            let _ = tx.send(Msg::Eof);
+                            return;
+                        }
+                    };
+                    rt.block_on(async move {
+                        let feed_notice = |text: &str| {
+                            let bytes = text.as_bytes().to_vec();
+                            *in_flight.bytes.lock().unwrap() += bytes.len();
+                            let _ = tx.send(Msg::Bytes(bytes));
+                        };
+                        let crate::hub::WsUpgradeRequest {
+                            request,
+                            material,
+                            nonce,
+                        } = match crate::hub::build_ws_request(
+                            &gateway,
+                            &["api", "pty", "ws"],
+                            "GET /api/pty/ws",
+                        ) {
+                            Ok(built) => built,
+                            Err(err) => {
+                                feed_notice(&format!("\r\n[Remote terminal config error: {err}]\r\n"));
+                                let _ = tx.send(Msg::Eof);
+                                return;
+                            }
+                        };
+
+                        let (mut socket, _) = match tokio::time::timeout(
+                            Duration::from_secs(10),
+                            tokio_tungstenite::connect_async(request),
+                        )
+                        .await
+                        {
+                            Ok(Ok(pair)) => pair,
+                            Ok(Err(err)) => {
+                                let err_text = err.to_string();
+                                if err_text.contains("404") || err_text.contains("501") {
+                                    feed_notice(
+                                        "\r\n[Remote terminal requires a newer Muqun Gateway on this computer (remote_pty_v1).]\r\n",
+                                    );
+                                } else {
+                                    feed_notice(&format!(
+                                        "\r\n[Could not connect to remote terminal: {err_text}]\r\n"
+                                    ));
+                                }
+                                let _ = tx.send(Msg::Eof);
+                                return;
+                            }
+                            Err(_) => {
+                                feed_notice("\r\n[Remote terminal connection timed out.]\r\n");
+                                let _ = tx.send(Msg::Eof);
+                                return;
+                            }
+                        };
+
+                        // Read hello (and initialize E2EE codec when transport_key is set).
+                        let first_msg = match tokio::time::timeout(
+                            Duration::from_secs(10),
+                            socket.next(),
+                        )
+                        .await
+                        {
+                            Ok(Some(Ok(Message::Text(t)))) => t.to_string(),
+                            _ => {
+                                feed_notice("\r\n[Remote terminal closed during handshake.]\r\n");
+                                let _ = tx.send(Msg::Eof);
+                                return;
+                            }
+                        };
+
+                        let mut codec: Option<crate::hub::WsClientCodec> = None;
+                        if let (Some(material), Some(request_nonce)) = (material.as_deref(), nonce) {
+                            let first_val: Value = match serde_json::from_str(&first_msg) {
+                                Ok(v) => v,
+                                Err(err) => {
+                                    feed_notice(&format!("\r\n[Invalid remote handshake: {err}]\r\n"));
+                                    let _ = tx.send(Msg::Eof);
+                                    return;
+                                }
+                            };
+                            match crate::hub::WsClientCodec::open_first(
+                                &first_val,
+                                material,
+                                "GET /api/pty/ws",
+                                &request_nonce,
+                            ) {
+                                Ok((c, _hello)) => codec = Some(c),
+                                Err(err) => {
+                                    feed_notice(&format!(
+                                        "\r\n[Remote terminal encryption handshake failed: {err}]\r\n"
+                                    ));
+                                    let _ = tx.send(Msg::Eof);
+                                    return;
+                                }
+                            }
+                        }
+
+                        let ws = winsize(size);
+                        let open_plain = json!({
+                            "t": "open",
+                            "cwd": cwd_str,
+                            "cols": ws.cols,
+                            "rows": ws.rows,
+                            "px_w": ws.px_w,
+                            "px_h": ws.px_h,
+                        })
+                        .to_string();
+                        let open_wire = match codec.as_mut() {
+                            Some(c) => match c.seal(&open_plain) {
+                                Ok(w) => w,
+                                Err(_) => {
+                                    let _ = tx.send(Msg::Eof);
+                                    return;
+                                }
+                            },
+                            None => open_plain,
+                        };
+                        if socket.send(Message::text(open_wire)).await.is_err() {
+                            let _ = tx.send(Msg::Eof);
+                            return;
+                        }
+
+                        loop {
+                            tokio::select! {
+                                outbound = ws_out_rx.recv() => {
+                                    let Some(cmd) = outbound else {
+                                        break;
+                                    };
+                                    let plain = match cmd {
+                                        RemoteOut::Input(bytes) => json!({
+                                            "t": "input",
+                                            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                                        })
+                                        .to_string(),
+                                        RemoteOut::Resize(s) => {
+                                            let w = winsize(s);
+                                            json!({
+                                                "t": "resize",
+                                                "cols": w.cols,
+                                                "rows": w.rows,
+                                                "px_w": w.px_w,
+                                                "px_h": w.px_h,
+                                            })
+                                            .to_string()
+                                        }
+                                        RemoteOut::Close => {
+                                            let plain = r#"{"t":"close"}"#.to_string();
+                                            let wire = match codec.as_mut() {
+                                                Some(c) => c.seal(&plain).unwrap_or(plain),
+                                                None => plain,
+                                            };
+                                            let _ = socket.send(Message::text(wire)).await;
+                                            let _ = socket.close(None).await;
+                                            return;
+                                        }
+                                    };
+                                    let wire = match codec.as_mut() {
+                                        Some(c) => match c.seal(&plain) {
+                                            Ok(w) => w,
+                                            Err(_) => break,
+                                        },
+                                        None => plain,
+                                    };
+                                    if socket.send(Message::text(wire)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                incoming = socket.next() => {
+                                    let Some(Ok(msg)) = incoming else {
+                                        break;
+                                    };
+                                    match msg {
+                                        Message::Text(text) => {
+                                            let plain = match codec.as_mut() {
+                                                Some(c) => {
+                                                    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                                                        break;
+                                                    };
+                                                    match c.open(&v) {
+                                                        Ok(p) => p,
+                                                        Err(_) => break,
+                                                    }
+                                                }
+                                                None => text.to_string(),
+                                            };
+                                            let Ok(val) = serde_json::from_str::<Value>(&plain) else {
+                                                continue;
+                                            };
+                                            match val.get("t").and_then(Value::as_str) {
+                                                Some("output") => {
+                                                    if let Some(data) = val.get("data").and_then(Value::as_str) {
+                                                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
+                                                            if !bytes.is_empty() {
+                                                                *in_flight.bytes.lock().unwrap() += bytes.len();
+                                                                if tx.send(Msg::Bytes(bytes)).is_err() {
+                                                                    return;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Some("exit") => {
+                                                    let exit = if let Some(sig) = val.get("signal").and_then(Value::as_i64) {
+                                                        Exit::Signal(sig as i32)
+                                                    } else {
+                                                        Exit::Code(val.get("code").and_then(Value::as_i64).unwrap_or(0) as i32)
+                                                    };
+                                                    let _ = tx.send(Msg::Exited(exit));
+                                                    break;
+                                                }
+                                                Some("error") => {
+                                                    let msg = val.get("message").and_then(Value::as_str).unwrap_or("remote error");
+                                                    feed_notice(&format!("\r\n[Remote terminal error: {msg}]\r\n"));
+                                                    break;
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        Message::Ping(p) => {
+                                            if socket.send(Message::Pong(p)).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Message::Close(_) => break,
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        let _ = tx.send(Msg::Eof);
+                    });
+                })?;
+        }
+
+        // Emulator thread (same libghostty-vt loop as local sessions).
+        {
+            let latest = latest.clone();
+            let ended = ended.clone();
+            std::thread::Builder::new()
+                .name("muqun-term".into())
+                .spawn(move || {
+                    let _release = Release(in_flight.clone());
+                    let end = |how: Ended| {
+                        *ended.lock().unwrap() = Some(how);
+                        wake();
+                    };
+                    let mut engine = match Engine::new(size, colors) {
+                        Ok(e) => e,
+                        Err(err) => {
+                            tracing::warn!("terminal: could not start the emulator: {err}");
+                            end(Ended::Broken);
+                            return;
+                        }
+                    };
+                    let mut last = Instant::now() - FRAME_GAP;
+                    let mut pending = false;
+                    let mut how: Option<Ended> = None;
+                    let mut eof = false;
+                    let mut until = Instant::now();
+                    loop {
+                        if let Some(how) = how.filter(|_| eof || Instant::now() >= until) {
+                            if pending {
+                                if let Ok(Some(frame)) = engine.frame() {
+                                    *latest.lock().unwrap() = Some(frame);
+                                }
+                            }
+                            end(how);
+                            return;
+                        }
+                        let msg = if pending || how.is_some() {
+                            let mut wait =
+                                (last + FRAME_GAP).saturating_duration_since(Instant::now());
+                            if how.is_some() {
+                                wait = until.saturating_duration_since(Instant::now());
+                                if pending {
+                                    wait = wait.min(
+                                        (last + FRAME_GAP)
+                                            .saturating_duration_since(Instant::now()),
+                                    );
+                                }
+                            }
+                            match rx.recv_timeout(wait) {
+                                Ok(m) => Some(m),
+                                Err(RecvTimeoutError::Timeout) => None,
+                                Err(RecvTimeoutError::Disconnected) => return,
+                            }
+                        } else {
+                            match rx.recv() {
+                                Ok(m) => Some(m),
+                                Err(_) => return,
+                            }
+                        };
+                        let mut batch: Vec<Msg> = msg.into_iter().collect();
+                        let started = Instant::now();
+                        while started.elapsed() < FRAME_GAP {
+                            match rx.try_recv() {
+                                Ok(m) => batch.push(m),
+                                Err(mpsc::TryRecvError::Empty) => break,
+                                Err(mpsc::TryRecvError::Disconnected) => return,
+                            }
+                        }
+                        for m in batch {
+                            match m {
+                                Msg::Bytes(b) => {
+                                    engine.feed(&b);
+                                    let mut n = in_flight.bytes.lock().unwrap();
+                                    *n = n.saturating_sub(b.len());
+                                    in_flight.drained.notify_one();
+                                }
+                                Msg::Key(k) => log(engine.key(&k)),
+                                Msg::Text(t) => engine.text(&t),
+                                Msg::Paste(t) => log(engine.paste(&t)),
+                                Msg::Mouse(m) => log(engine.mouse(m)),
+                                Msg::Wheel { lines, x, y, mods } => {
+                                    log(engine.wheel(lines, x, y, mods))
+                                }
+                                Msg::Resize(s) => {
+                                    if engine.size() != s {
+                                        log(engine.resize(s));
+                                        let _ = ws_out_tx.send(RemoteOut::Resize(s));
+                                    }
+                                }
+                                Msg::Colors(c) => log(engine.set_colors(c)),
+                                Msg::Clear => log(engine.clear()),
+                                Msg::ScrollToRow(row) => engine.scroll_to_row(row),
+                                Msg::ScrollToBottom => engine.scroll_to_bottom(),
+                                Msg::DumpText(resp) => {
+                                    let _ = resp.send(engine.dump_plain_text().unwrap_or_default());
+                                }
+                                Msg::Eof => {
+                                    eof = true;
+                                    if how.is_none() {
+                                        how = Some(Ended::Shell(Exit::Code(0)));
+                                        until = Instant::now() + LAST_WORDS;
+                                    }
+                                }
+                                Msg::Exited(exit) => {
+                                    how = Some(Ended::Shell(exit));
+                                    until = Instant::now() + LAST_WORDS;
+                                }
+                                Msg::Shutdown => {
+                                    let _ = ws_out_tx.send(RemoteOut::Close);
+                                    return;
+                                }
+                            }
+                            pending = true;
+                        }
+                        let out = engine.take_output();
+                        if !out.is_empty()
+                            && how.is_none()
+                            && ws_out_tx.send(RemoteOut::Input(out)).is_err()
+                        {
+                            how = Some(Ended::Broken);
+                        }
+                        if pending && last.elapsed() >= FRAME_GAP {
+                            last = Instant::now();
+                            pending = false;
+                            match engine.frame() {
+                                Ok(Some(frame)) => {
+                                    *latest.lock().unwrap() = Some(frame);
+                                    wake();
+                                }
+                                Ok(None) => {}
+                                Err(err) => tracing::warn!("terminal frame: {err}"),
+                            }
+                        }
+                    }
+                })?;
+        }
+
+        Ok(Self {
+            inner: Arc::new(SessionInner { tx }),
+            latest,
+            ended,
+            cwd,
+            session_id: None,
+            remote_computer: Some(computer),
             started: Instant::now(),
         })
     }
@@ -585,6 +1013,7 @@ impl Session {
             ended,
             cwd,
             session_id: None,
+            remote_computer: None,
             started: Instant::now(),
         })
     }
@@ -610,8 +1039,12 @@ impl Session {
         rx.recv_timeout(Duration::from_millis(200)).ok()
     }
 
-    /// Explicitly closes the remote daemon session if backed by one.
+    /// Explicitly closes the local daemon session if backed by one.
     pub fn close_remote(&self) {
+        if self.remote_computer.is_some() {
+            self.send(Msg::Shutdown);
+            return;
+        }
         #[cfg(unix)]
         if let Some(id) = &self.session_id {
             let client = super::daemon::SyncDaemonClient::new(None);
@@ -643,5 +1076,286 @@ fn winsize(s: Size) -> WinSize {
 fn log(r: Result<(), libghostty_vt::Error>) {
     if let Err(err) = r {
         tracing::debug!("terminal: {err}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn start_remote_e2ee_v2_roundtrip_drives_emulator_and_resize() {
+        use base64::Engine as _;
+        use futures::{SinkExt as _, StreamExt as _};
+        use muqun_gateway::connectivity::transport;
+        use serde_json::{json, Value};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let material = [0x5au8; 32];
+        let transport_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(material);
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let (seen_resize_tx, seen_resize_rx) = std::sync::mpsc::channel();
+
+        // Spawn an E2EE v2 /api/pty/ws peer verifying Desktop's exact upgrade headers,
+        // per-frame AAD, open/input/resize frames, and exit handling.
+        let server = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                addr_tx.send(listener.local_addr().unwrap()).unwrap();
+                let (tcp, _) = listener.accept().await.unwrap();
+
+                let mut captured_nonce = None;
+                let mut socket = tokio_tungstenite::accept_hdr_async(
+                    tcp,
+                    |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                     mut resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                        assert_eq!(req.uri().path(), "/api/pty/ws");
+                        assert_eq!(
+                            req.headers().get("x-muqun-transport").and_then(|v| v.to_str().ok()),
+                            Some("1")
+                        );
+                        assert_eq!(
+                            req.headers().get("x-muqun-device").and_then(|v| v.to_str().ok()),
+                            Some("dev-desktop-test")
+                        );
+                        let env_b64 = req
+                            .headers()
+                            .get("x-muqun-envelope")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap();
+                        let env_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .decode(env_b64)
+                            .unwrap();
+                        let env: transport::Envelope = serde_json::from_slice(&env_bytes).unwrap();
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis();
+                        let pt = transport::open(
+                            &material,
+                            transport::Direction::Request,
+                            b"GET /api/pty/ws",
+                            &env,
+                            now_ms,
+                        )
+                        .unwrap();
+                        let payload: Value = serde_json::from_slice(&pt).unwrap();
+                        assert_eq!(payload["token"], "remote-secret-token");
+                        captured_nonce = Some(env.nonce);
+                        resp.headers_mut()
+                            .insert("x-muqun-transport", "1".parse().unwrap());
+                        Ok(resp)
+                    },
+                )
+                .await
+                .unwrap();
+
+                let nonce = captured_nonce.unwrap();
+                let cid = "conn-desktop-pty-1";
+                let server_key = transport::derive_ws_server_key(&material, cid, &nonce).unwrap();
+                let client_key = transport::derive_ws_client_key(&material, cid, &nonce).unwrap();
+                let mut send_seq = 0u64;
+                let mut recv_seq = 0u64;
+
+                let seal = |plain: &str, send_seq: &mut u64| -> String {
+                    let s = *send_seq;
+                    let aad = format!("GET /api/pty/ws\n{cid}\n{s}");
+                    let c = transport::seal_stream_event(
+                        &server_key,
+                        s,
+                        aad.as_bytes(),
+                        plain.as_bytes(),
+                    )
+                    .unwrap();
+                    *send_seq += 1;
+                    if s == 0 {
+                        json!({"cid": cid, "seq": s, "c": c}).to_string()
+                    } else {
+                        json!({"seq": s, "c": c}).to_string()
+                    }
+                };
+                let open = |wire: &str, recv_seq: &mut u64| -> Value {
+                    let v: Value = serde_json::from_str(wire).unwrap();
+                    let s = *recv_seq;
+                    assert_eq!(v["seq"].as_u64(), Some(s));
+                    let aad = format!("GET /api/pty/ws\n{cid}\n{s}");
+                    let pt = transport::open_stream_event(
+                        &client_key,
+                        s,
+                        aad.as_bytes(),
+                        v["c"].as_str().unwrap(),
+                    )
+                    .unwrap();
+                    *recv_seq += 1;
+                    serde_json::from_slice(&pt).unwrap()
+                };
+
+                // 1. Send hello
+                socket
+                    .send(Message::text(seal(
+                        &json!({"t": "hello", "connection_id": cid, "protocol": 1}).to_string(),
+                        &mut send_seq,
+                    )))
+                    .await
+                    .unwrap();
+
+                // 2. Receive open
+                let open_msg = socket.next().await.unwrap().unwrap();
+                let open_val = open(open_msg.to_text().unwrap(), &mut recv_seq);
+                assert_eq!(open_val["t"], "open");
+                assert_eq!(open_val["cwd"], "/srv/project");
+
+                // 3. Send opened + prompt output
+                socket
+                    .send(Message::text(seal(
+                        &json!({"t": "opened", "cwd": "/srv/project", "cols": 80, "rows": 24})
+                            .to_string(),
+                        &mut send_seq,
+                    )))
+                    .await
+                    .unwrap();
+                socket
+                    .send(Message::text(seal(
+                        &json!({
+                            "t": "output",
+                            "data": base64::engine::general_purpose::STANDARD.encode(b"REMOTE_READY$ "),
+                        })
+                        .to_string(),
+                        &mut send_seq,
+                    )))
+                    .await
+                    .unwrap();
+
+                // 4. Read resize + input, echo back, then exit 0
+                let mut saw_input = false;
+                let mut saw_resize = false;
+                while let Some(Ok(Message::Text(wire))) = socket.next().await {
+                    let msg = open(&wire, &mut recv_seq);
+                    match msg["t"].as_str() {
+                        Some("resize") => {
+                            saw_resize = msg["cols"] == 100 && msg["rows"] == 32;
+                            let _ = seen_resize_tx.send(saw_resize);
+                        }
+                        Some("input") => {
+                            let raw = base64::engine::general_purpose::STANDARD
+                                .decode(msg["data"].as_str().unwrap())
+                                .unwrap();
+                            let text = String::from_utf8_lossy(&raw);
+                            if text.contains("nvim '/srv/project/main.rs'") {
+                                saw_input = true;
+                                socket
+                                    .send(Message::text(seal(
+                                        &json!({
+                                            "t": "output",
+                                            "data": base64::engine::general_purpose::STANDARD
+                                                .encode(b"NVIM_OPENED_OK\r\n"),
+                                        })
+                                        .to_string(),
+                                        &mut send_seq,
+                                    )))
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                        _ => {}
+                    }
+                    if saw_input && saw_resize {
+                        socket
+                            .send(Message::text(seal(
+                                &json!({"t": "exit", "code": 0}).to_string(),
+                                &mut send_seq,
+                            )))
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                }
+            });
+        });
+
+        let addr = addr_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let gateway = crate::hub::LocalGateway {
+            url: format!("http://{addr}"),
+            token: "remote-secret-token".into(),
+            device_id: Some("dev-desktop-test".into()),
+            transport_key: Some(transport_key),
+        };
+        let session = Session::start_remote(
+            "studio-mac".into(),
+            gateway,
+            PathBuf::from("/srv/project"),
+            Size {
+                cols: 80,
+                rows: 24,
+                cell_w: 8,
+                cell_h: 17,
+            },
+            Colors {
+                fg: crate::term::grid::Rgb(255, 255, 255),
+                bg: crate::term::grid::Rgb(0, 0, 0),
+                cursor: crate::term::grid::Rgb(255, 255, 255),
+                selection: crate::term::grid::Rgb(64, 64, 64),
+                ansi: [crate::term::grid::Rgb(128, 128, 128); 16],
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if session
+                .dump_plain_text()
+                .is_some_and(|t| t.contains("REMOTE_READY$"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            session
+                .dump_plain_text()
+                .unwrap_or_default()
+                .contains("REMOTE_READY$"),
+            "remote prompt never reached libghostty-vt emulator"
+        );
+
+        session.send(Msg::Resize(Size {
+            cols: 100,
+            rows: 32,
+            cell_w: 8,
+            cell_h: 17,
+        }));
+        session.send(Msg::Text("nvim '/srv/project/main.rs'\n".into()));
+
+        assert!(
+            seen_resize_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or(false),
+            "remote server did not receive resized dimensions"
+        );
+        while Instant::now() < deadline {
+            if session.ended().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(session.ended(), Some(Ended::Shell(Exit::Code(0))));
+        let frame = session.take_frame().expect("final remote frame published");
+        let rendered: String = frame
+            .grid
+            .iter()
+            .map(|row| row.plain_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("NVIM_OPENED_OK"),
+            "expected NVIM_OPENED_OK in final rendered frame, got: {rendered:?}"
+        );
+        server.join().unwrap();
     }
 }

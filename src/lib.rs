@@ -104,6 +104,9 @@ pub(crate) struct AppState {
     /// The open `GET /api/ws` event sockets, for the per-device and total
     /// caps. See `agents::ws_routes`.
     pub(crate) ws_connections: Arc<agents::ws_routes::WsRegistry>,
+    /// The open `GET /api/pty/ws` interactive PTY sockets, for per-device and
+    /// total caps. See `terminal::pty_ws`.
+    pub(crate) pty_connections: Arc<terminal::pty_ws::PtyRegistry>,
     /// This process's instance generation: an opaque id minted once at start
     /// and never changed while the process lives. Everything the gateway
     /// keeps in memory -- the scrollback above all -- is only valid within

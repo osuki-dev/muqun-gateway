@@ -27,8 +27,12 @@ use crate::model::viewer::{self as files, FileKind, FileRef, Loaded, Meta};
 
 #[derive(Debug, Clone)]
 pub struct Viewer {
-    /// The local file, when the target is on this computer.
+    /// The local file (or cached local copy for a remote file).
     pub path: Option<PathBuf>,
+    /// Original path on a remote computer when previewing a remote session's file.
+    pub remote_path: Option<String>,
+    /// Owning remote computer ID when previewing a remote session's file.
+    pub remote_computer: Option<String>,
     pub name: String,
     pub kind: FileKind,
     pub meta: Meta,
@@ -113,6 +117,55 @@ impl UiState {
     /// Show `target` in the viewer overlay, replacing whatever it showed.
     pub fn open_file(&mut self, target: impl Into<FileRef>) {
         let target = target.into();
+        let active_comp = self.active_session_computer();
+        if Self::is_remote_computer_id(&active_comp) {
+            let session_dir = self.current().and_then(|i| i.directory.clone());
+            if let Some(raw_path) = target.remote_path(session_dir.as_deref()) {
+                let name = Path::new(&raw_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| target.display_name());
+                let kind = files::kind_of(Path::new(&name), target.mime());
+                if self.cfg.general.files_in_editor && kind.reads_text() {
+                    if let Some(editor) = crate::platform::editors::resolve_terminal_editor(
+                        self.cfg.general.editor_command.as_deref(),
+                        Some(self.cfg.general.editor),
+                    ) {
+                        self.open_remote_file_in_terminal(&active_comp, &raw_path, &editor);
+                        return;
+                    }
+                }
+                let mut meta = Meta::default();
+                if let FileRef::Asset { asset, .. } = &target {
+                    meta.size = asset.size;
+                }
+                let body = if let Some(asid) = self.selected.clone() {
+                    self.send(crate::model::commands::Command::ReadRemoteFile {
+                        asid: muqun_gateway::agents::AgentSessionId(asid),
+                        path: raw_path.clone(),
+                    });
+                    Body::Loading
+                } else {
+                    Body::Missing
+                };
+                self.viewer = Some(Viewer {
+                    path: None,
+                    remote_path: Some(raw_path),
+                    remote_computer: Some(active_comp),
+                    name,
+                    kind,
+                    meta,
+                    body,
+                    zoom: None,
+                    image_viewport: [0.0; 2],
+                    image_pan_start: None,
+                    source: false,
+                });
+                self.show_file_window();
+                return;
+            }
+        }
         let path = target.resolve();
         if let Some(folder) = path.as_deref().filter(|path| path.is_dir()) {
             crate::platform::shell::open_folder(folder);
@@ -146,6 +199,8 @@ impl UiState {
         };
         self.viewer = Some(Viewer {
             path,
+            remote_path: None,
+            remote_computer: None,
             name,
             kind,
             meta,
@@ -191,6 +246,8 @@ impl UiState {
         self.menu = None;
         self.zoom = Some(Box::new(Viewer {
             path,
+            remote_path: None,
+            remote_computer: None,
             name,
             kind: FileKind::Image,
             meta,
@@ -322,6 +379,54 @@ impl UiState {
         };
     }
 
+    /// A remote file read (`Command::ReadRemoteFile`) finished.
+    pub fn remote_file_loaded(
+        &mut self,
+        path: &str,
+        result: Result<crate::hub::RemoteFile, String>,
+    ) {
+        let Some(v) = self
+            .viewer
+            .as_mut()
+            .filter(|v| v.remote_path.as_deref() == Some(path))
+        else {
+            return;
+        };
+        match result {
+            Ok(rf) => {
+                v.name = rf.name.clone();
+                v.meta.size = rf.size.or(Some(rf.bytes.len() as u64));
+                v.kind = files::kind_of(Path::new(&rf.name), rf.mime.as_deref());
+                // Cache remote bytes locally for Save as… and image rendering.
+                let cached = cache_remote_file(&rf.name, &rf.bytes);
+                v.path = cached;
+                if v.kind == FileKind::Image {
+                    v.body = if v.path.is_some() {
+                        Body::Image(None)
+                    } else {
+                        Body::Failed("could not cache remote image".into())
+                    };
+                } else if v.kind.reads_text() || v.kind == FileKind::Other {
+                    v.body = match files::load_text_bytes(&rf.bytes) {
+                        Loaded::Text { text, truncated } => {
+                            if v.kind == FileKind::Other {
+                                v.kind = FileKind::Text(None);
+                            }
+                            text_body(text, truncated)
+                        }
+                        Loaded::Binary => Body::External,
+                        Loaded::Failed(err) => Body::Failed(err),
+                    };
+                } else {
+                    v.body = Body::External;
+                }
+            }
+            Err(err) => {
+                v.body = Body::Failed(err);
+            }
+        }
+    }
+
     /// Save as… finished.
     pub fn file_saved(&mut self, result: Result<PathBuf, String>) {
         let language = self.cfg.general.language;
@@ -330,6 +435,30 @@ impl UiState {
             Err(err) => self.toast(tr(language, "Could not save"), Some(err)),
         }
     }
+}
+
+/// Cache downloaded remote file bytes into a temporary file so image decoding
+/// and Save as… work identically to local files.
+fn cache_remote_file(name: &str, bytes: &[u8]) -> Option<PathBuf> {
+    let dir = std::env::temp_dir().join("muqun-remote-files");
+    std::fs::create_dir_all(&dir).ok()?;
+    let safe_name: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = dir.join(format!("{stamp}-{safe_name}"));
+    std::fs::write(&path, bytes).ok()?;
+    Some(path)
 }
 
 /// A text body: the gutter is built once here, not on every frame.
@@ -517,7 +646,17 @@ fn civil_date(when: SystemTime) -> String {
 
 fn header(s: &UiState, v: &Viewer, k: &Kit, fit_zoom: f32, layer: &mut Vec<El>) -> El {
     let language = s.cfg.general.language;
-    let folder = v.path.as_deref().and_then(Path::parent).map(home_relative);
+    let folder = match (&v.remote_path, &v.remote_computer) {
+        (Some(rpath), Some(comp)) => {
+            let parent = Path::new(rpath)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| rpath.clone());
+            Some(format!("{} · {parent}", s.computer_name(comp)))
+        }
+        _ => v.path.as_deref().and_then(Path::parent).map(home_relative),
+    };
     let mut title = col()
         .key("viewer-title")
         .grow(1.0)
@@ -602,7 +741,38 @@ fn header(s: &UiState, v: &Viewer, k: &Kit, fit_zoom: f32, layer: &mut Vec<El>) 
         }
         return bar;
     }
-    if let Some(path) = v.path.clone() {
+    if let (Some(rpath), Some(comp)) = (v.remote_path.clone(), v.remote_computer.clone()) {
+        let editor = crate::platform::editors::resolve_terminal_editor(
+            s.cfg.general.editor_command.as_deref(),
+            Some(s.cfg.general.editor),
+        )
+        .unwrap_or_else(|| "nvim".to_string());
+        let open_path = rpath;
+        let open_comp = comp;
+        let open_editor = editor;
+        bar = bar.child(
+            Button::new(tr_ref(language, "Open in editor"))
+                .icon(&OPEN_EXTERNAL)
+                .variant(ButtonVariant::Ghost)
+                .on_press(move |s: &mut UiState| {
+                    s.open_remote_file_in_terminal(&open_comp, &open_path, &open_editor);
+                })
+                .build(k)
+                .key("viewer-open-remote"),
+        );
+        if let Some(cached) = v.path.clone() {
+            bar = bar.child(
+                Button::new(tr_ref(language, "Save as…"))
+                    .icon(&DOWNLOAD)
+                    .variant(ButtonVariant::Outline)
+                    .on_press(move |_: &mut UiState| {
+                        crate::platform::dialogs::save_copy(cached.clone())
+                    })
+                    .build(k)
+                    .key("viewer-save"),
+            );
+        }
+    } else if let Some(path) = v.path.clone() {
         let open = path.clone();
         let reveal = path.clone();
         let is_text = v.kind.reads_text();
@@ -1052,7 +1222,21 @@ fn external(v: &Viewer, k: &Kit, language: Language) -> El {
                 .color(k.c.text_muted),
         )
         .child(text(what).font(k.ty.ui).color(k.c.text_muted));
-    if let Some(path) = v.path.clone() {
+    if v.remote_path.is_some() {
+        if let Some(cached) = v.path.clone() {
+            card = card.child(
+                Button::new(tr_ref(language, "Save as…"))
+                    .icon(&DOWNLOAD)
+                    .variant(ButtonVariant::Contrast)
+                    .on_press(move |_: &mut UiState| {
+                        crate::platform::dialogs::save_copy(cached.clone())
+                    })
+                    .build(k)
+                    .key("viewer-external-save")
+                    .mt(6.0),
+            );
+        }
+    } else if let Some(path) = v.path.clone() {
         let is_text = v.kind.reads_text();
         card = card.child(
             Button::new(if is_text {
@@ -1255,5 +1439,68 @@ mod tests {
     fn old_files_show_their_date() {
         let when = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_794_096_000);
         assert_eq!(civil_date(when), "2026-11-08");
+    }
+
+    #[test]
+    fn remote_file_opens_via_gateway_preview_or_remote_nvim() {
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.cfg.current_computer = "mini".into();
+        s.mode = crate::ui::Mode::Session;
+        s.selected = Some("sess-remote".into());
+        s.cfg.general.files_in_editor = false;
+
+        s.open_file(PathBuf::from("/Users/mini/work/main.rs"));
+        assert!(matches!(
+            s.viewer.as_ref().map(|v| (
+                &v.body,
+                v.remote_path.as_deref(),
+                v.remote_computer.as_deref()
+            )),
+            Some((
+                Body::Loading,
+                Some("/Users/mini/work/main.rs"),
+                Some("mini")
+            ))
+        ));
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            sent.iter().any(|cmd| matches!(
+                cmd,
+                crate::model::commands::Command::ReadRemoteFile { asid, path }
+                    if asid.0 == "sess-remote" && path == "/Users/mini/work/main.rs"
+            )),
+            "expected ReadRemoteFile in {sent:?}"
+        );
+
+        s.remote_file_loaded(
+            "/Users/mini/work/main.rs",
+            Ok(crate::hub::RemoteFile {
+                name: "main.rs".into(),
+                mime: Some("text/plain".into()),
+                size: Some(15),
+                bytes: b"fn main() {}\n".to_vec(),
+            }),
+        );
+        assert!(matches!(
+            s.viewer.as_ref().map(|v| &v.body),
+            Some(Body::Text { text, .. }) if text.as_ref() == "fn main() {}"
+        ));
+
+        // With Neovim + files_in_editor enabled, clicking a remote text file
+        // opens a remote terminal tab queued to run nvim on that remote path.
+        s.cfg.general.files_in_editor = true;
+        s.cfg.general.editor = crate::platform::editors::Editor::Neovim;
+        s.open_file(PathBuf::from("/Users/mini/work/lib.rs"));
+        assert!(s.viewer.is_none());
+        let tab = s.term.tabs.last().expect("remote editor terminal tab");
+        assert_eq!(
+            s.term.remote_tabs.get(&tab.id).map(String::as_str),
+            Some("mini")
+        );
+        assert_eq!(
+            tab.pending_command.as_deref(),
+            Some("nvim '/Users/mini/work/lib.rs'\n")
+        );
     }
 }

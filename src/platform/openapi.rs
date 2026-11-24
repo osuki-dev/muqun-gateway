@@ -887,6 +887,15 @@ pub fn openapi_spec() -> Value {
             "503":{"description":"agent_unavailable"}
         }
     }});
+    spec["paths"]["/api/pty/ws"] = json!({"get": {
+        "summary": "Interactive remote PTY over WebSocket",
+        "description": "Upgrade to a paired-device WebSocket backed by a real pseudo-terminal running the host owner's login shell. Frames use the same per-connection E2EE sealing as /api/ws. Client sends open(cwd, cols, rows), input(base64), resize, ping, close; server sends hello, opened, output(base64), exit, pong, error. Announced as remote_pty_v1 on Unix hosts.",
+        "responses": {
+            "101": {"description": "Switched to the WebSocket protocol"},
+            "429": {"description": "too_many_ptys: device or gateway PTY cap reached"},
+            "501": {"description": "pty_unsupported: host platform does not support remote PTY"}
+        }
+    }});
     spec["paths"]["/api/agent-sessions/{asid}/file-asset"] = json!({"get": {
         "summary": "Resolve a local file output inside an agent session",
         "description": "Requires device authentication and agent_file_assets capability. Resolves audio, video, images, documents and binary files inside the server-owned directory. Web URLs, path escapes and symlinks outside the root are refused. Returns data.asset metadata with an opaque id.",

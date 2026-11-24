@@ -203,6 +203,7 @@ pub(crate) fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppSt
         session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
         agent_runtime: agents::AgentRuntime::disabled(),
         ws_connections: Arc::new(agents::ws_routes::WsRegistry::default()),
+        pty_connections: Arc::new(terminal::pty_ws::PtyRegistry::default()),
         generation: new_generation(),
         message_images: Arc::default(),
         preview_cache: Arc::default(),

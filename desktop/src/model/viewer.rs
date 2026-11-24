@@ -81,6 +81,41 @@ impl FileRef {
             Self::Asset { asset, .. } => Some(asset.mime.as_str()).filter(|m| !m.is_empty()),
         }
     }
+
+    /// Raw file path or URI suitable for asking a remote Gateway's
+    /// `/api/agent-sessions/{asid}/file-asset` or opening in a remote editor.
+    pub fn remote_path(&self, session_dir: Option<&str>) -> Option<String> {
+        let raw = match self {
+            Self::Path(path) => path.to_string_lossy().into_owned(),
+            Self::Asset { asset, directory } => {
+                let raw = asset.src.trim();
+                if raw.is_empty() {
+                    return None;
+                }
+                let dir = directory.as_deref().or(session_dir);
+                return resolve_remote_uri(raw, dir);
+            }
+        };
+        resolve_remote_uri(raw.trim(), session_dir)
+    }
+}
+
+fn resolve_remote_uri(raw: &str, session_dir: Option<&str>) -> Option<String> {
+    if raw.is_empty() || raw.starts_with("http://") || raw.starts_with("https://") {
+        return None;
+    }
+    let cleaned = raw
+        .strip_prefix("file://localhost")
+        .or_else(|| raw.strip_prefix("file://"))
+        .unwrap_or(raw);
+    if cleaned.starts_with('/') || cleaned.starts_with("~/") || cleaned == "~" {
+        return Some(cleaned.to_owned());
+    }
+    if let Some(dir) = session_dir.map(str::trim).filter(|d| !d.is_empty()) {
+        let joined = format!("{}/{}", dir.trim_end_matches('/'), cleaned);
+        return Some(joined);
+    }
+    Some(cleaned.to_owned())
 }
 
 fn expand_home(path: &Path) -> PathBuf {
@@ -201,6 +236,33 @@ pub enum Loaded {
     Failed(String),
 }
 
+/// Decode raw bytes (e.g. fetched from a remote Gateway) into [`Loaded`],
+/// applying the same size cap and binary sniffing as [`load_text`].
+pub fn load_text_bytes(raw: &[u8]) -> Loaded {
+    let truncated = raw.len() as u64 > MAX_TEXT_BYTES;
+    let slice = if truncated {
+        &raw[..MAX_TEXT_BYTES as usize]
+    } else {
+        raw
+    };
+    if slice.iter().take(8192).any(|b| *b == 0) {
+        return Loaded::Binary;
+    }
+    let text = match std::str::from_utf8(slice) {
+        Ok(text) => text.to_owned(),
+        Err(err) if truncated && err.error_len().is_none() => {
+            std::str::from_utf8(&slice[..err.valid_up_to()])
+                .unwrap_or_default()
+                .to_owned()
+        }
+        Err(_) => return Loaded::Binary,
+    };
+    Loaded::Text {
+        text: Arc::from(text.replace("\r\n", "\n")),
+        truncated,
+    }
+}
+
 /// Read `path` as text, at most [`MAX_TEXT_BYTES`]. Blocking.
 pub fn load_text(path: &Path) -> Loaded {
     use std::io::Read as _;
@@ -212,26 +274,7 @@ pub fn load_text(path: &Path) -> Loaded {
     if let Err(err) = file.take(MAX_TEXT_BYTES + 1).read_to_end(&mut bytes) {
         return Loaded::Failed(err.to_string());
     }
-    let truncated = bytes.len() as u64 > MAX_TEXT_BYTES;
-    bytes.truncate(MAX_TEXT_BYTES as usize);
-    if bytes.iter().take(8192).any(|b| *b == 0) {
-        return Loaded::Binary;
-    }
-    let text = match String::from_utf8(bytes) {
-        Ok(text) => text,
-        // A cut in the middle of a character at the cap is still text.
-        Err(err) if truncated && err.utf8_error().error_len().is_none() => {
-            let valid = err.utf8_error().valid_up_to();
-            let mut bytes = err.into_bytes();
-            bytes.truncate(valid);
-            String::from_utf8(bytes).unwrap_or_default()
-        }
-        Err(_) => return Loaded::Binary,
-    };
-    Loaded::Text {
-        text: Arc::from(text.replace("\r\n", "\n")),
-        truncated,
-    }
+    load_text_bytes(&bytes)
 }
 
 /// Read `path` on a thread of its own; the result is posted to the UI.

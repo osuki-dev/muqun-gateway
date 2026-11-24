@@ -183,6 +183,11 @@ pub enum Update {
         asid: String,
         result: Result<Box<AgentSessionSnapshot>, String>,
     },
+    /// One remote file fetched over the remote computer's Gateway.
+    RemoteFileLoaded {
+        path: String,
+        result: Result<crate::hub::RemoteFile, String>,
+    },
     /// An agent's account rate windows as the gateway words them (`None`:
     /// the agent has none to show).
     AccountLimits {

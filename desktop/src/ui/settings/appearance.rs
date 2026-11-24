@@ -1,7 +1,7 @@
 //! Settings → Appearance: the current theme, then how the window draws it.
 
 use rune::{col, el, row as hrow, text, El};
-use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
+use rune_kit::{Button, ButtonVariant, ControlSize, Kit, Slider};
 
 use super::{choice, flag, group, row, SettingsTab};
 use crate::config::{Appearance, ConfigEdit, Density, Scheme, Shape};
@@ -215,6 +215,62 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                             ))
                         },
                     ),
+                ),
+                row(
+                    k,
+                    "window-opacity",
+                    tr_ref(language, "Window opacity"),
+                    tr_ref(language, "Adjust transparency across the entire desktop."),
+                    {
+                        let custom = ap.custom_opacity();
+                        let pct = (custom.unwrap_or(Appearance::DEFAULT_OPACITY) * 100.0).round();
+                        let label_text = if glass {
+                            tr(language, "Solid (100%)")
+                        } else if custom.is_some() {
+                            format!("{pct:.0}%")
+                        } else {
+                            format!("{} · {pct:.0}%", tr_ref(language, "Auto"))
+                        };
+                        hrow()
+                            .gap(10.0)
+                            .center_y()
+                            .children((custom.is_some() && !glass).then(|| {
+                                Button::new(tr_ref(language, "Reset"))
+                                    .variant(ButtonVariant::Ghost)
+                                    .control_size(ControlSize::Small)
+                                    .on_press(|s: &mut UiState| {
+                                        s.edit(ConfigEdit::WindowOpacity(None));
+                                    })
+                                    .build(k)
+                                    .key("window-opacity-reset")
+                            }))
+                            .child(
+                                text(label_text)
+                                    .font(k.ty.small_medium)
+                                    .color(if glass {
+                                        k.c.text_faint
+                                    } else {
+                                        k.c.text_muted
+                                    })
+                                    .w(72.0),
+                            )
+                            .child(
+                                Slider::new("window-opacity", if glass { 100.0 } else { pct })
+                                    .range((Appearance::MIN_OPACITY * 100.0)..=100.0)
+                                    .step(1.0)
+                                    .label(tr_ref(language, "Window opacity"))
+                                    .hide_label()
+                                    .value_text(format!("{pct:.0}%"))
+                                    .width(156.0)
+                                    .disabled(glass)
+                                    .on_change(|s: &mut UiState, value, _done| {
+                                        let alpha = (value.round() / 100.0)
+                                            .clamp(Appearance::MIN_OPACITY, 1.0);
+                                        s.edit(ConfigEdit::WindowOpacity(Some(alpha)));
+                                    })
+                                    .build(k),
+                            )
+                    },
                 ),
             ],
         ),

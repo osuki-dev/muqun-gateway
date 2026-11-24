@@ -221,6 +221,10 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // and tasks another computer opened (`origin: "peer"`,
     // `requested_by.kind == "gateway"`).
     "fleet_peers",
+    // `GET /api/pty/ws`: interactive remote PTY WebSocket for paired
+    // Desktop/App devices (Unix hosts only).
+    #[cfg(unix)]
+    "remote_pty_v1",
 ];
 
 /// Handing a task to an agent the app did not start, and following it home.

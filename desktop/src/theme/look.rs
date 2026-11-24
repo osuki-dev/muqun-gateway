@@ -13,7 +13,7 @@ use rune_kit::Kit;
 use crate::config::Appearance;
 
 /// What the materials may do this frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Look {
     pub glass: bool,
     /// The window is see-through: the frame around the sidebar and the
@@ -26,6 +26,9 @@ pub struct Look {
     pub blur: bool,
     pub motion: bool,
     pub dark: bool,
+    /// User's custom global desktop opacity (`0.35..=1.0`), when configured
+    /// and transparency is not reduced.
+    pub opacity: Option<f32>,
 }
 
 /// The most device pixels a window may have before frosted panels fall back
@@ -149,12 +152,44 @@ impl Look {
         let pixels = crate::ui::fx::viewport_pixels();
         let glass = !appearance.reduced_transparency && !lost;
         let see_through = glass && crate::platform::see_through_window();
+        let opacity = if glass {
+            appearance.custom_opacity()
+        } else {
+            None
+        };
         Self {
             glass,
             see_through,
             blur: glass && !see_through && pixels > 0.0 && pixels <= BLUR_PIXEL_BUDGET,
             motion: !appearance.reduced_motion,
             dark,
+            opacity,
+        }
+    }
+
+    /// Unified surface alpha across panels, cards, tiles, and drawers.
+    /// Returns `1.0` under reduce transparency, the user's custom opacity when
+    /// set, or `default_alpha` otherwise.
+    pub fn surface_alpha(&self, default_alpha: f32) -> f32 {
+        if !self.glass {
+            return 1.0;
+        }
+        match self.opacity {
+            Some(custom) => custom.clamp(Appearance::MIN_OPACITY, 1.0),
+            None => default_alpha,
+        }
+    }
+
+    /// Sidebar and secondary chrome alpha: tracks custom desktop opacity while
+    /// preserving a touch more translucency than the main card (solid at 100%).
+    pub fn sidebar_alpha(&self, default_alpha: f32) -> f32 {
+        if !self.glass {
+            return 1.0;
+        }
+        match self.opacity {
+            Some(custom) if custom >= 0.995 => 1.0,
+            Some(custom) => (custom * 0.92).clamp(0.30, 1.0),
+            None => default_alpha,
         }
     }
 
@@ -190,19 +225,26 @@ impl Look {
         if !self.glass {
             return k.c.surface_raised_base;
         }
-        let tint = match (self.blur, self.dark) {
+        let default_tint = match (self.blur, self.dark) {
             (true, true) => 0.62,
             (true, false) => 0.70,
             (false, true) => 0.86,
             (false, false) => 0.90,
         };
-        k.c.surface_raised_base.alpha(tint)
+        k.c.surface_raised_base
+            .alpha(self.surface_alpha(default_tint))
     }
 
     /// A quieter card for list items: the layer colour, hairline border.
     pub fn row_card(&self, k: &Kit, e: El, radius: f32) -> El {
         let fill = if self.glass {
-            k.c.layer_01.alpha(if self.dark { 0.55 } else { 0.65 })
+            let default_alpha = if self.dark { 0.55 } else { 0.65 };
+            let alpha = match self.opacity {
+                Some(custom) if custom >= 0.995 => 1.0,
+                Some(custom) => (custom * 0.84).clamp(0.25, 1.0),
+                None => default_alpha,
+            };
+            k.c.layer_01.alpha(alpha)
         } else {
             k.c.layer_01
         };
@@ -564,5 +606,35 @@ mod tests {
         let w = wash_for(white, &[(ink, 4.5)], 1.0);
         let o = safe_art_opacity(white, &[(ink, 4.5)], 1.0);
         assert!((1.0 - w - o).abs() < 1e-4);
+    }
+
+    #[test]
+    fn custom_window_opacity_applies_uniformly_and_respects_reduce_transparency() {
+        let mut ap = Appearance::default();
+        assert_eq!(ap.custom_opacity(), None);
+        let default_look = Look::of(&ap, true);
+        assert_eq!(default_look.surface_alpha(0.82), 0.82);
+
+        ap.window_opacity = Some(0.60);
+        let custom_look = Look::of(&ap, true);
+        assert!((custom_look.surface_alpha(0.82) - 0.60).abs() < 1e-4);
+        assert!((custom_look.panel_fill(&Kit::neutral(true)).a - 0.60).abs() < 1e-4);
+        assert!(custom_look.sidebar_alpha(0.50) < 0.60);
+
+        // Extreme values clamp to readable bounds.
+        ap.window_opacity = Some(0.05);
+        assert_eq!(ap.custom_opacity(), Some(Appearance::MIN_OPACITY));
+        ap.window_opacity = Some(1.0);
+        let solid_custom = Look::of(&ap, true);
+        assert_eq!(solid_custom.surface_alpha(0.82), 1.0);
+        assert_eq!(solid_custom.sidebar_alpha(0.50), 1.0);
+
+        // Reduce transparency overrides custom opacity back to solid 1.0.
+        ap.window_opacity = Some(0.50);
+        ap.reduced_transparency = true;
+        let reduced = Look::of(&ap, true);
+        assert_eq!(reduced.surface_alpha(0.82), 1.0);
+        assert_eq!(reduced.sidebar_alpha(0.50), 1.0);
+        assert_eq!(reduced.panel_fill(&Kit::neutral(true)).a, 1.0);
     }
 }

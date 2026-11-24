@@ -28,8 +28,15 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// One agent's session list, at most.
 /// Local agents answer in milliseconds; a hung adapter must not hold the
-/// sidebar for half a minute.
+/// sidebar forever, while busy RPC adapters (e.g. Codex running subagents)
+/// may legitimately take > 6 s to project titles.
 const LIST_TIMEOUT: Duration = Duration::from_secs(6);
+const SESSION_LIST_TIMEOUT: Duration = Duration::from_secs(15);
+const SESSION_LIST_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+];
 /// How long after startup newly attached agents are looked for: the gateway
 /// probes cold agents for up to `DISCOVERY_TIMEOUT` (60 s).
 const WATCH_AGENTS_FOR: Duration = Duration::from_secs(90);
@@ -546,6 +553,14 @@ impl Core {
                     asid: asid.0,
                     result: read.map(Box::new).map_err(|err| err.to_string()),
                 });
+            }
+            Command::ReadRemoteFile { asid, path } => {
+                let result = self
+                    .hub
+                    .read_file(&asid, &path)
+                    .await
+                    .map_err(|err| err.to_string());
+                self.inbox.push(Update::RemoteFileLoaded { path, result });
             }
             Command::LoadAccountLimits { agent } => {
                 let limits = match self.hub.account_limits(&agent).await {
@@ -1727,27 +1742,45 @@ impl Core {
             limit: Some(SESSION_LIST_LIMIT),
             ..SessionQuery::default()
         };
-        match tokio::time::timeout(LIST_TIMEOUT, self.hub.sessions(&agent, query)).await {
-            Ok(Ok(sessions)) => {
-                tracing::info!(agent, count = sessions.len(), "sessions listed");
-                let dirs = sessions
-                    .iter()
-                    .filter_map(|s| s.directory.clone())
-                    .collect();
-                self.inbox.push(Update::AgentSessions {
-                    agent: agent.clone(),
-                    sessions,
-                });
-                // Paint the list first; project catalogues and folder resolve
-                // continue in the background so a slow agent does not stall Home.
-                self.resolve_dirs(dirs, false);
-                let core = self.clone();
-                crate::hub::spawn_connected(async move {
-                    core.known_projects(agent).await;
-                });
+        let mut attempt = 0usize;
+        loop {
+            match tokio::time::timeout(
+                SESSION_LIST_TIMEOUT,
+                self.hub.sessions(&agent, query.clone()),
+            )
+            .await
+            {
+                Ok(Ok(sessions)) => {
+                    tracing::info!(agent, count = sessions.len(), "sessions listed");
+                    let dirs = sessions
+                        .iter()
+                        .filter_map(|s| s.directory.clone())
+                        .collect();
+                    self.inbox.push(Update::AgentSessions {
+                        agent: agent.clone(),
+                        sessions,
+                    });
+                    // Paint the list first; project catalogues and folder resolve
+                    // continue in the background so a slow agent does not stall Home.
+                    self.resolve_dirs(dirs, false);
+                    let core = self.clone();
+                    crate::hub::spawn_connected(async move {
+                        core.known_projects(agent).await;
+                    });
+                    return;
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(agent, attempt, %err, "session list failed");
+                }
+                Err(_) => {
+                    tracing::warn!(agent, attempt, "session list timed out");
+                }
             }
-            Ok(Err(err)) => tracing::warn!(agent, %err, "session list failed"),
-            Err(_) => tracing::warn!(agent, "session list timed out"),
+            let Some(&delay) = SESSION_LIST_RETRY_DELAYS.get(attempt) else {
+                return;
+            };
+            attempt += 1;
+            tokio::time::sleep(delay).await;
         }
     }
 

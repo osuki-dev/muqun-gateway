@@ -24,7 +24,7 @@ use crate::model::types::ListedSession;
 
 const DEFAULT_OPEN: usize = 3;
 const PER_PROJECT: usize = 8;
-const RECENT_LIMIT: usize = 8;
+const RECENT_LIMIT: usize = 16;
 const RECENT_AGE_MS: u64 = 3 * 24 * 60 * 60 * 1000;
 
 fn is_hidden_sidebar_session(s: &UiState, info: &muqun_gateway::agents::AgentSessionInfo) -> bool {
@@ -53,16 +53,26 @@ fn recent_sessions(s: &UiState, now: u64) -> Vec<&muqun_gateway::agents::AgentSe
         )
     };
     sessions.sort_by_cached_key(|info| std::cmp::Reverse(last_worked(info)));
+    let selected_root = s.selected.as_deref().and_then(|id| s.sidebar_root(id));
+    let open_tile_roots: std::collections::HashSet<&str> = s
+        .tiles
+        .iter()
+        .filter_map(|tile| tile.asid.as_deref())
+        .filter_map(|open| s.sidebar_root(open))
+        .collect();
+    let active_roots: std::collections::HashSet<&str> = s
+        .sessions
+        .iter()
+        .filter(|info| matches!(s.activity(info), Activity::Working | Activity::NeedsYou))
+        .filter_map(|info| s.sidebar_root(&info.asid.0))
+        .collect();
     let mut ordinary = 0;
     sessions.retain(|info| {
         let id = &info.asid.0;
-        if s.selected.as_deref().and_then(|id| s.sidebar_root(id)) == Some(id.as_str())
-            || s.tiles
-                .iter()
-                .filter_map(|tile| tile.asid.as_deref())
-                .any(|open| s.sidebar_root(open) == Some(id.as_str()))
+        if selected_root == Some(id.as_str())
+            || open_tile_roots.contains(id.as_str())
             || s.cfg.general.pinned.contains(id)
-            || matches!(s.activity(info), Activity::Working | Activity::NeedsYou)
+            || active_roots.contains(id.as_str())
         {
             return true;
         }
@@ -1260,6 +1270,43 @@ mod tests {
         s.search = TextEdit::new("");
         s.selected = Some("current".into());
         assert!(listed(&s).contains(&"historic".into()));
+    }
+
+    #[test]
+    fn closing_a_tile_keeps_its_session_in_recent_sidebar_and_refresh_preserves_working_sessions() {
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let old = now_ms() - RECENT_AGE_MS - 1;
+        let mut busy = session("codex-busy", old);
+        busy.status = muqun_gateway::agents::AgentSessionStatus::Busy;
+        s.sessions = vec![
+            session("keep-open", now_ms()),
+            session("closed-tile", old),
+            busy,
+        ];
+        s.tiles = vec![
+            crate::ui::Tile::session("keep-open"),
+            crate::ui::Tile::session("closed-tile"),
+        ];
+        s.focus_tile(0);
+        s.close_tile(1);
+        let ids: Vec<_> = recent_sessions(&s, now_ms())
+            .iter()
+            .map(|i| i.asid.0.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"closed-tile"),
+            "closing a tile must not hide its session from Recent sessions: {ids:?}"
+        );
+        // A partial/stale AgentSessions list must never evict a currently working session.
+        s.apply_updates(vec![crate::model::inbox::Update::AgentSessions {
+            agent: "codex".into(),
+            sessions: vec![session("keep-open", now_ms())],
+        }]);
+        assert!(
+            s.session_by_id("codex-busy").is_some(),
+            "working Codex session must survive a partial AgentSessions refresh"
+        );
     }
 
     #[test]

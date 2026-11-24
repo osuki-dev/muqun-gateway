@@ -652,6 +652,15 @@ impl SessionHub for DynamicHub {
         Box::pin(async move { active.search(query).await })
     }
 
+    fn read_file<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        path: &'a str,
+    ) -> HubFuture<'a, super::RemoteFile> {
+        let active = self.active();
+        Box::pin(async move { active.read_file(asid, path).await })
+    }
+
     fn events(&self) -> broadcast::Receiver<AgentDomainEvent> {
         if let Ok(events) = CONNECTION.try_with(|c| c.hub.events()) {
             return events;
