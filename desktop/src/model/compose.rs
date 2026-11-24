@@ -203,25 +203,22 @@ fn queued_files(value: &Value) -> Vec<QueuedFile> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if !top.is_empty() {
-        return top
+    if !payload_files.is_empty() {
+        return payload_files
             .into_iter()
             .enumerate()
             .map(|(i, mut file)| {
-                if let Some(hint) = payload_files.get(i) {
-                    if !hint.image && file.image {
-                        // keep image flag from name/path
+                if let Some(att) = top.get(i) {
+                    file.image = file.image || att.image;
+                    if file.name == "attachment" && att.name != "attachment" {
+                        file.name = att.name.clone();
                     }
-                    if file.name == "attachment" {
-                        file.name = hint.name.clone();
-                    }
-                    file.image = file.image || hint.image;
                 }
                 file
             })
             .collect();
     }
-    payload_files
+    top
 }
 
 /// Where an attachment's bytes come from.
@@ -956,6 +953,31 @@ mod tests {
         assert!(items[0].files[0].image);
         assert!(items[0].files[0].path.ends_with("shot.png"));
         assert_eq!(items[0].files[0].name, "shot.png");
+    }
+
+    #[test]
+    fn inbox_files_prefer_host_upload_path_over_rewritten_image_api_url() {
+        let items = InboxItem::list(&[json!({
+            "id": "pic-rewritten",
+            "delivery": "queue",
+            "payload": {
+                "text": "edited queued prompt",
+                "files": [{
+                    "uri": "file:///home/ryu/.local/share/muqun-gateway/uploads/1234.png",
+                    "name": "1234.png",
+                    "mime": "image/png"
+                }]
+            },
+            "attachments": ["/api/agent-images/ai_abc123/original"]
+        })]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].files.len(), 1);
+        assert_eq!(
+            items[0].files[0].path,
+            "/home/ryu/.local/share/muqun-gateway/uploads/1234.png"
+        );
+        assert_eq!(items[0].files[0].name, "1234.png");
+        assert!(items[0].files[0].image);
     }
 
     #[test]
