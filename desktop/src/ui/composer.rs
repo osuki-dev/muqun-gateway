@@ -250,8 +250,8 @@ pub fn context_capsule(k: &Kit, look: &crate::theme::look::Look, content: El) ->
     look.panel(k, content.px(14.0).py(8.0), k.radius.xl)
 }
 
-/// A borderless frosted surface with a luminous theme-accent gradient focus
-/// highlight (no hard border stroke).
+/// A borderless frosted surface with a silky animated theme-accent gradient
+/// aura on focus (zero hard border stroke).
 pub fn composer_card(
     k: &Kit,
     look: &crate::theme::look::Look,
@@ -261,68 +261,36 @@ pub fn composer_card(
     drop_hover: bool,
 ) -> El {
     let active = focused || drop_hover;
-    let base = look.panel_fill(k);
-    let (a_mix, i_mix, end_mix) = match (active, look.dark) {
-        (true, true) => (0.20, 0.12, 0.10),
-        (true, false) => (0.14, 0.08, 0.06),
-        (false, true) => (0.04, 0.02, 0.04),
-        (false, false) => (0.03, 0.02, 0.04),
-    };
+    let [c0, _, _] = look.highlight_colors(k);
     let card = look
         .panel(k, card, k.radius.xl)
-        .linear_gradient(
-            0.65,
-            [
-                (0.0, base.mix(k.c.bg_accent, a_mix)),
-                (0.52, base.mix(k.c.info.icon, i_mix)),
-                (1.0, base.mix(k.c.bg_accent, end_mix)),
-            ],
-        )
-        .border(0.0, k.c.bg_accent.alpha(0.0))
+        .border(0.0, c0.alpha(0.0))
         .box_shadow(rune::Shadow {
             x: 0.0,
-            y: 6.0,
-            blur: 22.0,
+            y: if active { 8.0 } else { 4.0 },
+            blur: if active { 26.0 } else { 18.0 },
             spread: -8.0,
-            color: k.c.black.alpha(if look.dark { 0.45 } else { 0.10 }),
+            color: k.c.black.alpha(if look.dark { 0.44 } else { 0.09 }),
             inset: false,
         })
         .motion(look.focus_fade());
-    let card = look.glow(card, k.c.bg_accent, if active { 0.58 } else { 0.0 });
-    let sheen = el()
-        .key("composer-focus-sheen")
-        .pin(Some(0.0), Some(0.0), Some(0.0), None)
-        .h(34.0)
-        .radius(k.radius.xl)
-        .linear_gradient(
-            0.35,
-            [
-                (
-                    0.0,
-                    k.c.bg_accent.alpha(if look.dark { 0.22 } else { 0.15 }),
-                ),
-                (
-                    0.45,
-                    k.c.info.icon.alpha(if look.dark { 0.10 } else { 0.06 }),
-                ),
-                (1.0, k.c.bg_accent.alpha(0.0)),
-            ],
-        )
-        .opacity(if active { 1.0 } else { 0.0 })
-        .opacity_motion(look.focus_fade())
-        .a11y_hidden();
-    let card = card.child(if active && look.motion {
-        look.breathe(sheen)
-    } else {
-        sheen
-    });
+    let card = look.glow(card, c0, if active { 0.38 } else { 0.0 });
     if busy && look.motion && look.glass && super::fx::fx_enabled() {
         card.child(
             el().key("composer-energy")
                 .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                 .radius(k.radius.xl)
                 .effect(super::fx::COMPOSER_RIM)
-                .effect_data(super::fx::data(k.c.bg_accent, 1.8))
+                .effect_data(super::fx::data(c0, 1.25))
+                .a11y_hidden(),
+        )
+    } else if active && look.glass && super::fx::fx_enabled() {
+        card.child(
+            el().key("composer-focus-aura")
+                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .radius(k.radius.xl)
+                .effect(super::fx::FOCUS_AURA)
+                .effect_data(super::fx::data(c0, 1.0))
                 .a11y_hidden(),
         )
     } else {

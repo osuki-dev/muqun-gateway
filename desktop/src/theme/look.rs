@@ -272,11 +272,22 @@ impl Look {
         }
     }
 
+    /// Vivid 3-stop theme highlight palette `[primary, secondary, bridge]` for
+    /// borderless gradient glows and animated focus auras.
+    ///
+    /// Some light themes (such as `scene-voyager`) intentionally use near-black
+    /// ink (`#151719`) as `bg_accent`; painting a translucent glow in ink looks
+    /// like muddy grey soot. When `bg_accent` lacks chroma, we pull the theme's
+    /// authentic vivid cursor/link/ANSI accents instead.
+    pub fn highlight_colors(&self, k: &Kit) -> [rune::Color; 3] {
+        highlight_colors_for(k, self.dark)
+    }
+
     /// Borderless lit glass chrome shared by workspace windows and the input
-    /// deck: zero hard outline; active focus is carried by ambient accent
+    /// deck: zero hard outline; active focus is carried by soft ambient theme
     /// luminescence and depth shadow.
     pub fn luminous(&self, k: &Kit, e: El, active: bool) -> El {
-        let accent = k.c.bg_accent;
+        let [accent, _, _] = self.highlight_colors(k);
         let e = e.border(0.0, accent.alpha(0.0)).box_shadow(Shadow {
             x: 0.0,
             y: 12.0,
@@ -285,46 +296,28 @@ impl Look {
             color: k.c.black.alpha(if self.dark { 0.48 } else { 0.10 }),
             inset: false,
         });
-        self.glow(e, accent, if active { 0.85 } else { 0.0 })
+        self.glow(e, accent, if active { 0.42 } else { 0.0 })
     }
 
-    /// A borderless top aurora wash tinted with the theme's accent and info
-    /// highlights, fading smoothly to transparent without any outline stroke.
-    pub fn focus_aurora(&self, k: &Kit, key: &str, active: bool) -> El {
-        let top = k.c.bg_accent.alpha(if self.dark { 0.24 } else { 0.16 });
-        let mid = k.c.info.icon.alpha(if self.dark { 0.10 } else { 0.07 });
-        let clear = k.c.bg_accent.alpha(0.0);
-        let wash = el()
-            .key(key.to_string())
-            .h(84.0)
-            .linear_gradient(0.28, [(0.0, top), (0.48, mid), (1.0, clear)])
-            .opacity(if active { 1.0 } else { 0.0 })
-            .opacity_motion(self.focus_fade())
-            .a11y_hidden();
-        if active && self.motion {
-            self.breathe(wash)
-        } else {
-            wash
-        }
-    }
-
-    /// A two-tone edge light; glows smoothly in the theme's accent gradient.
+    /// A two-tone edge light; glows smoothly in the theme's highlight gradient.
+    #[allow(dead_code)]
     pub fn energy_line(&self, k: &Kit, key: &str, busy: bool) -> El {
+        let [c0, c1, _] = self.highlight_colors(k);
         let line = el()
             .key(key.to_string())
-            .h(2.5)
+            .h(2.0)
             .linear_gradient(
                 std::f32::consts::FRAC_PI_2,
                 [
-                    (0.0, k.c.bg_accent.alpha(0.0)),
-                    (0.18, k.c.bg_accent),
-                    (0.55, k.c.info.icon),
-                    (0.82, k.c.bg_accent),
-                    (1.0, k.c.bg_accent.alpha(0.0)),
+                    (0.0, c0.alpha(0.0)),
+                    (0.20, c0),
+                    (0.55, c1),
+                    (0.80, c0),
+                    (1.0, c0.alpha(0.0)),
                 ],
             )
             .a11y_hidden();
-        let line = self.spark(line, k.c.bg_accent);
+        let line = self.spark(line, c0);
         if busy && self.motion {
             self.pulse(line)
         } else {
@@ -419,6 +412,130 @@ impl Look {
             e
         }
     }
+}
+
+fn oklab_chroma(c: rune::Color) -> f32 {
+    let [_, a, b, _] = c.to_oklab();
+    (a * a + b * b).sqrt()
+}
+
+fn oklab_rotate(c: rune::Color, radians: f32) -> rune::Color {
+    let [l, a, b, alpha] = c.to_oklab();
+    let (sin, cos) = radians.sin_cos();
+    rune::Color::from_oklab([l, a * cos - b * sin, a * sin + b * cos, alpha])
+}
+
+fn lift_luminous(c: rune::Color, dark: bool) -> rune::Color {
+    let [l, a, b, _] = c.to_oklab();
+    let target_l = if dark {
+        l.clamp(0.62, 0.84)
+    } else {
+        l.clamp(0.54, 0.72)
+    };
+    let chroma = (a * a + b * b).sqrt();
+    let scale = if chroma > 0.001 && chroma < 0.12 {
+        (0.12 / chroma).min(1.35)
+    } else {
+        1.0
+    };
+    rune::Color::from_oklab([target_l, a * scale, b * scale, 1.0])
+}
+
+fn distinct_hue(a: rune::Color, b: rune::Color) -> bool {
+    let [_, aa, ab, _] = a.to_oklab();
+    let [_, ba, bb, _] = b.to_oklab();
+    let ca = (aa * aa + ab * ab).sqrt();
+    let cb = (ba * ba + bb * bb).sqrt();
+    if ca < 0.03 || cb < 0.03 {
+        return false;
+    }
+    let cos = ((aa * ba + ab * bb) / (ca * cb)).clamp(-1.0, 1.0);
+    cos < 0.82
+}
+
+/// Extract a vivid 3-stop highlight spectrum `[c0, c1, c2]` from the current
+/// theme (using `terminal.cursor`/`link`/ANSI when `bg_accent` is ink-neutral).
+pub fn highlight_colors_for(k: &Kit, dark: bool) -> [rune::Color; 3] {
+    let scheme = if dark {
+        crate::theme::color_scheme::ColorScheme::Dark
+    } else {
+        crate::theme::color_scheme::ColorScheme::Light
+    };
+    let term = crate::theme::apply::terminal(scheme);
+    let parse = |s: &str| rune::color::hex(s);
+    let term_cursor = term.as_ref().and_then(|t| parse(&t.cursor));
+    let term_link = term.as_ref().and_then(|t| parse(&t.link));
+    let term_violet = term
+        .as_ref()
+        .and_then(|t| t.ansi.get(5))
+        .and_then(|s| parse(s));
+    let term_amber = term
+        .as_ref()
+        .and_then(|t| t.ansi.get(3))
+        .and_then(|s| parse(s));
+
+    let raw_c0 = if oklab_chroma(k.c.bg_accent) >= 0.045 {
+        k.c.bg_accent
+    } else if let Some(c) = term_cursor.filter(|c| oklab_chroma(*c) >= 0.045) {
+        c
+    } else if let Some(c) = term_link.filter(|c| oklab_chroma(*c) >= 0.045) {
+        c
+    } else {
+        rune::Color::from_oklab([if dark { 0.74 } else { 0.60 }, 0.08, 0.11, 1.0])
+    };
+    let c0 = lift_luminous(raw_c0, dark);
+
+    let raw_c1 = [Some(k.c.info.icon), term_link, term_violet, term_amber]
+        .into_iter()
+        .flatten()
+        .find(|c| oklab_chroma(*c) >= 0.045 && distinct_hue(c0, *c))
+        .unwrap_or_else(|| oklab_rotate(c0, 0.95));
+    let c1 = lift_luminous(raw_c1, dark);
+
+    let raw_c2 = [term_violet, term_amber, Some(k.c.warning.icon)]
+        .into_iter()
+        .flatten()
+        .find(|c| oklab_chroma(*c) >= 0.045 && distinct_hue(c0, *c) && distinct_hue(c1, *c))
+        .unwrap_or_else(|| oklab_rotate(c0, -0.75));
+    let c2 = lift_luminous(raw_c2, dark);
+
+    [c0, c1, c2]
+}
+
+/// Companion theme highlight stops `[c1, c2]` for a GPU shader given `c0`
+/// (linear RGB) and the current light/dark scheme.
+pub fn companion_highlight_colors(c0: rune::Color, dark: bool) -> [rune::Color; 3] {
+    let scheme = if dark {
+        crate::theme::color_scheme::ColorScheme::Dark
+    } else {
+        crate::theme::color_scheme::ColorScheme::Light
+    };
+    let term = crate::theme::apply::terminal(scheme);
+    let parse = |s: &str| rune::color::hex(s);
+    let term_link = term.as_ref().and_then(|t| parse(&t.link));
+    let term_violet = term
+        .as_ref()
+        .and_then(|t| t.ansi.get(5))
+        .and_then(|s| parse(s));
+    let term_amber = term
+        .as_ref()
+        .and_then(|t| t.ansi.get(3))
+        .and_then(|s| parse(s));
+
+    let c0 = lift_luminous(c0, dark);
+    let c1 = [term_link, term_violet, term_amber]
+        .into_iter()
+        .flatten()
+        .find(|c| oklab_chroma(*c) >= 0.045 && distinct_hue(c0, *c))
+        .map(|c| lift_luminous(c, dark))
+        .unwrap_or_else(|| lift_luminous(oklab_rotate(c0, 0.95), dark));
+    let c2 = [term_violet, term_amber]
+        .into_iter()
+        .flatten()
+        .find(|c| oklab_chroma(*c) >= 0.045 && distinct_hue(c0, *c) && distinct_hue(c1, *c))
+        .map(|c| lift_luminous(c, dark))
+        .unwrap_or_else(|| lift_luminous(oklab_rotate(c0, -0.75), dark));
+    [c0, c1, c2]
 }
 
 #[cfg(test)]

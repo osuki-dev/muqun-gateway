@@ -27,6 +27,10 @@ pub const GLOW: u32 = 1;
 pub const METAL: u32 = 3;
 /// A highlight circulating around a busy composer's rounded outline.
 pub const COMPOSER_RIM: u32 = 4;
+/// A soft, borderless animated theme-gradient aura hugging a focused composer.
+pub const FOCUS_AURA: u32 = 5;
+/// A calmer borderless animated theme-gradient aura hugging a focused split pane.
+pub const TILE_AURA: u32 = 6;
 
 impl UiState {
     /// Whether views may emit effect slots this frame.
@@ -109,7 +113,33 @@ fn to_rgb(d: [f32; 4]) -> Rgb {
     ])
 }
 
-fn layer(kind: u32, d: [f32; 4], shape: Shape, t: f32, reduced: bool) -> Option<FxLayer> {
+fn color_to_rgb(c: rune::Color) -> Rgb {
+    Rgb([
+        c.r.clamp(0.0, 1.0),
+        c.g.clamp(0.0, 1.0),
+        c.b.clamp(0.0, 1.0),
+    ])
+}
+
+fn aura_triad(d: [f32; 4], dark: bool) -> [Rgb; 3] {
+    let base = rune::Color {
+        r: d[0].clamp(0.0, 1.0),
+        g: d[1].clamp(0.0, 1.0),
+        b: d[2].clamp(0.0, 1.0),
+        a: 1.0,
+    };
+    let [c0, c1, c2] = crate::theme::look::companion_highlight_colors(base, dark);
+    [color_to_rgb(c0), color_to_rgb(c1), color_to_rgb(c2)]
+}
+
+fn layer(
+    kind: u32,
+    d: [f32; 4],
+    shape: Shape,
+    t: f32,
+    reduced: bool,
+    dark: bool,
+) -> Option<FxLayer> {
     let fx = match kind {
         GLOW => rune_fx::Fx::glow(GlowParams {
             style: GlowStyle::Soft,
@@ -121,22 +151,62 @@ fn layer(kind: u32, d: [f32; 4], shape: Shape, t: f32, reduced: bool) -> Option<
             occlusion: 0.1,
             ..Default::default()
         }),
-        COMPOSER_RIM => rune_fx::Fx::glow(GlowParams {
-            // One bright lobe and two unlit stops give the accent a single
-            // lap around the actual perimeter, including the corner arcs.
-            style: GlowStyle::Aura,
-            color: to_rgb(d),
-            core: Rgb([0.0; 3]),
-            third: Rgb([0.0; 3]),
-            radius: 3.0,
-            rim_width: 1.15,
-            intensity: d[3],
-            inner: 0.22,
-            occlusion: 0.0,
-            aura_speed: 0.22,
-            hot: 0.0,
-            ..Default::default()
-        }),
+        COMPOSER_RIM => {
+            let [c0, c1, c2] = aura_triad(d, dark);
+            rune_fx::Fx::glow(GlowParams {
+                style: GlowStyle::Aura,
+                color: c0,
+                core: c1,
+                third: c2,
+                radius: 10.0,
+                rim_width: 1.0,
+                intensity: d[3].clamp(0.0, 2.0) * if dark { 1.0 } else { 0.72 },
+                inner: if dark { 0.56 } else { 0.48 },
+                occlusion: if dark { 0.35 } else { 0.88 },
+                aura_speed: 0.26,
+                hot: if dark { 0.28 } else { 0.14 },
+                reach: 2.8,
+                ..Default::default()
+            })
+        }
+        FOCUS_AURA => {
+            let [c0, c1, c2] = aura_triad(d, dark);
+            rune_fx::Fx::glow(GlowParams {
+                style: GlowStyle::Aura,
+                color: c0,
+                core: c1,
+                third: c2,
+                radius: 13.0,
+                rim_width: 0.8,
+                intensity: d[3].clamp(0.0, 1.5) * if dark { 0.84 } else { 0.64 },
+                inner: if dark { 0.56 } else { 0.44 },
+                occlusion: if dark { 0.50 } else { 0.92 },
+                breathe: 0.14,
+                breathe_period: 4.2,
+                aura_speed: 0.13,
+                hot: 0.0,
+                reach: 2.6,
+                ..Default::default()
+            })
+        }
+        TILE_AURA => {
+            let [c0, c1, c2] = aura_triad(d, dark);
+            rune_fx::Fx::glow(GlowParams {
+                style: GlowStyle::Aura,
+                color: c0,
+                core: c1,
+                third: c2,
+                radius: 11.0,
+                rim_width: 0.8,
+                intensity: d[3].clamp(0.0, 1.5) * if dark { 0.62 } else { 0.46 },
+                inner: if dark { 0.40 } else { 0.32 },
+                occlusion: if dark { 0.45 } else { 0.90 },
+                aura_speed: 0.08,
+                hot: 0.0,
+                reach: 2.4,
+                ..Default::default()
+            })
+        }
         METAL => {
             let tint = to_rgb(d);
             // Chrome lit through the theme's accent: a cool studio, a warm tint.
@@ -223,6 +293,7 @@ impl Compositor<UiState> for Fx {
         let mut layers: Vec<FxLayer> = Vec::new();
         let mut slots: Vec<FxSlot> = Vec::new();
         let rim_active = f.rt.state.demo || crate::platform::notify::window_focused();
+        let dark = f.rt.state.look().dark;
         for (n, i) in f.rt.instances.iter().enumerate() {
             if i.params[1] != KIND_EFFECT {
                 continue;
@@ -231,10 +302,18 @@ impl Compositor<UiState> for Fx {
             if kind == COMPOSER_RIM && (reduced || !rim_active) {
                 continue;
             }
+            let layer_reduced = reduced || (matches!(kind, FOCUS_AURA | TILE_AURA) && !rim_active);
             let k = i.params[3].max(1e-3);
             let [x, y, w, h] = i.rect.map(|v| v / k);
             let r = i.radii.iter().fold(0.0f32, |a, v| a.max(v.abs())) / k;
-            let Some(l) = layer(kind, i.uv, Shape::rounded(x, y, w, h, r), t, reduced) else {
+            let Some(l) = layer(
+                kind,
+                i.uv,
+                Shape::rounded(x, y, w, h, r),
+                t,
+                layer_reduced,
+                dark,
+            ) else {
                 continue;
             };
             at.push(n as u32);

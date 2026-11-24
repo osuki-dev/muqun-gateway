@@ -1248,19 +1248,19 @@ fn tile(
             .opacity_motion(look.focus_fade())
             .a11y_hidden(),
     );
-    body = body.child(look.focus_aurora(k, "tile-focus-aurora", focused).pin(
-        Some(0.0),
-        Some(0.0),
-        Some(0.0),
-        None,
-    ));
-    body = body.child(
-        look.energy_line(k, "window-energy", focused)
-            .pin(Some(0.0), Some(0.0), Some(0.0), None)
-            .opacity(if focused { 1.0 } else { 0.0 })
-            .opacity_motion(look.focus_fade()),
-    );
-    look.luminous(k, body, focused)
+    let split_focus = focused && s.tiles.len() > 1;
+    if split_focus && look.glass && super::fx::fx_enabled() {
+        let [c0, _, _] = look.highlight_colors(k);
+        body = body.child(
+            el().key("tile-focus-aura")
+                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .radius(radius)
+                .effect(super::fx::TILE_AURA)
+                .effect_data(super::fx::data(c0, 1.0))
+                .a11y_hidden(),
+        );
+    }
+    look.luminous(k, body, split_focus)
         .role("region")
         .label(format!(
             "{} {}",
@@ -1365,6 +1365,7 @@ fn drop_preview_overlay(s: &UiState, k: &Kit) -> Option<El> {
     let zone = drag.zone?;
     let rect = placed_rects(s).into_iter().find(|(i, _)| *i == dst)?.1;
     let [x, y, pw, ph] = dwindle::drop_preview_rect(rect, zone);
+    let [c0, c1, _] = s.look().highlight_colors(k);
     Some(
         el().key("tile-drop-preview")
             .motion(layout_motion(s))
@@ -1375,11 +1376,11 @@ fn drop_preview_overlay(s: &UiState, k: &Kit) -> Option<El> {
             .h(ph)
             .radius(k.radius.md)
             .linear_gradient(
-                0.65,
+                std::f32::consts::FRAC_PI_2,
                 [
-                    (0.0, k.c.bg_accent.alpha(0.28)),
-                    (0.55, k.c.info.icon.alpha(0.18)),
-                    (1.0, k.c.bg_accent.alpha(0.12)),
+                    (0.0, c0.alpha(0.24)),
+                    (0.55, c1.alpha(0.18)),
+                    (1.0, c0.alpha(0.12)),
                 ],
             )
             .a11y_hidden(),

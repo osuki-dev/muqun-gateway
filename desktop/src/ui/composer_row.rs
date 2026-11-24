@@ -506,17 +506,15 @@ fn pill_button(
     if square {
         e = e.w(ICON_PILL).min_w(ICON_PILL).px(0.0);
     }
+    let [c0, c1, _] = crate::theme::look::highlight_colors_for(k, k.dark);
     let mut e = e
         .h(32.0)
         .radius(if square { ICON_PILL / 2.0 } else { k.radius.lg })
-        .border(0.0, k.c.bg_accent.alpha(0.0));
+        .border(0.0, c0.alpha(0.0));
     if open {
         e = e.linear_gradient(
-            0.8,
-            [
-                (0.0, k.c.bg_accent.alpha(0.20)),
-                (1.0, k.c.info.icon.alpha(0.14)),
-            ],
+            std::f32::consts::FRAC_PI_2,
+            [(0.0, c0.alpha(0.20)), (1.0, c1.alpha(0.14))],
         );
     } else {
         e = e.fill(k.c.layer_01.alpha(0.38));
@@ -822,17 +820,15 @@ fn permission_control(
         OpenMenu::Mode,
     );
     if summary.warn {
+        let [c0, _, c2] = crate::theme::look::highlight_colors_for(k, k.dark);
         let a = if open { 0.24 } else { 0.16 };
-        let b = if open { 0.14 } else { 0.08 };
+        let b = if open { 0.16 } else { 0.10 };
         trigger = trigger
             .linear_gradient(
-                0.85,
-                [
-                    (0.0, k.c.warning.icon.alpha(a)),
-                    (1.0, k.c.bg_accent.alpha(b)),
-                ],
+                std::f32::consts::FRAC_PI_2,
+                [(0.0, c0.alpha(a)), (1.0, c2.alpha(b))],
             )
-            .border(0.0, k.c.warning.icon.alpha(0.0));
+            .border(0.0, c0.alpha(0.0));
     }
     let menu = Menu::new(format!("mode-{}", c.asid.0))
         .placement(rune_kit::Placement::TopStart)
