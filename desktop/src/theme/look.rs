@@ -276,9 +276,9 @@ impl Look {
     /// borderless gradient glows and animated focus auras.
     ///
     /// Some light themes (such as `scene-voyager`) intentionally use near-black
-    /// ink (`#151719`) as `bg_accent`; painting a translucent glow in ink looks
-    /// like muddy grey soot. When `bg_accent` lacks chroma, we pull the theme's
-    /// authentic vivid cursor/link/ANSI accents instead.
+    /// ink as `bg_accent`; painting a translucent glow in ink looks like muddy
+    /// grey soot. When `bg_accent` lacks chroma, we pull the theme's authentic
+    /// vivid cursor/link/ANSI accents instead.
     pub fn highlight_colors(&self, k: &Kit) -> [rune::Color; 3] {
         highlight_colors_for(k, self.dark)
     }
