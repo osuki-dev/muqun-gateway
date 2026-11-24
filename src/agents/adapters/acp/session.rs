@@ -197,6 +197,17 @@ pub trait AcpProvider: Send + Sync + 'static {
     ) -> AgentFuture<'a, Vec<TimelineItem>> {
         unsupported("reading a session held by a terminal")
     }
+    /// Whether [`Self::preview_timeline`] can read recent messages directly
+    /// from the native store without spawning an ACP child.
+    const PREVIEW_TIMELINE: bool = false;
+    fn preview_timeline<'a>(
+        _directory: &'a str,
+        _id: &'a str,
+        _limit: usize,
+        _stop: &'a CancellationToken,
+    ) -> AgentFuture<'a, Vec<TimelineItem>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
     /// The model and effort the native store says the session last ran
     /// with, applied when it is loaded so it does not fall back to the
     /// agent's default. `None` when the store records none.
@@ -3064,18 +3075,6 @@ impl<P: AcpProvider> AcpDriver<P> {
                 "ACP runtime stopped while loading a session".into(),
             ));
         }
-        if P::IDLE_RETIREMENT {
-            let _inspection = self.inspection.lock().await;
-            if let Ok(snapshot) =
-                P::recovery_snapshot(&self.binary, directory, &native_id, &self.stop).await
-            {
-                if snapshot.session_id == native_id
-                    && Self::snapshot_matches_projection(&snapshot, &state.projection)
-                {
-                    state.recovery = Some(RecoveryEvidence::Loaded(snapshot.checkpoint()));
-                }
-            }
-        }
         // Native replay ids need not survive a load. Only a fully validated
         // replacement may replace the old snapshot; no replay row is broadcast.
         let snapshot = AgentSessionSnapshot {
@@ -3172,6 +3171,34 @@ impl<P: AcpProvider> AcpDriver<P> {
             self.tx.clone(),
             self.stop.child_token(),
         );
+        // Compute idle-retirement recovery evidence asynchronously so opening
+        // a cold session does not block first paint on a second full-file parse.
+        if P::IDLE_RETIREMENT {
+            let session = session.clone();
+            let inspection = self.inspection.clone();
+            let binary = self.binary.clone();
+            let directory = directory.to_owned();
+            let native_id = native_id.clone();
+            let stop = self.stop.child_token();
+            tokio::spawn(async move {
+                let _inspection = inspection.lock().await;
+                if stop.is_cancelled() || session.finished.is_cancelled() {
+                    return;
+                }
+                if let Ok(snapshot) =
+                    P::recovery_snapshot(&binary, &directory, &native_id, &stop).await
+                {
+                    let mut state = session.state.lock().await;
+                    if !state.prompted
+                        && state.recovery.is_none()
+                        && snapshot.session_id == native_id
+                        && Self::snapshot_matches_projection(&snapshot, &state.projection)
+                    {
+                        state.recovery = Some(RecoveryEvidence::Loaded(snapshot.checkpoint()));
+                    }
+                }
+            });
+        }
         Ok(session)
     }
 
@@ -5377,6 +5404,36 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
                 })
                 .collect();
             Ok(timeline)
+        })
+    }
+    fn preview_timeline<'a>(
+        &'a self,
+        id: &'a str,
+        limit: usize,
+    ) -> AgentFuture<'a, Option<Vec<TimelineItem>>> {
+        Box::pin(async move {
+            if !P::PREVIEW_TIMELINE {
+                return Ok(None);
+            }
+            let info = match self.mirror.session_info(&AgentSessionId::from(id)).await {
+                Some(info) => info,
+                None => match self.native_session_info(id).await {
+                    Ok(info) => info,
+                    Err(_) => return Ok(None),
+                },
+            };
+            let Some(directory) = info.directory.as_deref() else {
+                return Ok(None);
+            };
+            let native_id = self
+                .native_ids
+                .lock()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| id.to_owned());
+            let items = P::preview_timeline(directory, &native_id, limit, &self.stop).await?;
+            Ok((!items.is_empty()).then_some(items))
         })
     }
     /// ACP's `pending` covers a tool call the agent is already executing:

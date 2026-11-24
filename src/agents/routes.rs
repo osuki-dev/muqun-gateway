@@ -1150,18 +1150,39 @@ async fn retained_history_window(
 ) -> ApiResult<Json<Value>> {
     validate_history_cursor(cursor)?;
     let manager = session_manager_or_err(state, asid).await?;
-    let window = manager
+    let session_id = AgentSessionId(asid.to_owned());
+    let window = match manager
         .sessions()
-        .retained_window(&AgentSessionId(asid.to_owned()), cursor)
+        .retained_window(&session_id, cursor)
         .await
         .map_err(agent_error)?
-        .ok_or_else(|| {
-            api_error(
+    {
+        Some(window) => window,
+        None if cursor.is_none() => {
+            let snapshot = manager
+                .sessions()
+                .preview_snapshot(&session_id)
+                .await
+                .ok_or_else(|| {
+                    api_error(
+                        StatusCode::NOT_FOUND,
+                        "not_retained",
+                        "The Gateway holds no history for this session",
+                    )
+                })?;
+            super::adapters::memory_mirror::history_window::HistoryWindow {
+                snapshot,
+                history_cursor: None,
+            }
+        }
+        None => {
+            return Err(api_error(
                 StatusCode::NOT_FOUND,
                 "not_retained",
                 "The Gateway holds no history for this session",
-            )
-        })?;
+            ));
+        }
+    };
     project_history_window(state, asid, window).await
 }
 

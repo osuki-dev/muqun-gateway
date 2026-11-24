@@ -406,6 +406,145 @@ fn replay_updates(chain: &[Chained]) -> Vec<Value> {
     updates
 }
 
+/// Maximum bytes read from the tail of a Claude Code transcript for instant
+/// cold-open preview before ACP `session/load` finishes in the background.
+const PREVIEW_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Fast, bounded tail preview of a Claude Code transcript without starting an
+/// ACP child process. Even on multi-hundred-MB transcripts this reads at most
+/// [`PREVIEW_TAIL_BYTES`] from the end and stops walking `parentUuid` cleanly
+/// at the start of the window.
+fn tail_chain_from(
+    path: &Path,
+    id: &str,
+    tail_bytes: u64,
+    stop: &CancellationToken,
+) -> Result<Vec<Chained>, AgentError> {
+    use std::io::{Seek, SeekFrom};
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).map_err(|_| unavailable())?;
+    let meta = file.metadata().map_err(|_| unavailable())?;
+    if !meta.is_file() {
+        return Err(unavailable());
+    }
+    let len = meta.len();
+    let skip_first = len > tail_bytes;
+    if skip_first {
+        file.seek(SeekFrom::Start(len - tail_bytes))
+            .map_err(|_| unavailable())?;
+    }
+    let mut reader = std::io::BufReader::with_capacity(256 * 1024, &file);
+    let mut buffer = Vec::new();
+    let mut total = 0u64;
+    if skip_first {
+        let _ = next_line(&mut reader, &mut buffer, &mut total);
+    }
+    let mut nodes: HashMap<String, (Option<String>, Chained)> = HashMap::new();
+    let mut leaf = None;
+    let mut records = 0usize;
+    loop {
+        if stop.is_cancelled() || total > tail_bytes.saturating_add(MAX_LINE as u64) {
+            break;
+        }
+        let line = match next_line(&mut reader, &mut buffer, &mut total) {
+            Ok(Some(line)) => line,
+            Ok(None) | Err(_) => break,
+        };
+        if buffer.is_empty() || metadata_type(&buffer).is_some() || matches!(line, Line::Oversized)
+        {
+            continue;
+        }
+        records += 1;
+        if records > MAX_RECORDS {
+            break;
+        }
+        let Ok(record) = serde_json::from_slice::<Record>(&buffer) else {
+            continue;
+        };
+        if record
+            .session_id
+            .as_deref()
+            .is_some_and(|native| native != id)
+        {
+            continue;
+        }
+        let Some(uuid) = record.uuid.clone() else {
+            continue;
+        };
+        if record.is_sidechain {
+            continue;
+        }
+        let node = node(&record);
+        let chained = Chained {
+            uuid: uuid.clone(),
+            node,
+            kind: record.kind.clone(),
+            message_id: record.message.as_ref().and_then(|m| m.id.clone()),
+            content: record.message.and_then(|m| m.content),
+        };
+        nodes.insert(uuid.clone(), (record.parent_uuid, chained));
+        leaf = Some(uuid);
+    }
+    let Some(mut next) = leaf else {
+        return Ok(Vec::new());
+    };
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
+    while seen.insert(next.clone()) {
+        let Some((parent, chained)) = nodes.remove(&next) else {
+            break;
+        };
+        chain.push(chained);
+        match parent {
+            Some(parent) => next = parent,
+            None => break,
+        }
+    }
+    chain.reverse();
+    Ok(chain)
+}
+
+/// Recent timeline items read directly from the tail of Claude Code's native
+/// `.jsonl` file, used to paint cold sessions immediately while ACP wakes.
+pub(crate) async fn tail_timeline(
+    directory: &str,
+    id: &str,
+    limit: usize,
+    stop: &CancellationToken,
+) -> Result<Vec<crate::agents::domain::TimelineItem>, AgentError> {
+    if !valid_session_id(id) || !Path::new(directory).is_absolute() {
+        return Ok(Vec::new());
+    }
+    let Some(root) = projects_root() else {
+        return Ok(Vec::new());
+    };
+    let (directory, id, stop) = (directory.to_owned(), id.to_owned(), stop.clone());
+    tokio::task::spawn_blocking(move || {
+        let Ok(path) = find_exact(&root, &directory, &id) else {
+            return Ok(Vec::new());
+        };
+        let chain = tail_chain_from(&path, &id, PREVIEW_TAIL_BYTES, &stop)?;
+        let mut projection = crate::agents::adapters::acp::mapper::Projection::new(false);
+        for update in replay_updates(&chain) {
+            let _ = projection.update(&update);
+        }
+        let mut items = projection.timeline();
+        if limit > 0 && items.len() > limit {
+            items.drain(..items.len() - limit);
+        }
+        Ok(items)
+    })
+    .await
+    .map_err(|_| unavailable())?
+}
+
 /// The timeline of a transcript another process is still writing, read-only.
 pub(crate) async fn live_timeline(
     directory: &str,
@@ -835,6 +974,40 @@ mod tests {
         // An unfinished append is not settled evidence.
         std::fs::write(&path, format!("{}\n{{\"type\":\"user\"", lines[0])).unwrap();
         assert!(inspect_file(&path, id, &CancellationToken::new()).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tail_timeline_reads_recent_turns_when_tail_window_truncates_earlier_history() {
+        let id = "00000000-0000-4000-8000-000000000003";
+        let big_pad = "x".repeat(4096);
+        let lines = [
+            json!({"type":"user","uuid":"u1","parentUuid":null,"sessionId":id,
+                   "origin":{"kind":"human"},"message":{"content":[{"type":"text","text":big_pad}]}}),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":id,
+                   "message":{"id":"m1","content":[{"type":"text","text":big_pad}]}}),
+            json!({"type":"user","uuid":"u2","parentUuid":"a1","sessionId":id,
+                   "origin":{"kind":"human"},"message":{"content":[{"type":"text","text":"Recent question"}]}}),
+            json!({"type":"assistant","uuid":"a2","parentUuid":"u2","sessionId":id,
+                   "message":{"id":"m2","content":[{"type":"text","text":"Recent answer"}]}}),
+        ];
+        let (dir, path) = write(&lines, "");
+        // Window smaller than the whole file, large enough for the final turn.
+        let chain = tail_chain_from(&path, id, 1024, &CancellationToken::new()).unwrap();
+        let mut projection = crate::agents::adapters::acp::mapper::Projection::new(false);
+        for update in replay_updates(&chain) {
+            let _ = projection.update(&update);
+        }
+        let timeline = projection.timeline();
+        assert!(timeline.len() >= 2, "{timeline:?}");
+        assert!(timeline.iter().any(|item| matches!(
+            &item.part,
+            crate::agents::domain::AgentPart::Text { text } if text.contains("Recent question")
+        )));
+        assert!(timeline.iter().any(|item| matches!(
+            &item.part,
+            crate::agents::domain::AgentPart::Text { text } if text.contains("Recent answer")
+        )));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

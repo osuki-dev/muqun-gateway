@@ -705,6 +705,16 @@ pub trait AgentPort: Send + Sync {
         Box::pin(async { Err(AgentError::Unsupported("fork_session".into())) })
     }
 
+    /// Fast read-only preview of recent timeline items directly from local
+    /// storage without starting or waking the agent process.
+    fn preview_timeline<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _limit: usize,
+    ) -> AgentFuture<'a, Option<Vec<TimelineItem>>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Clear a staged revert
     fn clear_revert<'a>(&'a self, _session_id: &'a str) -> AgentFuture<'a, ()> {
         Box::pin(async { Err(AgentError::Unsupported("clear_revert".into())) })

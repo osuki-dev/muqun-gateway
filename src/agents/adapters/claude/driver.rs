@@ -57,6 +57,15 @@ impl AcpProvider for ClaudeProvider {
     ) -> AgentFuture<'a, Vec<crate::agents::domain::TimelineItem>> {
         Box::pin(super::recovery::live_timeline(directory, id, stop))
     }
+    const PREVIEW_TIMELINE: bool = true;
+    fn preview_timeline<'a>(
+        directory: &'a str,
+        id: &'a str,
+        limit: usize,
+        stop: &'a tokio_util::sync::CancellationToken,
+    ) -> AgentFuture<'a, Vec<crate::agents::domain::TimelineItem>> {
+        Box::pin(super::recovery::tail_timeline(directory, id, limit, stop))
+    }
     fn transcript_model<'a>(
         directory: &'a str,
         id: &'a str,

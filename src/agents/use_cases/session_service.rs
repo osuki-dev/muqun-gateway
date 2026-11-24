@@ -196,6 +196,38 @@ impl SessionService {
         Some(snapshot)
     }
 
+    /// Fast read-only preview of recent messages from local native storage
+    /// without waking the agent or marking the mirror initialized.
+    pub async fn preview_snapshot(&self, asid: &AgentSessionId) -> Option<AgentSessionSnapshot> {
+        let timeline = self
+            .agent
+            .preview_timeline(&asid.0, 100)
+            .await
+            .ok()
+            .flatten()?;
+        if timeline.is_empty() {
+            return None;
+        }
+        let cached_info = match &self.memory {
+            Some(memory) => memory.session_info(asid).await,
+            None => None,
+        };
+        let mut info = match cached_info {
+            Some(info) => info,
+            None => self.agent.get_session(&asid.0).await.ok()?,
+        };
+        self.stamp(&mut info);
+        self.observe_runtime(&mut info).await;
+        Some(AgentSessionSnapshot {
+            info,
+            timeline,
+            permissions: Vec::new(),
+            forms: Vec::new(),
+            inbox: Vec::new(),
+            seq: 0,
+        })
+    }
+
     pub async fn get_snapshot(
         &self,
         asid: &AgentSessionId,

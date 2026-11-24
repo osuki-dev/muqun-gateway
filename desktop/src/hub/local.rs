@@ -342,9 +342,14 @@ impl SessionHub for LocalHub {
     fn peek<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Option<AgentSessionSnapshot>> {
         Box::pin(async move {
             let manager = self.manager_for_session(asid).await?;
-            let Some(mut snapshot) = manager.sessions().retained_snapshot(asid).await else {
-                return Ok(None);
+            let snapshot = match manager.sessions().retained_snapshot(asid).await {
+                Some(snapshot) => snapshot,
+                None => match manager.sessions().preview_snapshot(asid).await {
+                    Some(snapshot) => snapshot,
+                    None => return Ok(None),
+                },
             };
+            let mut snapshot = snapshot;
             enrich_local_media(&mut snapshot);
             Ok(Some(snapshot))
         })
