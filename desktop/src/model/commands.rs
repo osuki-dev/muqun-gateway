@@ -313,6 +313,21 @@ pub enum Command {
         base_commit: Option<String>,
         base_commits: std::collections::BTreeMap<String, String>,
     },
+    /// Load external upstream MCP servers from the active Gateway's MCP Hub.
+    LoadMcpUpstreams,
+    /// Create or update one upstream MCP server in the active Gateway's MCP Hub.
+    UpsertMcpUpstream {
+        id: String,
+        body: crate::hub::McpUpstreamUpsert,
+    },
+    /// Delete one upstream MCP server from the active Gateway's MCP Hub.
+    DeleteMcpUpstream {
+        id: String,
+    },
+    /// Live-probe one upstream MCP server in the active Gateway's MCP Hub.
+    ProbeMcpUpstream {
+        id: String,
+    },
 }
 
 pub type CommandSender = mpsc::UnboundedSender<Command>;

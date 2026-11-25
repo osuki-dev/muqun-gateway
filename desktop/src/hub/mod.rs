@@ -41,6 +41,86 @@ pub struct RemoteFile {
     pub bytes: Vec<u8>,
 }
 
+/// Transport definition for one upstream MCP server in Muqun's unified MCP Hub.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpUpstreamTransport {
+    Http {
+        url: String,
+        #[serde(default)]
+        headers: std::collections::BTreeMap<String, String>,
+    },
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: std::collections::BTreeMap<String, String>,
+    },
+}
+
+/// Preview of one tool discovered from an upstream MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpUpstreamToolPreview {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// One upstream MCP server as returned by `GET /api/mcp/upstreams`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpUpstreamView {
+    pub id: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default = "default_true_desktop")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub isolation: String,
+    #[serde(default)]
+    pub timeout_s: u64,
+    pub transport: McpUpstreamTransport,
+    #[serde(default)]
+    pub healthy: bool,
+    #[serde(default)]
+    pub tool_count: usize,
+    #[serde(default)]
+    pub skill_count: usize,
+    #[serde(default)]
+    pub tools: Vec<McpUpstreamToolPreview>,
+    #[serde(default)]
+    pub last_probed_ms: Option<u64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+fn default_true_desktop() -> bool {
+    true
+}
+
+/// Payload for `PUT /api/mcp/upstreams/{id}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpUpstreamUpsert {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub enabled: bool,
+    pub scope: String,
+    pub isolation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u64>,
+    pub transport: McpUpstreamTransport,
+}
+
+/// Why loading MCP Hub upstreams failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpHubError {
+    Unsupported(String),
+    Failed(String),
+}
+
 /// The agent a fresh install suggests first.
 pub const OPENCODE: &str = "opencode";
 
@@ -721,6 +801,46 @@ pub trait SessionHub: Send + Sync {
         Box::pin(async {
             Err(HubError::Agent(AgentError::Unsupported(
                 "remote file read".into(),
+            )))
+        })
+    }
+    /// List external upstream MCP servers configured in Gateway's unified MCP Hub.
+    fn list_mcp_upstreams(&self) -> HubFuture<'_, Vec<McpUpstreamView>> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "Connect to a Gateway service with mcp_hub_v1 to manage unified MCP servers."
+                    .into(),
+            )))
+        })
+    }
+    /// Create or update one upstream MCP server in Gateway's unified MCP Hub.
+    fn upsert_mcp_upstream<'a>(
+        &'a self,
+        _id: &'a str,
+        _body: McpUpstreamUpsert,
+    ) -> HubFuture<'a, McpUpstreamView> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "Connect to a Gateway service with mcp_hub_v1 to manage unified MCP servers."
+                    .into(),
+            )))
+        })
+    }
+    /// Delete one upstream MCP server from Gateway's unified MCP Hub.
+    fn delete_mcp_upstream<'a>(&'a self, _id: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "Connect to a Gateway service with mcp_hub_v1 to manage unified MCP servers."
+                    .into(),
+            )))
+        })
+    }
+    /// Probe one upstream MCP server live and return updated health/tools.
+    fn probe_mcp_upstream<'a>(&'a self, _id: &'a str) -> HubFuture<'a, McpUpstreamView> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "Connect to a Gateway service with mcp_hub_v1 to manage unified MCP servers."
+                    .into(),
             )))
         })
     }

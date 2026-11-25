@@ -45,6 +45,8 @@ const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const CAPABILITIES_FRESH: Duration = Duration::from_secs(60);
 /// The capability `GET /api/search` comes with.
 const SEARCH_CAPABILITY: &str = "session_search_v1";
+/// The capability `/api/mcp/upstreams*` comes with.
+const MCP_HUB_CAPABILITY: &str = "mcp_hub_v1";
 
 fn now_unix_ms() -> u128 {
     std::time::SystemTime::now()
@@ -1822,6 +1824,81 @@ impl SessionHub for RemoteHub {
                 size,
                 bytes,
             })
+        })
+    }
+
+    fn list_mcp_upstreams(&self) -> HubFuture<'_, Vec<super::McpUpstreamView>> {
+        Box::pin(async move {
+            if !self.has_capability(MCP_HUB_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "This Gateway needs the MCP Hub update (mcp_hub_v1).".into(),
+                )));
+            }
+            let json = self
+                .call(Method::GET, &["api", "mcp", "upstreams"], &[], None)
+                .await?;
+            decode(json.get("upstreams").cloned().unwrap_or_else(|| json!([])))
+        })
+    }
+
+    fn upsert_mcp_upstream<'a>(
+        &'a self,
+        id: &'a str,
+        body: super::McpUpstreamUpsert,
+    ) -> HubFuture<'a, super::McpUpstreamView> {
+        Box::pin(async move {
+            if !self.has_capability(MCP_HUB_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "This Gateway needs the MCP Hub update (mcp_hub_v1).".into(),
+                )));
+            }
+            let payload = serde_json::to_value(&body).map_err(|e| {
+                HubError::Agent(AgentError::InvalidRequest(format!(
+                    "invalid upstream payload: {e}"
+                )))
+            })?;
+            let json = self
+                .call(
+                    Method::PUT,
+                    &["api", "mcp", "upstreams", id],
+                    &[],
+                    Some(payload),
+                )
+                .await?;
+            decode(json.get("upstream").cloned().unwrap_or(Value::Null))
+        })
+    }
+
+    fn delete_mcp_upstream<'a>(&'a self, id: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            if !self.has_capability(MCP_HUB_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "This Gateway needs the MCP Hub update (mcp_hub_v1).".into(),
+                )));
+            }
+            Self::unit(
+                self.call(Method::DELETE, &["api", "mcp", "upstreams", id], &[], None)
+                    .await,
+            )
+        })
+    }
+
+    fn probe_mcp_upstream<'a>(&'a self, id: &'a str) -> HubFuture<'a, super::McpUpstreamView> {
+        Box::pin(async move {
+            if !self.has_capability(MCP_HUB_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "This Gateway needs the MCP Hub update (mcp_hub_v1).".into(),
+                )));
+            }
+            let json = self
+                .call(
+                    Method::POST,
+                    &["api", "mcp", "upstreams", id, "probe"],
+                    &[],
+                    None,
+                )
+                .await?;
+            decode(json.get("upstream").cloned().unwrap_or(Value::Null))
         })
     }
 

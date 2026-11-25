@@ -68,6 +68,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "native_agent_push",
     "agent_mcp",
     crate::mcp::files::CAPABILITY,
+    crate::mcp::hub::CAPABILITY,
     "agent_models",
     "agent_permissions",
     "agent_sessions",

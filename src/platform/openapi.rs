@@ -1376,6 +1376,36 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
             }}),
         ),
         (
+            "/api/mcp/upstreams",
+            json!({ "get": {
+                "summary": "List external upstream MCP servers registered in Muqun's unified MCP Hub (sensitive headers/env masked). Requires a device token and mcp_hub_v1",
+                "responses": ok_response()
+            }}),
+        ),
+        (
+            "/api/mcp/upstreams/{id}",
+            json!({
+                "put": {
+                    "summary": "Create or update an external upstream MCP server in Muqun's unified MCP Hub. Requires a device token and mcp_hub_v1",
+                    "parameters": [path_param("id")],
+                    "responses": ok_response()
+                },
+                "delete": {
+                    "summary": "Remove an external upstream MCP server from Muqun's unified MCP Hub. Requires a device token and mcp_hub_v1",
+                    "parameters": [path_param("id")],
+                    "responses": ok_response()
+                }
+            }),
+        ),
+        (
+            "/api/mcp/upstreams/{id}/probe",
+            json!({ "post": {
+                "summary": "Connect to an upstream MCP server, refresh its cached tools/skills catalog, and return live health status. Requires a device token and mcp_hub_v1",
+                "parameters": [path_param("id")],
+                "responses": ok_response()
+            }}),
+        ),
+        (
             "/api/pair/pending",
             json!({ "post": {
                 "summary": "Mint a pairing code on the owner's behalf for a device not in front of this computer: another gateway being linked (kind gateway). Requires the admin token or an app device; another gateway's token is refused (peer_forbidden). Requires the fleet_peers capability",

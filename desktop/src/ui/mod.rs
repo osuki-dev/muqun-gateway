@@ -594,6 +594,7 @@ pub struct UiState {
 
     pub agent_inputs: HashMap<String, TextEdit>,
     pub agent_errors: HashMap<String, String>,
+    pub mcp_hub: settings::mcp_hub::McpHubState,
     pub cwd_input: TextEdit,
     /// Themes: the library, the gallery, running installs, the link field.
     pub theme_library: Arc<Vec<ThemeEntry>>,
@@ -860,6 +861,7 @@ impl UiState {
             form_inputs: HashMap::new(),
             agent_inputs: HashMap::new(),
             agent_errors: HashMap::new(),
+            mcp_hub: Default::default(),
             cwd_input,
             theme_library: Arc::new(Vec::new()),
             theme_gallery: Arc::new(GalleryView::default()),
@@ -2214,6 +2216,12 @@ impl UiState {
                 });
             }
         }
+    }
+
+    pub fn refresh_mcp_upstreams(&mut self) {
+        self.mcp_hub.loading = true;
+        self.mcp_hub.error = None;
+        self.send(Command::LoadMcpUpstreams);
     }
 
     pub fn go(&mut self, mode: Mode) {
@@ -3602,6 +3610,10 @@ impl UiState {
                     orchestration::poll_active_gateway_runs(self, true);
                 }
                 Update::TasksFailed(why) => self.tasks_view.error = Some(why),
+                Update::McpUpstreamsLoaded { result } => self.mcp_hub.apply_loaded(result),
+                Update::McpUpstreamSaved { id, result } => self.mcp_hub.apply_saved(id, result),
+                Update::McpUpstreamDeleted { id, result } => self.mcp_hub.apply_deleted(id, result),
+                Update::McpUpstreamProbed { id, result } => self.mcp_hub.apply_probed(id, result),
                 Update::TaskHistory { id, steps } => {
                     self.tasks_view.history.insert(id, steps);
                 }

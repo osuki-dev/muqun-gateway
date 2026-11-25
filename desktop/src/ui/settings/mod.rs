@@ -18,6 +18,7 @@ mod agents;
 mod appearance;
 mod general;
 mod keys;
+pub(crate) mod mcp_hub;
 mod plugins;
 mod storage;
 mod themes;
@@ -42,6 +43,7 @@ pub enum SettingsTab {
     Appearance,
     Themes,
     Agents,
+    McpHub,
     Voice,
     Shortcuts,
     Plugins,
@@ -51,7 +53,7 @@ pub enum SettingsTab {
 }
 
 /// Every page in nav order, with its name.
-pub(super) fn tabs(language: Language) -> [(&'static str, SettingsTab); 11] {
+pub(super) fn tabs(language: Language) -> [(&'static str, SettingsTab); 12] {
     use SettingsTab as T;
     [
         (tr_ref(language, "General"), T::General),
@@ -59,6 +61,7 @@ pub(super) fn tabs(language: Language) -> [(&'static str, SettingsTab); 11] {
         (tr_ref(language, "Appearance"), T::Appearance),
         (tr_ref(language, "Themes"), T::Themes),
         (tr_ref(language, "Agents"), T::Agents),
+        (tr_ref(language, "MCP Hub"), T::McpHub),
         (tr_ref(language, "Voice"), T::Voice),
         (tr_ref(language, "Shortcuts"), T::Shortcuts),
         (tr_ref(language, "Plugins"), T::Plugins),
@@ -77,6 +80,7 @@ impl SettingsTab {
             Self::Appearance => &i::APPEARANCE,
             Self::Themes => &i::GRID,
             Self::Agents => &i::AGENT,
+            Self::McpHub => &i::CONTROLS,
             Self::Voice => &super::voice::MIC,
             Self::Shortcuts => &i::KEYBOARD,
             Self::Plugins => &i::GRID,
@@ -103,6 +107,10 @@ impl SettingsTab {
                 language,
                 "The coding agents found on this computer. Changes save as you type.",
             ),
+            Self::McpHub => tr_ref(
+                language,
+                "Connect external HTTP or stdio MCP servers once in Muqun Gateway so every agent discovers and calls them on demand.",
+            ),
             Self::Voice => super::voice::subtitle(language),
             Self::Shortcuts => tr_ref(language, "Every key the window answers to."),
             Self::Plugins => tr_ref(
@@ -126,6 +134,7 @@ pub(super) fn open(s: &mut UiState, tab: SettingsTab) {
         SettingsTab::About if s.desktop_update == Default::default() => s.check_desktop_update(),
         SettingsTab::Computers => s.refresh_local_pairings(),
         SettingsTab::Agents => s.refresh_account_limits(),
+        SettingsTab::McpHub => s.refresh_mcp_upstreams(),
         SettingsTab::Themes => s.send(Command::ThemeRefresh),
         SettingsTab::Plugins => s.refresh_runtimes(),
         SettingsTab::Storage => s.send(Command::ScanStorage),
@@ -576,7 +585,7 @@ fn nav(s: &UiState, k: &Kit, rail: bool) -> El {
     for (i, (name, tab)) in tabs(language).into_iter().enumerate() {
         // A breath between what the window looks like, what it runs, and
         // what it keeps.
-        if i == 4 || i == 8 {
+        if i == 4 || i == 9 {
             list = list.child(el().key(format!("nav-gap-{i}")).h(10.0));
         }
         let selected = s.settings_tab == tab;
@@ -694,6 +703,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             themes::page(s, k),
         ),
         SettingsTab::Agents => (agents::actions(s, k), None, agents::page(s, k, layer)),
+        SettingsTab::McpHub => (mcp_hub::actions(s, k), None, mcp_hub::page(s, k)),
         SettingsTab::Voice => (Vec::new(), None, super::voice::settings(s, k, layer)),
         SettingsTab::Shortcuts => (keys::actions(s, k), None, keys::page(s, k)),
         SettingsTab::Plugins => (plugins::actions(s, k), None, plugins::page(s, k)),

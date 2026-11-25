@@ -208,6 +208,7 @@ pub(crate) fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppSt
         message_images: Arc::default(),
         preview_cache: Arc::default(),
         mcp_tokens: Arc::new(crate::mcp::tokens_sqlite::SqliteTokenStore::new(db.clone())),
+        mcp_hub: Arc::new(crate::mcp::hub::McpHub::new(Vec::new(), None)),
         fleet: Arc::default(),
         peers,
         tasks,

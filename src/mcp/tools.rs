@@ -565,6 +565,33 @@ pub(crate) struct CompleteArgs {
     pub outcome: Outcome,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct HubSearchToolsArgs {
+    /// Optional keywords to search across upstream MCP tool names, servers, and descriptions. Omit to list available servers and top tools.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Optional upstream server id to restrict search to.
+    #[serde(default)]
+    pub server: Option<String>,
+    /// "summary" (default, compact name + description) or "schema" (includes inputSchema for calling).
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Maximum tools to return (1..=50, default 20).
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct HubCallToolArgs {
+    /// Registered upstream MCP server id (from hub.search_tools).
+    pub server: String,
+    /// Upstream tool name (from hub.search_tools).
+    pub tool: String,
+    /// JSON object of arguments for the upstream tool.
+    #[serde(default)]
+    pub arguments: Option<Value>,
+}
+
 #[derive(Clone)]
 pub(crate) struct MuqunMcp {
     state: AppState,
@@ -1239,7 +1266,13 @@ impl MuqunMcp {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         else {
-            return Ok(ok(super::skills::skills_catalog_json()));
+            let mut catalog = super::skills::skills_catalog_json();
+            let caller = super::hub::resolve_caller_scope(&self.state, &self.session).await;
+            let hub_skills = self.state.mcp_hub.cached_skills(caller);
+            if !hub_skills.is_empty() {
+                catalog["upstream_skills"] = json!(hub_skills);
+            }
+            return Ok(ok(catalog));
         };
         let Some(skill) = super::skills::find_skill(name) else {
             return Ok(fail(
@@ -1254,6 +1287,73 @@ impl MuqunMcp {
             "title": skill.title,
             "content": skill.skill_md_text(),
         })))
+    }
+
+    #[tool(
+        name = "hub.search_tools",
+        description = "Search external MCP tools registered in Muqun's unified MCP Hub. Returns compact summaries by default; pass detail=\"schema\" to inspect inputSchema before calling hub.call_tool."
+    )]
+    async fn hub_search_tools(
+        &self,
+        Parameters(args): Parameters<HubSearchToolsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let caller = super::hub::resolve_caller_scope(&self.state, &self.session).await;
+        let include_schema = args
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.trim().eq_ignore_ascii_case("schema"));
+        let limit = args.limit.unwrap_or(20).clamp(1, 50) as usize;
+        let result = self
+            .state
+            .mcp_hub
+            .search_tools(
+                caller,
+                args.query.as_deref(),
+                args.server.as_deref(),
+                include_schema,
+                limit,
+            )
+            .await;
+        Ok(ok(result))
+    }
+
+    #[tool(
+        name = "hub.call_tool",
+        description = "Call a tool on an external MCP server registered in Muqun's unified MCP Hub (discover server/tool names via hub.search_tools first). Subject to scope isolation and secret redaction."
+    )]
+    async fn hub_call_tool(
+        &self,
+        Parameters(args): Parameters<HubCallToolArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let server = args.server.trim();
+        let tool = args.tool.trim();
+        if server.is_empty() || tool.is_empty() {
+            return Ok(invalid("server and tool must be non-empty"));
+        }
+        let caller = super::hub::resolve_caller_scope(&self.state, &self.session).await;
+        match self
+            .state
+            .mcp_hub
+            .call_tool(caller, server, tool, args.arguments.unwrap_or_else(|| json!({})))
+            .await
+        {
+            Ok(result) => Ok(ok(result)),
+            Err(super::hub::HubCallError::NotFound(id)) => Ok(fail(
+                "upstream_not_found",
+                &format!("No upstream MCP server '{id}' is registered. Call hub.search_tools to list available servers."),
+            )),
+            Err(super::hub::HubCallError::Disabled(id)) => Ok(fail(
+                "upstream_disabled",
+                &format!("Upstream MCP server '{id}' is currently disabled."),
+            )),
+            Err(super::hub::HubCallError::ScopeDenied { server, scope }) => Ok(fail(
+                "scope_denied",
+                &format!("Upstream MCP server '{server}' is restricted ({scope:?}) and cannot be called from this session."),
+            )),
+            Err(super::hub::HubCallError::UpstreamFailed(msg)) => {
+                Ok(fail("upstream_failed", &msg))
+            }
+        }
     }
 }
 
@@ -1445,9 +1545,10 @@ pub(crate) fn instructions(in_task: bool, fleet: Option<&str>) -> String {
     let about = "Muqun Gateway on this computer. Use fleet.describe for capabilities/peers, \
                  exec.run for commands/scripts (prefer over SSH), and tasks.delegate for \
                  sub-tasks (use barrier_group for single-wakeup parallel fan-out; end your \
-                 turn for long jobs). Detailed playbooks are published as Skills over MCP \
-                 (skill://muqun/... or skills.read). Do not restate the completion protocol \
-                 in a delegated goal.";
+                 turn for long jobs). Use hub.search_tools and hub.call_tool to discover \
+                 and invoke external MCP servers configured in Muqun's unified MCP Hub. \
+                 Detailed playbooks are published as Skills over MCP (skill://muqun/... \
+                 or skills.read). Do not restate the completion protocol in a delegated goal.";
     let finish = "call tasks.complete with a one-line summary; when blocked on the user, \
                   call it with outcome \"blocked\" and the reason; fallback if unavailable: \
                   end with MUQUN_TASK_DONE: <summary> or MUQUN_TASK_BLOCKED: <reason>. \
@@ -2303,6 +2404,8 @@ mod tests {
                 "files.present",
                 "fleet.describe",
                 "fleet.list",
+                "hub.call_tool",
+                "hub.search_tools",
                 "skills.read",
                 "tasks.cancel",
                 "tasks.complete",

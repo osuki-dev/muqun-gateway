@@ -169,8 +169,12 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     let peers = Arc::new(crate::fleet::peers::PeerService::new(
         Arc::new(crate::fleet::peers_sqlite::SqlitePeerStore::new(db.clone())),
         &config.fleet,
-        Some(config_file),
+        Some(config_file.clone()),
         presence,
+    ));
+    let mcp_hub = Arc::new(crate::mcp::hub::McpHub::new(
+        config.mcp.upstreams.clone(),
+        Some(config_file),
     ));
     peers.load_names().await;
     let history =
@@ -195,6 +199,7 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         message_images: Arc::default(),
         preview_cache: Arc::default(),
         mcp_tokens: Arc::new(crate::mcp::tokens_sqlite::SqliteTokenStore::new(db.clone())),
+        mcp_hub,
         fleet: Arc::default(),
         peers,
         tasks,

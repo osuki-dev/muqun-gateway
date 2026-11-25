@@ -863,6 +863,40 @@ impl Core {
                 });
             }
             Command::RefreshTasks => self.refresh_tasks().await,
+            Command::LoadMcpUpstreams => {
+                let result = match self.hub.list_mcp_upstreams().await {
+                    Ok(list) => Ok(list),
+                    Err(HubError::Agent(AgentError::Unsupported(msg))) => {
+                        Err(crate::hub::McpHubError::Unsupported(msg))
+                    }
+                    Err(err) => Err(crate::hub::McpHubError::Failed(err.to_string())),
+                };
+                self.inbox.push(Update::McpUpstreamsLoaded { result });
+            }
+            Command::UpsertMcpUpstream { id, body } => {
+                let result = self
+                    .hub
+                    .upsert_mcp_upstream(&id, body)
+                    .await
+                    .map_err(|err| err.to_string());
+                self.inbox.push(Update::McpUpstreamSaved { id, result });
+            }
+            Command::DeleteMcpUpstream { id } => {
+                let result = self
+                    .hub
+                    .delete_mcp_upstream(&id)
+                    .await
+                    .map_err(|err| err.to_string());
+                self.inbox.push(Update::McpUpstreamDeleted { id, result });
+            }
+            Command::ProbeMcpUpstream { id } => {
+                let result = self
+                    .hub
+                    .probe_mcp_upstream(&id)
+                    .await
+                    .map_err(|err| err.to_string());
+                self.inbox.push(Update::McpUpstreamProbed { id, result });
+            }
             Command::UnpairComputer {
                 computer,
                 request,

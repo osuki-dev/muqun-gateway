@@ -282,6 +282,25 @@ pub enum Update {
         diff_summary: String,
         files: Vec<(String, usize, usize)>,
     },
+    /// Upstream MCP Hub servers loaded from Gateway.
+    McpUpstreamsLoaded {
+        result: Result<Vec<crate::hub::McpUpstreamView>, crate::hub::McpHubError>,
+    },
+    /// Upstream MCP server saved (created or updated).
+    McpUpstreamSaved {
+        id: String,
+        result: Result<crate::hub::McpUpstreamView, String>,
+    },
+    /// Upstream MCP server deleted.
+    McpUpstreamDeleted {
+        id: String,
+        result: Result<(), String>,
+    },
+    /// Upstream MCP server probed.
+    McpUpstreamProbed {
+        id: String,
+        result: Result<crate::hub::McpUpstreamView, String>,
+    },
 }
 
 impl Update {

@@ -122,6 +122,8 @@ pub(crate) struct AppState {
     pub(crate) db: Arc<platform::store::sqlite::SqliteStore>,
     /// The assistant tokens `/mcp` accepts, kept in `db`. See `mcp::tokens`.
     pub(crate) mcp_tokens: Arc<dyn mcp::tokens::AssistantTokenStore>,
+    /// Unified upstream MCP Hub (Tool Search + scoped proxy + upstream management).
+    pub(crate) mcp_hub: Arc<mcp::hub::McpHub>,
     /// This machine's manifest and its cached toolchain probes. See `fleet`.
     pub(crate) fleet: Arc<fleet::FleetService>,
     /// The owner's other gateways and the accept switch. See `fleet::peers`.

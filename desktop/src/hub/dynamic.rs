@@ -661,6 +661,30 @@ impl SessionHub for DynamicHub {
         Box::pin(async move { active.read_file(asid, path).await })
     }
 
+    fn list_mcp_upstreams(&self) -> HubFuture<'_, Vec<super::McpUpstreamView>> {
+        let active = self.active();
+        Box::pin(async move { active.list_mcp_upstreams().await })
+    }
+
+    fn upsert_mcp_upstream<'a>(
+        &'a self,
+        id: &'a str,
+        body: super::McpUpstreamUpsert,
+    ) -> HubFuture<'a, super::McpUpstreamView> {
+        let active = self.active();
+        Box::pin(async move { active.upsert_mcp_upstream(id, body).await })
+    }
+
+    fn delete_mcp_upstream<'a>(&'a self, id: &'a str) -> HubFuture<'a, ()> {
+        let active = self.active();
+        Box::pin(async move { active.delete_mcp_upstream(id).await })
+    }
+
+    fn probe_mcp_upstream<'a>(&'a self, id: &'a str) -> HubFuture<'a, super::McpUpstreamView> {
+        let active = self.active();
+        Box::pin(async move { active.probe_mcp_upstream(id).await })
+    }
+
     fn events(&self) -> broadcast::Receiver<AgentDomainEvent> {
         if let Ok(events) = CONNECTION.try_with(|c| c.hub.events()) {
             return events;
