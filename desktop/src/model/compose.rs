@@ -340,20 +340,118 @@ pub enum ComposeCommand {
         cwd: String,
         branch: String,
     },
-    /// Revert changes to a single file.
+    /// Revert changes to a single file (tracked or untracked inside the repo).
     DiscardFile {
         cwd: String,
         path: String,
+        asid: Option<AgentSessionId>,
     },
     /// Computers `@` may name (this machine + linked peers when available).
     ListPeers,
 }
 
-/// What the branch pill knows about one folder.
+/// Detected Git hosting provider for a repository's `origin` remote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitRemoteHost {
+    GitHub,
+    GitLab,
+    Gitea,
+    Bitbucket,
+    Remote,
+}
+
+impl GitRemoteHost {
+    /// Classify a normalized `http(s)://host/path` repository web URL by host.
+    pub fn detect(web_url: &str) -> Self {
+        let host = web_url
+            .trim()
+            .strip_prefix("https://")
+            .or_else(|| web_url.trim().strip_prefix("http://"))
+            .unwrap_or(web_url.trim())
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .rsplit('@')
+            .next()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if host == "github.com" || host.ends_with(".github.com") || host.contains("github") {
+            Self::GitHub
+        } else if host == "gitlab.com" || host.ends_with(".gitlab.com") || host.contains("gitlab") {
+            Self::GitLab
+        } else if host == "bitbucket.org"
+            || host.ends_with(".bitbucket.org")
+            || host.contains("bitbucket")
+        {
+            Self::Bitbucket
+        } else if host == "gitea.com"
+            || host.contains("gitea")
+            || host.contains("forgejo")
+            || host == "codeberg.org"
+        {
+            Self::Gitea
+        } else {
+            Self::Remote
+        }
+    }
+
+    pub fn view_repo_label(self) -> &'static str {
+        match self {
+            Self::GitHub => "View on GitHub",
+            Self::GitLab => "View on GitLab",
+            Self::Gitea => "View on Gitea",
+            Self::Bitbucket => "View on Bitbucket",
+            Self::Remote => "Open Remote",
+        }
+    }
+
+    pub fn pr_action_label(self, is_feature_branch: bool) -> &'static str {
+        match self {
+            Self::GitLab if is_feature_branch => "Create Merge Request",
+            Self::GitLab => "View Merge Requests",
+            Self::Gitea => "View Pull Requests",
+            _ if is_feature_branch => "Create Pull Request",
+            _ => "View Pull Requests",
+        }
+    }
+
+    /// Build the provider-appropriate Pull/Merge Request URL for `web_url` and `branch`.
+    pub fn pr_url(self, web_url: &str, branch: Option<&str>) -> String {
+        let base = web_url.trim().trim_end_matches('/');
+        let feature = branch
+            .map(str::trim)
+            .filter(|b| !b.is_empty() && !matches!(*b, "main" | "master" | "detached"));
+        match self {
+            Self::GitHub => match feature {
+                Some(b) => format!("{base}/pull/new/{b}"),
+                None => format!("{base}/pulls"),
+            },
+            Self::GitLab => match feature {
+                Some(b) => {
+                    format!("{base}/-/merge_requests/new?merge_request%5Bsource_branch%5D={b}")
+                }
+                None => format!("{base}/-/merge_requests"),
+            },
+            Self::Gitea => format!("{base}/pulls"),
+            Self::Bitbucket => match feature {
+                Some(b) => format!("{base}/pull-requests/new?source={b}"),
+                None => format!("{base}/pull-requests"),
+            },
+            Self::Remote => base.to_string(),
+        }
+    }
+}
+
+/// What the branch pill and Git inspector know about one folder.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BranchInfo {
     pub current: Option<String>,
     pub local: Vec<String>,
+    pub remote_url: Option<String>,
+    pub remote_host: Option<GitRemoteHost>,
 }
 
 #[derive(Debug, Clone)]
@@ -569,7 +667,7 @@ pub async fn run(
                 )),
             }
         }
-        ComposeCommand::DiscardFile { cwd, path } => {
+        ComposeCommand::DiscardFile { cwd, path, .. } => {
             let path_buf = PathBuf::from(&cwd);
             let target = path.clone();
             let result =
@@ -766,15 +864,58 @@ pub(crate) fn parse_repo_web_url(remote_url: &str) -> Option<String> {
     let url = remote_url.trim();
     if let Some(rest) = url.strip_prefix("git@") {
         if let Some((host, path)) = rest.split_once(':') {
-            let path = path.trim_end_matches(".git");
-            return Some(format!("https://{host}/{path}"));
+            let path = path
+                .trim_start_matches('/')
+                .trim_end_matches('/')
+                .trim_end_matches(".git");
+            if !host.is_empty() && !path.is_empty() {
+                return Some(format!("https://{host}/{path}"));
+            }
         }
     }
-    if url.starts_with("http://") || url.starts_with("https://") {
-        let clean = url.trim_end_matches(".git");
-        return Some(clean.to_string());
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        let rest = rest.rsplit('@').next().unwrap_or(rest);
+        if let Some((host_port, path)) = rest.split_once('/') {
+            let host = host_port.split(':').next().unwrap_or(host_port);
+            let path = path.trim_end_matches('/').trim_end_matches(".git");
+            if !host.is_empty() && !path.is_empty() {
+                return Some(format!("https://{host}/{path}"));
+            }
+        }
+    }
+    if let Some(scheme) = url
+        .strip_prefix("https://")
+        .map(|rest| ("https://", rest))
+        .or_else(|| url.strip_prefix("http://").map(|rest| ("http://", rest)))
+    {
+        let (prefix, rest) = scheme;
+        let rest = if let Some((authority, path)) = rest.split_once('/') {
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            format!("{host}/{path}")
+        } else {
+            rest.rsplit('@').next().unwrap_or(rest).to_string()
+        };
+        let clean = rest.trim_end_matches('/').trim_end_matches(".git");
+        if !clean.is_empty() {
+            return Some(format!("{prefix}{clean}"));
+        }
     }
     None
+}
+
+fn common_git_dir(git_dir: &std::path::Path) -> PathBuf {
+    if let Ok(raw) = std::fs::read_to_string(git_dir.join("commondir")) {
+        let rel = raw.trim();
+        if !rel.is_empty() {
+            let candidate = PathBuf::from(rel);
+            return if candidate.is_absolute() {
+                candidate
+            } else {
+                git_dir.join(candidate)
+            };
+        }
+    }
+    git_dir.to_path_buf()
 }
 
 /// The branch checked out in `cwd` (or the repository above it), read from
@@ -791,18 +932,24 @@ pub fn current_branch(cwd: &std::path::Path) -> Option<String> {
     })
 }
 
-/// Current branch plus local branch names under `refs/heads`.
+/// Current branch, local branch names under `refs/heads`, and parsed `origin` remote info.
 pub fn branch_info(cwd: &std::path::Path) -> BranchInfo {
     let current = current_branch(cwd);
     let mut local = Vec::new();
     let Some(git_dir) = git_dir(cwd) else {
-        return BranchInfo { current, local };
+        return BranchInfo {
+            current,
+            local,
+            remote_url: None,
+            remote_host: None,
+        };
     };
-    let heads = git_dir.join("refs/heads");
+    let common_dir = common_git_dir(&git_dir);
+    let heads = common_dir.join("refs/heads");
     if heads.is_dir() {
         collect_heads(&heads, "", &mut local);
     }
-    if let Ok(packed) = std::fs::read_to_string(git_dir.join("packed-refs")) {
+    if let Ok(packed) = std::fs::read_to_string(common_dir.join("packed-refs")) {
         for line in packed.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
@@ -824,7 +971,16 @@ pub fn branch_info(cwd: &std::path::Path) -> BranchInfo {
             local.insert(0, cur.clone());
         }
     }
-    BranchInfo { current, local }
+    let remote_url = parse_git_remote_url(&common_dir)
+        .or_else(|| parse_git_remote_url(&git_dir))
+        .and_then(|raw| parse_repo_web_url(&raw));
+    let remote_host = remote_url.as_deref().map(GitRemoteHost::detect);
+    BranchInfo {
+        current,
+        local,
+        remote_url,
+        remote_host,
+    }
 }
 
 fn collect_heads(dir: &std::path::Path, prefix: &str, out: &mut Vec<String>) {
@@ -877,44 +1033,134 @@ pub fn checkout_branch(cwd: &std::path::Path, branch: &str) -> Result<(), String
     }
 }
 
-/// `git checkout HEAD -- <file_path>` at the repository root of `cwd`.
-pub fn discard_file(cwd: &std::path::Path, file_path: &str) -> Result<(), String> {
-    let root = git_root(cwd).ok_or_else(|| "not a git checkout".to_string())?;
+/// Validate a relative repository file path: must stay strictly inside `root`
+/// and never touch `.git` or traverse via `..`.
+fn validated_repo_rel_path(file_path: &str) -> Result<PathBuf, String> {
+    use std::path::{Component, Path};
     let file_path = file_path.trim();
-    if file_path.is_empty() {
+    if file_path.is_empty() || file_path.contains('\0') {
         return Err("invalid file path".into());
     }
-    let output = std::process::Command::new("git")
-        .args(["checkout", "HEAD", "--", file_path])
-        .current_dir(&root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|err| format!("git checkout: {err}"))?;
-    if output.status.success() {
-        return Ok(());
+    if file_path.starts_with('/') || file_path.starts_with('\\') {
+        return Err("path must be relative to the repository".into());
     }
-    // Fallback if HEAD does not exist (e.g. unborn branch before initial commit)
-    if let Ok(fallback) = std::process::Command::new("git")
-        .args(["checkout", "--", file_path])
-        .current_dir(&root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-    {
-        if fallback.status.success() {
-            return Ok(());
+    let rel = Path::new(file_path);
+    if rel.is_absolute() {
+        return Err("path must be relative to the repository".into());
+    }
+    let mut clean = PathBuf::new();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(part) => {
+                if part.to_string_lossy().eq_ignore_ascii_case(".git") {
+                    return Err("refusing to modify .git metadata".into());
+                }
+                clean.push(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err("path escapes repository root".into());
+            }
         }
     }
-    let err = String::from_utf8_lossy(&output.stderr);
-    let err = err.trim();
-    if err.is_empty() {
-        Err("git checkout failed".into())
-    } else {
-        Err(err.lines().next().unwrap_or(err).to_string())
+    if clean.as_os_str().is_empty() {
+        return Err("invalid file path".into());
     }
+    Ok(clean)
+}
+
+/// Discard working-tree changes for one file at the repository root of `cwd`.
+///
+/// Tracked files are restored from `HEAD` (or removed if newly staged without a
+/// `HEAD` entry). Untracked files inside the repository root are removed
+/// cleanly after refusing `..`, absolute paths, and `.git`.
+pub fn discard_file(cwd: &std::path::Path, file_path: &str) -> Result<(), String> {
+    let root = git_root(cwd).ok_or_else(|| "not a git checkout".to_string())?;
+    let rel = validated_repo_rel_path(file_path)?;
+    let rel_str = rel.to_string_lossy().into_owned();
+
+    let ls_files = std::process::Command::new("git")
+        .args(["ls-files", "--error-unmatch", "--", &rel_str])
+        .current_dir(&root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|err| format!("git ls-files: {err}"))?;
+
+    if ls_files.success() {
+        let output = std::process::Command::new("git")
+            .args(["checkout", "HEAD", "--", &rel_str])
+            .current_dir(&root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|err| format!("git checkout: {err}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        // Tracked in index, e.g. newly staged file not present in HEAD: remove from index & tree.
+        let in_head = std::process::Command::new("git")
+            .args(["cat-file", "-e", &format!("HEAD:{rel_str}")])
+            .current_dir(&root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !in_head {
+            let rm = std::process::Command::new("git")
+                .args(["rm", "-f", "--", &rel_str])
+                .current_dir(&root)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .map_err(|err| format!("git rm: {err}"))?;
+            if rm.status.success() {
+                return Ok(());
+            }
+        }
+        // Fallback if HEAD does not exist (e.g. unborn branch before initial commit)
+        if let Ok(fallback) = std::process::Command::new("git")
+            .args(["checkout", "--", &rel_str])
+            .current_dir(&root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+        {
+            if fallback.status.success() {
+                return Ok(());
+            }
+        }
+        let err = String::from_utf8_lossy(&output.stderr);
+        let err = err.trim();
+        return Err(if err.is_empty() {
+            "git checkout failed".into()
+        } else {
+            err.lines().next().unwrap_or(err).to_string()
+        });
+    }
+
+    // Untracked file: verify its parent stays inside the canonical repo root before removing.
+    let target = root.join(&rel);
+    let canon_root = std::fs::canonicalize(&root).map_err(|e| format!("resolve repo root: {e}"))?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| "invalid file path".to_string())?;
+    let canon_parent =
+        std::fs::canonicalize(parent).map_err(|e| format!("resolve file parent: {e}"))?;
+    if !canon_parent.starts_with(&canon_root) {
+        return Err("path escapes repository root".into());
+    }
+    let meta = std::fs::symlink_metadata(&target).map_err(|e| format!("file not found: {e}"))?;
+    if meta.is_dir() {
+        return Err("refusing to remove directory".into());
+    }
+    std::fs::remove_file(&target).map_err(|e| format!("remove untracked file: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1034,16 +1280,145 @@ mod tests {
             parse_repo_web_url("https://gitlab.com/group/project").as_deref(),
             Some("https://gitlab.com/group/project")
         );
+        assert_eq!(
+            parse_repo_web_url("ssh://git@gitea.home.t-diy.com:2222/team/repo.git").as_deref(),
+            Some("https://gitea.home.t-diy.com/team/repo")
+        );
     }
 
     #[test]
-    fn discard_file_validates_inputs() {
+    fn branch_info_detects_remote_providers_and_pr_urls() {
+        let cases = [
+            (
+                "git@github.com:muqun/desktop.git",
+                "https://github.com/muqun/desktop",
+                GitRemoteHost::GitHub,
+                "https://github.com/muqun/desktop/pull/new/feat/ui",
+                "https://github.com/muqun/desktop/pulls",
+            ),
+            (
+                "https://gitlab.com/group/sub/project.git",
+                "https://gitlab.com/group/sub/project",
+                GitRemoteHost::GitLab,
+                "https://gitlab.com/group/sub/project/-/merge_requests/new?merge_request%5Bsource_branch%5D=feat/ui",
+                "https://gitlab.com/group/sub/project/-/merge_requests",
+            ),
+            (
+                "ssh://git@gitea.home.t-diy.com:2222/ryu/gateway.git",
+                "https://gitea.home.t-diy.com/ryu/gateway",
+                GitRemoteHost::Gitea,
+                "https://gitea.home.t-diy.com/ryu/gateway/pulls",
+                "https://gitea.home.t-diy.com/ryu/gateway/pulls",
+            ),
+            (
+                "git@bitbucket.org:org/app.git",
+                "https://bitbucket.org/org/app",
+                GitRemoteHost::Bitbucket,
+                "https://bitbucket.org/org/app/pull-requests/new?source=feat/ui",
+                "https://bitbucket.org/org/app/pull-requests",
+            ),
+            (
+                "https://git.example.org/org/repo.git",
+                "https://git.example.org/org/repo",
+                GitRemoteHost::Remote,
+                "https://git.example.org/org/repo",
+                "https://git.example.org/org/repo",
+            ),
+        ];
+
+        for (i, (raw_remote, expected_web, expected_host, expected_feat_pr, expected_main_pr)) in
+            cases.iter().enumerate()
+        {
+            let dir = std::env::temp_dir().join(format!(
+                "muqun-branch-remote-{}-{}",
+                std::process::id(),
+                i
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".git/refs/heads")).unwrap();
+            std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/feat/ui\n").unwrap();
+            std::fs::write(dir.join(".git/refs/heads/main"), "abc\n").unwrap();
+            std::fs::write(
+                dir.join(".git/config"),
+                format!("[remote \"origin\"]\n\turl = {raw_remote}\n"),
+            )
+            .unwrap();
+
+            let info = branch_info(&dir);
+            assert_eq!(info.remote_url.as_deref(), Some(*expected_web));
+            assert_eq!(info.remote_host, Some(*expected_host));
+            let host = info.remote_host.unwrap();
+            let web = info.remote_url.as_deref().unwrap();
+            assert_eq!(host.pr_url(web, Some("feat/ui")), *expected_feat_pr);
+            assert_eq!(host.pr_url(web, Some("main")), *expected_main_pr);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn discard_file_handles_tracked_untracked_and_rejects_traversal() {
         assert!(discard_file(std::path::Path::new("/nonexistent"), "test.txt").is_err());
-        let dir = std::env::temp_dir().join(format!("muqun-discard-{}", std::process::id()));
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("muqun-discard-{}-{stamp}", std::process::id()));
+        let outside = dir
+            .parent()
+            .unwrap()
+            .join(format!("muqun-outside-{stamp}.txt"));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&outside, "keep me\n").unwrap();
+
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+
+        std::fs::write(dir.join("tracked.txt"), "original\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-m", "initial"]);
+
+        // 1. Tracked modified file reverts cleanly to HEAD.
+        std::fs::write(dir.join("tracked.txt"), "dirty\n").unwrap();
+        discard_file(&dir, "tracked.txt").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("tracked.txt")).unwrap(),
+            "original\n"
+        );
+
+        // 2. Untracked file inside repo is removed cleanly.
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested/untracked.txt"), "scratch\n").unwrap();
+        discard_file(&dir, "nested/untracked.txt").unwrap();
+        assert!(!dir.join("nested/untracked.txt").exists());
+
+        // 3. Invalid paths, path traversal, absolute paths, and `.git` metadata are rejected.
         assert!(discard_file(&dir, "").is_err());
         assert!(discard_file(&dir, "   ").is_err());
+        assert!(discard_file(&dir, "../muqun-outside.txt").is_err());
+        assert!(discard_file(
+            &dir,
+            &format!("../{}", outside.file_name().unwrap().to_string_lossy())
+        )
+        .is_err());
+        assert!(discard_file(&dir, outside.to_str().unwrap()).is_err());
+        assert!(discard_file(&dir, ".git/config").is_err());
+        assert!(outside.exists(), "outside file must never be deleted");
+
+        let _ = std::fs::remove_file(&outside);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

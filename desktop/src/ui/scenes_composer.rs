@@ -45,6 +45,7 @@ fn claude_session(s: &mut UiState) {
         crate::model::compose::BranchInfo {
             current: Some("main".into()),
             local: vec!["main".into(), "desktop-polish".into()],
+            ..Default::default()
         },
     );
 }

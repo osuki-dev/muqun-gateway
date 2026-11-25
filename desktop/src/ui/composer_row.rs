@@ -1027,6 +1027,7 @@ mod tests {
                 BranchInfo {
                     current: Some("main".into()),
                     local: vec!["main".into(), "next".into()],
+                    ..Default::default()
                 },
             )),
             modes: [

@@ -217,6 +217,10 @@ struct ConnectionState {
     last_seq: Mutex<HashMap<String, u64>>,
     /// Which view-heartbeat task is current; older ones end at their next tick.
     beat: AtomicU64,
+    /// Monotonic sequence for background-shell loads so stale responses are dropped.
+    shells_seq: AtomicU64,
+    /// Monotonic sequence for worktree loads so stale responses are dropped.
+    worktrees_seq: AtomicU64,
     /// When the last full refresh started: boot asks from main and from the
     /// window, and a second ask this soon is answered by the first.
     refreshed_at: Mutex<Option<std::time::Instant>>,
@@ -1032,6 +1036,14 @@ impl Core {
                 push,
                 asid,
             } => {
+                if !crate::hub::connection_origin().is_none_or(|(c, _)| c == "local" || c == "self")
+                {
+                    self.inbox.push(Update::Ui(super::inbox::UiAction::Toast {
+                        title: "Git commit failed".into(),
+                        detail: Some("Local git actions are unavailable on remote hosts.".into()),
+                    }));
+                    return;
+                }
                 let inbox = self.inbox.clone();
                 let cwd_clone = cwd.clone();
                 let _ = tokio::task::spawn_blocking(move || {
@@ -1082,6 +1094,14 @@ impl Core {
                 )));
             }
             Command::GitPush { cwd, asid } => {
+                if !crate::hub::connection_origin().is_none_or(|(c, _)| c == "local" || c == "self")
+                {
+                    self.inbox.push(Update::Ui(super::inbox::UiAction::Toast {
+                        title: "Git push failed".into(),
+                        detail: Some("Local git actions are unavailable on remote hosts.".into()),
+                    }));
+                    return;
+                }
                 let inbox = self.inbox.clone();
                 let cwd_clone = cwd.clone();
                 let _ = tokio::task::spawn_blocking(move || {
@@ -1409,6 +1429,45 @@ impl Core {
     }
 
     async fn compose(self: Arc<Self>, command: ComposeCommand) {
+        if let ComposeCommand::DiscardFile { cwd, path, asid } = command {
+            if !crate::hub::connection_origin().is_none_or(|(c, _)| c == "local" || c == "self") {
+                self.inbox.push(Update::Ui(super::inbox::UiAction::Toast {
+                    title: "Could not discard file".into(),
+                    detail: Some("Local git actions are unavailable on remote hosts.".into()),
+                }));
+                return;
+            }
+            let cwd_path = PathBuf::from(&cwd);
+            let target = path.clone();
+            let result =
+                tokio::task::spawn_blocking(move || compose::discard_file(&cwd_path, &target))
+                    .await;
+            match result {
+                Ok(Ok(())) => {
+                    let diff_asid = asid.or_else(|| self.state().active.lock().unwrap().clone());
+                    if let Some(asid) = diff_asid {
+                        crate::hub::spawn_connected(self.clone().diff(asid));
+                    }
+                    self.inbox.push(Update::Ui(super::inbox::UiAction::Toast {
+                        title: "Reverted file changes".into(),
+                        detail: Some(path),
+                    }));
+                }
+                Ok(Err(why)) => {
+                    self.inbox.push(Update::Ui(super::inbox::UiAction::Toast {
+                        title: "Could not discard file".into(),
+                        detail: Some(why),
+                    }));
+                }
+                Err(err) => {
+                    self.inbox.push(Update::Ui(super::inbox::UiAction::Toast {
+                        title: "Could not discard file".into(),
+                        detail: Some(err.to_string()),
+                    }));
+                }
+            }
+            return;
+        }
         let ComposeCommand::Submit {
             token,
             target,
@@ -1423,12 +1482,24 @@ impl Core {
                 | ComposeCommand::SwitchMode { asid, .. } => Some(asid.clone()),
                 _ => None,
             };
+            let checked_out_branch = match &command {
+                ComposeCommand::Checkout { branch, .. } => Some(branch.clone()),
+                _ => None,
+            };
             if let Some(err) = compose::run(command, self.hub.clone(), self.inbox.clone()).await {
                 self.fail(err);
                 // Roll back the optimistic header after a failed switch.
                 if let Some(asid) = resync {
                     self.open(&asid).await;
                 }
+            } else if let Some(branch) = checked_out_branch {
+                if let Some(asid) = self.state().active.lock().unwrap().clone() {
+                    crate::hub::spawn_connected(self.clone().diff(asid));
+                }
+                self.inbox.push(Update::Ui(super::inbox::UiAction::Toast {
+                    title: "Switched branch".into(),
+                    detail: Some(branch),
+                }));
             }
             return;
         };
@@ -1738,24 +1809,56 @@ impl Core {
     }
 
     async fn load_shells(self: Arc<Self>, agent: String, directory: Option<String>) {
-        match tokio::time::timeout(
+        let state = self.state();
+        let seq = state.shells_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let expected_active = state.active.lock().unwrap().clone();
+        let items = match tokio::time::timeout(
             LIST_TIMEOUT,
             self.hub.list_shells(&agent, directory.as_deref()),
         )
         .await
         {
-            Ok(Ok(items)) => self.inbox.push(Update::Shells(items)),
-            Ok(Err(err)) => tracing::debug!(%agent, %err, "shells unavailable"),
-            Err(_) => tracing::debug!(%agent, "shells timed out"),
+            Ok(Ok(items)) => items,
+            Ok(Err(err)) => {
+                tracing::debug!(%agent, %err, "shells unavailable");
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::debug!(%agent, "shells timed out");
+                Vec::new()
+            }
+        };
+        if self.connection_is_current()
+            && state.shells_seq.load(Ordering::SeqCst) == seq
+            && *state.active.lock().unwrap() == expected_active
+        {
+            self.inbox.push(Update::Shells(items));
         }
     }
 
     async fn load_worktrees(self: Arc<Self>, agent: String, directory: String) {
-        match tokio::time::timeout(LIST_TIMEOUT, self.hub.list_worktrees(&agent, &directory)).await
+        let state = self.state();
+        let seq = state.worktrees_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let expected_active = state.active.lock().unwrap().clone();
+        let items =
+            match tokio::time::timeout(LIST_TIMEOUT, self.hub.list_worktrees(&agent, &directory))
+                .await
+            {
+                Ok(Ok(items)) => items,
+                Ok(Err(err)) => {
+                    tracing::debug!(%agent, %err, "worktrees unavailable");
+                    Vec::new()
+                }
+                Err(_) => {
+                    tracing::debug!(%agent, "worktrees timed out");
+                    Vec::new()
+                }
+            };
+        if self.connection_is_current()
+            && state.worktrees_seq.load(Ordering::SeqCst) == seq
+            && *state.active.lock().unwrap() == expected_active
         {
-            Ok(Ok(items)) => self.inbox.push(Update::Worktrees(items)),
-            Ok(Err(err)) => tracing::debug!(%agent, %err, "worktrees unavailable"),
-            Err(_) => tracing::debug!(%agent, "worktrees timed out"),
+            self.inbox.push(Update::Worktrees(items));
         }
     }
 

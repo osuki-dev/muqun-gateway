@@ -78,7 +78,11 @@ pub fn git_push(cwd: &Path) -> Result<String, String> {
         let stderr = String::from_utf8_lossy(&out.stderr);
         // If current branch has no upstream branch, try git push -u origin <branch>
         if stderr.contains("has no upstream branch") || stderr.contains("set-upstream") {
-            if let Some(branch) = crate::model::compose::current_branch(&repo) {
+            let info = crate::model::compose::branch_info(&repo);
+            if let Some(branch) = info
+                .current
+                .filter(|b| info.local.iter().any(|local| local == b))
+            {
                 let retry = Command::new("git")
                     .arg("-C")
                     .arg(&repo)

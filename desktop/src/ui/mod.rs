@@ -173,6 +173,8 @@ pub enum OpenMenu {
     Model,
     Effort,
     Branch,
+    /// The Git inspector's inline branch switcher dropdown.
+    InspectorBranch,
     /// The session composer's permission mode menu, and its overflow
     /// (what a narrow composer folds away).
     Mode,
@@ -550,6 +552,14 @@ pub struct UiState {
     pub saved_permissions: Vec<SavedPermission>,
     pub shells: Vec<ShellRow>,
     pub worktrees: Vec<WorktreeRow>,
+    /// Whether the Git inspector expanded beyond the initial 12 changed files.
+    pub inspector_git_show_all: bool,
+    /// Pending two-step confirmation key inside the Inspector (discard/remove/stop).
+    pub inspector_confirm: Option<String>,
+    /// Guards against stale in-flight `Update::Shells` after switching sessions/computers.
+    inspector_shells_expect: bool,
+    /// Guards against stale in-flight `Update::Worktrees` after switching sessions/computers.
+    inspector_worktrees_expect: bool,
 
     pub search: TextEdit,
     pub sidebar_all_sessions: bool,
@@ -833,6 +843,10 @@ impl UiState {
             saved_permissions: Vec::new(),
             shells: Vec::new(),
             worktrees: Vec::new(),
+            inspector_git_show_all: false,
+            inspector_confirm: None,
+            inspector_shells_expect: true,
+            inspector_worktrees_expect: true,
             search: TextEdit::new(""),
             sidebar_all_sessions: false,
             sidebar_opened: HashMap::new(),
@@ -1297,6 +1311,11 @@ impl UiState {
         !matches!(computer_id, "" | "local" | "self" | "all")
     }
 
+    /// Whether the active session (or currently selected computer) runs on a remote computer.
+    pub fn is_remote_session(&self) -> bool {
+        Self::is_remote_computer_id(&self.active_session_computer())
+    }
+
     /// Build a [`crate::hub::LocalGateway`] credential for a saved remote computer.
     pub fn remote_gateway_for(&self, computer_id: &str) -> Option<crate::hub::LocalGateway> {
         if !Self::is_remote_computer_id(computer_id) {
@@ -1413,6 +1432,7 @@ impl UiState {
         if prev != id {
             self.waiting_perms.clear();
             self.waiting_forms.clear();
+            self.reset_inspector_session_state();
             self.persist_draft(Slot::Session);
             let slot = self.take_slot();
             let default_cwd = if id == "local" {
@@ -1867,6 +1887,7 @@ impl UiState {
             self.diff = None;
             self.diff_active_file = 0;
             self.show_diff = false;
+            self.reset_inspector_session_state();
         }
         self.status = format!("Opening {asid}");
         let is_optimistic = asid.starts_with("new-")
@@ -2435,32 +2456,49 @@ impl UiState {
         self.catalog.as_deref()
     }
 
+    /// Clear session-scoped inspector state when switching sessions, tiles, or computers.
+    fn reset_inspector_session_state(&mut self) {
+        self.shells.clear();
+        self.worktrees.clear();
+        self.inspector_git_show_all = false;
+        self.inspector_confirm = None;
+        self.inspector_shells_expect = false;
+        self.inspector_worktrees_expect = false;
+    }
+
     /// Ask the core for what the inspector's current tab shows.
     pub fn refresh_inspector(&mut self) {
         let Some(info) = self.current().cloned() else {
             return;
         };
         let asid = info.asid.clone();
+        let remote = self.is_remote_session();
         match self.inspector_tab {
             InspectorTab::Queue => {}
             InspectorTab::Git => {
                 if let Some(directory) = info.directory.clone() {
+                    self.inspector_worktrees_expect = true;
                     self.send(Command::LoadWorktrees {
                         agent: info.agent_id.clone(),
                         directory: directory.clone(),
                     });
-                    self.send(Command::Compose(
-                        crate::model::compose::ComposeCommand::Branch { cwd: directory },
-                    ));
+                    if !remote {
+                        self.send(Command::Compose(
+                            crate::model::compose::ComposeCommand::Branch { cwd: directory },
+                        ));
+                    }
                 }
                 self.send(Command::RefreshDiff(asid));
             }
             InspectorTab::Subagents => self.refresh_session_tree(),
             InspectorTab::Saved => self.send(Command::LoadSavedPermissions { asid }),
-            InspectorTab::Shells => self.send(Command::LoadShells {
-                agent: info.agent_id.clone(),
-                directory: info.directory.clone(),
-            }),
+            InspectorTab::Shells => {
+                self.inspector_shells_expect = true;
+                self.send(Command::LoadShells {
+                    agent: info.agent_id.clone(),
+                    directory: info.directory.clone(),
+                });
+            }
         }
     }
 
@@ -2548,8 +2586,10 @@ impl UiState {
         self.send(Command::Compose(C::AutoApprove {
             asid: info.asid.clone(),
         }));
-        if let Some(cwd) = info.directory.clone() {
-            self.send(Command::Compose(C::Branch { cwd }));
+        if !self.is_remote_session() {
+            if let Some(cwd) = info.directory.clone() {
+                self.send(Command::Compose(C::Branch { cwd }));
+            }
         }
         self.send(Command::Compose(C::ListPeers));
         if self.right_open {
@@ -2696,6 +2736,7 @@ impl UiState {
         }
         self.menu = None;
         self.context_open = None;
+        self.reset_inspector_session_state();
         self.mode = Mode::Session;
 
         match &self.tiles[i].content {
@@ -2707,6 +2748,8 @@ impl UiState {
                     if let Some(info) = self.current().cloned() {
                         self.session_opened(&info);
                     }
+                } else if self.right_open {
+                    self.refresh_inspector();
                 }
             }
             TileContent::Terminal => {
@@ -3707,8 +3750,16 @@ impl UiState {
                         slot.saved_permissions = items;
                     }
                 }
-                Update::Shells(rows) => self.shells = rows,
-                Update::Worktrees(rows) => self.worktrees = rows,
+                Update::Shells(rows) => {
+                    if self.inspector_shells_expect {
+                        self.shells = rows;
+                    }
+                }
+                Update::Worktrees(rows) => {
+                    if self.inspector_worktrees_expect {
+                        self.worktrees = rows;
+                    }
+                }
                 Update::HubMode(mode) => self.hub_label = mode.to_string(),
                 Update::HubLink(down) => self.hub_down = down,
                 Update::Search {
