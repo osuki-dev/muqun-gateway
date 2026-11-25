@@ -298,10 +298,25 @@ fn list_width(card_w: f32) -> f32 {
 }
 
 pub fn view(s: &UiState, k: &Kit) -> El {
+    view_in_surface(s, k, true)
+}
+
+pub fn view_in_surface(s: &UiState, k: &Kit, full_page: bool) -> El {
     let language = s.cfg.general.language;
     let list = items(s);
     let at = current(&list, &s.inbox_view);
-    let card_w = rune::memo::layout_with("main", |r| r[2]).unwrap_or(1080.0);
+    let card_w = if full_page {
+        rune::memo::layout_with("main", |r| r[2]).unwrap_or(1080.0)
+    } else {
+        rune::memo::layout_with("inbox", |r| r[2]).unwrap_or(480.0)
+    };
+    let list_w = if full_page {
+        list_width(card_w)
+    } else {
+        (card_w * 0.36)
+            .clamp(180.0, 340.0)
+            .min((card_w * 0.48).max(140.0))
+    };
     let panes = if list.is_empty() {
         col()
             .key("inbox")
@@ -310,7 +325,7 @@ pub fn view(s: &UiState, k: &Kit) -> El {
     } else {
         row()
             .key("inbox")
-            .child(list_pane(s, k, &list, at, list_width(card_w)))
+            .child(list_pane(s, k, &list, at, list_w))
             .child(
                 el().key("inbox-rule")
                     .w(1.0)
@@ -323,7 +338,11 @@ pub fn view(s: &UiState, k: &Kit) -> El {
                 None => el(),
             })
     };
-    super::card_stage("inbox", panes)
+    if full_page {
+        super::card_stage("inbox", panes)
+    } else {
+        panes.w_full().h_full().min_h(0.0)
+    }
 }
 
 fn page_head(k: &Kit, language: Language, count: usize) -> El {

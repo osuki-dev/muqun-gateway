@@ -794,14 +794,6 @@ fn shells(s: &UiState, k: &Kit) -> Vec<El> {
 }
 
 pub fn view(s: &UiState, k: &Kit) -> El {
-    panel(s, k, false)
-}
-
-pub fn inline_view(s: &UiState, k: &Kit) -> El {
-    panel(s, k, true)
-}
-
-fn panel(s: &UiState, k: &Kit, inline: bool) -> El {
     let language = s.cfg.general.language;
     let asid = s.selected.clone().unwrap_or_default();
     let waiting = s.waiting_perms.get(&asid).map_or(0, Vec::len)
@@ -831,17 +823,6 @@ fn panel(s: &UiState, k: &Kit, inline: bool) -> El {
             tab,
             s.inspector_tab == tab,
         ));
-    }
-    if inline {
-        strip = strip.child(el().grow(1.0)).child(
-            rune_kit::IconButton::new(k.glyph.close)
-                .variant(rune_kit::IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .label(tr_ref(language, "Close"))
-                .shortcut("Esc")
-                .on_press(UiState::close_inspector)
-                .build(k),
-        );
     }
     let body = match s.inspector_tab {
         InspectorTab::Queue => queue(s, k),

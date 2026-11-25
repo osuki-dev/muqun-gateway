@@ -685,10 +685,18 @@ fn frame(card_w: f32, nav_w: f32, tab: SettingsTab) -> (f32, f32, f32) {
 }
 
 pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+    view_in_surface(s, k, layer, true)
+}
+
+pub fn view_in_surface(s: &UiState, k: &Kit, layer: &mut Vec<El>, full_page: bool) -> El {
     let language = s.cfg.general.language;
     let look = s.look();
     let tab = s.settings_tab;
-    let card_w = rune::memo::layout_with("main", |r| r[2]).unwrap_or(1080.0);
+    let card_w = if full_page {
+        rune::memo::layout_with("main", |r| r[2]).unwrap_or(1080.0)
+    } else {
+        rune::memo::layout_with("settings", |r| r[2]).unwrap_or(680.0)
+    };
     let rail = card_w < FOLD_AT;
     let nav_w = if rail { RAIL_W } else { NAV_W };
     let (lead, trail, max_w) = frame(card_w, nav_w, tab);
@@ -750,6 +758,30 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 })
                 .scroll_bar(k),
         );
+    let body_row = hrow()
+        .key("settings")
+        .w_full()
+        .h_full()
+        .min_h(0.0)
+        .pl(lead)
+        .pr(trail)
+        .child(nav(s, k, rail))
+        .child(
+            el().key("settings-nav-divider")
+                .w(1.0)
+                .h_full()
+                .fill(k.c.border_weak.alpha(0.35))
+                .a11y_hidden(),
+        )
+        .child(content);
+    if !full_page {
+        return col()
+            .key("settings-stage")
+            .w_full()
+            .h_full()
+            .min_h(0.0)
+            .child(body_row);
+    }
     // Settings has no toolbar: like Home, the stage rises under the card's
     // empty toolbar row, so the nav and page start at the card's top edge.
     let lift = rune_kit::shell::TOOLBAR_HEIGHT;
@@ -759,24 +791,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         Some(h) => stage.h(h).offset(0.0, -lift),
         None => stage.h_full(),
     };
-    stage.child(
-        hrow()
-            .key("settings")
-            .w_full()
-            .h_full()
-            .min_h(0.0)
-            .pl(lead)
-            .pr(trail)
-            .child(nav(s, k, rail))
-            .child(
-                el().key("settings-nav-divider")
-                    .w(1.0)
-                    .h_full()
-                    .fill(k.c.border_weak.alpha(0.35))
-                    .a11y_hidden(),
-            )
-            .child(content),
-    )
+    stage.child(body_row)
 }
 
 /// The default `TextEdit` for a stored value, or the one being typed.

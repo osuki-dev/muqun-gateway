@@ -654,21 +654,6 @@ impl DesktopPlugin for SysInfoPlugin {
         let lang = s.cfg.general.language;
         let tile_id = ctx.tile_id;
 
-        let header_row = row()
-            .w_full()
-            .h(36.0)
-            .px(12.0)
-            .gap(8.0)
-            .center_y()
-            .fill(k.alpha(k.c.layer_01, 0.45))
-            .child(icon(&icons::INFORMATION, 14.0).color(k.c.text_accent))
-            .child(
-                text(tr_ref(lang, "System & Diagnostics"))
-                    .font(k.ty.ui_medium)
-                    .color(k.c.text_base),
-            )
-            .child(el().grow(1.0));
-
         let host_name = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("HOST"))
             .unwrap_or_else(|_| "localhost".to_string());
@@ -939,7 +924,6 @@ impl DesktopPlugin for SysInfoPlugin {
                 .grow(1.0)
                 .w_full()
                 .min_h(0.0)
-                .child(header_row)
                 .child(body),
         )
     }
@@ -1018,21 +1002,6 @@ impl DesktopPlugin for QuickNotesPlugin {
         let tile_id = ctx.tile_id.to_string();
 
         let has_notes = !s.quick_notes_edit.text.trim().is_empty();
-
-        let header_row = row()
-            .w_full()
-            .h(36.0)
-            .px(10.0)
-            .gap(6.0)
-            .center_y()
-            .fill(k.alpha(k.c.layer_01, 0.45))
-            .child(icon(&icons::TASK, 13.0).color(k.c.text_accent))
-            .child(
-                text(tr_ref(lang, "Scratchpad"))
-                    .font(k.ty.ui_medium)
-                    .color(k.c.text_base),
-            )
-            .child(el().grow(1.0));
 
         let actions_bar = row()
             .w_full()
@@ -1124,7 +1093,6 @@ impl DesktopPlugin for QuickNotesPlugin {
                 .grow(1.0)
                 .w_full()
                 .min_h(0.0)
-                .child(header_row)
                 .child(actions_bar)
                 .child(note_body),
         )
@@ -1216,21 +1184,6 @@ impl DesktopPlugin for DiffPlugin {
         let s = ctx.s;
         let lang = s.cfg.general.language;
         let tile_id = ctx.tile_id;
-
-        let header_row = row()
-            .w_full()
-            .h(36.0)
-            .px(10.0)
-            .gap(8.0)
-            .center_y()
-            .fill(k.alpha(k.c.layer_01, 0.45))
-            .child(icon(&icons::BRANCH, 13.0).color(k.c.text_accent))
-            .child(
-                text(tr_ref(lang, "Working Tree Changes"))
-                    .font(k.ty.ui_medium)
-                    .color(k.c.text_base),
-            )
-            .child(el().grow(1.0));
 
         let actions_bar = row()
             .w_full()
@@ -1404,7 +1357,6 @@ impl DesktopPlugin for DiffPlugin {
                 .grow(1.0)
                 .w_full()
                 .min_h(0.0)
-                .child(header_row)
                 .child(actions_bar)
                 .child(content),
         )
@@ -1675,7 +1627,8 @@ impl DesktopPlugin for InboxPlugin {
     }
 
     fn render_tile(&self, ctx: &PluginViewContext<'_>, _layer: &mut Vec<El>) -> Option<El> {
-        Some(crate::ui::inbox::view(ctx.s, ctx.k))
+        let full_page = ctx.surface == PluginSlot::Page && ctx.s.active_plugin_page.is_none();
+        Some(crate::ui::inbox::view_in_surface(ctx.s, ctx.k, full_page))
     }
 }
 
@@ -1735,7 +1688,10 @@ impl DesktopPlugin for SettingsPlugin {
     }
 
     fn render_tile(&self, ctx: &PluginViewContext<'_>, layer: &mut Vec<El>) -> Option<El> {
-        Some(crate::ui::settings::view(ctx.s, ctx.k, layer))
+        let full_page = ctx.surface == PluginSlot::Page && ctx.s.active_plugin_page.is_none();
+        Some(crate::ui::settings::view_in_surface(
+            ctx.s, ctx.k, layer, full_page,
+        ))
     }
 }
 
@@ -2103,5 +2059,56 @@ mod tests {
         assert!(rt.state.toasts[0]
             .title
             .contains("Shortcut Test Plugin: Trigger Shortcut Action"));
+    }
+
+    #[test]
+    fn inbox_and_settings_in_tile_or_drawer_stay_below_host_header() {
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.sessions = vec![sample_session("s1")];
+        s.open_session("s1");
+        s.splash = None;
+        s.open_plugin_tile("settings");
+        s.open_plugin_drawer("inbox");
+
+        let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+        for _ in 0..10 {
+            rt.frame(1.0 / 60.0);
+        }
+        let nodes = rt.elements();
+
+        let inbox_header = nodes
+            .iter()
+            .find(|n| n.key.as_deref() == Some("window-header-inbox-Drawer"))
+            .expect("inbox drawer window header");
+        let inbox_body = nodes
+            .iter()
+            .find(|n| n.key.as_deref() == Some("inbox"))
+            .expect("inbox body in drawer");
+        assert!(
+            inbox_body.rect[1] >= inbox_header.rect[1] + inbox_header.rect[3] - 1.0,
+            "inbox drawer shifted over host header: header={:?} body={:?}",
+            inbox_header.rect,
+            inbox_body.rect
+        );
+
+        let settings_stage = nodes
+            .iter()
+            .find(|n| n.key.as_deref() == Some("settings-stage"))
+            .expect("settings stage in tile");
+        let tile_head = nodes
+            .iter()
+            .filter(|n| n.key.as_deref() == Some("tile-head"))
+            .find(|n| {
+                (n.rect[0] - settings_stage.rect[0]).abs() < 4.0
+                    && (n.rect[2] - settings_stage.rect[2]).abs() < 4.0
+            })
+            .expect("settings tile header");
+        assert!(
+            settings_stage.rect[1] >= tile_head.rect[1] + tile_head.rect[3] - 1.0,
+            "settings tile shifted over host header: header={:?} stage={:?}",
+            tile_head.rect,
+            settings_stage.rect
+        );
     }
 }

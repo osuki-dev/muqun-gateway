@@ -7,10 +7,12 @@
 //! slot (`ui::shell`), which other panels may share.
 
 use muqun_gateway::agents::{AgentPart, TimelineItem, TimelineRole};
-use rune::{col, icon, row, text, Cursor, El, PointerPress, ScrollSpec, Tx};
-use rune_kit::{context_menu, Kit, MenuItem, ScrollBar};
+use rune::{col, row, text, El, PointerPress, ScrollSpec, Tx};
+use rune_kit::{
+    context_menu, ControlSize, IconButton, IconButtonVariant, Kit, MenuItem, ScrollBar,
+};
 
-use super::{glyphs, Tcx};
+use super::Tcx;
 use crate::model::activity::{self, Block};
 use crate::model::tool_view as tv;
 use crate::ui::timeline::{group_key, SessionTimeline};
@@ -563,31 +565,32 @@ pub fn view(s: &UiState, k: &Kit) -> Option<El> {
     let bar = row()
         .key("pane-bar")
         .w_full()
-        // The main card's toolbar row, so the two line up.
+        // Matches `window::chrome` header height and control chrome.
         .h(rune_kit::shell::TOOLBAR_HEIGHT)
-        .px(12.0)
+        .px(10.0)
+        .py(4.0)
         .gap(8.0)
         .center_y()
         .child(
             text(cx.t("Details"))
-                .font(k.ty.small_medium)
-                .color(k.c.text_muted)
+                .font(k.ty.ui_medium)
+                .color(k.c.text_base)
+                .single_line()
+                .truncate()
+                .min_w(0.0)
+                .w(0.0)
                 .grow(1.0),
         )
         .child(
-            k.interactive(
-                row()
-                    .key("pane-close")
-                    .size(24.0, 24.0)
-                    .center()
-                    .radius(k.radius.sm)
-                    .child(icon(&glyphs::CLOSE, 13.0).color(k.c.icon_muted)),
-            )
-            .cursor(Cursor::Pointer)
-            .role("button")
-            .label(cx.t("Close"))
-            .help(cx.t("Close (Esc)"))
-            .on_press(|s: &mut UiState| s.close_inspect()),
+            IconButton::new(k.glyph.close)
+                .label(cx.t("Close"))
+                .help(cx.t("Close (Esc)"))
+                .shortcut("Esc")
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Large)
+                .on_press(|s: &mut UiState| s.close_inspect())
+                .build(k)
+                .key("pane-close"),
         );
     let (asid, id) = (open.asid.clone(), found.id.clone());
     let body = col()

@@ -498,28 +498,33 @@ pub(super) fn image_overlay(s: &UiState, k: &Kit, scale: f32, layer: &mut Vec<El
     let Some(v) = &s.zoom else {
         return;
     };
+    let look = s.look();
     let mut menus = Vec::new();
     let close = |s: &mut UiState| {
         s.zoom = None;
         s.menu = None;
     };
+    let card = col()
+        .w_full()
+        .h_full()
+        .min_h(0.0)
+        .on_press(|_: &mut UiState| {})
+        .child(viewer_content(s, v, k, scale, &mut menus));
+    let mut panel = look.panel(k, card, k.radius.xl);
+    for shadow in k.shadow_layers(&k.elevation.overlay) {
+        panel = panel.box_shadow(shadow);
+    }
     let dialog = col()
         .key("plugin-image-dialog")
         .absolute(0.0, 0.0)
         .w_full()
         .h_full()
         .padding(20.0)
-        .fill(k.alpha(k.c.black, 0.88))
+        .fill(k.alpha(k.c.black, if s.dark { 0.65 } else { 0.45 }))
+        .token_motion(k.motion.overlay)
         .on_press(close)
         .modal(true, close)
-        .child(
-            col()
-                .w_full()
-                .h_full()
-                .fill(k.c.layer_01)
-                .on_press(|_: &mut UiState| {})
-                .child(viewer_content(s, v, k, scale, &mut menus)),
-        );
+        .child(look.dialog_motion(panel));
     layer.push(dialog);
     layer.extend(menus);
 }
@@ -723,20 +728,18 @@ fn header(s: &UiState, v: &Viewer, k: &Kit, fit_zoom: f32, layer: &mut Vec<El>) 
         if matches!(v.body, Body::Image(Some(_))) {
             let close = tr_ref(language, "Close");
             bar = bar.child(
-                k.interactive(
-                    el().size(32.0, 32.0)
-                        .center()
-                        .child(rune::icon(&rune_kit::glyphs::CLOSE, 16.0).color(k.c.text_base)),
-                )
-                .key("plugin-image-close")
-                .role("button")
-                .focusable(true)
-                .cursor(rune::Cursor::Pointer)
-                .label(close)
-                .on_press(|s: &mut UiState| {
-                    s.zoom = None;
-                    s.menu = None;
-                }),
+                rune_kit::IconButton::new(k.glyph.close)
+                    .label(close)
+                    .help(close)
+                    .shortcut("Esc")
+                    .variant(rune_kit::IconButtonVariant::GhostMuted)
+                    .control_size(rune_kit::ControlSize::Large)
+                    .on_press(|s: &mut UiState| {
+                        s.zoom = None;
+                        s.menu = None;
+                    })
+                    .build(k)
+                    .key("plugin-image-close"),
             );
         }
         return bar;
@@ -1418,12 +1421,17 @@ mod tests {
         ];
         s.selected = Some("one".into());
         s.open_git_inspector();
-        assert!(s.inline_inspector_open());
+        assert!(s.right_open);
+        assert_eq!(s.active_plugin_drawer.as_deref(), Some("inspector"));
+        assert_eq!(s.selected_dock_tab(), Some("inspector"));
+        assert!(!s.inline_inspector_open());
         s.open_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/icons/app-icon.png"));
         assert!(s.file_window_focused());
         assert!(!s.inline_inspector_open());
         s.focus_tile(0);
-        assert!(s.inline_inspector_open());
+        assert!(s.right_open);
+        assert_eq!(s.selected_dock_tab(), Some("inspector"));
+        assert!(!s.inline_inspector_open());
     }
 
     #[test]

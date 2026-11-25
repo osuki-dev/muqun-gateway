@@ -169,8 +169,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         },
     );
     let plugin_drawer = s.right_open && s.active_plugin_drawer.is_some();
-    let inspector_here =
-        (s.right_open && s.mode == Mode::Session && !s.in_split()) || plugin_drawer;
+    let inspector_here = (s.right_open && s.mode == Mode::Session) || plugin_drawer;
     // A row's details take the right-hand slot while they are open; an open
     // terminal takes it over both, and the inspector comes last.
     let details = (s.mode == Mode::Session

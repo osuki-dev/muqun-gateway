@@ -523,23 +523,53 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
     match content {
         super::TileContent::Session(a) => {
             let a = a.clone();
-            menu = menu.item(MenuItem::new(tr(language, "Show only this one")).on_select(
-                move |s: &mut UiState| {
-                    if let Some(at) = s.tile_of(&a) {
-                        s.focus_tile(at);
-                    }
-                    let mut j = s.tiles.len();
-                    while j > 0 {
-                        j -= 1;
-                        if s.tiles
-                            .get(j)
-                            .is_some_and(|t| t.asid.as_deref() != Some(a.as_str()))
-                        {
-                            s.close_tile(j);
+            let fork_id = a.clone();
+            let compact_id = a.clone();
+            let busy = s.session_by_id(&a).is_some_and(|x| {
+                matches!(
+                    x.status,
+                    muqun_gateway::agents::AgentSessionStatus::Busy
+                        | muqun_gateway::agents::AgentSessionStatus::Retry
+                )
+            });
+            menu = menu
+                .item(MenuItem::new(tr(language, "Fork session")).on_select(
+                    move |s: &mut UiState| {
+                        s.menu = None;
+                        s.send(Command::ForkSession {
+                            asid: muqun_gateway::agents::AgentSessionId(fork_id.clone()),
+                            message_id: None,
+                        });
+                    },
+                ))
+                .item(
+                    MenuItem::new(tr(language, "Compact history"))
+                        .disabled(busy)
+                        .on_select(move |s: &mut UiState| {
+                            s.menu = None;
+                            s.send(Command::CompactSession {
+                                asid: muqun_gateway::agents::AgentSessionId(compact_id.clone()),
+                            });
+                        }),
+                )
+                .separator()
+                .item(MenuItem::new(tr(language, "Show only this one")).on_select(
+                    move |s: &mut UiState| {
+                        if let Some(at) = s.tile_of(&a) {
+                            s.focus_tile(at);
                         }
-                    }
-                },
-            ));
+                        let mut j = s.tiles.len();
+                        while j > 0 {
+                            j -= 1;
+                            if s.tiles
+                                .get(j)
+                                .is_some_and(|t| t.asid.as_deref() != Some(a.as_str()))
+                            {
+                                s.close_tile(j);
+                            }
+                        }
+                    },
+                ));
         }
         super::TileContent::Terminal => {
             menu = menu
@@ -1223,18 +1253,6 @@ fn tile(
                 )
                 .child(parked_composer(s, k, look, i));
         }
-    }
-    if focused && s.inline_inspector_open() {
-        body = body.child(
-            col()
-                .key("tile-git-panel")
-                .pin(Some(8.0), Some(HEAD_H), Some(8.0), Some(8.0))
-                .fill(k.c.bg_base)
-                .radius(k.radius.lg)
-                .motion(look.focus_fade())
-                .border(1.0, k.c.border_muted)
-                .child(super::inspector::inline_view(s, k).grow(1.0).min_h(0.0)),
-        );
     }
     // Focus is contrast: the other panes' content sits a step back under a
     // scrim of the card's own colour (one quad, no layer, no blur) that
@@ -2558,5 +2576,108 @@ mod tests {
 
         s.toggle_tile_split_axis();
         s.equalize_tiles();
+    }
+
+    #[test]
+    fn split_tile_session_menu_exposes_fork_and_compact_and_no_inline_inspector() {
+        use muqun_gateway::agents::{AgentSessionInfo, AgentSessionStatus};
+        use rune::{Env, Runtime};
+
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let s1: AgentSessionInfo = serde_json::from_value(serde_json::json!({
+            "asid": "s-idle",
+            "agent_id": "claude",
+            "title": "Idle session",
+            "status": "idle",
+            "updated_ms": 1000u64,
+        }))
+        .unwrap();
+        let s2: AgentSessionInfo = serde_json::from_value(serde_json::json!({
+            "asid": "s-busy",
+            "agent_id": "claude",
+            "title": "Busy session",
+            "status": "busy",
+            "updated_ms": 1000u64,
+        }))
+        .unwrap();
+        s.sessions = vec![s1, s2];
+        s.open_session("s-idle");
+        s.open_in_tile("s-busy");
+        s.focus_tile(0);
+        s.splash = None;
+
+        // Opening Git inspector in split view uses the unified right dock, never an inline overlay.
+        s.open_git_inspector();
+        assert!(s.right_open);
+        assert_eq!(s.active_plugin_drawer.as_deref(), Some("inspector"));
+        assert_eq!(s.selected_dock_tab(), Some("inspector"));
+        assert!(!s.inline_inspector_open());
+
+        s.menu = Some(OpenMenu::Tile(0));
+        let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+        for _ in 0..10 {
+            rt.frame(1.0 / 60.0);
+        }
+        let nodes = rt.elements();
+        assert!(
+            nodes
+                .iter()
+                .all(|n| n.key.as_deref() != Some("tile-git-panel")),
+            "split tiles must never render the legacy inline inspector overlay"
+        );
+        assert!(
+            nodes.iter().any(|n| n.key.as_deref() == Some("inspector")),
+            "inspector must render inside the unified right dock"
+        );
+
+        let click_item = |rt: &mut Runtime<UiState>, label: &str| {
+            let item = rt
+                .elements()
+                .into_iter()
+                .find(|n| n.role == "menuitem" && n.label.as_deref() == Some(label))
+                .unwrap_or_else(|| panic!("missing menuitem {label}"));
+            let [x, y, w, h] = item.rect;
+            rt.pointer_down(x + w / 2.0, y + h / 2.0);
+            rt.pointer_up(x + w / 2.0, y + h / 2.0);
+            rt.frame(1.0 / 60.0);
+        };
+
+        while rx.try_recv().is_ok() {}
+        click_item(&mut rt, "Fork session");
+        let cmds: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            cmds.iter().any(|cmd| matches!(
+                cmd,
+                Command::ForkSession { asid, message_id: None } if asid.0 == "s-idle"
+            )),
+            "expected ForkSession for s-idle, got {cmds:?}"
+        );
+
+        rt.update(|s, _| s.menu = Some(OpenMenu::Tile(0)));
+        rt.frame(1.0 / 60.0);
+        click_item(&mut rt, "Compact history");
+        let cmds: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            cmds.iter().any(|cmd| matches!(
+                cmd,
+                Command::CompactSession { asid } if asid.0 == "s-idle"
+            )),
+            "expected CompactSession for s-idle, got {cmds:?}"
+        );
+
+        // On the busy tile, Compact history must be disabled.
+        assert_eq!(rt.state.sessions[1].status, AgentSessionStatus::Busy);
+        rt.update(|s, _| s.menu = Some(OpenMenu::Tile(1)));
+        rt.frame(1.0 / 60.0);
+        while rx.try_recv().is_ok() {}
+        click_item(&mut rt, "Compact history");
+        let cmds: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, Command::CompactSession { .. })),
+            "busy session must not trigger CompactSession, got {cmds:?}"
+        );
     }
 }

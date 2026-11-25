@@ -255,8 +255,7 @@ impl UiState {
             self.term.sink.focused = false;
         }
         self.quick_notes_edit.focused = plugin_id == "quicknotes";
-        self.active_plugin_drawer =
-            (plugin_id != "inspector" || self.dock_tabs.len() > 1).then(|| plugin_id.to_owned());
+        self.active_plugin_drawer = Some(plugin_id.to_owned());
         self.right_open = true;
         self.right.set_open(true);
         if plugin_id == "inspector" {
@@ -290,25 +289,29 @@ impl UiState {
 
     /// Open or pop out a plugin into a draggable floating window tile.
     pub fn open_plugin_float(&mut self, plugin_id: &str) {
-        self.release_plugin_page();
-        if self.selected_dock_tab() == Some(plugin_id) {
-            if plugin_id == "terminal" {
-                self.close_terminal();
-            } else {
-                self.close_plugin_drawer();
-            }
-        }
-        self.remove_dock_tab(plugin_id, false);
-        if let Some(i) = self.tile_of_plugin(plugin_id) {
-            self.mode = Mode::Session;
-            if !self.tiles.get(i).is_some_and(|t| t.popped) {
-                self.toggle_tile_pop_at(i);
-            } else {
-                self.focus_tile(i);
-            }
+        if !self
+            .plugins
+            .get_enabled(plugin_id, &self.cfg.plugins_disabled)
+            .is_some_and(|plugin| plugin.supports_surface(crate::plugin::PluginSlot::Tile))
+        {
             return;
         }
-        self.open_plugin_tile(plugin_id);
+        if self.active_plugin_page.as_deref() != Some(plugin_id)
+            && self.selected_dock_tab() != Some(plugin_id)
+            && !self.dock_tabs.iter().any(|tab| tab == plugin_id)
+        {
+            if let Some(i) = self.tile_of_plugin(plugin_id) {
+                self.release_plugin_page();
+                self.mode = Mode::Session;
+                if !self.tiles.get(i).is_some_and(|t| t.popped) {
+                    self.toggle_tile_pop_at(i);
+                } else {
+                    self.focus_tile(i);
+                }
+                return;
+            }
+        }
+        self.switch_plugin_surface(plugin_id, crate::plugin::PluginSlot::Tile);
         if let Some(i) = self.tile_of_plugin(plugin_id) {
             if !self.tiles.get(i).is_some_and(|t| t.popped) {
                 self.toggle_tile_pop_at(i);
@@ -715,7 +718,132 @@ mod tests {
         assert!(s.draft.focused);
         s.toggle_inspector();
         assert!(s.right_open);
+        assert_eq!(s.active_plugin_drawer.as_deref(), Some("inspector"));
+        assert_eq!(s.selected_dock_tab(), Some("inspector"));
         s.close_plugin_drawer();
         assert!(!s.right_open);
+    }
+
+    #[test]
+    fn open_plugin_float_preserves_live_view_and_fields_across_surfaces() {
+        use crate::plugin::{DesktopPlugin, PluginSlot, PluginViewContext};
+
+        #[derive(Default)]
+        struct LiveFloatPanel(std::sync::Mutex<Option<String>>);
+        impl DesktopPlugin for LiveFloatPanel {
+            fn id(&self) -> &'static str {
+                "live-float-test"
+            }
+            fn title(&self, _: crate::config::Language) -> String {
+                self.id().into()
+            }
+            fn icon(&self) -> &'static rune::Icon {
+                &crate::ui::icons::OPEN_EXTERNAL
+            }
+            fn render_tile(
+                &self,
+                _: &PluginViewContext<'_>,
+                _: &mut Vec<rune::El>,
+            ) -> Option<rune::El> {
+                None
+            }
+            fn on_view_action(&self, _: &mut UiState, instance: &str, _: &str) -> bool {
+                assert!(
+                    self.0.lock().unwrap().replace(instance.into()).is_none(),
+                    "live view must not be destroyed and re-mounted when floating"
+                );
+                true
+            }
+            fn can_move_view(&self, instance: &str) -> bool {
+                self.0.lock().unwrap().as_deref() == Some(instance)
+            }
+            fn move_view(&self, from: &str, to: &str) {
+                assert_eq!(
+                    self.0.lock().unwrap().replace(to.into()).as_deref(),
+                    Some(from)
+                );
+            }
+            fn close_view(&self, instance: &str) {
+                let mut live = self.0.lock().unwrap();
+                if live.as_deref() == Some(instance) {
+                    live.take();
+                }
+            }
+        }
+
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.selected = Some("workspace-session".into());
+        let live = std::sync::Arc::new(LiveFloatPanel::default());
+        let id = live.id();
+        s.plugins.register(live.clone());
+
+        // 1. Drawer -> Floating window preserves live view and plugin_fields.
+        let field_key = ("form".to_owned(), "query".to_owned());
+        s.open_plugin_drawer(id);
+        assert!(live.can_move_view("drawer"));
+        s.plugin_fields
+            .entry((id.to_owned(), "drawer".to_owned()))
+            .or_default()
+            .insert(field_key.clone(), rune::TextEdit::new("unsaved draft"));
+        s.open_plugin_float(id);
+        let tile_idx = s.tile_of_plugin(id).expect("plugin floated into tile");
+        assert!(s.tiles[tile_idx].popped);
+        let tile_instance = match &s.tiles[tile_idx].content {
+            crate::ui::TileContent::Custom { id: inst, .. } => inst.clone(),
+            other => panic!("expected custom tile, got {other:?}"),
+        };
+        assert!(live.can_move_view(&tile_instance));
+        assert_eq!(
+            s.plugin_fields
+                .get(&(id.to_owned(), tile_instance.clone()))
+                .and_then(|fields| fields.get(&field_key))
+                .map(|edit| edit.text.as_str()),
+            Some("unsaved draft")
+        );
+
+        // Calling open_plugin_float again while already popped keeps live state intact.
+        s.open_plugin_float(id);
+        assert!(s.tiles[tile_idx].popped);
+        assert!(live.can_move_view(&tile_instance));
+
+        // 2. Page -> Floating window preserves live view and plugin_fields.
+        s.switch_plugin_surface(id, PluginSlot::Page);
+        assert!(live.can_move_view("page"));
+        s.open_plugin_float(id);
+        let tile_idx = s.tile_of_plugin(id).expect("plugin floated from page");
+        assert!(s.tiles[tile_idx].popped);
+        assert!(s.active_plugin_page.is_none());
+        assert!(live.can_move_view(&tile_instance));
+        assert_eq!(
+            s.plugin_fields
+                .get(&(id.to_owned(), tile_instance.clone()))
+                .and_then(|fields| fields.get(&field_key))
+                .map(|edit| edit.text.as_str()),
+            Some("unsaved draft")
+        );
+
+        // 3. Background dock tab -> Floating window preserves live view and plugin_fields.
+        s.switch_plugin_surface(id, PluginSlot::Drawer);
+        assert!(live.can_move_view("drawer"));
+        s.open_plugin_drawer("terminal");
+        assert_eq!(s.selected_dock_tab(), Some("terminal"));
+        s.open_plugin_float(id);
+        let tile_idx = s
+            .tile_of_plugin(id)
+            .expect("plugin floated from background dock tab");
+        assert!(s.tiles[tile_idx].popped);
+        let next_instance = match &s.tiles[tile_idx].content {
+            crate::ui::TileContent::Custom { id: inst, .. } => inst.clone(),
+            other => panic!("expected custom tile, got {other:?}"),
+        };
+        assert!(live.can_move_view(&next_instance));
+        assert_eq!(
+            s.plugin_fields
+                .get(&(id.to_owned(), next_instance))
+                .and_then(|fields| fields.get(&field_key))
+                .map(|edit| edit.text.as_str()),
+            Some("unsaved draft")
+        );
     }
 }
