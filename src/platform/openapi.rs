@@ -1378,7 +1378,7 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
         (
             "/api/mcp/upstreams",
             json!({ "get": {
-                "summary": "List external upstream MCP servers registered in Muqun's unified MCP Hub (sensitive headers/env masked). Requires a device token and mcp_hub_v1",
+                "summary": "List Muqun's built-in MCP server status/tools/skills and external upstream MCP servers registered in Muqun's unified MCP Hub (sensitive headers/env masked). Requires a device token and mcp_hub_v1",
                 "responses": ok_response()
             }}),
         ),

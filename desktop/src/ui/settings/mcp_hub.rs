@@ -8,7 +8,10 @@ use rune::{col, el, row as hrow, text, El, TextEdit};
 use rune_kit::{ButtonVariant, Kit, TextInput};
 
 use super::{button, choice, empty, field, flag, group, group_with, row, status, Tone};
-use crate::hub::{McpHubError, McpUpstreamTransport, McpUpstreamUpsert, McpUpstreamView};
+use crate::hub::{
+    McpBuiltinView, McpHubError, McpHubSnapshot, McpUpstreamTransport, McpUpstreamUpsert,
+    McpUpstreamView,
+};
 use crate::model::commands::Command;
 use crate::ui::copy::tr_ref;
 use crate::ui::UiState;
@@ -19,6 +22,7 @@ const SCOPES: [&str; 3] = ["local_only", "tasks", "all"];
 const ISOLATIONS: [&str; 2] = ["shared", "per_session"];
 
 pub struct McpHubState {
+    pub builtin: Option<McpBuiltinView>,
     pub upstreams: Vec<McpUpstreamView>,
     pub loading: bool,
     pub unsupported_reason: Option<String>,
@@ -50,6 +54,7 @@ pub struct McpHubState {
 impl Default for McpHubState {
     fn default() -> Self {
         Self {
+            builtin: None,
             upstreams: Vec::new(),
             loading: false,
             unsupported_reason: None,
@@ -79,6 +84,7 @@ impl Default for McpHubState {
 
 impl McpHubState {
     pub fn reset_for_switch(&mut self) {
+        self.builtin = None;
         self.upstreams.clear();
         self.loading = false;
         self.unsupported_reason = None;
@@ -254,15 +260,17 @@ impl McpHubState {
         ))
     }
 
-    pub fn apply_loaded(&mut self, result: Result<Vec<McpUpstreamView>, McpHubError>) {
+    pub fn apply_loaded(&mut self, result: Result<McpHubSnapshot, McpHubError>) {
         self.loading = false;
         match result {
-            Ok(list) => {
-                self.upstreams = list;
+            Ok(snapshot) => {
+                self.builtin = snapshot.builtin;
+                self.upstreams = snapshot.upstreams;
                 self.unsupported_reason = None;
                 self.error = None;
             }
             Err(McpHubError::Unsupported(reason)) => {
+                self.builtin = None;
                 self.upstreams.clear();
                 self.unsupported_reason = Some(reason);
                 self.error = None;
@@ -474,6 +482,10 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
         sections.push(status(k, "mcp-hub-error", Tone::Bad, err.clone()));
     }
 
+    if let Some(builtin) = &s.mcp_hub.builtin {
+        sections.push(builtin_card(s, k, builtin));
+    }
+
     if s.mcp_hub.form_open {
         sections.push(editor_form(s, k));
     }
@@ -500,6 +512,164 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
     }
 
     sections
+}
+
+fn builtin_card(s: &UiState, k: &Kit, builtin: &McpBuiltinView) -> El {
+    let lang = s.cfg.general.language;
+    let t = |en| tr_ref(lang, en);
+
+    let title = if builtin.label.is_empty() {
+        format!("Muqun Gateway ({})", builtin.id)
+    } else {
+        format!("{} ({})", builtin.label, builtin.id)
+    };
+
+    let (dot_color, status_text) = if !builtin.enabled {
+        (k.c.text_muted.alpha(0.5), t("Disabled").to_owned())
+    } else if builtin.serves_agents {
+        (
+            k.c.success.icon,
+            format!("{} · {} {}", t("Running"), builtin.tool_count, t("tools")),
+        )
+    } else {
+        (k.c.danger.fg, t("Loopback unavailable").to_owned())
+    };
+
+    let status_pill = hrow()
+        .key("builtin-status-pill")
+        .gap(6.0)
+        .px(8.0)
+        .py(2.0)
+        .radius(k.radius.sm)
+        .fill(k.c.layer_02)
+        .border(1.0, k.c.border_weak.alpha(0.5))
+        .center_y()
+        .child(
+            el().size(6.0, 6.0)
+                .radius(3.0)
+                .fill(dot_color)
+                .a11y_hidden(),
+        )
+        .child(text(status_text).font(k.ty.small).color(k.c.text_base));
+
+    let inject_pill = pill(
+        k,
+        "builtin-inject-pill",
+        if builtin.inject_into_agents {
+            t("Auto-inject on")
+        } else {
+            t("Auto-inject off")
+        },
+    );
+
+    let head = hrow()
+        .key("head")
+        .w_full()
+        .min_h(32.0)
+        .gap(10.0)
+        .center_y()
+        .child(
+            hrow()
+                .key("title-group")
+                .gap(8.0)
+                .center_y()
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .flex_wrap()
+                .child(
+                    text(title)
+                        .font(k.ty.ui_medium)
+                        .color(k.c.text_base)
+                        .truncate(),
+                )
+                .child(pill(k, "builtin-pill", t("Built-in")))
+                .child(pill(k, "transport-pill", "HTTP"))
+                .child(status_pill),
+        )
+        .child(inject_pill);
+
+    let mut rows = Vec::new();
+
+    let endpoint_detail = if builtin.protocol.is_empty() {
+        builtin.url.clone()
+    } else {
+        format!("{}  ·  {}", builtin.url, builtin.protocol)
+    };
+    let token_badge = pill(
+        k,
+        "builtin-tokens-pill",
+        format!("{}: {}", t("Active tokens"), builtin.active_tokens),
+    );
+    rows.push(row(
+        k,
+        "mcp-builtin-ep",
+        t("Endpoint"),
+        &endpoint_detail,
+        token_badge,
+    ));
+
+    if !builtin.tools.is_empty() {
+        let names = builtin
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        rows.push(
+            col()
+                .key("mcp-builtin-tools")
+                .w_full()
+                .py(8.0)
+                .gap(4.0)
+                .child(
+                    text(format!("{} ({})", t("Built-in tools"), builtin.tool_count))
+                        .font(k.ty.small)
+                        .color(k.c.text_base),
+                )
+                .child(
+                    text(names)
+                        .font(k.ty.small)
+                        .color(k.c.text_muted)
+                        .wrap()
+                        .w_full(),
+                ),
+        );
+    }
+
+    if !builtin.skills.is_empty() {
+        let names = builtin
+            .skills
+            .iter()
+            .map(|sk| format!("{}/{}", sk.namespace, sk.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        rows.push(
+            col()
+                .key("mcp-builtin-skills")
+                .w_full()
+                .py(8.0)
+                .gap(4.0)
+                .child(
+                    text(format!(
+                        "{} ({})",
+                        t("Available skills"),
+                        builtin.skill_count
+                    ))
+                    .font(k.ty.small)
+                    .color(k.c.text_base),
+                )
+                .child(
+                    text(names)
+                        .font(k.ty.small)
+                        .color(k.c.text_muted)
+                        .wrap()
+                        .w_full(),
+                ),
+        );
+    }
+
+    group_with(k, "mcp-builtin-muqun", head, rows)
 }
 
 fn editor_form(s: &UiState, k: &Kit) -> El {
@@ -1095,8 +1265,25 @@ mod tests {
         st.apply_loaded(Err(McpHubError::Unsupported("upgrade gateway".into())));
         assert_eq!(st.unsupported_reason.as_deref(), Some("upgrade gateway"));
 
-        st.apply_loaded(Ok(Vec::new()));
+        st.apply_loaded(Ok(McpHubSnapshot {
+            builtin: Some(McpBuiltinView {
+                id: "muqun".into(),
+                label: "Muqun Gateway".into(),
+                enabled: true,
+                serves_agents: true,
+                inject_into_agents: true,
+                url: "http://127.0.0.1:23847/mcp".into(),
+                protocol: "Streamable HTTP (MCP 2026-07-28)".into(),
+                active_tokens: 2,
+                tool_count: 12,
+                skill_count: 4,
+                tools: Vec::new(),
+                skills: Vec::new(),
+            }),
+            upstreams: Vec::new(),
+        }));
         assert!(st.unsupported_reason.is_none());
+        assert_eq!(st.builtin.as_ref().map(|b| b.id.as_str()), Some("muqun"));
 
         let view = McpUpstreamView {
             id: "demo".into(),

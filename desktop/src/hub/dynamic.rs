@@ -661,7 +661,7 @@ impl SessionHub for DynamicHub {
         Box::pin(async move { active.read_file(asid, path).await })
     }
 
-    fn list_mcp_upstreams(&self) -> HubFuture<'_, Vec<super::McpUpstreamView>> {
+    fn list_mcp_upstreams(&self) -> HubFuture<'_, super::McpHubSnapshot> {
         let active = self.active();
         Box::pin(async move { active.list_mcp_upstreams().await })
     }

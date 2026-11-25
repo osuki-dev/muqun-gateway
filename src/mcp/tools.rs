@@ -608,6 +608,22 @@ pub(crate) struct MuqunMcp {
 
 static CACHED_TOOL_ROUTER: OnceLock<ToolRouter<MuqunMcp>> = OnceLock::new();
 
+/// Preview metadata for every built-in tool served on `/mcp`, derived directly
+/// from the cached `ToolRouter` so the management UI stays in sync.
+pub(crate) fn builtin_tool_previews() -> Vec<super::hub::UpstreamToolPreview> {
+    let mut tools: Vec<super::hub::UpstreamToolPreview> = CACHED_TOOL_ROUTER
+        .get_or_init(MuqunMcp::tool_router)
+        .list_all()
+        .into_iter()
+        .map(|tool| super::hub::UpstreamToolPreview {
+            name: tool.name.to_string(),
+            description: tool.description.map(|d| d.to_string()).unwrap_or_default(),
+        })
+        .collect();
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    tools
+}
+
 #[tool_router(router = tool_router)]
 impl MuqunMcp {
     pub(crate) fn new(state: AppState, session: AssistantSession) -> Self {

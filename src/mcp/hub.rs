@@ -220,6 +220,29 @@ pub(crate) struct UpstreamToolPreview {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct BuiltinSkillPreview {
+    pub(crate) name: String,
+    pub(crate) namespace: String,
+    pub(crate) description: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BuiltinMcpView {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) enabled: bool,
+    pub(crate) serves_agents: bool,
+    pub(crate) inject_into_agents: bool,
+    pub(crate) url: String,
+    pub(crate) protocol: String,
+    pub(crate) active_tokens: usize,
+    pub(crate) tool_count: usize,
+    pub(crate) skill_count: usize,
+    pub(crate) tools: Vec<UpstreamToolPreview>,
+    pub(crate) skills: Vec<BuiltinSkillPreview>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct UpstreamView {
     pub(crate) id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1842,8 +1865,38 @@ async fn list_upstreams(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     let upstreams = state.mcp_hub.list_views();
+    let tools = crate::mcp::tools::builtin_tool_previews();
+    let skills: Vec<BuiltinSkillPreview> = crate::mcp::skills::all_skills()
+        .into_iter()
+        .map(|s| BuiltinSkillPreview {
+            name: s.name,
+            namespace: s.namespace,
+            description: s.description,
+        })
+        .collect();
+    let active_tokens = state
+        .mcp_tokens
+        .list()
+        .await
+        .map(|rows| rows.len())
+        .unwrap_or(0);
+    let builtin = BuiltinMcpView {
+        id: "muqun".to_owned(),
+        label: "Muqun Gateway".to_owned(),
+        enabled: state.config.mcp.enabled,
+        serves_agents: state.config.mcp.enabled && crate::mcp::serves_agents(&state.config.listen),
+        inject_into_agents: state.config.mcp.inject_into_agents,
+        url: crate::mcp::recorded_url(&state.config.listen),
+        protocol: "Streamable HTTP (MCP 2026-07-28)".to_owned(),
+        active_tokens,
+        tool_count: tools.len(),
+        skill_count: skills.len(),
+        tools,
+        skills,
+    };
     Ok(Json(json!({
         "capability": CAPABILITY,
+        "builtin": builtin,
         "upstreams": upstreams,
     })))
 }
@@ -2392,6 +2445,22 @@ done
             .unwrap();
         let listed: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(listed["capability"], CAPABILITY);
+        assert_eq!(listed["builtin"]["id"], "muqun");
+        assert_eq!(listed["builtin"]["enabled"], true);
+        assert!(
+            listed["builtin"]["tool_count"].as_u64().unwrap_or(0) >= 12,
+            "expected built-in tools in GET /api/mcp/upstreams: {listed}"
+        );
+        assert!(
+            listed["builtin"]["skill_count"].as_u64().unwrap_or(0) >= 4,
+            "expected built-in skills in GET /api/mcp/upstreams: {listed}"
+        );
+        assert!(
+            listed["builtin"]["url"]
+                .as_str()
+                .is_some_and(|u| u.ends_with("/mcp")),
+            "expected /mcp endpoint URL: {listed}"
+        );
         assert_eq!(listed["upstreams"].as_array().unwrap().len(), 1);
 
         // DELETE removes upstream

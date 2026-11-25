@@ -282,9 +282,9 @@ pub enum Update {
         diff_summary: String,
         files: Vec<(String, usize, usize)>,
     },
-    /// Upstream MCP Hub servers loaded from Gateway.
+    /// Built-in Muqun MCP server + upstream MCP Hub servers loaded from Gateway.
     McpUpstreamsLoaded {
-        result: Result<Vec<crate::hub::McpUpstreamView>, crate::hub::McpHubError>,
+        result: Result<crate::hub::McpHubSnapshot, crate::hub::McpHubError>,
     },
     /// Upstream MCP server saved (created or updated).
     McpUpstreamSaved {

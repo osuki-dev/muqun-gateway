@@ -1827,7 +1827,7 @@ impl SessionHub for RemoteHub {
         })
     }
 
-    fn list_mcp_upstreams(&self) -> HubFuture<'_, Vec<super::McpUpstreamView>> {
+    fn list_mcp_upstreams(&self) -> HubFuture<'_, super::McpHubSnapshot> {
         Box::pin(async move {
             if !self.has_capability(MCP_HUB_CAPABILITY).await? {
                 return Err(HubError::Agent(AgentError::Unsupported(
@@ -1837,7 +1837,7 @@ impl SessionHub for RemoteHub {
             let json = self
                 .call(Method::GET, &["api", "mcp", "upstreams"], &[], None)
                 .await?;
-            decode(json.get("upstreams").cloned().unwrap_or_else(|| json!([])))
+            decode(json)
         })
     }
 

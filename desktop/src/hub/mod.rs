@@ -68,6 +68,56 @@ pub struct McpUpstreamToolPreview {
     pub description: String,
 }
 
+/// Preview of one skill served by Muqun's built-in MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpBuiltinSkillPreview {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub namespace: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Muqun Gateway's own built-in `/mcp` server status as returned by
+/// `GET /api/mcp/upstreams`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpBuiltinView {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default = "default_true_desktop")]
+    pub enabled: bool,
+    #[serde(default = "default_true_desktop")]
+    pub serves_agents: bool,
+    #[serde(default = "default_true_desktop")]
+    pub inject_into_agents: bool,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub protocol: String,
+    #[serde(default)]
+    pub active_tokens: usize,
+    #[serde(default)]
+    pub tool_count: usize,
+    #[serde(default)]
+    pub skill_count: usize,
+    #[serde(default)]
+    pub tools: Vec<McpUpstreamToolPreview>,
+    #[serde(default)]
+    pub skills: Vec<McpBuiltinSkillPreview>,
+}
+
+/// Snapshot returned by `GET /api/mcp/upstreams`: Muqun's own built-in MCP
+/// server alongside any configured external upstream MCP servers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpHubSnapshot {
+    #[serde(default)]
+    pub builtin: Option<McpBuiltinView>,
+    #[serde(default)]
+    pub upstreams: Vec<McpUpstreamView>,
+}
+
 /// One upstream MCP server as returned by `GET /api/mcp/upstreams`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct McpUpstreamView {
@@ -812,8 +862,9 @@ pub trait SessionHub: Send + Sync {
             )))
         })
     }
-    /// List external upstream MCP servers configured in Gateway's unified MCP Hub.
-    fn list_mcp_upstreams(&self) -> HubFuture<'_, Vec<McpUpstreamView>> {
+    /// List Muqun's built-in MCP server and external upstream MCP servers
+    /// configured in Gateway's unified MCP Hub.
+    fn list_mcp_upstreams(&self) -> HubFuture<'_, McpHubSnapshot> {
         Box::pin(async {
             Err(HubError::Agent(AgentError::Unsupported(
                 "Connect to a Gateway service with mcp_hub_v1 to manage unified MCP servers."

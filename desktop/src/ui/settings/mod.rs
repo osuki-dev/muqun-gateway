@@ -109,7 +109,7 @@ impl SettingsTab {
             ),
             Self::McpHub => tr_ref(
                 language,
-                "Connect external HTTP or stdio MCP servers once in Muqun Gateway so every agent discovers and calls them on demand.",
+                "Muqun's built-in MCP server and external HTTP/stdio MCP servers shared across all connected agents.",
             ),
             Self::Voice => super::voice::subtitle(language),
             Self::Shortcuts => tr_ref(language, "Every key the window answers to."),
