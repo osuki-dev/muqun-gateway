@@ -41,6 +41,8 @@ pub struct McpHubState {
     /// 0 = shared, 1 = per_session
     pub isolation_idx: usize,
     pub timeout_input: TextEdit,
+    pub allowed_tools_input: TextEdit,
+    pub denied_tools_input: TextEdit,
     pub form_saving: bool,
     pub form_error: Option<String>,
 }
@@ -67,6 +69,8 @@ impl Default for McpHubState {
             scope_idx: 0,
             isolation_idx: 0,
             timeout_input: TextEdit::new("30"),
+            allowed_tools_input: TextEdit::new(""),
+            denied_tools_input: TextEdit::new(""),
             form_saving: false,
             form_error: None,
         }
@@ -74,6 +78,16 @@ impl Default for McpHubState {
 }
 
 impl McpHubState {
+    pub fn reset_for_switch(&mut self) {
+        self.upstreams.clear();
+        self.loading = false;
+        self.unsupported_reason = None;
+        self.error = None;
+        self.busy_ids.clear();
+        self.confirm_delete = None;
+        self.close_form();
+    }
+
     pub fn open_new_form(&mut self) {
         self.form_open = true;
         self.editing_id = None;
@@ -88,6 +102,8 @@ impl McpHubState {
         self.scope_idx = 0;
         self.isolation_idx = 0;
         self.timeout_input = TextEdit::new("30");
+        self.allowed_tools_input = TextEdit::new("");
+        self.denied_tools_input = TextEdit::new("");
         self.form_saving = false;
         self.form_error = None;
         self.confirm_delete = None;
@@ -129,6 +145,8 @@ impl McpHubState {
         self.scope_idx = scope_index(&upstream.scope);
         self.isolation_idx = isolation_index(&upstream.isolation);
         self.timeout_input = TextEdit::new(upstream.timeout_s.to_string());
+        self.allowed_tools_input = TextEdit::new(upstream.allowed_tools.join(", "));
+        self.denied_tools_input = TextEdit::new(upstream.denied_tools.join(", "));
         self.form_saving = false;
         self.form_error = None;
         self.confirm_delete = None;
@@ -218,6 +236,9 @@ impl McpHubState {
             McpUpstreamTransport::Stdio { command, args, env }
         };
 
+        let allowed_tools = parse_patterns(&self.allowed_tools_input.text);
+        let denied_tools = parse_patterns(&self.denied_tools_input.text);
+
         Ok((
             id,
             McpUpstreamUpsert {
@@ -226,6 +247,8 @@ impl McpHubState {
                 scope: SCOPES[self.scope_idx.min(SCOPES.len() - 1)].to_owned(),
                 isolation: ISOLATIONS[self.isolation_idx.min(ISOLATIONS.len() - 1)].to_owned(),
                 timeout_s,
+                allowed_tools,
+                denied_tools,
                 transport,
             },
         ))
@@ -375,6 +398,15 @@ fn parse_env(input: &str) -> Result<BTreeMap<String, String>, String> {
     Ok(map)
 }
 
+fn parse_patterns(input: &str) -> Vec<String> {
+    input
+        .split([',', ';', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn upsert_from_view(view: &McpUpstreamView) -> McpUpstreamUpsert {
     McpUpstreamUpsert {
         label: view.label.clone(),
@@ -382,6 +414,8 @@ fn upsert_from_view(view: &McpUpstreamView) -> McpUpstreamUpsert {
         scope: view.scope.clone(),
         isolation: view.isolation.clone(),
         timeout_s: Some(view.timeout_s),
+        allowed_tools: view.allowed_tools.clone(),
+        denied_tools: view.denied_tools.clone(),
         transport: view.transport.clone(),
     }
 }
@@ -624,6 +658,30 @@ fn editor_form(s: &UiState, k: &Kit) -> El {
         t("Timeout (seconds)"),
         t("Per-call timeout (1–120 seconds, default 30)."),
         field(timeout_in, &s.mcp_hub.timeout_input, k, "mcp-timeout"),
+    ));
+
+    let allow_in = TextInput::new(&s.mcp_hub.allowed_tools_input)
+        .label(t("Allowed tools"))
+        .placeholder("read_*, list_*, get_*")
+        .on_edit(|s: &mut UiState| &mut s.mcp_hub.allowed_tools_input);
+    rows.push(row(
+        k,
+        "mcp-allow-tools",
+        t("Allowed tools"),
+        t("Optional comma-separated allowlist (supports * wildcards). Empty allows all non-blocked tools."),
+        field(allow_in, &s.mcp_hub.allowed_tools_input, k, "mcp-allow-tools"),
+    ));
+
+    let deny_in = TextInput::new(&s.mcp_hub.denied_tools_input)
+        .label(t("Blocked tools"))
+        .placeholder("delete_*, drop_*, exec_*")
+        .on_edit(|s: &mut UiState| &mut s.mcp_hub.denied_tools_input);
+    rows.push(row(
+        k,
+        "mcp-deny-tools",
+        t("Blocked tools"),
+        t("Optional comma-separated denylist (supports * wildcards). Always overrides allowed tools."),
+        field(deny_in, &s.mcp_hub.denied_tools_input, k, "mcp-deny-tools"),
     ));
 
     if let Some(err) = &s.mcp_hub.form_error {
@@ -977,6 +1035,8 @@ mod tests {
             scope: "local_only".into(),
             isolation: "shared".into(),
             timeout_s: 30,
+            allowed_tools: Vec::new(),
+            denied_tools: vec!["delete_*".into()],
             transport: McpUpstreamTransport::Http {
                 url: "https://example.com/mcp".into(),
                 headers: existing_headers,
@@ -1045,6 +1105,8 @@ mod tests {
             scope: "local_only".into(),
             isolation: "shared".into(),
             timeout_s: 30,
+            allowed_tools: Vec::new(),
+            denied_tools: vec!["delete_*".into()],
             transport: McpUpstreamTransport::Http {
                 url: "http://127.0.0.1:8080/mcp".into(),
                 headers: BTreeMap::new(),

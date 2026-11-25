@@ -263,6 +263,12 @@ pub(crate) struct UpstreamMcpConfig {
     pub(crate) isolation: UpstreamIsolation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) timeout_s: Option<u64>,
+    /// Optional allowlist of tool name patterns (exact or `*` wildcards). Empty allows all non-denied tools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) allowed_tools: Vec<String>,
+    /// Optional denylist of tool name patterns (exact or `*` wildcards). Always overrides `allowed_tools`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) denied_tools: Vec<String>,
     pub(crate) transport: UpstreamTransport,
 }
 

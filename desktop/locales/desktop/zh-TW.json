@@ -1165,5 +1165,9 @@
   "tools": "個工具",
   "Error": "異常",
   "Not probed": "未探測",
-  "Discovered tools": "已發現的工具"
+  "Discovered tools": "已發現的工具",
+  "Allowed tools": "允許的工具",
+  "Optional comma-separated allowlist (supports * wildcards). Empty allows all non-blocked tools.": "可選的工具白名單（逗號分隔，支援 * 萬用字元）；留空則放行所有未被禁止的工具。",
+  "Blocked tools": "禁止的工具",
+  "Optional comma-separated denylist (supports * wildcards). Always overrides allowed tools.": "可選的工具黑名單（逗號分隔，支援 * 萬用字元），優先權始終高於白名單（例如 delete_*）。"
 }

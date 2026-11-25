@@ -82,6 +82,10 @@ pub struct McpUpstreamView {
     pub isolation: String,
     #[serde(default)]
     pub timeout_s: u64,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub denied_tools: Vec<String>,
     pub transport: McpUpstreamTransport,
     #[serde(default)]
     pub healthy: bool,
@@ -111,6 +115,10 @@ pub struct McpUpstreamUpsert {
     pub isolation: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_s: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_tools: Vec<String>,
     pub transport: McpUpstreamTransport,
 }
 

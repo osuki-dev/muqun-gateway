@@ -1274,19 +1274,47 @@ impl MuqunMcp {
             }
             return Ok(ok(catalog));
         };
-        let Some(skill) = super::skills::find_skill(name) else {
-            return Ok(fail(
-                "skill_not_found",
-                &format!("Unknown skill '{name}'. Call skills.read without arguments to list available playbooks."),
-            ));
-        };
-        Ok(ok(json!({
-            "uri": skill.uri(),
-            "name": skill.name,
-            "namespace": skill.namespace,
-            "title": skill.title,
-            "content": skill.skill_md_text(),
-        })))
+        if let Some(skill) = super::skills::find_skill(name) {
+            return Ok(ok(json!({
+                "uri": skill.uri(),
+                "name": skill.name,
+                "namespace": skill.namespace,
+                "title": skill.title,
+                "content": skill.skill_md_text(),
+            })));
+        }
+        if let Some((server, skill_name)) = super::hub::parse_hub_skill_ref(name) {
+            let caller = super::hub::resolve_caller_scope(&self.state, &self.session, None).await;
+            return Ok(
+                match self
+                    .state
+                    .mcp_hub
+                    .read_upstream_skill(caller, server, skill_name)
+                    .await
+                {
+                    Ok(body) => ok(body),
+                    Err(super::hub::HubCallError::ScopeDenied { server, scope }) => fail(
+                        "scope_denied",
+                        &format!("Upstream MCP server '{server}' is restricted ({scope:?})."),
+                    ),
+                    Err(super::hub::HubCallError::Disabled(id)) => fail(
+                        "upstream_disabled",
+                        &format!("Upstream MCP server '{id}' is disabled."),
+                    ),
+                    Err(super::hub::HubCallError::UpstreamFailed(msg)) => {
+                        fail("upstream_failed", &msg)
+                    }
+                    Err(_) => fail(
+                        "skill_not_found",
+                        &format!("Unknown skill '{name}'. Call skills.read without arguments to list available playbooks."),
+                    ),
+                },
+            );
+        }
+        Ok(fail(
+            "skill_not_found",
+            &format!("Unknown skill '{name}'. Call skills.read without arguments to list available playbooks."),
+        ))
     }
 
     #[tool(
@@ -1354,6 +1382,10 @@ impl MuqunMcp {
             Err(super::hub::HubCallError::ScopeDenied { server, scope }) => Ok(fail(
                 "scope_denied",
                 &format!("Upstream MCP server '{server}' is restricted ({scope:?}) and cannot be called from this session."),
+            )),
+            Err(super::hub::HubCallError::ToolDenied { server, tool }) => Ok(fail(
+                "tool_denied",
+                &format!("Tool '{tool}' on upstream MCP server '{server}' is blocked by tool ACL policy."),
             )),
             Err(super::hub::HubCallError::UpstreamFailed(msg)) => {
                 Ok(fail("upstream_failed", &msg))
@@ -1487,6 +1519,36 @@ impl ServerHandler for MuqunMcp {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
+        if let Some((server, skill_name)) = super::hub::parse_hub_skill_ref(&request.uri) {
+            let caller = super::hub::resolve_caller_scope(&self.state, &self.session, None).await;
+            let body = self
+                .state
+                .mcp_hub
+                .read_upstream_skill(caller, server, skill_name)
+                .await
+                .map_err(|err| match err {
+                    super::hub::HubCallError::ScopeDenied { .. } => {
+                        ErrorData::invalid_params("upstream skill access denied by scope", None)
+                    }
+                    super::hub::HubCallError::NotFound(_)
+                    | super::hub::HubCallError::Disabled(_) => ErrorData::resource_not_found(
+                        format!("resource not found: {}", request.uri),
+                        None,
+                    ),
+                    _ => ErrorData::internal_error("failed to read upstream skill", None),
+                })?;
+            let text = body["content"].as_str().unwrap_or_default().to_owned();
+            return Ok(ReadResourceResponse::Complete(
+                rmcp::model::ReadResourceResult::new(vec![
+                    rmcp::model::ResourceContents::TextResourceContents {
+                        uri: request.uri,
+                        mime_type: Some("text/markdown".into()),
+                        text,
+                        meta: None,
+                    },
+                ]),
+            ));
+        }
         super::skills::read_resource(&request.uri)
     }
 

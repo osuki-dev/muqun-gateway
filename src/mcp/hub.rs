@@ -228,6 +228,10 @@ pub(crate) struct UpstreamView {
     pub(crate) scope: UpstreamScope,
     pub(crate) isolation: UpstreamIsolation,
     pub(crate) timeout_s: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) allowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) denied_tools: Vec<String>,
     pub(crate) transport: UpstreamTransport,
     pub(crate) healthy: bool,
     pub(crate) tool_count: usize,
@@ -250,6 +254,10 @@ pub(crate) struct UpstreamUpsertBody {
     pub(crate) isolation: UpstreamIsolation,
     #[serde(default)]
     pub(crate) timeout_s: Option<u64>,
+    #[serde(default)]
+    pub(crate) allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub(crate) denied_tools: Vec<String>,
     pub(crate) transport: UpstreamTransport,
 }
 
@@ -264,6 +272,10 @@ pub(crate) enum HubCallError {
     ScopeDenied {
         server: String,
         scope: UpstreamScope,
+    },
+    ToolDenied {
+        server: String,
+        tool: String,
     },
     UpstreamFailed(String),
 }
@@ -337,6 +349,8 @@ impl McpHub {
         let timeout_s = body
             .timeout_s
             .map(|s| s.clamp(MIN_UPSTREAM_TIMEOUT_S, MAX_UPSTREAM_TIMEOUT_S));
+        let allowed_tools = sanitize_tool_patterns(body.allowed_tools, "allowed_tools")?;
+        let denied_tools = sanitize_tool_patterns(body.denied_tools, "denied_tools")?;
 
         let next = UpstreamMcpConfig {
             id: id.clone(),
@@ -345,6 +359,8 @@ impl McpHub {
             scope: body.scope,
             isolation: body.isolation,
             timeout_s,
+            allowed_tools,
+            denied_tools,
             transport,
         };
 
@@ -653,14 +669,19 @@ impl McpHub {
 
         for cfg in &permitted {
             let st = states.get(&cfg.id).cloned().unwrap_or_default();
+            let permitted_tools: Vec<&UpstreamTool> = st
+                .tools
+                .iter()
+                .filter(|tool| tool_permitted(cfg, &tool.name))
+                .collect();
             servers_summary.push(json!({
                 "id": cfg.id,
                 "label": cfg.label,
                 "healthy": st.healthy,
-                "tool_count": st.tools.len(),
+                "tool_count": permitted_tools.len(),
                 "error": st.last_error,
             }));
-            for tool in &st.tools {
+            for tool in permitted_tools {
                 let score = match_score(&cfg.id, tool, &tokens);
                 if score == 0 {
                     continue;
@@ -711,6 +732,12 @@ impl McpHub {
             return Err(HubCallError::ScopeDenied {
                 server: cfg.id,
                 scope: cfg.scope,
+            });
+        }
+        if !tool_permitted(&cfg, tool) {
+            return Err(HubCallError::ToolDenied {
+                server: cfg.id,
+                tool: tool.to_owned(),
             });
         }
         let args_obj = if arguments.is_object() {
@@ -776,6 +803,97 @@ impl McpHub {
             }
         }
         out
+    }
+
+    /// Read the body of an upstream MCP skill via `resources/read` with scope enforcement
+    /// and secret redaction. Accepts `server` + `skill_name_or_uri`.
+    pub(crate) async fn read_upstream_skill(
+        &self,
+        caller: CallerScope,
+        server: &str,
+        skill_key: &str,
+    ) -> Result<Value, HubCallError> {
+        let cfg = self
+            .get_config(server)
+            .ok_or_else(|| HubCallError::NotFound(server.to_owned()))?;
+        if !cfg.enabled {
+            return Err(HubCallError::Disabled(cfg.id));
+        }
+        if !caller.permits(cfg.scope) {
+            return Err(HubCallError::ScopeDenied {
+                server: cfg.id,
+                scope: cfg.scope,
+            });
+        }
+
+        // Lazy-probe once if this upstream hasn't been probed yet.
+        let need_probe = self
+            .runtime
+            .read()
+            .ok()
+            .and_then(|map| map.get(&cfg.id).and_then(|st| st.last_probed_ms))
+            .is_none();
+        if need_probe {
+            self.probe_config(&cfg, Some(Duration::from_secs(LAZY_PROBE_MAX_TIMEOUT_S)))
+                .await;
+        }
+
+        let skill = self
+            .runtime
+            .read()
+            .ok()
+            .and_then(|map| {
+                map.get(&cfg.id).and_then(|st| {
+                    st.skills
+                        .iter()
+                        .find(|s| s.name == skill_key || s.uri == skill_key)
+                        .cloned()
+                })
+            })
+            .ok_or_else(|| {
+                HubCallError::NotFound(format!("skill '{skill_key}' on upstream '{}'", cfg.id))
+            })?;
+
+        let worker = self.worker_for(&cfg.id);
+        let timeout = upstream_timeout(&cfg, None);
+        let raw = self
+            .rpc_call(
+                &cfg,
+                &worker,
+                "resources/read",
+                json!({ "uri": skill.uri }),
+                Some(&skill.uri),
+                timeout,
+            )
+            .await
+            .map_err(|err| {
+                let (clean, _) = redact_secrets(&err);
+                HubCallError::UpstreamFailed(clean)
+            })?;
+
+        let contents = raw
+            .get("contents")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let text = contents
+            .iter()
+            .filter_map(|c| c.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (clean_text, redacted) = redact_secrets(&text);
+        let mut out = json!({
+            "uri": format!("skill://hub/{}/{}/SKILL.md", cfg.id, skill.name),
+            "upstream_uri": skill.uri,
+            "server": cfg.id,
+            "name": skill.name,
+            "namespace": format!("hub/{}", cfg.id),
+            "content": clean_text,
+        });
+        if redacted {
+            out["redacted"] = json!(true);
+        }
+        Ok(out)
     }
 
     async fn rpc_call(
@@ -1567,6 +1685,86 @@ fn preserve_masked_secrets(
     }
 }
 
+fn sanitize_tool_patterns(raw: Vec<String>, field: &str) -> Result<Vec<String>, String> {
+    if raw.len() > 64 {
+        return Err(format!("at most 64 {field} patterns allowed"));
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.len() > 128 || trimmed.chars().any(char::is_control) {
+            return Err(format!("invalid {field} pattern '{trimmed}'"));
+        }
+        if !out.iter().any(|existing: &String| existing == trimmed) {
+            out.push(trimmed.to_owned());
+        }
+    }
+    Ok(out)
+}
+
+/// Wildcard glob matcher supporting `*` (0 or more chars), case-sensitive for tool names.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0, 0);
+    let (mut star_pi, mut star_ti) = (None, 0);
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            pi += 1;
+            star_ti = ti;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+pub(crate) fn tool_permitted(cfg: &UpstreamMcpConfig, tool: &str) -> bool {
+    if cfg.denied_tools.iter().any(|pat| glob_match(pat, tool)) {
+        return false;
+    }
+    if !cfg.allowed_tools.is_empty() {
+        return cfg.allowed_tools.iter().any(|pat| glob_match(pat, tool));
+    }
+    true
+}
+
+/// Parse `skill://hub/<server>/<skill>(/SKILL.md)?` or `<server>/<skill>` into `(server, skill)`.
+pub(crate) fn parse_hub_skill_ref(input: &str) -> Option<(&str, &str)> {
+    let trimmed = input.trim();
+    if let Some(rest) = trimmed.strip_prefix("skill://hub/") {
+        let mut parts = rest.split('/');
+        let server = parts.next().filter(|s| !s.is_empty())?;
+        let skill = parts.next().filter(|s| !s.is_empty())?;
+        return Some((server, skill));
+    }
+    if let Some((server, skill)) = trimmed.split_once('/') {
+        if !server.is_empty()
+            && !skill.is_empty()
+            && server != "muqun"
+            && server != "user"
+            && !skill.contains('/')
+        {
+            return Some((server, skill));
+        }
+    }
+    None
+}
+
 fn upstream_view(cfg: UpstreamMcpConfig, st: UpstreamRuntimeState) -> UpstreamView {
     let tools = st
         .tools
@@ -1587,6 +1785,8 @@ fn upstream_view(cfg: UpstreamMcpConfig, st: UpstreamRuntimeState) -> UpstreamVi
             .timeout_s
             .unwrap_or(DEFAULT_UPSTREAM_TIMEOUT_S)
             .clamp(MIN_UPSTREAM_TIMEOUT_S, MAX_UPSTREAM_TIMEOUT_S),
+        allowed_tools: cfg.allowed_tools,
+        denied_tools: cfg.denied_tools,
         transport: mask_transport(cfg.transport),
         healthy: st.healthy,
         tool_count: st.tools.len(),
@@ -1809,6 +2009,17 @@ mod tests {
                         ]
                     }
                 }),
+                "resources/read" => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "contents": [{
+                            "uri": "skill://github/triage/SKILL.md",
+                            "mimeType": "text/markdown",
+                            "text": "# Triage Playbook\nCheck labels; sample ghp_1234567890abcdefghijklmnop1234567890"
+                        }]
+                    }
+                }),
                 "tools/call" => {
                     let tool = req["params"]["name"].as_str().unwrap_or_default();
                     if tool == "leak_secret" {
@@ -1898,6 +2109,8 @@ mod tests {
                     scope: UpstreamScope::LocalOnly,
                     isolation: UpstreamIsolation::Shared,
                     timeout_s: Some(15),
+                    allowed_tools: Vec::new(),
+                    denied_tools: Vec::new(),
                     transport: UpstreamTransport::Http { url, headers },
                 },
             )
@@ -1922,6 +2135,8 @@ mod tests {
                 scope: UpstreamScope::All,
                 isolation: UpstreamIsolation::Shared,
                 timeout_s: Some(2),
+                allowed_tools: Vec::new(),
+                denied_tools: Vec::new(),
                 transport: UpstreamTransport::Http {
                     url: "http://127.0.0.1:1/dead".into(),
                     headers: BTreeMap::new(),
@@ -1955,10 +2170,24 @@ mod tests {
             json!(["title"])
         );
 
-        // Upstream skills were discovered.
+        // Upstream skills were discovered and can be read via resources/read (redacted).
         let skills = hub.cached_skills(CallerScope::LocalOwner);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "triage");
+        let skill_doc = hub
+            .read_upstream_skill(CallerScope::LocalOwner, "github", "triage")
+            .await
+            .unwrap();
+        assert_eq!(skill_doc["uri"], "skill://hub/github/triage/SKILL.md");
+        let skill_text = skill_doc["content"].as_str().unwrap();
+        assert!(skill_text.contains("# Triage Playbook"), "{skill_doc}");
+        assert!(!skill_text.contains("ghp_1234567890"), "{skill_doc}");
+        assert!(skill_text.contains("[REDACTED]"), "{skill_doc}");
+        assert!(matches!(
+            hub.read_upstream_skill(CallerScope::LocalTask, "github", "triage")
+                .await,
+            Err(HubCallError::ScopeDenied { .. })
+        ));
 
         // LocalOwner can call create_issue.
         let called = hub
@@ -2032,6 +2261,8 @@ done
                 scope: UpstreamScope::Tasks,
                 isolation: UpstreamIsolation::Shared,
                 timeout_s: Some(10),
+                allowed_tools: Vec::new(),
+                denied_tools: Vec::new(),
                 transport: UpstreamTransport::Stdio {
                     command: "sh".into(),
                     args: vec!["-c".into(), script.into()],
@@ -2193,6 +2424,8 @@ done
                         scope: UpstreamScope::LocalOnly,
                         isolation: UpstreamIsolation::Shared,
                         timeout_s: Some(5),
+                        allowed_tools: Vec::new(),
+                        denied_tools: Vec::new(),
                         transport: UpstreamTransport::Http {
                             url: bad_url.into(),
                             headers: BTreeMap::new(),
@@ -2214,6 +2447,8 @@ done
                     scope: UpstreamScope::LocalOnly,
                     isolation: UpstreamIsolation::Shared,
                     timeout_s: Some(5),
+                    allowed_tools: Vec::new(),
+                    denied_tools: Vec::new(),
                     transport: UpstreamTransport::Http {
                         url: "https://example.com/mcp".into(),
                         headers: bad_headers,
@@ -2233,6 +2468,8 @@ done
                 scope: UpstreamScope::LocalOnly,
                 isolation: UpstreamIsolation::Shared,
                 timeout_s: Some(5),
+                allowed_tools: Vec::new(),
+                denied_tools: Vec::new(),
                 transport: UpstreamTransport::Http {
                     url: "https://trusted.example.com/mcp".into(),
                     headers: h,
@@ -2251,6 +2488,8 @@ done
                     scope: UpstreamScope::LocalOnly,
                     isolation: UpstreamIsolation::Shared,
                     timeout_s: Some(5),
+                    allowed_tools: Vec::new(),
+                    denied_tools: Vec::new(),
                     transport: UpstreamTransport::Http {
                         url: "https://attacker.example.com/mcp".into(),
                         headers: replay_h,
@@ -2302,6 +2541,8 @@ done
                 scope: UpstreamScope::LocalOnly,
                 isolation: UpstreamIsolation::Shared,
                 timeout_s: Some(5),
+                allowed_tools: Vec::new(),
+                denied_tools: Vec::new(),
                 transport: UpstreamTransport::Http {
                     url: format!("http://{redir_addr}/mcp"),
                     headers: redir_h,
@@ -2343,6 +2584,8 @@ done
                 scope: UpstreamScope::LocalOnly,
                 isolation: UpstreamIsolation::Shared,
                 timeout_s: Some(5),
+                allowed_tools: Vec::new(),
+                denied_tools: Vec::new(),
                 transport: UpstreamTransport::Http {
                     url: format!("http://{big_addr}/mcp"),
                     headers: BTreeMap::new(),
@@ -2418,5 +2661,56 @@ done
         assert!(!scope.permits(UpstreamScope::LocalOnly));
         assert!(!scope.permits(UpstreamScope::Tasks));
         assert!(scope.permits(UpstreamScope::All));
+    }
+
+    #[tokio::test]
+    async fn tool_level_acl_hides_and_blocks_denied_or_non_allowed_tools() {
+        let url = start_mock_http_mcp("Bearer acl-tok", false).await;
+        let hub = McpHub::new(Vec::new(), None);
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".into(), "Bearer acl-tok".into());
+        hub.upsert(
+            "gh_acl".into(),
+            UpstreamUpsertBody {
+                label: Some("GitHub ACL".into()),
+                enabled: true,
+                scope: UpstreamScope::LocalOnly,
+                isolation: UpstreamIsolation::Shared,
+                timeout_s: Some(10),
+                allowed_tools: vec!["create_*".into(), "leak_*".into()],
+                denied_tools: vec!["leak_*".into()],
+                transport: UpstreamTransport::Http { url, headers },
+            },
+        )
+        .unwrap();
+
+        let search = hub
+            .search_tools(CallerScope::LocalOwner, None, Some("gh_acl"), false, 20)
+            .await;
+        let names: Vec<&str> = search["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["create_issue"]);
+
+        // Denied tool cannot be called directly even though allowed_tools also matched it.
+        let blocked = hub
+            .call_tool(CallerScope::LocalOwner, "gh_acl", "leak_secret", json!({}))
+            .await;
+        assert!(matches!(blocked, Err(HubCallError::ToolDenied { .. })));
+
+        // Allowed non-denied tool succeeds.
+        let ok = hub
+            .call_tool(
+                CallerScope::LocalOwner,
+                "gh_acl",
+                "create_issue",
+                json!({ "title": "ACL ok" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok["result"]["content"][0]["text"], "created:ACL ok");
     }
 }

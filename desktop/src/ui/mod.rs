@@ -1523,6 +1523,10 @@ impl UiState {
         composer::restore_attachments(self);
         self.edit(ConfigEdit::CurrentComputer(id.clone()));
         self.agent_inputs.clear();
+        self.mcp_hub.reset_for_switch();
+        if self.mode == Mode::Settings && self.settings_tab == SettingsTab::McpHub && id != "all" {
+            self.refresh_mcp_upstreams();
+        }
         self.agent_errors.clear();
         self.pairing_offer = None;
         self.pairing_busy = false;
