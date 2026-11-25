@@ -14,8 +14,8 @@
 use std::collections::{HashMap, HashSet};
 
 use muqun_gateway::agents::{order_efforts, ModelInfo, ModelRef, ProviderInfo};
-use rune::{col, el, icon, row, text, El, ScrollSpec, TextEdit, Tx};
-use rune_kit::{Kit, Placement, Popover, SegmentedControl, TextInput};
+use rune::{col, el, icon, row, text, Align, El, ScrollSpec, Side, TextEdit, Transition, Tx};
+use rune_kit::{Kit, SegmentedControl, TextInput};
 
 use super::copy::tr_ref;
 use super::{OpenMenu, Slot, UiState};
@@ -23,10 +23,11 @@ use crate::config::Language;
 use crate::hub::CatalogView;
 
 const RECENT_PROVIDER_ID: &str = "__recent__";
-const PANEL_W_TWO_COL: f32 = 500.0;
+const PANEL_W_TWO_COL: f32 = 504.0;
 const PANEL_W_ONE_COL: f32 = 320.0;
-const PROVIDER_RAIL_W: f32 = 152.0;
-const LIST_MAX_H: f32 = 360.0;
+const PANEL_PAD: f32 = 12.0;
+const PROVIDER_RAIL_W: f32 = 148.0;
+const LIST_MAX_H: f32 = 380.0;
 const MAX_RECENT_ITEMS: usize = 5;
 
 /// Ephemeral UI state for the open model picker popover.
@@ -484,12 +485,7 @@ fn model_row(
         .w_full()
         .radius(k.radius.md)
         .px(10.0)
-        .py(8.0)
-        .fill(if selected && !unavailable {
-            k.c.bg_accent.alpha(0.08)
-        } else {
-            k.c.bg_accent.alpha(0.0)
-        })
+        .py(7.0)
         .focusable(!unavailable)
         .role("menuitemradio")
         .checked(selected && !unavailable)
@@ -502,15 +498,24 @@ fn model_row(
     }
 
     if !show_variants {
-        return main_row;
+        return if selected && !unavailable {
+            col()
+                .key(format!("{key}-wrap"))
+                .w_full()
+                .radius(k.radius.md)
+                .fill(k.c.bg_accent.alpha(0.08))
+                .child(main_row)
+        } else {
+            main_row
+        };
     }
 
     let mut chips = row()
         .key(format!("{key}-variants"))
         .w_full()
         .px(10.0)
-        .pt(4.0)
-        .pb(6.0)
+        .pt(2.0)
+        .pb(8.0)
         .gap(6.0)
         .flex_wrap()
         .center_y();
@@ -532,6 +537,8 @@ fn model_row(
     col()
         .key(format!("{key}-wrap"))
         .w_full()
+        .radius(k.radius.md)
+        .fill(k.c.bg_accent.alpha(0.08))
         .child(main_row)
         .child(chips)
 }
@@ -555,15 +562,10 @@ pub(super) fn popup(
 ) -> El {
     let lang = s.cfg.general.language;
     let search_placeholder = tr_ref(lang, "Search models or providers");
-    let mut pop = Popover::new(key)
-        .placement(Placement::TopStart)
-        .trigger(trigger)
-        .label(tr_ref(lang, "Select model"))
-        .padding(10.0)
-        .open(open)
-        .on_close(close);
+    let anchor_key = format!("{key}-trigger");
+    let anchored_trigger = el().key(anchor_key.clone()).child(trigger);
     if !open {
-        return pop.build(k, layer);
+        return anchored_trigger;
     }
 
     let synthetic_models;
@@ -591,6 +593,7 @@ pub(super) fn popup(
     } else {
         PANEL_W_ONE_COL
     };
+    let inner_w = panel_w - PANEL_PAD * 2.0;
 
     let terms = s.model_query.text.trim().to_ascii_lowercase();
     let searching = !terms.is_empty() || filter_free;
@@ -749,12 +752,21 @@ pub(super) fn popup(
     }
 
     let mut body = col()
+        .key(format!("{key}-panel"))
+        .role("dialog")
+        .label(tr_ref(lang, "Select model"))
         .w(panel_w)
+        .padding(PANEL_PAD)
+        .radius(k.radius.lg)
+        .fill(k.c.surface_raised_base)
+        .border(1.0, k.c.border_strong)
+        .clip_soft(0.0)
         .min_h(0.0)
         .shrink()
         .gap(8.0)
         .modal(true, close)
-        .focus_return(format!("{key}-trigger"))
+        .focus_return(anchor_key.clone())
+        .on_press(|_: &mut UiState| {})
         .child(header);
 
     // Search field
@@ -766,7 +778,7 @@ pub(super) fn popup(
                 .label(search_placeholder)
                 .leading_icon(&rune_kit::glyphs::SEARCH)
                 .leading_icon_size(14.0)
-                .width(Some(panel_w))
+                .width(Some(inner_w))
                 .on_edit(|s: &mut UiState| &mut s.model_query)
                 .on_key(move |_: &mut UiState, event, tx| {
                     if event.key == rune::Key::Down {
@@ -906,6 +918,7 @@ pub(super) fn popup(
         .max_h(LIST_MAX_H)
         .min_h(0.0)
         .shrink()
+        .clip_soft(0.0)
         .scroll(ScrollSpec {
             stick_bottom: false,
         })
@@ -923,6 +936,7 @@ pub(super) fn popup(
             .max_h(LIST_MAX_H)
             .min_h(0.0)
             .shrink()
+            .clip_soft(0.0)
             .scroll(ScrollSpec {
                 stick_bottom: false,
             })
@@ -935,6 +949,7 @@ pub(super) fn popup(
         row()
             .w_full()
             .min_h(0.0)
+            .max_h(LIST_MAX_H)
             .gap(8.0)
             .child(left_rail)
             .child(divider)
@@ -943,8 +958,19 @@ pub(super) fn popup(
         right_pane
     };
 
-    pop = pop.child(body.child(content));
-    pop.build(k, layer)
+    let mut panel = body.child(content);
+    for shadow in k.shadow_layers(&k.elevation.overlay) {
+        panel = panel.box_shadow(shadow);
+    }
+
+    layer.push(rune_kit::scrim(format!("{key}-scrim"), close));
+    layer.push(
+        panel
+            .anchored_fit(&anchor_key, Side::Top, Align::Start, 6.0)
+            .transition(Transition::opacity().combined(Transition::scale(0.97)))
+            .token_motion(k.motion.overlay),
+    );
+    anchored_trigger
 }
 
 #[cfg(test)]
@@ -1030,6 +1056,19 @@ mod tests {
         assert_eq!(
             model_caption(&small).as_deref(),
             Some("200k context · high")
+        );
+
+        let with_none = sample_model(
+            "opencode",
+            "hy4-flash",
+            "Hy4 flash",
+            Some(1_000_000),
+            &["high", "none"],
+            None,
+        );
+        assert_eq!(
+            model_caption(&with_none).as_deref(),
+            Some("1.0M context · none to high")
         );
     }
 
@@ -1186,6 +1225,26 @@ mod tests {
         assert!(rt
             .find("start-model-home-option-anthropic-claude-sonnet-variant-high")
             .is_some());
+
+        // Panel background must span the full two-column width with no right-side overflow.
+        let (panel_rect, _) = rt
+            .presented("start-model-home-panel")
+            .expect("panel surface");
+        assert!(
+            (panel_rect[2] - PANEL_W_TWO_COL).abs() < 1.0,
+            "expected two-column panel width {PANEL_W_TWO_COL}, got {}",
+            panel_rect[2]
+        );
+        let (filter_rect, _) = rt.presented("model-free-filter").expect("free filter");
+        assert!(
+            filter_rect[0] + filter_rect[2] <= panel_rect[0] + panel_rect[2] + 0.5,
+            "free filter overflows panel: filter={filter_rect:?} panel={panel_rect:?}"
+        );
+        let (search_rect, _) = rt.presented("model-filter").expect("search input");
+        assert!(
+            search_rect[0] + search_rect[2] <= panel_rect[0] + panel_rect[2] + 0.5,
+            "search input overflows panel: search={search_rect:?} panel={panel_rect:?}"
+        );
 
         // Switching to "Free only" narrows to opencode's free model.
         rt.state.model_picker.filter_free = true;

@@ -28,12 +28,12 @@ pub struct ModelInfo {
     pub status: Option<String>,
 }
 
-/// Order effort levels low to high: default, minimal, low, medium, high,
+/// Order effort levels low to high: default, none, minimal, low, medium, high,
 /// xhigh, max. Adapters list them alphabetically; unknown levels keep their
 /// relative order after the known ones.
 pub fn order_efforts<T>(items: &mut [T], effort: impl Fn(&T) -> Option<&str>) {
-    const KNOWN: [&str; 7] = [
-        "default", "minimal", "low", "medium", "high", "xhigh", "max",
+    const KNOWN: [&str; 8] = [
+        "default", "none", "minimal", "low", "medium", "high", "xhigh", "max",
     ];
     items.sort_by_key(|item| {
         effort(item)
