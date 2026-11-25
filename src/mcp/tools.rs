@@ -1267,7 +1267,7 @@ impl MuqunMcp {
             .filter(|s| !s.is_empty())
         else {
             let mut catalog = super::skills::skills_catalog_json();
-            let caller = super::hub::resolve_caller_scope(&self.state, &self.session).await;
+            let caller = super::hub::resolve_caller_scope(&self.state, &self.session, None).await;
             let hub_skills = self.state.mcp_hub.cached_skills(caller);
             if !hub_skills.is_empty() {
                 catalog["upstream_skills"] = json!(hub_skills);
@@ -1297,7 +1297,7 @@ impl MuqunMcp {
         &self,
         Parameters(args): Parameters<HubSearchToolsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let caller = super::hub::resolve_caller_scope(&self.state, &self.session).await;
+        let caller = super::hub::resolve_caller_scope(&self.state, &self.session, None).await;
         let include_schema = args
             .detail
             .as_deref()
@@ -1330,7 +1330,12 @@ impl MuqunMcp {
         if server.is_empty() || tool.is_empty() {
             return Ok(invalid("server and tool must be non-empty"));
         }
-        let caller = super::hub::resolve_caller_scope(&self.state, &self.session).await;
+        let call = lineage::Call {
+            tool: "hub.call_tool",
+            args: vec![("server", server), ("tool", tool)],
+        };
+        let caller =
+            super::hub::resolve_caller_scope(&self.state, &self.session, Some(&call)).await;
         match self
             .state
             .mcp_hub
@@ -1531,8 +1536,11 @@ impl ServerHandler for MuqunMcp {
             .tasks
             .cancel(&self.state, &self.by(), &id)
             .await
-            .map_err(|err| {
-                ErrorData::invalid_params(format!("cannot cancel task: {err:?}"), None)
+            .map_err(|err| match err {
+                TaskError::NotFound | TaskError::NotYours => {
+                    ErrorData::resource_not_found(format!("task not found: {}", id.0), None)
+                }
+                _ => ErrorData::internal_error("cannot cancel task", None),
             })?;
         Ok(())
     }

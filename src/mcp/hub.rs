@@ -15,7 +15,9 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, BufWriter};
+use tokio::io::{
+    AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader, BufWriter,
+};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -36,6 +38,11 @@ const MAX_UPSTREAM_TIMEOUT_S: u64 = 120;
 const LAZY_PROBE_MAX_TIMEOUT_S: u64 = 10;
 const MAX_UPSTREAMS: usize = 64;
 const MAX_STDIO_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_HTTP_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOOLS_PER_UPSTREAM: usize = 256;
+const MAX_SKILLS_PER_UPSTREAM: usize = 64;
+const MAX_TOOL_DESC_CHARS: usize = 512;
+const MAX_TOOL_SCHEMA_BYTES: usize = 16 * 1024;
 const MCP_CLIENT_PROTOCOL_VERSION: &str = "2025-03-26";
 
 /// Effective caller scope for evaluating [`UpstreamScope`] policies.
@@ -63,6 +70,7 @@ impl CallerScope {
 pub(crate) async fn resolve_caller_scope(
     state: &AppState,
     session: &AssistantSession,
+    call: Option<&crate::mcp::lineage::Call<'_>>,
 ) -> CallerScope {
     match &session.binding {
         TokenBinding::Task { task_id } => match state.tasks.task(&TaskId(task_id.clone())).await {
@@ -99,7 +107,57 @@ pub(crate) async fn resolve_caller_scope(
                 Err(_) => CallerScope::RemoteOrRestricted,
             }
         }
-        TokenBinding::Runtime { .. } | TokenBinding::Agent { .. } => CallerScope::LocalOwner,
+        TokenBinding::Runtime { agent_id } | TokenBinding::Agent { agent_id } => {
+            // If this call can be attributed to a specific open task, enforce its task scope.
+            if let Some(call) = call {
+                if let Some(task_id) =
+                    crate::mcp::lineage::own_task(state, session, call, None).await
+                {
+                    return match state.tasks.task(&task_id).await {
+                        Ok(Some(task)) => {
+                            if task.origin == TaskOrigin::Peer || task.requester_server_id.is_some()
+                            {
+                                CallerScope::RemoteOrRestricted
+                            } else {
+                                CallerScope::LocalTask
+                            }
+                        }
+                        _ => CallerScope::RemoteOrRestricted,
+                    };
+                }
+            }
+            // Fail closed on shared daemons while any remote peer-originated task is open on this agent.
+            let open = state
+                .tasks
+                .open_tasks(TaskFilter {
+                    limit: 64,
+                    ..Default::default()
+                })
+                .await;
+            match open {
+                Ok(tasks) => {
+                    let has_peer_task_on_agent = tasks.iter().any(|t| {
+                        let matches_agent = match &t.binding {
+                            crate::tasks::domain::TaskBinding::AgentSession {
+                                agent_id: a, ..
+                            } => a == agent_id,
+                            crate::tasks::domain::TaskBinding::Pane {
+                                agent_id: Some(a), ..
+                            } => a == agent_id,
+                            _ => false,
+                        };
+                        (t.origin == TaskOrigin::Peer || t.requester_server_id.is_some())
+                            && matches_agent
+                    });
+                    if has_peer_task_on_agent {
+                        CallerScope::RemoteOrRestricted
+                    } else {
+                        CallerScope::LocalOwner
+                    }
+                }
+                Err(_) => CallerScope::RemoteOrRestricted,
+            }
+        }
     }
 }
 
@@ -214,6 +272,9 @@ impl McpHub {
     pub(crate) fn new(upstreams: Vec<UpstreamMcpConfig>, config_path: Option<PathBuf>) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(format!("muqun-gateway/{}", env!("CARGO_PKG_VERSION")))
+            // Never follow HTTP redirects automatically: prevents leaking Authorization headers
+            // or bouncing requests onto loopback/cloud-metadata endpoints.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
@@ -263,9 +324,7 @@ impl McpHub {
             .and_then(|list| list.iter().find(|u| u.id == id).cloned());
 
         let mut transport = body.transport;
-        if let Some(prev) = existing.as_ref() {
-            preserve_masked_secrets(&prev.transport, &mut transport);
-        }
+        preserve_masked_secrets(existing.as_ref().map(|p| &p.transport), &mut transport)?;
         validate_transport(&transport)?;
 
         let label = body
@@ -431,20 +490,29 @@ impl McpHub {
                     .unwrap_or_default();
                 next.tools = raw_tools
                     .into_iter()
+                    .take(MAX_TOOLS_PER_UPSTREAM)
                     .filter_map(|t| {
                         let name = t.get("name")?.as_str()?.trim().to_owned();
-                        if name.is_empty() {
+                        if name.is_empty() || name.len() > 128 {
                             return None;
                         }
-                        let description = t
+                        let raw_desc = t
                             .get("description")
                             .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned();
-                        let input_schema = t
+                            .unwrap_or_default();
+                        let (clean_desc, _) = redact_secrets(raw_desc);
+                        let description: String =
+                            clean_desc.chars().take(MAX_TOOL_DESC_CHARS).collect();
+                        let mut input_schema = t
                             .get("inputSchema")
                             .cloned()
                             .unwrap_or_else(|| json!({ "type": "object" }));
+                        if input_schema.to_string().len() > MAX_TOOL_SCHEMA_BYTES {
+                            input_schema = json!({
+                                "type": "object",
+                                "description": "Schema omitted (exceeded 16 KiB limit)"
+                            });
+                        }
                         Some(UpstreamTool {
                             name,
                             description,
@@ -474,21 +542,30 @@ impl McpHub {
                         .unwrap_or_default();
                     next.skills = raw_skills
                         .into_iter()
+                        .take(MAX_SKILLS_PER_UPSTREAM)
                         .filter_map(|s| {
                             let uri = s.get("uri")?.as_str()?.to_owned();
+                            if uri.len() > 512 {
+                                return None;
+                            }
                             let name = s
                                 .get("frontmatter")
                                 .and_then(|f| f.get("name"))
                                 .and_then(Value::as_str)
                                 .or_else(|| s.get("name").and_then(Value::as_str))?
                                 .to_owned();
-                            let description = s
+                            if name.len() > 128 {
+                                return None;
+                            }
+                            let raw_desc = s
                                 .get("frontmatter")
                                 .and_then(|f| f.get("description"))
                                 .and_then(Value::as_str)
                                 .or_else(|| s.get("description").and_then(Value::as_str))
-                                .unwrap_or_default()
-                                .to_owned();
+                                .unwrap_or_default();
+                            let (clean_desc, _) = redact_secrets(raw_desc);
+                            let description: String =
+                                clean_desc.chars().take(MAX_TOOL_DESC_CHARS).collect();
                             Some(UpstreamSkill {
                                 server: cfg.id.clone(),
                                 name,
@@ -903,6 +980,11 @@ impl McpHub {
             .map_err(|e| HttpRpcErr::Other(format!("HTTP request failed: {e}")))?;
 
         let status = resp.status();
+        if status.is_redirection() {
+            return Err(HttpRpcErr::Other(format!(
+                "upstream HTTP redirect ({status}) refused for security"
+            )));
+        }
         let next_sid = resp
             .headers()
             .get("mcp-session-id")
@@ -914,10 +996,10 @@ impl McpHub {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_lowercase();
-        let text = resp
-            .text()
+        let is_sse = content_type.contains("text/event-stream");
+        let text = read_bounded_http_body(resp, is_sse, id, MAX_HTTP_RESPONSE_BYTES)
             .await
-            .map_err(|e| HttpRpcErr::Other(format!("failed reading HTTP body: {e}")))?;
+            .map_err(HttpRpcErr::Other)?;
 
         if status == reqwest::StatusCode::NOT_FOUND && session_id.is_some() {
             return Err(HttpRpcErr::SessionExpired);
@@ -1089,8 +1171,8 @@ async fn stdio_send_and_read(
     let mut buf = Vec::new();
     for _ in 0..256 {
         buf.clear();
-        let n = proc
-            .stdout
+        let n = (&mut proc.stdout)
+            .take((MAX_STDIO_LINE_BYTES + 1) as u64)
             .read_until(b'\n', &mut buf)
             .await
             .map_err(|e| format!("stdio read failed: {e}"))?;
@@ -1114,6 +1196,39 @@ async fn stdio_send_and_read(
         }
     }
     Err("stdio MCP did not answer matching request id".into())
+}
+
+async fn read_bounded_http_body(
+    mut resp: reqwest::Response,
+    is_sse: bool,
+    expected_id: u64,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let mut out = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("failed reading HTTP body: {e}"))?
+    {
+        if out.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(format!(
+                "upstream HTTP response exceeded {} MiB limit",
+                max_bytes / (1024 * 1024)
+            ));
+        }
+        out.extend_from_slice(&chunk);
+        // For long-lived SSE streams, return immediately once the matching JSON-RPC id arrives.
+        if is_sse {
+            if let Ok(text) = std::str::from_utf8(&out) {
+                if let Ok(val) = parse_sse_jsonrpc(text, expected_id) {
+                    if val.get("id").and_then(Value::as_u64) == Some(expected_id) {
+                        return Ok(text.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 fn parse_sse_jsonrpc(body: &str, expected_id: u64) -> Result<Value, String> {
@@ -1206,6 +1321,46 @@ pub(crate) fn valid_upstream_id(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
 }
 
+fn http_origin(raw: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(raw.trim()).ok()?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let port = parsed.port_or_known_default()?;
+    Some(format!("{scheme}://{host}:{port}"))
+}
+
+fn is_forbidden_header(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "upgrade"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "mcp-session-id"
+            | "mcp-method"
+            | "mcp-name"
+    )
+}
+
+fn is_blocked_metadata_host(host: &str) -> bool {
+    let h = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    matches!(
+        h.as_str(),
+        "169.254.169.254"
+            | "169.254.170.2"
+            | "fd00:ec2::254"
+            | "metadata.google.internal"
+            | "metadata.goog"
+    )
+}
+
 fn validate_transport(transport: &UpstreamTransport) -> Result<(), String> {
     match transport {
         UpstreamTransport::Http { url, headers } => {
@@ -1213,8 +1368,21 @@ fn validate_transport(transport: &UpstreamTransport) -> Result<(), String> {
             if trimmed.is_empty() || trimmed.len() > 2048 {
                 return Err("HTTP upstream url must be 1..=2048 characters".into());
             }
-            if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+            let parsed = reqwest::Url::parse(trimmed)
+                .map_err(|_| "HTTP upstream url is not a valid URL".to_owned())?;
+            if !matches!(parsed.scheme(), "http" | "https") {
                 return Err("HTTP upstream url must start with http:// or https://".into());
+            }
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                return Err(
+                    "HTTP upstream url must not embed credentials; use Authorization header".into(),
+                );
+            }
+            let Some(host) = parsed.host_str() else {
+                return Err("HTTP upstream url must include a host".into());
+            };
+            if is_blocked_metadata_host(host) {
+                return Err("HTTP upstream host is blocked".into());
             }
             if headers.len() > 32 {
                 return Err("at most 32 HTTP headers allowed".into());
@@ -1230,6 +1398,11 @@ fn validate_transport(transport: &UpstreamTransport) -> Result<(), String> {
                 {
                     return Err("invalid HTTP header name or value".into());
                 }
+                if is_forbidden_header(k) {
+                    return Err(format!(
+                        "HTTP header '{k}' is reserved and cannot be overridden"
+                    ));
+                }
             }
             Ok(())
         }
@@ -1239,6 +1412,7 @@ fn validate_transport(transport: &UpstreamTransport) -> Result<(), String> {
                 || trimmed.len() > 1024
                 || trimmed.contains('\0')
                 || trimmed.contains('\n')
+                || trimmed.contains('\r')
             {
                 return Err("stdio command must be non-empty and at most 1024 characters".into());
             }
@@ -1270,7 +1444,19 @@ fn validate_transport(transport: &UpstreamTransport) -> Result<(), String> {
 fn is_sensitive_key(key: &str) -> bool {
     let lc = key.to_ascii_lowercase();
     [
-        "auth", "token", "secret", "key", "pass", "cookie", "cred", "bearer",
+        "auth",
+        "token",
+        "secret",
+        "key",
+        "pass",
+        "pwd",
+        "cookie",
+        "cred",
+        "bearer",
+        "jwt",
+        "session",
+        "signature",
+        "private",
     ]
     .iter()
     .any(|needle| lc.contains(needle))
@@ -1308,39 +1494,76 @@ fn mask_transport(transport: UpstreamTransport) -> UpstreamTransport {
     }
 }
 
-fn preserve_masked_secrets(prev: &UpstreamTransport, next: &mut UpstreamTransport) {
-    match (prev, next) {
-        (
-            UpstreamTransport::Http {
+/// Only restore masked secret placeholders when the destination origin (HTTP) or
+/// executable (Stdio) is unchanged, preventing credential replay onto a new host/command.
+fn preserve_masked_secrets(
+    prev: Option<&UpstreamTransport>,
+    next: &mut UpstreamTransport,
+) -> Result<(), String> {
+    match next {
+        UpstreamTransport::Http {
+            url: next_url,
+            headers: next_headers,
+        } => {
+            let has_masked = next_headers.values().any(|v| v == MASKED_SECRET);
+            if !has_masked {
+                return Ok(());
+            }
+            let Some(UpstreamTransport::Http {
+                url: prev_url,
                 headers: prev_headers,
-                ..
-            },
-            UpstreamTransport::Http {
-                headers: next_headers,
-                ..
-            },
-        ) => {
+            }) = prev
+            else {
+                return Err("masked secret placeholder has no existing HTTP upstream".into());
+            };
+            if http_origin(prev_url).is_none() || http_origin(prev_url) != http_origin(next_url) {
+                return Err(
+                    "re-enter secret headers when changing the HTTP endpoint origin".into(),
+                );
+            }
             for (k, v) in next_headers.iter_mut() {
                 if v == MASKED_SECRET {
-                    if let Some(old) = prev_headers.get(k) {
-                        *v = old.clone();
-                    }
+                    let old = prev_headers
+                        .iter()
+                        .find(|(pk, _)| pk.eq_ignore_ascii_case(k))
+                        .map(|(_, pv)| pv.clone())
+                        .ok_or_else(|| format!("masked secret header '{k}' has no stored value"))?;
+                    *v = old;
                 }
             }
+            Ok(())
         }
-        (
-            UpstreamTransport::Stdio { env: prev_env, .. },
-            UpstreamTransport::Stdio { env: next_env, .. },
-        ) => {
+        UpstreamTransport::Stdio {
+            command: next_cmd,
+            env: next_env,
+            ..
+        } => {
+            let has_masked = next_env.values().any(|v| v == MASKED_SECRET);
+            if !has_masked {
+                return Ok(());
+            }
+            let Some(UpstreamTransport::Stdio {
+                command: prev_cmd,
+                env: prev_env,
+                ..
+            }) = prev
+            else {
+                return Err("masked secret placeholder has no existing stdio upstream".into());
+            };
+            if prev_cmd.trim() != next_cmd.trim() {
+                return Err("re-enter secret env values when changing the stdio command".into());
+            }
             for (k, v) in next_env.iter_mut() {
                 if v == MASKED_SECRET {
-                    if let Some(old) = prev_env.get(k) {
-                        *v = old.clone();
-                    }
+                    let old = prev_env
+                        .get(k)
+                        .cloned()
+                        .ok_or_else(|| format!("masked secret env '{k}' has no stored value"))?;
+                    *v = old;
                 }
             }
+            Ok(())
         }
-        _ => {}
     }
 }
 
@@ -1445,6 +1668,21 @@ async fn upsert_upstream(
             "invalid_upstream_id",
             "id must be 1..=64 lowercase alphanumeric/dash/underscore characters and not 'muqun'",
         ));
+    }
+    if let UpstreamTransport::Http { url, .. } = &payload.transport {
+        let self_url = crate::mcp::local_url(&state.config.listen);
+        if http_origin(url).is_some()
+            && http_origin(url) == http_origin(&self_url)
+            && reqwest::Url::parse(url.trim())
+                .ok()
+                .is_some_and(|u| u.path().trim_end_matches('/') == crate::mcp::MCP_PATH)
+        {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "self_loop_upstream",
+                "cannot register this Gateway's own /mcp endpoint as an upstream",
+            ));
+        }
     }
     let view = state
         .mcp_hub
@@ -1935,5 +2173,250 @@ done
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         assert!(state.mcp_hub.list_views().is_empty());
+    }
+
+    #[tokio::test]
+    async fn security_blocks_redirects_secret_replay_oversized_bodies_and_metadata_urls() {
+        // 1. Metadata IP, embedded credentials, and reserved headers are rejected.
+        let hub = McpHub::new(Vec::new(), None);
+        for bad_url in [
+            "http://169.254.169.254/latest/meta-data",
+            "http://metadata.google.internal/computeMetadata/v1",
+            "https://user:pass@example.com/mcp",
+        ] {
+            let err = hub
+                .upsert(
+                    "bad_url".into(),
+                    UpstreamUpsertBody {
+                        label: None,
+                        enabled: true,
+                        scope: UpstreamScope::LocalOnly,
+                        isolation: UpstreamIsolation::Shared,
+                        timeout_s: Some(5),
+                        transport: UpstreamTransport::Http {
+                            url: bad_url.into(),
+                            headers: BTreeMap::new(),
+                        },
+                    },
+                )
+                .unwrap_err();
+            assert!(!err.is_empty(), "expected error for {bad_url}");
+        }
+
+        let mut bad_headers = BTreeMap::new();
+        bad_headers.insert("Host".into(), "evil.example".into());
+        assert!(hub
+            .upsert(
+                "bad_hdr".into(),
+                UpstreamUpsertBody {
+                    label: None,
+                    enabled: true,
+                    scope: UpstreamScope::LocalOnly,
+                    isolation: UpstreamIsolation::Shared,
+                    timeout_s: Some(5),
+                    transport: UpstreamTransport::Http {
+                        url: "https://example.com/mcp".into(),
+                        headers: bad_headers,
+                    },
+                },
+            )
+            .is_err());
+
+        // 2. Masked secret cannot be replayed onto a different HTTP origin or Stdio command.
+        let mut h = BTreeMap::new();
+        h.insert("Authorization".into(), "Bearer real-token-123".into());
+        hub.upsert(
+            "sec".into(),
+            UpstreamUpsertBody {
+                label: None,
+                enabled: true,
+                scope: UpstreamScope::LocalOnly,
+                isolation: UpstreamIsolation::Shared,
+                timeout_s: Some(5),
+                transport: UpstreamTransport::Http {
+                    url: "https://trusted.example.com/mcp".into(),
+                    headers: h,
+                },
+            },
+        )
+        .unwrap();
+        let mut replay_h = BTreeMap::new();
+        replay_h.insert("Authorization".into(), MASKED_SECRET.into());
+        let replay_err = hub
+            .upsert(
+                "sec".into(),
+                UpstreamUpsertBody {
+                    label: None,
+                    enabled: true,
+                    scope: UpstreamScope::LocalOnly,
+                    isolation: UpstreamIsolation::Shared,
+                    timeout_s: Some(5),
+                    transport: UpstreamTransport::Http {
+                        url: "https://attacker.example.com/mcp".into(),
+                        headers: replay_h,
+                    },
+                },
+            )
+            .unwrap_err();
+        assert!(replay_err.contains("origin"), "{replay_err}");
+
+        // 3. HTTP redirect (302) is refused and never forwards Authorization to redirect target.
+        let leaked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let leaked_flag = leaked.clone();
+        let sink_app = Router::new().route(
+            "/steal",
+            axum_post(move || {
+                let flag = leaked_flag.clone();
+                async move {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    StatusCode::OK
+                }
+            }),
+        );
+        let sink_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sink_addr = sink_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(sink_listener, sink_app).await.unwrap();
+        });
+        let redirect_target = format!("http://{sink_addr}/steal");
+        let redir_app = Router::new().route(
+            "/mcp",
+            axum_post(move || {
+                let loc = redirect_target.clone();
+                async move { (StatusCode::FOUND, [("location", loc)]).into_response() }
+            }),
+        );
+        let redir_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redir_addr = redir_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(redir_listener, redir_app).await.unwrap();
+        });
+
+        let mut redir_h = BTreeMap::new();
+        redir_h.insert("Authorization".into(), "Bearer do-not-leak".into());
+        hub.upsert(
+            "redir".into(),
+            UpstreamUpsertBody {
+                label: None,
+                enabled: true,
+                scope: UpstreamScope::LocalOnly,
+                isolation: UpstreamIsolation::Shared,
+                timeout_s: Some(5),
+                transport: UpstreamTransport::Http {
+                    url: format!("http://{redir_addr}/mcp"),
+                    headers: redir_h,
+                },
+            },
+        )
+        .unwrap();
+        let probed = hub.probe("redir").await.unwrap();
+        assert!(!probed.healthy);
+        assert!(
+            probed
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("redirect"),
+            "{:?}",
+            probed.last_error
+        );
+        assert!(
+            !leaked.load(std::sync::atomic::Ordering::SeqCst),
+            "redirect target must never be contacted"
+        );
+
+        // 4. Oversized HTTP response (>4 MiB) is rejected cleanly without OOM.
+        let big_app = Router::new().route(
+            "/mcp",
+            axum_post(|| async { "x".repeat(MAX_HTTP_RESPONSE_BYTES + 1024) }),
+        );
+        let big_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let big_addr = big_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(big_listener, big_app).await.unwrap();
+        });
+        hub.upsert(
+            "big".into(),
+            UpstreamUpsertBody {
+                label: None,
+                enabled: true,
+                scope: UpstreamScope::LocalOnly,
+                isolation: UpstreamIsolation::Shared,
+                timeout_s: Some(5),
+                transport: UpstreamTransport::Http {
+                    url: format!("http://{big_addr}/mcp"),
+                    headers: BTreeMap::new(),
+                },
+            },
+        )
+        .unwrap();
+        let big_probe = hub.probe("big").await.unwrap();
+        assert!(!big_probe.healthy);
+        assert!(
+            big_probe
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("limit"),
+            "{:?}",
+            big_probe.last_error
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_agent_fails_closed_when_peer_task_is_active_on_that_agent() {
+        use crate::tasks::domain::{
+            PrincipalKind, Task, TaskBinding, TaskId, TaskKind, TaskOrigin, TaskPrincipal,
+            TaskState,
+        };
+        let state = test_state("admin", Vec::new());
+        let now = now_ms();
+        state
+            .tasks
+            .insert_for_test(&Task {
+                id: TaskId::new(),
+                kind: TaskKind::Delegation,
+                goal: "remote peer work".into(),
+                cwd: None,
+                binding: TaskBinding::AgentSession {
+                    agent_id: "claude".into(),
+                    asid: "ses_peer_1".into(),
+                },
+                state: TaskState::Working,
+                summary: None,
+                exit_code: None,
+                created_by: TaskPrincipal {
+                    kind: PrincipalKind::Gateway,
+                    id: "peer-gw-1".into(),
+                },
+                created_ms: now,
+                updated_ms: now,
+                seq: 0,
+                parent: None,
+                origin: TaskOrigin::Peer,
+                label: None,
+                requester_name: Some("mini".into()),
+                session_title: None,
+                mentions: Vec::new(),
+                client_ref: None,
+                requester_server_id: Some("srv-mini".into()),
+                reopened_ms: None,
+                reopen_count: 0,
+            })
+            .await;
+
+        let shared_claude = AssistantSession {
+            token_id: "tok-claude".into(),
+            binding: TokenBinding::Agent {
+                agent_id: "claude".into(),
+            },
+            label: "claude".into(),
+            expires_ms: None,
+        };
+        let scope = resolve_caller_scope(&state, &shared_claude, None).await;
+        assert_eq!(scope, CallerScope::RemoteOrRestricted);
+        assert!(!scope.permits(UpstreamScope::LocalOnly));
+        assert!(!scope.permits(UpstreamScope::Tasks));
+        assert!(scope.permits(UpstreamScope::All));
     }
 }

@@ -750,11 +750,29 @@ mod unix {
         fn drop(&mut self) {
             let reaped = self.reaped.lock().unwrap_or_else(|e| e.into_inner());
             if !*reaped {
+                let pid = self.pid;
+                let flag = self.reaped.clone();
                 // SAFETY: sending SIGHUP to our own unreaped child process group.
                 unsafe {
-                    libc::kill(-self.pid, libc::SIGHUP);
-                    libc::kill(self.pid, libc::SIGHUP);
+                    libc::kill(-pid, libc::SIGHUP);
+                    libc::kill(pid, libc::SIGHUP);
                 }
+                drop(reaped);
+                // Escalate to SIGKILL after 2s if the shell ignores SIGHUP or is blocked,
+                // preventing orphaned PTY children and leaked wait threads.
+                let _ = std::thread::Builder::new()
+                    .name("muqun-gw-pty-kill".into())
+                    .spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        let reaped = flag.lock().unwrap_or_else(|e| e.into_inner());
+                        if !*reaped {
+                            // SAFETY: child is still unreaped, so pid has not been recycled.
+                            unsafe {
+                                libc::kill(-pid, libc::SIGKILL);
+                                libc::kill(pid, libc::SIGKILL);
+                            }
+                        }
+                    });
             }
         }
     }

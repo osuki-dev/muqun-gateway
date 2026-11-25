@@ -22,6 +22,8 @@ const SKILL_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 const MAX_USER_SKILLS: usize = 64;
 const MAX_FILES_PER_SKILL: usize = 32;
 const MAX_SKILL_FILE_BYTES: u64 = 256 * 1024;
+const MAX_SKILL_DEPTH: usize = 6;
+const MAX_SKILL_ENTRIES_VISITED: usize = 512;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BuiltinSkill {
@@ -236,6 +238,10 @@ fn load_user_skills(root: &Path) -> Vec<ResolvedSkill> {
             if !valid_skill_segment(&name) {
                 return None;
             }
+            let sym_meta = std::fs::symlink_metadata(e.path()).ok()?;
+            if sym_meta.file_type().is_symlink() || !sym_meta.is_dir() {
+                return None;
+            }
             let path = e.path().canonicalize().ok()?;
             if !path.starts_with(&canonical_root) || !path.is_dir() {
                 return None;
@@ -267,7 +273,8 @@ fn load_user_skills(root: &Path) -> Vec<ResolvedSkill> {
         };
         let description = fm_desc.unwrap_or_else(|| format!("User skill {name}"));
         let mut files = BTreeMap::new();
-        collect_skill_files(&skill_dir, &skill_dir, "", &mut files);
+        let mut visited = 0usize;
+        collect_skill_files(&skill_dir, &skill_dir, "", 0, &mut visited, &mut files);
         if !files.contains_key(SKILL_MD) {
             continue;
         }
@@ -286,32 +293,47 @@ fn collect_skill_files(
     root: &Path,
     current: &Path,
     prefix: &str,
+    depth: usize,
+    visited: &mut usize,
     out: &mut BTreeMap<String, Vec<u8>>,
 ) {
-    if out.len() >= MAX_FILES_PER_SKILL {
+    if depth > MAX_SKILL_DEPTH
+        || out.len() >= MAX_FILES_PER_SKILL
+        || *visited >= MAX_SKILL_ENTRIES_VISITED
+    {
         return;
     }
     let Ok(entries) = std::fs::read_dir(current) else {
         return;
     };
-    let mut children: Vec<(String, PathBuf)> = entries
+    let mut children: Vec<(String, PathBuf, bool)> = entries
         .flatten()
         .filter_map(|e| {
+            if *visited >= MAX_SKILL_ENTRIES_VISITED {
+                return None;
+            }
+            *visited += 1;
             let name = e.file_name().to_string_lossy().into_owned();
             if name.starts_with('.') || !valid_skill_segment(&name) {
                 return None;
             }
+            // Reject symlinks outright to prevent both symlink escape and symlink directory cycles.
+            let sym_meta = std::fs::symlink_metadata(e.path()).ok()?;
+            if sym_meta.file_type().is_symlink() {
+                return None;
+            }
+            let is_dir = sym_meta.is_dir();
             let path = e.path().canonicalize().ok()?;
             if !path.starts_with(root) {
                 return None;
             }
-            Some((name, path))
+            Some((name, path, is_dir))
         })
         .collect();
     children.sort_by(|a, b| a.0.cmp(&b.0));
 
-    for (name, path) in children {
-        if out.len() >= MAX_FILES_PER_SKILL {
+    for (name, path, is_dir) in children {
+        if out.len() >= MAX_FILES_PER_SKILL || *visited >= MAX_SKILL_ENTRIES_VISITED {
             break;
         }
         let rel = if prefix.is_empty() {
@@ -319,8 +341,8 @@ fn collect_skill_files(
         } else {
             format!("{prefix}/{name}")
         };
-        if path.is_dir() {
-            collect_skill_files(root, &path, &rel, out);
+        if is_dir {
+            collect_skill_files(root, &path, &rel, depth + 1, visited, out);
         } else if path.is_file() {
             if let Ok(meta) = std::fs::metadata(&path) {
                 if meta.len() <= MAX_SKILL_FILE_BYTES {
@@ -595,5 +617,26 @@ mod tests {
         };
         assert_eq!(res.ttl_ms, Some(SKILL_CACHE_TTL_MS));
         assert_eq!(res.cache_scope, Some(CacheScope::Public));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_loop_in_user_skill_is_ignored_without_stack_overflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("loop-skill");
+        let sub_dir = skill_dir.join("sub");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: loop-skill\ndescription: Loop guard test\n---\nBody\n",
+        )
+        .unwrap();
+        // Create a symlink cycle pointing back to the skill root!
+        std::os::unix::fs::symlink(&skill_dir, sub_dir.join("cycle")).unwrap();
+
+        let skills = all_skills_with_dir(Some(tmp.path()));
+        let found = skills.iter().find(|s| s.name == "loop-skill").unwrap();
+        assert!(found.files.contains_key("SKILL.md"));
+        assert!(!found.files.keys().any(|k| k.contains("cycle")));
     }
 }
