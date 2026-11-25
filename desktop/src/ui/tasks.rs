@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use rune::{col, el, row, text, El, TextEdit, Tx};
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Keybind, Kit, Menu,
-    MenuItem, ScrollBar, SegmentedControl, TextInput,
+    MenuItem, ScrollBar, TextInput,
 };
 
 use super::copy::{tr, tr_ref};
@@ -570,18 +570,19 @@ fn filters(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .gap(12.0)
         .center_y()
         .flex_wrap()
-        .child(
-            SegmentedControl::new(&labels, at)
-                .fit()
-                .label(tr_ref(language, "State"))
-                .on_pick(|s: &mut UiState, i, _: &mut Tx| {
-                    s.tasks_view.filter = Filter::ALL[i];
-                    s.tasks_view.arm_cancel = None;
-                    s.tasks_view.arm_clean_wt = None;
-                })
-                .build(k)
-                .key("tasks-state"),
-        );
+        .child(super::settings::segmented(
+            k,
+            "tasks-state",
+            tr_ref(language, "State"),
+            &labels,
+            at,
+            false,
+            |s: &mut UiState, i| {
+                s.tasks_view.filter = Filter::ALL[i];
+                s.tasks_view.arm_cancel = None;
+                s.tasks_view.arm_clean_wt = None;
+            },
+        ));
     let mut machines: Vec<String> = s.tasks.iter().filter_map(|t| t.machine.clone()).collect();
     for comp in s.all_computers() {
         if comp.server_id != "local" && comp.server_id != "self" && comp.server_id != "all" {

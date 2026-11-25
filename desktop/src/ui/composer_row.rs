@@ -73,8 +73,12 @@ fn mode_glyph(id: &str) -> (&'static Icon, bool) {
 
 // ---- metrics ------------------------------------------------------------------------
 
-/// A pill (`ControlSize::Small` ghost button): 10 pt each side.
-const PILL_PAD: f32 = 20.0;
+/// A pill (`ControlSize::Small` ghost/neutral button): 10 pt each side + border/rounding headroom.
+const PILL_PAD: f32 = 22.0;
+/// `composer::pill` (`model_menu` / `effort_menu`): 12 pt each side + 1 pt border each side.
+const MENU_PILL_PAD: f32 = 26.0;
+/// Width of `ActivityMark::Compact` (12 pt) plus its 5 pt gap inside `agent_chip`.
+const BUSY_MARK_W: f32 = 17.0;
 /// Compact controls keep enough room around their glyph.
 const ICON_PILL: f32 = 32.0;
 const GLYPH: f32 = 14.0;
@@ -371,9 +375,14 @@ impl Controls {
         }
     }
 
-    fn branch_label(&self) -> Option<String> {
+    fn branch_text(&self, compact: bool) -> Option<&str> {
         let (_, info) = self.branch.as_ref()?;
-        info.current.as_ref().map(|b| format!("⎇ {b}"))
+        let current = info.current.as_deref().unwrap_or("Git");
+        if compact && current.len() > 3 {
+            Some("Git")
+        } else {
+            Some(current)
+        }
     }
 
     /// Whether anything goes into the "…" menu at `f`.
@@ -385,42 +394,76 @@ impl Controls {
 
     /// The row's width at fold `f`, as it will lay out.
     fn width(&self, k: &Kit, f: Fold) -> f32 {
-        let small = k.ty.small;
+        let btn_font = k.ty.small_medium;
         let mut items: Vec<f32> = Vec::new();
         if !f.more_agent {
             items.push(if f.agent_icon {
                 ICON_PILL
             } else {
-                8.0 + 20.0 + 6.0 + text_w(&self.agent_name, k.ty.small_medium) + 8.0
+                let busy_w = if self.busy { BUSY_MARK_W } else { 0.0 };
+                7.0 + super::composer::AGENT_ICON
+                    + 5.0
+                    + text_w(&self.agent_name, k.ty.small_medium)
+                    + busy_w
+                    + 7.0
             });
         }
         if let Some(m) = &self.model {
+            let reload_only = m.models.is_empty() && m.variants.is_empty();
             match f.model {
                 ModelLook::Split => {
-                    items.push(text_w(&m.name, small) + PILL_PAD);
+                    if m.models.is_empty() {
+                        items.push(text_w(&format!("{} ↻", m.name), btn_font) + PILL_PAD);
+                    } else {
+                        items.push(text_w(&m.name, btn_font) + MENU_PILL_PAD);
+                    }
                     if let Some(e) = &m.effort {
-                        items.push(text_w(e, small) + PILL_PAD);
+                        items.push(text_w(e, btn_font) + MENU_PILL_PAD);
                     }
                 }
-                ModelLook::Joined => items.push(text_w(&joined(m), small) + PILL_PAD),
-                ModelLook::Name => items.push(text_w(&m.name, small) + PILL_PAD),
-                ModelLook::Short => items.push(text_w(short_name(&m.name), small) + PILL_PAD),
-                ModelLook::Icon => items.push(ICON_PILL),
+                ModelLook::Joined => {
+                    if reload_only {
+                        items.push(text_w(&reload_label(m, f.model), btn_font) + PILL_PAD);
+                    } else {
+                        items.push(text_w(&joined(m), btn_font) + PILL_PAD);
+                    }
+                }
+                ModelLook::Name => {
+                    if reload_only {
+                        items.push(text_w(&reload_label(m, f.model), btn_font) + PILL_PAD);
+                    } else {
+                        items.push(text_w(&m.name, btn_font) + PILL_PAD);
+                    }
+                }
+                ModelLook::Short => {
+                    if reload_only {
+                        items.push(text_w(&reload_label(m, f.model), btn_font) + PILL_PAD);
+                    } else {
+                        items.push(text_w(short_name(&m.name), btn_font) + PILL_PAD);
+                    }
+                }
+                ModelLook::Icon => {
+                    if reload_only {
+                        items.push(
+                            (text_w(&reload_label(m, f.model), btn_font) + PILL_PAD).max(ICON_PILL),
+                        );
+                    } else {
+                        items.push(ICON_PILL);
+                    }
+                }
             }
         }
-        if let (Some(label), false) = (self.branch_label(), f.more_branch) {
-            items.push(if f.branch_icon {
-                ICON_PILL
-            } else {
-                text_w(&label, small) + PILL_PAD
-            });
+        if !f.more_branch {
+            if let Some(label) = self.branch_text(f.branch_icon) {
+                items.push(text_w(label, btn_font) + PILL_PAD);
+            }
         }
         if !f.more_mode && self.has_permission_control() {
             if f.mode_icon {
                 items.push(ICON_PILL);
             } else {
                 let summary = self.permission_summary();
-                items.push(GLYPH + 4.0 + text_w(&summary.label, small) + PILL_PAD);
+                items.push(GLYPH + 4.0 + text_w(&summary.label, btn_font) + PILL_PAD);
             }
         }
         if self.has_more(f) {
@@ -454,6 +497,15 @@ fn joined(m: &ModelChip) -> String {
     match &m.effort {
         Some(e) => format!("{} · {e}", m.name),
         None => m.name.clone(),
+    }
+}
+
+fn reload_label(m: &ModelChip, look: ModelLook) -> String {
+    match look {
+        ModelLook::Split | ModelLook::Name => format!("{} ↻", m.name),
+        ModelLook::Joined => format!("{} ↻", joined(m)),
+        ModelLook::Short => format!("{} ↻", short_name(&m.name)),
+        ModelLook::Icon => "↻".to_string(),
     }
 }
 
@@ -507,10 +559,7 @@ fn pill_button(
         e = e.w(ICON_PILL).min_w(ICON_PILL).px(0.0);
     }
     let [c0, c1, _] = crate::theme::look::highlight_colors_for(k, k.dark);
-    let mut e = e
-        .h(32.0)
-        .radius(if square { ICON_PILL / 2.0 } else { k.radius.lg })
-        .border(0.0, c0.alpha(0.0));
+    let mut e = e.h(32.0).radius(k.radius.lg).border(0.0, c0.alpha(0.0));
     if open {
         e = e.linear_gradient(
             std::f32::consts::FRAC_PI_2,
@@ -537,7 +586,7 @@ fn agent_chip(c: &Controls, k: &Kit, f: Fold) -> El {
         return chip
             .w(ICON_PILL)
             .min_w(ICON_PILL)
-            .radius(ICON_PILL / 2.0)
+            .radius(k.radius.lg)
             .center()
             .help(c.agent_name.clone());
     }
@@ -553,8 +602,8 @@ fn agent_chip(c: &Controls, k: &Kit, f: Fold) -> El {
     chip
 }
 
-fn reload_model(k: &Kit, c: &Controls, name: &str) -> El {
-    Button::new(format!("{name} ↻"))
+fn reload_model(k: &Kit, c: &Controls, label: String) -> El {
+    Button::new(label)
         .variant(ButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
         .help(c.tr("Reload model list"))
@@ -583,7 +632,7 @@ fn model_chips(
     if f.model == ModelLook::Split {
         let mut line = line;
         line = line.child(if m.models.is_empty() {
-            reload_model(k, c, &m.name)
+            reload_model(k, c, reload_label(m, f.model))
         } else {
             model_menu(
                 s,
@@ -623,7 +672,7 @@ fn model_chips(
         _ => Face::Glyph(&MODEL, None),
     };
     if m.models.is_empty() && m.variants.is_empty() {
-        return line.child(reload_model(k, c, &whole));
+        return line.child(reload_model(k, c, reload_label(m, f.model)));
     }
     let trigger = pill_button(
         k,
@@ -845,10 +894,9 @@ fn branch_control(
     _layer: &mut Vec<El>,
     f: Fold,
 ) -> Option<El> {
-    let (_, info) = c.branch.as_ref()?;
-    let current = info.current.clone().unwrap_or_else(|| "Git".into());
+    let label = c.branch_text(f.branch_icon)?;
     Some(
-        Button::new(if f.branch_icon { "Git".into() } else { current })
+        Button::new(label.to_string())
             .variant(ButtonVariant::Neutral)
             .control_size(ControlSize::Small)
             .on_press(|s: &mut UiState| s.toggle_git_inspector())
@@ -933,7 +981,13 @@ fn build(
     layer: &mut Vec<El>,
     f: Fold,
 ) -> El {
-    let mut line = row().key("pills").gap(ROW_GAP).center_y();
+    let mut line = row()
+        .key("pills")
+        .gap(ROW_GAP)
+        .center_y()
+        .min_w(0.0)
+        .shrink()
+        .clip_soft(0.0);
     if !f.more_agent {
         line = line.child(agent_chip(c, k, f));
     }

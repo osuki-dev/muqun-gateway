@@ -54,13 +54,14 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
     let total = report.total();
 
     // The total, large, over a bar each kind takes its share of.
+    let bar_radius = k.radius.xs.min(5.0);
     let mut bar = hrow()
         .key("storage-bar")
         .w_full()
         .h(10.0)
         .gap(2.0)
-        .radius(5.0)
-        .clip_rounded(5.0)
+        .radius(bar_radius)
+        .clip_rounded(bar_radius)
         .fill(k.c.text_base.alpha(0.06));
     if scanned && total > 0 {
         for (key, _, _, n, color) in &kinds {

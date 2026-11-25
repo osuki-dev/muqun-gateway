@@ -12,7 +12,7 @@ use std::sync::Arc;
 use rune::{col, el, row as hrow, text, El, ImageCache, SurfaceFit, TextEdit, Transition, Tx};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit,
-    SegmentedControl, TextInput,
+    TextInput,
 };
 
 use super::{row, status, Tone};
@@ -56,7 +56,7 @@ fn mini_window(k: &Kit, key: &str, sw: &Swatch, w: f32, h: f32) -> El {
         el().key(key.to_string())
             .w(w)
             .h((h * 0.07).max(2.0))
-            .radius(1.0)
+            .radius((k.radius.xs * 0.25).min(1.5))
             .fill(text_c.alpha(0.55))
     };
     el().key(key.to_string())
@@ -67,7 +67,7 @@ fn mini_window(k: &Kit, key: &str, sw: &Swatch, w: f32, h: f32) -> El {
             col()
                 .key("sheet")
                 .pin(Some(w * 0.12), Some(h * 0.18), Some(w * 0.12), Some(0.0))
-                .radius((h * 0.08).max(2.0))
+                .radius((h * 0.08).max(k.radius.xs * 0.5))
                 .fill(hex(k, &sw.surface))
                 .px(w * 0.08)
                 .pt(h * 0.12)
@@ -76,7 +76,7 @@ fn mini_window(k: &Kit, key: &str, sw: &Swatch, w: f32, h: f32) -> El {
                     el().key("accent")
                         .w(w * 0.28)
                         .h((h * 0.09).max(2.0))
-                        .radius(2.0)
+                        .radius((k.radius.xs * 0.5).min(3.0))
                         .fill(hex(k, &sw.primary)),
                 )
                 .child(line("l1", w * 0.5))
@@ -92,13 +92,13 @@ fn scheme_chips(k: &Kit, light: &Swatch, dark: &Swatch) -> El {
         .gap(4.0)
         .child(
             mini_window(k, "light", light, 26.0, 18.0)
-                .radius(4.0)
-                .clip_rounded(4.0),
+                .radius(k.radius.xs)
+                .clip_rounded(k.radius.xs),
         )
         .child(
             mini_window(k, "dark", dark, 26.0, 18.0)
-                .radius(4.0)
-                .clip_rounded(4.0),
+                .radius(k.radius.xs)
+                .clip_rounded(k.radius.xs),
         )
         .a11y_hidden()
 }
@@ -585,10 +585,14 @@ pub(super) fn sub_header(s: &UiState, k: &Kit) -> El {
         gallery_label,
     ];
 
-    let seg = SegmentedControl::new(&labels, Some(at))
-        .fit()
-        .label(tr_ref(language, "Theme sources"))
-        .on_pick(|s: &mut UiState, i, _: &mut Tx| {
+    let seg = super::segmented(
+        k,
+        "theme-tabs-segmented",
+        tr_ref(language, "Theme sources"),
+        &labels,
+        Some(at),
+        false,
+        |s: &mut UiState, i| {
             s.theme_tab = match i {
                 0 => ThemeTab::Installed,
                 _ => {
@@ -598,9 +602,8 @@ pub(super) fn sub_header(s: &UiState, k: &Kit) -> El {
                     ThemeTab::Gallery
                 }
             };
-        })
-        .build(k)
-        .key("theme-tabs-segmented");
+        },
+    );
 
     let mut bar = hrow().key("theme-tabs-bar").gap(14.0).center_y().child(seg);
 

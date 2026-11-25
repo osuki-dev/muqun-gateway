@@ -89,7 +89,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                             row()
                                 .px(6.0)
                                 .py(1.0)
-                                .radius(4.0)
+                                .radius(k.radius.xs)
                                 .fill(k.c.layer_01)
                                 .border(1.0, k.c.border_weak)
                                 .child(
@@ -329,7 +329,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                         row()
                             .px(7.0)
                             .py(2.0)
-                            .radius(4.0)
+                            .radius(k.radius.xs)
                             .fill(k.c.bg_contrast)
                             .child(
                                 text(tr(language, "CODE"))

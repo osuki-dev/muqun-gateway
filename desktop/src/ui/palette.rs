@@ -832,7 +832,7 @@ fn hint(k: &Kit, key: &str, what: String) -> El {
                 .color(k.c.text_muted)
                 .px(5.0)
                 .py(1.0)
-                .radius(4.0)
+                .radius(k.radius.xs)
                 .fill(k.c.layer_02),
         )
         .child(text(what).font(k.ty.small).color(k.c.text_faint))

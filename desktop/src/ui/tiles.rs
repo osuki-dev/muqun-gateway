@@ -919,7 +919,7 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         .radius(k.radius.lg);
     actions = actions.child(submit);
     let card = col()
-        .key("composer-card")
+        .key(composer::card_layout_key(Some(asid), s.in_split()))
         .on_drop_files(move |s: &mut UiState, files, _| {
             s.focus_tile(i);
             composer::attach_dropped_files(s, files);
@@ -1427,7 +1427,7 @@ fn floating_card(
         .size(14.0, 14.0)
         .cursor(Cursor::ResizeColumn)
         .fill(k.c.border_muted)
-        .radius(3.0)
+        .radius(k.radius.xs)
         .on_drag(move |s: &mut UiState, d: &mut rune::Drag, _: &mut Tx| {
             if d.phase == Phase::Down {
                 s.focus_tile(resize_i);
@@ -1849,7 +1849,11 @@ mod tests {
             let mut cards: Vec<_> = rt
                 .elements()
                 .into_iter()
-                .filter(|n| n.key.as_deref() == Some("composer-card"))
+                .filter(|n| {
+                    n.key
+                        .as_deref()
+                        .is_some_and(|k| k == "composer-card" || k.starts_with("composer-card-"))
+                })
                 .collect();
             cards.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
             let r = cards[1].rect;
@@ -2279,8 +2283,11 @@ mod tests {
                 .elements()
                 .into_iter()
                 .filter(|node| {
-                    node.key.as_deref() == Some("composer-footer")
-                        || node.key.as_deref() == Some("composer-card")
+                    node.key.as_deref().is_some_and(|k| {
+                        k == "composer-footer"
+                            || k == "composer-card"
+                            || k.starts_with("composer-card-")
+                    })
                 })
                 .map(|node| (node.key.clone(), node.rect))
                 .collect();
@@ -2679,5 +2686,159 @@ mod tests {
                 .any(|cmd| matches!(cmd, Command::CompactSession { .. })),
             "busy session must not trigger CompactSession, got {cmds:?}"
         );
+    }
+
+    #[test]
+    fn narrow_split_composer_footer_controls_never_overlap_context_or_send() {
+        use rune::{Env, Runtime};
+
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        crate::ui::scenes::scenes()
+            .iter()
+            .find(|(name, _)| *name == "split2")
+            .unwrap()
+            .1(&mut s);
+        s.splash = None;
+        // Give both sessions long model names and branch info to stress narrow folding.
+        for session in &mut s.sessions {
+            session.model = Some(muqun_gateway::agents::ModelRef {
+                provider_id: "anthropic".into(),
+                model_id: "claude-opus-4-5-thinking".into(),
+                variant: Some("high".into()),
+            });
+            if let Some(dir) = &session.directory {
+                s.branches.insert(
+                    dir.clone(),
+                    crate::model::compose::BranchInfo {
+                        current: Some("feat/very-long-branch-name".into()),
+                        local: vec!["feat/very-long-branch-name".into(), "main".into()],
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        // 980px window with sidebar open => ~350px per split pane.
+        let mut rt = Runtime::new(s, crate::ui::view, (980.0, 800.0), Env::new(true, 1.0));
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+
+        let els = rt.elements();
+        let card_keys: Vec<_> = els
+            .iter()
+            .filter_map(|n| n.key.as_deref())
+            .filter(|k| k.starts_with("composer-card-"))
+            .collect();
+        assert_eq!(
+            card_keys.len(),
+            2,
+            "each split tile must have its own unique composer-card-<asid> key, got {card_keys:?}"
+        );
+        assert_ne!(card_keys[0], card_keys[1]);
+
+        let mut footers: Vec<_> = els
+            .iter()
+            .filter(|n| n.key.as_deref() == Some("composer-footer"))
+            .collect();
+        footers.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
+        assert_eq!(footers.len(), 2);
+
+        let rects_overlap = |a: [f32; 4], b: [f32; 4]| {
+            a[0] < b[0] + b[2] - 0.5
+                && b[0] < a[0] + a[2] - 0.5
+                && a[1] < b[1] + b[3] - 0.5
+                && b[1] < a[1] + a[3] - 0.5
+        };
+
+        for footer in &footers {
+            let fx0 = footer.rect[0] - 1.0;
+            let fx1 = footer.rect[0] + footer.rect[2] + 1.0;
+            let fy0 = footer.rect[1] - 2.0;
+            let fy1 = footer.rect[1] + footer.rect[3] + 2.0;
+
+            let in_footer = |r: [f32; 4]| {
+                r[2] > 0.0
+                    && r[3] > 0.0
+                    && r[0] >= fx0
+                    && r[0] + r[2] <= fx1 + 40.0
+                    && r[1] >= fy0
+                    && r[1] + r[3] <= fy1
+            };
+
+            let left_pills: Vec<_> = els
+                .iter()
+                .filter(|n| {
+                    in_footer(n.rect)
+                        && n.key.as_deref().is_some_and(|k| {
+                            k == "composer-controls"
+                                || k == "agent"
+                                || k == "model-pill"
+                                || k == "model-reload"
+                                || k == "effort-pill"
+                                || k == "branch"
+                                || k == "mode-pill"
+                                || k == "composer-more-pill"
+                                || (k.starts_with("model-") && k.ends_with("-pill"))
+                        })
+                })
+                .collect();
+
+            let right_controls: Vec<_> = els
+                .iter()
+                .filter(|n| {
+                    in_footer(n.rect)
+                        && (n.key.as_deref() == Some("stop")
+                            || n.key.as_deref() == Some("composer-git")
+                            || n.label.as_deref() == Some("Context")
+                            || n.key.as_deref().is_some_and(|k| k.starts_with("context-")))
+                })
+                .collect();
+
+            let sends: Vec<_> = els
+                .iter()
+                .filter(|n| {
+                    n.key.as_deref() == Some("send")
+                        && n.rect[0] >= fx0
+                        && n.rect[0] + n.rect[2] <= fx1
+                })
+                .collect();
+
+            assert!(
+                !left_pills.is_empty(),
+                "expected left composer pills in footer {:?}",
+                footer.rect
+            );
+            assert!(
+                !right_controls.is_empty(),
+                "expected right footer controls (Context/Stop) in footer {:?}",
+                footer.rect
+            );
+
+            for left in &left_pills {
+                for right in &right_controls {
+                    assert!(
+                        !rects_overlap(left.rect, right.rect),
+                        "left pill {:?} ({:?}) overlapped right control {:?}/{:?} ({:?}) in narrow split footer {:?}",
+                        left.key,
+                        left.rect,
+                        right.key,
+                        right.label,
+                        right.rect,
+                        footer.rect
+                    );
+                }
+                for send in &sends {
+                    assert!(
+                        !rects_overlap(left.rect, send.rect),
+                        "left pill {:?} ({:?}) overlapped send button ({:?})",
+                        left.key,
+                        left.rect,
+                        send.rect
+                    );
+                }
+            }
+        }
     }
 }

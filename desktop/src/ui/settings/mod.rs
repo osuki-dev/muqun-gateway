@@ -27,8 +27,8 @@ pub use themes::ThemeTab;
 use rune::{col, el, row as hrow, text, El, TextEdit, Tx};
 use rune_kit::shell::SidebarRow;
 use rune_kit::{
-    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, ScrollBar,
-    SegmentedControl, Select, SelectAppearance, Switch, TextInput,
+    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, ScrollBar, Select,
+    SelectAppearance, Switch, TextInput,
 };
 
 use super::copy::tr_ref;
@@ -333,6 +333,96 @@ pub(super) fn status(k: &Kit, key: &str, tone: Tone, words: impl Into<String>) -
 
 // ---- controls ------------------------------------------------------------------------
 
+/// Theme-radius-aware segmented control honoring `Settings → Appearance → Corners`.
+///
+/// When `equal_width` is `true`, segments share equal width (ideal for settings controls);
+/// when `false`, each segment sizes compactly to its own label.
+pub(crate) fn segmented<S: AsRef<str>>(
+    k: &Kit,
+    key: &str,
+    aria_label: impl Into<String>,
+    labels: &[S],
+    selected: Option<usize>,
+    equal_width: bool,
+    pick: impl Fn(&mut UiState, usize) + Clone + 'static,
+) -> El {
+    let n = labels.len().max(1);
+    let mut track = hrow()
+        .key(key.to_string())
+        .role("radiogroup")
+        .focus_group()
+        .label(aria_label.into())
+        .h(32.0)
+        .px(2.0)
+        .py(2.0)
+        .gap(2.0)
+        .center_y()
+        .radius(k.radius.lg)
+        .fill(k.c.layer_02)
+        .border(1.0, k.c.border_weak.alpha(0.6));
+    if equal_width {
+        track = track.equal_columns(n);
+    }
+    let active_font = rune::TextStyle {
+        line_height: 14.0,
+        ..if equal_width {
+            k.ty.ui_medium
+        } else {
+            k.ty.small_medium
+        }
+    };
+    let rest_font = rune::TextStyle {
+        line_height: 14.0,
+        ..if equal_width { k.ty.ui } else { k.ty.small }
+    };
+    let seg_px = if equal_width { 12.0 } else { 10.0 };
+
+    for (i, raw_label) in labels.iter().enumerate() {
+        let is_active = selected == Some(i);
+        let label_text = raw_label.as_ref().to_string();
+        let mut word = text(label_text.clone())
+            .key("label")
+            .font(if is_active { active_font } else { rest_font })
+            .color(if is_active {
+                k.c.text_base
+            } else {
+                k.c.text_muted
+            })
+            .truncate()
+            .a11y_hidden();
+        if !is_active {
+            word = word.group_color(k.c.text_base);
+        }
+        let pick = pick.clone();
+        let mut seg = hrow()
+            .key(format!("segment{i}"))
+            .role("radio")
+            .checked(is_active)
+            .focusable(true)
+            .focus_selected(is_active)
+            .label(label_text)
+            .position_in_set(i + 1, n)
+            .h_full()
+            .px(seg_px)
+            .center()
+            .radius(k.radius.md)
+            .child(word)
+            .on_press(move |s: &mut UiState| pick(s, i));
+        if equal_width {
+            seg = seg.grid_cell(i).grow(1.0).shrink().min_w(0.0);
+        }
+        if is_active {
+            seg = seg
+                .fill(k.c.surface_raised)
+                .border(1.0, k.c.border_weak.alpha(0.5));
+        } else {
+            seg = k.interactive(seg);
+        }
+        track = track.child(seg);
+    }
+    track
+}
+
 pub(super) fn choice(
     k: &Kit,
     key: &str,
@@ -340,12 +430,7 @@ pub(super) fn choice(
     at: usize,
     pick: impl Fn(&mut UiState, usize) + Clone + 'static,
 ) -> El {
-    SegmentedControl::new(labels, Some(at))
-        .fit()
-        .label(key.to_string())
-        .on_pick(move |s: &mut UiState, i, _: &mut Tx| pick(s, i))
-        .build(k)
-        .key(format!("seg-{key}"))
+    segmented(k, &format!("seg-{key}"), key, labels, Some(at), true, pick)
 }
 
 pub(super) fn flag(

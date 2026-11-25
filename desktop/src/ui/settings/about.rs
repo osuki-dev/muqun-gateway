@@ -44,13 +44,13 @@ fn hero(s: &UiState, k: &Kit) -> El {
             crate::ui::art::picture(images, Arc::<[u8]>::from(APP_MARK_PNG), SurfaceFit::Fill)
                 .key("about-mark")
                 .size(MARK, MARK)
-                .radius(14.0)
-                .clip_rounded(14.0)
+                .radius(k.radius.xl)
+                .clip_rounded(k.radius.xl)
         }
         None => el()
             .key("about-mark")
             .size(MARK, MARK)
-            .radius(14.0)
+            .radius(k.radius.xl)
             .fill(k.c.bg_accent),
     };
     let build = option_env!("MUQUN_BUILD").unwrap_or(if cfg!(debug_assertions) {

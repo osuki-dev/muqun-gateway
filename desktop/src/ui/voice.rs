@@ -13,9 +13,7 @@ use std::sync::{Arc, Mutex};
 use crate::model::inbox::UiAction;
 
 use rune::{col, el, row, text, El, TextEdit, Tx};
-use rune_kit::{
-    ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, SegmentedControl, TextInput,
-};
+use rune_kit::{ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, TextInput};
 use tokio::sync::mpsc;
 
 use super::copy::{tr, tr_ref};
@@ -424,38 +422,38 @@ pub fn settings(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
     let voice = &s.cfg.voice;
     let mode_at = usize::from(voice.mode == VoiceMode::Realtime);
     let (preset_url, preset_model) = VoiceConfig::preset(voice.mode);
-    let mode = SegmentedControl::new(
+    let mode = super::settings::segmented(
+        k,
+        "seg-voice-mode",
+        tr_ref(language, "Mode"),
         &[
             tr_ref(language, "After recording"),
             tr_ref(language, "Realtime"),
         ],
         Some(mode_at),
-    )
-    .fit()
-    .label(tr_ref(language, "Mode"))
-    .on_pick(|s: &mut UiState, i, _: &mut Tx| {
-        let to = [VoiceMode::File, VoiceMode::Realtime][i];
-        let from = s.cfg.voice.mode;
-        if from == to {
-            return;
-        }
-        // Follow the built-in preset only; a custom endpoint stays.
-        let (from_url, from_model) = VoiceConfig::preset(from);
-        let (to_url, to_model) = VoiceConfig::preset(to);
-        s.edit_voice(|v| {
-            v.mode = to;
-            if v.url == from_url {
-                v.url = to_url.into();
-                if v.model == from_model {
-                    v.model = to_model.into();
-                }
+        false,
+        |s: &mut UiState, i| {
+            let to = [VoiceMode::File, VoiceMode::Realtime][i];
+            let from = s.cfg.voice.mode;
+            if from == to {
+                return;
             }
-        });
-        s.voice_form.url = TextEdit::new(s.cfg.voice.url.clone());
-        s.voice_form.model = TextEdit::new(s.cfg.voice.model.clone());
-    })
-    .build(k)
-    .key("seg-voice-mode");
+            // Follow the built-in preset only; a custom endpoint stays.
+            let (from_url, from_model) = VoiceConfig::preset(from);
+            let (to_url, to_model) = VoiceConfig::preset(to);
+            s.edit_voice(|v| {
+                v.mode = to;
+                if v.url == from_url {
+                    v.url = to_url.into();
+                    if v.model == from_model {
+                        v.model = to_model.into();
+                    }
+                }
+            });
+            s.voice_form.url = TextEdit::new(s.cfg.voice.url.clone());
+            s.voice_form.model = TextEdit::new(s.cfg.voice.model.clone());
+        },
+    );
     let lang_at = LANGUAGES
         .iter()
         .position(|(code, _)| *code == voice.language)

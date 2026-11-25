@@ -13,7 +13,7 @@ use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 use rune::{col, el, icon, row, text, Color, El, TextEdit, TextStyle, Tx};
 use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, ControlSize, Kit, Menu, MenuEntry, MenuItem,
-    Placement, ScrollBar, SegmentedControl, TextInput,
+    Placement, ScrollBar, TextInput,
 };
 
 use crate::config::{ConfigEdit, Language, MaoPrefs, MaoRoleConfig, MaoSessionOverride};
@@ -4797,16 +4797,22 @@ fn page_filters(s: &UiState, k: &Kit) -> El {
         .iter()
         .position(|f| *f == s.orchestration.filter);
 
-    row().key("mao-filters").w_full().px(28.0).pb(12.0).child(
-        SegmentedControl::new(&labels, at)
-            .fit()
-            .label(tr_ref(language, "State"))
-            .on_pick(|s: &mut UiState, i, _: &mut Tx| {
+    row()
+        .key("mao-filters")
+        .w_full()
+        .px(28.0)
+        .pb(12.0)
+        .child(super::settings::segmented(
+            k,
+            "mao-state-filter",
+            tr_ref(language, "State"),
+            &labels,
+            at,
+            false,
+            |s: &mut UiState, i| {
                 s.orchestration.filter = Filter::ALL[i];
-            })
-            .build(k)
-            .key("mao-state-filter"),
-    )
+            },
+        ))
 }
 
 fn page_empty(s: &UiState, k: &Kit) -> El {

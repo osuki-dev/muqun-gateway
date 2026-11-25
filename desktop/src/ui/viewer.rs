@@ -18,7 +18,7 @@ use std::time::SystemTime;
 
 use rune::{col, el, rich, row, text, El, SurfaceFit};
 use rune_kit::syntax::{self, SyntaxTheme};
-use rune_kit::{Button, ButtonVariant, Kit, Markdown, SegmentedControl};
+use rune_kit::{Button, ButtonVariant, Kit, Markdown};
 
 use super::copy::{tr, tr_ref};
 use super::UiState;
@@ -727,18 +727,19 @@ fn header(s: &UiState, v: &Viewer, k: &Kit, fit_zoom: f32, layer: &mut Vec<El>) 
 
     if v.kind == FileKind::Markdown && matches!(v.body, Body::Text { .. }) {
         let labels = [tr_ref(language, "Rendered"), tr_ref(language, "Source")];
-        bar = bar.child(
-            SegmentedControl::new(&labels, Some(usize::from(v.source)))
-                .fit()
-                .label(tr_ref(language, "Show"))
-                .on_pick(|s: &mut UiState, i, _: &mut rune::Tx| {
-                    if let Some(v) = s.viewer.as_mut() {
-                        v.source = i == 1;
-                    }
-                })
-                .build(k)
-                .key("viewer-md-mode"),
-        );
+        bar = bar.child(super::settings::segmented(
+            k,
+            "viewer-md-mode",
+            tr_ref(language, "Show"),
+            &labels,
+            Some(usize::from(v.source)),
+            false,
+            |s: &mut UiState, i| {
+                if let Some(v) = s.viewer.as_mut() {
+                    v.source = i == 1;
+                }
+            },
+        ));
     }
     if matches!(v.body, Body::Image(_)) {
         bar = bar.child(image_actions(s, v, k, fit_zoom, layer));

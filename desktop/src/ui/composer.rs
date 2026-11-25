@@ -2433,6 +2433,16 @@ pub(super) fn send_with_delivery(s: &mut UiState) {
     }
 }
 
+/// Unique layout key for a composer card so split tiles each measure their own width.
+pub(super) fn card_layout_key(asid: Option<&str>, in_split: bool) -> String {
+    if in_split {
+        if let Some(id) = asid.filter(|id| !id.is_empty()) {
+            return format!("composer-card-{id}");
+        }
+    }
+    "composer-card".to_string()
+}
+
 /// The same controls and metrics for focused and parked session composers.
 pub(super) fn session_footer(
     s: &UiState,
@@ -2446,37 +2456,62 @@ pub(super) fn session_footer(
     use super::composer_row as controls_row;
     let language = s.cfg.general.language;
     let busy = asid.is_some_and(|id| s.session_busy(id));
-    let inner = rune::memo::layout_with("composer-card", |r| r[2].round())
-        .map_or(f32::INFINITY, |w| w - controls_row::CARD_PAD - 24.0);
-    let room = (inner - if busy { 400.0 } else { 180.0 }).max(80.0);
-    let own_line = asid
-        .and_then(|id| controls_row::Controls::for_session(s, id, catalog))
-        .map(|c| {
-            controls_row::own_line(s, &c, catalog, k, layer, room)
-                .key("composer-controls")
-                .w_full()
-        });
-    let mut footer = row().grow(1.0).min_w(0.0).min_h(32.0).gap(8.0).center_y();
-    if let Some(controls) = own_line {
-        footer = footer.child(controls.w(0.0).grow(1.0).min_w(0.0));
-    } else if busy {
-        footer = footer.child(el().grow(1.0));
-    }
-    if let Some(asid) = asid {
-        if crate::plugin::is_enabled("inspector", &s.cfg.plugins_disabled)
-            && s.session_by_id(asid)
+    let show_git_btn = asid.is_some_and(|id| {
+        crate::plugin::is_enabled("inspector", &s.cfg.plugins_disabled)
+            && s.session_by_id(id)
                 .and_then(|info| info.directory.as_ref())
                 .and_then(|dir| s.branches.get(dir))
                 .and_then(|b| b.current.as_ref())
                 .is_none()
-        {
-            let label = if diff_stat.files > 0 {
-                format!("Git +{} −{}", diff_stat.added, diff_stat.removed)
-            } else {
-                "Git".into()
-            };
+    });
+    let git_label = if diff_stat.files > 0 {
+        format!("Git +{} −{}", diff_stat.added, diff_stat.removed)
+    } else {
+        "Git".into()
+    };
+    let show_stop = asid.is_some() && busy && (parked.is_some() || s.voice.is_none());
+    let mut right_w = 0.0_f32;
+    if show_git_btn {
+        right_w += rune::text::measure(&git_label, &[], k.ty.small_medium, None).0 + 24.0 + 8.0;
+    }
+    if asid.is_some() {
+        let ctx_w = rune::text::measure(tr_ref(language, "Context"), &[], k.ty.small_medium, None)
+            .0
+            .max(84.0);
+        right_w += ctx_w + 26.0 + 8.0;
+    }
+    if busy {
+        right_w += 108.0;
+    }
+    if show_stop {
+        right_w += 108.0;
+    }
+    let card_key = card_layout_key(asid, s.in_split());
+    let card_w = rune::memo::layout_with(&card_key, |r| r[2].round()).or_else(|| {
+        (!s.in_split())
+            .then(|| rune::memo::layout_with("composer-card", |r| r[2].round()))
+            .flatten()
+    });
+    let room = card_w.map_or(f32::INFINITY, |w| (w - right_w).max(0.0));
+    let own_line = asid
+        .and_then(|id| controls_row::Controls::for_session(s, id, catalog))
+        .map(|c| controls_row::own_line(s, &c, catalog, k, layer, room).key("composer-controls"));
+    let mut footer = row()
+        .grow(1.0)
+        .shrink()
+        .min_w(0.0)
+        .min_h(32.0)
+        .gap(8.0)
+        .center_y();
+    if let Some(controls) = own_line {
+        footer = footer.child(controls.w(0.0).grow(1.0).shrink().min_w(0.0).clip_soft(0.0));
+    } else if busy {
+        footer = footer.child(el().grow(1.0));
+    }
+    if let Some(asid) = asid {
+        if show_git_btn {
             footer = footer.child(
-                Button::new(label)
+                Button::new(git_label)
                     .variant(ButtonVariant::Neutral)
                     .control_size(ControlSize::Small)
                     .on_press(|s: &mut UiState| s.toggle_git_inspector())
@@ -2504,6 +2539,7 @@ pub(super) fn session_footer(
     if let Some(i) = parked {
         footer = el()
             .grow(1.0)
+            .shrink()
             .min_w(0.0)
             .on_background_press(move |s: &mut UiState| s.focus_tile(i))
             .child(footer.inert().w_full());
@@ -2515,7 +2551,7 @@ pub(super) fn session_footer(
         .center_y()
         .gap(8.0)
         .child(footer);
-    if let Some(asid) = asid.filter(|_| busy && (parked.is_some() || s.voice.is_none())) {
+    if let Some(asid) = asid.filter(|_| show_stop) {
         let target = AgentSessionId(asid.to_owned());
         bar = bar.child(
             Button::new(tr_ref(language, "Stop"))
@@ -2556,7 +2592,9 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let attach = attachment_button(k, language, start, has_session, "attach");
     // Measure the actual card so controls also fold inside split panes.
     use super::composer_row::{ACTION_GAP, CARD_PAD};
-    let inner = rune::memo::layout_with("composer-card", |r| r[2].round())
+    let compact = s.in_split();
+    let card_key = card_layout_key(s.selected.as_deref(), compact);
+    let inner = rune::memo::layout_with(&card_key, |r| r[2].round())
         .map_or(f32::INFINITY, |w| w - CARD_PAD - 24.0);
     let mut tools = row()
         .gap(ACTION_GAP)
@@ -2626,13 +2664,12 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
 
     popup(s, k, layer, Slot::Session);
     history_popup(s, k, layer, Slot::Session);
-    let compact = s.in_split();
     let mut card = if compact {
         col().w_full().gap(4.0).px(16.0).pt(8.0).pb(8.0)
     } else {
         body()
     }
-    .key("composer-card");
+    .key(card_key);
 
     if s.drop_hover {
         card = card.child(drop_hint(k, &look, language));

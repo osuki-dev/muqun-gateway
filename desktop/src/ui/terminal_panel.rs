@@ -2850,7 +2850,7 @@ fn prefix_badge(k: &Kit, sfx: &str) -> El {
         .h(20.0)
         .px(7.0)
         .center()
-        .radius(4.0)
+        .radius(k.radius.xs)
         .fill(k.c.bg_accent.alpha(0.18))
         .border(1.0, k.c.bg_accent.alpha(0.45))
         .child(
@@ -3090,7 +3090,7 @@ fn grid(
                     el().key(format!("term-match{sfx}-{idx}"))
                         .absolute(x, y)
                         .size(w.max(2.0), h)
-                        .radius(2.0)
+                        .radius((k.radius.xs * 0.5).min(3.0))
                         .fill(highlight_fill)
                         .a11y_hidden(),
                 );
@@ -3156,7 +3156,7 @@ fn grid(
             el().key(format!("terminal-scroll{sfx}"))
                 .absolute(f32::from(frame.cols) * m.cw - 3.0, top.min(h - thumb))
                 .size(3.0, thumb)
-                .radius(1.5)
+                .radius((k.radius.xs * 0.5).min(1.5))
                 .fill(k.c.text_faint.alpha(0.6))
                 .a11y_hidden(),
         );

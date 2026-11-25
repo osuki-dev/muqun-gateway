@@ -575,13 +575,13 @@ fn home_brand(s: &UiState, k: &Kit, look: &Look, lights: f32) -> El {
             .key("home-mark")
             .w(MARK)
             .h(MARK)
-            .radius(5.0)
-            .clip_rounded(5.0),
+            .radius(k.radius.sm)
+            .clip_rounded(k.radius.sm),
         None => el()
             .key("home-mark")
             .w(MARK)
             .h(MARK)
-            .radius(5.0)
+            .radius(k.radius.sm)
             .fill(k.c.bg_accent),
     };
     let mark = look.glow(mark, k.c.bg_accent, 0.35);
@@ -675,7 +675,7 @@ fn session_identity(s: &UiState, k: &Kit, look: &Look) -> El {
             look.glow(
                 el().key("session-mark")
                     .size(26.0, 26.0)
-                    .radius(7.0)
+                    .radius(k.radius.md)
                     .fill(super::agents::color(&info.agent_id, s.dark).alpha(0.14))
                     .center()
                     .child(super::agents::mark(&info.agent_id, 16.0, s.dark)),
