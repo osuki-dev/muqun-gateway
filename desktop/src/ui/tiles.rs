@@ -2612,7 +2612,7 @@ mod tests {
         assert!(s.right_open);
         assert_eq!(s.active_plugin_drawer.as_deref(), Some("inspector"));
         assert_eq!(s.selected_dock_tab(), Some("inspector"));
-        assert!(!s.inline_inspector_open());
+        assert_eq!(s.active_plugin_drawer.as_deref(), Some("inspector"));
 
         s.menu = Some(OpenMenu::Tile(0));
         let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));

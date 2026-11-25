@@ -1424,14 +1424,11 @@ mod tests {
         assert!(s.right_open);
         assert_eq!(s.active_plugin_drawer.as_deref(), Some("inspector"));
         assert_eq!(s.selected_dock_tab(), Some("inspector"));
-        assert!(!s.inline_inspector_open());
         s.open_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/icons/app-icon.png"));
         assert!(s.file_window_focused());
-        assert!(!s.inline_inspector_open());
         s.focus_tile(0);
         assert!(s.right_open);
         assert_eq!(s.selected_dock_tab(), Some("inspector"));
-        assert!(!s.inline_inspector_open());
     }
 
     #[test]

@@ -1490,7 +1490,10 @@ impl DesktopPlugin for TasksPlugin {
     }
 
     fn render_tile(&self, ctx: &PluginViewContext<'_>, layer: &mut Vec<El>) -> Option<El> {
-        Some(crate::ui::tasks::view(ctx.s, ctx.k, layer))
+        let full_page = ctx.surface == PluginSlot::Page && ctx.s.active_plugin_page.is_none();
+        Some(crate::ui::tasks::view_in_surface(
+            ctx.s, ctx.k, layer, full_page,
+        ))
     }
 }
 

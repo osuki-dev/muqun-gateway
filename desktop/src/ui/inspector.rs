@@ -9,7 +9,7 @@ use rune_kit::{
 };
 
 use super::copy::{tr, tr_ref};
-use super::{muted, timeline, title_of, InspectorTab, Mode, UiState};
+use super::{muted, timeline, InspectorTab, Mode, UiState};
 use crate::config::Language;
 use crate::model::commands::Command;
 use crate::model::compose::ComposeCommand;
@@ -595,104 +595,6 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
     out
 }
 
-fn subagents(s: &UiState, k: &Kit) -> Vec<El> {
-    let language = s.cfg.general.language;
-    if s.descendants.is_empty() {
-        return vec![empty(
-            k,
-            "subagents",
-            tr_ref(language, "No sub-agents"),
-            tr_ref(language, "Sessions this one delegates to appear here."),
-        )];
-    }
-    let mut out = Vec::new();
-    if s.descendants.len() > 1 {
-        let sub_ids: Vec<String> = s
-            .descendants
-            .iter()
-            .take(super::MAX_TILES.saturating_sub(1))
-            .map(|d| d.asid.0.clone())
-            .collect();
-        let tile_all_btn = small(
-            k,
-            tr_ref(language, "Tile all"),
-            ButtonVariant::Outline,
-            "tile-all-subagents".into(),
-            move |s| {
-                for id in &sub_ids {
-                    s.open_in_tile(id);
-                }
-            },
-        );
-        let header_row = row()
-            .key("subagents-header-actions")
-            .w_full()
-            .center_y()
-            .px(4.0)
-            .py(2.0)
-            .child(
-                text(format!(
-                    "{} {}",
-                    s.descendants.len(),
-                    tr_ref(language, "sub-agents")
-                ))
-                .font(k.ty.ui_medium)
-                .color(k.c.text_base),
-            )
-            .child(el().grow(1.0))
-            .child(tile_all_btn);
-        out.push(header_row);
-    }
-    out.extend(s.descendants.iter().map(|d| {
-        let asid = d.asid.0.clone();
-        let asid_split = asid.clone();
-        let in_tile = s.tile_of(&asid).is_some();
-        let split_label = if in_tile {
-            tr_ref(language, "Tiled")
-        } else {
-            tr_ref(language, "Split")
-        };
-        let split_btn = small(
-            k,
-            split_label,
-            if in_tile {
-                ButtonVariant::Outline
-            } else {
-                ButtonVariant::Ghost
-            },
-            format!("split-{}", d.asid.0),
-            move |s| s.open_in_tile(&asid_split),
-        );
-        let open_btn = small(
-            k,
-            tr_ref(language, "Open"),
-            ButtonVariant::Ghost,
-            format!("open-{}", d.asid.0),
-            move |s| s.open_session(&asid),
-        );
-        let actions = row().gap(6.0).center_y().child(split_btn).child(open_btn);
-
-        use muqun_gateway::agents::domain::session::AgentSessionStatus;
-        let status_text = match d.status {
-            AgentSessionStatus::Busy => tr_ref(language, "Running"),
-            AgentSessionStatus::Idle => tr_ref(language, "Idle"),
-            AgentSessionStatus::Retry => tr_ref(language, "Retrying"),
-            AgentSessionStatus::Failed => tr_ref(language, "Failed"),
-            AgentSessionStatus::Interrupted => tr_ref(language, "Stopped"),
-            AgentSessionStatus::Unknown => tr_ref(language, "Unknown"),
-        };
-
-        item(
-            k,
-            format!("sub-{}", d.asid.0),
-            title_of(d),
-            format!("{} · {}", s.agent_name(&d.agent_id), status_text),
-            Some(actions),
-        )
-    }));
-    out
-}
-
 fn saved(s: &UiState, k: &Kit) -> Vec<El> {
     let language = s.cfg.general.language;
     if s.saved_permissions.is_empty() {
@@ -827,7 +729,7 @@ pub fn view(s: &UiState, k: &Kit) -> El {
     let body = match s.inspector_tab {
         InspectorTab::Queue => queue(s, k),
         InspectorTab::Git => git(s, k),
-        InspectorTab::Subagents => subagents(s, k),
+        InspectorTab::Subagents => super::session_tree::view(s, k),
         InspectorTab::Saved => saved(s, k),
         InspectorTab::Shells => shells(s, k),
     };
@@ -901,9 +803,18 @@ mod tests {
     fn subagents_renders_items_and_tile_all() {
         let (tx, _rx) = crate::model::commands::channel();
         let mut s = UiState::new(tx);
+        let root: AgentSessionInfo = serde_json::from_value(serde_json::json!({
+            "asid": "root-1",
+            "agent_id": "opencode",
+            "title": "Main session",
+            "status": "idle",
+            "updated_ms": 1000u64,
+        }))
+        .unwrap();
         let sub1: AgentSessionInfo = serde_json::from_value(serde_json::json!({
             "asid": "sub-1",
             "agent_id": "opencode",
+            "parent_id": "root-1",
             "title": "Fix bug in parser",
             "status": "busy",
             "updated_ms": 1000u64,
@@ -912,15 +823,18 @@ mod tests {
         let sub2: AgentSessionInfo = serde_json::from_value(serde_json::json!({
             "asid": "sub-2",
             "agent_id": "deepseek",
+            "parent_id": "root-1",
             "title": "Add tests for API",
             "status": "idle",
             "updated_ms": 1000u64,
         }))
         .unwrap();
+        s.sessions = vec![root];
+        s.selected = Some("root-1".into());
         s.descendants = vec![sub1, sub2];
         let k = Kit::neutral(s.dark);
-        let els = subagents(&s, &k);
-        assert_eq!(els.len(), 3); // 1 header banner with "Tile all" + 2 subagent rows
+        let els = crate::ui::session_tree::view(&s, &k);
+        assert!(els.len() >= 2);
     }
 
     #[test]

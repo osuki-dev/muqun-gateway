@@ -1,9 +1,6 @@
 //! Hierarchical session tree (App `agent-session-tree-sheet.tsx` parity):
 //! renders the full Root → Parent → Siblings → Children / Forks hierarchy for
 //! the active session, even when viewing a nested child session.
-//!
-//! Wired into the inspector / drawer surface by the window-system integration.
-#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 

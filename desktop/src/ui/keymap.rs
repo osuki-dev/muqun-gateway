@@ -1364,7 +1364,10 @@ pub fn intercept_global_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool
     }
     if ev.key == rune::Key::Escape
         && !(ev.mods.shift || ev.mods.alt || ev.mods.ctrl || ev.mods.cmd || ev.mods.logo)
-        && s.inline_inspector_open()
+        && s.mode == Mode::Session
+        && s.in_split()
+        && s.right_open
+        && s.active_plugin_drawer.as_deref() == Some("inspector")
         && s.menu.is_none()
         && s.row_menu.is_none()
         && s.context_open.is_none()
@@ -2288,7 +2291,8 @@ mod tests {
         let mut rt = Runtime::new(s, super::super::view, (1440.0, 900.0), Env::new(true, 1.0));
         rt.on_key = Some(super::super::on_key);
         rt.frame(0.0);
-        assert!(rt.state.inline_inspector_open());
+        assert!(rt.state.right_open);
+        assert_eq!(rt.state.active_plugin_drawer.as_deref(), Some("inspector"));
         rt.key(Key::Escape.into());
         rt.frame(1.0 / 60.0);
         assert!(!rt.state.right_open);

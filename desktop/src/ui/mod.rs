@@ -2464,15 +2464,6 @@ impl UiState {
         }
     }
 
-    pub fn inline_inspector_open(&self) -> bool {
-        self.mode == Mode::Session
-            && self.in_split()
-            && self.tiles.get(self.focus).is_some_and(Tile::is_session)
-            && self.right_open
-            && !self.term.open
-            && self.active_plugin_drawer.is_none()
-    }
-
     pub fn close_inspector(&mut self) {
         self.close_plugin_drawer();
     }
