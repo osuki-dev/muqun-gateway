@@ -845,6 +845,7 @@ fn queued_chip(
         super::timeline::clip(&item.text, 32)
     );
     let mut menu = Menu::new(format!("queued-{id}"))
+        .placement(rune_kit::Placement::TopStart)
         .trigger(
             Button::new(label.clone())
                 .label_with(move |font, ink| {
@@ -878,7 +879,7 @@ fn queued_chip(
         MenuItem::new(if item.steer {
             tr_ref(language, "Keep queued")
         } else {
-            tr_ref(language, "Send next")
+            tr_ref(language, "Send now")
         })
         .on_select(move |s: &mut UiState| toggle_queued_steer(s, &steer_id, next_steer)),
     );
@@ -913,6 +914,22 @@ fn queued_chip(
         content = content.child(thumbs);
     }
     let mut chip_row = chip_row.child(content.child(pill.grow(1.0).min_w(0.0)));
+    if !item.steer {
+        let send_id = id.clone();
+        chip_row = chip_row.child(
+            rune_kit::IconButton::new(&SEND)
+                .label(tr_ref(language, "Send now"))
+                .help(tr_ref(language, "Send now"))
+                .variant(rune_kit::IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Large)
+                .on_press(move |s: &mut UiState| toggle_queued_steer(s, &send_id, true))
+                .build(k)
+                .key(format!("queued-send-{id}"))
+                .radius(k.radius.xl)
+                .fill(k.c.bg_accent.alpha(0.12))
+                .border(1.0, k.c.border_active.alpha(0.45)),
+        );
+    }
     {
         let (edit_id, text) = (id.clone(), item.text.clone());
         chip_row = chip_row.child(
@@ -1063,6 +1080,7 @@ pub(super) fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
             );
         } else {
             let depth = (queue.len() - 1).min(2);
+            let trailing_w = if queue[page].steer { 88.0 } else { 132.0 };
             let mut stack = el().w_full().pb(depth as f32 * 4.0);
             for n in (1..=depth).rev() {
                 stack = stack.child(
@@ -1070,7 +1088,7 @@ pub(super) fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
                         .pin(
                             Some(n as f32 * 6.0),
                             Some(n as f32 * 4.0),
-                            Some(88.0 + n as f32 * 6.0),
+                            Some(trailing_w + n as f32 * 6.0),
                             Some((depth - n) as f32 * 4.0),
                         )
                         .radius(k.radius.xl)
@@ -2434,7 +2452,7 @@ pub(super) fn session_footer(
     let own_line = asid
         .and_then(|id| controls_row::Controls::for_session(s, id, catalog))
         .map(|c| {
-            controls_row::own_line(s, &c, k, layer, room)
+            controls_row::own_line(s, &c, catalog, k, layer, room)
                 .key("composer-controls")
                 .w_full()
         });
@@ -2885,6 +2903,60 @@ mod tests {
             image: false,
         });
         assert!(chips(&s, &k, &mut layer).is_some());
+    }
+
+    #[test]
+    fn clicking_queued_send_button_steers_item_immediately() {
+        use crate::model::compose::InboxItem;
+        use crate::ui::Mode;
+        use rune::{Cx, Env, Runtime};
+
+        fn view(s: &UiState, _: &mut Cx<UiState>) -> El {
+            let k = Kit::neutral(true);
+            let mut layer = Vec::new();
+            let body = chips(s, &k, &mut layer).unwrap_or_else(el);
+            rune_kit::root(el().w_full().h_full().center().child(body), layer)
+        }
+
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.mode = Mode::Session;
+        s.selected = Some("session-1".into());
+        s.queue.push(InboxItem {
+            id: "q-42".into(),
+            text: "Follow up right now".into(),
+            steer: false,
+            files: Vec::new(),
+        });
+
+        let mut rt = Runtime::new(s, view, (800.0, 400.0), Env::new(true, 1.0));
+        for i in 0..10 {
+            rt.frame(i as f64 / 60.0);
+        }
+        let (x, y) = rt
+            .find("queued-send-q-42")
+            .expect("queued send-now button must be rendered");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.3);
+
+        assert!(
+            rt.state.queue[0].steer,
+            "clicking queued send-now should mark item as steer"
+        );
+        let mut steered = false;
+        while let Ok(cmd) = rx.try_recv() {
+            if let Command::Compose(ComposeCommand::InboxDelivery { asid, item, steer }) = cmd {
+                assert_eq!(asid.0, "session-1");
+                assert_eq!(item, "q-42");
+                assert!(steer);
+                steered = true;
+            }
+        }
+        assert!(
+            steered,
+            "expected ComposeCommand::InboxDelivery(steer=true)"
+        );
     }
 
     #[test]

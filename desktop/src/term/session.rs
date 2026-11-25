@@ -200,7 +200,6 @@ impl Session {
                 }
             }
             let _ = stream.set_read_timeout(None);
-            let _ = client.resize_session(&id, size.cols, size.rows);
         }
         let mut reader_stream = stream.try_clone()?;
         let mut writer_stream = stream;
@@ -262,6 +261,10 @@ impl Session {
                         }
                     };
                     if !initial_scrollback.is_empty() {
+                        if initial_scrollback.len() >= 1024 * 1024 {
+                            // Ring buffer wrapped and may begin mid-sequence; reset SGR first.
+                            engine.feed(b"\x1b[0m");
+                        }
                         engine.feed(&initial_scrollback);
                         // Discard historical terminal query replies (DECRQM, DA1, DSR, Kitty)
                         // so reattaching never injects escape sequences into the live PTY stdin.
@@ -271,6 +274,10 @@ impl Session {
                             wake();
                         }
                     }
+                    // On reattach, force one SIGWINCH redraw on the first viewport resize
+                    // even when dimensions are unchanged, so full-screen TUIs (nvim, htop)
+                    // repaint a clean frame over any truncated scrollback replay.
+                    let mut needs_reattach_redraw = is_reattach;
                     let mut last = Instant::now() - FRAME_GAP;
                     let mut pending = false;
                     let mut how: Option<Ended> = None;
@@ -334,7 +341,16 @@ impl Session {
                                 }
                                 Msg::Resize(s) => {
                                     if engine.size() != s {
+                                        needs_reattach_redraw = false;
                                         log(engine.resize(s));
+                                        let _ =
+                                            client_clone.resize_session(&id_clone, s.cols, s.rows);
+                                    } else if needs_reattach_redraw {
+                                        needs_reattach_redraw = false;
+                                        let nudge =
+                                            if s.cols > 2 { s.cols - 1 } else { s.cols + 1 };
+                                        let _ =
+                                            client_clone.resize_session(&id_clone, nudge, s.rows);
                                         let _ =
                                             client_clone.resize_session(&id_clone, s.cols, s.rows);
                                     }

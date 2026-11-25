@@ -1424,7 +1424,7 @@ impl UiState {
                 let alive: Vec<_> = sessions.into_iter().filter(|s| s.alive).collect();
                 if !alive.is_empty() {
                     let waker = self.term.waker.clone().unwrap();
-                    let size = self.term.size.unwrap_or(Size {
+                    let fallback_size = self.term.size.unwrap_or(Size {
                         cols: 80,
                         rows: 24,
                         cell_w: 8,
@@ -1441,6 +1441,15 @@ impl UiState {
                         )
                     });
                     for s_info in alive {
+                        // Replay daemon scrollback at the session's recorded dimensions
+                        // (not a hardcoded 80x24 fallback) so wide TUI statuslines do not
+                        // wrap into garbage before the viewport's real Resize arrives.
+                        let size = Size {
+                            cols: s_info.cols.max(2),
+                            rows: s_info.rows.max(2),
+                            cell_w: fallback_size.cell_w,
+                            cell_h: fallback_size.cell_h,
+                        };
                         if let Ok(session) = Session::start_with_id(
                             Some(s_info.id),
                             s_info.cwd.clone(),

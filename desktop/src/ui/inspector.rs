@@ -218,7 +218,7 @@ fn queue(s: &UiState, k: &Kit) -> Vec<El> {
                 if steer {
                     t("Keep queued")
                 } else {
-                    t("Send next")
+                    t("Send now")
                 },
                 ButtonVariant::Ghost,
                 format!("dl-{id}"),

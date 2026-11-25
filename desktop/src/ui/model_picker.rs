@@ -14,8 +14,8 @@
 use std::collections::{HashMap, HashSet};
 
 use muqun_gateway::agents::{order_efforts, ModelInfo, ModelRef, ProviderInfo};
-use rune::{col, el, icon, row, text, Align, El, ScrollSpec, Side, TextEdit, Transition, Tx};
-use rune_kit::{Kit, SegmentedControl, TextInput};
+use rune::{col, el, icon, row, text, Align, El, ScrollSpec, Side, TextEdit, Transition};
+use rune_kit::{Kit, TextInput};
 
 use super::copy::tr_ref;
 use super::{OpenMenu, Slot, UiState};
@@ -305,7 +305,7 @@ fn free_chip(k: &Kit, label: &str) -> El {
     row()
         .px(7.0)
         .py(2.0)
-        .radius(k.radius.sm)
+        .radius(k.radius.lg)
         .fill(k.c.success.icon.alpha(0.14))
         .center_y()
         .child(
@@ -313,6 +313,69 @@ fn free_chip(k: &Kit, label: &str) -> El {
                 .font(k.ty.small_medium)
                 .color(k.c.success.fg),
         )
+}
+
+fn free_filter_bar(k: &Kit, lang: Language, filter_free: bool) -> El {
+    let segment = |key: &str, label: &str, active: bool, next_free: bool| {
+        let mut btn = row()
+            .key(key.to_owned())
+            .grow(1.0)
+            .min_w(0.0)
+            .h(28.0)
+            .px(10.0)
+            .radius(k.radius.md)
+            .center()
+            .focusable(true)
+            .role("radio")
+            .checked(active)
+            .label(label.to_owned())
+            .child(
+                text(label.to_owned())
+                    .font(if active {
+                        k.ty.small_medium
+                    } else {
+                        k.ty.small
+                    })
+                    .color(if active {
+                        k.c.text_strong
+                    } else {
+                        k.c.text_muted
+                    })
+                    .truncate(),
+            );
+        if active {
+            btn = btn
+                .fill(k.c.surface_raised_base)
+                .border(1.0, k.c.border_base.alpha(0.6));
+        }
+        k.interactive(btn).on_press(move |s: &mut UiState| {
+            s.model_picker.filter_free = next_free;
+        })
+    };
+
+    row()
+        .key("model-free-filter")
+        .role("radiogroup")
+        .label(tr_ref(lang, "Filter models"))
+        .w_full()
+        .padding(3.0)
+        .gap(3.0)
+        .radius(k.radius.lg)
+        .fill(k.c.layer_01)
+        .border(1.0, k.c.border_weak.alpha(0.6))
+        .center_y()
+        .child(segment(
+            "model-filter-all",
+            tr_ref(lang, "All models"),
+            !filter_free,
+            false,
+        ))
+        .child(segment(
+            "model-filter-free",
+            tr_ref(lang, "Free only"),
+            filter_free,
+            true,
+        ))
 }
 
 fn variant_chip(
@@ -380,7 +443,7 @@ fn provider_rail_item(k: &Kit, section: &ProviderSection<'_>, selected: bool) ->
         .key(format!("model-provider-{}", section.provider_id))
         .w_full()
         .min_h(36.0)
-        .radius(k.radius.sm)
+        .radius(k.radius.md)
         .fill(bg)
         .center_y()
         .focusable(true)
@@ -390,7 +453,7 @@ fn provider_rail_item(k: &Kit, section: &ProviderSection<'_>, selected: bool) ->
         .child(
             el().w(2.5)
                 .h(20.0)
-                .radius(2.0)
+                .radius(k.radius.xs)
                 .fill(bar_color)
                 .a11y_hidden(),
         )
@@ -751,6 +814,7 @@ pub(super) fn popup(
         );
     }
 
+    let look = s.look();
     let mut body = col()
         .key(format!("{key}-panel"))
         .role("dialog")
@@ -758,9 +822,9 @@ pub(super) fn popup(
         .w(panel_w)
         .padding(PANEL_PAD)
         .radius(k.radius.lg)
-        .fill(k.c.surface_raised_base)
+        .clip_rounded(k.radius.lg)
+        .fill(look.panel_fill(k))
         .border(1.0, k.c.border_strong)
-        .clip_soft(0.0)
         .min_h(0.0)
         .shrink()
         .gap(8.0)
@@ -801,17 +865,7 @@ pub(super) fn popup(
 
     // All models / Free only segmented control (only when free models exist)
     if show_filter {
-        let filter_labels = [tr_ref(lang, "All models"), tr_ref(lang, "Free only")];
-        body = body.child(
-            SegmentedControl::new(&filter_labels, Some(usize::from(filter_free)))
-                .label(tr_ref(lang, "Filter models"))
-                .on_pick(|s: &mut UiState, idx, _: &mut Tx| {
-                    s.model_picker.filter_free = idx == 1;
-                })
-                .build(k)
-                .key("model-free-filter")
-                .w_full(),
-        );
+        body = body.child(free_filter_bar(k, lang, filter_free));
     }
 
     // Right column: models list for active section(s)
@@ -911,19 +965,6 @@ pub(super) fn popup(
         filter_free,
         terms
     );
-    let right_pane = col()
-        .key(list_scroll_key)
-        .grow(1.0)
-        .min_w(0.0)
-        .max_h(LIST_MAX_H)
-        .min_h(0.0)
-        .shrink()
-        .clip_soft(0.0)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .child(model_list);
-
     let content = if show_provider_rail && !provider_sections.is_empty() {
         let mut rail_list = col().w_full().gap(2.0).role("tablist");
         for section in &provider_sections {
@@ -941,6 +982,18 @@ pub(super) fn popup(
                 stick_bottom: false,
             })
             .child(rail_list);
+        let right_pane = col()
+            .key(list_scroll_key)
+            .grow(1.0)
+            .min_w(0.0)
+            .max_h(LIST_MAX_H)
+            .min_h(0.0)
+            .shrink()
+            .clip_soft(0.0)
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .child(model_list);
         let divider = el()
             .w(1.0)
             .h_full()
@@ -955,7 +1008,20 @@ pub(super) fn popup(
             .child(divider)
             .child(right_pane)
     } else {
-        right_pane
+        // Single-column mode sits directly in `body` (`col`): do NOT set `.grow(1.0)`
+        // because in a vertical column without fixed height, `.grow(1.0)` + `.min_h(0.0)`
+        // + `.scroll(...)` collapses the viewport to 0 px.
+        col()
+            .key(list_scroll_key)
+            .w_full()
+            .max_h(LIST_MAX_H)
+            .min_h(0.0)
+            .shrink()
+            .clip_soft(0.0)
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .child(model_list)
     };
 
     let mut panel = body.child(content);
@@ -1240,6 +1306,12 @@ mod tests {
             filter_rect[0] + filter_rect[2] <= panel_rect[0] + panel_rect[2] + 0.5,
             "free filter overflows panel: filter={filter_rect:?} panel={panel_rect:?}"
         );
+        let (all_rect, _) = rt.presented("model-filter-all").expect("all segment");
+        let (free_rect, _) = rt.presented("model-filter-free").expect("free segment");
+        assert!(
+            (all_rect[2] - free_rect[2]).abs() < 2.0 && all_rect[2] > 180.0,
+            "filter segments must split 50/50 cleanly: all={all_rect:?} free={free_rect:?}"
+        );
         let (search_rect, _) = rt.presented("model-filter").expect("search input");
         assert!(
             search_rect[0] + search_rect[2] <= panel_rect[0] + panel_rect[2] + 0.5,
@@ -1256,5 +1328,103 @@ mod tests {
         assert!(rt
             .find("start-model-home-option-opencode-beam-free")
             .is_some());
+    }
+
+    #[test]
+    fn single_provider_picker_renders_visible_rows_without_collapsing() {
+        let catalog = std::sync::Arc::new(CatalogView {
+            catalog: AgentCatalog {
+                models: vec![
+                    sample_model(
+                        "openai",
+                        "gpt-6-astra",
+                        "GPT-6-Astra",
+                        Some(400_000),
+                        &["low", "medium", "high"],
+                        None,
+                    ),
+                    sample_model(
+                        "openai",
+                        "gpt-6-mini",
+                        "GPT-6-Mini",
+                        Some(200_000),
+                        &[],
+                        None,
+                    ),
+                ],
+                providers: vec![ProviderInfo {
+                    id: "openai".into(),
+                    name: "OpenAI".into(),
+                    activation: Some("enabled".into()),
+                    available: true,
+                    models: Vec::new(),
+                }],
+                defaults: CatalogDefaults {
+                    model: Some(ModelRef {
+                        provider_id: "openai".into(),
+                        model_id: "gpt-6-astra".into(),
+                        variant: Some("medium".into()),
+                    }),
+                    mode: None,
+                },
+                ..Default::default()
+            },
+        });
+
+        fn view(s: &UiState, _: &mut Cx<UiState>) -> El {
+            let k = Kit::neutral(true);
+            let mut layer = Vec::new();
+            let trigger = super::super::composer::model_menu(
+                s,
+                &k,
+                &mut layer,
+                OpenMenu::StartModel,
+                "home",
+                Slot::Start,
+                "codex",
+                s.menu == Some(OpenMenu::StartModel),
+                "GPT-6-Astra".into(),
+                s.start_catalog.as_deref(),
+                &[],
+                s.start_model.as_ref(),
+                |s, p, id| {
+                    s.start_model = Some(super::super::composer::choose_model(
+                        s.start_catalog.as_deref(),
+                        s.start_model.as_ref(),
+                        p,
+                        id,
+                    ));
+                    close(s);
+                },
+            );
+            rune_kit::root(el().w_full().h_full().center().child(trigger), layer)
+        }
+
+        let (commands, _) = crate::model::commands::channel();
+        let mut s = UiState::new(commands);
+        s.start_catalog = Some(catalog);
+        s.toggle_composer_menu(OpenMenu::StartModel);
+        let mut rt = Runtime::new(s, view, (900.0, 700.0), Env::new(true, 1.0));
+        for i in 0..10 {
+            rt.frame(i as f64 / 60.0);
+        }
+
+        assert!(rt.find("model-provider-rail").is_none());
+        let (panel_rect, _) = rt
+            .presented("start-model-home-panel")
+            .expect("single-col panel");
+        assert!((panel_rect[2] - PANEL_W_ONE_COL).abs() < 1.0);
+        let (row1_rect, _) = rt
+            .presented("start-model-home-option-openai-gpt-6-astra")
+            .expect("first model row must be visible");
+        let (row2_rect, _) = rt
+            .presented("start-model-home-option-openai-gpt-6-mini")
+            .expect("second model row must be visible");
+        assert!(row1_rect[3] > 20.0, "row1 collapsed: {row1_rect:?}");
+        assert!(row2_rect[3] > 20.0, "row2 collapsed: {row2_rect:?}");
+        assert!(
+            panel_rect[3] > 160.0,
+            "single-col panel collapsed vertically: {panel_rect:?}"
+        );
     }
 }

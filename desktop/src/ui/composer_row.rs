@@ -569,7 +569,15 @@ fn reload_model(k: &Kit, c: &Controls, name: &str) -> El {
         .radius(k.radius.lg)
 }
 
-fn model_chips(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold, line: El) -> El {
+fn model_chips(
+    s: &UiState,
+    c: &Controls,
+    catalog: Option<&crate::hub::CatalogView>,
+    k: &Kit,
+    layer: &mut Vec<El>,
+    f: Fold,
+    line: El,
+) -> El {
     let Some(m) = &c.model else { return line };
     let open = s.menu == Some(OpenMenu::Model);
     if f.model == ModelLook::Split {
@@ -587,7 +595,7 @@ fn model_chips(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold,
                 &c.agent_id,
                 open,
                 m.name.clone(),
-                s.catalog.as_deref(),
+                catalog,
                 &m.models,
                 m.current.as_ref(),
                 switch_model,
@@ -635,7 +643,7 @@ fn model_chips(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold,
         open,
         super::Slot::Session,
         &c.agent_id,
-        s.catalog.as_deref(),
+        catalog,
         &m.models,
         m.current.as_ref(),
         switch_model,
@@ -917,12 +925,19 @@ fn more_menu(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -
     menu.build(k, layer)
 }
 
-fn build(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -> El {
+fn build(
+    s: &UiState,
+    c: &Controls,
+    catalog: Option<&crate::hub::CatalogView>,
+    k: &Kit,
+    layer: &mut Vec<El>,
+    f: Fold,
+) -> El {
     let mut line = row().key("pills").gap(ROW_GAP).center_y();
     if !f.more_agent {
         line = line.child(agent_chip(c, k, f));
     }
-    line = model_chips(s, c, k, layer, f, line);
+    line = model_chips(s, c, catalog, k, layer, f, line);
     if !f.more_branch {
         if let Some(b) = branch_control(s, c, k, layer, f) {
             line = line.child(b);
@@ -940,9 +955,16 @@ fn build(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -> El
 }
 
 /// The row on a line of its own, `room` points wide.
-pub fn own_line(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, room: f32) -> El {
+pub fn own_line(
+    s: &UiState,
+    c: &Controls,
+    catalog: Option<&crate::hub::CatalogView>,
+    k: &Kit,
+    layer: &mut Vec<El>,
+    room: f32,
+) -> El {
     let f = c.fit(k, room).unwrap_or_else(|| fold_at(FOLDS.len()));
-    build(s, c, k, layer, f)
+    build(s, c, catalog, k, layer, f)
 }
 
 #[cfg(test)]
