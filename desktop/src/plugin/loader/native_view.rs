@@ -997,28 +997,91 @@ impl ExternalPlugin {
         ctx: &PluginViewContext<'_>,
         layer: &mut Vec<El>,
     ) -> El {
-        let views = self.native_views.lock().unwrap();
-        let open = Node::Button {
-            label: tr_ref(ctx.s.cfg.general.language, "Open").into(),
-            action: "open".into(),
-            presentation: ButtonPresentation::default(),
-        };
-        let mut body = col().w_full().px(16.0).py(12.0).gap(8.0);
-        if self
+        let k = ctx.k;
+        let lang = ctx.s.cfg.general.language;
+        let is_loading = self
             .jobs
             .lock()
             .unwrap()
-            .contains_key(&Some(ctx.tile_id.to_owned()))
-        {
-            body = body.child(
-                text(tr_ref(ctx.s.cfg.general.language, "Loading…")).color(ctx.k.c.text_muted),
-            );
-        }
+            .contains_key(&Some(ctx.tile_id.to_owned()));
+        let view_error = self.view_errors.lock().unwrap().get(ctx.tile_id).cloned();
+        let views = self.native_views.lock().unwrap();
         let doc = views.get(ctx.tile_id);
-        let node = doc.map_or(&open, |document| &document.root);
-        body = body.child(node.render_child(ctx, self.id, false, layer));
         let scope = format!("native-view-{}-{}", self.id, ctx.tile_id);
-        let pane = if node.fills_height() {
+        let mut body = col().w_full().px(16.0).py(12.0).gap(8.0);
+        if is_loading {
+            body = body.child(text(tr_ref(lang, "Loading…")).color(k.c.text_muted));
+        }
+        let fills_height = if let Some(document) = doc {
+            body = body.child(document.root.render_child(ctx, self.id, false, layer));
+            document.root.fills_height()
+        } else if is_loading {
+            false
+        } else if let Some(error) = view_error {
+            let id = self.id;
+            let instance = ctx.tile_id.to_owned();
+            let error_card = ctx
+                .look
+                .row_card(
+                    k,
+                    col()
+                        .w_full()
+                        .px(14.0)
+                        .py(14.0)
+                        .gap(10.0)
+                        .child(
+                            row()
+                                .w_full()
+                                .gap(8.0)
+                                .center_y()
+                                .child(icon(&icons::INFORMATION, 14.0).color(k.c.danger.icon))
+                                .child(
+                                    text(&self.manifest.name)
+                                        .font(k.ty.ui_medium)
+                                        .color(k.c.text_base),
+                                ),
+                        )
+                        .child(
+                            text(error)
+                                .selectable(true)
+                                .font(k.ty.small)
+                                .color(k.c.text_muted)
+                                .wrap(),
+                        )
+                        .child(
+                            row().w_full().gap(8.0).center_y().child(
+                                Button::new(tr_ref(lang, "Retry"))
+                                    .variant(ButtonVariant::Outline)
+                                    .control_size(ControlSize::Small)
+                                    .on_press(move |s: &mut UiState| {
+                                        if let Some(plugin) =
+                                            s.plugins.get_enabled(id, &s.cfg.plugins_disabled)
+                                        {
+                                            plugin.on_view_action(s, &instance, "open");
+                                        }
+                                    })
+                                    .build(k)
+                                    .key(format!(
+                                        "plugin-native-retry-{}-{}",
+                                        self.id, ctx.tile_id
+                                    )),
+                            ),
+                        ),
+                    k.radius.md,
+                )
+                .key(format!("plugin-native-error-{}-{}", self.id, ctx.tile_id));
+            body = body.child(error_card);
+            false
+        } else {
+            let open = Node::Button {
+                label: tr_ref(lang, "Open").into(),
+                action: "open".into(),
+                presentation: ButtonPresentation::default(),
+            };
+            body = body.child(open.render_child(ctx, self.id, false, layer));
+            false
+        };
+        let pane = if fills_height {
             body.grow(1.0).min_h(0.0)
         } else {
             col()
@@ -1029,7 +1092,7 @@ impl ExternalPlugin {
                 .scroll(rune::ScrollSpec {
                     stick_bottom: false,
                 })
-                .scroll_bar(ctx.k)
+                .scroll_bar(k)
         }
         .key(&scope);
         match doc {
@@ -1354,7 +1417,7 @@ mod tests {
                 col()
                     .w_full()
                     .h_full()
-                    .child(col().h(28.0).clip_rounded(2.0).child(trigger)),
+                    .child(col().h(28.0).clip_rounded(k.radius.sm).child(trigger)),
                 layer,
             )
         }

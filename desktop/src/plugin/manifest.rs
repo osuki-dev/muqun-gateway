@@ -370,7 +370,7 @@ impl PluginManifest {
                 matches!(
                     capability.as_str(),
                     "native-view" | "forms" | "terminal-entry"
-                ) || (cfg!(target_os = "linux") && capability == "webview-entry"),
+                ) || (std::env::consts::OS == "linux" && capability == "webview-entry"),
                 "This plugin requires a newer Desktop capability: {capability}"
             );
         }

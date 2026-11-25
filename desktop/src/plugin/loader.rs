@@ -12,19 +12,19 @@ mod panel;
 mod web_surface;
 pub(crate) use crate::platform::plugin_webview::webview_helper;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc, Arc, Mutex, OnceLock,
 };
 use std::time::{Duration, Instant};
 
 use muqun_gateway::platform::runtimes::{self, RuntimeKind};
 use rune::{col, el, icon, row, text, El, Icon};
-use rune_kit::{Button, ButtonVariant, ControlSize, Markdown};
+use rune_kit::{Button, ButtonVariant, ControlSize, Markdown, ScrollBar};
 
 use crate::config::Language;
 use crate::diagnostics::{Attempt, EventKind, Outcome};
@@ -81,6 +81,7 @@ struct ScriptJob {
     receiver: mpsc::Receiver<Result<ScriptOutput, ScriptFailure>>,
     cancel: Arc<AtomicBool>,
     title: String,
+    silent_on_success: bool,
     attempt: Attempt,
 }
 
@@ -89,6 +90,25 @@ impl ScriptJob {
         self.cancel.store(true, Ordering::Release);
         self.attempt.finish(Outcome::Cancelled);
     }
+}
+
+fn interner() -> &'static Mutex<HashSet<&'static str>> {
+    static INTERNER: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    INTERNER.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Deduplicating static string interner for external plugin IDs, command IDs, and shortcuts.
+/// Repeated package reloads reuse the same `'static` allocation instead of leaking memory.
+fn intern_str(value: &str) -> &'static str {
+    let mut set = interner()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(&existing) = set.get(value) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(value.to_owned().into_boxed_str());
+    set.insert(leaked);
+    leaked
 }
 
 /// An external file-based plugin loaded from a manifest.
@@ -101,6 +121,8 @@ pub struct ExternalPlugin {
     dynamic_markdown: Mutex<Option<String>>,
     panels: Mutex<HashMap<String, panel::Panel>>,
     native_views: Mutex<HashMap<String, native_selection::Document>>,
+    view_errors: Mutex<HashMap<String, String>>,
+    tui_launched: Mutex<HashSet<String>>,
     jobs: Mutex<HashMap<Option<String>, ScriptJob>>,
     notifications: Mutex<notifications::Poll>,
     web_surfaces: Mutex<HashMap<String, super::webview_preview::Surface>>,
@@ -127,16 +149,13 @@ impl ExternalPlugin {
         } else {
             std::env::current_dir().unwrap_or_default().join(dir)
         };
-        let id: &'static str = Box::leak(manifest.id.clone().into_boxed_str());
+        let id: &'static str = intern_str(&manifest.id);
         let commands = manifest
             .commands
             .iter()
             .map(|c| {
-                let cid: &'static str = Box::leak(c.id.clone().into_boxed_str());
-                let shortcut: Option<&'static str> = c
-                    .shortcut
-                    .as_ref()
-                    .map(|s| &*Box::leak(s.clone().into_boxed_str()));
+                let cid: &'static str = intern_str(&c.id);
+                let shortcut: Option<&'static str> = c.shortcut.as_deref().map(intern_str);
                 PluginCommand {
                     id: cid,
                     title: c.title.clone(),
@@ -149,6 +168,9 @@ impl ExternalPlugin {
             .icon
             .as_deref()
             .and_then(|path| load_image_icon(&dir, path));
+        let notifications = Mutex::new(notifications::Poll::new(
+            manifest.notification_entry.is_some(),
+        ));
         Self {
             id,
             manifest,
@@ -157,9 +179,11 @@ impl ExternalPlugin {
             image_icon,
             dynamic_markdown: Mutex::new(None),
             native_views: Mutex::default(),
+            view_errors: Mutex::default(),
+            tui_launched: Mutex::default(),
             panels: Mutex::default(),
             jobs: Mutex::default(),
-            notifications: Mutex::default(),
+            notifications,
             web_surfaces: Mutex::default(),
             bun_binary_override: Mutex::new(None),
         }
@@ -276,8 +300,32 @@ impl ExternalPlugin {
         command_id: &str,
         command_title: &str,
         script_path: &Path,
+        silent_on_success: bool,
     ) -> bool {
-        self.start_script(s, command_id, command_title, script_path, None)
+        self.start_script(
+            s,
+            command_id,
+            command_title,
+            script_path,
+            None,
+            silent_on_success,
+        )
+    }
+
+    fn launch_terminal_tui(&self, s: &mut UiState, command: &[String], cwd: Option<&str>) {
+        let dir = cwd
+            .map(|c| {
+                let p = Path::new(c);
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    self.dir.join(p)
+                }
+            })
+            .unwrap_or_else(|| s.terminal_cwd());
+        let cmd_str = command.join(" ");
+        let run_cmd = (!cmd_str.is_empty()).then(|| format!("{cmd_str}\n"));
+        s.term_new_tab_in(dir, run_cmd);
     }
 
     fn start_script(
@@ -287,11 +335,15 @@ impl ExternalPlugin {
         command_title: &str,
         script_path: &Path,
         view: Option<(&str, &str)>,
+        silent_on_success: bool,
     ) -> bool {
         let instance = view.map(|(id, _)| id.to_owned());
         let mut jobs = self.jobs.lock().unwrap();
         if jobs.contains_key(&instance) {
             return true;
+        }
+        if let Some(inst) = &instance {
+            self.view_errors.lock().unwrap().remove(inst);
         }
         let kind = match view {
             Some((_, "open")) => EventKind::PluginOpen,
@@ -393,6 +445,7 @@ impl ExternalPlugin {
                 receiver: rx,
                 cancel: cancel.clone(),
                 title: command_title.into(),
+                silent_on_success,
                 attempt,
             },
         );
@@ -408,7 +461,13 @@ impl ExternalPlugin {
         true
     }
 
-    fn apply_script_output(&self, s: &mut UiState, command_title: &str, stdout_str: String) {
+    fn apply_script_output(
+        &self,
+        s: &mut UiState,
+        command_title: &str,
+        stdout_str: String,
+        silent_on_success: bool,
+    ) {
         // Parse structured JSON response from full stdout or the last JSON line.
         let parsed_json = serde_json::from_str::<BunScriptResponse>(&stdout_str).or_else(|_| {
             stdout_str
@@ -447,7 +506,7 @@ impl ExternalPlugin {
                     _ => ToastLevel::Info,
                 };
                 s.notify(level, toast.title, toast.detail);
-            } else {
+            } else if !silent_on_success {
                 s.notify(
                     ToastLevel::Success,
                     format!("{}: {}", self.manifest.name, command_title),
@@ -456,12 +515,14 @@ impl ExternalPlugin {
             }
         } else if !stdout_str.is_empty() {
             *self.dynamic_markdown.lock().unwrap() = Some(stdout_str.clone());
-            s.notify(
-                ToastLevel::Success,
-                format!("{}: {}", self.manifest.name, command_title),
-                Some(stdout_str),
-            );
-        } else {
+            if !silent_on_success {
+                s.notify(
+                    ToastLevel::Success,
+                    format!("{}: {}", self.manifest.name, command_title),
+                    Some(stdout_str),
+                );
+            }
+        } else if !silent_on_success {
             s.notify(
                 ToastLevel::Success,
                 format!("{}: {}", self.manifest.name, command_title),
@@ -587,18 +648,201 @@ impl DesktopPlugin for ExternalPlugin {
         {
             return Some(self.render_native_view(ctx, layer));
         }
+
+        if let PluginRenderKind::WebView { entry } = &render_kind {
+            let entry_str = entry.as_str();
+            let title = self
+                .manifest
+                .tile
+                .as_ref()
+                .map(|t| t.title.as_str())
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or(self.manifest.name.as_str());
+            let is_local = web_surface::local_panel_url(entry_str);
+            let can_embed = is_local && webview_helper().is_some();
+            let view_error = self.view_errors.lock().unwrap().get(tile_id).cloned();
+
+            let mut card_body = col()
+                .w_full()
+                .px(14.0)
+                .py(14.0)
+                .gap(10.0)
+                .child(
+                    row()
+                        .w_full()
+                        .gap(8.0)
+                        .center_y()
+                        .child(icon(&icons::OPEN_EXTERNAL, 13.0).color(k.c.text_accent))
+                        .child(
+                            text(title)
+                                .font(k.ty.ui_medium)
+                                .color(k.c.text_base)
+                                .grow(1.0)
+                                .shrink()
+                                .min_w(0.0)
+                                .truncate(),
+                        ),
+                )
+                .child(
+                    text(entry_str)
+                        .selectable(true)
+                        .font(k.ty.mono)
+                        .color(k.c.text_muted)
+                        .wrap(),
+                );
+
+            if let Some(error) = view_error {
+                card_body = card_body.child(
+                    text(error)
+                        .selectable(true)
+                        .font(k.ty.small)
+                        .color(k.c.danger.fg)
+                        .wrap(),
+                );
+            }
+
+            let mut actions = row().w_full().wrap().gap(8.0).center_y();
+            if can_embed {
+                let pid_retry = pid.clone();
+                let inst_retry = tile_id.to_owned();
+                actions = actions.child(
+                    Button::new(tr_ref(lang, "Retry"))
+                        .variant(ButtonVariant::Outline)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut UiState| {
+                            if let Some(p) =
+                                s.plugins.get_enabled(&pid_retry, &s.cfg.plugins_disabled)
+                            {
+                                p.on_view_action(s, &inst_retry, "open");
+                            }
+                        })
+                        .build(k)
+                        .key(format!("webview-retry-{tile_id}")),
+                );
+            }
+            actions = actions.child(
+                Button::new(tr_ref(lang, "Open in Browser"))
+                    .variant(if can_embed {
+                        ButtonVariant::Ghost
+                    } else {
+                        ButtonVariant::Outline
+                    })
+                    .control_size(ControlSize::Small)
+                    .disabled(entry_str == "about:blank" || entry_str.trim().is_empty())
+                    .on_press({
+                        let url = entry_str.to_string();
+                        move |_s: &mut UiState| {
+                            crate::platform::shell::open_url(&url);
+                        }
+                    })
+                    .build(k)
+                    .key(format!("webview-open-browser-{tile_id}")),
+            );
+            card_body = card_body.child(actions);
+
+            let mut content_col = col().w_full().max_w(720.0).px(24.0).py(20.0).gap(14.0);
+            content_col = content_col.child(
+                look.row_card(k, card_body, k.radius.md)
+                    .key(format!("webview-card-{tile_id}")),
+            );
+
+            if !self.manifest.description.trim().is_empty() {
+                content_col = content_col.child(
+                    look.row_card(
+                        k,
+                        col()
+                            .w_full()
+                            .px(14.0)
+                            .py(12.0)
+                            .gap(6.0)
+                            .child(
+                                text(tr_ref(lang, "About"))
+                                    .font(k.ty.caption())
+                                    .color(k.c.text_muted),
+                            )
+                            .child(
+                                text(&self.manifest.description)
+                                    .font(k.ty.body)
+                                    .color(k.c.text_base)
+                                    .wrap(),
+                            ),
+                        k.radius.md,
+                    ),
+                );
+            }
+
+            if !self.manifest.commands.is_empty() {
+                let is_running = self.jobs.lock().unwrap().contains_key(&None);
+                let mut commands_col = col().w_full().gap(8.0).child(
+                    text(tr_ref(lang, "Commands"))
+                        .font(k.ty.caption())
+                        .color(k.c.text_muted),
+                );
+                for cmd in &self.manifest.commands {
+                    let cmd_id = cmd.id.clone();
+                    let pid_clone = pid.clone();
+                    let mut cmd_row = row()
+                        .w_full()
+                        .h(36.0)
+                        .px(10.0)
+                        .center_y()
+                        .gap(10.0)
+                        .fill(k.alpha(k.c.layer_01, 0.3))
+                        .radius(k.radius.sm)
+                        .border(1.0, k.alpha(k.c.border_weak, 0.3))
+                        .child(icon(&icons::KEYBOARD, 12.0).color(k.c.icon_muted))
+                        .child(text(&cmd.title).font(k.ty.small).color(k.c.text_base));
+                    if let Some(sc) = &cmd.shortcut {
+                        cmd_row =
+                            cmd_row.child(text(sc).font(k.ty.caption()).color(k.c.text_faint));
+                    }
+                    cmd_row = cmd_row.child(el().grow(1.0)).child(
+                        Button::new(tr_ref(lang, "Run"))
+                            .disabled(is_running)
+                            .variant(ButtonVariant::Ghost)
+                            .control_size(ControlSize::Small)
+                            .on_press(move |s: &mut UiState| {
+                                if let Some(p) = s.plugins.get(&pid_clone) {
+                                    p.on_command(s, &cmd_id);
+                                }
+                            })
+                            .build(k),
+                    );
+                    commands_col = commands_col.child(cmd_row);
+                }
+                content_col = content_col.child(commands_col);
+            }
+
+            return Some(
+                col()
+                    .key(format!("ext-plugin-webview-{}-{}", self.id, tile_id))
+                    .grow(1.0)
+                    .w_full()
+                    .min_h(0.0)
+                    .items_center()
+                    .child(content_col)
+                    .scroll(rune::ScrollSpec {
+                        stick_bottom: false,
+                    })
+                    .scroll_bar(k),
+            );
+        }
+
         if let PluginRenderKind::TerminalTui { command, cwd } = &render_kind {
             let cmd_str = command.join(" ");
             let cwd_opt = cwd.clone();
             let pid_launch = pid.clone();
-            let tui_bar = row()
-                .w_full()
-                .h(36.0)
-                .px(12.0)
-                .gap(8.0)
+            let command_badge = row()
+                .px(8.0)
+                .py(3.0)
+                .gap(6.0)
                 .center_y()
-                .fill(k.alpha(k.c.layer_01, 0.3))
-                .child(icon(&terminal_panel::TERMINAL_WINDOW, 13.0).color(k.c.text_accent))
+                .shrink()
+                .min_w(0.0)
+                .fill(k.alpha(k.c.layer_02, 0.55))
+                .radius(k.radius.sm)
+                .border(1.0, k.alpha(k.c.border_weak, 0.35))
+                .child(icon(&terminal_panel::TERMINAL_WINDOW, 12.0).color(k.c.text_accent))
                 .child(
                     text(if cmd_str.is_empty() {
                         tr_ref(lang, "Interactive Terminal TUI").to_string()
@@ -607,32 +851,52 @@ impl DesktopPlugin for ExternalPlugin {
                     })
                     .font(k.ty.mono)
                     .color(k.c.text_base)
+                    .single_line()
                     .truncate(),
-                )
-                .child(el().grow(1.0))
-                .child(
-                    Button::new(tr_ref(lang, "Launch in Terminal"))
-                        .variant(ButtonVariant::Outline)
-                        .control_size(ControlSize::Small)
-                        .on_press(move |s: &mut UiState| {
-                            if let Some(p) = s.plugins.get(&pid_launch) {
-                                p.on_command(s, "__run_entry__");
-                            } else {
-                                let dir = cwd_opt
-                                    .as_ref()
-                                    .map(PathBuf::from)
-                                    .unwrap_or_else(|| s.terminal_cwd());
-                                let run_cmd = if cmd_str.is_empty() {
-                                    None
-                                } else {
-                                    Some(format!("{cmd_str}\n"))
-                                };
-                                s.term_new_tab_in(dir, run_cmd);
-                            }
-                        })
-                        .build(k)
-                        .key(format!("tui-launch-{tile_id}")),
                 );
+            let mut tui_bar = row()
+                .key(format!("tui-bar-{tile_id}"))
+                .w_full()
+                .h(36.0)
+                .px(10.0)
+                .gap(8.0)
+                .center_y()
+                .fill(k.alpha(k.c.layer_01, 0.28))
+                .child(command_badge);
+            if let Some(dir) = cwd_opt.as_deref().filter(|d| !d.trim().is_empty()) {
+                tui_bar = tui_bar.child(
+                    text(dir)
+                        .font(k.ty.caption())
+                        .color(k.c.text_muted)
+                        .single_line()
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0),
+                );
+            }
+            tui_bar = tui_bar.child(el().grow(1.0)).child(
+                Button::new(tr_ref(lang, "Launch in Terminal"))
+                    .variant(ButtonVariant::Outline)
+                    .control_size(ControlSize::Small)
+                    .on_press(move |s: &mut UiState| {
+                        if let Some(p) = s.plugins.get(&pid_launch) {
+                            p.on_command(s, "__run_entry__");
+                        } else {
+                            let dir = cwd_opt
+                                .as_ref()
+                                .map(PathBuf::from)
+                                .unwrap_or_else(|| s.terminal_cwd());
+                            let run_cmd = if cmd_str.is_empty() {
+                                None
+                            } else {
+                                Some(format!("{cmd_str}\n"))
+                            };
+                            s.term_new_tab_in(dir, run_cmd);
+                        }
+                    })
+                    .build(k)
+                    .key(format!("tui-launch-{tile_id}")),
+            );
 
             let scheme = if k.dark {
                 crate::theme::color_scheme::ColorScheme::Dark
@@ -651,9 +915,14 @@ impl DesktopPlugin for ExternalPlugin {
             );
         }
 
+        let is_running = self.jobs.lock().unwrap().contains_key(&None);
+        let has_dynamic_md = self.dynamic_markdown.lock().unwrap().is_some();
+        let initial_bun_loading = matches!(render_kind, PluginRenderKind::BunScript { .. })
+            && is_running
+            && !has_dynamic_md;
         let md_content = self.load_markdown_content();
 
-        let body = if let Some(content) = md_content {
+        let body = if initial_bun_loading || md_content.is_some() {
             let mut col_inner = col().w_full().max_w(760.0).px(24.0).py(16.0).gap(12.0);
 
             if !self.manifest.commands.is_empty()
@@ -671,27 +940,41 @@ impl DesktopPlugin for ExternalPlugin {
                     .border(1.0, k.alpha(k.c.border_weak, 0.3));
 
                 if let PluginRenderKind::BunScript { entry } = &render_kind {
-                    let pid_run = pid.clone();
-                    cmd_bar = cmd_bar.child(
-                        Button::new(format!("{} ({entry})", tr_ref(lang, "Run Script")))
-                            .variant(ButtonVariant::Outline)
-                            .control_size(ControlSize::Small)
-                            .on_press(move |s: &mut UiState| {
-                                if let Some(p) = s.plugins.get(&pid_run) {
-                                    p.on_command(s, "__run_entry__");
-                                }
-                            })
-                            .build(k)
-                            .key(format!("bun-run-entry-{tile_id}")),
-                    );
+                    let entry_path = self.resolve_script_path(entry);
+                    let entry_covered_by_cmd = self.manifest.commands.iter().any(|c| {
+                        self.script_for_command(c).as_deref() == Some(entry_path.as_path())
+                    });
+                    if !entry_covered_by_cmd {
+                        let pid_run = pid.clone();
+                        cmd_bar = cmd_bar.child(
+                            Button::new(format!("{} ({entry})", tr_ref(lang, "Run Script")))
+                                .disabled(is_running)
+                                .variant(ButtonVariant::Outline)
+                                .control_size(ControlSize::Small)
+                                .on_press(move |s: &mut UiState| {
+                                    if let Some(p) = s.plugins.get(&pid_run) {
+                                        p.on_command(s, "__run_entry__");
+                                    }
+                                })
+                                .build(k)
+                                .key(format!("bun-run-entry-{tile_id}")),
+                        );
+                    }
                 }
 
-                for cmd in &self.manifest.commands {
+                for (index, cmd) in self.manifest.commands.iter().enumerate() {
                     let cmd_id = cmd.id.clone();
                     let pid_clone = pid.clone();
+                    let variant = if index == 0
+                        && matches!(render_kind, PluginRenderKind::BunScript { .. })
+                    {
+                        ButtonVariant::Outline
+                    } else {
+                        ButtonVariant::Ghost
+                    };
                     let btn = Button::new(&cmd.title)
-                        .disabled(self.jobs.lock().unwrap().contains_key(&None))
-                        .variant(ButtonVariant::Ghost)
+                        .disabled(is_running)
+                        .variant(variant)
                         .control_size(ControlSize::Small)
                         .on_press(move |s: &mut UiState| {
                             if let Some(p) = s.plugins.get(&pid_clone) {
@@ -701,7 +984,7 @@ impl DesktopPlugin for ExternalPlugin {
                         .build(k);
                     cmd_bar = cmd_bar.child(btn.key(format!("plugin-command-{}", cmd.id)));
                 }
-                if self.jobs.lock().unwrap().contains_key(&None) {
+                if is_running {
                     cmd_bar = cmd_bar.child(
                         text(tr_ref(lang, "Loading…"))
                             .font(k.ty.small)
@@ -711,14 +994,40 @@ impl DesktopPlugin for ExternalPlugin {
                 col_inner = col_inner.child(cmd_bar);
             }
 
-            col_inner = col_inner.child(
-                Markdown::new(content)
-                    .selectable(true)
-                    .on_link_tx(|s: &mut UiState, url: &str, tx: &mut rune::Tx| {
-                        crate::ui::open_markdown_link(s, url, tx);
-                    })
-                    .build(k),
-            );
+            if initial_bun_loading {
+                let mut loading_card = col().w_full().px(16.0).py(16.0).gap(6.0).child(
+                    row()
+                        .gap(8.0)
+                        .center_y()
+                        .child(icon(&icons::REFRESH, 13.0).color(k.c.text_accent))
+                        .child(
+                            text(tr_ref(lang, "Loading…"))
+                                .font(k.ty.ui_medium)
+                                .color(k.c.text_base),
+                        ),
+                );
+                if !self.manifest.description.trim().is_empty() {
+                    loading_card = loading_card.child(
+                        text(&self.manifest.description)
+                            .font(k.ty.small)
+                            .color(k.c.text_muted)
+                            .wrap(),
+                    );
+                }
+                col_inner = col_inner.child(
+                    look.row_card(k, loading_card, k.radius.md)
+                        .key(format!("bun-loading-{tile_id}")),
+                );
+            } else if let Some(content) = md_content {
+                col_inner = col_inner.child(
+                    Markdown::new(content)
+                        .selectable(true)
+                        .on_link_tx(|s: &mut UiState, url: &str, tx: &mut rune::Tx| {
+                            crate::ui::open_markdown_link(s, url, tx);
+                        })
+                        .build(k),
+                );
+            }
 
             col()
                 .key(format!("ext-plugin-md-{tile_id}"))
@@ -729,6 +1038,7 @@ impl DesktopPlugin for ExternalPlugin {
                 .scroll(rune::ScrollSpec {
                     stick_bottom: false,
                 })
+                .scroll_bar(k)
         } else {
             let mut content_col = col().w_full().max_w(720.0).px(24.0).py(20.0).gap(16.0);
 
@@ -747,7 +1057,8 @@ impl DesktopPlugin for ExternalPlugin {
                     .child(
                         text(&self.manifest.description)
                             .font(k.ty.body)
-                            .color(k.c.text_base),
+                            .color(k.c.text_base)
+                            .wrap(),
                     ),
                 k.radius.md,
             );
@@ -781,6 +1092,7 @@ impl DesktopPlugin for ExternalPlugin {
                         )
                         .child(
                             Button::new(tr_ref(lang, "Run"))
+                                .disabled(is_running)
                                 .variant(ButtonVariant::Outline)
                                 .control_size(ControlSize::Small)
                                 .on_press(move |s: &mut UiState| {
@@ -794,43 +1106,6 @@ impl DesktopPlugin for ExternalPlugin {
                     k.radius.md,
                 );
                 content_col = content_col.child(bun_card);
-            }
-
-            if let Some(tile) = &self.manifest.tile {
-                if tile.kind == "webview" {
-                    let entry_str = tile.entry.as_deref().unwrap_or("about:blank");
-                    let webview_card = look.row_card(
-                        k,
-                        col()
-                            .w_full()
-                            .px(14.0)
-                            .py(14.0)
-                            .gap(8.0)
-                            .child(
-                                row()
-                                    .gap(6.0)
-                                    .center_y()
-                                    .child(icon(&icons::OPEN_EXTERNAL, 12.0).color(k.c.text_accent))
-                                    .child(
-                                        text(&tile.title).font(k.ty.ui_medium).color(k.c.text_base),
-                                    ),
-                            )
-                            .child(
-                                Button::new(tr_ref(lang, "Open in Browser"))
-                                    .variant(ButtonVariant::Outline)
-                                    .control_size(ControlSize::Small)
-                                    .on_press({
-                                        let url = entry_str.to_string();
-                                        move |_s: &mut UiState| {
-                                            crate::platform::shell::open_url(&url);
-                                        }
-                                    })
-                                    .build(k),
-                            ),
-                        k.radius.md,
-                    );
-                    content_col = content_col.child(webview_card);
-                }
             }
 
             if !self.manifest.commands.is_empty() {
@@ -863,6 +1138,7 @@ impl DesktopPlugin for ExternalPlugin {
                     cmd_row = cmd_row.child(el().grow(1.0));
 
                     let run_btn = Button::new(tr_ref(lang, "Run"))
+                        .disabled(is_running)
                         .variant(ButtonVariant::Ghost)
                         .control_size(ControlSize::Small)
                         .on_press(move |s: &mut UiState| {
@@ -889,6 +1165,7 @@ impl DesktopPlugin for ExternalPlugin {
                 .scroll(rune::ScrollSpec {
                     stick_bottom: false,
                 })
+                .scroll_bar(k)
         };
 
         Some(
@@ -913,7 +1190,11 @@ impl DesktopPlugin for ExternalPlugin {
             }
             self.panels.lock().unwrap().clear();
             self.native_views.lock().unwrap().clear();
+            self.view_errors.lock().unwrap().clear();
+            self.tui_launched.lock().unwrap().clear();
             self.web_surfaces.lock().unwrap().clear();
+        } else if self.manifest.notification_entry.is_some() {
+            self.notifications.lock().unwrap().armed = true;
         }
     }
 
@@ -955,6 +1236,7 @@ impl DesktopPlugin for ExternalPlugin {
         let changed = !completed.is_empty();
         for (instance, job, result) in completed {
             let mut attempt = job.attempt;
+            let failed_instance = instance.clone();
             let outcome =
                 result.and_then(|output| {
                     attempt.wrote_stderr = output.wrote_stderr;
@@ -985,12 +1267,13 @@ impl DesktopPlugin for ExternalPlugin {
                         }
                         s.plugin_fields
                             .insert((self.id.to_owned(), instance.clone()), fields);
+                        self.view_errors.lock().unwrap().remove(&instance);
                         self.native_views
                             .lock()
                             .unwrap()
                             .insert(instance, native_selection::Document::new(parsed.view));
                     } else {
-                        self.apply_script_output(s, &job.title, output);
+                        self.apply_script_output(s, &job.title, output, job.silent_on_success);
                     }
                     Ok(())
                 });
@@ -1001,6 +1284,12 @@ impl DesktopPlugin for ExternalPlugin {
                     .map_or(Outcome::Completed, |err| err.reason),
             );
             if let Err(err) = outcome {
+                if let Some(instance) = failed_instance {
+                    self.view_errors
+                        .lock()
+                        .unwrap()
+                        .insert(instance, err.detail.clone());
+                }
                 s.notify_diagnostic(
                     event,
                     ToastLevel::Error,
@@ -1053,6 +1342,8 @@ impl DesktopPlugin for ExternalPlugin {
         self.web_surfaces.lock().unwrap().contains_key(instance)
             || self.has_panel_service(instance)
             || self.native_views.lock().unwrap().contains_key(instance)
+            || self.view_errors.lock().unwrap().contains_key(instance)
+            || self.tui_launched.lock().unwrap().contains(instance)
             || self
                 .jobs
                 .lock()
@@ -1076,6 +1367,16 @@ impl DesktopPlugin for ExternalPlugin {
         if let Some(node) = views.remove(from) {
             views.insert(to.to_owned(), node);
         }
+        drop(views);
+        let mut errors = self.view_errors.lock().unwrap();
+        if let Some(error) = errors.remove(from) {
+            errors.insert(to.to_owned(), error);
+        }
+        drop(errors);
+        let mut launched = self.tui_launched.lock().unwrap();
+        if launched.remove(from) {
+            launched.insert(to.to_owned());
+        }
     }
 
     fn close_view(&self, instance: &str) {
@@ -1085,41 +1386,89 @@ impl DesktopPlugin for ExternalPlugin {
         }
         self.panels.lock().unwrap().remove(instance);
         self.native_views.lock().unwrap().remove(instance);
+        self.view_errors.lock().unwrap().remove(instance);
+        self.tui_launched.lock().unwrap().remove(instance);
     }
 
     fn on_view_action(&self, s: &mut UiState, instance: &str, action: &str) -> bool {
+        if !super::is_enabled(self.id, &s.cfg.plugins_disabled) {
+            return false;
+        }
         if self.manifest.notification_entry.is_some() {
             self.notifications.lock().unwrap().armed = true;
         }
-        if action == "open" && webview_helper().is_some() {
-            if let PluginRenderKind::WebView { entry } = self.manifest.render_kind() {
-                if web_surface::local_panel_url(&entry) {
+        match self.manifest.render_kind() {
+            PluginRenderKind::WebView { entry } => {
+                if action == "open"
+                    && webview_helper().is_some()
+                    && web_surface::local_panel_url(&entry)
+                {
+                    self.view_errors.lock().unwrap().remove(instance);
                     if let Err(reason) = self.open_web_url(s, instance, &entry, false, None) {
+                        self.view_errors
+                            .lock()
+                            .unwrap()
+                            .insert(instance.to_owned(), reason.clone());
                         s.toast_error(self.manifest.name.clone(), Some(reason));
                     }
                     return true;
                 }
+                false
             }
+            PluginRenderKind::TerminalTui { command, cwd } => {
+                if action == "open"
+                    && self
+                        .tui_launched
+                        .lock()
+                        .unwrap()
+                        .insert(instance.to_owned())
+                {
+                    self.launch_terminal_tui(s, &command, cwd.as_deref());
+                    return true;
+                }
+                false
+            }
+            PluginRenderKind::BunScript { entry } => {
+                if self
+                    .manifest
+                    .tile
+                    .as_ref()
+                    .is_some_and(|t| t.kind == "native-view")
+                {
+                    return self.start_script(
+                        s,
+                        "view",
+                        &self.manifest.name,
+                        &self.resolve_script_path(&entry),
+                        Some((instance, action)),
+                        false,
+                    );
+                }
+                if action == "open"
+                    && self.dynamic_markdown.lock().unwrap().is_none()
+                    && !self.jobs.lock().unwrap().contains_key(&None)
+                {
+                    if let Some((cmd_id, cmd_title, script_path)) =
+                        self.manifest.commands.iter().find_map(|cmd| {
+                            self.script_for_command(cmd)
+                                .map(|path| (cmd.id.as_str(), cmd.title.as_str(), path))
+                        })
+                    {
+                        return self.execute_bun_script(s, cmd_id, cmd_title, &script_path, true);
+                    }
+                    let script_path = self.resolve_script_path(&entry);
+                    return self.execute_bun_script(
+                        s,
+                        "__run_entry__",
+                        &self.manifest.name,
+                        &script_path,
+                        true,
+                    );
+                }
+                false
+            }
+            PluginRenderKind::Native { .. } => false,
         }
-        let PluginRenderKind::BunScript { entry } = self.manifest.render_kind() else {
-            return false;
-        };
-        if !super::is_enabled(self.id, &s.cfg.plugins_disabled)
-            || !self
-                .manifest
-                .tile
-                .as_ref()
-                .is_some_and(|t| t.kind == "native-view")
-        {
-            return false;
-        }
-        self.start_script(
-            s,
-            "view",
-            &self.manifest.name,
-            &self.resolve_script_path(&entry),
-            Some((instance, action)),
-        )
     }
 
     fn on_notification_action(&self, s: &mut UiState, action: &str) {
@@ -1142,23 +1491,11 @@ impl DesktopPlugin for ExternalPlugin {
                         command_id,
                         &self.manifest.name,
                         &script_path,
+                        false,
                     );
                 }
                 PluginRenderKind::TerminalTui { command, cwd } => {
-                    let dir = cwd
-                        .as_ref()
-                        .map(|c| {
-                            let p = Path::new(c);
-                            if p.is_absolute() {
-                                p.to_path_buf()
-                            } else {
-                                self.dir.join(p)
-                            }
-                        })
-                        .unwrap_or_else(|| s.terminal_cwd());
-                    let cmd_str = command.join(" ");
-                    let run_cmd = (!cmd_str.is_empty()).then(|| format!("{cmd_str}\n"));
-                    s.term_new_tab_in(dir, run_cmd);
+                    self.launch_terminal_tui(s, &command, cwd.as_deref());
                     return true;
                 }
                 _ => return false,
@@ -1167,7 +1504,7 @@ impl DesktopPlugin for ExternalPlugin {
 
         if let Some(cmd) = self.manifest.commands.iter().find(|c| c.id == command_id) {
             if let Some(script_path) = self.script_for_command(cmd) {
-                return self.execute_bun_script(s, command_id, &cmd.title, &script_path);
+                return self.execute_bun_script(s, command_id, &cmd.title, &script_path, false);
             }
             if let Some(action) = &cmd.action {
                 if action.starts_with("http://") || action.starts_with("https://") {
@@ -1558,6 +1895,7 @@ printf '%s' '{"version":1,"view":{"type":"text","text":"saved"}}'
                 receiver,
                 cancel: cancel.clone(),
                 title: String::new(),
+                silent_on_success: false,
                 attempt: Attempt::new(EventKind::PluginCommand, "cancel-test", None),
             },
         );
@@ -1869,7 +2207,7 @@ printf '{"toast":{"title":"Bun Executed %s","detail":"session=%s cmd=%s","level"
         assert_eq!(context["theme"]["preference"], "system");
         assert_eq!(context["theme"]["colorScheme"], "light");
         assert_eq!(context["theme"]["reducedMotion"], true);
-        plugin.apply_script_output(&mut s, "Analyze workspace", result.body);
+        plugin.apply_script_output(&mut s, "Analyze workspace", result.body, false);
         assert_eq!(s.toasts.len(), 1);
         assert_eq!(s.toasts[0].level, ToastLevel::Success);
         assert_eq!(s.toasts[0].title, "Bun Executed bun-demo");
@@ -1884,5 +2222,398 @@ printf '{"toast":{"title":"Bun Executed %s","detail":"session=%s cmd=%s","level"
         assert!(s.draft.text.contains("generated prompt from bun"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn webview_plugin_with_readme_renders_webview_card_instead_of_readme() {
+        let dir =
+            std::env::temp_dir().join(format!("muqun-webview-readme-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("plugin.json"),
+            r#"{
+                "id": "web-docs",
+                "name": "Web Docs",
+                "version": "1.0.0",
+                "description": "Remote docs dashboard",
+                "tile": {
+                    "kind": "webview",
+                    "title": "Docs Portal",
+                    "entry": "https://example.com/docs"
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("README.md"),
+            "# Shadowing README\n\nThis markdown must not hide the WebView card.",
+        )
+        .unwrap();
+
+        let plugin = Arc::new(ExternalPlugin::from_dir(&dir).unwrap());
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.plugins.register(plugin);
+
+        fn render_web(s: &UiState, _: &mut rune::Cx<UiState>) -> El {
+            let k = rune_kit::Kit::neutral(true);
+            let look = s.look();
+            let ctx = PluginViewContext::new(s, &k, &look, "page", 1.0, PluginSlot::Page);
+            let p = s.plugins.get("web-docs").unwrap();
+            col()
+                .w_full()
+                .h_full()
+                .child(p.render_tile(&ctx, &mut vec![]).unwrap())
+        }
+
+        let mut rt = rune::Runtime::new(s, render_web, (640.0, 480.0), rune::Env::new(true, 1.0));
+        rt.frame(0.0);
+        let elements = rt.elements();
+        assert!(
+            elements
+                .iter()
+                .any(|e| e.key.as_deref() == Some("webview-card-page")),
+            "expected WebView card to render even when README.md exists"
+        );
+        assert!(
+            elements
+                .iter()
+                .any(|e| e.key.as_deref() == Some("webview-open-browser-page")),
+            "expected Open in Browser button to render"
+        );
+        assert!(
+            !elements.iter().any(|e| e
+                .text
+                .as_deref()
+                .is_some_and(|t| t.contains("Shadowing README"))),
+            "README.md must never shadow a WebView tile"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repeated_plugin_reloads_intern_static_strings_without_unbounded_leaks() {
+        let unique = format!("intern-test-{}", uuid::Uuid::new_v4());
+        let cmd_id = format!("{unique}.run");
+        let shortcut = format!("Ctrl+Alt+{unique}");
+        let manifest = PluginManifest {
+            id: unique.clone(),
+            name: "Intern Test".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Reload interning test".to_string(),
+            commands: vec![PluginCommandManifest {
+                id: cmd_id.clone(),
+                title: "Run".to_string(),
+                shortcut: Some(shortcut.clone()),
+                action: None,
+                script: None,
+            }],
+            ..Default::default()
+        };
+
+        let first = ExternalPlugin::new(manifest.clone(), PathBuf::from("/tmp"));
+        let count_matching = || {
+            interner()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.contains(&unique))
+                .count()
+        };
+        assert_eq!(count_matching(), 3);
+        let first_id_ptr = first.id().as_ptr();
+        let first_cmd_ptr = first.commands()[0].id.as_ptr();
+        let first_sc_ptr = first.commands()[0].shortcut.unwrap().as_ptr();
+
+        for _ in 0..100 {
+            let reloaded = ExternalPlugin::new(manifest.clone(), PathBuf::from("/tmp"));
+            assert_eq!(reloaded.id().as_ptr(), first_id_ptr);
+            assert_eq!(reloaded.commands()[0].id.as_ptr(), first_cmd_ptr);
+            assert_eq!(
+                reloaded.commands()[0].shortcut.unwrap().as_ptr(),
+                first_sc_ptr
+            );
+        }
+        assert_eq!(
+            count_matching(),
+            3,
+            "reloading identical plugin manifests must allocate zero new leaked strings"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn panel_runtime_error_retains_error_card_with_retry_instead_of_blanking() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("muqun-panel-err-card-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"panel-err-test","version":"1.0.0","main":"entry.ts","muqun":{}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("entry.ts"), "").unwrap();
+        let bun = dir.join("mock-bun");
+        std::fs::write(
+            &bun,
+            r#"#!/bin/sh
+printf '{"version":1,"view":{"type":"text","text":"Recovered after retry"}}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bun, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let plugin = Arc::new(ExternalPlugin::from_dir(&dir).unwrap());
+        plugin.set_bun_binary_override(Some(Some(bun)));
+
+        // Start a panel whose process immediately fails with a structured startup error.
+        let mut fail_cmd = ProcessCommand::new("sh");
+        fail_cmd.args([
+            "-c",
+            "echo '!muqun:webview:error:backend-unavailable'; exit 1",
+        ]);
+        plugin.panels.lock().unwrap().insert(
+            "page".into(),
+            panel::Panel::start_for_test(PathBuf::from("panel.ts"), fail_cmd),
+        );
+
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.plugins.register(plugin.clone());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !plugin.poll(&mut s, &mut rune::Tx::default()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            plugin.view_errors.lock().unwrap().contains_key("page"),
+            "panel failure must retain an explicit error state on the instance"
+        );
+
+        fn render_panel_err(s: &UiState, _: &mut rune::Cx<UiState>) -> El {
+            let k = rune_kit::Kit::neutral(true);
+            let look = s.look();
+            let ctx = PluginViewContext::new(s, &k, &look, "page", 1.0, PluginSlot::Page);
+            let p = s.plugins.get("panel-err-test").unwrap();
+            col()
+                .w_full()
+                .h_full()
+                .child(p.render_tile(&ctx, &mut vec![]).unwrap())
+        }
+
+        let mut rt = rune::Runtime::new(
+            s,
+            render_panel_err,
+            (640.0, 480.0),
+            rune::Env::new(true, 1.0),
+        );
+        rt.set_system_reduced_motion(true);
+        rt.frame(0.0);
+        let elements = rt.elements();
+        assert!(
+            elements
+                .iter()
+                .any(|e| e.key.as_deref() == Some("plugin-native-error-panel-err-test-page")),
+            "expected explicit error card after panel failure"
+        );
+        assert!(
+            elements.iter().any(|e| e
+                .text
+                .as_deref()
+                .is_some_and(|t| t.contains("could not open its WebView panel"))),
+            "expected error detail text on panel error card"
+        );
+        let retry = elements
+            .iter()
+            .find(|e| e.key.as_deref() == Some("plugin-native-retry-panel-err-test-page"))
+            .expect("expected Retry button on panel error card");
+        let [x, y, w, h] = retry.rect;
+        rt.pointer_down(x + w / 2.0, y + h / 2.0);
+        rt.pointer_up(x + w / 2.0, y + h / 2.0);
+        rt.frame(0.0);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let mut done = false;
+            rt.update(|s, tx| {
+                done = plugin.poll(s, tx);
+            });
+            if done {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        rt.frame(0.0);
+        assert!(
+            !plugin.view_errors.lock().unwrap().contains_key("page"),
+            "retry recovery must clear the error state"
+        );
+        assert!(
+            rt.elements()
+                .iter()
+                .any(|e| e.text.as_deref() == Some("Recovered after retry")),
+            "expected recovered native view after clicking Retry"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notification_entry_is_armed_on_load_for_enabled_plugins_and_respects_disable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("muqun-notif-armed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"notif-auto","version":"1.0.0","main":"entry.ts","muqun":{"notificationEntry":"notify.ts"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("entry.ts"), "").unwrap();
+        std::fs::write(dir.join("notify.ts"), "").unwrap();
+        let bun = dir.join("mock-bun");
+        std::fs::write(
+            &bun,
+            r#"#!/bin/sh
+printf '{"notices":[{"title":"Background update","body":"Polled without manual open","action":"open-item"}]}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bun, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let plugin = ExternalPlugin::from_dir(&dir).unwrap();
+        plugin.set_bun_binary_override(Some(Some(bun)));
+        assert!(
+            plugin.notifications.lock().unwrap().armed,
+            "notificationEntry must start armed on load without requiring manual open"
+        );
+
+        // Disabled plugins must not poll notifications.
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.cfg.notifications.enabled = true;
+        s.cfg.plugins_disabled.insert("notif-auto".into());
+        assert!(!plugin.poll(&mut s, &mut rune::Tx::default()));
+        assert!(!plugin.notifications.lock().unwrap().armed);
+
+        // Re-enabling re-arms notifications and polling delivers notices without manual open.
+        s.cfg.plugins_disabled.remove("notif-auto");
+        plugin.enabled_changed(true);
+        assert!(plugin.notifications.lock().unwrap().armed);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut delivered = false;
+        while Instant::now() < deadline {
+            if plugin.poll(&mut s, &mut rune::Tx::default()) {
+                delivered = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            delivered,
+            "enabled plugin should poll notifications automatically"
+        );
+        assert!(
+            s.toasts
+                .iter()
+                .any(|t| t.title.contains("Background update")),
+            "expected toast from background notification poll"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_center_auto_refreshes_on_open_and_shows_loading_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let review_dir = if Path::new("desktop/assets/plugins/review-center/plugin.json").is_file()
+        {
+            PathBuf::from("desktop/assets/plugins/review-center")
+        } else {
+            PathBuf::from("assets/plugins/review-center")
+        };
+        let plugin = ExternalPlugin::from_dir(&review_dir).expect("review-center must load");
+        assert_eq!(
+            plugin.render_kind(),
+            PluginRenderKind::BunScript {
+                entry: "review.ts".to_string()
+            }
+        );
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("muqun-review-auto-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let mock_bun = temp_dir.join("mock-bun");
+        std::fs::write(
+            &mock_bun,
+            r##"#!/bin/sh
+printf '{"markdown":"# owner/repo\\n\\n## Pull requests (1)"}'
+"##,
+        )
+        .unwrap();
+        std::fs::set_permissions(&mock_bun, std::fs::Permissions::from_mode(0o755)).unwrap();
+        plugin.set_bun_binary_override(Some(Some(mock_bun)));
+
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        assert!(plugin.dynamic_markdown().is_none());
+        assert!(
+            plugin.on_view_action(&mut s, "page", "open"),
+            "opening review-center with no cached output must auto-run its refresh script"
+        );
+
+        // While running, render_tile displays a Loading… card rather than stale README.
+        let k = rune_kit::Kit::neutral(true);
+        let look = s.look();
+        let ctx = PluginViewContext::new(&s, &k, &look, "page", 1.0, PluginSlot::Page);
+        assert!(plugin.render_tile(&ctx, &mut vec![]).is_some());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !plugin.poll(&mut s, &mut rune::Tx::default()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(plugin
+            .dynamic_markdown()
+            .as_deref()
+            .unwrap_or_default()
+            .contains("## Pull requests (1)"));
+        // Auto-refresh on open should not spam a generic success toast when script didn't send one.
+        assert!(s.toasts.is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn terminal_tui_auto_launches_once_per_instance_and_survives_move() {
+        let manifest = PluginManifest {
+            id: "tui-auto".to_string(),
+            name: "Lazygit".to_string(),
+            version: "1.0.0".to_string(),
+            description: "Git TUI".to_string(),
+            tile: Some(crate::plugin::manifest::PluginTileManifest {
+                kind: "terminal_tui".to_string(),
+                title: "Lazygit".to_string(),
+                entry: None,
+                command: Some(vec!["lazygit".to_string()]),
+                cwd: None,
+            }),
+            ..Default::default()
+        };
+        let plugin = ExternalPlugin::new(manifest, PathBuf::from("/tmp"));
+        let (tx, _) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+
+        assert!(plugin.on_view_action(&mut s, "tile-1", "open"));
+        assert!(!plugin.on_view_action(&mut s, "tile-1", "open"));
+        assert!(plugin.can_move_view("tile-1"));
+        plugin.move_view("tile-1", "page");
+        assert!(!plugin.on_view_action(&mut s, "page", "open"));
+        plugin.close_view("page");
+        assert!(plugin.on_view_action(&mut s, "page", "open"));
     }
 }

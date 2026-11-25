@@ -11,6 +11,15 @@ pub(super) struct Poll {
     worker: Option<Worker>,
 }
 
+impl Poll {
+    pub(super) fn new(armed: bool) -> Self {
+        Self {
+            armed,
+            ..Default::default()
+        }
+    }
+}
+
 struct Worker {
     result: mpsc::Receiver<Vec<Notice>>,
     cancel: Arc<AtomicBool>,

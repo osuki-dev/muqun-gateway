@@ -63,6 +63,11 @@ fn read_endpoint(pipe: impl Read) -> Result<String, String> {
 }
 
 impl Panel {
+    #[cfg(test)]
+    pub(super) fn start_for_test(entry: PathBuf, command: ProcessCommand) -> Self {
+        Self::start(entry, command)
+    }
+
     fn start(entry: PathBuf, mut command: ProcessCommand) -> Self {
         let (tx, events) = mpsc::channel();
         let (lifetime, cancel) = mpsc::channel();
@@ -195,6 +200,7 @@ impl ExternalPlugin {
             serde_json::to_string(&context).map_err(|_| "Could not encode the WebView context")?,
         );
         self.clear_web_instance(instance);
+        self.view_errors.lock().unwrap().remove(instance);
         let mut panel = Panel::start(entry, command);
         panel.draft_target = draft_target;
         panels.insert(instance.to_string(), panel);
@@ -216,11 +222,16 @@ impl ExternalPlugin {
             match result {
                 Ok(()) => {
                     panel.ready = true;
+                    self.view_errors.lock().unwrap().remove(instance);
                     true
                 }
                 Err(error) => {
                     self.clear_web_instance(instance);
                     self.native_views.lock().unwrap().remove(instance);
+                    self.view_errors
+                        .lock()
+                        .unwrap()
+                        .insert(instance.clone(), error.clone());
                     s.toast_error(self.manifest.name.clone(), Some(error));
                     false
                 }

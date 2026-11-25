@@ -5,6 +5,8 @@
   "description": "Read GitHub pull requests and issues for the current workspace with your existing gh login.",
   "category": "extensions",
   "icon": "branch",
+  "runtime": "bun",
+  "entry": "review.ts",
   "surfaces": [
     "tile",
     "page",
