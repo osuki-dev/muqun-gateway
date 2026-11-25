@@ -5,12 +5,12 @@
 use std::collections::{BTreeMap, HashSet};
 
 use rune::{col, el, row as hrow, text, El, TextEdit};
-use rune_kit::{ButtonVariant, Kit, TextInput};
+use rune_kit::{Button, ButtonVariant, ControlSize, Kit, TextInput};
 
 use super::{button, choice, empty, field, flag, group, group_with, row, status, Tone};
 use crate::hub::{
-    McpBuiltinView, McpHubError, McpHubSnapshot, McpUpstreamTransport, McpUpstreamUpsert,
-    McpUpstreamView,
+    McpBuiltinView, McpHubError, McpHubSnapshot, McpToolCallResult, McpUpstreamToolPreview,
+    McpUpstreamTransport, McpUpstreamUpsert, McpUpstreamView,
 };
 use crate::model::commands::Command;
 use crate::ui::copy::tr_ref;
@@ -20,6 +20,55 @@ use crate::ui::UiState;
 const MASKED_SECRET: &str = "••••••••";
 const SCOPES: [&str; 3] = ["local_only", "tasks", "all"];
 const ISOLATIONS: [&str; 2] = ["shared", "per_session"];
+const MAX_PREVIEW_CHARS: usize = 4000;
+
+/// Built-in quick-start templates for the "Add MCP server" form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpTemplate {
+    Filesystem,
+    GitHub,
+    Context7,
+    Playwright,
+    TailscaleHttp,
+}
+
+const TEMPLATES: [McpTemplate; 5] = [
+    McpTemplate::Filesystem,
+    McpTemplate::GitHub,
+    McpTemplate::Context7,
+    McpTemplate::Playwright,
+    McpTemplate::TailscaleHttp,
+];
+
+impl McpTemplate {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Filesystem => "filesystem",
+            Self::GitHub => "github",
+            Self::Context7 => "context7",
+            Self::Playwright => "playwright",
+            Self::TailscaleHttp => "tailscale-http",
+        }
+    }
+
+    fn button_label(self, lang: crate::config::Language) -> &'static str {
+        match self {
+            Self::Filesystem => tr_ref(lang, "Filesystem"),
+            Self::GitHub => "GitHub",
+            Self::Context7 => "Context7",
+            Self::Playwright => "Playwright",
+            Self::TailscaleHttp => tr_ref(lang, "Tailscale HTTP"),
+        }
+    }
+}
+
+/// Outcome of the last live tool test invocation shown in the inspector panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallPanelResult {
+    pub server_id: String,
+    pub tool: String,
+    pub outcome: Result<McpToolCallResult, String>,
+}
 
 pub struct McpHubState {
     pub builtin: Option<McpBuiltinView>,
@@ -49,6 +98,18 @@ pub struct McpHubState {
     pub denied_tools_input: TextEdit,
     pub form_saving: bool,
     pub form_error: Option<String>,
+    /// Currently inspected tool chip `(server_id, tool_name)`.
+    pub inspected_tool: Option<(String, String)>,
+    /// Whether the raw JSON schema block is expanded in the inspector panel.
+    pub show_raw_schema: bool,
+    /// JSON arguments input for the interactive live tool tester.
+    pub tool_args_input: TextEdit,
+    /// Validation error for `tool_args_input` before sending a request.
+    pub tool_args_error: Option<String>,
+    /// In-flight live tool test `(server_id, tool_name)`.
+    pub tool_calling: Option<(String, String)>,
+    /// Last live tool test result or error.
+    pub tool_call_output: Option<ToolCallPanelResult>,
 }
 
 impl Default for McpHubState {
@@ -78,6 +139,12 @@ impl Default for McpHubState {
             denied_tools_input: TextEdit::new(""),
             form_saving: false,
             form_error: None,
+            inspected_tool: None,
+            show_raw_schema: false,
+            tool_args_input: TextEdit::new("{}"),
+            tool_args_error: None,
+            tool_calling: None,
+            tool_call_output: None,
         }
     }
 }
@@ -91,7 +158,121 @@ impl McpHubState {
         self.error = None;
         self.busy_ids.clear();
         self.confirm_delete = None;
+        self.inspected_tool = None;
+        self.show_raw_schema = false;
+        self.tool_args_input = TextEdit::new("{}");
+        self.tool_args_error = None;
+        self.tool_calling = None;
+        self.tool_call_output = None;
         self.close_form();
+    }
+
+    pub fn apply_template(&mut self, template: McpTemplate) {
+        self.form_open = true;
+        self.editing_id = None;
+        self.scope_idx = 0; // local_only
+        self.isolation_idx = 0; // shared
+        self.timeout_input = TextEdit::new("30");
+        self.allowed_tools_input = TextEdit::new("");
+        self.denied_tools_input = TextEdit::new("");
+        self.form_error = None;
+        match template {
+            McpTemplate::Filesystem => {
+                self.id_input = TextEdit::new("filesystem");
+                self.label_input = TextEdit::new("Filesystem");
+                self.transport_idx = 1;
+                self.url_input = TextEdit::new("");
+                self.auth_header_input = TextEdit::new("");
+                self.command_input = TextEdit::new("npx");
+                self.args_input =
+                    TextEdit::new("-y @modelcontextprotocol/server-filesystem /path/to/dir");
+                self.env_input = TextEdit::new("");
+            }
+            McpTemplate::GitHub => {
+                self.id_input = TextEdit::new("github");
+                self.label_input = TextEdit::new("GitHub");
+                self.transport_idx = 1;
+                self.url_input = TextEdit::new("");
+                self.auth_header_input = TextEdit::new("");
+                self.command_input = TextEdit::new("npx");
+                self.args_input = TextEdit::new("-y @modelcontextprotocol/server-github");
+                self.env_input = TextEdit::new("GITHUB_PERSONAL_ACCESS_TOKEN=");
+            }
+            McpTemplate::Context7 => {
+                self.id_input = TextEdit::new("context7");
+                self.label_input = TextEdit::new("Context7");
+                self.transport_idx = 1;
+                self.url_input = TextEdit::new("");
+                self.auth_header_input = TextEdit::new("");
+                self.command_input = TextEdit::new("npx");
+                self.args_input = TextEdit::new("-y @upstash/context7-mcp");
+                self.env_input = TextEdit::new("");
+            }
+            McpTemplate::Playwright => {
+                self.id_input = TextEdit::new("playwright");
+                self.label_input = TextEdit::new("Playwright");
+                self.transport_idx = 1;
+                self.url_input = TextEdit::new("");
+                self.auth_header_input = TextEdit::new("");
+                self.command_input = TextEdit::new("npx");
+                self.args_input = TextEdit::new("-y @playwright/mcp@latest");
+                self.env_input = TextEdit::new("");
+            }
+            McpTemplate::TailscaleHttp => {
+                self.id_input = TextEdit::new("tailscale-mcp");
+                self.label_input = TextEdit::new("Tailscale HTTP");
+                self.transport_idx = 0;
+                self.url_input = TextEdit::new("http://100.x.y.z:3000/mcp");
+                self.auth_header_input = TextEdit::new("");
+                self.command_input = TextEdit::new("");
+                self.args_input = TextEdit::new("");
+                self.env_input = TextEdit::new("");
+            }
+        }
+    }
+
+    pub fn toggle_inspected_tool(&mut self, server_id: &str, tool: &McpUpstreamToolPreview) {
+        let same = self
+            .inspected_tool
+            .as_ref()
+            .is_some_and(|(sid, tname)| sid == server_id && tname == &tool.name);
+        if same {
+            self.inspected_tool = None;
+            self.show_raw_schema = false;
+            self.tool_args_error = None;
+            return;
+        }
+        self.inspected_tool = Some((server_id.to_owned(), tool.name.clone()));
+        self.show_raw_schema = false;
+        self.tool_args_error = None;
+        self.tool_args_input = TextEdit::new(schema_args_skeleton(tool.input_schema.as_ref()));
+        if self
+            .tool_call_output
+            .as_ref()
+            .is_some_and(|out| out.server_id != server_id || out.tool != tool.name)
+        {
+            self.tool_call_output = None;
+        }
+    }
+
+    pub fn apply_tool_called(
+        &mut self,
+        id: String,
+        tool: String,
+        result: Result<McpToolCallResult, String>,
+    ) {
+        if self
+            .tool_calling
+            .as_ref()
+            .is_some_and(|(sid, tname)| sid == &id && tname == &tool)
+        {
+            self.tool_calling = None;
+        }
+        self.tool_call_output = Some(ToolCallPanelResult {
+            server_id: id,
+            tool,
+            outcome: result,
+        });
     }
 
     pub fn open_new_form(&mut self) {
@@ -318,6 +499,29 @@ impl McpHubState {
         match result {
             Ok(()) => {
                 self.upstreams.retain(|u| u.id != id);
+                if self
+                    .inspected_tool
+                    .as_ref()
+                    .is_some_and(|(sid, _)| sid == &id)
+                {
+                    self.inspected_tool = None;
+                    self.show_raw_schema = false;
+                    self.tool_args_error = None;
+                }
+                if self
+                    .tool_calling
+                    .as_ref()
+                    .is_some_and(|(sid, _)| sid == &id)
+                {
+                    self.tool_calling = None;
+                }
+                if self
+                    .tool_call_output
+                    .as_ref()
+                    .is_some_and(|out| out.server_id == id)
+                {
+                    self.tool_call_output = None;
+                }
                 self.error = None;
             }
             Err(msg) => {
@@ -425,6 +629,191 @@ fn upsert_from_view(view: &McpUpstreamView) -> McpUpstreamUpsert {
         allowed_tools: view.allowed_tools.clone(),
         denied_tools: view.denied_tools.clone(),
         transport: view.transport.clone(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaParam {
+    name: String,
+    ty: String,
+    required: bool,
+    description: Option<String>,
+}
+
+fn schema_type_label(prop: &serde_json::Value) -> String {
+    if let Some(ty) = prop.get("type").and_then(serde_json::Value::as_str) {
+        return ty.to_owned();
+    }
+    if let Some(arr) = prop.get("type").and_then(serde_json::Value::as_array) {
+        let parts: Vec<&str> = arr.iter().filter_map(serde_json::Value::as_str).collect();
+        if !parts.is_empty() {
+            return parts.join(" | ");
+        }
+    }
+    if prop.get("enum").is_some() {
+        return "enum".to_owned();
+    }
+    if prop.get("anyOf").is_some() || prop.get("oneOf").is_some() {
+        return "union".to_owned();
+    }
+    "any".to_owned()
+}
+
+fn extract_schema_params(schema: Option<&serde_json::Value>) -> Vec<SchemaParam> {
+    let Some(props) = schema
+        .and_then(|s| s.get("properties"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Vec::new();
+    };
+    let required_set: HashSet<&str> = schema
+        .and_then(|s| s.get("required"))
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| arr.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+
+    let mut params: Vec<SchemaParam> = props
+        .iter()
+        .map(|(name, prop)| SchemaParam {
+            name: name.clone(),
+            ty: schema_type_label(prop),
+            required: required_set.contains(name.as_str()),
+            description: prop
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+        })
+        .collect();
+    params.sort_by(|a, b| {
+        b.required
+            .cmp(&a.required)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    params
+}
+
+/// Build a compact single-line JSON skeleton from `input_schema.properties` so the
+/// user can edit values immediately in the live tool tester.
+pub fn schema_args_skeleton(schema: Option<&serde_json::Value>) -> String {
+    let Some(props) = schema
+        .and_then(|s| s.get("properties"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return "{}".to_owned();
+    };
+    if props.is_empty() {
+        return "{}".to_owned();
+    }
+    let required_set: HashSet<&str> = schema
+        .and_then(|s| s.get("required"))
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| arr.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+
+    let mut ordered_keys: Vec<(&String, &serde_json::Value)> = props.iter().collect();
+    ordered_keys.sort_by(|(ka, _), (kb, _)| {
+        required_set
+            .contains(kb.as_str())
+            .cmp(&required_set.contains(ka.as_str()))
+            .then_with(|| ka.cmp(kb))
+    });
+
+    // Prefer required keys when there are many optional properties; otherwise include all up to 8.
+    let keys_to_include: Vec<(&String, &serde_json::Value)> =
+        if !required_set.is_empty() && ordered_keys.len() > 6 {
+            ordered_keys
+                .into_iter()
+                .filter(|(k, _)| required_set.contains(k.as_str()))
+                .take(8)
+                .collect()
+        } else {
+            ordered_keys.into_iter().take(8).collect()
+        };
+
+    let mut map = serde_json::Map::new();
+    for (name, prop) in keys_to_include {
+        let placeholder = if let Some(def) = prop.get("default") {
+            def.clone()
+        } else if let Some(first_enum) = prop
+            .get("enum")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|a| a.first())
+        {
+            first_enum.clone()
+        } else {
+            let primary_ty = prop
+                .get("type")
+                .and_then(|t| {
+                    t.as_str().or_else(|| {
+                        t.as_array().and_then(|arr| {
+                            arr.iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .find(|s| *s != "null")
+                        })
+                    })
+                })
+                .unwrap_or("string");
+            match primary_ty {
+                "string" => serde_json::Value::String(String::new()),
+                "integer" | "number" => serde_json::json!(0),
+                "boolean" => serde_json::Value::Bool(false),
+                "array" => serde_json::json!([]),
+                "object" => serde_json::json!({}),
+                _ => serde_json::Value::Null,
+            }
+        };
+        map.insert(name.clone(), placeholder);
+    }
+    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".to_owned())
+}
+
+fn format_json_preview(value: &serde_json::Value) -> String {
+    let pretty = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    let char_count = pretty.chars().count();
+    if char_count <= MAX_PREVIEW_CHARS {
+        pretty
+    } else {
+        let mut cut: String = pretty.chars().take(MAX_PREVIEW_CHARS).collect();
+        cut.push_str("\n… (truncated)");
+        cut
+    }
+}
+
+fn parse_tool_arguments(raw: &str) -> Result<serde_json::Value, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    let val: serde_json::Value =
+        serde_json::from_str(trimmed).map_err(|e| format!("Invalid JSON: {e}"))?;
+    if !val.is_object() {
+        return Err("Arguments must be a JSON object.".into());
+    }
+    Ok(val)
+}
+
+fn submit_tool_test(s: &mut UiState, server_id: &str, tool_name: &str) {
+    let lang = s.cfg.general.language;
+    match parse_tool_arguments(&s.mcp_hub.tool_args_input.text) {
+        Ok(arguments) => {
+            s.mcp_hub.tool_args_error = None;
+            s.mcp_hub.tool_calling = Some((server_id.to_owned(), tool_name.to_owned()));
+            s.send(Command::CallMcpUpstreamTool {
+                id: server_id.to_owned(),
+                tool: tool_name.to_owned(),
+                arguments,
+            });
+        }
+        Err(msg) => {
+            let localized = if msg == "Arguments must be a JSON object." {
+                tr_ref(lang, "Arguments must be a JSON object.").to_owned()
+            } else {
+                msg
+            };
+            s.mcp_hub.tool_args_error = Some(localized);
+        }
     }
 }
 
@@ -734,31 +1123,16 @@ fn builtin_card(s: &UiState, k: &Kit, builtin: &McpBuiltinView) -> El {
     ));
 
     if !builtin.tools.is_empty() {
-        let names = builtin
-            .tools
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        rows.push(
-            col()
-                .key("mcp-builtin-tools")
-                .w_full()
-                .py(8.0)
-                .gap(4.0)
-                .child(
-                    text(format!("{} ({})", t("Built-in tools"), builtin.tool_count))
-                        .font(k.ty.small)
-                        .color(k.c.text_base),
-                )
-                .child(
-                    text(names)
-                        .font(k.ty.small)
-                        .color(k.c.text_muted)
-                        .wrap()
-                        .w_full(),
-                ),
-        );
+        rows.push(tools_section(
+            s,
+            k,
+            &builtin.id,
+            t("Built-in tools"),
+            builtin.tool_count,
+            &builtin.tools,
+            false,
+            false,
+        ));
     }
 
     if !builtin.skills.is_empty() {
@@ -809,6 +1183,31 @@ fn editor_form(s: &UiState, k: &Kit) -> El {
     let mut rows = Vec::new();
 
     if !editing {
+        let mut tpl_bar = hrow()
+            .key("mcp-templates-bar")
+            .gap(6.0)
+            .flex_wrap()
+            .center_y();
+        for tpl in TEMPLATES {
+            tpl_bar = tpl_bar.child(
+                Button::new(tpl.button_label(lang))
+                    .variant(ButtonVariant::Outline)
+                    .control_size(ControlSize::Small)
+                    .on_press(move |s: &mut UiState| {
+                        s.mcp_hub.apply_template(tpl);
+                    })
+                    .build(k)
+                    .key(format!("mcp-tpl-{}", tpl.key())),
+            );
+        }
+        rows.push(row(
+            k,
+            "mcp-templates",
+            t("Quick templates"),
+            t("Pre-fill common MCP servers with safe defaults."),
+            tpl_bar,
+        ));
+
         let id_in = TextInput::new(&s.mcp_hub.id_input)
             .label(t("Server ID"))
             .placeholder("github")
@@ -1244,45 +1643,449 @@ fn upstream_card(s: &UiState, k: &Kit, upstream: &McpUpstreamView) -> El {
     }
 
     if !upstream.tools.is_empty() {
-        let preview_names: Vec<&str> = upstream
-            .tools
-            .iter()
-            .take(12)
-            .map(|tool| tool.name.as_str())
-            .collect();
-        let mut summary = preview_names.join(", ");
-        if upstream.tool_count > preview_names.len() {
-            summary.push_str(&format!(
-                " (+{})",
-                upstream.tool_count - preview_names.len()
-            ));
-        }
-        rows.push(
-            col()
-                .key(format!("mcp-tools-{id}"))
+        rows.push(tools_section(
+            s,
+            k,
+            &upstream.id,
+            t("Discovered tools"),
+            upstream.tool_count,
+            &upstream.tools,
+            true,
+            upstream.enabled,
+        ));
+    }
+
+    group_with(k, &format!("mcp-upstream-{id}"), head, rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tools_section(
+    s: &UiState,
+    k: &Kit,
+    server_id: &str,
+    heading: &str,
+    total_count: usize,
+    tools: &[McpUpstreamToolPreview],
+    is_external: bool,
+    server_enabled: bool,
+) -> El {
+    let lang = s.cfg.general.language;
+    let t = |en| tr_ref(lang, en);
+
+    let inspected_name = s
+        .mcp_hub
+        .inspected_tool
+        .as_ref()
+        .filter(|(sid, _)| sid == server_id)
+        .map(|(_, tname)| tname.as_str());
+
+    let hint = if is_external {
+        t("Click a tool to inspect its schema or run a live test")
+    } else {
+        t("Click a tool to inspect its schema")
+    };
+
+    let mut chips = hrow()
+        .key(format!("mcp-tool-chips-{server_id}"))
+        .w_full()
+        .gap(6.0)
+        .flex_wrap()
+        .center_y();
+
+    for tool in tools {
+        let selected = inspected_name == Some(tool.name.as_str());
+        let sid = server_id.to_owned();
+        let tool_clone = tool.clone();
+        chips = chips.child(
+            Button::new(&tool.name)
+                .variant(if selected {
+                    ButtonVariant::Contrast
+                } else {
+                    ButtonVariant::Outline
+                })
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut UiState| {
+                    s.mcp_hub.toggle_inspected_tool(&sid, &tool_clone);
+                })
+                .build(k)
+                .key(format!("mcp-tool-chip-{server_id}-{}", tool.name)),
+        );
+    }
+
+    if total_count > tools.len() {
+        chips = chips.child(pill(
+            k,
+            &format!("mcp-tools-more-{server_id}"),
+            format!("+{}", total_count - tools.len()),
+        ));
+    }
+
+    let mut section = col()
+        .key(format!("mcp-tools-{server_id}"))
+        .w_full()
+        .py(8.0)
+        .gap(8.0)
+        .child(
+            hrow()
+                .key(format!("mcp-tools-head-{server_id}"))
                 .w_full()
-                .py(8.0)
-                .gap(4.0)
+                .gap(8.0)
+                .center_y()
+                .flex_wrap()
                 .child(
-                    text(format!(
-                        "{} ({})",
-                        t("Discovered tools"),
-                        upstream.tool_count
-                    ))
-                    .font(k.ty.small)
-                    .color(k.c.text_base),
+                    text(format!("{heading} ({total_count})"))
+                        .font(k.ty.small_medium)
+                        .color(k.c.text_base),
                 )
+                .child(text(hint).font(k.ty.small).color(k.c.text_muted)),
+        )
+        .child(chips);
+
+    if let Some(inspected_tool) =
+        inspected_name.and_then(|name| tools.iter().find(|t| t.name == name))
+    {
+        section = section.child(tool_inspector_panel(
+            s,
+            k,
+            server_id,
+            inspected_tool,
+            is_external,
+            server_enabled,
+        ));
+    }
+
+    section
+}
+
+fn tool_inspector_panel(
+    s: &UiState,
+    k: &Kit,
+    server_id: &str,
+    tool: &McpUpstreamToolPreview,
+    is_external: bool,
+    server_enabled: bool,
+) -> El {
+    let lang = s.cfg.general.language;
+    let t = |en| tr_ref(lang, en);
+
+    let mut header_actions = hrow()
+        .key(format!("mcp-insp-actions-{server_id}-{}", tool.name))
+        .gap(6.0)
+        .center_y();
+    if tool.input_schema.is_some() {
+        let toggle_label = if s.mcp_hub.show_raw_schema {
+            t("Hide JSON")
+        } else {
+            t("Raw JSON")
+        };
+        header_actions = header_actions.child(
+            Button::new(toggle_label)
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Small)
+                .on_press(|s: &mut UiState| {
+                    s.mcp_hub.show_raw_schema = !s.mcp_hub.show_raw_schema;
+                })
+                .build(k)
+                .key(format!("mcp-insp-raw-{server_id}-{}", tool.name)),
+        );
+    }
+    header_actions = header_actions.child(
+        Button::new(t("Close"))
+            .variant(ButtonVariant::Ghost)
+            .control_size(ControlSize::Small)
+            .on_press(|s: &mut UiState| {
+                s.mcp_hub.inspected_tool = None;
+                s.mcp_hub.show_raw_schema = false;
+                s.mcp_hub.tool_args_error = None;
+            })
+            .build(k)
+            .key(format!("mcp-insp-close-{server_id}-{}", tool.name)),
+    );
+
+    let header = hrow()
+        .key(format!("mcp-insp-head-{server_id}-{}", tool.name))
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .child(
+            text(tool.name.clone())
+                .font(k.ty.mono)
+                .color(k.c.text_base)
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .truncate(),
+        )
+        .child(header_actions);
+
+    let desc_text = if tool.description.trim().is_empty() {
+        t("No description provided.").to_owned()
+    } else {
+        tool.description.clone()
+    };
+
+    let mut panel = col()
+        .key(format!("mcp-inspector-{server_id}-{}", tool.name))
+        .w_full()
+        .px(12.0)
+        .py(12.0)
+        .gap(10.0)
+        .radius(k.radius.md)
+        .fill(k.c.layer_02)
+        .border(1.0, k.c.border_weak.alpha(0.6))
+        .child(header)
+        .child(
+            text(desc_text)
+                .font(k.ty.small)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full(),
+        );
+
+    let params = extract_schema_params(tool.input_schema.as_ref());
+    if !params.is_empty() {
+        let mut list = col()
+            .key(format!("mcp-insp-params-{server_id}-{}", tool.name))
+            .w_full()
+            .gap(6.0)
+            .child(
+                text(t("Parameters"))
+                    .font(k.ty.small_medium)
+                    .color(k.c.text_base),
+            );
+        for param in &params {
+            let mut line = hrow()
+                .key(format!(
+                    "mcp-param-{server_id}-{}-{}",
+                    tool.name, param.name
+                ))
+                .w_full()
+                .gap(6.0)
+                .center_y()
+                .flex_wrap()
                 .child(
-                    text(summary)
+                    text(param.name.clone())
+                        .font(k.ty.mono)
+                        .color(k.c.text_base),
+                )
+                .child(pill(
+                    k,
+                    &format!("mcp-param-ty-{server_id}-{}-{}", tool.name, param.name),
+                    param.ty.clone(),
+                ));
+            if param.required {
+                line = line.child(
+                    hrow()
+                        .key(format!(
+                            "mcp-param-req-{server_id}-{}-{}",
+                            tool.name, param.name
+                        ))
+                        .px(6.0)
+                        .py(1.0)
+                        .radius(k.radius.sm)
+                        .fill(k.c.layer_01)
+                        .border(1.0, k.c.border_weak.alpha(0.6))
+                        .center_y()
+                        .child(text(t("required")).font(k.ty.small).color(k.c.text_accent)),
+                );
+            }
+            let mut item = col()
+                .key(format!(
+                    "mcp-param-item-{server_id}-{}-{}",
+                    tool.name, param.name
+                ))
+                .w_full()
+                .gap(2.0)
+                .child(line);
+            if let Some(desc) = &param.description {
+                item = item.child(
+                    text(desc.clone())
                         .font(k.ty.small)
                         .color(k.c.text_muted)
                         .wrap()
                         .w_full(),
-                ),
+                );
+            }
+            list = list.child(item);
+        }
+        panel = panel.child(list);
+    } else if tool.input_schema.is_some() {
+        panel = panel.child(
+            text(t("No parameters required."))
+                .font(k.ty.small)
+                .color(k.c.text_muted),
+        );
+    } else {
+        panel = panel.child(
+            text(t("Input schema unavailable."))
+                .font(k.ty.small)
+                .color(k.c.text_muted),
         );
     }
 
-    group_with(k, &format!("mcp-upstream-{id}"), head, rows)
+    if s.mcp_hub.show_raw_schema {
+        if let Some(schema) = &tool.input_schema {
+            panel = panel.child(
+                col()
+                    .key(format!("mcp-insp-rawbox-{server_id}-{}", tool.name))
+                    .w_full()
+                    .px(8.0)
+                    .py(8.0)
+                    .radius(k.radius.sm)
+                    .fill(k.c.bg_base)
+                    .border(1.0, k.c.border_weak.alpha(0.45))
+                    .child(
+                        text(format_json_preview(schema))
+                            .font(k.ty.mono)
+                            .color(k.c.text_muted)
+                            .wrap()
+                            .w_full(),
+                    ),
+            );
+        }
+    }
+
+    if is_external && server_id != "muqun" {
+        panel = panel.child(
+            el().key(format!("mcp-insp-rule-{server_id}-{}", tool.name))
+                .w_full()
+                .h(1.0)
+                .fill(k.c.border_weak.alpha(0.35))
+                .a11y_hidden(),
+        );
+        if !server_enabled {
+            panel = panel.child(
+                text(t("Enable this server to test tools live."))
+                    .font(k.ty.small)
+                    .color(k.c.text_muted),
+            );
+        } else {
+            let calling = s
+                .mcp_hub
+                .tool_calling
+                .as_ref()
+                .is_some_and(|(sid, tname)| sid == server_id && tname == &tool.name);
+            let run_sid = server_id.to_owned();
+            let run_tool = tool.name.clone();
+            let submit_sid = server_id.to_owned();
+            let submit_tool = tool.name.clone();
+
+            let args_field = TextInput::new(&s.mcp_hub.tool_args_input)
+                .label(t("Test arguments (JSON)"))
+                .placeholder("{}")
+                .width(None)
+                .on_edit(|s: &mut UiState| &mut s.mcp_hub.tool_args_input)
+                .on_submit(move |s: &mut UiState, _: &mut rune::Tx| {
+                    submit_tool_test(s, &submit_sid, &submit_tool);
+                })
+                .build(k)
+                .key(format!("mcp-test-args-{server_id}-{}", tool.name))
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0);
+
+            let run_btn = Button::new(if calling {
+                t("Running…")
+            } else {
+                t("Test tool")
+            })
+            .variant(ButtonVariant::Submit)
+            .control_size(ControlSize::Regular)
+            .disabled(calling)
+            .on_press(move |s: &mut UiState| {
+                submit_tool_test(s, &run_sid, &run_tool);
+            })
+            .build(k)
+            .key(format!("mcp-test-run-{server_id}-{}", tool.name));
+
+            let mut tester = col()
+                .key(format!("mcp-tester-{server_id}-{}", tool.name))
+                .w_full()
+                .gap(8.0)
+                .child(
+                    text(t("Test arguments (JSON)"))
+                        .font(k.ty.small_medium)
+                        .color(k.c.text_base),
+                )
+                .child(
+                    hrow()
+                        .key(format!("mcp-tester-row-{server_id}-{}", tool.name))
+                        .w_full()
+                        .gap(8.0)
+                        .center_y()
+                        .child(args_field)
+                        .child(run_btn),
+                );
+
+            if let Some(arg_err) = &s.mcp_hub.tool_args_error {
+                tester = tester.child(status(
+                    k,
+                    &format!("mcp-test-arg-err-{server_id}-{}", tool.name),
+                    Tone::Bad,
+                    arg_err.clone(),
+                ));
+            }
+
+            if let Some(output) = s
+                .mcp_hub
+                .tool_call_output
+                .as_ref()
+                .filter(|out| out.server_id == server_id && out.tool == tool.name)
+            {
+                match &output.outcome {
+                    Ok(res) => {
+                        let mut meta = hrow()
+                            .key(format!("mcp-test-meta-{server_id}-{}", tool.name))
+                            .w_full()
+                            .gap(8.0)
+                            .center_y()
+                            .child(status(
+                                k,
+                                &format!("mcp-test-latency-{server_id}-{}", tool.name),
+                                Tone::Good,
+                                format!("{} ms", res.duration_ms),
+                            ));
+                        if res.redacted {
+                            meta = meta.child(pill(
+                                k,
+                                &format!("mcp-test-redacted-{server_id}-{}", tool.name),
+                                t("Redacted"),
+                            ));
+                        }
+                        tester = tester.child(meta).child(
+                            col()
+                                .key(format!("mcp-test-result-{server_id}-{}", tool.name))
+                                .w_full()
+                                .px(8.0)
+                                .py(8.0)
+                                .radius(k.radius.sm)
+                                .fill(k.c.bg_base)
+                                .border(1.0, k.c.border_weak.alpha(0.45))
+                                .child(
+                                    text(format_json_preview(&res.result))
+                                        .font(k.ty.mono)
+                                        .color(k.c.text_base)
+                                        .wrap()
+                                        .w_full(),
+                                ),
+                        );
+                    }
+                    Err(err) => {
+                        tester = tester.child(status(
+                            k,
+                            &format!("mcp-test-err-{server_id}-{}", tool.name),
+                            Tone::Bad,
+                            err.clone(),
+                        ));
+                    }
+                }
+            }
+
+            panel = panel.child(tester);
+        }
+    }
+
+    panel
 }
 
 #[cfg(test)]
@@ -1341,6 +2144,7 @@ mod tests {
             tools: vec![McpUpstreamToolPreview {
                 name: "create_issue".into(),
                 description: "Create issue".into(),
+                input_schema: None,
             }],
             last_probed_ms: Some(1234),
             last_error: None,
@@ -1437,5 +2241,131 @@ mod tests {
 
         st.apply_deleted("demo".into(), Ok(()));
         assert!(st.upstreams.is_empty());
+    }
+
+    #[test]
+    fn quick_templates_prefill_safe_defaults_for_stdio_and_http() {
+        let mut st = McpHubState::default();
+        st.open_new_form();
+
+        st.apply_template(McpTemplate::Filesystem);
+        assert_eq!(st.id_input.text, "filesystem");
+        assert_eq!(st.transport_idx, 1);
+        assert_eq!(st.command_input.text, "npx");
+        assert!(st
+            .args_input
+            .text
+            .contains("@modelcontextprotocol/server-filesystem"));
+        assert_eq!(st.scope_idx, 0);
+        assert_eq!(st.timeout_input.text, "30");
+
+        st.apply_template(McpTemplate::GitHub);
+        assert_eq!(st.id_input.text, "github");
+        assert_eq!(st.transport_idx, 1);
+        assert_eq!(st.env_input.text, "GITHUB_PERSONAL_ACCESS_TOKEN=");
+
+        st.apply_template(McpTemplate::Context7);
+        assert_eq!(st.id_input.text, "context7");
+        assert!(st.args_input.text.contains("@upstash/context7-mcp"));
+
+        st.apply_template(McpTemplate::Playwright);
+        assert_eq!(st.id_input.text, "playwright");
+        assert!(st.args_input.text.contains("@playwright/mcp@latest"));
+
+        st.apply_template(McpTemplate::TailscaleHttp);
+        assert_eq!(st.id_input.text, "tailscale-mcp");
+        assert_eq!(st.transport_idx, 0);
+        assert_eq!(st.url_input.text, "http://100.x.y.z:3000/mcp");
+        assert_eq!(st.scope_idx, 0);
+        assert!(st.command_input.text.is_empty());
+        let (id, body) = st.build_upsert().unwrap();
+        assert_eq!(id, "tailscale-mcp");
+        assert_eq!(body.scope, "local_only");
+    }
+
+    #[test]
+    fn schema_skeleton_generates_typed_json_and_fallback() {
+        assert_eq!(schema_args_skeleton(None), "{}");
+        assert_eq!(
+            schema_args_skeleton(Some(&serde_json::json!({ "type": "object" }))),
+            "{}"
+        );
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string", "description": "Issue title" },
+                "limit": { "type": "integer" },
+                "draft": { "type": "boolean" },
+                "labels": { "type": "array" },
+                "mode": { "type": "string", "enum": ["fast", "deep"] }
+            },
+            "required": ["title"]
+        });
+        let skeleton = schema_args_skeleton(Some(&schema));
+        let parsed: serde_json::Value = serde_json::from_str(&skeleton).unwrap();
+        assert_eq!(parsed["title"], "");
+        assert_eq!(parsed["limit"], 0);
+        assert_eq!(parsed["draft"], false);
+        assert_eq!(parsed["labels"], serde_json::json!([]));
+        assert_eq!(parsed["mode"], "fast");
+
+        let params = extract_schema_params(Some(&schema));
+        assert_eq!(params[0].name, "title");
+        assert!(params[0].required);
+        assert_eq!(params[0].ty, "string");
+    }
+
+    #[test]
+    fn toggle_inspected_tool_and_apply_tool_called_update_state() {
+        let mut st = McpHubState::default();
+        let tool = McpUpstreamToolPreview {
+            name: "create_issue".into(),
+            description: "Create a GitHub issue".into(),
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "title": { "type": "string" } },
+                "required": ["title"]
+            })),
+        };
+
+        st.toggle_inspected_tool("github", &tool);
+        assert_eq!(
+            st.inspected_tool,
+            Some(("github".into(), "create_issue".into()))
+        );
+        assert_eq!(st.tool_args_input.text, r#"{"title":""}"#);
+
+        st.tool_calling = Some(("github".into(), "create_issue".into()));
+        let call_res = McpToolCallResult {
+            upstream: "github".into(),
+            tool: "create_issue".into(),
+            result: serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] }),
+            redacted: true,
+            duration_ms: 42,
+        };
+        st.apply_tool_called("github".into(), "create_issue".into(), Ok(call_res.clone()));
+        assert!(st.tool_calling.is_none());
+        let output = st.tool_call_output.as_ref().unwrap();
+        assert_eq!(output.server_id, "github");
+        assert_eq!(output.tool, "create_issue");
+        assert_eq!(output.outcome, Ok(call_res));
+
+        // Error outcome replaces output and clears matching in-flight state.
+        st.tool_calling = Some(("github".into(), "create_issue".into()));
+        st.apply_tool_called(
+            "github".into(),
+            "create_issue".into(),
+            Err("tool denied".into()),
+        );
+        assert!(st.tool_calling.is_none());
+        assert_eq!(
+            st.tool_call_output.as_ref().unwrap().outcome,
+            Err("tool denied".into())
+        );
+
+        // Clicking same tool again collapses inspector.
+        st.toggle_inspected_tool("github", &tool);
+        assert!(st.inspected_tool.is_none());
     }
 }

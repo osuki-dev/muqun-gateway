@@ -217,6 +217,23 @@ pub(crate) struct McpHub {
 pub(crate) struct UpstreamToolPreview {
     pub(crate) name: String,
     pub(crate) description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) input_schema: Option<Value>,
+}
+
+/// Cap an `inputSchema` value for management previews so oversized schemas
+/// never bloat `GET /api/mcp/upstreams` responses.
+pub(crate) fn preview_input_schema(schema: Value) -> Option<Value> {
+    if schema.is_null() {
+        return None;
+    }
+    if schema.to_string().len() > MAX_TOOL_SCHEMA_BYTES {
+        return Some(json!({
+            "type": "object",
+            "description": "Schema omitted (exceeded 16 KiB limit)"
+        }));
+    }
+    Some(schema)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -282,6 +299,14 @@ pub(crate) struct UpstreamUpsertBody {
     #[serde(default)]
     pub(crate) denied_tools: Vec<String>,
     pub(crate) transport: UpstreamTransport,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpstreamCallBody {
+    pub(crate) tool: String,
+    #[serde(default)]
+    pub(crate) arguments: Option<Value>,
 }
 
 fn default_true_hub() -> bool {
@@ -1114,11 +1139,13 @@ impl McpHub {
             "method": method,
             "params": params,
         });
-        let resp = req
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| HttpRpcErr::Other(format!("HTTP request failed: {e}")))?;
+        let resp = req.json(&body).send().await.map_err(|e| {
+            if e.is_timeout() {
+                HttpRpcErr::Other(format!("upstream HTTP request timed out: {e}"))
+            } else {
+                HttpRpcErr::Other(format!("HTTP request failed: {e}"))
+            }
+        })?;
 
         let status = resp.status();
         if status.is_redirection() {
@@ -1796,6 +1823,7 @@ fn upstream_view(cfg: UpstreamMcpConfig, st: UpstreamRuntimeState) -> UpstreamVi
         .map(|t| UpstreamToolPreview {
             name: t.name.clone(),
             description: t.description.clone(),
+            input_schema: preview_input_schema(t.input_schema.clone()),
         })
         .collect();
     UpstreamView {
@@ -1857,6 +1885,7 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
             put(upsert_upstream).delete(delete_upstream),
         )
         .route("/api/mcp/upstreams/{id}/probe", post(probe_upstream))
+        .route("/api/mcp/upstreams/{id}/call", post(call_upstream_tool))
 }
 
 async fn list_upstreams(
@@ -1983,6 +2012,98 @@ async fn probe_upstream(
             "probe_failed",
             "Upstream probe failed",
         )),
+    }
+}
+
+async fn call_upstream_tool(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Result<Json<UpstreamCallBody>, axum::extract::rejection::JsonRejection>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let Json(payload) = body.map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Invalid upstream tool call payload",
+        )
+    })?;
+    let tool = payload.tool.trim();
+    if tool.is_empty() || tool.len() > 128 || tool.chars().any(char::is_control) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_tool",
+            "tool must be 1..=128 non-control characters",
+        ));
+    }
+    let arguments = match payload.arguments {
+        None | Some(Value::Null) => json!({}),
+        Some(val) if val.is_object() => val,
+        Some(_) => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_arguments",
+                "arguments must be a JSON object",
+            ));
+        }
+    };
+
+    let started = std::time::Instant::now();
+    // Paired device test calls act as LocalOwner so local_only upstreams can be tested
+    // from Settings while strictly enforcing enabled, tool ACLs, timeout, size cap, and redaction.
+    match state
+        .mcp_hub
+        .call_tool(CallerScope::LocalOwner, &id, tool, arguments)
+        .await
+    {
+        Ok(out) => {
+            let duration_ms = started.elapsed().as_millis() as u64;
+            let redacted = out
+                .get("redacted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let result = out.get("result").cloned().unwrap_or(Value::Null);
+            Ok(Json(json!({
+                "ok": true,
+                "data": {
+                    "upstream": id,
+                    "tool": tool,
+                    "result": result,
+                    "redacted": redacted,
+                    "duration_ms": duration_ms,
+                }
+            })))
+        }
+        Err(HubCallError::NotFound(_)) => Err(api_error(
+            StatusCode::NOT_FOUND,
+            "upstream_not_found",
+            "Upstream MCP server not found",
+        )),
+        Err(HubCallError::Disabled(server)) => Err(api_error(
+            StatusCode::FORBIDDEN,
+            "upstream_disabled",
+            &format!("Upstream MCP server '{server}' is disabled"),
+        )),
+        Err(HubCallError::ScopeDenied { server, .. }) => Err(api_error(
+            StatusCode::FORBIDDEN,
+            "scope_denied",
+            &format!("Caller scope does not permit upstream '{server}'"),
+        )),
+        Err(HubCallError::ToolDenied { server, tool }) => Err(api_error(
+            StatusCode::FORBIDDEN,
+            "tool_denied",
+            &format!("Tool '{tool}' is blocked by ACL policy on upstream '{server}'"),
+        )),
+        Err(HubCallError::UpstreamFailed(msg)) => {
+            let lc = msg.to_ascii_lowercase();
+            let (status, code) = if lc.contains("timed out") || lc.contains("timeout") {
+                (StatusCode::GATEWAY_TIMEOUT, "upstream_timeout")
+            } else {
+                (StatusCode::BAD_GATEWAY, "upstream_call_failed")
+            };
+            Err(api_error(status, code, &msg))
+        }
     }
 }
 
@@ -2781,5 +2902,190 @@ done
             .await
             .unwrap();
         assert_eq!(ok["result"]["content"][0]["text"], "created:ACL ok");
+    }
+
+    #[tokio::test]
+    async fn rest_api_exposes_input_schema_and_live_tool_call_enforces_acl_and_redaction() {
+        let url = start_mock_http_mcp("Bearer call-secret", false).await;
+        let state = test_state("admin", vec![test_device("d1", "device-tok")]);
+        let app = mount(Router::new()).with_state(state.clone());
+
+        // 1. Register an upstream with a denied tool ACL (`blocked_*`) and probe it.
+        let put_req = Request::builder()
+            .method("PUT")
+            .uri("/api/mcp/upstreams/test_srv")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer device-tok")
+            .body(Body::from(
+                json!({
+                    "label": "Test Server",
+                    "enabled": true,
+                    "scope": "local_only",
+                    "isolation": "shared",
+                    "denied_tools": ["blocked_*"],
+                    "transport": {
+                        "kind": "http",
+                        "url": url,
+                        "headers": { "Authorization": "Bearer call-secret" }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(put_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let probe_req = Request::builder()
+            .method("POST")
+            .uri("/api/mcp/upstreams/test_srv/probe")
+            .header("authorization", "Bearer device-tok")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(probe_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 2. GET /api/mcp/upstreams includes `input_schema` for built-in and upstream tools.
+        let get_req = Request::builder()
+            .method("GET")
+            .uri("/api/mcp/upstreams")
+            .header("authorization", "Bearer device-tok")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(get_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let listed: Value = serde_json::from_slice(&bytes).unwrap();
+        let builtin_tools = listed["builtin"]["tools"].as_array().unwrap();
+        assert!(
+            builtin_tools.iter().any(|t| t["name"] == "exec.run"
+                && t["input_schema"]["properties"]["command"].is_object()),
+            "expected built-in exec.run input_schema: {listed}"
+        );
+        let upstream_tools = listed["upstreams"][0]["tools"].as_array().unwrap();
+        let create_issue = upstream_tools
+            .iter()
+            .find(|t| t["name"] == "create_issue")
+            .expect("create_issue preview");
+        assert_eq!(create_issue["input_schema"]["required"], json!(["title"]));
+
+        // 3. POST /api/mcp/upstreams/{id}/call succeeds and returns result, duration_ms, redacted=false.
+        let call_req = Request::builder()
+            .method("POST")
+            .uri("/api/mcp/upstreams/test_srv/call")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer device-tok")
+            .body(Body::from(
+                json!({
+                    "tool": "create_issue",
+                    "arguments": { "title": "Live test" }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(call_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let called: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(called["ok"], true, "{called}");
+        assert_eq!(called["data"]["upstream"], "test_srv");
+        assert_eq!(called["data"]["tool"], "create_issue");
+        assert_eq!(called["data"]["redacted"], false);
+        assert!(called["data"]["duration_ms"].as_u64().is_some());
+        assert_eq!(
+            called["data"]["result"]["content"][0]["text"],
+            "created:Live test"
+        );
+
+        // 4. POST /api/mcp/upstreams/{id}/call redacts secrets and sets redacted=true.
+        let leak_req = Request::builder()
+            .method("POST")
+            .uri("/api/mcp/upstreams/test_srv/call")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer device-tok")
+            .body(Body::from(json!({ "tool": "leak_secret" }).to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(leak_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let leaked: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(leaked["data"]["redacted"], true, "{leaked}");
+        let leaked_text = leaked["data"]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(!leaked_text.contains("ghp_1234567890"), "{leaked}");
+        assert!(leaked_text.contains("[REDACTED]"), "{leaked}");
+
+        // 5. Rejects denied ACL tool (403) and non-object arguments (400) and missing upstream (404).
+        let denied_req = Request::builder()
+            .method("POST")
+            .uri("/api/mcp/upstreams/test_srv/call")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer device-tok")
+            .body(Body::from(json!({ "tool": "blocked_delete" }).to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(denied_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let bad_args_req = Request::builder()
+            .method("POST")
+            .uri("/api/mcp/upstreams/test_srv/call")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer device-tok")
+            .body(Body::from(
+                json!({ "tool": "create_issue", "arguments": ["not-an-object"] }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(bad_args_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let missing_req = Request::builder()
+            .method("POST")
+            .uri("/api/mcp/upstreams/does_not_exist/call")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer device-tok")
+            .body(Body::from(json!({ "tool": "ping" }).to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(missing_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // 6. Disable upstream and verify call is rejected with 403 upstream_disabled.
+        let disable_req = Request::builder()
+            .method("PUT")
+            .uri("/api/mcp/upstreams/test_srv")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer device-tok")
+            .body(Body::from(
+                json!({
+                    "label": "Test Server",
+                    "enabled": false,
+                    "scope": "local_only",
+                    "isolation": "shared",
+                    "transport": {
+                        "kind": "http",
+                        "url": url,
+                        "headers": { "Authorization": MASKED_SECRET }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(disable_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let disabled_call_req = Request::builder()
+            .method("POST")
+            .uri("/api/mcp/upstreams/test_srv/call")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer device-tok")
+            .body(Body::from(json!({ "tool": "create_issue" }).to_string()))
+            .unwrap();
+        let resp = app.oneshot(disabled_call_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }

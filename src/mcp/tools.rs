@@ -618,6 +618,9 @@ pub(crate) fn builtin_tool_previews() -> Vec<super::hub::UpstreamToolPreview> {
         .map(|tool| super::hub::UpstreamToolPreview {
             name: tool.name.to_string(),
             description: tool.description.map(|d| d.to_string()).unwrap_or_default(),
+            input_schema: super::hub::preview_input_schema(Value::Object(
+                (*tool.input_schema).clone(),
+            )),
         })
         .collect();
     tools.sort_by(|a, b| a.name.cmp(&b.name));

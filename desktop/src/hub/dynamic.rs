@@ -691,6 +691,16 @@ impl SessionHub for DynamicHub {
         Box::pin(async move { active.probe_mcp_upstream(id).await })
     }
 
+    fn call_mcp_upstream_tool<'a>(
+        &'a self,
+        id: &'a str,
+        tool: &'a str,
+        arguments: serde_json::Value,
+    ) -> HubFuture<'a, super::McpToolCallResult> {
+        let active = self.active();
+        Box::pin(async move { active.call_mcp_upstream_tool(id, tool, arguments).await })
+    }
+
     fn events(&self) -> broadcast::Receiver<AgentDomainEvent> {
         if let Ok(events) = CONNECTION.try_with(|c| c.hub.events()) {
             return events;

@@ -328,6 +328,12 @@ pub enum Command {
     ProbeMcpUpstream {
         id: String,
     },
+    /// Call one tool on an enabled upstream MCP server in the active Gateway's MCP Hub.
+    CallMcpUpstreamTool {
+        id: String,
+        tool: String,
+        arguments: serde_json::Value,
+    },
 }
 
 pub type CommandSender = mpsc::UnboundedSender<Command>;

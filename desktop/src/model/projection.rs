@@ -903,6 +903,19 @@ impl Core {
                     .map_err(|err| err.to_string());
                 self.inbox.push(Update::McpUpstreamProbed { id, result });
             }
+            Command::CallMcpUpstreamTool {
+                id,
+                tool,
+                arguments,
+            } => {
+                let result = self
+                    .hub
+                    .call_mcp_upstream_tool(&id, &tool, arguments)
+                    .await
+                    .map_err(|err| err.to_string());
+                self.inbox
+                    .push(Update::McpUpstreamToolCalled { id, tool, result });
+            }
             Command::UnpairComputer {
                 computer,
                 request,

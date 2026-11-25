@@ -1406,6 +1406,45 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
             }}),
         ),
         (
+            "/api/mcp/upstreams/{id}/call",
+            json!({ "post": {
+                "summary": "Call a tool on an enabled upstream MCP server with ACL, timeout, size cap, and secret redaction enforcement. Requires a device token and mcp_hub_v1",
+                "parameters": [path_param("id")],
+                "requestBody": json_body(json!({
+                    "type": "object",
+                    "required": ["tool"],
+                    "properties": {
+                        "tool": { "type": "string", "description": "Name of the tool exposed by this upstream MCP server" },
+                        "arguments": { "type": "object", "description": "Optional JSON object of tool arguments (defaults to {})", "additionalProperties": true }
+                    }
+                })),
+                "responses": with_errors(json_ok("Tool call result", json!({
+                    "type": "object",
+                    "required": ["ok", "data"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "data": {
+                            "type": "object",
+                            "required": ["upstream", "tool", "result", "redacted", "duration_ms"],
+                            "properties": {
+                                "upstream": { "type": "string" },
+                                "tool": { "type": "string" },
+                                "result": {},
+                                "redacted": { "type": "boolean" },
+                                "duration_ms": { "type": "integer" }
+                            }
+                        }
+                    }
+                })), &[
+                    ("400", "invalid_request, invalid_tool, invalid_arguments"),
+                    ("403", "upstream_disabled, scope_denied, tool_denied"),
+                    ("404", "upstream_not_found"),
+                    ("502", "upstream_call_failed"),
+                    ("504", "upstream_timeout"),
+                ])
+            }}),
+        ),
+        (
             "/api/pair/pending",
             json!({ "post": {
                 "summary": "Mint a pairing code on the owner's behalf for a device not in front of this computer: another gateway being linked (kind gateway). Requires the admin token or an app device; another gateway's token is refused (peer_forbidden). Requires the fleet_peers capability",

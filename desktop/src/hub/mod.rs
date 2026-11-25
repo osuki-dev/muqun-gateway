@@ -68,6 +68,20 @@ pub struct McpUpstreamToolPreview {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub input_schema: Option<serde_json::Value>,
+}
+
+/// Result returned by `POST /api/mcp/upstreams/{id}/call`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpToolCallResult {
+    pub upstream: String,
+    pub tool: String,
+    pub result: serde_json::Value,
+    #[serde(default)]
+    pub redacted: bool,
+    #[serde(default)]
+    pub duration_ms: u64,
 }
 
 /// Preview of one skill served by Muqun's built-in MCP server.
@@ -906,6 +920,20 @@ pub trait SessionHub: Send + Sync {
     }
     /// Probe one upstream MCP server live and return updated health/tools.
     fn probe_mcp_upstream<'a>(&'a self, _id: &'a str) -> HubFuture<'a, McpUpstreamView> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "Connect to a Gateway service with mcp_hub_v1 to manage unified MCP servers."
+                    .into(),
+            )))
+        })
+    }
+    /// Call one tool on an enabled upstream MCP server in Gateway's unified MCP Hub.
+    fn call_mcp_upstream_tool<'a>(
+        &'a self,
+        _id: &'a str,
+        _tool: &'a str,
+        _arguments: serde_json::Value,
+    ) -> HubFuture<'a, McpToolCallResult> {
         Box::pin(async {
             Err(HubError::Agent(AgentError::Unsupported(
                 "Connect to a Gateway service with mcp_hub_v1 to manage unified MCP servers."

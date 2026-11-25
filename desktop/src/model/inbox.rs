@@ -301,6 +301,12 @@ pub enum Update {
         id: String,
         result: Result<crate::hub::McpUpstreamView, String>,
     },
+    /// Live test call to one upstream MCP tool completed.
+    McpUpstreamToolCalled {
+        id: String,
+        tool: String,
+        result: Result<crate::hub::McpToolCallResult, String>,
+    },
 }
 
 impl Update {

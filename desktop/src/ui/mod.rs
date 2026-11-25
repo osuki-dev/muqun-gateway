@@ -3717,6 +3717,9 @@ impl UiState {
                 Update::McpUpstreamSaved { id, result } => self.mcp_hub.apply_saved(id, result),
                 Update::McpUpstreamDeleted { id, result } => self.mcp_hub.apply_deleted(id, result),
                 Update::McpUpstreamProbed { id, result } => self.mcp_hub.apply_probed(id, result),
+                Update::McpUpstreamToolCalled { id, tool, result } => {
+                    self.mcp_hub.apply_tool_called(id, tool, result)
+                }
                 Update::TaskHistory { id, steps } => {
                     self.tasks_view.history.insert(id, steps);
                 }

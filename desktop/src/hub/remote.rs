@@ -1973,6 +1973,34 @@ impl SessionHub for RemoteHub {
         })
     }
 
+    fn call_mcp_upstream_tool<'a>(
+        &'a self,
+        id: &'a str,
+        tool: &'a str,
+        arguments: Value,
+    ) -> HubFuture<'a, super::McpToolCallResult> {
+        Box::pin(async move {
+            if !self.has_capability(MCP_HUB_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "This Gateway needs the MCP Hub update (mcp_hub_v1).".into(),
+                )));
+            }
+            let body = json!({
+                "tool": tool,
+                "arguments": arguments,
+            });
+            let json = self
+                .call(
+                    Method::POST,
+                    &["api", "mcp", "upstreams", id, "call"],
+                    &[],
+                    Some(body),
+                )
+                .await?;
+            decode(json.get("data").cloned().unwrap_or(Value::Null))
+        })
+    }
+
     fn task_events(&self) -> Option<broadcast::Receiver<TaskHubEvent>> {
         Some(self.task_events.subscribe())
     }
