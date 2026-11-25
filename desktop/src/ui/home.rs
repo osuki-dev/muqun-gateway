@@ -52,7 +52,10 @@ pub fn submit_start(s: &mut UiState) {
     } else {
         PathBuf::from(typed)
     };
-    let (agent, worktree) = (s.start_agent.clone(), s.start_worktree);
+    let (agent, worktree) = (
+        s.start_agent.clone(),
+        s.start_worktree && s.current_computer() == "local",
+    );
     let (model, mode) = (s.start_model.clone(), s.start_mode.clone());
     if model.is_some() || mode.is_some() {
         s.edit(ConfigEdit::Remember {
@@ -704,10 +707,12 @@ fn quick_start(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>, size: [f3
         .center_y()
         .flex_wrap()
         .child(folder(s, k, layer));
-    if let Some(branch) = start_branch(s, k, layer) {
-        context = context.child(branch);
+    if s.current_computer() == "local" {
+        if let Some(branch) = start_branch(s, k, layer) {
+            context = context.child(branch);
+        }
+        context = context.child(worktree(s, k));
     }
-    context = context.child(worktree(s, k));
     let context = composer::context_capsule(k, look, context);
     composer::popup(s, k, layer, Slot::Start);
     if s.drop_hover {

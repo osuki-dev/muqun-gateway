@@ -1153,5 +1153,10 @@
   "Confirm remove": "Confirm remove",
   "Confirm stop": "Confirm stop",
   "Could not discard file": "Could not discard file",
-  "Switched branch": "Switched branch"
+  "Switched branch": "Switched branch",
+  "Target gateway": "Target gateway",
+  "Remote host": "Remote host",
+  "Select a computer": "Select a computer",
+  "All computers view is active. Pick a specific computer to manage its MCP Hub.": "All computers view is active. Pick a specific computer to manage its MCP Hub.",
+  "Changes apply to the Muqun Gateway running on this host.": "Changes apply to the Muqun Gateway running on this host."
 }

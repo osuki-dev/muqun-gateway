@@ -1226,5 +1226,10 @@
   "Confirm remove": "確認移除",
   "Confirm stop": "確認停止",
   "Could not discard file": "無法放棄檔案修改",
-  "Switched branch": "已切換分支"
+  "Switched branch": "已切換分支",
+  "Target gateway": "目標閘道",
+  "Remote host": "遠端主機",
+  "Select a computer": "選擇一台電腦",
+  "All computers view is active. Pick a specific computer to manage its MCP Hub.": "目前處於全部電腦彙總檢視。請選擇一台特定電腦來管理其 MCP Hub。",
+  "Changes apply to the Muqun Gateway running on this host.": "此處的設定變更將直接生效於該主機上的 Muqun Gateway。"
 }

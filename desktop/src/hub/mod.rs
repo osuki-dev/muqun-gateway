@@ -24,7 +24,9 @@ use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
 use muqun_gateway::platform::StoredUpload;
 use tokio::sync::broadcast;
 
-pub use dynamic::{connection_origin, spawn_connected, ConnectionContext, DynamicHub};
+pub use dynamic::{
+    connection_origin, is_local_connection, spawn_connected, ConnectionContext, DynamicHub,
+};
 pub use local::LocalHub;
 pub(crate) use remote::{
     build_ws_request, local_gateway_credential, WsClientCodec, WsUpgradeRequest,
@@ -820,7 +822,11 @@ pub trait SessionHub: Send + Sync {
         _branch: &'a str,
         _worktree_dir: Option<&'a str>,
     ) -> HubFuture<'a, String> {
-        Box::pin(async { Ok("Merged".into()) })
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "task worktree merge".into(),
+            )))
+        })
     }
     /// Clean up a task's worktree.
     fn clean_task_worktree<'a>(
@@ -830,7 +836,11 @@ pub trait SessionHub: Send + Sync {
         _worktree_dir: Option<&'a str>,
         _branch: Option<&'a str>,
     ) -> HubFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "task worktree cleanup".into(),
+            )))
+        })
     }
     /// What a task opened without a folder would run in.
     fn task_defaults(&self) -> HubFuture<'_, TaskDefaults>;

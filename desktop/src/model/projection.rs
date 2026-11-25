@@ -719,7 +719,9 @@ impl Core {
             }
             Command::LoadProjects { agent } => match self.hub.projects(&agent).await {
                 Ok(mut projects) => {
-                    mark_missing(&mut projects).await;
+                    if crate::hub::is_local_connection() {
+                        mark_missing(&mut projects).await;
+                    }
                     self.inbox.push(Update::Projects { agent, projects })
                 }
                 Err(err) => tracing::debug!(%err, "project list unavailable"),
@@ -1036,8 +1038,7 @@ impl Core {
                 push,
                 asid,
             } => {
-                if !crate::hub::connection_origin().is_none_or(|(c, _)| c == "local" || c == "self")
-                {
+                if !crate::hub::is_local_connection() {
                     self.inbox.push(Update::Ui(super::inbox::UiAction::Toast {
                         title: "Git commit failed".into(),
                         detail: Some("Local git actions are unavailable on remote hosts.".into()),
@@ -1094,8 +1095,7 @@ impl Core {
                 )));
             }
             Command::GitPush { cwd, asid } => {
-                if !crate::hub::connection_origin().is_none_or(|(c, _)| c == "local" || c == "self")
-                {
+                if !crate::hub::is_local_connection() {
                     self.inbox.push(Update::Ui(super::inbox::UiAction::Toast {
                         title: "Git push failed".into(),
                         detail: Some("Local git actions are unavailable on remote hosts.".into()),
@@ -1268,6 +1268,16 @@ impl Core {
                 });
             }
             Command::MaoCaptureBaseline { run_id, cwd, goal } => {
+                let allow_local_git = self.hub.mode() == crate::hub::HubMode::Standalone
+                    || crate::hub::is_local_connection();
+                if !allow_local_git {
+                    self.inbox.push(Update::MaoBaselineCaptured {
+                        run_id,
+                        base_commit: None,
+                        base_commits: std::collections::BTreeMap::new(),
+                    });
+                    return;
+                }
                 let inbox = self.inbox.clone();
                 tokio::task::spawn_blocking(move || {
                     let base_commits =
@@ -1430,7 +1440,7 @@ impl Core {
 
     async fn compose(self: Arc<Self>, command: ComposeCommand) {
         if let ComposeCommand::DiscardFile { cwd, path, asid } = command {
-            if !crate::hub::connection_origin().is_none_or(|(c, _)| c == "local" || c == "self") {
+            if !crate::hub::is_local_connection() {
                 self.inbox.push(Update::Ui(super::inbox::UiAction::Toast {
                     title: "Could not discard file".into(),
                     detail: Some("Local git actions are unavailable on remote hosts.".into()),
@@ -1517,6 +1527,19 @@ impl Core {
                     Deliver::Command { name, .. } | Deliver::Skill { name, .. } => name.as_str(),
                 };
                 let cwd = if worktree {
+                    if !crate::hub::is_local_connection() {
+                        self.fail(HubError::Agent(
+                            muqun_gateway::agents::ports::AgentError::Unsupported(
+                                "Git worktree creation is only available on this computer.".into(),
+                            ),
+                        ));
+                        self.inbox
+                            .push(Update::Composer(Box::new(ComposerUpdate::Submitted {
+                                token,
+                                ok: false,
+                            })));
+                        return;
+                    }
                     match compose::ensure_worktree(&cwd, hint) {
                         Ok(path) => path,
                         Err(err) => {
@@ -2222,7 +2245,9 @@ impl Core {
     async fn known_projects(self: &Arc<Self>, agent: String) {
         match tokio::time::timeout(LIST_TIMEOUT, self.hub.projects(&agent)).await {
             Ok(Ok(mut projects)) => {
-                mark_missing(&mut projects).await;
+                if crate::hub::is_local_connection() {
+                    mark_missing(&mut projects).await;
+                }
                 let dirs = projects
                     .iter()
                     .filter(|p| !p.missing)
@@ -2239,7 +2264,7 @@ impl Core {
     /// Resolve session folders to their projects (`projects::resolve`) off
     /// the async threads; each folder once unless `again`.
     fn resolve_dirs(self: &Arc<Self>, dirs: Vec<String>, again: bool) {
-        if !self.connection_is_current() {
+        if !self.connection_is_current() || !crate::hub::is_local_connection() {
             return;
         }
         let fresh: Vec<String> = {

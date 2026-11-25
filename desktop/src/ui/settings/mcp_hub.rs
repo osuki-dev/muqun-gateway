@@ -431,6 +431,9 @@ fn upsert_from_view(view: &McpUpstreamView) -> McpUpstreamUpsert {
 pub(super) fn actions(s: &UiState, k: &Kit) -> Vec<El> {
     let lang = s.cfg.general.language;
     let t = |en| tr_ref(lang, en);
+    if s.current_computer() == "all" {
+        return Vec::new();
+    }
     let mut out = vec![button(t("Refresh"))
         .disabled(s.mcp_hub.loading)
         .on_press(|s: &mut UiState| s.refresh_mcp_upstreams())
@@ -463,10 +466,131 @@ pub(super) fn actions(s: &UiState, k: &Kit) -> Vec<El> {
     out
 }
 
+fn target_host_card(s: &UiState, k: &Kit) -> El {
+    let lang = s.cfg.general.language;
+    let t = |en| tr_ref(lang, en);
+    let comp = s.current_computer();
+
+    if comp == "all" {
+        let mut picker = hrow()
+            .key("mcp-hub-host-picker")
+            .gap(8.0)
+            .flex_wrap()
+            .center_y();
+        picker = picker.child(
+            button(t("This computer"))
+                .variant(ButtonVariant::Outline)
+                .on_press(|s: &mut UiState| s.switch_computer("local".into()))
+                .build(k)
+                .key("mcp-hub-pick-local"),
+        );
+        let mut remote_ids: Vec<(String, String)> = s
+            .cfg
+            .computers
+            .keys()
+            .filter(|id| UiState::is_remote_computer_id(id))
+            .map(|id| (id.clone(), s.computer_name(id)))
+            .collect();
+        remote_ids.sort_by_key(|a| a.1.to_lowercase());
+        for (id, name) in remote_ids {
+            let target = id.clone();
+            picker = picker.child(
+                button(&name)
+                    .variant(ButtonVariant::Outline)
+                    .on_press(move |s: &mut UiState| s.switch_computer(target.clone()))
+                    .build(k)
+                    .key(format!("mcp-hub-pick-{id}")),
+            );
+        }
+        return group_with(
+            k,
+            "mcp-hub-target-host",
+            hrow()
+                .key("target-head")
+                .gap(8.0)
+                .center_y()
+                .child(
+                    text(t("Select a computer"))
+                        .font(k.ty.ui_medium)
+                        .color(k.c.text_base),
+                ),
+            vec![
+                col()
+                    .key("target-all-body")
+                    .w_full()
+                    .gap(10.0)
+                    .child(
+                        text(t(
+                            "All computers view is active. Pick a specific computer to manage its MCP Hub.",
+                        ))
+                        .font(k.ty.small)
+                        .color(k.c.text_muted),
+                    )
+                    .child(picker),
+            ],
+        );
+    }
+
+    let is_remote = UiState::is_remote_computer_id(comp);
+    let host_name = s.computer_name(comp);
+    let dot_color = if is_remote {
+        s.computer_color(comp)
+    } else {
+        k.c.success.icon
+    };
+    let host_pill = hrow()
+        .key("target-host-pill")
+        .gap(6.0)
+        .px(8.0)
+        .py(2.0)
+        .radius(k.radius.sm)
+        .fill(k.c.layer_02)
+        .border(1.0, k.c.border_weak.alpha(0.5))
+        .center_y()
+        .child(
+            el().size(6.0, 6.0)
+                .radius(3.0)
+                .fill(dot_color)
+                .a11y_hidden(),
+        )
+        .child(text(host_name).font(k.ty.small).color(k.c.text_base));
+
+    let mut head = hrow()
+        .key("target-head")
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .flex_wrap()
+        .child(
+            text(t("Target gateway"))
+                .font(k.ty.ui_medium)
+                .color(k.c.text_base),
+        )
+        .child(host_pill);
+    if is_remote {
+        head = head.child(pill(k, "target-remote-pill", t("Remote host")));
+    }
+
+    group_with(
+        k,
+        "mcp-hub-target-host",
+        head,
+        vec![text(t(
+            "Changes apply to the Muqun Gateway running on this host.",
+        ))
+        .font(k.ty.small)
+        .color(k.c.text_muted)],
+    )
+}
+
 pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
     let lang = s.cfg.general.language;
     let t = |en| tr_ref(lang, en);
-    let mut sections = Vec::new();
+    let mut sections = vec![target_host_card(s, k)];
+
+    if s.current_computer() == "all" {
+        return sections;
+    }
 
     if let Some(reason) = &s.mcp_hub.unsupported_reason {
         sections.push(empty(

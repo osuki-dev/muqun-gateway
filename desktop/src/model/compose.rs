@@ -639,6 +639,16 @@ pub async fn run(
             .await
             .err(),
         ComposeCommand::Branch { cwd } => {
+            if !crate::hub::is_local_connection() {
+                push(
+                    &inbox,
+                    ComposerUpdate::Branch {
+                        cwd,
+                        info: BranchInfo::default(),
+                    },
+                );
+                return None;
+            }
             let path = PathBuf::from(&cwd);
             let info = tokio::task::spawn_blocking(move || branch_info(&path))
                 .await
@@ -647,6 +657,13 @@ pub async fn run(
             None
         }
         ComposeCommand::Checkout { cwd, branch } => {
+            if !crate::hub::is_local_connection() {
+                return Some(HubError::Agent(
+                    muqun_gateway::agents::ports::AgentError::Unsupported(
+                        "Local git checkout is unavailable on remote hosts.".into(),
+                    ),
+                ));
+            }
             let path = PathBuf::from(&cwd);
             let target = branch.clone();
             let result = tokio::task::spawn_blocking(move || checkout_branch(&path, &target)).await;

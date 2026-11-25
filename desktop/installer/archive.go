@@ -109,6 +109,19 @@ func stageLinux(archive, dest, txn, payload string) ([]string, error) {
 	return paths, err
 }
 
+func macTool(name string) string {
+	if path, err := exec.LookPath(name); err == nil {
+		return path
+	}
+	for _, dir := range []string{"/usr/sbin", "/usr/bin", "/sbin", "/bin"} {
+		candidate := filepath.Join(dir, name)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return name
+}
+
 func stageMac(archive, dest, payload string) ([]string, error) {
 	z, err := zip.OpenReader(archive)
 	if err != nil {
@@ -135,15 +148,15 @@ func stageMac(archive, dest, payload string) ([]string, error) {
 		if i == nil || !i.IsDir() {
 			return nil, fmt.Errorf("unexpected app at %s", bundle)
 		}
-		id, err := exec.Command("plutil", "-extract", "CFBundleIdentifier", "raw", "-o", "-", filepath.Join(bundle, "Contents/Info.plist")).Output()
+		id, err := exec.Command(macTool("plutil"), "-extract", "CFBundleIdentifier", "raw", "-o", "-", filepath.Join(bundle, "Contents/Info.plist")).Output()
 		if err != nil || strings.TrimSpace(string(id)) != "com.muqun.desktop" {
 			return nil, fmt.Errorf("unexpected app identity at %s", bundle)
 		}
 	}
-	if err = run(nil, "codesign", "--verify", "--deep", "--strict", app); err != nil {
+	if err = run(nil, macTool("codesign"), "--verify", "--deep", "--strict", app); err != nil {
 		return nil, err
 	}
-	if err = run(nil, "spctl", "--assess", "--type", "execute", app); err != nil {
+	if err = run(nil, macTool("spctl"), "--assess", "--type", "execute", app); err != nil {
 		return nil, err
 	}
 	return []string{macApp}, nil

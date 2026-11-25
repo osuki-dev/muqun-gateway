@@ -365,6 +365,19 @@ impl RemoteHub {
         }
     }
 
+    /// True when this gateway URL points to the local loopback interface.
+    fn is_loopback_base(&self) -> bool {
+        matches!(
+            self.base.host_str(),
+            Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+        )
+    }
+
+    /// True when this hub targets the local machine's filesystem.
+    fn targets_local_machine(&self) -> bool {
+        super::is_local_connection() && self.is_loopback_base()
+    }
+
     /// The whole JSON answer of one call.
     async fn call(
         &self,
@@ -1066,19 +1079,20 @@ impl SessionHub for RemoteHub {
         limit: usize,
     ) -> HubFuture<'a, Vec<Value>> {
         Box::pin(async move {
-            if !Path::new(directory).is_absolute() || !Path::new(directory).is_dir() {
+            let trimmed = directory.trim();
+            if trimmed.is_empty() || !is_remote_or_local_absolute(trimmed) {
                 return Ok(Vec::new());
             }
-            let limit = limit.to_string();
+            let limit_str = limit.to_string();
             let found: Result<Vec<Value>, HubError> = self
                 .data(
                     Method::GET,
                     &["api", "agent-files"],
                     &[
                         ("agent_id", agent),
-                        ("directory", directory),
+                        ("directory", trimmed),
                         ("query", query),
-                        ("limit", &limit),
+                        ("limit", &limit_str),
                     ],
                     None,
                 )
@@ -1094,20 +1108,21 @@ impl SessionHub for RemoteHub {
                         hit
                     })
                     .collect()),
-                Ok(_) => Ok(crate::platform::filesearch::find_files(
-                    directory,
-                    query,
-                    limit.parse().unwrap_or(20),
-                )
-                .await),
+                Ok(_) => {
+                    if self.targets_local_machine() && Path::new(trimmed).is_dir() {
+                        Ok(crate::platform::filesearch::find_files(trimmed, query, limit).await)
+                    } else {
+                        Ok(Vec::new())
+                    }
+                }
                 Err(err) => {
-                    tracing::debug!(agent, %err, "gateway find_files; local fallback");
-                    Ok(crate::platform::filesearch::find_files(
-                        directory,
-                        query,
-                        limit.parse().unwrap_or(20),
-                    )
-                    .await)
+                    if self.targets_local_machine() && Path::new(trimmed).is_dir() {
+                        tracing::debug!(agent, %err, "gateway find_files; local fallback");
+                        Ok(crate::platform::filesearch::find_files(trimmed, query, limit).await)
+                    } else {
+                        tracing::debug!(agent, %err, "remote gateway find_files failed");
+                        Ok(Vec::new())
+                    }
                 }
             }
         })
@@ -1701,6 +1716,62 @@ impl SessionHub for RemoteHub {
                 )
                 .await,
             )
+        })
+    }
+
+    fn merge_task_worktree<'a>(
+        &'a self,
+        _task_id: &'a str,
+        base_dir: &'a str,
+        branch: &'a str,
+        worktree_dir: Option<&'a str>,
+    ) -> HubFuture<'a, String> {
+        let base_dir = base_dir.to_string();
+        let branch = branch.to_string();
+        let worktree_dir = worktree_dir.map(String::from);
+        let allow_local = self.targets_local_machine();
+        Box::pin(async move {
+            if !allow_local {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Task worktree merge is only available on this computer".into(),
+                )));
+            }
+            let res = tokio::task::spawn_blocking(move || {
+                let base = PathBuf::from(&base_dir);
+                let wt = worktree_dir.as_deref().map(Path::new);
+                crate::model::git_ops::git_merge_branch(&base, wt, &branch)
+            })
+            .await
+            .map_err(|e| HubError::Agent(AgentError::RequestFailed(e.to_string())))?;
+            res.map_err(|why| HubError::Agent(AgentError::RequestFailed(why)))
+        })
+    }
+
+    fn clean_task_worktree<'a>(
+        &'a self,
+        _task_id: &'a str,
+        base_dir: &'a str,
+        worktree_dir: Option<&'a str>,
+        branch: Option<&'a str>,
+    ) -> HubFuture<'a, ()> {
+        let base_dir = base_dir.to_string();
+        let worktree_dir = worktree_dir.map(String::from);
+        let branch = branch.map(String::from);
+        let allow_local = self.targets_local_machine();
+        Box::pin(async move {
+            if !allow_local {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Task worktree cleanup is only available on this computer".into(),
+                )));
+            }
+            let res = tokio::task::spawn_blocking(move || {
+                let base = PathBuf::from(&base_dir);
+                let wt = worktree_dir.as_deref().map(Path::new);
+                crate::model::git_ops::git_clean_worktree(&base, wt, branch.as_deref())
+            })
+            .await
+            .map_err(|e| HubError::Agent(AgentError::RequestFailed(e.to_string())))?;
+            res.map_err(|why| HubError::Agent(AgentError::RequestFailed(why)))
         })
     }
 
@@ -2456,6 +2527,20 @@ fn parse_task_frame(frame: &Value) -> Option<TaskHubEvent> {
     }
 }
 
+/// True when `path` looks like an absolute path on Unix, macOS, or Windows, or
+/// starts with `~` for remote gateway expansion. Used instead of `Path::is_dir`
+/// so remote sessions can search directories that do not exist on this machine.
+fn is_remote_or_local_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || path.starts_with('~')
+        || path.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2868,5 +2953,96 @@ mod tests {
         })
         .await
         .expect("silent half-open socket recovers via ping timeout and reconnect");
+    }
+
+    #[tokio::test]
+    async fn find_files_queries_remote_gateway_without_local_directory_check() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            assert!(
+                req.contains("GET /api/agent-files?")
+                    && req.contains("directory=%2FUsers%2Fremote-mac%2Fnonexistent-project"),
+                "unexpected request: {req}"
+            );
+            let body = json!({
+                "ok": true,
+                "data": [{
+                    "path": "src/main.rs",
+                    "kind": "file"
+                }]
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let hub = RemoteHub::client(
+            LocalGateway {
+                url: format!("http://{addr}"),
+                token: "test-token".into(),
+                device_id: None,
+                transport_key: None,
+            },
+            reqwest::redirect::Policy::default(),
+        )
+        .unwrap();
+        let ctx = crate::hub::ConnectionContext {
+            computer: "mini".into(),
+            generation: 1,
+            hub: hub.clone(),
+        };
+        let hits = ctx
+            .scope(hub.find_files("codex", "/Users/remote-mac/nonexistent-project", "main", 20))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["path"], "src/main.rs");
+        assert_eq!(hits[0]["type"], "file");
+    }
+
+    #[tokio::test]
+    async fn remote_task_worktree_operations_return_unsupported() {
+        let hub = RemoteHub::client(
+            LocalGateway {
+                url: "http://100.64.0.9:43210".into(),
+                token: "test-token".into(),
+                device_id: None,
+                transport_key: None,
+            },
+            reqwest::redirect::Policy::default(),
+        )
+        .unwrap();
+        let ctx = crate::hub::ConnectionContext {
+            computer: "mini".into(),
+            generation: 1,
+            hub: hub.clone(),
+        };
+        let merge_err = ctx
+            .clone()
+            .scope(hub.merge_task_worktree("t1", "/Users/mini/repo", "feat", None))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            merge_err,
+            HubError::Agent(AgentError::Unsupported(_))
+        ));
+        let clean_err = ctx
+            .scope(hub.clean_task_worktree("t1", "/Users/mini/repo", None, Some("feat")))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            clean_err,
+            HubError::Agent(AgentError::Unsupported(_))
+        ));
     }
 }

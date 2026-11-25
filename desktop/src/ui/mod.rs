@@ -1540,6 +1540,9 @@ impl UiState {
         }
 
         self.cfg.current_computer = id.clone();
+        if id != "local" {
+            self.start_worktree = false;
+        }
         // Receipts can close an optimistic pane or issue follow-up reads.
         // Establish the backend barrier before applying any of them.
         if id != "all" {
@@ -2250,6 +2253,11 @@ impl UiState {
     }
 
     pub fn refresh_mcp_upstreams(&mut self) {
+        if self.current_computer() == "all" {
+            self.mcp_hub.loading = false;
+            self.mcp_hub.error = None;
+            return;
+        }
         self.mcp_hub.loading = true;
         self.mcp_hub.error = None;
         self.send(Command::LoadMcpUpstreams);

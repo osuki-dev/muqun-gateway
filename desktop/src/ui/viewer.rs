@@ -165,6 +165,23 @@ impl UiState {
                 self.show_file_window();
                 return;
             }
+            let name = target.display_name();
+            let kind = files::kind_of(Path::new(&name), target.mime());
+            self.viewer = Some(Viewer {
+                path: None,
+                remote_path: None,
+                remote_computer: Some(active_comp),
+                name,
+                kind,
+                meta: Meta::default(),
+                body: Body::Missing,
+                zoom: None,
+                image_viewport: [0.0; 2],
+                image_pan_start: None,
+                source: false,
+            });
+            self.show_file_window();
+            return;
         }
         let path = target.resolve();
         if let Some(folder) = path.as_deref().filter(|path| path.is_dir()) {
@@ -867,35 +884,38 @@ fn image_actions(s: &UiState, v: &Viewer, k: &Kit, fit_zoom: f32, layer: &mut Ve
                 .on_select(set_zoom(Some(1.0))),
         );
     if let Some(path) = &v.path {
-        let open_path = path.clone();
-        let reveal_path = path.clone();
+        let is_remote = v.remote_path.is_some() || v.remote_computer.is_some();
         let save_path = path.clone();
-        menu = menu
-            .separator()
-            .item(
-                MenuItem::new(tr_ref(lang, "Open with system app"))
-                    .icon(&OPEN_EXTERNAL)
-                    .on_select(move |s: &mut UiState| {
-                        s.menu = None;
-                        crate::platform::shell::open_path(&open_path);
-                    }),
-            )
-            .item(
-                MenuItem::new(tr_ref(lang, "Reveal in folder"))
-                    .icon(&OPEN_FOLDER)
-                    .on_select(move |s: &mut UiState| {
-                        s.menu = None;
-                        crate::platform::shell::reveal(&reveal_path);
-                    }),
-            )
-            .item(
-                MenuItem::new(tr_ref(lang, "Save as…"))
-                    .icon(&DOWNLOAD)
-                    .on_select(move |s: &mut UiState| {
-                        s.menu = None;
-                        crate::platform::dialogs::save_copy(save_path.clone());
-                    }),
-            );
+        menu = menu.separator();
+        if !is_remote {
+            let open_path = path.clone();
+            let reveal_path = path.clone();
+            menu = menu
+                .item(
+                    MenuItem::new(tr_ref(lang, "Open with system app"))
+                        .icon(&OPEN_EXTERNAL)
+                        .on_select(move |s: &mut UiState| {
+                            s.menu = None;
+                            crate::platform::shell::open_path(&open_path);
+                        }),
+                )
+                .item(
+                    MenuItem::new(tr_ref(lang, "Reveal in folder"))
+                        .icon(&OPEN_FOLDER)
+                        .on_select(move |s: &mut UiState| {
+                            s.menu = None;
+                            crate::platform::shell::reveal(&reveal_path);
+                        }),
+                );
+        }
+        menu = menu.item(
+            MenuItem::new(tr_ref(lang, "Save as…"))
+                .icon(&DOWNLOAD)
+                .on_select(move |s: &mut UiState| {
+                    s.menu = None;
+                    crate::platform::dialogs::save_copy(save_path.clone());
+                }),
+        );
     }
     menu.build(k, layer)
 }

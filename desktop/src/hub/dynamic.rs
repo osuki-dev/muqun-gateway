@@ -45,6 +45,12 @@ pub fn connection_origin() -> Option<(String, u64)> {
         .ok()
 }
 
+/// True when the current task-local hub connection targets this computer
+/// (or when no connection origin is bound, e.g. standalone mode or unit tests).
+pub fn is_local_connection() -> bool {
+    connection_origin().is_none_or(|(c, _)| c == "local" || c == "self")
+}
+
 /// Child reads retain their connection even if the UI changes computers.
 pub fn spawn_connected<F>(future: F) -> tokio::task::JoinHandle<F::Output>
 where
