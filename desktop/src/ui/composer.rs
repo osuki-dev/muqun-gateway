@@ -1981,7 +1981,7 @@ pub fn pill(k: &Kit, key: &str, label: String, open: bool, menu: OpenMenu) -> El
         .border(1.0, k.c.border_muted.alpha(0.25))
 }
 
-/// The model menu: every enabled model of the agent's catalogue, by provider.
+/// The model menu: App-style searchable, provider-grouped picker with inline effort chips.
 /// `on_pick(state, provider, model)` runs on a choice.
 #[allow(clippy::too_many_arguments)]
 pub fn model_menu(
@@ -1990,10 +1990,13 @@ pub fn model_menu(
     layer: &mut Vec<El>,
     kind: OpenMenu,
     scope: &str,
+    slot: Slot,
+    agent_id: &str,
     open: bool,
     label: String,
+    catalog: Option<&crate::hub::CatalogView>,
     models: &[(String, String, String)],
-    current: Option<(&str, &str)>,
+    current: Option<&ModelRef>,
     on_pick: impl Fn(&mut UiState, String, String) + Clone + 'static,
 ) -> El {
     let key = match kind {
@@ -2003,7 +2006,7 @@ pub fn model_menu(
     let key = format!("{key}-{scope}");
     let trigger = pill(k, &format!("{key}-pill"), label, open, kind);
     super::model_picker::popup(
-        s, k, layer, &key, trigger, open, models, current, None, on_pick,
+        s, k, layer, &key, trigger, open, slot, agent_id, catalog, models, current, on_pick,
     )
 }
 

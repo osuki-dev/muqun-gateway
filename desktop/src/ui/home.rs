@@ -590,22 +590,32 @@ fn start_pills(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
             layer,
             OpenMenu::StartModel,
             "home",
+            Slot::Start,
+            &s.start_agent,
             s.menu == Some(OpenMenu::StartModel),
             label,
+            view,
             &models,
-            picked.map(|m| (m.provider_id.as_str(), m.model_id.as_str())),
+            picked,
             |s: &mut UiState, provider_id: String, model_id: String| {
                 s.menu = None;
                 let current = s
                     .start_model
                     .as_ref()
                     .or_else(|| s.start_catalog.as_ref()?.catalog.defaults.model.as_ref());
-                s.start_model = Some(composer::choose_model(
+                let chosen = composer::choose_model(
                     s.start_catalog.as_deref(),
                     current,
                     provider_id,
                     model_id,
-                ));
+                );
+                if !s.start_agent.is_empty() {
+                    s.edit(ConfigEdit::RememberRecentModel {
+                        agent: s.start_agent.clone(),
+                        model: format!("{}/{}", chosen.provider_id, chosen.model_id),
+                    });
+                }
+                s.start_model = Some(chosen);
             },
         ));
         if let Some(variants) = selected

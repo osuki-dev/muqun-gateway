@@ -578,6 +578,7 @@ pub struct UiState {
     /// The start card's folder picker filter (`ui/home.rs`).
     pub folder_query: TextEdit,
     pub model_query: TextEdit,
+    pub model_picker: model_picker::PickerState,
     pub full_projects: HashSet<String>,
 
     /// Pending prompts per session, from snapshots and events.
@@ -851,6 +852,7 @@ impl UiState {
             busy_since: HashMap::new(),
             folder_query: TextEdit::new(""),
             model_query: TextEdit::new(""),
+            model_picker: Default::default(),
             full_projects: HashSet::new(),
             waiting_perms: HashMap::new(),
             waiting_forms: HashMap::new(),

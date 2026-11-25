@@ -158,7 +158,7 @@ struct ModelChip {
     variant: Option<String>,
     variants: Vec<String>,
     models: Vec<(String, String, String)>,
-    current: Option<(String, String)>,
+    current: Option<muqun_gateway::agents::ModelRef>,
 }
 
 struct ModeChoice {
@@ -234,7 +234,7 @@ impl Controls {
                     effort: (!variants.is_empty()).then(|| effort_label(m.variant.as_deref())),
                     variant: m.variant.clone(),
                     variants,
-                    current: Some((m.provider_id.clone(), m.model_id.clone())),
+                    current: Some(m.clone()),
                     models,
                 })
             }
@@ -577,17 +577,19 @@ fn model_chips(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold,
         line = line.child(if m.models.is_empty() {
             reload_model(k, c, &m.name)
         } else {
-            let current = m.current.as_ref().map(|(p, i)| (p.as_str(), i.as_str()));
             model_menu(
                 s,
                 k,
                 layer,
                 OpenMenu::Model,
                 &c.asid.0,
+                super::Slot::Session,
+                &c.agent_id,
                 open,
                 m.name.clone(),
+                s.catalog.as_deref(),
                 &m.models,
-                current,
+                m.current.as_ref(),
                 switch_model,
             )
         });
@@ -631,9 +633,11 @@ fn model_chips(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold,
         &format!("model-{}", c.asid.0),
         trigger,
         open,
+        super::Slot::Session,
+        &c.agent_id,
+        s.catalog.as_deref(),
         &m.models,
-        m.current.as_ref().map(|(p, id)| (p.as_str(), id.as_str())),
-        Some((&m.variants, m.variant.as_deref())),
+        m.current.as_ref(),
         switch_model,
     ))
 }
@@ -990,7 +994,11 @@ mod tests {
                 variant: Some("medium".into()),
                 variants: efforts,
                 models: vec![("anthropic".into(), "opus-5.5".into(), "Opus 5.5".into())],
-                current: Some(("anthropic".into(), "opus-5.5".into())),
+                current: Some(muqun_gateway::agents::ModelRef {
+                    provider_id: "anthropic".into(),
+                    model_id: "opus-5.5".into(),
+                    variant: Some("medium".into()),
+                }),
             }),
             branch: Some((
                 "/w".into(),

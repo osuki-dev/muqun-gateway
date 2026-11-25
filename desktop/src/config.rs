@@ -292,6 +292,9 @@ pub struct General {
     /// The model last chosen for an agent in a folder, by [`choice_key`]
     /// (the composer preselects it next time).
     pub last_model: HashMap<String, String>,
+    /// Recently chosen models per agent id (`"provider_id/model_id"`, newest first, up to 5).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub recent_models: HashMap<String, Vec<String>>,
     /// The mode last chosen, likewise.
     pub last_mode: HashMap<String, String>,
     /// Unsent composer text: the start page under [`START_DRAFT`], each
@@ -325,6 +328,9 @@ pub const START_DRAFT: &str = "start";
 /// session drafts of a few arbitrary sessions go (the start page's never).
 pub(crate) const MAX_DRAFTS: usize = 64;
 
+/// Maximum recently used models remembered per agent.
+pub(crate) const MAX_RECENT_MODELS: usize = 5;
+
 /// What "an agent in a folder" is called in [`General::last_model`] and
 /// [`General::last_mode`].
 pub fn choice_key(agent: &str, cwd: &str) -> String {
@@ -332,6 +338,24 @@ pub fn choice_key(agent: &str, cwd: &str) -> String {
 }
 
 impl General {
+    /// Recently used `"provider_id/model_id"` entries for `agent`, newest first.
+    pub fn recent_models_for(&self, agent: &str) -> &[String] {
+        self.recent_models
+            .get(agent)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn record_recent_model(&mut self, agent: &str, model: &str) {
+        if agent.is_empty() || model.is_empty() {
+            return;
+        }
+        let list = self.recent_models.entry(agent.to_owned()).or_default();
+        list.retain(|existing| existing != model);
+        list.insert(0, model.to_owned());
+        list.truncate(MAX_RECENT_MODELS);
+    }
+
     /// The folder to preselect for `agent`: the one it last used, else the
     /// configured default, else `~`.
     pub fn initial_cwd(&self, agent: &str) -> PathBuf {
@@ -951,6 +975,10 @@ pub enum ConfigEdit {
         model: Option<String>,
         mode: Option<String>,
     },
+    RememberRecentModel {
+        agent: String,
+        model: String,
+    },
     /// Pin the session, or unpin it when it is pinned.
     TogglePin(String),
     /// Open or close the sidebar's Running list.
@@ -1076,13 +1104,21 @@ impl DesktopConfig {
                 let key = choice_key(&agent, &cwd);
                 let g = &mut self.general;
                 match model {
-                    Some(m) => g.last_model.insert(key.clone(), m),
-                    None => g.last_model.remove(&key),
-                };
+                    Some(m) => {
+                        g.record_recent_model(&agent, &m);
+                        g.last_model.insert(key.clone(), m);
+                    }
+                    None => {
+                        g.last_model.remove(&key);
+                    }
+                }
                 match mode {
                     Some(m) => g.last_mode.insert(key, m),
                     None => g.last_mode.remove(&key),
                 };
+            }
+            ConfigEdit::RememberRecentModel { agent, model } => {
+                self.general.record_recent_model(&agent, &model);
             }
             ConfigEdit::RunningOpen(open) => self.ui.running_open = open,
             ConfigEdit::TogglePin(asid) => {

@@ -1168,5 +1168,16 @@
   "Allowed tools": "允許的工具",
   "Optional comma-separated allowlist (supports * wildcards). Empty allows all non-blocked tools.": "可選的工具白名單（逗號分隔，支援 * 萬用字元）；留空則放行所有未被禁止的工具。",
   "Blocked tools": "禁止的工具",
-  "Optional comma-separated denylist (supports * wildcards). Always overrides allowed tools.": "可選的工具黑名單（逗號分隔，支援 * 萬用字元），優先權始終高於白名單（例如 delete_*）。"
+  "Optional comma-separated denylist (supports * wildcards). Always overrides allowed tools.": "可選的工具黑名單（逗號分隔，支援 * 萬用字元），優先權始終高於白名單（例如 delete_*）。",
+  "Select model": "選擇模型",
+  "Search models or providers": "搜尋模型或提供者",
+  "Filter models": "篩選模型",
+  "All models": "全部模型",
+  "Free only": "僅免費",
+  "Recently used": "最近使用",
+  "Free": "免費",
+  "Not signed in on the host": "主機尚未登入此提供者",
+  "Set up on the host": "需在主機設定",
+  "No free models on this host.": "此主機沒有免費模型。",
+  "No models on this host.": "此主機沒有可用模型。"
 }
