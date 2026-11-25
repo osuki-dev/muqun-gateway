@@ -518,6 +518,33 @@ impl View {
         })
     }
 
+    /// Return the primary coder session id owning an internal MAO child session.
+    pub fn parent_session_of(&self, asid: &str) -> Option<&str> {
+        if !self.is_internal_child_session(asid) {
+            return None;
+        }
+        self.runs.iter().rev().find_map(|r| {
+            let owns = r.reviewer_asid.as_deref() == Some(asid)
+                || r.advisor_asid.as_deref() == Some(asid)
+                || r.subtasks
+                    .iter()
+                    .any(|sub| sub.asid.as_deref() == Some(asid))
+                || r.steps.iter().any(|st| {
+                    matches!(st.kind, MaoStepKind::Review | MaoStepKind::Advisor)
+                        && st.asid.as_deref() == Some(asid)
+                });
+            if owns
+                && !r.coder_asid.is_empty()
+                && !r.coder_asid.starts_with("new-")
+                && r.coder_asid != asid
+            {
+                Some(r.coder_asid.as_str())
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn is_tracked(&self, asid: &str) -> bool {
         self.runs.iter().any(|run| {
             run.coder_asid == asid
@@ -3656,7 +3683,17 @@ fn subtasks_box_el(
         if let Some(ref target_asid) = sub.asid {
             if !target_asid.is_empty() && !target_asid.starts_with("new-") {
                 let jump = target_asid.clone();
-                r = r.on_press(move |s: &mut UiState| s.open_session(&jump));
+                let parent = (!run.coder_asid.is_empty() && !run.coder_asid.starts_with("new-"))
+                    .then(|| run.coder_asid.clone());
+                let agent = sub.agent_id.clone();
+                r = r.on_press(move |s: &mut UiState| {
+                    s.remember_subagent_context_with_agent(
+                        &jump,
+                        parent.as_deref(),
+                        agent.as_deref(),
+                    );
+                    s.open_session(&jump);
+                });
             }
         }
         box_col = box_col.child(r);
@@ -3706,11 +3743,21 @@ fn advisor_box_el(
     if let Some(ref adv_asid) = run.advisor_asid {
         if !adv_asid.is_empty() && !adv_asid.starts_with("new-") {
             let jump = adv_asid.clone();
+            let parent = (!run.coder_asid.is_empty() && !run.coder_asid.starts_with("new-"))
+                .then(|| run.coder_asid.clone());
+            let agent = run.advisor_agent.clone();
             header = header.child(
                 Button::new(tr_ref(language, "Enter session"))
                     .variant(ButtonVariant::GhostMuted)
                     .control_size(ControlSize::Small)
-                    .on_press(move |s: &mut UiState| s.open_session(&jump))
+                    .on_press(move |s: &mut UiState| {
+                        s.remember_subagent_context_with_agent(
+                            &jump,
+                            parent.as_deref(),
+                            agent.as_deref(),
+                        );
+                        s.open_session(&jump);
+                    })
                     .build(k)
                     .key(format!("mao-adv-open-{key_prefix}")),
             );
@@ -3884,6 +3931,9 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
     if rev_live.waiting_attention {
         if let Some(ref rev_id) = run.reviewer_asid {
             let target = rev_id.clone();
+            let parent = (!run.coder_asid.is_empty() && !run.coder_asid.starts_with("new-"))
+                .then(|| run.coder_asid.clone());
+            let rev_agent = run.reviewer.agent.clone();
             right_actions = right_actions.child(
                 Button::new(format!(
                     "{} · {reviewer_name}",
@@ -3891,7 +3941,14 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
                 ))
                 .variant(ButtonVariant::Neutral)
                 .control_size(ControlSize::Small)
-                .on_press(move |s: &mut UiState| s.open_session(&target))
+                .on_press(move |s: &mut UiState| {
+                    s.remember_subagent_context_with_agent(
+                        &target,
+                        parent.as_deref(),
+                        (!rev_agent.is_empty()).then_some(rev_agent.as_str()),
+                    );
+                    s.open_session(&target);
+                })
                 .build(k)
                 .key("mao-banner-attn-rev")
                 .border(1.0, k.c.warning.icon.alpha(0.65)),
@@ -4229,8 +4286,17 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
                 } else if !detail.is_empty() {
                     prev_detail = Some(detail.clone());
                 }
-                timeline_box =
-                    timeline_box.child(compact_timeline_row(k, idx, step, title, detail));
+                let coder_parent = (!run.coder_asid.is_empty()
+                    && !run.coder_asid.starts_with("new-"))
+                .then_some(run.coder_asid.as_str());
+                timeline_box = timeline_box.child(compact_timeline_row(
+                    k,
+                    idx,
+                    step,
+                    title,
+                    detail,
+                    coder_parent,
+                ));
             }
             drawer_body = drawer_body.child(timeline_box);
         }
@@ -4251,13 +4317,23 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
             if !rev_asid.starts_with("new-") {
                 let coder_parent = run.coder_asid.clone();
                 let rev_target = rev_asid.clone();
+                let rev_agent = run.reviewer.agent.clone();
                 footer_links = footer_links.child(
                     Button::new(tr_ref(language, "Switch to reviewer"))
                         .variant(ButtonVariant::GhostMuted)
                         .control_size(ControlSize::Small)
                         .on_press(move |s: &mut UiState| {
-                            if !coder_parent.starts_with("new-") && coder_parent != rev_target {
-                                s.open_detail(&coder_parent, &rev_target);
+                            let parent = (!coder_parent.is_empty()
+                                && !coder_parent.starts_with("new-")
+                                && coder_parent != rev_target)
+                                .then_some(coder_parent.as_str());
+                            s.remember_subagent_context_with_agent(
+                                &rev_target,
+                                parent,
+                                (!rev_agent.is_empty()).then_some(rev_agent.as_str()),
+                            );
+                            if let Some(parent) = parent {
+                                s.open_detail(parent, &rev_target);
                             } else {
                                 s.open_session(&rev_target);
                             }
@@ -4316,7 +4392,14 @@ fn format_step_title(s: &UiState, raw: &str) -> String {
     raw.to_string()
 }
 
-fn compact_timeline_row(k: &Kit, idx: usize, step: &MaoStep, title: String, detail: String) -> El {
+fn compact_timeline_row(
+    k: &Kit,
+    idx: usize,
+    step: &MaoStep,
+    title: String,
+    detail: String,
+    coder_parent: Option<&str>,
+) -> El {
     let dot_color = match step.status {
         "running" => k.c.text_accent,
         "completed" => k.c.success.icon,
@@ -4356,7 +4439,14 @@ fn compact_timeline_row(k: &Kit, idx: usize, step: &MaoStep, title: String, deta
     if let Some(asid) = &step.asid {
         if !asid.starts_with("new-") {
             let target = asid.clone();
-            item = item.on_press(move |s: &mut UiState| s.open_session(&target));
+            let is_child = matches!(step.kind, MaoStepKind::Review | MaoStepKind::Advisor);
+            let parent = coder_parent.map(str::to_owned);
+            item = item.on_press(move |s: &mut UiState| {
+                if is_child {
+                    s.remember_subagent_context(&target, parent.as_deref());
+                }
+                s.open_session(&target);
+            });
         }
     }
     item
@@ -4428,7 +4518,7 @@ fn clean_one_line(raw: &str) -> String {
         .join(" ")
 }
 
-fn step_row(k: &Kit, idx: usize, step: &MaoStep) -> El {
+fn step_row(k: &Kit, idx: usize, step: &MaoStep, coder_parent: Option<&str>) -> El {
     let dot_color = match step.status {
         "running" => k.c.text_accent,
         "completed" => k.c.success.icon,
@@ -4466,7 +4556,14 @@ fn step_row(k: &Kit, idx: usize, step: &MaoStep) -> El {
     if let Some(asid) = &step.asid {
         if !asid.starts_with("new-") {
             let target = asid.clone();
-            item = item.on_press(move |s: &mut UiState| s.open_session(&target));
+            let is_child = matches!(step.kind, MaoStepKind::Review | MaoStepKind::Advisor);
+            let parent = coder_parent.map(str::to_owned);
+            item = item.on_press(move |s: &mut UiState| {
+                if is_child {
+                    s.remember_subagent_context(&target, parent.as_deref());
+                }
+                s.open_session(&target);
+            });
         }
     }
     item
@@ -5004,6 +5101,7 @@ fn agent_live_card(
     role_title: &'static str,
     role: &MaoRole,
     asid: Option<&str>,
+    parent_asid: Option<&str>,
     live: &AgentLiveSnapshot,
     language: Language,
     key_prefix: &str,
@@ -5082,6 +5180,10 @@ fn agent_live_card(
 
     if let Some(target_id) = asid.filter(|id| !id.is_empty() && !id.starts_with("new-")) {
         let target = target_id.to_string();
+        let parent = parent_asid
+            .filter(|id| !id.is_empty() && !id.starts_with("new-") && *id != target_id)
+            .map(str::to_owned);
+        let child_agent = role.agent.clone();
         card = card.child(
             row().w_full().pt(2.0).child(
                 Button::new(if live.waiting_attention {
@@ -5095,7 +5197,16 @@ fn agent_live_card(
                     ButtonVariant::GhostMuted
                 })
                 .control_size(ControlSize::Small)
-                .on_press(move |s: &mut UiState| s.open_session(&target))
+                .on_press(move |s: &mut UiState| {
+                    if let Some(parent) = parent.as_deref() {
+                        s.remember_subagent_context_with_agent(
+                            &target,
+                            Some(parent),
+                            (!child_agent.is_empty()).then_some(child_agent.as_str()),
+                        );
+                    }
+                    s.open_session(&target);
+                })
                 .build(k)
                 .key(format!("mao-agent-open-{key_prefix}")),
             ),
@@ -5190,6 +5301,7 @@ fn page_detail(s: &UiState, k: &Kit, run: &MaoRun) -> El {
                 tr_ref(language, "Coder"),
                 &run.coder,
                 Some(run.coder_asid.as_str()),
+                None,
                 &coder_live,
                 language,
                 "coder",
@@ -5205,6 +5317,7 @@ fn page_detail(s: &UiState, k: &Kit, run: &MaoRun) -> El {
                 tr_ref(language, "Reviewer"),
                 &run.reviewer,
                 run.reviewer_asid.as_deref(),
+                Some(run.coder_asid.as_str()),
                 &rev_live,
                 language,
                 "reviewer",
@@ -5458,8 +5571,10 @@ fn page_detail(s: &UiState, k: &Kit, run: &MaoRun) -> El {
         );
 
     let mut steps_col = col().w_full().gap(6.0);
+    let coder_parent = (!run.coder_asid.is_empty() && !run.coder_asid.starts_with("new-"))
+        .then_some(run.coder_asid.as_str());
     for (idx, step) in run.steps.iter().enumerate() {
-        steps_col = steps_col.child(step_row(k, idx, step));
+        steps_col = steps_col.child(step_row(k, idx, step, coder_parent));
     }
 
     let session_turns = s.orchestration.turns_for_group(run.session_group_key());
@@ -6245,8 +6360,10 @@ fn window_compact_view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         }
 
         let mut steps_col = col().w_full().gap(4.0);
+        let coder_parent = (!run.coder_asid.is_empty() && !run.coder_asid.starts_with("new-"))
+            .then_some(run.coder_asid.as_str());
         for (idx, step) in run.steps.iter().rev().take(6).rev().enumerate() {
-            steps_col = steps_col.child(step_row(k, idx, step));
+            steps_col = steps_col.child(step_row(k, idx, step, coder_parent));
         }
 
         let mut win_header = row()
@@ -6337,6 +6454,7 @@ fn window_compact_view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                             tr_ref(language, "Coder"),
                             &run.coder,
                             Some(run.coder_asid.as_str()),
+                            None,
                             &coder_live,
                             language,
                             "win-coder",
@@ -6350,6 +6468,7 @@ fn window_compact_view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                             tr_ref(language, "Reviewer"),
                             &run.reviewer,
                             run.reviewer_asid.as_deref(),
+                            Some(run.coder_asid.as_str()),
                             &rev_live,
                             language,
                             "win-reviewer",
@@ -7010,6 +7129,44 @@ fn parse_route_decision(val: &serde_json::Value) -> Option<MaoRouteDecision> {
     })
 }
 
+fn remember_run_child_contexts(s: &mut UiState, run: &MaoRun) {
+    let parent = (!run.coder_asid.is_empty() && !run.coder_asid.starts_with("new-"))
+        .then_some(run.coder_asid.as_str());
+    if let Some(ref rev) = run.reviewer_asid {
+        if !rev.is_empty() && !rev.starts_with("new-") && parent != Some(rev.as_str()) {
+            let agent = (!run.reviewer.agent.is_empty()).then_some(run.reviewer.agent.as_str());
+            s.remember_subagent_context_with_agent(rev, parent, agent);
+        }
+    }
+    if let Some(ref adv) = run.advisor_asid {
+        if !adv.is_empty() && !adv.starts_with("new-") && parent != Some(adv.as_str()) {
+            s.remember_subagent_context_with_agent(adv, parent, run.advisor_agent.as_deref());
+        }
+    }
+    for sub in &run.subtasks {
+        if let Some(ref sub_asid) = sub.asid {
+            if !sub_asid.is_empty()
+                && !sub_asid.starts_with("new-")
+                && parent != Some(sub_asid.as_str())
+            {
+                s.remember_subagent_context_with_agent(sub_asid, parent, sub.agent_id.as_deref());
+            }
+        }
+    }
+    for step in &run.steps {
+        if matches!(step.kind, MaoStepKind::Review | MaoStepKind::Advisor) {
+            if let Some(ref step_asid) = step.asid {
+                if !step_asid.is_empty()
+                    && !step_asid.starts_with("new-")
+                    && parent != Some(step_asid.as_str())
+                {
+                    s.remember_subagent_context(step_asid, parent);
+                }
+            }
+        }
+    }
+}
+
 fn merge_gateway_run(
     s: &mut UiState,
     computer: &str,
@@ -7398,6 +7555,8 @@ fn merge_gateway_run(
             expanded: existing.expanded || entered_decision_phase,
             ..gw_run
         };
+        let snapshot = existing.clone();
+        remember_run_child_contexts(s, &snapshot);
         return Some(if was_same_rev {
             None
         } else {
@@ -7405,6 +7564,7 @@ fn merge_gateway_run(
         });
     }
 
+    remember_run_child_contexts(s, &gw_run);
     s.orchestration.runs.push(gw_run);
     Some(rev_pair_if_local)
 }

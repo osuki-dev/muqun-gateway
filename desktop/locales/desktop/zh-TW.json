@@ -1180,5 +1180,10 @@
   "Not signed in on the host": "主機尚未登入此提供者",
   "Set up on the host": "需在主機設定",
   "No free models on this host.": "此主機沒有免費模型。",
-  "No models on this host.": "此主機沒有可用模型。"
+  "No models on this host.": "此主機沒有可用模型。",
+  "Compact context": "壓縮上下文",
+  "Compacting…": "正在壓縮…",
+  "messages in context": "則上下文訊息",
+  "Session tree": "工作階段樹",
+  "No sub-agents or forks yet.": "尚無子 Agent 或分支工作階段。"
 }

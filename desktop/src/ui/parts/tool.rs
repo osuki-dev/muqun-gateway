@@ -769,6 +769,8 @@ fn subagent(
         let view = child_id.clone();
         let parent = cx.asid.to_owned();
         let split_id = child_id.clone();
+        let split_parent = parent.clone();
+        let open_parent = parent.clone();
         let in_tile = cx.s.tile_of(&child_id).is_some();
         card.actions.push(
             Button::new(if in_tile {
@@ -782,7 +784,10 @@ fn subagent(
                 ButtonVariant::Ghost
             })
             .control_size(ControlSize::Small)
-            .on_press(move |s: &mut UiState| s.open_in_tile(&split_id))
+            .on_press(move |s: &mut UiState| {
+                s.remember_subagent_context(&split_id, Some(&split_parent));
+                s.open_in_tile(&split_id);
+            })
             .build(k),
         );
         card.actions.push(
@@ -798,6 +803,7 @@ fn subagent(
                 .control_size(ControlSize::Small)
                 .build(k)
                 .on_press_tx(move |s: &mut UiState, tx: &mut rune::Tx| {
+                    s.remember_subagent_context(&child_id, Some(&open_parent));
                     let mods = tx.mods();
                     if mods.ctrl || mods.cmd || mods.alt || mods.shift {
                         s.open_in_tile(&child_id);

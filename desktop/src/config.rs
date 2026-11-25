@@ -1081,13 +1081,11 @@ impl DesktopConfig {
             ConfigEdit::CloseToTray(on) => self.general.close_to_tray = on,
             ConfigEdit::RecentCommands(list) => self.ui.recent_commands = list,
             ConfigEdit::RememberSubagent(context) => {
-                self.ui.subagent_contexts.retain(|old| {
-                    old.computer != context.computer
-                        || (old.agent != context.agent && !old.agent.is_empty())
-                        || old.asid != context.asid
-                });
+                self.ui
+                    .subagent_contexts
+                    .retain(|old| old.computer != context.computer || old.asid != context.asid);
                 self.ui.subagent_contexts.push(context);
-                let excess = self.ui.subagent_contexts.len().saturating_sub(256);
+                let excess = self.ui.subagent_contexts.len().saturating_sub(1024);
                 self.ui.subagent_contexts.drain(..excess);
             }
             ConfigEdit::Voice(voice) => self.voice = voice,

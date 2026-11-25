@@ -1180,5 +1180,10 @@
   "Not signed in on the host": "宿主机尚未登录该提供者",
   "Set up on the host": "需在宿主机配置",
   "No free models on this host.": "此宿主机没有免费模型。",
-  "No models on this host.": "此宿主机没有可用模型。"
+  "No models on this host.": "此宿主机没有可用模型。",
+  "Compact context": "压缩上下文",
+  "Compacting…": "正在压缩…",
+  "messages in context": "条上下文消息",
+  "Session tree": "会话树",
+  "No sub-agents or forks yet.": "暂无子 Agent 或分支会话。"
 }

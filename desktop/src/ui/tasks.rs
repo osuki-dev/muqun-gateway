@@ -179,9 +179,48 @@ fn select(s: &mut UiState, id: String) {
     s.tasks_view.pick = Some(id);
 }
 
+/// Record subagent lineage for a delegated child task that has a bound session.
+pub(super) fn remember_task_lineage(s: &mut UiState, task: &TaskRow) {
+    let Some(parent_task_id) = task
+        .parent_task_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    let Some(child_asid) = task
+        .asid
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    let parent_asid = s
+        .tasks
+        .iter()
+        .find(|p| p.id == parent_task_id)
+        .and_then(|p| p.asid.as_deref())
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && *id != child_asid)
+        .map(str::to_owned);
+    let agent = task.agent_id.clone();
+    s.remember_subagent_context_with_agent(child_asid, parent_asid.as_deref(), agent.as_deref());
+}
+
+/// Record lineage for every child task in `s.tasks` so none leak into the sidebar.
+pub(super) fn remember_all_task_lineage(s: &mut UiState) {
+    let tasks = s.tasks.clone();
+    for task in &tasks {
+        remember_task_lineage(s, task);
+    }
+}
+
 /// A new list arrived: it reads again, and the selected task's history
 /// follows it while the page is open.
 pub fn listed(s: &mut UiState) {
+    remember_all_task_lineage(s);
     s.tasks_view.error = None;
     if s.mode != super::Mode::Tasks {
         return;
@@ -264,6 +303,8 @@ pub fn key(s: &mut UiState, action: Action) -> bool {
         }
         Action::OpenRow => {
             if let Some(asid) = t.asid.clone() {
+                let task = t.clone();
+                remember_task_lineage(s, &task);
                 s.open_session(&asid);
             } else if t.cwd.is_some() || t.pane_id.is_some() {
                 let pane_id = t.pane_id.clone();
@@ -311,20 +352,72 @@ const STATE_W: f32 = 104.0;
 const TIME_W: f32 = 64.0;
 
 pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+    view_in_surface(s, k, layer, true)
+}
+
+/// Render Tasks either as a full-screen page (`full_page == true`, lifted under
+/// the empty toolbar row via `card_stage`) or inside an embedded Tile / Drawer
+/// (`full_page == false`, no negative top offset).
+pub fn view_in_surface(s: &UiState, k: &Kit, layer: &mut Vec<El>, full_page: bool) -> El {
     let language = s.cfg.general.language;
     // On a very wide card the table and its detail stay together.
-    let card_w = rune::memo::layout_with("main", |r| r[2])
-        .unwrap_or(1080.0)
-        .min(MAX_W);
+    let card_w = if full_page {
+        rune::memo::layout_with("main", |r| r[2])
+            .unwrap_or(1080.0)
+            .min(MAX_W)
+    } else {
+        rune::memo::layout_with("tasks-surface", |r| r[2])
+            .unwrap_or(680.0)
+            .min(MAX_W)
+    };
     let list = shown(s);
     let at = current(&list, &s.tasks_view);
+    let stacked_detail = !full_page && card_w < 640.0;
     let detail_w = (card_w * 0.36).clamp(300.0, 440.0);
-    let table_w = card_w - detail_w - 1.0;
-    let mut body = row().key("tasks-body").w_full().grow(1.0).min_h(0.0);
-    if s.tasks.is_empty() {
-        body = body.child(empty(s, k));
+    let table_w = if stacked_detail {
+        card_w
     } else {
-        body = body
+        card_w - detail_w - 1.0
+    };
+    let body = if s.tasks.is_empty() {
+        row()
+            .key("tasks-body")
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .child(empty(s, k))
+    } else if stacked_detail {
+        col()
+            .key("tasks-body")
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .child(
+                table(s, k, &list, at, Cols::for_width(table_w - 32.0))
+                    .grow(1.0)
+                    .min_h(0.0),
+            )
+            .child(
+                el().key("tasks-rule")
+                    .w_full()
+                    .h(1.0)
+                    .fill(k.c.border_weak)
+                    .a11y_hidden(),
+            )
+            .child(match at {
+                Some(i) => detail(s, k, list[i], card_w).w_full().h(260.0),
+                None => col().key("task-detail").w_full().h(120.0).center().child(
+                    text(tr_ref(language, "No task selected"))
+                        .font(k.ty.small)
+                        .color(k.c.text_faint),
+                ),
+            })
+    } else {
+        row()
+            .key("tasks-body")
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
             .child(table(s, k, &list, at, Cols::for_width(table_w - 56.0)))
             .child(
                 el().key("tasks-rule")
@@ -345,8 +438,8 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                             .font(k.ty.small)
                             .color(k.c.text_faint),
                     ),
-            });
-    }
+            })
+    };
     let page = col()
         .key("tasks")
         .max_w(MAX_W)
@@ -354,14 +447,23 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .children((!s.tasks.is_empty()).then(|| filters(s, k, layer)))
         .children(error_line(s, k))
         .child(body);
-    super::card_stage(
-        "tasks",
-        row()
-            .key("tasks-centre")
-            .child(el().grow(1.0))
-            .child(page.w_full())
-            .child(el().grow(1.0)),
-    )
+    if full_page {
+        super::card_stage(
+            "tasks",
+            row()
+                .key("tasks-centre")
+                .child(el().grow(1.0))
+                .child(page.w_full())
+                .child(el().grow(1.0)),
+        )
+    } else {
+        col()
+            .key("tasks-surface")
+            .w_full()
+            .h_full()
+            .min_h(0.0)
+            .child(page.w_full().grow(1.0).min_h(0.0))
+    }
 }
 
 /// The page's widest: past it the table would stretch its title column.
@@ -1156,6 +1258,7 @@ fn actions(s: &UiState, k: &Kit, t: &TaskRow) -> El {
         .center_y()
         .flex_wrap();
     if let Some(asid) = t.asid.clone() {
+        let task_row = t.clone();
         let label = tr(language, "Open session");
         line = line.child(
             Button::new(label.clone())
@@ -1164,6 +1267,7 @@ fn actions(s: &UiState, k: &Kit, t: &TaskRow) -> El {
                 .build(k)
                 .key("task-open")
                 .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
+                    remember_task_lineage(s, &task_row);
                     let mods = tx.mods();
                     if mods.ctrl || mods.cmd || mods.alt || mods.shift {
                         s.open_in_tile(&asid);

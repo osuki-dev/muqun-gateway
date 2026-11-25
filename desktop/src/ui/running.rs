@@ -69,7 +69,10 @@ pub fn entries(s: &UiState) -> Vec<Entry<'_>> {
     let mut out: Vec<Entry<'_>> = s
         .sessions
         .iter()
-        .filter(|i| matches!(s.activity(i), Activity::Working | Activity::NeedsYou))
+        .filter(|i| {
+            !super::sessions::is_hidden_sidebar_session(s, i)
+                && matches!(s.activity(i), Activity::Working | Activity::NeedsYou)
+        })
         .map(|info| Entry::Session {
             info,
             task: s

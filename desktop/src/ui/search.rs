@@ -327,6 +327,18 @@ impl UiState {
         let Some(hit) = self.content.hits.get(i).cloned() else {
             return;
         };
+        if let Some(parent) = hit
+            .parent_asid
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty() && *p != "null" && *p != hit.asid)
+        {
+            self.remember_subagent_context_with_agent(
+                &hit.asid,
+                Some(parent),
+                (!hit.agent_id.is_empty()).then_some(hit.agent_id.as_str()),
+            );
+        }
         self.content.cursor = Some(Cursor::Hit(i));
         self.jump = Some(PendingJump {
             asid: hit.asid.clone(),

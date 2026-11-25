@@ -4,9 +4,13 @@
 //! already gives: `context_usage` on the session, and
 //! `GET /api/agents/{id}/account-limits` where the agent offers it.
 
-use muqun_gateway::agents::AgentSessionInfo;
-use rune::{col, icon, row, text, Color, Cursor, El};
-use rune_kit::Kit;
+use std::collections::HashSet;
+
+use muqun_gateway::agents::{
+    AgentPart, AgentSessionId, AgentSessionInfo, AgentSessionStatus, CompactionStatus,
+};
+use rune::{col, row, text, Color, Cursor, El};
+use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit};
 use serde_json::Value;
 
 use super::glyphs;
@@ -29,16 +33,88 @@ pub fn tokens_label(_language: Language, n: u64) -> String {
     format!("{} tokens", compact(n))
 }
 
-/// What the model holds now and the most it can: (used, limit).
-fn usage(info: &AgentSessionInfo) -> Option<(u64, Option<u64>)> {
-    let usage = info.context_usage.as_ref()?;
-    let limit = usage
-        .limit
-        .as_ref()
-        .and_then(|l| l.get("context").or(Some(l)))
+fn limit_from_value(v: &Value) -> Option<u64> {
+    v.get("context")
+        .or(Some(v))
         .and_then(Value::as_u64)
-        .filter(|l| *l > 0);
+        .filter(|l| *l > 0)
+}
+
+/// Resolve the model's context window: session `context_usage.limit` first,
+/// then catalog model `limit.context`, then `info.limit.context`.
+fn resolved_limit(s: &UiState, info: &AgentSessionInfo) -> Option<u64> {
+    info.context_usage
+        .as_ref()
+        .and_then(|u| u.limit.as_ref())
+        .and_then(limit_from_value)
+        .or_else(|| {
+            let model = info.model.as_ref()?;
+            let catalog = s.catalog_for_session(&info.asid.0)?;
+            crate::ui::labels::catalog_model_info(catalog, model)
+                .and_then(|m| m.limit.as_ref())
+                .and_then(limit_from_value)
+        })
+        .or_else(|| info.limit.as_ref().and_then(limit_from_value))
+}
+
+/// What the model holds now and the most it can: (used, limit).
+fn usage(s: &UiState, info: &AgentSessionInfo) -> Option<(u64, Option<u64>)> {
+    let usage = info.context_usage.as_ref()?;
+    let limit = resolved_limit(s, info);
     (usage.total_tokens > 0).then_some((usage.total_tokens, limit))
+}
+
+/// Count messages currently in context: explicit `context_usage.limit.messages`
+/// when reported by the backend, otherwise distinct messages in the loaded
+/// timeline after the latest completed compaction.
+fn context_message_count(s: &UiState, asid: &str, info: &AgentSessionInfo) -> Option<usize> {
+    if let Some(n) = info
+        .context_usage
+        .as_ref()
+        .and_then(|u| u.limit.as_ref())
+        .and_then(|l| l.get("messages"))
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)
+    {
+        return Some(n as usize);
+    }
+    let tl = s.timelines.get(asid)?;
+    let start = tl
+        .items
+        .iter()
+        .rposition(|it| {
+            matches!(
+                it.part,
+                AgentPart::Compaction {
+                    status: CompactionStatus::Completed,
+                    ..
+                }
+            )
+        })
+        .map_or(0, |idx| idx + 1);
+    let mut ids = HashSet::new();
+    for item in &tl.items[start..] {
+        if !matches!(item.part, AgentPart::Compaction { .. }) && !item.message_id.is_empty() {
+            ids.insert(item.message_id.as_str());
+        }
+    }
+    (!ids.is_empty()).then_some(ids.len())
+}
+
+fn is_compacting(s: &UiState, asid: &str) -> bool {
+    if s.compacting_sessions.contains(asid) {
+        return true;
+    }
+    s.timelines.get(asid).is_some_and(|tl| {
+        tl.items
+            .iter()
+            .rev()
+            .find_map(|it| match &it.part {
+                AgentPart::Compaction { status, .. } => Some(*status),
+                _ => None,
+            })
+            .is_some_and(|st| matches!(st, CompactionStatus::Started | CompactionStatus::Running))
+    })
 }
 
 fn tone(k: &Kit, fraction: f32) -> Color {
@@ -125,7 +201,7 @@ pub fn open(s: &mut UiState, asid: &str) {
 /// model's window is unknown). `None` when the session reports nothing.
 pub fn meter(s: &UiState, k: &Kit, asid: &str) -> Option<El> {
     let info = s.session_by_id(asid)?;
-    let (used, limit) = usage(info)?;
+    let (used, limit) = usage(s, info)?;
     let language = s.cfg.general.language;
     let mut line = row()
         .key("context-meter")
@@ -428,20 +504,17 @@ fn content(s: &UiState, k: &Kit, asid: &str) -> Option<El> {
                     .grow(1.0),
             )
             .child(
-                k.interactive(
-                    row()
-                        .key("context-close")
-                        .size(28.0, 28.0)
-                        .center()
-                        .radius(k.radius.md)
-                        .child(icon(&glyphs::CLOSE, 14.0).color(k.c.icon_muted)),
-                )
-                .cursor(Cursor::Pointer)
-                .label(t("Close"))
-                .on_press(close),
+                IconButton::new(&glyphs::CLOSE)
+                    .variant(IconButtonVariant::Ghost)
+                    .control_size(ControlSize::Small)
+                    .label(t("Close"))
+                    .help(t("Close"))
+                    .on_press(close)
+                    .build(k)
+                    .key("context-close"),
             ),
     );
-    match usage(info) {
+    match usage(s, info) {
         Some((used, Some(limit))) => {
             let fraction = used as f32 / limit as f32;
             body = body
@@ -492,12 +565,31 @@ fn content(s: &UiState, k: &Kit, asid: &str) -> Option<El> {
         }
         None => body = body.child(crate::ui::muted(k, t("Not available"))),
     }
+    if let Some(messages) = context_message_count(s, asid, info) {
+        body = body.child(
+            text(match language {
+                Language::En if messages == 1 => "1 message in context".to_string(),
+                Language::En => format!("{messages} messages in context"),
+                _ => format!(
+                    "{messages} {}",
+                    crate::ui::copy::t(language, "messages in context")
+                ),
+            })
+            .key("context-messages")
+            .font(k.ty.small)
+            .color(k.c.text_faint),
+        );
+    }
     body = body.child(heading(k, t("This session")));
     if let Some(model) = &info.model {
+        let catalog_name = s
+            .catalog_for_session(asid)
+            .and_then(|cat| crate::ui::labels::catalog_model_info(cat, model))
+            .map(|m| m.name.as_str());
         body = body.child(fact(
             k,
             t("Model"),
-            crate::ui::labels::format_model_name(model, &model.model_id, None),
+            crate::ui::labels::format_model_name(model, &model.model_id, catalog_name),
         ));
     }
     if let Some(dir) = &info.directory {
@@ -523,5 +615,136 @@ fn content(s: &UiState, k: &Kit, asid: &str) -> Option<El> {
     if let Some(limits) = limits_section(s, k, &info.agent_id) {
         body = body.child(limits);
     }
+    let busy = matches!(
+        info.status,
+        AgentSessionStatus::Busy | AgentSessionStatus::Retry
+    );
+    let compacting = is_compacting(s, asid);
+    let compact_asid = asid.to_string();
+    body = body.child(
+        col().key("context-actions").w_full().pt(6.0).child(
+            Button::new(if compacting {
+                t("Compacting…")
+            } else {
+                t("Compact context")
+            })
+            .variant(ButtonVariant::Submit)
+            .disabled(busy || compacting)
+            .on_press(move |s: &mut UiState| {
+                s.context_open = None;
+                s.compacting_sessions.insert(compact_asid.clone());
+                s.send(Command::CompactSession {
+                    asid: AgentSessionId(compact_asid.clone()),
+                });
+            })
+            .build(k)
+            .key("context-compact-btn")
+            .w_full(),
+        ),
+    );
     Some(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hub::CatalogView;
+    use crate::model::commands;
+    use crate::ui::timeline::SessionTimeline;
+    use muqun_gateway::agents::{AgentCatalog, CatalogDefaults, ModelInfo, ModelRef, TimelineItem};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn mk_session(id: &str) -> AgentSessionInfo {
+        serde_json::from_value(json!({
+            "asid": id,
+            "agent_id": "codex",
+            "title": id,
+            "status": "idle",
+            "model": { "provider_id": "openai", "model_id": "gpt-5.4" },
+            "context_usage": {
+                "total_tokens": 50_000,
+                "tokens": { "input": 45_000, "output": 5_000 }
+            },
+            "updated_ms": 100
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn usage_falls_back_to_catalog_model_context_limit() {
+        let (tx, _) = commands::channel();
+        let mut s = UiState::new(tx);
+        let info = mk_session("s1");
+        s.sessions.push(info.clone());
+        s.selected = Some("s1".into());
+        assert_eq!(usage(&s, &info), Some((50_000, None)));
+
+        let catalog = CatalogView {
+            catalog: AgentCatalog {
+                providers: vec![],
+                models: vec![ModelInfo {
+                    id: "gpt-5.4".into(),
+                    name: "GPT-5.4".into(),
+                    provider_id: "openai".into(),
+                    family: None,
+                    limit: Some(json!({ "context": 200_000 })),
+                    variants: None,
+                    cost: None,
+                    enabled: true,
+                    status: None,
+                }],
+                modes: vec![],
+                commands: vec![],
+                skills: vec![],
+                mcp: vec![],
+                defaults: CatalogDefaults {
+                    model: Some(ModelRef {
+                        provider_id: "openai".into(),
+                        model_id: "gpt-5.4".into(),
+                        variant: None,
+                    }),
+                    mode: None,
+                },
+            },
+        };
+        s.catalog = Some(Arc::new(catalog));
+        assert_eq!(usage(&s, &info), Some((50_000, Some(200_000))));
+    }
+
+    #[test]
+    fn context_message_count_respects_reported_limit_and_compaction_boundary() {
+        let (tx, _) = commands::channel();
+        let mut s = UiState::new(tx);
+        let mut info = mk_session("s1");
+        let items: Vec<TimelineItem> = vec![
+            serde_json::from_value(json!({"id":"i1","message_id":"m1","role":"user","seq":1,"updated_ms":1,"part":{"type":"text","text":"old"}})).unwrap(),
+            serde_json::from_value(json!({"id":"c1","message_id":"mc","role":"assistant","seq":2,"updated_ms":2,"part":{"type":"compaction","status":"completed"}})).unwrap(),
+            serde_json::from_value(json!({"id":"i2","message_id":"m2","role":"user","seq":3,"updated_ms":3,"part":{"type":"text","text":"after"}})).unwrap(),
+            serde_json::from_value(json!({"id":"i3","message_id":"m3","role":"assistant","seq":4,"updated_ms":4,"part":{"type":"text","text":"reply"}})).unwrap(),
+        ];
+        let mut tl = SessionTimeline::default();
+        tl.upsert(items);
+        s.timelines.insert("s1".into(), tl);
+        assert_eq!(context_message_count(&s, "s1", &info), Some(2));
+
+        info.context_usage.as_mut().unwrap().limit =
+            Some(json!({ "context": 200_000, "messages": 7 }));
+        assert_eq!(context_message_count(&s, "s1", &info), Some(7));
+    }
+
+    #[test]
+    fn compact_context_button_renders_and_respects_compacting_state() {
+        let (tx, _) = commands::channel();
+        let mut s = UiState::new(tx);
+        s.sessions.push(mk_session("s1"));
+        s.selected = Some("s1".into());
+        s.context_open = Some("s1".into());
+        assert!(!is_compacting(&s, "s1"));
+        s.compacting_sessions.insert("s1".into());
+        assert!(is_compacting(&s, "s1"));
+
+        let k = Kit::neutral(true);
+        assert!(content(&s, &k, "s1").is_some());
+    }
 }

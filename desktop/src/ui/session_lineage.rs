@@ -17,12 +17,11 @@ fn parent(info: &AgentSessionInfo) -> Option<&str> {
 
 fn child_metadata(info: &AgentSessionInfo) -> bool {
     parent(info).is_some()
-        || (info.agent_id == "codex"
-            && (info.mode.as_deref() == Some("subagent")
-                || [info.agent_role.as_deref(), info.agent_name.as_deref()]
-                    .into_iter()
-                    .flatten()
-                    .any(|value| !value.trim().is_empty())))
+        || info.mode.as_deref() == Some("subagent")
+        || [info.agent_role.as_deref(), info.agent_name.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|value| !value.trim().is_empty())
 }
 
 impl UiState {
@@ -37,19 +36,19 @@ impl UiState {
     fn subagent_context(&self, asid: &str) -> Option<&SubagentContext> {
         let computer = self.lineage_computer(asid, self.selected.as_deref())?;
         let agent = self.session_by_id(asid).map(|info| info.agent_id.as_str());
-        let mut contexts = self
-            .cfg
+        if let Some(agent) = agent {
+            if let Some(exact) = self.cfg.ui.subagent_contexts.iter().rev().find(|context| {
+                context.computer == computer && context.asid == asid && context.agent == agent
+            }) {
+                return Some(exact);
+            }
+        }
+        self.cfg
             .ui
             .subagent_contexts
             .iter()
             .rev()
-            .filter(|context| {
-                context.computer == computer
-                    && context.asid == asid
-                    && agent.is_none_or(|agent| context.agent == agent)
-            });
-        let context = contexts.next()?;
-        (agent.is_some() || contexts.next().is_none()).then_some(context)
+            .find(|context| context.computer == computer && context.asid == asid)
     }
 
     pub(super) fn is_subagent_session(&self, info: &AgentSessionInfo) -> bool {
@@ -61,11 +60,12 @@ impl UiState {
 
     pub(super) fn is_subagent_session_on(&self, computer: &str, info: &AgentSessionInfo) -> bool {
         child_metadata(info)
-            || self.cfg.ui.subagent_contexts.iter().any(|context| {
-                context.computer == computer
-                    && context.agent == info.agent_id
-                    && context.asid == info.asid.0
-            })
+            || self
+                .cfg
+                .ui
+                .subagent_contexts
+                .iter()
+                .any(|context| context.computer == computer && context.asid == info.asid.0)
     }
 
     /// The actual pane selection remains the child. Only its sidebar context
@@ -76,13 +76,16 @@ impl UiState {
         while visited.insert(current) {
             let info = self.session_by_id(current);
             let context = self.subagent_context(current);
+            let mao_parent = self.orchestration.parent_session_of(current);
             let ancestor = info
                 .and_then(parent)
-                .or_else(|| context.and_then(|c| c.ancestor.as_deref()));
+                .or_else(|| context.and_then(|c| c.ancestor.as_deref()))
+                .or(mao_parent);
             if let Some(ancestor) = ancestor {
                 current = ancestor;
             } else if context.is_some()
                 || info.is_some_and(child_metadata)
+                || self.orchestration.is_internal_child_session(current)
                 || (info.is_none()
                     && self
                         .lineage_computer(current, None)
@@ -101,34 +104,61 @@ impl UiState {
     }
 
     pub(super) fn remember_subagent_context(&mut self, child: &str, ancestor: Option<&str>) {
-        if ancestor == Some(child) || child.is_empty() {
+        self.remember_subagent_context_with_agent(child, ancestor, None);
+    }
+
+    pub(super) fn remember_subagent_context_with_agent(
+        &mut self,
+        child: &str,
+        ancestor: Option<&str>,
+        agent_hint: Option<&str>,
+    ) {
+        let child = child.trim();
+        if ancestor.map(str::trim) == Some(child) || child.is_empty() {
             return;
         }
+        let ancestor = ancestor
+            .map(str::trim)
+            .filter(|id| !id.is_empty() && *id != "null" && *id != child);
         let Some(computer) = self.lineage_computer(child, ancestor) else {
             return;
         };
-        let Some(agent) = self
+        let old = self.subagent_context(child).cloned();
+        let agent = self
             .session_by_id(child)
-            .or_else(|| ancestor.and_then(|id| self.session_by_id(id)))
             .map(|info| info.agent_id.clone())
             .filter(|agent| !agent.is_empty())
-        else {
-            return;
-        };
-        let old = self.subagent_context(child);
+            .or_else(|| {
+                agent_hint
+                    .map(str::trim)
+                    .filter(|agent| !agent.is_empty())
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                old.as_ref()
+                    .map(|c| c.agent.clone())
+                    .filter(|agent| !agent.is_empty())
+            })
+            .or_else(|| {
+                ancestor
+                    .and_then(|id| self.session_by_id(id))
+                    .map(|info| info.agent_id.clone())
+                    .filter(|agent| !agent.is_empty())
+            })
+            .unwrap_or_default();
         let ancestor = self
             .session_by_id(child)
             .and_then(parent)
             .or(ancestor)
             .map(str::to_owned)
-            .or_else(|| old.and_then(|c| c.ancestor.clone()));
+            .or_else(|| old.as_ref().and_then(|c| c.ancestor.clone()));
         let context = SubagentContext {
             computer,
             agent,
             asid: child.to_owned(),
             ancestor,
         };
-        if old != Some(&context) {
+        if old.as_ref() != Some(&context) {
             self.edit(ConfigEdit::RememberSubagent(context));
         }
         self.remove_child_recency(child);
@@ -142,22 +172,31 @@ impl UiState {
     }
 
     pub(super) fn remember_session_lineage_on(&mut self, computer: &str, info: &AgentSessionInfo) {
-        if child_metadata(info) && !info.agent_id.is_empty() {
-            // The metadata may be arriving before the inventory entry exists.
-            let old = self.cfg.ui.subagent_contexts.iter().rev().find(|context| {
-                context.computer == computer
-                    && (context.agent == info.agent_id || context.agent.is_empty())
-                    && context.asid == info.asid.0
-            });
+        let old = self
+            .cfg
+            .ui
+            .subagent_contexts
+            .iter()
+            .rev()
+            .find(|context| context.computer == computer && context.asid == info.asid.0)
+            .cloned();
+        if child_metadata(info) || old.is_some() {
+            // The metadata may be arriving before the inventory entry exists, or
+            // updating a cross-agent child whose stored agent was the parent's.
+            let agent = if !info.agent_id.is_empty() {
+                info.agent_id.clone()
+            } else {
+                old.as_ref().map(|c| c.agent.clone()).unwrap_or_default()
+            };
             let context = SubagentContext {
                 computer: computer.to_owned(),
-                agent: info.agent_id.clone(),
+                agent,
                 asid: info.asid.0.clone(),
                 ancestor: parent(info)
                     .map(str::to_owned)
-                    .or_else(|| old.and_then(|context| context.ancestor.clone())),
+                    .or_else(|| old.as_ref().and_then(|context| context.ancestor.clone())),
             };
-            if old != Some(&context) {
+            if old.as_ref() != Some(&context) {
                 self.edit(ConfigEdit::RememberSubagent(context));
             }
             if self.current_computer() == computer {
@@ -293,25 +332,16 @@ mod tests {
             "computer identities cannot leak"
         );
         restarted.cfg.current_computer = "local".into();
-        let mut other_agent = info("child");
-        other_agent.agent_id = "opencode".into();
-        restarted.sessions = vec![other_agent.clone()];
+        // Cross-agent delegations match persisted SubagentContext by (computer, asid)
+        // even if `context.agent` was initially recorded as the parent's agent_id.
+        let mut cross_agent_child = info("child");
+        cross_agent_child.agent_id = "opencode".into();
+        restarted.sessions = vec![cross_agent_child.clone()];
         assert!(
-            !restarted.is_subagent_session(&other_agent),
-            "agent identities cannot leak"
+            restarted.is_subagent_session(&cross_agent_child),
+            "cross-agent child matches persisted lineage by (computer, asid)"
         );
-        restarted.cfg.ui.subagent_contexts.push(SubagentContext {
-            computer: "local".into(),
-            agent: "opencode".into(),
-            asid: "child".into(),
-            ancestor: Some("other-root".into()),
-        });
-        restarted.sessions.clear();
-        assert_eq!(
-            restarted.sidebar_root("child"),
-            None,
-            "unhydrated ambiguous agent identity is not guessed"
-        );
+        assert_eq!(restarted.sidebar_root("child"), Some("root"));
     }
 
     #[test]
@@ -326,11 +356,40 @@ mod tests {
         state.cfg.general.pinned.push("uuid-looking-child".into());
         assert!(!sessions::listed(&state).contains(&"uuid-looking-child".into()));
         assert_eq!(state.sidebar_root("uuid-looking-child"), None);
-        let mut persona = info("root-with-custom-persona");
-        persona.agent_id = "opencode".into();
-        persona.mode = Some("subagent".into());
-        state.merge_sessions(vec![persona]);
-        assert!(sessions::listed(&state).contains(&"root-with-custom-persona".into()));
+        // Subagent mode/role/name hides subagents for ALL agents, not only Codex.
+        let mut non_codex_sub = info("opencode-subagent");
+        non_codex_sub.agent_id = "opencode".into();
+        non_codex_sub.mode = Some("subagent".into());
+        state.merge_sessions(vec![non_codex_sub]);
+        state.selected = Some("opencode-subagent".into());
+        assert!(!sessions::listed(&state).contains(&"opencode-subagent".into()));
+
+        let mut claude_named_sub = info("claude-named-subagent");
+        claude_named_sub.agent_id = "claude".into();
+        claude_named_sub.agent_name = Some("researcher".into());
+        state.merge_sessions(vec![claude_named_sub]);
+        state.selected = Some("claude-named-subagent".into());
+        assert!(!sessions::listed(&state).contains(&"claude-named-subagent".into()));
+    }
+
+    #[test]
+    fn cross_agent_remember_uses_child_agent_id_when_known() {
+        let mut state = state();
+        let mut child = info("cross-child");
+        child.agent_id = "claude".into();
+        state.sessions.push(child.clone());
+        state.remember_subagent_context("cross-child", Some("root"));
+        let ctx = state
+            .cfg
+            .ui
+            .subagent_contexts
+            .iter()
+            .find(|c| c.asid == "cross-child")
+            .unwrap();
+        assert_eq!(ctx.agent, "claude");
+        assert_eq!(ctx.ancestor.as_deref(), Some("root"));
+        assert!(state.is_subagent_session(&child));
+        assert!(!sessions::listed(&state).contains(&"cross-child".into()));
     }
 
     #[test]

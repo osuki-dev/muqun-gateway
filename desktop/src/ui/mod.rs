@@ -35,6 +35,7 @@ mod running;
 pub mod scenes;
 mod search;
 mod session_lineage;
+pub(crate) mod session_tree;
 mod sessions;
 pub(crate) mod settings;
 mod shell;
@@ -474,6 +475,8 @@ pub struct UiState {
     pub row_menu: Option<RowMenu>,
     /// The session whose context sheet is open (`timeline::context_meter`).
     pub context_open: Option<String>,
+    /// Sessions currently executing a context compaction.
+    pub compacting_sessions: HashSet<String>,
     /// Account rate windows by agent, once asked for (`None`: it has none).
     pub account_limits: HashMap<String, Option<serde_json::Value>>,
     pub agent_details: std::collections::HashSet<String>,
@@ -775,6 +778,7 @@ impl UiState {
             fits: panes::Fits::default(),
             row_menu: None,
             context_open: None,
+            compacting_sessions: HashSet::new(),
             account_limits: HashMap::new(),
             agent_details: std::collections::HashSet::new(),
             status: "Starting…".into(),
@@ -2381,6 +2385,56 @@ impl UiState {
         }
     }
 
+    /// Resolve the root session id for `asid` so the Session Tree always loads
+    /// the full Root → Parent → Siblings → Children hierarchy even when viewing a child.
+    pub fn session_tree_root_id<'a>(&'a self, asid: &'a str) -> &'a str {
+        if let Some(root) = self.sidebar_root(asid) {
+            return root;
+        }
+        let mut current = asid;
+        let mut visited = HashSet::new();
+        while visited.insert(current) {
+            let next = self
+                .session_by_id(current)
+                .and_then(|info| {
+                    info.parent_id
+                        .as_deref()
+                        .or_else(|| info.fork.as_ref().map(|f| f.session_id.as_str()))
+                })
+                .map(str::trim)
+                .filter(|id| !id.is_empty() && *id != "null" && *id != current);
+            match next {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+        current
+    }
+
+    /// Ask the core for the complete session tree rooted above the current session.
+    pub fn refresh_session_tree(&mut self) {
+        let Some(current) = self.selected.clone() else {
+            return;
+        };
+        let root = self.session_tree_root_id(&current).to_owned();
+        self.send(Command::LoadDescendants {
+            asid: AgentSessionId(root),
+        });
+    }
+
+    /// The catalog loaded for `asid` (focused session or a parked tile), if any.
+    pub(super) fn catalog_for_session(&self, asid: &str) -> Option<&CatalogView> {
+        if self.selected.as_deref() == Some(asid) {
+            return self.catalog.as_deref();
+        }
+        if let Some(i) = self.tile_of(asid) {
+            if let Some(view) = self.tiles[i].slot.catalog.as_deref() {
+                return Some(view);
+            }
+        }
+        self.catalog.as_deref()
+    }
+
     /// Ask the core for what the inspector's current tab shows.
     pub fn refresh_inspector(&mut self) {
         let Some(info) = self.current().cloned() else {
@@ -2401,7 +2455,7 @@ impl UiState {
                 }
                 self.send(Command::RefreshDiff(asid));
             }
-            InspectorTab::Subagents => self.send(Command::LoadDescendants { asid }),
+            InspectorTab::Subagents => self.refresh_session_tree(),
             InspectorTab::Saved => self.send(Command::LoadSavedPermissions { asid }),
             InspectorTab::Shells => self.send(Command::LoadShells {
                 agent: info.agent_id.clone(),
@@ -3547,6 +3601,7 @@ impl UiState {
                 Update::Snapshot(snapshot) => self.on_snapshot(*snapshot),
                 Update::Event(event) => self.apply_event(*event),
                 Update::Error(mut err) => {
+                    self.compacting_sessions.clear();
                     err.message = crate::model::inbox::clean_error_message(&err.message);
                     self.status = err.message.clone();
                     self.error_at = Some(std::time::Instant::now());
@@ -3631,10 +3686,27 @@ impl UiState {
                             info.parent_id.as_deref().or(Some(&asid)),
                         );
                     }
-                    if self.selected.as_deref() == Some(asid.as_str()) {
-                        self.descendants = sessions;
-                    } else if let Some(slot) = self.parked_slot(&asid) {
-                        slot.descendants = sessions;
+                    let matches_selected = self
+                        .selected
+                        .as_deref()
+                        .is_some_and(|sel| sel == asid || self.session_tree_root_id(sel) == asid);
+                    if matches_selected {
+                        self.descendants = sessions.clone();
+                    }
+                    let matching_tiles: Vec<usize> = self
+                        .tiles
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, tile)| {
+                            (*i != self.focus || !matches_selected)
+                                && tile.asid.as_deref().is_some_and(|tid| {
+                                    tid == asid || self.session_tree_root_id(tid) == asid
+                                })
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    for idx in matching_tiles {
+                        self.tiles[idx].slot.descendants = sessions.clone();
                     }
                 }
                 Update::SavedPermissions { asid, items } => {
@@ -4101,6 +4173,16 @@ impl UiState {
                     .retain(|k, _| !k.starts_with(&format!("{form_id}/")));
             }
             AgentDomainEvent::CompactionChanged { asid, status, .. } => {
+                match status {
+                    muqun_gateway::agents::CompactionStatus::Started
+                    | muqun_gateway::agents::CompactionStatus::Running => {
+                        self.compacting_sessions.insert(asid.0.clone());
+                    }
+                    muqun_gateway::agents::CompactionStatus::Completed
+                    | muqun_gateway::agents::CompactionStatus::Failed => {
+                        self.compacting_sessions.remove(&asid.0);
+                    }
+                }
                 if current(self, &asid) {
                     self.status = format!("Compaction {status:?}").to_lowercase();
                 }

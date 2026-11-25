@@ -27,15 +27,11 @@ const PER_PROJECT: usize = 8;
 const RECENT_LIMIT: usize = 16;
 const RECENT_AGE_MS: u64 = 3 * 24 * 60 * 60 * 1000;
 
-fn is_hidden_sidebar_session(s: &UiState, info: &muqun_gateway::agents::AgentSessionInfo) -> bool {
-    if s.is_subagent_session(info) {
-        return true;
-    }
-    let id = info.asid.0.as_str();
-    if s.selected.as_deref() == Some(id) || s.cfg.general.pinned.iter().any(|p| p == id) {
-        return false;
-    }
-    s.orchestration.is_internal_child_session(id)
+pub(super) fn is_hidden_sidebar_session(
+    s: &UiState,
+    info: &muqun_gateway::agents::AgentSessionInfo,
+) -> bool {
+    s.is_subagent_session(info) || s.orchestration.is_internal_child_session(&info.asid.0)
 }
 
 fn recent_sessions(s: &UiState, now: u64) -> Vec<&muqun_gateway::agents::AgentSessionInfo> {
@@ -1373,5 +1369,146 @@ mod tests {
         assert_eq!(s.tiles.len(), 2);
         assert_eq!(s.tiles[0].asid.as_deref(), Some("session-1"));
         assert_eq!(s.tiles[1].asid.as_deref(), Some("session-2"));
+    }
+
+    #[test]
+    fn manually_opened_or_pinned_subagents_and_mao_children_never_appear_in_sidebar() {
+        use crate::hub::{SearchHit, TaskRow};
+        use crate::ui::orchestration::{MaoRun, MaoSubtaskView};
+
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        s.cfg.current_computer = "local".into();
+        let now = now_ms();
+
+        let root = session("root", now);
+        let mut codex_sub = session("codex-sub", now);
+        codex_sub.agent_role = Some("explorer".into());
+
+        let mut claude_sub = session("claude-sub", now);
+        claude_sub.agent_id = "claude".into();
+        claude_sub.mode = Some("subagent".into());
+
+        let mut cross_child = session("cross-child", now);
+        cross_child.agent_id = "opencode".into();
+
+        let mao_rev = session("mao-rev", now);
+        let mao_adv = session("mao-adv", now);
+        let mao_sub = session("mao-sub", now);
+        let search_sub = session("search-sub", now);
+        let task_sub = session("task-sub", now);
+
+        s.sessions = vec![
+            root,
+            codex_sub,
+            claude_sub,
+            cross_child,
+            mao_rev,
+            mao_adv,
+            mao_sub,
+            search_sub,
+            task_sub,
+        ];
+
+        // Cross-agent child persisted under parent's agent_id ("codex")
+        s.cfg
+            .ui
+            .subagent_contexts
+            .push(crate::config::SubagentContext {
+                computer: "local".into(),
+                agent: "codex".into(),
+                asid: "cross-child".into(),
+                ancestor: Some("root".into()),
+            });
+
+        // MAO run owning reviewer, advisor, and delegated subtask
+        s.orchestration.runs.push(MaoRun {
+            id: "mao-1".into(),
+            coder_asid: "root".into(),
+            reviewer_asid: Some("mao-rev".into()),
+            advisor_asid: Some("mao-adv".into()),
+            subtasks: vec![MaoSubtaskView {
+                task_id: "t-sub".into(),
+                asid: Some("mao-sub".into()),
+                ..MaoSubtaskView::default()
+            }],
+            ..MaoRun::default()
+        });
+
+        // Search hit with parent_asid records lineage on open
+        s.content.hits.push(SearchHit {
+            asid: "search-sub".into(),
+            agent_id: "claude".into(),
+            parent_asid: Some("root".into()),
+            ..SearchHit::default()
+        });
+        s.open_hit(0);
+
+        // Child TaskRow records lineage via Update::Tasks
+        s.apply_updates(vec![crate::model::inbox::Update::Tasks {
+            rows: vec![
+                TaskRow {
+                    id: "t-root".into(),
+                    asid: Some("root".into()),
+                    ..TaskRow::default()
+                },
+                TaskRow {
+                    id: "t-child".into(),
+                    parent_task_id: Some("t-root".into()),
+                    asid: Some("task-sub".into()),
+                    agent_id: Some("codex".into()),
+                    ..TaskRow::default()
+                },
+            ],
+            default_cwd: None,
+        }]);
+
+        let hidden_ids = [
+            "codex-sub",
+            "claude-sub",
+            "cross-child",
+            "mao-rev",
+            "mao-adv",
+            "mao-sub",
+            "search-sub",
+            "task-sub",
+        ];
+
+        // Even when manually selected, pinned, and bumped in sidebar_opened,
+        // NONE of these child sessions may ever appear in Recent, All, Palette, or Running.
+        for child_id in hidden_ids {
+            s.cfg.general.pinned.push(child_id.into());
+            s.sidebar_opened
+                .insert(format!("local:{child_id}"), now + 999);
+            s.open_session(child_id);
+            assert_eq!(s.selected.as_deref(), Some(child_id));
+
+            s.sidebar_all_sessions = false;
+            assert_eq!(
+                listed(&s),
+                vec!["root"],
+                "recent sidebar leaked child {child_id}"
+            );
+
+            s.sidebar_all_sessions = true;
+            assert_eq!(
+                listed(&s),
+                vec!["root"],
+                "all-sessions sidebar leaked child {child_id}"
+            );
+
+            let palette_sessions: Vec<String> = super::super::palette::entries(&s)
+                .into_iter()
+                .filter_map(|e| match e.act {
+                    super::super::palette::Act::Session(id) => Some(id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                palette_sessions,
+                vec!["root"],
+                "palette leaked child {child_id}"
+            );
+        }
     }
 }

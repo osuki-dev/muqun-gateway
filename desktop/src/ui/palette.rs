@@ -210,6 +210,9 @@ pub fn entries(s: &UiState) -> Vec<Entry> {
     };
     // Sessions, most recent first (the list is kept in that order).
     for info in &s.sessions {
+        if super::sessions::is_hidden_sidebar_session(s, info) {
+            continue;
+        }
         let folder = info
             .directory
             .as_deref()
