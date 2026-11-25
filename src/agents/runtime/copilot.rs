@@ -106,6 +106,12 @@ impl CopilotState {
             runtime.events_tx.clone(),
         );
         driver.observe_terminals(runtime.terminal_runtime.get().cloned());
+        if let Some(servers) = runtime
+            .acp_muqun_mcp_servers("copilot", "GitHub Copilot CLI")
+            .await
+        {
+            driver.set_mcp_servers(servers);
+        }
         let _ = self.driver.set(driver);
         runtime.install("copilot", manager, AgentOrigin::None).await;
         true

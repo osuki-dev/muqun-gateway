@@ -631,10 +631,10 @@ pub(crate) async fn message(state: &AppState, child: &Task) -> String {
         }
         _ => None,
     };
-    let result = one_plain_line(
+    let (redacted_raw, _) = crate::mcp::reducer::redact_secrets(
         &answer.or_else(|| child.summary.clone()).unwrap_or_default(),
-        MAX_RESULT_CHARS,
     );
+    let result = one_plain_line(&redacted_raw, MAX_RESULT_CHARS);
     let (how, fallback) = match child.state {
         TaskState::Done => ("finished", "it is done."),
         TaskState::Waiting => ("needs an answer", "it is waiting for you."),

@@ -3,14 +3,17 @@
 //! long work returns a handle that `tasks.wait` polls.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, GetSkillRequestParams, GetSkillResult, Implementation,
-    ListResourcesResult, ListSkillsResult, PaginatedRequestParams, ReadResourceRequestParams,
-    ReadResourceResponse, ServerCapabilities, ServerConfig,
+    CallToolResult, CancelTaskParams, ContentBlock, DetailedTask, GetSkillRequestParams,
+    GetSkillResult, GetTaskParams, GetTaskResult, Implementation, JsonObject, ListResourcesResult,
+    ListSkillsResult, PaginatedRequestParams, ReadResourceDirectoryRequestParams,
+    ReadResourceDirectoryResult, ReadResourceRequestParams, ReadResourceResponse,
+    ServerCapabilities, ServerConfig, Task as McpTask, TaskPayload, TaskStatus,
 };
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::{RequestContext, RoleServer};
@@ -576,15 +579,18 @@ pub(crate) struct MuqunMcp {
     tool_router: ToolRouter<Self>,
 }
 
+static CACHED_TOOL_ROUTER: OnceLock<ToolRouter<MuqunMcp>> = OnceLock::new();
+
 #[tool_router(router = tool_router)]
 impl MuqunMcp {
     pub(crate) fn new(state: AppState, session: AssistantSession) -> Self {
+        let tool_router = CACHED_TOOL_ROUTER.get_or_init(Self::tool_router).clone();
         Self {
             state,
             session,
             in_task: false,
             fleet: None,
-            tool_router: Self::tool_router(),
+            tool_router,
         }
     }
 
@@ -1244,8 +1250,9 @@ impl MuqunMcp {
         Ok(ok(json!({
             "uri": skill.uri(),
             "name": skill.name,
+            "namespace": skill.namespace,
             "title": skill.title,
-            "content": skill.body,
+            "content": skill.skill_md_text(),
         })))
     }
 }
@@ -1272,13 +1279,87 @@ fn redact_json_strings(value: &mut Value) {
     }
 }
 
+fn iso8601_utc(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    let millis = ms % 1000;
+    let days = (total_secs / 86_400) as i64;
+    let secs_of_day = total_secs % 86_400;
+    let hour = secs_of_day / 3600;
+    let min = (secs_of_day % 3600) / 60;
+    let sec = secs_of_day % 60;
+    // Howard Hinnant's civil_from_days algorithm (Unix epoch 1970-01-01).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
+}
+
+fn task_to_mcp_detailed(task: &crate::tasks::domain::Task) -> DetailedTask {
+    use crate::tasks::domain::TaskState;
+    let (summary, _) = super::reducer::redact_secrets(task.summary.as_deref().unwrap_or(""));
+    let summary_opt = (!summary.is_empty()).then_some(summary.clone());
+    let mut base = McpTask::new(
+        task.id.0.clone(),
+        TaskStatus::Working,
+        iso8601_utc(task.created_ms),
+        iso8601_utc(task.updated_ms),
+    )
+    .with_poll_interval_ms(2000);
+    if let Some(msg) = summary_opt.clone() {
+        base = base.with_status_message(msg);
+    }
+    let payload = match task.state {
+        TaskState::Queued | TaskState::Dispatching | TaskState::Working => TaskPayload::Working,
+        TaskState::Waiting => {
+            // Surface waiting status cleanly without fabricating unrequested Elicitation IDs.
+            base = base.with_status_message(
+                summary_opt.unwrap_or_else(|| "Task is waiting for user input".into()),
+            );
+            TaskPayload::Working
+        }
+        TaskState::Done | TaskState::IdleUnconfirmed => {
+            let mut obj = JsonObject::new();
+            obj.insert("task_id".into(), json!(task.id.0));
+            obj.insert("state".into(), json!(task.state));
+            if let Some(s) = summary_opt {
+                obj.insert("summary".into(), json!(s));
+            }
+            if let Some(code) = task.exit_code {
+                obj.insert("exit_code".into(), json!(code));
+            }
+            TaskPayload::Completed { result: obj }
+        }
+        TaskState::Failed => {
+            let mut err = JsonObject::new();
+            err.insert("code".into(), json!(-32000));
+            err.insert(
+                "message".into(),
+                json!(summary_opt.unwrap_or_else(|| "Task failed".into())),
+            );
+            TaskPayload::Failed { error: err }
+        }
+        TaskState::Cancelled => TaskPayload::Cancelled,
+    };
+    DetailedTask::new(base, payload)
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MuqunMcp {
     fn get_info(&self) -> ServerConfig {
         let capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_resources()
-            .enable_skills()
+            .enable_skills_with_directory_read()
+            .enable_tasks()
             .build();
         ServerConfig::new(capabilities)
             .with_server_info(Implementation::new(
@@ -1304,6 +1385,14 @@ impl ServerHandler for MuqunMcp {
         super::skills::read_resource(&request.uri)
     }
 
+    async fn read_resource_directory(
+        &self,
+        request: ReadResourceDirectoryRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceDirectoryResult, ErrorData> {
+        super::skills::read_resource_directory(&request.uri)
+    }
+
     async fn list_skills(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -1318,6 +1407,34 @@ impl ServerHandler for MuqunMcp {
         _context: RequestContext<RoleServer>,
     ) -> Result<GetSkillResult, ErrorData> {
         super::skills::get_skill(&request.uri)
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, ErrorData> {
+        let id = TaskId(request.task_id);
+        let task = self.state.tasks.owned(&self.by(), &id).await.map_err(|_| {
+            ErrorData::resource_not_found(format!("task not found: {}", id.0), None)
+        })?;
+        Ok(GetTaskResult::new(task_to_mcp_detailed(&task)))
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        let id = TaskId(request.task_id);
+        self.state
+            .tasks
+            .cancel(&self.state, &self.by(), &id)
+            .await
+            .map_err(|err| {
+                ErrorData::invalid_params(format!("cannot cancel task: {err:?}"), None)
+            })?;
+        Ok(())
     }
 }
 

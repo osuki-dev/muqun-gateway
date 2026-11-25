@@ -446,6 +446,34 @@ impl McpEnv {
 }
 
 impl AgentRuntime {
+    /// Unified ACP `mcpServers` entry pointing at this gateway's `/mcp` with a
+    /// runtime-scoped token for `agent_id`. Shared across all native ACP drivers
+    /// (Claude Code, Cursor, Antigravity, Copilot, Qoder, FX) so every agent uses
+    /// the single gateway MCP endpoint and its unified Hub/Skills surface.
+    pub(super) async fn acp_muqun_mcp_servers(
+        &self,
+        agent_id: &str,
+        display_name: &str,
+    ) -> Option<serde_json::Value> {
+        let wiring = self.mcp.get()?;
+        let label = format!("{agent_id} (native sessions)");
+        match issue_agent_env_for(wiring.tokens.as_ref(), &wiring.url, agent_id, &label).await {
+            Ok((env, previous)) => {
+                settle_agent_tokens(wiring.tokens.as_ref(), &env, &previous, true).await;
+                Some(serde_json::json!([{
+                    "type": "http",
+                    "name": crate::mcp::hosts::SERVER_NAME,
+                    "url": env.url,
+                    "headers": [{ "name": "Authorization", "value": format!("Bearer {}", env.token) }],
+                }]))
+            }
+            Err(error) => {
+                tracing::warn!("could not mint {display_name}'s MCP token: {error}");
+                None
+            }
+        }
+    }
+
     pub fn new(config: OpencodeConfig) -> Arc<Self> {
         Self::with_configs(config, DeepseekConfig::default(), T3Config::default(), None)
     }

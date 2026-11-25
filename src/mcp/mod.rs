@@ -945,6 +945,17 @@ mod tests {
                 .is_object(),
             "expected io.modelcontextprotocol/skills extension: {body}"
         );
+        assert_eq!(
+            body["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/skills"]
+                ["directoryRead"],
+            true,
+            "expected directoryRead in skills capability: {body}"
+        );
+        assert!(
+            body["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/tasks"]
+                .is_object(),
+            "expected io.modelcontextprotocol/tasks extension: {body}"
+        );
 
         // 2. resources/list exposes skill://muqun/*/SKILL.md resources.
         let (status, list_body) = send(
@@ -1062,5 +1073,70 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{item_body}");
         let item_text = item_body["result"]["content"][0]["text"].as_str().unwrap();
         assert!(item_text.contains("barrier_group"), "{item_text}");
+
+        // 6. Native SEP-2663 tasks/get + tasks/cancel respect ownership and redact secrets.
+        let owned_task = crate::tasks::domain::Task {
+            id: crate::tasks::domain::TaskId::new(),
+            kind: crate::tasks::domain::TaskKind::Delegation,
+            goal: "check secrets".into(),
+            cwd: None,
+            binding: crate::tasks::domain::TaskBinding::None,
+            state: crate::tasks::domain::TaskState::Done,
+            summary: Some("Bearer eyJhbGciOiJIUzI1NiJ9.secret123456 ok".into()),
+            exit_code: Some(0),
+            created_by: crate::tasks::domain::TaskPrincipal {
+                kind: crate::tasks::domain::PrincipalKind::Assistant,
+                id: pane().owner_key(),
+            },
+            created_ms: 1_700_000_000_000,
+            updated_ms: 1_700_000_005_000,
+            seq: 1,
+            parent: None,
+            origin: crate::tasks::domain::TaskOrigin::Mcp,
+            label: None,
+            requester_name: None,
+            session_title: None,
+            mentions: Vec::new(),
+            client_ref: None,
+            requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
+        };
+        let task_id = state.tasks.insert_for_test(&owned_task).await;
+        let mut get_task_params = json!({ "taskId": task_id.0 });
+        get_task_params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": { "name": "test", "version": "0" },
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": { "io.modelcontextprotocol/tasks": {} }
+            }
+        });
+        let mut get_task_req = Request::post(MCP_PATH)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("host", "127.0.0.1:23999")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tasks/get")
+            .header("mcp-name", &task_id.0)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tasks/get",
+                    "params": get_task_params,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        get_task_req
+            .extensions_mut()
+            .insert(ConnectInfo("127.0.0.1:5".parse::<SocketAddr>().unwrap()));
+        let (status, task_body) = send(&state, get_task_req).await;
+        assert_eq!(status, StatusCode::OK, "{task_body}");
+        assert_eq!(task_body["result"]["status"], "completed", "{task_body}");
+        let status_msg = task_body["result"]["statusMessage"].as_str().unwrap();
+        assert!(!status_msg.contains("eyJhbGciOiJIUzI1NiJ9"), "{status_msg}");
+        assert!(status_msg.contains("Bearer [REDACTED]"), "{status_msg}");
     }
 }

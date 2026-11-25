@@ -30,17 +30,36 @@ fn is_zero(n: &usize) -> bool {
     *n == 0
 }
 
-/// Redact common API keys, bearer tokens, and secret key=value assignments.
-/// Returns `(redacted_text, changed)`.
+/// Redact common API keys, bearer tokens, PEM private keys, credentialed URLs,
+/// and secret key=value assignments. Returns `(redacted_text, changed)`.
 pub(crate) fn redact_secrets(input: &str) -> (String, bool) {
     if input.is_empty() {
         return (String::new(), false);
     }
     let mut out = String::with_capacity(input.len());
     let mut changed = false;
+    let mut in_pem_key = false;
     for (idx, line) in input.split('\n').enumerate() {
         if idx > 0 {
             out.push('\n');
+        }
+        let trimmed = line.trim();
+        if !in_pem_key && trimmed.starts_with("-----BEGIN ") && trimmed.contains("PRIVATE KEY-----")
+        {
+            in_pem_key = true;
+            changed = true;
+            out.push_str("[REDACTED_PRIVATE_KEY]");
+            if trimmed.contains("-----END ") {
+                in_pem_key = false;
+            }
+            continue;
+        }
+        if in_pem_key {
+            changed = true;
+            if trimmed.starts_with("-----END ") && trimmed.contains("PRIVATE KEY-----") {
+                in_pem_key = false;
+            }
+            continue;
         }
         let (clean, line_changed) = redact_line(line);
         changed |= line_changed;
@@ -76,6 +95,16 @@ fn redact_line(line: &str) -> (String, bool) {
             } else {
                 out.push_str(&line[start..i]);
             }
+            continue;
+        }
+
+        // 1b. Credentialed URLs: scheme://user:pass@host (e.g. postgres://, https://, redis://)
+        if let Some((scheme_end, at_pos)) = credentialed_url_span(&line[i..]) {
+            out.push_str(&line[i..i + scheme_end]);
+            out.push_str(REDACTED);
+            out.push('@');
+            i += at_pos + 1;
+            changed = true;
             continue;
         }
 
@@ -154,6 +183,44 @@ fn starts_with_ascii_ci(haystack: &str, needle: &str) -> bool {
 
 fn is_token_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+' | b'/' | b'=')
+}
+
+/// Match `scheme://user:password@` at the start of `s`, returning
+/// `(offset_after_scheme_slashes, offset_of_at_sign)` when a non-empty password
+/// is present before `@`.
+fn credentialed_url_span(s: &str) -> Option<(usize, usize)> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let mut i = 1;
+    while i < bytes.len()
+        && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'+' | b'-' | b'.'))
+    {
+        i += 1;
+    }
+    if !s.get(i..)?.starts_with("://") {
+        return None;
+    }
+    let auth_start = i + 3;
+    let rest = s.get(auth_start..)?;
+    let mut colon = None;
+    for (rel, b) in rest.bytes().enumerate() {
+        match b {
+            b'@' => {
+                let colon_pos = colon?;
+                let pass_len = rel.saturating_sub(colon_pos + 1);
+                if pass_len >= 1 {
+                    return Some((auth_start, auth_start + rel));
+                }
+                return None;
+            }
+            b':' if colon.is_none() => colon = Some(rel),
+            b'/' | b'?' | b'#' | b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'\'' => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 fn is_known_secret_prefix(s: &str) -> bool {
@@ -425,6 +492,34 @@ mod tests {
         assert!(clean.contains("OPENAI_API_KEY=[REDACTED]"));
         assert!(clean.contains("\"safe\": \"hello\""));
         assert!(clean.contains("let count = 42;"));
+    }
+
+    #[test]
+    fn redacts_pem_private_keys_and_credentialed_urls() {
+        let raw = "DATABASE_URL=postgres://admin:s3cr3tPass@db.internal:5432/prod\n\
+                   curl https://bot:tok_xyz999@api.example.com/v1\n\
+                   safe: https://example.com/docs and git@github.com:org/repo.git\n\
+                   -----BEGIN OPENSSH PRIVATE KEY-----\n\
+                   b3BlbnNzaC1rZXktdjEAAAAABG5vbmU=\n\
+                   -----END OPENSSH PRIVATE KEY-----\n\
+                   done";
+        let (clean, changed) = redact_secrets(raw);
+        assert!(changed);
+        assert!(!clean.contains("s3cr3tPass"), "{clean}");
+        assert!(!clean.contains("tok_xyz999"), "{clean}");
+        assert!(!clean.contains("b3BlbnNzaC1rZXktdjE"), "{clean}");
+        assert!(
+            clean.contains("postgres://[REDACTED]@db.internal:5432/prod"),
+            "{clean}"
+        );
+        assert!(
+            clean.contains("https://[REDACTED]@api.example.com/v1"),
+            "{clean}"
+        );
+        assert!(clean.contains("[REDACTED_PRIVATE_KEY]"), "{clean}");
+        assert!(clean.contains("https://example.com/docs"), "{clean}");
+        assert!(clean.contains("git@github.com:org/repo.git"), "{clean}");
+        assert!(clean.ends_with("done"), "{clean}");
     }
 
     #[test]

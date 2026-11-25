@@ -230,29 +230,8 @@ impl AgentRuntime {
     /// token could not be minted. Earlier such tokens belonged to children of
     /// a previous Gateway run and are revoked.
     async fn antigravity_mcp_servers(&self) -> Option<serde_json::Value> {
-        let wiring = self.mcp.get()?;
-        match super::issue_agent_env_for(
-            wiring.tokens.as_ref(),
-            &wiring.url,
-            "antigravity",
-            "antigravity (native sessions)",
-        )
-        .await
-        {
-            Ok((env, previous)) => {
-                super::settle_agent_tokens(wiring.tokens.as_ref(), &env, &previous, true).await;
-                Some(serde_json::json!([{
-                    "type": "http",
-                    "name": crate::mcp::hosts::SERVER_NAME,
-                    "url": env.url,
-                    "headers": [{ "name": "Authorization", "value": format!("Bearer {}", env.token) }],
-                }]))
-            }
-            Err(error) => {
-                tracing::warn!("could not mint Antigravity's MCP token: {error}");
-                None
-            }
-        }
+        self.acp_muqun_mcp_servers("antigravity", "Antigravity")
+            .await
     }
 }
 
