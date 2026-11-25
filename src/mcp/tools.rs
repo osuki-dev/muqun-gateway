@@ -7,8 +7,13 @@ use std::time::Duration;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
+use rmcp::model::{
+    CallToolResult, ContentBlock, GetSkillRequestParams, GetSkillResult, Implementation,
+    ListResourcesResult, ListSkillsResult, PaginatedRequestParams, ReadResourceRequestParams,
+    ReadResourceResponse, ServerCapabilities, ServerConfig,
+};
 use rmcp::schemars::{self, JsonSchema};
+use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -414,6 +419,16 @@ pub(crate) struct DelegateArgs {
     /// Optional task_id of a previous completed/idle sub-task you created: sends this goal as a follow-up in that same warm agent session instead of cold-starting a new session.
     #[serde(default)]
     pub reuse_task_id: Option<String>,
+    /// Optional parallel barrier group key (<=128 chars): when delegating multiple async sub-tasks, Muqun holds individual notices until every task in the group settles and wakes you once with a combined summary.
+    #[serde(default)]
+    pub barrier_group: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct SkillReadArgs {
+    /// Skill name, slug, or URI (`skill://muqun/<slug>/SKILL.md`). Omit to list available Muqun playbooks.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 impl DelegateArgs {
@@ -591,7 +606,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "fleet.list",
-        description = "List the computers this gateway can hand work to: this one and every linked one, with OS, what each is suitable for, whether it is reachable and how busy it is."
+        description = "List this computer and linked computers with OS, reachability, and load."
     )]
     async fn fleet_list(&self) -> Result<CallToolResult, ErrorData> {
         let machines = self.state.fleet.list(&self.state).await;
@@ -600,7 +615,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "fleet.describe",
-        description = "What a computer offers: its agents (status, version, modes, available models, live quota health), terminal backends, toolchains with versions, task counts and what it is suitable for. Without machine, this computer plus a short entry per linked computer (peers)."
+        description = "Inspect a computer's agents, models, live quota health, toolchains, and peers (omit machine for self + peer summaries)."
     )]
     async fn fleet_describe(
         &self,
@@ -638,7 +653,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "files.present",
-        description = "Share a file from this computer or a linked computer with machine. Uses the same file permissions and preview/download handling as opening a local session file. Any file type can be downloaded; supported types can also be previewed. The App must be paired with the source computer. No public URL or credentials are returned."
+        description = "Present a file on this computer or a linked machine for preview/download in Muqun Desktop/App."
     )]
     async fn present_file(
         &self,
@@ -687,7 +702,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "exec.run",
-        description = "Run a shell command in a visible terminal pane on this computer, or (machine) on a linked computer, and return its exit code and output tail. Blocks up to timeout_s (max 45); if still running, returns a task_id for tasks.wait. For a command or a short script on another computer use this first, before your own SSH and not tasks.delegate: it is visible, recorded, interruptible and approved there, and no agent is started."
+        description = "Run a shell command in a visible pane on this computer or a linked machine (blocks <=45s, else returns task_id). Prefer this over SSH or tasks.delegate for commands/scripts."
     )]
     async fn exec_run(
         &self,
@@ -803,7 +818,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.delegate",
-        description = "Start a sub-task on an agent, on this computer or (machine) on a linked one: a new native agent session in cwd with your goal as the first prompt (or pass reuse_task_id to continue an existing warm child session you created). Returns task_id. If the work will take long, end your turn after delegating; you will be told when it finishes. Use tasks.wait (with task_ids for parallel fan-in) for short jobs. One hop only: a task another computer handed here cannot hand work to a linked computer (delegation_loop)."
+        description = "Delegate a goal to a coding agent on this computer or a linked machine (supports reuse_task_id for warm local sessions and barrier_group for single-wakeup parallel fan-out). Returns task_id; end your turn for long jobs."
     )]
     async fn tasks_delegate(
         &self,
@@ -817,6 +832,18 @@ impl MuqunMcp {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
+        let barrier_group = match args.barrier_group.as_deref() {
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if !crate::tasks::domain::valid_barrier_group(trimmed) {
+                    return Ok(invalid(
+                        "barrier_group must be non-empty, at most 128 bytes, and contain no control characters",
+                    ));
+                }
+                Some(trimmed.to_owned())
+            }
+            None => None,
+        };
         let config = &self.state.config;
         let peers = self.state.peers.selectors();
         let mut request = match args.request(&config.server_id, &config.label, &peers) {
@@ -875,7 +902,10 @@ impl MuqunMcp {
         };
         let id = TaskId(view.task_id.clone());
         if let Some(caller) = caller {
-            self.state.tasks.notify(&id, &caller).await;
+            self.state
+                .tasks
+                .notify_with_barrier(&id, &caller, barrier_group.as_deref())
+                .await;
         }
         if let (Some(parent), Ok(Some(child))) = (
             view.parent_task_id.as_ref(),
@@ -885,6 +915,9 @@ impl MuqunMcp {
             self.state.tasks.waits_on(&parent, &child).await;
         }
         let mut body = json!(view);
+        if let Some(group) = barrier_group {
+            body["barrier_group"] = json!(group);
+        }
         // The create went out and got no answer: whether it started is unknown.
         if let TaskBinding::Peer {
             remote_task_id,
@@ -905,7 +938,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.wait",
-        description = "Wait up to timeout_s (max 45) for a task (task_id) or a batch of parallel tasks (task_ids, up to 16, wait_for: \"all\" or \"any\") to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing: read its answer and decide; do not call again while it says idle_unconfirmed). Returns compact redacted state, summary, and key_errors. If the work will take long, end your turn after delegating; you will be told when it finishes."
+        description = "Wait <=45s for one task_id or parallel task_ids (up to 16, wait_for: \"all\"|\"any\") to settle; returns compact redacted summary and key_errors. For long jobs, end your turn instead of polling."
     )]
     async fn tasks_wait(
         &self,
@@ -1068,7 +1101,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.read",
-        description = "Read a task you created: its summary or recent timeline. Without task_id: whether this session itself is working on a Muqun task, and that task, whose summary lists the computers the user named for it (mentions)."
+        description = "Read a delegated task's summary or timeline. Omit task_id to check your own active Muqun task and user-named machines (mentions)."
     )]
     async fn tasks_read(
         &self,
@@ -1129,7 +1162,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.complete",
-        description = "Call this when the task you were given is finished, with a one-line summary (outcome done, the default) -- or when you stop because you need the user, with outcome blocked and the reason (a missing file, an unclear request, a permission you cannot get). Only the session (or terminal pane) working on the task can complete it; stopping or going idle does not, and a blocked task stays open until you call this again with done. If it answers task_not_found, you are not working on a Muqun task: do not call it again."
+        description = "Report your active Muqun task finished (outcome \"done\") or blocked on the user (\"blocked\") with a one-line summary. Ignore if it returns task_not_found."
     )]
     async fn tasks_complete(
         &self,
@@ -1185,6 +1218,36 @@ impl MuqunMcp {
         }
         reply(cancelled)
     }
+
+    #[tool(
+        name = "skills.read",
+        description = "List or read Muqun orchestration playbooks on demand (fallback for clients without MCP Skills/Resources)."
+    )]
+    async fn skills_read(
+        &self,
+        Parameters(args): Parameters<SkillReadArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Some(name) = args
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(ok(super::skills::skills_catalog_json()));
+        };
+        let Some(skill) = super::skills::find_skill(name) else {
+            return Ok(fail(
+                "skill_not_found",
+                &format!("Unknown skill '{name}'. Call skills.read without arguments to list available playbooks."),
+            ));
+        };
+        Ok(ok(json!({
+            "uri": skill.uri(),
+            "name": skill.name,
+            "title": skill.title,
+            "content": skill.body,
+        })))
+    }
 }
 
 fn redact_json_strings(value: &mut Value) {
@@ -1212,12 +1275,49 @@ fn redact_json_strings(value: &mut Value) {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MuqunMcp {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        let capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .enable_skills()
+            .build();
+        ServerConfig::new(capabilities)
             .with_server_info(Implementation::new(
                 "muqun-gateway",
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(instructions(self.in_task, self.fleet.as_deref()))
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        Ok(super::skills::list_resources())
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        super::skills::read_resource(&request.uri)
+    }
+
+    async fn list_skills(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListSkillsResult, ErrorData> {
+        Ok(super::skills::list_skills())
+    }
+
+    async fn get_skill(
+        &self,
+        request: GetSkillRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetSkillResult, ErrorData> {
+        super::skills::get_skill(&request.uri)
     }
 }
 
@@ -1225,25 +1325,17 @@ impl ServerHandler for MuqunMcp {
 /// plainly to one started for a task (`in_task`), conditionally to anyone
 /// else, who may never have been given one.
 pub(crate) fn instructions(in_task: bool, fleet: Option<&str>) -> String {
-    let about = "Muqun Gateway on this computer. fleet.describe says what it has and which \
-                 other computers are linked to it, exec.run runs short commands, \
-                 tasks.delegate hands work to a coding agent -- if the work will take long, \
-                 end your turn after delegating; you will be told when it finishes. Use \
-                 tasks.wait (at most 45 s) only for short jobs; tasks.delegate(machine) \
-                 sends work to a linked computer, and your task's summary (tasks.read without \
-                 a task_id) lists the ones the user named (mentions). For a command or a \
-                 short script on another computer, call exec.run with machine first: it runs \
-                 in a visible pane there, is recorded, can be interrupted and goes through \
-                 approvals. Fall back to your own SSH only when that computer is not linked \
-                 or exec.run cannot do it (an interactive session, a directory outside its \
-                 home), and say so. Delegate a goal only when the other computer needs an \
-                 agent of its own. Do not restate the completion protocol in a delegated \
-                 goal: the agent there already knows it.";
-    let finish = "call tasks.complete with a one-line summary; when you stop because you \
-                  need the user, call it with outcome \"blocked\" and the reason; if you \
-                  cannot call it, end with the line MUQUN_TASK_DONE: <summary> (or \
-                  MUQUN_TASK_BLOCKED: <reason>). If tasks.complete answers task_not_found, \
-                  this session is not a Muqun task: do not call it again and print no marker.";
+    let about = "Muqun Gateway on this computer. Use fleet.describe for capabilities/peers, \
+                 exec.run for commands/scripts (prefer over SSH), and tasks.delegate for \
+                 sub-tasks (use barrier_group for single-wakeup parallel fan-out; end your \
+                 turn for long jobs). Detailed playbooks are published as Skills over MCP \
+                 (skill://muqun/... or skills.read). Do not restate the completion protocol \
+                 in a delegated goal.";
+    let finish = "call tasks.complete with a one-line summary; when blocked on the user, \
+                  call it with outcome \"blocked\" and the reason; fallback if unavailable: \
+                  end with MUQUN_TASK_DONE: <summary> or MUQUN_TASK_BLOCKED: <reason>. \
+                  If tasks.complete answers task_not_found, ignore the task protocol and \
+                  print no marker.";
     if in_task {
         // First and imperative: a host may show this beside many other
         // instructions, and an agent that just stops leaves its task paused.
@@ -1383,6 +1475,7 @@ pub(crate) mod tests_support {
             machine: Some(machine.into()),
             terminal: None,
             reuse_task_id: None,
+            barrier_group: None,
         };
         let result = MuqunMcp::new(state.clone(), session)
             .tasks_delegate(Parameters(args))
@@ -1462,6 +1555,7 @@ mod tests {
             machine: None,
             terminal: None,
             reuse_task_id: None,
+            barrier_group: None,
         };
         let (error, _, body) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(!error, "{body}");
@@ -1511,6 +1605,7 @@ mod tests {
             machine: None,
             terminal: None,
             reuse_task_id: None,
+            barrier_group: None,
         };
         let (error, _, task) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(!error, "{task}");
@@ -1556,6 +1651,7 @@ mod tests {
             machine: None,
             terminal: Some("nope".into()),
             reuse_task_id: None,
+            barrier_group: None,
         };
         let (error, text, _) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(error, "{text}");
@@ -1673,6 +1769,7 @@ mod tests {
             machine: None,
             terminal: None,
             reuse_task_id: None,
+            barrier_group: None,
         }
         .request("srv-coding", "coding", &[])
         .unwrap();
@@ -1689,6 +1786,7 @@ mod tests {
             machine: None,
             terminal: None,
             reuse_task_id: None,
+            barrier_group: None,
         };
         let (error, _, body) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(error, "{body}");
@@ -2088,6 +2186,7 @@ mod tests {
                 "files.present",
                 "fleet.describe",
                 "fleet.list",
+                "skills.read",
                 "tasks.cancel",
                 "tasks.complete",
                 "tasks.delegate",
@@ -2443,6 +2542,7 @@ for line in sys.stdin:
                 machine: None,
                 terminal: None,
                 reuse_task_id: Some(first_id.clone()),
+                barrier_group: None,
             }))
             .await,
         );

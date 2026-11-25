@@ -16,6 +16,7 @@ pub(crate) mod inject;
 pub(crate) mod issue;
 pub(crate) mod lineage;
 pub(crate) mod reducer;
+pub(crate) mod skills;
 pub(crate) mod token_routes;
 pub(crate) mod tokens;
 pub(crate) mod tokens_sqlite;
@@ -912,5 +913,154 @@ mod tests {
         let headers = crate::bearer_headers("tok");
         assert!(crate::require_device(&state, &headers).is_err());
         assert!(crate::require_admin(&state.config, &headers).is_err());
+    }
+
+    #[tokio::test]
+    async fn skills_over_mcp_resources_and_fallback_tool_roundtrip() {
+        use sha2::{Digest as _, Sha256};
+
+        let state = crate::test_state("admin", Vec::new());
+        let token = issue(&state).await;
+
+        // 1. initialize advertises resources + io.modelcontextprotocol/skills extension.
+        let init_req = rpc(
+            "127.0.0.1:5",
+            Some(&token),
+            &[],
+            "initialize",
+            json!({
+                "protocolVersion": "2026-07-28",
+                "capabilities": {},
+                "clientInfo": { "name": "test-client", "version": "1.0" },
+            }),
+        );
+        let (status, body) = send(&state, init_req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body["result"]["capabilities"]["resources"].is_object(),
+            "expected resources capability: {body}"
+        );
+        assert!(
+            body["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/skills"]
+                .is_object(),
+            "expected io.modelcontextprotocol/skills extension: {body}"
+        );
+
+        // 2. resources/list exposes skill://muqun/*/SKILL.md resources.
+        let (status, list_body) = send(
+            &state,
+            rpc(
+                "127.0.0.1:5",
+                Some(&token),
+                &[],
+                "resources/list",
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{list_body}");
+        let resources = list_body["result"]["resources"].as_array().unwrap();
+        assert_eq!(resources.len(), skills::BUILTIN_SKILLS.len());
+        assert!(resources
+            .iter()
+            .any(|r| r["uri"] == "skill://muqun/parallel-tasks/SKILL.md"));
+
+        // 3. resources/read returns SKILL.md markdown and rejects unknown URIs.
+        let (status, read_body) = send(
+            &state,
+            rpc(
+                "127.0.0.1:5",
+                Some(&token),
+                &[("mcp-name", "skill://muqun/parallel-tasks/SKILL.md")],
+                "resources/read",
+                json!({ "uri": "skill://muqun/parallel-tasks/SKILL.md" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{read_body}");
+        let md = read_body["result"]["contents"][0]["text"].as_str().unwrap();
+        assert!(md.contains("barrier_group"), "{md}");
+        let expected_sha = hex::encode(Sha256::digest(md.as_bytes()));
+
+        let (_, missing_body) = send(
+            &state,
+            rpc(
+                "127.0.0.1:5",
+                Some(&token),
+                &[("mcp-name", "skill://muqun/does-not-exist/SKILL.md")],
+                "resources/read",
+                json!({ "uri": "skill://muqun/does-not-exist/SKILL.md" }),
+            ),
+        )
+        .await;
+        assert!(missing_body.get("error").is_some(), "{missing_body}");
+
+        // 4. SEP-2640 skills/list + skills/get carry matching SHA-256 digests.
+        let (status, skills_list_body) = send(
+            &state,
+            rpc("127.0.0.1:5", Some(&token), &[], "skills/list", json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{skills_list_body}");
+        let entries = skills_list_body["result"]["skills"].as_array().unwrap();
+        assert_eq!(entries.len(), skills::BUILTIN_SKILLS.len());
+        let parallel = entries
+            .iter()
+            .find(|s| s["uri"] == "skill://muqun/parallel-tasks/SKILL.md")
+            .unwrap();
+        assert_eq!(
+            parallel["resources"][0]["digest"],
+            format!("sha256:{expected_sha}")
+        );
+
+        let (status, skills_get_body) = send(
+            &state,
+            rpc(
+                "127.0.0.1:5",
+                Some(&token),
+                &[("mcp-name", "skill://muqun/parallel-tasks/SKILL.md")],
+                "skills/get",
+                json!({ "uri": "skill://muqun/parallel-tasks/SKILL.md" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{skills_get_body}");
+        assert_eq!(
+            skills_get_body["result"]["skill"]["frontmatter"]["name"],
+            "parallel-tasks"
+        );
+
+        // 5. Fallback skills.read tool works for non-SEP-2640 clients.
+        let (status, catalog_body) = send(
+            &state,
+            rpc(
+                "127.0.0.1:5",
+                Some(&token),
+                &[("mcp-name", "skills.read")],
+                "tools/call",
+                json!({ "name": "skills.read", "arguments": {} }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{catalog_body}");
+        let catalog_text = catalog_body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(catalog_text.contains("parallel-tasks"), "{catalog_text}");
+
+        let (status, item_body) = send(
+            &state,
+            rpc(
+                "127.0.0.1:5",
+                Some(&token),
+                &[("mcp-name", "skills.read")],
+                "tools/call",
+                json!({ "name": "skills.read", "arguments": { "name": "parallel-tasks" } }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{item_body}");
+        let item_text = item_body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(item_text.contains("barrier_group"), "{item_text}");
     }
 }

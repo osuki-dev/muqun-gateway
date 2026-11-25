@@ -6,8 +6,8 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::domain::{
-    now_ms, ChildCounts, NoticeTarget, Task, TaskBinding, TaskChange, TaskEvent, TaskFilter,
-    TaskId, TaskPrincipal, TaskState, REPORTED_STATES,
+    now_ms, ChildCounts, NoticeTarget, PendingNotice, Task, TaskBinding, TaskChange, TaskEvent,
+    TaskFilter, TaskId, TaskPrincipal, TaskState, REPORTED_STATES,
 };
 use super::ports::{TaskFuture, TaskStore, TaskStoreError};
 use crate::platform::store::sqlite::{Migration, SqliteStore};
@@ -63,6 +63,9 @@ ALTER TABLE task_restricted_sessions ADD COLUMN title TEXT;
 ALTER TABLE task_restricted_sessions ADD COLUMN cwd TEXT;
 ALTER TABLE task_restricted_sessions ADD COLUMN since_ms INTEGER;
 ALTER TABLE task_restricted_sessions ADD COLUMN reason TEXT;
+", "
+ALTER TABLE task_notices ADD COLUMN barrier_group TEXT;
+CREATE INDEX task_notices_by_barrier ON task_notices(barrier_group) WHERE barrier_group IS NOT NULL;
 "],
 };
 
@@ -394,15 +397,28 @@ impl TaskStore for SqliteTaskStore {
     }
 
     fn set_notice<'a>(&'a self, id: &'a TaskId, target: &'a NoticeTarget) -> TaskFuture<'a, ()> {
-        let (id, target) = (id.0.clone(), json_text(target));
+        self.set_notice_with_barrier(id, target, None)
+    }
+
+    fn set_notice_with_barrier<'a>(
+        &'a self,
+        id: &'a TaskId,
+        target: &'a NoticeTarget,
+        barrier_group: Option<&'a str>,
+    ) -> TaskFuture<'a, ()> {
+        let (id, target, barrier_group) = (
+            id.0.clone(),
+            json_text(target),
+            barrier_group.map(str::to_owned),
+        );
         Box::pin(async move {
             let target = target?;
             self.db
                 .call(move |c| {
                     c.execute(
-                        "INSERT INTO task_notices(task_id, target) VALUES(?1, ?2) \
-                         ON CONFLICT(task_id) DO UPDATE SET target=excluded.target",
-                        params![id, target],
+                        "INSERT INTO task_notices(task_id, target, barrier_group) VALUES(?1, ?2, ?3) \
+                         ON CONFLICT(task_id) DO UPDATE SET target=excluded.target, barrier_group=excluded.barrier_group",
+                        params![id, target, barrier_group],
                     )?;
                     Ok(())
                 })
@@ -429,6 +445,21 @@ impl TaskStore for SqliteTaskStore {
         since_ms: u64,
         limit: usize,
     ) -> TaskFuture<'a, Vec<(Task, NoticeTarget)>> {
+        Box::pin(async move {
+            Ok(self
+                .pending_notices_with_barrier(since_ms, limit)
+                .await?
+                .into_iter()
+                .map(|item| (item.task, item.target))
+                .collect())
+        })
+    }
+
+    fn pending_notices_with_barrier<'a>(
+        &'a self,
+        since_ms: u64,
+        limit: usize,
+    ) -> TaskFuture<'a, Vec<PendingNotice>> {
         Box::pin(self.db.call(move |c| {
             let reported = REPORTED_STATES
                 .iter()
@@ -436,21 +467,57 @@ impl TaskStore for SqliteTaskStore {
                 .collect::<anyhow::Result<Vec<_>>>()?
                 .join(", ");
             let mut stmt = c.prepare(&format!(
-                "SELECT {TASK_COLUMNS}, target FROM tasks JOIN task_notices ON task_id = id \
+                "SELECT {TASK_COLUMNS}, target, barrier_group FROM tasks JOIN task_notices ON task_id = id \
                  WHERE state IN ({reported}) AND updated_ms >= ?1 \
                  AND (told_seq IS NULL OR told_seq != seq) \
                  ORDER BY updated_ms DESC LIMIT ?2"
             ))?;
             let rows = stmt.query_map(params![since_ms as i64, limit as i64], |r| {
-                Ok((read_row(r)?, r.get::<_, String>(22)?))
+                Ok((
+                    read_row(r)?,
+                    r.get::<_, String>(22)?,
+                    r.get::<_, Option<String>>(23)?,
+                ))
             })?;
             let mut pending = Vec::new();
             for row in rows {
-                let (task, target) = row?;
-                pending.push((task?, serde_json::from_str(&target)?));
+                let (task, target, barrier_group) = row?;
+                pending.push(PendingNotice {
+                    task: task?,
+                    target: serde_json::from_str(&target)?,
+                    barrier_group,
+                });
             }
             Ok(pending)
         }))
+    }
+
+    fn barrier_group_tasks<'a>(
+        &'a self,
+        target: &'a NoticeTarget,
+        barrier_group: &'a str,
+        since_ms: u64,
+    ) -> TaskFuture<'a, Vec<Task>> {
+        let target = json_text(target);
+        let group = barrier_group.to_owned();
+        Box::pin(async move {
+            let target = target?;
+            self.db
+                .call(move |c| {
+                    let mut stmt = c.prepare(&format!(
+                        "SELECT {TASK_COLUMNS} FROM tasks JOIN task_notices ON task_id = id \
+                         WHERE target = ?1 AND barrier_group = ?2 AND updated_ms >= ?3 \
+                         ORDER BY created_ms ASC, seq ASC"
+                    ))?;
+                    let rows = stmt.query_map(params![target, group, since_ms as i64], read_row)?;
+                    let mut tasks = Vec::new();
+                    for row in rows {
+                        tasks.push(row??);
+                    }
+                    Ok(tasks)
+                })
+                .await
+        })
     }
 
     fn mark_told<'a>(&'a self, task: &'a Task, at_ms: u64) -> TaskFuture<'a, ()> {

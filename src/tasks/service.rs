@@ -16,9 +16,9 @@ use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::time::Instant;
 
 use super::domain::{
-    clip, now_ms, one_line, ChildCounts, NoticeTarget, PrincipalKind, Requested, Task, TaskBinding,
-    TaskChange, TaskEvent, TaskFilter, TaskId, TaskKind, TaskOrigin, TaskPrincipal, TaskState,
-    REPORTED_STATES,
+    clip, now_ms, one_line, ChildCounts, NoticeTarget, PendingNotice, PrincipalKind, Requested,
+    Task, TaskBinding, TaskChange, TaskEvent, TaskFilter, TaskId, TaskKind, TaskOrigin,
+    TaskPrincipal, TaskState, REPORTED_STATES,
 };
 use super::events::TaskDomainEvent;
 use super::pane_agent;
@@ -1011,7 +1011,20 @@ impl TaskService {
 
     /// Tell `target` how task `id` ends (`tasks::notices`).
     pub(crate) async fn notify(&self, id: &TaskId, target: &NoticeTarget) {
-        if let Err(error) = self.store.set_notice(id, target).await {
+        self.notify_with_barrier(id, target, None).await;
+    }
+
+    pub(crate) async fn notify_with_barrier(
+        &self,
+        id: &TaskId,
+        target: &NoticeTarget,
+        barrier_group: Option<&str>,
+    ) {
+        if let Err(error) = self
+            .store
+            .set_notice_with_barrier(id, target, barrier_group)
+            .await
+        {
             tracing::warn!(task = %id.0, %error, "the parent will not be told how this task ends");
         }
     }
@@ -1022,12 +1035,36 @@ impl TaskService {
     }
 
     /// Untold reported states of tasks with a notice target (`tasks::notices`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn pending_notices(
         &self,
         since_ms: u64,
         limit: usize,
     ) -> anyhow::Result<Vec<(Task, NoticeTarget)>> {
         self.store.pending_notices(since_ms, limit).await
+    }
+
+    /// Like [`Self::pending_notices`], including optional `barrier_group`.
+    pub(crate) async fn pending_notices_with_barrier(
+        &self,
+        since_ms: u64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<PendingNotice>> {
+        self.store
+            .pending_notices_with_barrier(since_ms, limit)
+            .await
+    }
+
+    /// All tasks registered under `(target, barrier_group)` updated since `since_ms`.
+    pub(crate) async fn barrier_group_tasks(
+        &self,
+        target: &NoticeTarget,
+        barrier_group: &str,
+        since_ms: u64,
+    ) -> anyhow::Result<Vec<Task>> {
+        self.store
+            .barrier_group_tasks(target, barrier_group, since_ms)
+            .await
     }
 
     /// Task `id`'s `state` has reached its parent: delivered, or answered by
