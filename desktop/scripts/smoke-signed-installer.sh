@@ -32,4 +32,5 @@ unzip -p "$zip" 'Muqun Desktop.app/Contents/Resources/installers/install-desktop
 app="$MUQUN_DESKTOP_APPLICATIONS_DIR/Muqun Desktop.app"
 test ! -e "$HOME/Library/Application Support/muqun-desktop/gateway-auto-install.disabled"
 codesign --verify --strict "$app/Contents/Helpers/muqun-desktop-install"
+codesign --verify --strict "$app/Contents/MacOS/muqun-wry-embedded"
 spctl --assess --type execute "$app"

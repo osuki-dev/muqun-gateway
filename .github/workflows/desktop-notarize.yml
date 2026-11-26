@@ -87,7 +87,11 @@ jobs:
           if len(identities) != 1:
               raise SystemExit("Expected one valid imported Developer ID Application identity; check private key, expiry and certificate chain")
           print("::add-mask::" + identities[0], flush=True)
-          for target in (app + "/Contents/Helpers/muqun-desktop-install", app):
+          for target in (
+              app + "/Contents/Helpers/muqun-desktop-install",
+              app + "/Contents/MacOS/muqun-wry-embedded",
+              app,
+          ):
               subprocess.run([
                   "codesign", "--force", "--options", "runtime", "--timestamp",
                   "--keychain", keychain, "--sign", identities[0], target,
@@ -97,7 +101,19 @@ jobs:
           mkdir -p ../signed
           ditto -c -k --keepParent "$app" "../signed/$archive"
           xcrun notarytool submit "../signed/$archive" --key "$RUNNER_TEMP/notary.p8" --key-id "$KEY_ID" --issuer "$ISSUER" --wait --timeout 30m --output-format json > "$RUNNER_TEMP/notary-result.json"
-          python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["status"] == "Accepted"' "$RUNNER_TEMP/notary-result.json"
+          python3 - "$RUNNER_TEMP/notary-result.json" "$RUNNER_TEMP/notary.p8" "$KEY_ID" "$ISSUER" <<'PY_NOTARY'
+          import json, subprocess, sys
+          res_path, key_path, key_id, issuer = sys.argv[1:]
+          res = json.load(open(res_path))
+          if res.get("status") != "Accepted":
+              print("Notarization result:", json.dumps(res, indent=2), flush=True)
+              if res.get("id"):
+                  subprocess.run([
+                      "xcrun", "notarytool", "log", res["id"],
+                      "--key", key_path, "--key-id", key_id, "--issuer", issuer,
+                  ], check=False)
+              raise SystemExit(f"Notarization failed with status: {res.get('status')}")
+          PY_NOTARY
           xcrun stapler staple "$app"
           xcrun stapler validate "$app"
           spctl --assess --type execute "$app"
