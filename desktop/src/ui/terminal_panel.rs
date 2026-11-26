@@ -1093,6 +1093,9 @@ impl UiState {
             self.term.send(Msg::Colors(want));
         }
         if let Some(size) = self.term.size {
+            if let Some(id) = self.term.tabs.get(index).map(|t| t.id) {
+                self.term.tab_sizes.insert(id, size);
+            }
             self.term.send(Msg::Resize(size));
         }
         self.focus_terminal();
@@ -1502,6 +1505,7 @@ impl UiState {
                         ) {
                             let id = self.term.next_tab_id;
                             self.term.next_tab_id += 1;
+                            self.term.tab_sizes.insert(id, size);
                             self.term.tabs.push(TermTab {
                                 id,
                                 session: Some(session),
@@ -1515,6 +1519,9 @@ impl UiState {
                     if !self.term.tabs.is_empty() {
                         self.term.active_tab = 0;
                         self.term.session = self.term.tabs[0].session.clone();
+                        // Clear cached viewport size so the very next layout pass reconciles
+                        // the actual pane dimensions against the reattached daemon tab's size.
+                        self.term.size = None;
                         self.term.sent = Some(colors);
                         self.term.error = None;
                         return;
@@ -1619,7 +1626,13 @@ impl UiState {
         } else {
             grid_size(self.term.pane.width(), rect[3], m, scale)
         };
+        let frame_matches = self
+            .term
+            .frame
+            .as_ref()
+            .is_none_or(|f| f.cols == size.cols && f.rows == size.rows);
         if self.term.size == Some(size)
+            && frame_matches
             && (self.term.session.is_some() || self.term.frame.is_some())
         {
             self.term.resize.pending = None;

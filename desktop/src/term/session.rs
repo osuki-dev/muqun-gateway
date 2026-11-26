@@ -186,12 +186,15 @@ impl Session {
         if is_reattach {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(25)));
             let mut sb_buf = [0u8; 64 * 1024];
+            // Allow room beyond the 1 MiB daemon ring for synthetic DEC mode
+            // restoration prefix/suffix emitted on wrapped reattach.
+            const MAX_INITIAL_REPLAY: usize = super::daemon::DEFAULT_SCROLLBACK_CAPACITY + 4096;
             loop {
                 match stream.read(&mut sb_buf) {
                     Ok(0) => break,
                     Ok(n) => {
                         initial_scrollback.extend_from_slice(&sb_buf[..n]);
-                        if initial_scrollback.len() >= 1024 * 1024 {
+                        if initial_scrollback.len() >= MAX_INITIAL_REPLAY {
                             break;
                         }
                     }
@@ -274,28 +277,91 @@ impl Session {
                             wake();
                         }
                     }
-                    // On reattach, force one SIGWINCH redraw on the first viewport resize
-                    // even when dimensions are unchanged, so full-screen TUIs (nvim, htop)
-                    // repaint a clean frame over any truncated scrollback replay.
-                    let mut needs_reattach_redraw = is_reattach;
+                    // On reattach, schedule a spaced two-step SIGWINCH redraw (cols -> cols-1,
+                    // wait 90ms, -> cols) if no dimension-changing viewport resize arrives first.
+                    // Back-to-back TIOCSWINSZ ioctls get coalesced into a single SIGWINCH where
+                    // full-screen TUIs (nvim, htop) observe unchanged dimensions and skip repainting
+                    // over truncated/wrapped scrollback replay.
+                    let mut reattach_nudge_at =
+                        is_reattach.then(|| Instant::now() + Duration::from_millis(60));
+                    let mut nudge_restore: Option<(Instant, Size)> = None;
                     let mut last = Instant::now() - FRAME_GAP;
                     let mut pending = false;
                     let mut how: Option<Ended> = None;
                     let mut until = Instant::now();
 
                     loop {
-                        let msg = if pending || how.is_some() {
-                            let mut wait =
-                                (last + FRAME_GAP).saturating_duration_since(Instant::now());
-                            if how.is_some() {
-                                wait = until.saturating_duration_since(Instant::now());
-                                if pending {
-                                    wait = wait.min(
-                                        (last + FRAME_GAP)
-                                            .saturating_duration_since(Instant::now()),
+                        let now = Instant::now();
+                        let mut nudged = false;
+                        if let Some((restore_at, target)) = nudge_restore {
+                            if now >= restore_at {
+                                nudge_restore = None;
+                                if engine.size() != target {
+                                    log(engine.resize(target));
+                                    let _ = client_clone.resize_session(
+                                        &id_clone,
+                                        target.cols,
+                                        target.rows,
                                     );
+                                    nudged = true;
+                                    pending = true;
                                 }
                             }
+                        } else if let Some(nudge_at) = reattach_nudge_at {
+                            if now >= nudge_at {
+                                reattach_nudge_at = None;
+                                let cur = engine.size();
+                                let nudge = Size {
+                                    cols: if cur.cols > 2 {
+                                        cur.cols - 1
+                                    } else {
+                                        cur.cols + 1
+                                    },
+                                    ..cur
+                                };
+                                log(engine.resize(nudge));
+                                let _ =
+                                    client_clone.resize_session(&id_clone, nudge.cols, nudge.rows);
+                                nudge_restore = Some((now + Duration::from_millis(90), cur));
+                                nudged = true;
+                                pending = true;
+                            }
+                        }
+                        if nudged {
+                            // Flush any in-band resize report (Mode 2048, `\x1b[48;...t`)
+                            // immediately so TUIs like Neovim 0.10+ repaint without waiting
+                            // for the next recv timeout.
+                            let out = engine.take_output();
+                            if !out.is_empty()
+                                && how.is_none()
+                                && writer_stream.write_all(&out).is_err()
+                            {
+                                how = Some(Ended::Broken);
+                            }
+                        }
+
+                        let mut wake_at: Option<Instant> = None;
+                        let mut consider = |t: Instant| {
+                            wake_at = Some(match wake_at {
+                                Some(cur) => cur.min(t),
+                                None => t,
+                            });
+                        };
+                        if pending {
+                            consider(last + FRAME_GAP);
+                        }
+                        if how.is_some() {
+                            consider(until);
+                        }
+                        if let Some(t) = reattach_nudge_at {
+                            consider(t);
+                        }
+                        if let Some((t, _)) = nudge_restore {
+                            consider(t);
+                        }
+
+                        let msg = if let Some(deadline) = wake_at {
+                            let wait = deadline.saturating_duration_since(Instant::now());
                             match rx.recv_timeout(wait) {
                                 Ok(m) => Some(m),
                                 Err(RecvTimeoutError::Timeout) => None,
@@ -340,19 +406,34 @@ impl Session {
                                     log(engine.wheel(lines, x, y, mods))
                                 }
                                 Msg::Resize(s) => {
-                                    if engine.size() != s {
-                                        needs_reattach_redraw = false;
+                                    if let Some((restore_at, target)) = nudge_restore {
+                                        if target.cols == s.cols && target.rows == s.rows {
+                                            // Same logical grid target as the in-flight spaced nudge:
+                                            // preserve the 90ms spacing while updating cell pixel metrics.
+                                            nudge_restore = Some((restore_at, s));
+                                            continue;
+                                        }
+                                    }
+                                    let cur = engine.size();
+                                    let grid_changed = cur.cols != s.cols || cur.rows != s.rows;
+                                    if grid_changed {
+                                        // A genuine grid dimension change already triggers a full
+                                        // SIGWINCH / Mode-2048 repaint; cancel any pending same-size nudge.
+                                        reattach_nudge_at = None;
+                                        nudge_restore = None;
                                         log(engine.resize(s));
                                         let _ =
                                             client_clone.resize_session(&id_clone, s.cols, s.rows);
-                                    } else if needs_reattach_redraw {
-                                        needs_reattach_redraw = false;
-                                        let nudge =
-                                            if s.cols > 2 { s.cols - 1 } else { s.cols + 1 };
-                                        let _ =
-                                            client_clone.resize_session(&id_clone, nudge, s.rows);
-                                        let _ =
-                                            client_clone.resize_session(&id_clone, s.cols, s.rows);
+                                    } else {
+                                        // Cell pixel metrics (HiDPI scale) may still differ from the
+                                        // daemon attach fallback; update pixel size without cancelling
+                                        // the same-grid reattach redraw.
+                                        if cur != s {
+                                            log(engine.resize(s));
+                                        }
+                                        if reattach_nudge_at.is_some() {
+                                            reattach_nudge_at = Some(Instant::now());
+                                        }
                                     }
                                 }
                                 Msg::Colors(c) => log(engine.set_colors(c)),
@@ -1373,5 +1454,56 @@ mod tests {
             "expected NVIM_OPENED_OK in final rendered frame, got: {rendered:?}"
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn wrapped_attach_snapshot_restores_mode_2048_in_band_resize_on_engine() {
+        use super::super::daemon::ScrollbackBuffer;
+        use super::super::grid::Rgb;
+
+        // Simulate a long-running Neovim 0.10+ session whose 1 MiB daemon ring
+        // has wrapped and evicted the startup `\x1b[?1049h\x1b[?2048h` sequences.
+        let mut sb = ScrollbackBuffer::new(128);
+        sb.push(b"\x1b[?1049h\x1b[?2048h");
+        sb.push(&[b' '; 256]);
+        sb.push(b"\x1b[1;1HNVIM_FRAME");
+
+        let colors = Colors {
+            fg: Rgb(240, 240, 240),
+            bg: Rgb(18, 18, 18),
+            cursor: Rgb(255, 255, 255),
+            selection: Rgb(60, 80, 120),
+            ansi: [Rgb(128, 128, 128); 16],
+        };
+        let mut engine = Engine::new(
+            Size {
+                cols: 132,
+                rows: 73,
+                cell_w: 8,
+                cell_h: 17,
+            },
+            colors,
+        )
+        .unwrap();
+
+        // Reattach replay: feed wrapped snapshot, then discard historical replies.
+        engine.feed(&sb.to_attach_vec());
+        let _ = engine.take_output();
+
+        // Resizing the reattached pane MUST emit CSI 48;<rows>;<cols>;...t
+        // in-band resize report so Mode-2048 TUIs (Neovim) repaint at 110x34.
+        engine
+            .resize(Size {
+                cols: 110,
+                rows: 34,
+                cell_w: 8,
+                cell_h: 17,
+            })
+            .unwrap();
+        let report = String::from_utf8(engine.take_output()).unwrap();
+        assert!(
+            report.contains("\x1b[48;34;110;"),
+            "expected Mode 2048 in-band resize report after wrapped reattach, got: {report:?}"
+        );
     }
 }

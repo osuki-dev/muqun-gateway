@@ -49,11 +49,173 @@ fn default_rows() -> u16 {
 ///
 /// When the buffer reaches `max_bytes`, the oldest bytes are evicted to
 /// make room for new output, preserving terminal state continuity on client
-/// reattachment.
+/// reattachment. Also tracks active DEC private modes (such as alternate
+/// screen `?1049`, in-band resize `?2048`, mouse tracking, and bracketed paste)
+/// so clients reattaching after the ring wraps still inherit the TUI's active
+/// terminal modes.
 #[derive(Debug, Clone)]
 pub struct ScrollbackBuffer {
     max_bytes: usize,
     buffer: VecDeque<u8>,
+    wrapped: bool,
+    modes: DecModeTracker,
+}
+
+/// Minimal zero-allocation VT CSI parser tracking persistent DEC private modes
+/// (`CSI ? <p1>;<p2>... h/l` and `ESC c` RIS) across scrollback ring eviction.
+#[derive(Debug, Clone, Default)]
+struct DecModeTracker {
+    state: ModeParseState,
+    param: u16,
+    has_param: bool,
+    params: Vec<u16>,
+    alt_screen: Option<u16>,
+    active: std::collections::BTreeSet<u16>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ModeParseState {
+    #[default]
+    Ground,
+    Esc,
+    CsiStart,
+    CsiDecParam,
+}
+
+impl DecModeTracker {
+    fn is_alt_screen(mode: u16) -> bool {
+        matches!(mode, 47 | 1047 | 1049)
+    }
+
+    fn is_tracked(mode: u16) -> bool {
+        matches!(
+            mode,
+            1 | 1000
+                | 1002
+                | 1003
+                | 1004
+                | 1005
+                | 1006
+                | 1007
+                | 1015
+                | 1016
+                | 2004
+                | 2027
+                | 2031
+                | 2048
+        )
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if b == 0x1b {
+                self.state = ModeParseState::Esc;
+                self.params.clear();
+                self.param = 0;
+                self.has_param = false;
+                continue;
+            }
+            match self.state {
+                ModeParseState::Ground => {}
+                ModeParseState::Esc => match b {
+                    b'[' => self.state = ModeParseState::CsiStart,
+                    b'c' => {
+                        // RIS (Full Terminal Reset)
+                        self.alt_screen = None;
+                        self.active.clear();
+                        self.state = ModeParseState::Ground;
+                    }
+                    _ => self.state = ModeParseState::Ground,
+                },
+                ModeParseState::CsiStart => {
+                    if b == b'?' {
+                        self.params.clear();
+                        self.param = 0;
+                        self.has_param = false;
+                        self.state = ModeParseState::CsiDecParam;
+                    } else {
+                        self.state = ModeParseState::Ground;
+                    }
+                }
+                ModeParseState::CsiDecParam => match b {
+                    b'0'..=b'9' => {
+                        self.param = self
+                            .param
+                            .saturating_mul(10)
+                            .saturating_add(u16::from(b - b'0'));
+                        self.has_param = true;
+                    }
+                    b';' => {
+                        if self.has_param && self.params.len() < 16 {
+                            self.params.push(self.param);
+                        }
+                        self.param = 0;
+                        self.has_param = false;
+                    }
+                    b'h' | b'l' => {
+                        if self.has_param && self.params.len() < 16 {
+                            self.params.push(self.param);
+                        }
+                        let enable = b == b'h';
+                        for &mode in &self.params {
+                            if Self::is_alt_screen(mode) {
+                                self.alt_screen = enable.then_some(mode);
+                            } else if Self::is_tracked(mode) {
+                                if enable {
+                                    self.active.insert(mode);
+                                } else {
+                                    self.active.remove(&mode);
+                                }
+                            }
+                        }
+                        self.params.clear();
+                        self.param = 0;
+                        self.has_param = false;
+                        self.state = ModeParseState::Ground;
+                    }
+                    _ => {
+                        // Query (`$p`), unknown intermediate, or malformed CSI: ignore.
+                        self.params.clear();
+                        self.param = 0;
+                        self.has_param = false;
+                        self.state = ModeParseState::Ground;
+                    }
+                },
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Escape sequence emitted *before* wrapped scrollback so alt-screen TUI
+    /// output replays into the alternate screen rather than primary history.
+    fn restore_prefix(&self) -> Vec<u8> {
+        match self.alt_screen {
+            Some(mode) => format!("\x1b[?{mode}h").into_bytes(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Escape sequence emitted *after* wrapped scrollback to clear any dangling
+    /// synchronized-output / SGR state and re-assert active DEC modes (notably
+    /// `?2048` in-band resize for Neovim 0.10+, mouse reporting, bracketed paste).
+    fn restore_suffix(&self) -> Vec<u8> {
+        let mut out = String::from("\x1b[?2026l\x1b[0m");
+        if !self.active.is_empty() {
+            out.push_str("\x1b[?");
+            for (i, mode) in self.active.iter().enumerate() {
+                if i > 0 {
+                    out.push(';');
+                }
+                use std::fmt::Write as _;
+                let _ = write!(&mut out, "{mode}");
+            }
+            out.push('h');
+        }
+        out.into_bytes()
+    }
 }
 
 impl ScrollbackBuffer {
@@ -62,6 +224,8 @@ impl ScrollbackBuffer {
         Self {
             max_bytes,
             buffer: VecDeque::with_capacity(max_bytes.min(64 * 1024)),
+            wrapped: false,
+            modes: DecModeTracker::default(),
         }
     }
 
@@ -72,16 +236,24 @@ impl ScrollbackBuffer {
 
     /// Appends bytes to the buffer, evicting oldest data if capacity is exceeded.
     pub fn push(&mut self, data: &[u8]) {
-        if self.max_bytes == 0 || data.is_empty() {
+        if data.is_empty() {
+            return;
+        }
+        self.modes.feed(data);
+        if self.max_bytes == 0 {
             return;
         }
         if data.len() >= self.max_bytes {
+            if data.len() > self.max_bytes || !self.buffer.is_empty() {
+                self.wrapped = true;
+            }
             self.buffer.clear();
             self.buffer.extend(&data[data.len() - self.max_bytes..]);
             return;
         }
         let excess = (self.buffer.len() + data.len()).saturating_sub(self.max_bytes);
         if excess > 0 {
+            self.wrapped = true;
             self.buffer.drain(..excess);
         }
         self.buffer.extend(data);
@@ -93,6 +265,23 @@ impl ScrollbackBuffer {
         let mut out = Vec::with_capacity(s1.len() + s2.len());
         out.extend_from_slice(s1);
         out.extend_from_slice(s2);
+        out
+    }
+
+    /// Returns the buffered bytes wrapped with DEC private mode restoration
+    /// sequences when the ring buffer has evicted earlier output.
+    pub fn to_attach_vec(&self) -> Vec<u8> {
+        if !self.wrapped {
+            return self.to_vec();
+        }
+        let prefix = self.modes.restore_prefix();
+        let suffix = self.modes.restore_suffix();
+        let (s1, s2) = self.buffer.as_slices();
+        let mut out = Vec::with_capacity(prefix.len() + s1.len() + s2.len() + suffix.len());
+        out.extend_from_slice(&prefix);
+        out.extend_from_slice(s1);
+        out.extend_from_slice(s2);
+        out.extend_from_slice(&suffix);
         out
     }
 
@@ -109,6 +298,8 @@ impl ScrollbackBuffer {
     /// Clears the buffer.
     pub fn clear(&mut self) {
         self.buffer.clear();
+        self.wrapped = false;
+        self.modes.reset();
     }
 }
 
@@ -718,6 +909,13 @@ impl DaemonSession {
             .unwrap_or_default()
     }
 
+    pub fn attach_scrollback(&self) -> Vec<u8> {
+        self.scrollback
+            .lock()
+            .map(|sb| sb.to_attach_vec())
+            .unwrap_or_default()
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<OutputMsg> {
         self.broadcast_tx.subscribe()
     }
@@ -1106,7 +1304,7 @@ impl DaemonServer {
         };
 
         let mut broadcast_rx = session.subscribe();
-        let scrollback_bytes = session.scrollback();
+        let scrollback_bytes = session.attach_scrollback();
 
         if raw {
             let resp = Response::success();
@@ -2572,5 +2770,50 @@ mod tests {
         let _ = shutdown_tx.send(true);
         let _ = rt.block_on(server_task);
         let _ = std::fs::remove_dir_all(&socket_dir);
+    }
+
+    #[test]
+    fn test_scrollback_buffer_preserves_dec_modes_across_wrap() {
+        let mut sb = ScrollbackBuffer::new(64);
+        // Simulate Neovim 0.10+ startup: alt screen, in-band resize (2048),
+        // mouse tracking/SGR, bracketed paste, split across chunk boundary.
+        sb.push(b"\x1b[?1049h\x1b[?1002;1006;20");
+        sb.push(b"04;2048h\x1b[?2048$p");
+        // Before wrapping, attach snapshot is byte-identical to raw scrollback.
+        assert_eq!(sb.to_attach_vec(), sb.to_vec());
+
+        // Overflow the ring so all startup sequences are evicted.
+        sb.push(&[b'x'; 128]);
+        assert_eq!(sb.len(), 64);
+
+        let snap = String::from_utf8(sb.to_attach_vec()).unwrap();
+        assert!(
+            snap.starts_with("\x1b[?1049h"),
+            "wrapped snapshot should re-enter alt screen before replaying: {snap:?}"
+        );
+        assert!(
+            snap.ends_with("\x1b[?2026l\x1b[0m\x1b[?1002;1006;2004;2048h"),
+            "wrapped snapshot should restore active DEC modes after replay: {snap:?}"
+        );
+
+        // DECRST disables a single mode without disturbing the rest.
+        sb.push(b"\x1b[?1002l\x1b[?1049l");
+        let after_reset = String::from_utf8(sb.to_attach_vec()).unwrap();
+        assert!(
+            !after_reset.starts_with("\x1b[?1049h"),
+            "exiting alt screen should drop prefix: {after_reset:?}"
+        );
+        assert!(
+            after_reset.ends_with("\x1b[?2026l\x1b[0m\x1b[?1006;2004;2048h"),
+            "only reset modes should be removed: {after_reset:?}"
+        );
+
+        // RIS (`ESC c`) clears all tracked modes.
+        sb.push(b"\x1bc");
+        let after_ris = String::from_utf8(sb.to_attach_vec()).unwrap();
+        assert!(
+            after_ris.ends_with("\x1b[?2026l\x1b[0m"),
+            "RIS should clear all tracked modes: {after_ris:?}"
+        );
     }
 }
