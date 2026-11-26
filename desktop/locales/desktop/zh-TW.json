@@ -1250,5 +1250,18 @@
   "Running…": "執行中…",
   "Redacted": "已遮蔽",
   "Enable this server to test tools live.": "啟用此伺服器以即時測試工具。",
-  "Arguments must be a JSON object.": "參數必須為 JSON 物件。"
+  "Arguments must be a JSON object.": "參數必須為 JSON 物件。",
+  "New remote terminal": "新增遠端終端機",
+  "New local terminal": "新增本機終端機",
+  "+ Local": "+ 本機",
+  "Standalone mode (embedded)": "獨立模式（內建）",
+  "available": "可用",
+  "Remote host — update on that computer": "遠端主機 — 請在該電腦上更新",
+  "Update manually via installer": "請透過安裝腳本手動更新",
+  "Updating Gateway…": "正在更新 Gateway…",
+  "Updated to": "已更新至",
+  "Gateway update failed": "Gateway 更新失敗",
+  "Update Gateway": "更新 Gateway",
+  "Updating…": "正在更新…",
+  "Muqun Gateway updated": "Muqun Gateway 已更新"
 }

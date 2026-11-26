@@ -1250,5 +1250,18 @@
   "Running…": "Running…",
   "Redacted": "Redacted",
   "Enable this server to test tools live.": "Enable this server to test tools live.",
-  "Arguments must be a JSON object.": "Arguments must be a JSON object."
+  "Arguments must be a JSON object.": "Arguments must be a JSON object.",
+  "New remote terminal": "New remote terminal",
+  "New local terminal": "New local terminal",
+  "+ Local": "+ Local",
+  "Standalone mode (embedded)": "Standalone mode (embedded)",
+  "available": "available",
+  "Remote host — update on that computer": "Remote host — update on that computer",
+  "Update manually via installer": "Update manually via installer",
+  "Updating Gateway…": "Updating Gateway…",
+  "Updated to": "Updated to",
+  "Gateway update failed": "Gateway update failed",
+  "Update Gateway": "Update Gateway",
+  "Updating…": "Updating…",
+  "Muqun Gateway updated": "Muqun Gateway updated"
 }
