@@ -274,17 +274,18 @@ pub fn composer_card(
             inset: false,
         })
         .motion(look.focus_fade());
-    let card = look.glow(card, c0, if active { 0.38 } else { 0.0 });
-    if busy && look.motion && look.glass && super::fx::fx_enabled() {
+    let gpu_aura = active && look.glass && super::fx::fx_enabled();
+    let card = look.glow(card, c0, if active && !gpu_aura { 0.28 } else { 0.0 });
+    if gpu_aura && busy && look.motion {
         card.child(
             el().key("composer-energy")
                 .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                 .radius(k.radius.xl)
                 .effect(super::fx::COMPOSER_RIM)
-                .effect_data(super::fx::data(c0, 1.25))
+                .effect_data(super::fx::data(c0, 1.0))
                 .a11y_hidden(),
         )
-    } else if active && look.glass && super::fx::fx_enabled() {
+    } else if gpu_aura {
         card.child(
             el().key("composer-focus-aura")
                 .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))

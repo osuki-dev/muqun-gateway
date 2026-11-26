@@ -845,7 +845,6 @@ fn status_mark(
 fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
     let language = s.cfg.general.language;
     let asid = s.tiles[i].asid.as_deref().unwrap_or_default();
-    let info = s.session_by_id(asid);
     let mut parked_draft = s.tiles[i].slot.draft.clone();
     parked_draft.focused = false;
     let editor = rune_kit::TextArea::new(&parked_draft)
@@ -893,13 +892,6 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
                 .key("mic"),
         );
     }
-    let running = info.is_some_and(|x| {
-        matches!(
-            x.status,
-            muqun_gateway::agents::AgentSessionStatus::Busy
-                | muqun_gateway::agents::AgentSessionStatus::Retry
-        )
-    });
     let submit = Button::new(tr_ref(language, "Send"))
         .label_with(|_, ink| rune::icon(&composer::SEND, composer::SEND_ICON).color(ink))
         .control_size(ControlSize::Regular)
@@ -956,7 +948,7 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         .pb(8.0)
         .gap(6.0)
         .child(
-            composer::composer_card(k, look, card, false, running, false)
+            composer::composer_card(k, look, card, false, false, false)
                 .w_full()
                 .max_w(super::timeline::FEED_MAX_W),
         )
@@ -1267,7 +1259,8 @@ fn tile(
             .a11y_hidden(),
     );
     let split_focus = focused && s.tiles.len() > 1;
-    if split_focus && look.glass && super::fx::fx_enabled() {
+    let tile_gpu_aura = split_focus && look.glass && super::fx::fx_enabled();
+    if tile_gpu_aura {
         let [c0, _, _] = look.highlight_colors(k);
         body = body.child(
             el().key("tile-focus-aura")
@@ -1278,7 +1271,7 @@ fn tile(
                 .a11y_hidden(),
         );
     }
-    look.luminous(k, body, split_focus)
+    look.luminous(k, body, split_focus && !tile_gpu_aura)
         .role("region")
         .label(format!(
             "{} {}",

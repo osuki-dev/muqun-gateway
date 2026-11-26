@@ -486,7 +486,7 @@ fn lift_luminous(c: rune::Color, dark: bool) -> rune::Color {
 fn shift_tonal(c: rune::Color, delta_l: f32, delta_hue_rad: f32) -> rune::Color {
     let rotated = oklab_rotate(c, delta_hue_rad);
     let [l, a, b, alpha] = rotated.to_oklab();
-    rune::Color::from_oklab([(l + delta_l).clamp(0.28, 0.92), a, b, alpha])
+    rune::Color::from_oklab([(l + delta_l).clamp(0.30, 0.82), a, b, alpha])
 }
 
 /// Extract a harmonious 3-stop highlight spectrum `[c0, c1, c2]` strictly from
@@ -521,7 +521,7 @@ pub fn highlight_colors_for(k: &Kit, dark: bool) -> [rune::Color; 3] {
 /// theme's own hue family via subtle tonal/analogous shifts.
 pub fn companion_highlight_colors(c0: rune::Color, dark: bool) -> [rune::Color; 3] {
     let base = lift_luminous(c0, dark);
-    let c1 = shift_tonal(base, if dark { 0.09 } else { 0.08 }, 0.14);
+    let c1 = shift_tonal(base, 0.04, 0.14);
     let c2 = shift_tonal(base, if dark { -0.07 } else { -0.06 }, -0.12);
     [base, c1, c2]
 }
