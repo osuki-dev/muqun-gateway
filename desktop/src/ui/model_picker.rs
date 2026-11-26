@@ -821,10 +821,6 @@ pub(super) fn popup(
         .label(tr_ref(lang, "Select model"))
         .w(panel_w)
         .padding(PANEL_PAD)
-        .radius(k.radius.lg)
-        .clip_rounded(k.radius.lg)
-        .fill(look.panel_fill(k))
-        .border(1.0, k.c.border_strong)
         .min_h(0.0)
         .shrink()
         .gap(8.0)
@@ -1024,10 +1020,7 @@ pub(super) fn popup(
             .child(model_list)
     };
 
-    let mut panel = body.child(content);
-    for shadow in k.shadow_layers(&k.elevation.overlay) {
-        panel = panel.box_shadow(shadow);
-    }
+    let panel = look.floating_surface(k, body.child(content), k.radius.lg);
 
     layer.push(rune_kit::scrim(format!("{key}-scrim"), close));
     layer.push(

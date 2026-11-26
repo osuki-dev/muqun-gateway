@@ -4100,8 +4100,7 @@ pub fn session_banner(s: &UiState, k: &Kit) -> Option<El> {
     if !run.is_active() {
         let dismiss_id = run.id.clone();
         right_actions = right_actions.child(
-            Button::new("×")
-                .variant(ButtonVariant::GhostMuted)
+            super::icons::header_button(k.glyph.close, tr_ref(language, "Dismiss"))
                 .control_size(ControlSize::Small)
                 .on_press(move |s: &mut UiState| {
                     s.orchestration.dismissed_runs.insert(dismiss_id.clone());

@@ -224,7 +224,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                 ),
         );
     let card = look
-        .dialog_motion(look.panel(k, card, k.radius.xl))
+        .dialog_motion(look.floating_surface(k, card, k.radius.xl))
         .modal(true, |s: &mut UiState| s.dismiss_welcome(false));
     let card = look.glow(card, k.c.bg_accent, 0.35);
     layer.push(

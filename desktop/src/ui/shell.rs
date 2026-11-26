@@ -251,7 +251,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             .plugins
             .get(pid)
             .and_then(|p| crate::plugin::window::render(p.as_ref(), &ctx, layer))
-            .unwrap_or_else(|| inspector::view(s, k));
+            .unwrap_or_else(|| inspector::view(s, k, layer));
         split = split.inspector(
             &s.right,
             super::right_pane,

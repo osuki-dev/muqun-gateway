@@ -202,14 +202,9 @@ impl DownloadPanel<'_> {
             buttons = buttons.child(button);
         }
         let card = look
-            .dialog_motion(look.panel(k, card.child(buttons), k.radius.xl))
+            .dialog_motion(look.floating_surface(k, card.child(buttons), k.radius.xl))
             .modal(on_close.is_some(), on_close.unwrap_or(|_| {}));
-        layer.push(
-            el().key("download-panel-scrim")
-                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-                .fill(k.c.scrim)
-                .a11y_hidden(),
-        );
+        layer.push(look.modal_scrim(k, "download-panel-scrim"));
         layer.push(
             el().key("download-panel-layer")
                 .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))

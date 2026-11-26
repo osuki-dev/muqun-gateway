@@ -304,6 +304,13 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                 .radius(k.radius.md)
                 .fill(k.c.text_base.alpha(0.06))
                 .child(field),
+        )
+        .child(
+            super::icons::header_button(k.glyph.close, tr_ref(language, "Close"))
+                .shortcut("Esc")
+                .on_press(|s: &mut UiState| s.keys_sheet = None)
+                .build(k)
+                .key("keys-close"),
         );
 
     let found = groups(s, k, &sheet.query.text, "keys");
@@ -390,25 +397,14 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .child(el().w_full().h(1.0).fill(k.c.border_muted))
         .child(foot);
     // Denser than the palette's glass: the sheet is text to read.
-    let mut panel = look
-        .panel(k, panel, k.radius.xl)
+    let panel = look
+        .floating_surface(k, panel, k.radius.xl)
         .fill(k.c.surface_raised_base.alpha(0.97));
-    for shadow in k.shadow_layers(&k.elevation.overlay) {
-        panel = panel.box_shadow(shadow);
-    }
     let panel = look
         .dialog_motion(panel)
         .modal(true, |s: &mut UiState| s.keys_sheet = None);
 
-    layer.push(
-        el().key("keys-scrim")
-            .absolute(0.0, 0.0)
-            .w_full()
-            .h_full()
-            .fill(k.c.black.alpha(if s.dark { 0.5 } else { 0.26 }))
-            .token_motion(k.motion.overlay)
-            .a11y_hidden(),
-    );
+    layer.push(look.modal_scrim(k, "keys-scrim"));
     layer.push(
         col()
             .key("keys-layer")
@@ -660,12 +656,9 @@ fn mount_which_key(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .child(el().w_full().h(1.0).fill(k.c.border_muted))
         .child(grid);
 
-    let mut card = look
-        .panel(k, card, k.radius.xl)
+    let card = look
+        .floating_surface(k, card, k.radius.xl)
         .fill(k.c.surface_raised_base.alpha(0.97));
-    for shadow in k.shadow_layers(&k.elevation.overlay) {
-        card = card.box_shadow(shadow);
-    }
 
     layer.push(
         col()

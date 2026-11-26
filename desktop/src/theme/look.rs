@@ -219,6 +219,28 @@ impl Look {
         }
     }
 
+    /// Unified floating surface for dropdown popups, anchored pickers, modals,
+    /// and overlays: [`Self::panel`] (frosted glass / raised fill + rounded
+    /// clip), a consistent 1 px hairline border, and standard overlay elevation
+    /// shadow layers.
+    pub fn floating_surface(&self, k: &Kit, e: El, radius: f32) -> El {
+        let mut e = self.panel(k, e, radius).border(1.0, k.c.border_muted);
+        for shadow in k.shadow_layers(&k.elevation.overlay) {
+            e = e.box_shadow(shadow);
+        }
+        e
+    }
+
+    /// Unified backdrop scrim behind centered modals and command sheets.
+    pub fn modal_scrim(&self, k: &Kit, key: impl Into<String>) -> El {
+        rune::el()
+            .key(key.into())
+            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+            .fill(k.c.black.alpha(if self.dark { 0.45 } else { 0.24 }))
+            .token_motion(k.motion.overlay)
+            .a11y_hidden()
+    }
+
     /// A [`Look::panel`]'s fill: the raised surface, translucent on glass
     /// (denser without the blur, which then carries the frost).
     pub fn panel_fill(&self, k: &Kit) -> rune::Color {

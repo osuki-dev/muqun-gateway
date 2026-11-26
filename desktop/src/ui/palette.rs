@@ -761,26 +761,13 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .child(list)
         .child(el().w_full().h(1.0).fill(k.c.border_muted))
         .child(foot);
-    let mut panel = look.panel(k, panel, k.radius.xl);
-    for shadow in k.shadow_layers(&k.elevation.overlay) {
-        panel = panel.box_shadow(shadow);
-    }
+    let panel = look.floating_surface(k, panel, k.radius.xl);
     // Shared dialog motion, including the reduced-motion fallback.
     let panel = look
         .dialog_motion(panel)
         .modal(true, |s: &mut UiState| s.palette = None);
 
-    layer.push(
-        el().key("palette-scrim")
-            .absolute(0.0, 0.0)
-            .w_full()
-            .h_full()
-            // The kit's scrim is faint in some packs; the palette wants the
-            // window to recede a little more.
-            .fill(k.c.black.alpha(if s.dark { 0.38 } else { 0.18 }))
-            .token_motion(k.motion.overlay)
-            .a11y_hidden(),
-    );
+    layer.push(look.modal_scrim(k, "palette-scrim"));
     layer.push(
         col()
             .key("palette-layer")

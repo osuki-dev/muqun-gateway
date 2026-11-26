@@ -1425,8 +1425,8 @@ impl DesktopPlugin for InspectorPlugin {
         }
     }
 
-    fn render_tile(&self, ctx: &PluginViewContext<'_>, _layer: &mut Vec<El>) -> Option<El> {
-        Some(crate::ui::inspector::view(ctx.s, ctx.k))
+    fn render_tile(&self, ctx: &PluginViewContext<'_>, layer: &mut Vec<El>) -> Option<El> {
+        Some(crate::ui::inspector::view(ctx.s, ctx.k, layer))
     }
 }
 

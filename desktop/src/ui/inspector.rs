@@ -495,6 +495,7 @@ pub(crate) fn visible_diff_file_count(s: &UiState) -> usize {
 fn branch_switcher_dropdown(
     s: &UiState,
     k: &Kit,
+    layer: &mut Vec<El>,
     cwd: &str,
     cur_branch: &str,
     local: &[String],
@@ -537,87 +538,41 @@ fn branch_switcher_dropdown(
                 .color(k.c.text_muted)
                 .a11y_hidden(),
         );
-    if can_switch {
-        trigger = k.interactive(trigger).on_press(move |s: &mut UiState| {
-            s.menu = if s.menu == Some(OpenMenu::InspectorBranch) {
-                None
-            } else {
-                Some(OpenMenu::InspectorBranch)
-            };
+    if !can_switch {
+        return trigger;
+    }
+    trigger = k
+        .interactive(trigger)
+        .expanded(open)
+        .on_press(move |s: &mut UiState| {
+            s.menu = (!open).then_some(OpenMenu::InspectorBranch);
         });
+    let mut menu = rune_kit::Menu::new("git-branch-switcher")
+        .trigger(trigger)
+        .open(open)
+        .min_width(220.0)
+        .on_close(|s: &mut UiState| s.menu = None);
+    for branch in local {
+        let is_current = branch == cur_branch;
+        let (cwd_owned, target_branch) = (cwd.to_string(), branch.clone());
+        menu = menu.item(
+            rune_kit::MenuItem::new(branch.clone())
+                .checked(is_current)
+                .on_select(move |s: &mut UiState| {
+                    s.menu = None;
+                    if !is_current {
+                        s.send(Command::Compose(ComposeCommand::Checkout {
+                            cwd: cwd_owned.clone(),
+                            branch: target_branch.clone(),
+                        }));
+                    }
+                }),
+        );
     }
-
-    let mut wrap = col()
-        .key("git-branch-switcher")
-        .w_full()
-        .gap(4.0)
-        .child(trigger);
-
-    if open && can_switch {
-        let mut list = col()
-            .key("git-branch-list")
-            .w_full()
-            .gap(2.0)
-            .px(4.0)
-            .py(4.0)
-            .radius(k.radius.md)
-            .fill(k.c.layer_01)
-            .border(1.0, k.c.border_weak);
-        for branch in local {
-            let is_current = branch == cur_branch;
-            let (cwd_owned, target_branch) = (cwd.to_string(), branch.clone());
-            let mut item = row()
-                .key(format!("git-branch-opt-{branch}"))
-                .w_full()
-                .h(28.0)
-                .px(8.0)
-                .gap(6.0)
-                .center_y()
-                .radius(k.radius.sm)
-                .child(
-                    text(if is_current { "✓" } else { " " })
-                        .font(k.ty.small_medium)
-                        .color(k.c.text_accent)
-                        .a11y_hidden(),
-                )
-                .child(
-                    text(branch.clone())
-                        .font(if is_current {
-                            k.ty.small_medium
-                        } else {
-                            k.ty.small
-                        })
-                        .color(if is_current {
-                            k.c.text_base
-                        } else {
-                            k.c.text_muted
-                        })
-                        .truncate()
-                        .grow(1.0)
-                        .shrink()
-                        .min_w(0.0),
-                );
-            if is_current {
-                item = item.fill(k.c.bg_accent.alpha(0.14));
-            }
-            item = k.interactive(item).on_press(move |s: &mut UiState| {
-                s.menu = None;
-                if !is_current {
-                    s.send(Command::Compose(ComposeCommand::Checkout {
-                        cwd: cwd_owned.clone(),
-                        branch: target_branch.clone(),
-                    }));
-                }
-            });
-            list = list.child(item);
-        }
-        wrap = wrap.child(list);
-    }
-
-    wrap
+    menu.build(k, layer).w_full()
 }
 
-fn git(s: &UiState, k: &Kit) -> Vec<El> {
+fn git(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
     let language = s.cfg.general.language;
     let t = |en: &'static str| tr_ref(language, en);
     let mut out = Vec::new();
@@ -707,6 +662,7 @@ fn git(s: &UiState, k: &Kit) -> Vec<El> {
         let mut body = vec![branch_switcher_dropdown(
             s,
             k,
+            layer,
             &cwd_str,
             &cur_branch,
             &b.local,
@@ -1418,7 +1374,7 @@ fn shells(s: &UiState, k: &Kit) -> Vec<El> {
     )]
 }
 
-pub fn view(s: &UiState, k: &Kit) -> El {
+pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let language = s.cfg.general.language;
     let mut strip = row()
         .key("inspector-tabs")
@@ -1441,7 +1397,7 @@ pub fn view(s: &UiState, k: &Kit) -> El {
     }
     let body = match s.inspector_tab {
         InspectorTab::Queue => queue(s, k),
-        InspectorTab::Git => git(s, k),
+        InspectorTab::Git => git(s, k, layer),
         InspectorTab::Subagents => super::session_tree::view(s, k),
         InspectorTab::Saved => saved(s, k),
         InspectorTab::Shells => shells(s, k),
@@ -1623,7 +1579,8 @@ mod tests {
         assert_eq!(tab_label(Language::En, "Tree"), "Tree");
         assert_eq!(tab_label(Language::ZhCn, "Tree"), "会话树");
         let k = Kit::neutral(s.dark);
-        let _ = view(&s, &k);
+        let mut layer = Vec::new();
+        let _ = view(&s, &k, &mut layer);
     }
 
     #[test]
@@ -1652,7 +1609,7 @@ mod tests {
         assert!(can_run_local_git(&s));
         let k = Kit::neutral(s.dark);
         // Branch + Changes + Commit & Push + Worktrees = 4 cards.
-        let els = git(&s, &k);
+        let els = git(&s, &k, &mut Vec::new());
         assert_eq!(els.len(), 4);
 
         while rx.try_recv().is_ok() {}
@@ -1692,7 +1649,7 @@ mod tests {
             "non-git repo must hide Push commits"
         );
         // Clean non-git folder renders 3 cards (No repo + Changes + Worktrees).
-        assert_eq!(git(&s, &k).len(), 3);
+        assert_eq!(git(&s, &k, &mut Vec::new()).len(), 3);
 
         // Even if diff_stat has entries, non-git folder hides local Commit & Push card.
         s.diff_stat.files = 1;
@@ -1702,7 +1659,7 @@ mod tests {
             removed: 0,
             patch: "".into(),
         }];
-        assert_eq!(git(&s, &k).len(), 3);
+        assert_eq!(git(&s, &k, &mut Vec::new()).len(), 3);
 
         // Calling push_changes or commit_changes on a non-git dir must be a no-op.
         while rx.try_recv().is_ok() {}
@@ -1735,11 +1692,11 @@ mod tests {
 
         let k = Kit::neutral(s.dark);
         // Remote session renders 3 cards (Remote host + Changes + Worktrees, no local Commit card).
-        assert_eq!(git(&s, &k).len(), 3);
+        assert_eq!(git(&s, &k, &mut Vec::new()).len(), 3);
 
         s.inspector_git_show_all = true;
         assert_eq!(visible_diff_file_count(&s), 15);
-        assert_eq!(git(&s, &k).len(), 3);
+        assert_eq!(git(&s, &k, &mut Vec::new()).len(), 3);
 
         // Refreshing Git on a remote session must NOT dispatch local ComposeCommand::Branch.
         while rx.try_recv().is_ok() {}

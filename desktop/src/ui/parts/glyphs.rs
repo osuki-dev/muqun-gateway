@@ -117,12 +117,6 @@ pub static WORKFLOW: Icon = Icon {
     body: r#"<rect x="3" y="3" width="7" height="6" rx="2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><rect x="14" y="15" width="7" height="6" rx="2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 6h5a3 3 0 0 1 3 3v6M6 9v9h8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
-pub static CLOSE: Icon = Icon {
-    name: "tl-close",
-    view: 24.0,
-    body: r#"<path d="m6 6 12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-
 pub static COMPLETED: Icon = Icon {
     name: "tl-completed",
     view: 24.0,

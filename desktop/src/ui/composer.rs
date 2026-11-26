@@ -1643,23 +1643,17 @@ fn mount_popup(
         .shrink()
         .min_h(0.0);
 
-    let mut panel = col()
+    let panel = col()
         .key(format!("{key}-panel"))
         .preserve_focus_on_press(true)
         .w(380.0)
         .padding(4.0)
-        .radius(k.radius.md)
-        .fill(look.panel_fill(k))
-        .border(1.0, k.c.border_strong)
         .on_press(|_: &mut UiState| {})
         .child(header)
         .child(el().w_full().h(1.0).fill(k.c.border_weak).mb(2.0))
         .child(viewport);
 
-    panel = look.accent_rim(k, panel, k.c.bg_accent);
-    for shadow in k.shadow_layers(&k.elevation.overlay) {
-        panel = panel.box_shadow(shadow);
-    }
+    let panel = look.floating_surface(k, panel, k.radius.lg);
 
     let anchored_panel = panel
         .anchored_fit(anchor, rune::Side::Top, rune::Align::Start, 6.0)
@@ -1689,15 +1683,8 @@ pub(super) fn history_popup(s: &UiState, k: &Kit, layer: &mut Vec<El>, slot: Slo
     };
 
     // Scrim overlay to catch outside clicks
-    layer.push(
-        el().key("prompt-history-scrim")
-            .absolute(0.0, 0.0)
-            .w_full()
-            .h_full()
-            .on_press(|s: &mut UiState| {
-                s.composer_history_open = false;
-            }),
-    );
+    let close_history = |s: &mut UiState| s.composer_history_open = false;
+    layer.push(rune_kit::scrim("prompt-history-scrim", close_history));
 
     let count = s.prompt_history.len();
     let count_text = if count == 1 {
@@ -1731,12 +1718,8 @@ pub(super) fn history_popup(s: &UiState, k: &Kit, layer: &mut Vec<El>, slot: Slo
                 .mr(8.0),
         )
         .child(
-            rune_kit::IconButton::new(&super::parts::glyphs::CLOSE)
-                .variant(rune_kit::IconButtonVariant::GhostMuted)
-                .label(tr_ref(language, "Close"))
-                .on_press(|s: &mut UiState| {
-                    s.composer_history_open = false;
-                })
+            super::icons::header_button(k.glyph.close, tr_ref(language, "Close"))
+                .on_press(close_history)
                 .build(k)
                 .key("prompt-history-close"),
         );
@@ -1842,14 +1825,12 @@ pub(super) fn history_popup(s: &UiState, k: &Kit, layer: &mut Vec<El>, slot: Slo
                 .color(k.c.text_faint),
         );
 
-    let mut panel = col()
+    let panel = col()
         .key("prompt-history-panel")
         .preserve_focus_on_press(true)
         .w(440.0)
         .padding(4.0)
-        .radius(k.radius.md)
-        .fill(look.panel_fill(k))
-        .border(1.0, k.c.border_strong)
+        .modal(true, close_history)
         .on_press(|_: &mut UiState| {})
         .child(header)
         .child(el().w_full().h(1.0).fill(k.c.border_weak).mb(2.0))
@@ -1857,10 +1838,7 @@ pub(super) fn history_popup(s: &UiState, k: &Kit, layer: &mut Vec<El>, slot: Slo
         .child(el().w_full().h(1.0).fill(k.c.border_weak).mt(2.0))
         .child(footer);
 
-    panel = look.accent_rim(k, panel, k.c.bg_accent);
-    for shadow in k.shadow_layers(&k.elevation.overlay) {
-        panel = panel.box_shadow(shadow);
-    }
+    let panel = look.floating_surface(k, panel, k.radius.lg);
 
     let anchored_panel = panel
         .anchored_fit(anchor, rune::Side::Top, rune::Align::Start, 6.0)

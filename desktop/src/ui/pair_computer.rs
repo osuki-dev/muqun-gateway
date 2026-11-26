@@ -122,8 +122,7 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                 ),
         )
         .child(
-            Button::new("✕")
-                .variant(ButtonVariant::Ghost)
+            super::icons::header_button(k.glyph.close, tr(language, "Close"))
                 .on_press(|s: &mut UiState| s.close_pairing())
                 .build(k)
                 .key("pair-close-x"),
@@ -561,28 +560,16 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         card = card.child(form);
     }
 
-    let mut panel = look
-        .panel(k, card, k.radius.xl)
+    let panel = look
+        .floating_surface(k, card, k.radius.xl)
         .fill(k.c.surface_raised_base.alpha(0.97));
-    for shadow in k.shadow_layers(&k.elevation.overlay) {
-        panel = panel.box_shadow(shadow);
-    }
 
     let panel = look
         .dialog_motion(panel)
         .modal(true, |s: &mut UiState| s.close_pairing());
 
     // Scrim overlay
-    layer.push(
-        rune::el()
-            .key("pair-scrim")
-            .absolute(0.0, 0.0)
-            .w_full()
-            .h_full()
-            .fill(k.c.black.alpha(if s.dark { 0.5 } else { 0.26 }))
-            .token_motion(k.motion.overlay)
-            .a11y_hidden(),
-    );
+    layer.push(look.modal_scrim(k, "pair-scrim"));
 
     // Modal dialog centered
     layer.push(

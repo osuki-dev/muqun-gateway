@@ -1470,25 +1470,14 @@ fn floating_card(
             }
         })
         .a11y_hidden();
-    el().key(format!("tile-float-{i}"))
+    let mut floating = el()
+        .key(format!("tile-float-{i}"))
         .transition(panel_transition(s))
-        .radius(k.radius.lg)
-        .box_shadow(rune::Shadow {
-            x: 0.0,
-            y: 18.0,
-            blur: 48.0,
-            spread: 0.0,
-            color: k.c.black.alpha(if look.dark { 0.65 } else { 0.22 }),
-            inset: false,
-        })
-        .box_shadow(rune::Shadow {
-            x: 0.0,
-            y: 2.0,
-            blur: 8.0,
-            spread: 1.0,
-            color: k.c.black.alpha(0.24),
-            inset: false,
-        })
+        .radius(k.radius.lg);
+    for shadow in k.shadow_layers(&k.elevation.overlay) {
+        floating = floating.box_shadow(shadow);
+    }
+    floating
         .paint_order(if i == s.focus { 2 } else { 1 })
         .motion(layout_motion(s))
         .absolute(x, y)

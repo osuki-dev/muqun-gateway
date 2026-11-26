@@ -10,10 +10,9 @@ use muqun_gateway::agents::{
     AgentPart, AgentSessionId, AgentSessionInfo, AgentSessionStatus, CompactionStatus,
 };
 use rune::{col, row, text, Color, Cursor, El};
-use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit};
+use rune_kit::{Button, ButtonVariant, Kit};
 use serde_json::Value;
 
-use super::glyphs;
 use crate::config::Language;
 use crate::model::commands::Command;
 use crate::ui::copy::tr_ref;
@@ -504,11 +503,7 @@ fn content(s: &UiState, k: &Kit, asid: &str) -> Option<El> {
                     .grow(1.0),
             )
             .child(
-                IconButton::new(&glyphs::CLOSE)
-                    .variant(IconButtonVariant::Ghost)
-                    .control_size(ControlSize::Small)
-                    .label(t("Close"))
-                    .help(t("Close"))
+                crate::ui::icons::header_button(k.glyph.close, t("Close"))
                     .on_press(close)
                     .build(k)
                     .key("context-close"),

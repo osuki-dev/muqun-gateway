@@ -2881,32 +2881,23 @@ fn terminal_search_bar(s: &UiState, k: &Kit) -> El {
     .build(k)
     .key("term-search-next");
 
-    let close_btn = IconButton::new(&rune_kit::glyphs::CLOSE)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
-        .label(tr_ref(language, "Close search"))
+    let close_btn = super::icons::header_button(k.glyph.close, tr_ref(language, "Close search"))
         .on_press_tx(|s: &mut UiState, tx: &mut rune::Tx| s.close_terminal_search(tx))
         .build(k)
         .key("term-search-close");
 
-    let mut bar = row()
+    let bar = row()
         .key("terminal-search-bar")
         .gap(6.0)
         .center_y()
         .px(10.0)
         .py(4.0)
-        .radius(k.radius.lg)
-        .fill(k.c.layer_01)
-        .border(1.0, k.c.border_muted)
         .child(field)
         .child(counter)
         .child(prev_btn)
         .child(next_btn)
         .child(close_btn);
-
-    for shadow in k.shadow_layers(&k.elevation.overlay) {
-        bar = bar.box_shadow(shadow);
-    }
+    let bar = s.look().floating_surface(k, bar, k.radius.lg);
 
     row()
         .key("term-search-band")
