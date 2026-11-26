@@ -725,6 +725,20 @@ impl SessionHub for RemoteHub {
         HubMode::LocalGateway
     }
 
+    fn gateway_version(&self) -> HubFuture<'_, Option<String>> {
+        Box::pin(async move {
+            let json = self.call(Method::GET, &["api", "meta"], &[], None).await?;
+            let version = json
+                .get("version")
+                .and_then(Value::as_str)
+                .or_else(|| json.pointer("/data/version").and_then(Value::as_str))
+                .map(|v| v.trim().trim_start_matches('v'))
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned);
+            Ok(version)
+        })
+    }
+
     fn agents(&self) -> HubFuture<'_, Vec<AgentDiscoveryInfo>> {
         Box::pin(async move {
             let json = self

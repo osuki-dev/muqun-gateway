@@ -254,6 +254,9 @@ pub enum Update {
     Worktrees(Vec<crate::hub::WorktreeRow>),
     /// Where this desktop's sessions run, applied by the drain to a binding.
     HubMode(crate::hub::HubMode),
+    /// Status of checking or updating the connected Muqun Gateway.
+    #[allow(clippy::enum_variant_names)]
+    GatewayUpdate(crate::platform::update::GatewayStatus),
     /// A session wants the owner, or finished (`model/notify.rs`): the UI
     /// raises a system notification unless that session is on screen.
     FleetAttention(Box<super::fleet_attention::Change>),

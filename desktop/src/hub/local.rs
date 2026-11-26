@@ -196,6 +196,10 @@ impl SessionHub for LocalHub {
         HubMode::Standalone
     }
 
+    fn gateway_version(&self) -> HubFuture<'_, Option<String>> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn agents(&self) -> HubFuture<'_, Vec<AgentDiscoveryInfo>> {
         Box::pin(async move { Ok(self.runtime.discovery_snapshot().await.agents) })
     }

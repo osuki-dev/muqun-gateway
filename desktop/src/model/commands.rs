@@ -230,6 +230,11 @@ pub enum Command {
     RefreshTasks,
     CheckDesktopUpdate,
     InstallDesktopUpdate(String),
+    CheckGatewayUpdate,
+    InstallGatewayUpdate {
+        version: String,
+        channel: String,
+    },
     CheckpointForUpdateRestart,
     RefreshLocalPairings,
     ReadLocalInvite(u64),

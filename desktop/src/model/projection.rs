@@ -473,6 +473,22 @@ impl Core {
                         ok: false,
                     })));
             }
+            if let Command::CheckGatewayUpdate = &command {
+                self.inbox.push(Update::GatewayUpdate(
+                    crate::platform::update::GatewayStatus::Failed(
+                        "Computer is not connected".into(),
+                    ),
+                ));
+            }
+            if let Command::InstallGatewayUpdate { version, channel } = &command {
+                self.inbox.push(Update::GatewayUpdate(
+                    crate::platform::update::GatewayStatus::InstallFailed {
+                        version: version.clone(),
+                        channel: channel.clone(),
+                        error: "Computer is not connected".into(),
+                    },
+                ));
+            }
             return;
         }
         match command {
@@ -980,6 +996,53 @@ impl Core {
                     .push(Update::Ui(crate::model::inbox::UiAction::DesktopUpdate(
                         status,
                     )));
+            }
+            Command::CheckGatewayUpdate => {
+                let is_local = crate::hub::is_local_connection();
+                let status = match self.hub.gateway_version().await {
+                    Ok(version) => crate::platform::update::check_gateway(version, is_local).await,
+                    Err(err) => {
+                        tracing::debug!(%err, "failed to read Gateway version from /api/meta");
+                        crate::platform::update::GatewayStatus::Failed(
+                            crate::model::inbox::clean_error_message(&err.to_string()),
+                        )
+                    }
+                };
+                self.inbox.push(Update::GatewayUpdate(status));
+            }
+            Command::InstallGatewayUpdate { version, channel } => {
+                if !crate::hub::is_local_connection() {
+                    self.inbox.push(Update::GatewayUpdate(
+                        crate::platform::update::GatewayStatus::InstallFailed {
+                            version,
+                            channel,
+                            error: "Remote host — update on that computer".into(),
+                        },
+                    ));
+                    return;
+                }
+                let target_version = version.clone();
+                let target_channel = channel.clone();
+                let status = tokio::task::spawn_blocking(move || {
+                    crate::platform::update::install_gateway(version, channel)
+                })
+                .await
+                .unwrap_or_else(|err| {
+                    crate::platform::update::GatewayStatus::InstallFailed {
+                        version: target_version,
+                        channel: target_channel,
+                        error: err.to_string(),
+                    }
+                });
+                let updated = matches!(
+                    status,
+                    crate::platform::update::GatewayStatus::Updated { .. }
+                );
+                self.inbox.push(Update::GatewayUpdate(status));
+                if updated {
+                    *self.state().refreshed_at.lock().unwrap() = None;
+                    self.refresh().await;
+                }
             }
             Command::RefreshLocalPairings => {
                 let devices = crate::platform::paired_devices::load().await;

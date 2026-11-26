@@ -4,15 +4,59 @@ use super::installer::{self, Phase};
 use anyhow::{ensure, Context as _};
 use muqun_gateway::ReleaseVersion;
 use std::{
-    path::PathBuf,
-    process::Command,
+    io::Read as _,
+    os::{fd::OwnedFd, unix::net::UnixStream},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{atomic::AtomicBool, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub const INSTALL_URL: &str = "https://muqun.dev/desktop/#install";
 const RELEASE_API: &str = "https://muqun.dev/api/releases/desktop";
+pub const GATEWAY_INSTALL_URL: &str = "https://muqun.dev/#install";
+const GATEWAY_RELEASE_API: &str = "https://muqun.dev/api/releases/gateway";
+const GATEWAY_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
+const GATEWAY_OUTPUT_LIMIT: usize = 32 * 1024;
 const INSTALLED: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub enum GatewayStatus {
+    #[default]
+    Idle,
+    Checking,
+    Standalone,
+    Current {
+        installed: String,
+    },
+    Available {
+        installed: String,
+        latest: String,
+        channel: String,
+        can_install: bool,
+    },
+    Manual {
+        installed: String,
+        latest: String,
+        channel: String,
+        remote: bool,
+    },
+    NoRelease {
+        installed: String,
+    },
+    Installing {
+        version: String,
+    },
+    Updated {
+        version: String,
+    },
+    InstallFailed {
+        version: String,
+        channel: String,
+        error: String,
+    },
+    Failed(String),
+}
 
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -54,13 +98,7 @@ pub async fn check() -> Status {
     }
 }
 
-async fn check_endpoint(base: &str, installed: &str) -> anyhow::Result<Status> {
-    let current = ReleaseVersion::parse(installed)?;
-    let channel = if current.is_preview() {
-        "preview"
-    } else {
-        "stable"
-    };
+async fn fetch_release_version(base: &str, channel: &str) -> anyhow::Result<Option<String>> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(8))
@@ -86,19 +124,328 @@ async fn check_endpoint(base: &str, installed: &str) -> anyhow::Result<Status> {
     );
     let version = body.get("version").context("missing release version")?;
     if version.is_null() {
-        return Ok(Status::NoRelease);
+        return Ok(None);
     }
     let value = version.as_str().context("invalid release version")?;
-    let latest = ReleaseVersion::parse(value)?;
+    Ok(Some(value.to_owned()))
+}
+
+async fn check_endpoint(base: &str, installed: &str) -> anyhow::Result<Status> {
+    let current = ReleaseVersion::parse(installed)?;
+    let channel = if current.is_preview() {
+        "preview"
+    } else {
+        "stable"
+    };
+    let Some(value) = fetch_release_version(base, channel).await? else {
+        return Ok(Status::NoRelease);
+    };
+    let latest = ReleaseVersion::parse(&value)?;
     ensure!(
         latest.is_preview() == current.is_preview() && !value.ends_with("-preview.0"),
         "invalid release for this channel"
     );
     Ok(if latest > current {
-        Status::Available(value.to_owned())
+        Status::Available(value)
     } else {
         Status::Current
     })
+}
+
+pub async fn check_gateway(installed: Option<String>, is_local: bool) -> GatewayStatus {
+    check_gateway_endpoint(
+        GATEWAY_RELEASE_API,
+        installed,
+        is_local,
+        is_preview_build(),
+        gateway_installer_script().is_some(),
+    )
+    .await
+}
+
+async fn check_gateway_endpoint(
+    base: &str,
+    installed: Option<String>,
+    is_local: bool,
+    prefer_preview: bool,
+    has_installer: bool,
+) -> GatewayStatus {
+    let Some(raw_installed) = installed else {
+        return GatewayStatus::Standalone;
+    };
+    let installed = raw_installed.trim().trim_start_matches('v').to_owned();
+    let Ok(current) = ReleaseVersion::parse(&installed) else {
+        return GatewayStatus::Failed("Unrecognized gateway version".into());
+    };
+    let channel = if current.is_preview() || prefer_preview {
+        "preview"
+    } else {
+        "stable"
+    };
+    let value = match fetch_release_version(base, channel).await {
+        Ok(Some(value)) => value,
+        Ok(None) => return GatewayStatus::NoRelease { installed },
+        Err(error) => {
+            tracing::debug!(%error, "Gateway release check failed");
+            return GatewayStatus::Failed(error.to_string());
+        }
+    };
+    let cleaned = value.trim().trim_start_matches('v');
+    let Ok(latest) = ReleaseVersion::parse(cleaned) else {
+        return GatewayStatus::Failed("Invalid release version".into());
+    };
+    let expect_preview = channel == "preview";
+    if latest.is_preview() != expect_preview || cleaned.ends_with("-preview.0") {
+        return GatewayStatus::Failed("Invalid release for this channel".into());
+    }
+    if latest > current {
+        let can_install = is_local && has_installer;
+        if can_install {
+            GatewayStatus::Available {
+                installed,
+                latest: cleaned.to_owned(),
+                channel: channel.to_owned(),
+                can_install: true,
+            }
+        } else {
+            GatewayStatus::Manual {
+                installed,
+                latest: cleaned.to_owned(),
+                channel: channel.to_owned(),
+                remote: !is_local,
+            }
+        }
+    } else {
+        GatewayStatus::Current { installed }
+    }
+}
+
+fn gateway_installer_script_at(executable: &Path) -> Option<PathBuf> {
+    if !executable.is_absolute() {
+        return None;
+    }
+    let prefix = executable.parent()?.parent()?;
+    let candidate = if executable.ends_with("Contents/MacOS/muqun-desktop") {
+        prefix.join("Resources/installers/install.sh")
+    } else if executable.ends_with("bin/muqun-desktop") {
+        prefix.join("share/muqun-desktop/installers/install.sh")
+    } else {
+        return None;
+    };
+    candidate.is_file().then_some(candidate)
+}
+
+fn gateway_installer_script() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(script) = gateway_installer_script_at(&exe) {
+            return Some(script);
+        }
+    }
+    #[cfg(debug_assertions)]
+    {
+        if let Some(script) = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(|p| p.join("install.sh"))
+            .filter(|p| p.is_file())
+        {
+            return Some(script);
+        }
+    }
+    None
+}
+
+fn gateway_installer_path_env() -> Option<std::ffi::OsString> {
+    let mut entries = Vec::new();
+    let mut push_unique = |path: PathBuf| {
+        if !path.as_os_str().is_empty() && !entries.contains(&path) {
+            entries.push(path);
+        }
+    };
+    if let Some(existing) = std::env::var_os("PATH") {
+        for path in std::env::split_paths(&existing) {
+            push_unique(path);
+        }
+    }
+    push_unique(PathBuf::from("/usr/local/bin"));
+    push_unique(PathBuf::from("/opt/homebrew/bin"));
+    if let Some(home) = dirs::home_dir() {
+        push_unique(home.join(".local/bin"));
+    }
+    for sys in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        push_unique(PathBuf::from(sys));
+    }
+    std::env::join_paths(entries).ok()
+}
+
+fn validate_gateway_install_args(version: &str, channel: &str) -> Result<(), String> {
+    if !matches!(channel, "stable" | "preview") {
+        return Err("Invalid Gateway release channel".into());
+    }
+    let parsed =
+        ReleaseVersion::parse(version).map_err(|_| "Invalid Gateway release version".to_owned())?;
+    if version.ends_with("-preview.0") || parsed.is_preview() != (channel == "preview") {
+        return Err("Gateway version does not match release channel".into());
+    }
+    Ok(())
+}
+
+fn last_error_line(output: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(output);
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(240).collect())
+}
+
+fn install_gateway_with_script(
+    script: &Path,
+    version: String,
+    channel: String,
+    timeout: Duration,
+) -> GatewayStatus {
+    if let Err(error) = validate_gateway_install_args(&version, &channel) {
+        return GatewayStatus::InstallFailed {
+            version,
+            channel,
+            error,
+        };
+    }
+    let (mut reader, writer) = match UnixStream::pair() {
+        Ok(pair) => pair,
+        Err(error) => {
+            return GatewayStatus::InstallFailed {
+                version,
+                channel,
+                error: error.to_string(),
+            };
+        }
+    };
+    if let Err(error) = reader.set_nonblocking(true) {
+        return GatewayStatus::InstallFailed {
+            version,
+            channel,
+            error: error.to_string(),
+        };
+    }
+    let stderr_writer = match writer.try_clone() {
+        Ok(cloned) => cloned,
+        Err(error) => {
+            return GatewayStatus::InstallFailed {
+                version,
+                channel,
+                error: error.to_string(),
+            };
+        }
+    };
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg(script)
+        .arg("--channel")
+        .arg(&channel)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .stderr(Stdio::from(OwnedFd::from(stderr_writer)));
+    if let Some(path) = gateway_installer_path_env() {
+        command.env("PATH", path);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is the only post-fork operation; no allocation or locking.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return GatewayStatus::InstallFailed {
+                version,
+                channel,
+                error: error.to_string(),
+            };
+        }
+    };
+    drop(command);
+    let started = Instant::now();
+    let mut captured = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let drain = |reader: &mut UnixStream, captured: &mut Vec<u8>, chunk: &mut [u8; 4096]| {
+        while let Ok(count @ 1..) = reader.read(chunk) {
+            captured.extend_from_slice(&chunk[..count]);
+            if captured.len() > GATEWAY_OUTPUT_LIMIT {
+                let excess = captured.len() - GATEWAY_OUTPUT_LIMIT;
+                captured.drain(..excess);
+            }
+        }
+    };
+    loop {
+        let exit = child.try_wait();
+        drain(&mut reader, &mut captured, &mut chunk);
+        match exit {
+            Ok(Some(status)) => {
+                if status.success() {
+                    return GatewayStatus::Updated { version };
+                }
+                let error = last_error_line(&captured)
+                    .unwrap_or_else(|| format!("Installer exited with {status}"));
+                tracing::warn!(%error, %channel, %version, "Gateway installer failed");
+                return GatewayStatus::InstallFailed {
+                    version,
+                    channel,
+                    error,
+                };
+            }
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::kill(-(child.id() as i32), libc::SIGKILL);
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return GatewayStatus::InstallFailed {
+                        version,
+                        channel,
+                        error: "Gateway update timed out".into(),
+                    };
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                return GatewayStatus::InstallFailed {
+                    version,
+                    channel,
+                    error: error.to_string(),
+                };
+            }
+        }
+    }
+}
+
+pub fn install_gateway(version: String, channel: String) -> GatewayStatus {
+    if let Err(error) = validate_gateway_install_args(&version, &channel) {
+        return GatewayStatus::InstallFailed {
+            version,
+            channel,
+            error,
+        };
+    }
+    let Some(script) = gateway_installer_script() else {
+        return GatewayStatus::InstallFailed {
+            version,
+            channel,
+            error: "Packaged Gateway installer is unavailable".into(),
+        };
+    };
+    install_gateway_with_script(&script, version, channel, GATEWAY_INSTALL_TIMEOUT)
 }
 
 /// The current executable is resolved before activation: after Linux replaces
@@ -371,5 +718,275 @@ echo 1.1.0 > "$PREFIX/share/muqun-desktop/installers/VERSION"
         assert!(fixture("1.0.0", "stable", 200, r#"{"channel":"stable"}"#)
             .await
             .is_err());
+    }
+
+    async fn gateway_fixture(
+        installed: Option<&str>,
+        expected_channel: &str,
+        status: u16,
+        json: &str,
+        is_local: bool,
+        prefer_preview: bool,
+        has_installer: bool,
+    ) -> GatewayStatus {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/api/releases/gateway",
+            listener.local_addr().unwrap()
+        );
+        let expected = format!("GET /api/releases/gateway/{expected_channel} HTTP/1.1\r\n");
+        let response = format!(
+            "HTTP/1.1 {status} fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+            json.len()
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut input = tokio::io::BufReader::new(&mut stream);
+            let mut line = String::new();
+            input.read_line(&mut line).await.unwrap();
+            assert_eq!(line, expected);
+            loop {
+                line.clear();
+                if input.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let result = check_gateway_endpoint(
+            &url,
+            installed.map(str::to_owned),
+            is_local,
+            prefer_preview,
+            has_installer,
+        )
+        .await;
+        server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn gateway_release_check_compares_versions_and_respects_local_vs_remote() {
+        assert_eq!(
+            check_gateway_endpoint("http://127.0.0.1:1", None, true, false, true).await,
+            GatewayStatus::Standalone
+        );
+        assert_eq!(
+            check_gateway_endpoint(
+                "http://127.0.0.1:1",
+                Some("not-a-version".into()),
+                true,
+                false,
+                true
+            )
+            .await,
+            GatewayStatus::Failed("Unrecognized gateway version".into())
+        );
+
+        let preview_release = r#"{"channel":"preview","version":"0.14.1-preview.35"}"#;
+        // Local with packaged installer -> Available { can_install: true }
+        assert_eq!(
+            gateway_fixture(
+                Some("v0.14.1-preview.34"),
+                "preview",
+                200,
+                preview_release,
+                true,
+                false,
+                true,
+            )
+            .await,
+            GatewayStatus::Available {
+                installed: "0.14.1-preview.34".into(),
+                latest: "0.14.1-preview.35".into(),
+                channel: "preview".into(),
+                can_install: true,
+            }
+        );
+        // Remote host -> Manual { remote: true } even when local installer exists
+        assert_eq!(
+            gateway_fixture(
+                Some("0.14.1-preview.34"),
+                "preview",
+                200,
+                preview_release,
+                false,
+                false,
+                true,
+            )
+            .await,
+            GatewayStatus::Manual {
+                installed: "0.14.1-preview.34".into(),
+                latest: "0.14.1-preview.35".into(),
+                channel: "preview".into(),
+                remote: true,
+            }
+        );
+        // Local without packaged installer -> Manual { remote: false }
+        assert_eq!(
+            gateway_fixture(
+                Some("0.14.1-preview.34"),
+                "preview",
+                200,
+                preview_release,
+                true,
+                false,
+                false,
+            )
+            .await,
+            GatewayStatus::Manual {
+                installed: "0.14.1-preview.34".into(),
+                latest: "0.14.1-preview.35".into(),
+                channel: "preview".into(),
+                remote: false,
+            }
+        );
+        // Already up to date
+        assert_eq!(
+            gateway_fixture(
+                Some("0.14.1-preview.35"),
+                "preview",
+                200,
+                preview_release,
+                true,
+                false,
+                true,
+            )
+            .await,
+            GatewayStatus::Current {
+                installed: "0.14.1-preview.35".into(),
+            }
+        );
+        // Unpublished channel -> NoRelease
+        assert_eq!(
+            gateway_fixture(
+                Some("0.14.1"),
+                "stable",
+                200,
+                r#"{"channel":"stable","version":null}"#,
+                true,
+                false,
+                true,
+            )
+            .await,
+            GatewayStatus::NoRelease {
+                installed: "0.14.1".into(),
+            }
+        );
+        // Mismatched channel in response -> Failed
+        assert!(matches!(
+            gateway_fixture(
+                Some("0.14.1"),
+                "stable",
+                200,
+                preview_release,
+                true,
+                false,
+                true,
+            )
+            .await,
+            GatewayStatus::Failed(_)
+        ));
+
+        // Verify packaged install.sh lookup for both Linux prefix and macOS bundle layouts
+        let tmp = tempfile::tempdir().unwrap();
+        let linux_script = tmp
+            .path()
+            .join("linux/share/muqun-desktop/installers/install.sh");
+        std::fs::create_dir_all(linux_script.parent().unwrap()).unwrap();
+        std::fs::write(&linux_script, "#!/bin/sh\n").unwrap();
+        assert_eq!(
+            gateway_installer_script_at(&tmp.path().join("linux/bin/muqun-desktop")),
+            Some(linux_script)
+        );
+        let mac_script = tmp
+            .path()
+            .join("Muqun Desktop.app/Contents/Resources/installers/install.sh");
+        std::fs::create_dir_all(mac_script.parent().unwrap()).unwrap();
+        std::fs::write(&mac_script, "#!/bin/sh\n").unwrap();
+        assert_eq!(
+            gateway_installer_script_at(
+                &tmp.path()
+                    .join("Muqun Desktop.app/Contents/MacOS/muqun-desktop")
+            ),
+            Some(mac_script)
+        );
+        assert!(
+            gateway_installer_script_at(&tmp.path().join("target/debug/muqun-desktop")).is_none()
+        );
+    }
+
+    #[test]
+    fn gateway_installer_rejects_invalid_channel_or_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("install.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+set -eu
+[ "$#" -eq 2 ] && [ "$1" = "--channel" ]
+if [ "$2" = "preview" ]; then
+  echo "updated preview"
+  exit 0
+fi
+echo "first detail line" >&2
+echo "Error: simulated download failure" >&2
+exit 1
+"#,
+        )
+        .unwrap();
+
+        for (version, channel) in [
+            ("0.14.1", "nightly"),
+            ("0.14.1", "stable; rm -rf /"),
+            ("0.14.1", "--help"),
+            ("not-a-version", "stable"),
+            ("v0.14.1", "stable"),
+            ("0.14.1;id", "stable"),
+            ("0.14.1-preview.0", "preview"),
+            ("0.14.1-preview.1", "stable"),
+            ("0.14.1", "preview"),
+        ] {
+            let status = install_gateway_with_script(
+                &script,
+                version.into(),
+                channel.into(),
+                Duration::from_secs(5),
+            );
+            assert!(
+                matches!(status, GatewayStatus::InstallFailed { .. }),
+                "expected rejection for version={version:?} channel={channel:?}, got {status:?}"
+            );
+            let direct = install_gateway(version.into(), channel.into());
+            assert!(matches!(direct, GatewayStatus::InstallFailed { .. }));
+        }
+
+        // Valid preview invocation succeeds
+        assert_eq!(
+            install_gateway_with_script(
+                &script,
+                "0.14.1-preview.35".into(),
+                "preview".into(),
+                Duration::from_secs(5),
+            ),
+            GatewayStatus::Updated {
+                version: "0.14.1-preview.35".into(),
+            }
+        );
+
+        // Failing script captures concise last error line
+        assert_eq!(
+            install_gateway_with_script(
+                &script,
+                "0.14.1".into(),
+                "stable".into(),
+                Duration::from_secs(5),
+            ),
+            GatewayStatus::InstallFailed {
+                version: "0.14.1".into(),
+                channel: "stable".into(),
+                error: "Error: simulated download failure".into(),
+            }
+        );
     }
 }

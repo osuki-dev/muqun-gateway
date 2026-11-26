@@ -212,6 +212,11 @@ impl SessionHub for DynamicHub {
         self.active().mode()
     }
 
+    fn gateway_version(&self) -> HubFuture<'_, Option<String>> {
+        let active = self.active();
+        Box::pin(async move { active.gateway_version().await })
+    }
+
     fn agents(&self) -> HubFuture<'_, Vec<AgentDiscoveryInfo>> {
         let active = self.active();
         Box::pin(async move { active.agents().await })

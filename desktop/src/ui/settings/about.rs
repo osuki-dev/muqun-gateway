@@ -9,7 +9,7 @@ use rune_kit::Kit;
 use super::{button, group, link_button, row};
 use crate::branding::{APP_MARK_PNG, APP_NAME};
 use crate::config::Language;
-use crate::platform::update::{self, Status};
+use crate::platform::update::{self, GatewayStatus, Status};
 use crate::ui::copy::{tr, tr_ref};
 use crate::ui::UiState;
 
@@ -22,6 +22,35 @@ impl UiState {
             self.desktop_update = Status::Checking;
             self.send(crate::model::commands::Command::CheckDesktopUpdate);
         }
+    }
+
+    pub(in crate::ui) fn check_gateway_update(&mut self) {
+        if !matches!(
+            self.gateway_update,
+            GatewayStatus::Checking | GatewayStatus::Installing { .. }
+        ) {
+            self.gateway_update = GatewayStatus::Checking;
+            self.send(crate::model::commands::Command::CheckGatewayUpdate);
+        }
+    }
+
+    pub(in crate::ui) fn start_gateway_update(&mut self) {
+        let (version, channel) = match &self.gateway_update {
+            GatewayStatus::Available {
+                latest,
+                channel,
+                can_install: true,
+                ..
+            } => (latest.clone(), channel.clone()),
+            GatewayStatus::InstallFailed {
+                version, channel, ..
+            } => (version.clone(), channel.clone()),
+            _ => return,
+        };
+        self.gateway_update = GatewayStatus::Installing {
+            version: version.clone(),
+        };
+        self.send(crate::model::commands::Command::InstallGatewayUpdate { version, channel });
     }
 }
 
@@ -235,13 +264,109 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
                 update::INSTALL_URL,
             )),
     );
+    let current_computer = s.current_computer();
+    let is_remote = !matches!(current_computer, "local" | "self" | "all" | "");
+    let gateway_title = if is_remote {
+        format!("Muqun Gateway · {}", s.computer_name(current_computer))
+    } else {
+        "Muqun Gateway".to_string()
+    };
+    let gateway_result = match &s.gateway_update {
+        GatewayStatus::Idle => String::new(),
+        GatewayStatus::Checking => tr(language, "Checking…"),
+        GatewayStatus::Standalone => tr(language, "Standalone mode (embedded)"),
+        GatewayStatus::Current { installed } => {
+            format!("v{installed} · {}", tr_ref(language, "Up to date"))
+        }
+        GatewayStatus::Available {
+            installed, latest, ..
+        } => format!("v{installed} → {latest} {}", tr_ref(language, "available")),
+        GatewayStatus::Manual {
+            installed,
+            latest,
+            remote,
+            ..
+        } => {
+            let note = if *remote {
+                tr_ref(language, "Remote host — update on that computer")
+            } else {
+                tr_ref(language, "Update manually via installer")
+            };
+            format!("v{installed} → {latest} · {note}")
+        }
+        GatewayStatus::NoRelease { installed } => format!(
+            "v{installed} · {}",
+            tr_ref(language, "No published version in this channel")
+        ),
+        GatewayStatus::Installing { .. } => tr(language, "Updating Gateway…"),
+        GatewayStatus::Updated { version } => {
+            format!("{} {version}", tr_ref(language, "Updated to"))
+        }
+        GatewayStatus::InstallFailed { error, .. } => {
+            if error.is_empty() {
+                tr(language, "Gateway update failed")
+            } else {
+                format!("{}: {error}", tr_ref(language, "Gateway update failed"))
+            }
+        }
+        GatewayStatus::Failed(error) => {
+            if error.is_empty() {
+                tr(language, "Check failed")
+            } else {
+                format!("{}: {error}", tr_ref(language, "Check failed"))
+            }
+        }
+    };
+    let gateway_row = row(
+        k,
+        "update-gateway",
+        &gateway_title,
+        &gateway_result,
+        hrow()
+            .key("gateway-update-actions")
+            .gap(6.0)
+            .center_y()
+            .flex_wrap()
+            .child(
+                match &s.gateway_update {
+                    GatewayStatus::Available {
+                        can_install: true, ..
+                    } => button(tr_ref(language, "Update Gateway"))
+                        .on_press(UiState::start_gateway_update),
+                    GatewayStatus::InstallFailed { .. } => {
+                        button(tr_ref(language, "Retry")).on_press(UiState::start_gateway_update)
+                    }
+                    GatewayStatus::Installing { .. } => {
+                        button(tr_ref(language, "Updating…")).disabled(true)
+                    }
+                    other => button(tr_ref(
+                        language,
+                        if matches!(other, GatewayStatus::Idle | GatewayStatus::Checking) {
+                            "Check for updates"
+                        } else {
+                            "Check again"
+                        },
+                    ))
+                    .disabled(*other == GatewayStatus::Checking)
+                    .on_press(UiState::check_gateway_update),
+                }
+                .build(k)
+                .key("gateway-update-action"),
+            )
+            .child(link_button(
+                k,
+                "gateway-downloads",
+                tr_ref(language, "View downloads"),
+                update::GATEWAY_INSTALL_URL,
+            )),
+    );
     vec![
         hero(s, k),
         group(
             k,
             "about-updates",
             tr_ref(language, "Updates"),
-            vec![update_row],
+            vec![update_row, gateway_row],
         ),
         group(
             k,
@@ -452,5 +577,97 @@ mod tests {
         click(&mut rt, "desktop-update-hide");
         assert!(receiver.try_recv().is_err());
         assert!(!rt.state.restart_on_frame);
+    }
+
+    #[test]
+    fn about_gateway_update_row_checks_and_installs() {
+        fn view(s: &UiState, _: &mut rune::Cx<UiState>) -> El {
+            let kit = Kit::neutral(true);
+            rune_kit::root(col().w_full().children(page(s, &kit)), Vec::new())
+        }
+        let (sender, mut receiver) = commands::channel();
+        let mut s = UiState::new(sender);
+        s.splash = None;
+        while receiver.try_recv().is_ok() {}
+        let mut rt = rune::Runtime::new(s, view, (1100.0, 900.0), rune::Env::new(true, 1.0));
+        let mut time = 0.0;
+        let mut click = |rt: &mut rune::Runtime<UiState>, key: &str| {
+            for _ in 0..25 {
+                time += 1.0 / 60.0;
+                rt.frame(time);
+            }
+            let (x, y) = rt.find(key).unwrap();
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+            time += 1.0 / 60.0;
+            rt.frame(time);
+        };
+
+        // Idle -> clicking dispatches Command::CheckGatewayUpdate
+        click(&mut rt, "gateway-update-action");
+        assert_eq!(rt.state.gateway_update, GatewayStatus::Checking);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Command::CheckGatewayUpdate)
+        ));
+
+        // Available (local) -> clicking dispatches Command::InstallGatewayUpdate
+        rt.update(|s, _| {
+            s.apply_updates(vec![crate::model::inbox::Update::GatewayUpdate(
+                GatewayStatus::Available {
+                    installed: "0.14.1-preview.34".into(),
+                    latest: "0.14.1-preview.35".into(),
+                    channel: "preview".into(),
+                    can_install: true,
+                },
+            )]);
+        });
+        click(&mut rt, "gateway-update-action");
+        assert_eq!(
+            rt.state.gateway_update,
+            GatewayStatus::Installing {
+                version: "0.14.1-preview.35".into(),
+            }
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Command::InstallGatewayUpdate { version, channel })
+                if version == "0.14.1-preview.35" && channel == "preview"
+        ));
+
+        // InstallFailed -> shows toast and clicking Retry dispatches Command::InstallGatewayUpdate again
+        rt.update(|s, _| {
+            s.apply_updates(vec![crate::model::inbox::Update::GatewayUpdate(
+                GatewayStatus::InstallFailed {
+                    version: "0.14.1-preview.35".into(),
+                    channel: "preview".into(),
+                    error: "network error".into(),
+                },
+            )]);
+        });
+        assert!(!rt.state.toasts.is_empty());
+        click(&mut rt, "gateway-update-action");
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Command::InstallGatewayUpdate { version, channel })
+                if version == "0.14.1-preview.35" && channel == "preview"
+        ));
+
+        // Updated -> records updated status and emits toast
+        rt.state.toasts.clear();
+        rt.update(|s, _| {
+            s.apply_updates(vec![crate::model::inbox::Update::GatewayUpdate(
+                GatewayStatus::Updated {
+                    version: "0.14.1-preview.35".into(),
+                },
+            )]);
+        });
+        assert_eq!(
+            rt.state.gateway_update,
+            GatewayStatus::Updated {
+                version: "0.14.1-preview.35".into(),
+            }
+        );
+        assert!(!rt.state.toasts.is_empty());
     }
 }

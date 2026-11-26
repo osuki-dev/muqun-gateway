@@ -631,6 +631,7 @@ pub struct UiState {
     restart_checkpoint_pending: bool,
     restart_on_frame: bool,
     pub desktop_update: crate::platform::update::Status,
+    pub gateway_update: crate::platform::update::GatewayStatus,
     pub local_pairings: crate::platform::paired_devices::List,
     pub(crate) plugin_packages: package_activity::PackageActivity,
     /// Settings → Themes: the search over both grids.
@@ -899,6 +900,7 @@ impl UiState {
             restart_checkpoint_pending: false,
             restart_on_frame: false,
             desktop_update: Default::default(),
+            gateway_update: Default::default(),
             local_pairings: Default::default(),
             local_revoke: Default::default(),
             computer_unpair: Default::default(),
@@ -1553,6 +1555,7 @@ impl UiState {
         self.edit(ConfigEdit::CurrentComputer(id.clone()));
         self.agent_inputs.clear();
         self.mcp_hub.reset_for_switch();
+        self.gateway_update = crate::platform::update::GatewayStatus::Idle;
         if self.mode == Mode::Settings && self.settings_tab == SettingsTab::McpHub && id != "all" {
             self.refresh_mcp_upstreams();
         }
@@ -3772,6 +3775,27 @@ impl UiState {
                     }
                 }
                 Update::HubMode(mode) => self.hub_label = mode.to_string(),
+                Update::GatewayUpdate(status) => {
+                    let lang = self.cfg.general.language;
+                    match &status {
+                        crate::platform::update::GatewayStatus::Updated { version } => {
+                            self.notify(
+                                ToastLevel::Success,
+                                copy::tr(lang, "Muqun Gateway updated"),
+                                Some(format!("v{version}")),
+                            );
+                        }
+                        crate::platform::update::GatewayStatus::InstallFailed { error, .. } => {
+                            self.notify(
+                                ToastLevel::Error,
+                                copy::tr(lang, "Gateway update failed"),
+                                (!error.is_empty()).then(|| error.clone()),
+                            );
+                        }
+                        _ => {}
+                    }
+                    self.gateway_update = status;
+                }
                 Update::HubLink(down) => self.hub_down = down,
                 Update::Search {
                     generation,

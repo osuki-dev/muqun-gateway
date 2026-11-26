@@ -547,6 +547,11 @@ pub trait SessionHub: Send + Sync {
     }
     /// Which kind of backend this hub is.
     fn mode(&self) -> HubMode;
+    /// The connected Gateway's version from `GET /api/meta`, or `None` for
+    /// standalone in-process hubs.
+    fn gateway_version(&self) -> HubFuture<'_, Option<String>> {
+        Box::pin(async { Ok(None) })
+    }
     /// Every agent this hub knows, with the gateway's availability words.
     /// Never waits on a probe: the answer is what is known now (attached
     /// agents, the last probe), and asking again later picks up the result
