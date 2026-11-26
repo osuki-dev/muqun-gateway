@@ -233,6 +233,7 @@ static NSString *MuqunNSString(const char *s) {
     self.captureTimer = [NSTimer scheduledTimerWithTimeInterval:delay
                                                         repeats:NO
                                                           block:^(NSTimer * _Nonnull timer) {
+        (void)timer;
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) return;
         strongSelf.captureTimer = nil;

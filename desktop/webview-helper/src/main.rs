@@ -120,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     #[cfg(target_os = "macos")]
     {
-        drop(read);
+        let _ = read;
         macos::run(event, url, uri, browser, pixels, idle)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
