@@ -959,6 +959,13 @@ impl UiState {
         self.term_new_tab_in(cwd, None);
     }
 
+    /// Open a new local terminal tab on this machine, even when viewing a
+    /// remote computer session.
+    pub fn term_new_local_tab(&mut self) {
+        let cwd = self.local_terminal_cwd();
+        self.term_new_tab_on(None, cwd, None);
+    }
+
     /// Record the lone shell as tab 0 before a second tab joins it. `force`
     /// seeds even before that shell has started (a second terminal tile).
     pub(crate) fn ensure_term_tabs_seeded(&mut self, force: bool) {
@@ -973,6 +980,14 @@ impl UiState {
                 .as_ref()
                 .map(|s| s.cwd.clone())
                 .unwrap_or_else(|| self.terminal_cwd());
+            if let Some(comp) = self
+                .term
+                .session
+                .as_ref()
+                .and_then(|s| s.remote_computer.clone())
+            {
+                self.term.remote_tabs.insert(id, comp);
+            }
             self.term.tabs.push(TermTab {
                 id,
                 session: self.term.session.clone(),
@@ -1339,6 +1354,34 @@ impl UiState {
             .map(PathBuf::from)
             .filter(|p| p.is_dir())
             .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("/"))
+    }
+
+    /// A guaranteed-local working directory for spawning a shell on this
+    /// machine, never returning a remote session path.
+    pub fn local_terminal_cwd(&self) -> PathBuf {
+        if let Some(agent) = self.cfg.general.last_agent.as_deref() {
+            if let Some(path) = self.cfg.general.last_cwd.get(agent).filter(|p| p.is_dir()) {
+                return path.clone();
+            }
+        }
+        let mut last_cwds: Vec<&PathBuf> = self
+            .cfg
+            .general
+            .last_cwd
+            .values()
+            .filter(|p| p.is_dir())
+            .collect();
+        last_cwds.sort();
+        if let Some(path) = last_cwds.first() {
+            return (*path).clone();
+        }
+        if let Some(path) = self.cfg.general.default_cwd.as_ref().filter(|p| p.is_dir()) {
+            return path.clone();
+        }
+        dirs::home_dir()
+            .filter(|p| p.is_dir())
+            .or_else(|| std::env::current_dir().ok().filter(|p| p.is_dir()))
             .unwrap_or_else(|| PathBuf::from("/"))
     }
 
@@ -1794,6 +1837,7 @@ impl UiState {
         let action = [
             Action::ToggleFocus,
             Action::ToggleTerminal,
+            Action::NewShell,
             Action::TermNewTab,
             Action::TermCloseTab,
             Action::TermSearch,
@@ -1809,6 +1853,11 @@ impl UiState {
             match action {
                 Action::ToggleFocus => self.toggle_focus_tx(tx),
                 Action::ToggleTerminal => self.toggle_terminal_tx(tx),
+                Action::NewShell => {
+                    self.open_terminal_default();
+                    self.restart_terminal();
+                    self.focus_terminal_tx(tx);
+                }
                 Action::TermNewTab => self.term_new_tab(),
                 Action::TermCloseTab => self.term_close_tab(self.term.active_tab),
                 Action::TermSearch => self.open_terminal_search(),
@@ -2097,9 +2146,35 @@ impl UiState {
     }
 }
 
+fn tab_remote_computer(s: &UiState, index: usize) -> Option<&str> {
+    let from_tab = s.term.tabs.get(index).and_then(|tab| {
+        tab.session
+            .as_ref()
+            .and_then(|sess| sess.remote_computer.as_deref())
+            .or_else(|| s.term.remote_tabs.get(&tab.id).map(String::as_str))
+    });
+    from_tab.or_else(|| {
+        (index == s.term.active_tab)
+            .then(|| {
+                s.term
+                    .session
+                    .as_ref()
+                    .and_then(|sess| sess.remote_computer.as_deref())
+            })
+            .flatten()
+    })
+}
+
 /// The panel.
-fn shell_tab(k: &Kit, key: String, title: String, active: bool, number: usize) -> El {
-    let caption = if title.starts_with('/') || title.starts_with("~/") {
+fn shell_tab(
+    k: &Kit,
+    key: String,
+    title: String,
+    remote: Option<(String, Color)>,
+    active: bool,
+    number: usize,
+) -> El {
+    let base_caption = if title.starts_with('/') || title.starts_with("~/") {
         std::path::Path::new(&title)
             .file_name()
             .and_then(|n| n.to_str())
@@ -2109,51 +2184,62 @@ fn shell_tab(k: &Kit, key: String, title: String, active: bool, number: usize) -
     } else {
         title.clone()
     };
+    let (caption, tooltip, dot) = match remote {
+        Some((host, dot_color)) => (
+            format!("{host} · {base_caption}"),
+            format!("[{host}] {title}"),
+            Some(dot_color),
+        ),
+        None => (base_caption, title, None),
+    };
     let ink = if active {
         k.c.text_base
     } else {
         k.c.text_muted
     };
+    let mut pill = row()
+        .key(key)
+        .h(32.0)
+        .min_w(76.0)
+        .max_w(if dot.is_some() { 210.0 } else { 190.0 })
+        .shrink()
+        .pl(10.0)
+        .pr(4.0)
+        .gap(6.0)
+        .center_y()
+        .radius(k.radius.lg)
+        .fill(if active {
+            k.c.surface_raised.mix(k.c.bg_accent, 0.14)
+        } else {
+            k.c.bg_base.alpha(0.0)
+        })
+        .motion(crate::theme::look::MOVE)
+        .role("tab")
+        .label(tooltip.clone())
+        .help(tooltip)
+        .cursor(rune::Cursor::Pointer)
+        .preserve_focus_on_press(true)
+        .child(
+            text(format!("{:02}", number + 1))
+                .font(k.ty.small)
+                .color(if active {
+                    k.c.text_accent
+                } else {
+                    k.c.text_faint
+                }),
+        );
+    if let Some(dot_color) = dot {
+        pill = pill.child(el().w(6.0).h(6.0).radius(3.0).fill(dot_color));
+    }
     k.interactive(
-        row()
-            .key(key)
-            .h(32.0)
-            .min_w(76.0)
-            .max_w(190.0)
-            .shrink()
-            .pl(10.0)
-            .pr(4.0)
-            .gap(8.0)
-            .center_y()
-            .radius(k.radius.lg)
-            .fill(if active {
-                k.c.surface_raised.mix(k.c.bg_accent, 0.14)
-            } else {
-                k.c.bg_base.alpha(0.0)
-            })
-            .motion(crate::theme::look::MOVE)
-            .role("tab")
-            .label(title.clone())
-            .help(title.clone())
-            .cursor(rune::Cursor::Pointer)
-            .preserve_focus_on_press(true)
-            .child(
-                text(format!("{:02}", number + 1))
-                    .font(k.ty.small)
-                    .color(if active {
-                        k.c.text_accent
-                    } else {
-                        k.c.text_faint
-                    }),
-            )
-            .child(
-                text(caption)
-                    .font(k.ty.small_medium)
-                    .color(ink)
-                    .truncate()
-                    .shrink()
-                    .min_w(0.0),
-            ),
+        pill.child(
+            text(caption)
+                .font(k.ty.small_medium)
+                .color(ink)
+                .truncate()
+                .shrink()
+                .min_w(0.0),
+        ),
     )
 }
 
@@ -2190,6 +2276,9 @@ pub(crate) fn shell_tabs(s: &UiState, k: &Kit, in_dock: bool) -> El {
             format!("Tab {}", i + 1)
         };
 
+        let remote =
+            tab_remote_computer(s, i).map(|comp| (s.computer_name(comp), s.computer_color(comp)));
+
         let close_tab = if tab_count > 1 {
             Some(
                 IconButton::new(k.glyph.close)
@@ -2209,20 +2298,68 @@ pub(crate) fn shell_tabs(s: &UiState, k: &Kit, in_dock: bool) -> El {
             None
         };
 
-        let mut tab_pill = shell_tab(k, format!("terminal-tab-{i}"), tab_title, is_active, i)
-            .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
-                if in_dock && !s.term.open {
-                    s.open_terminal();
-                }
-                s.term_switch_tab(i);
-                s.focus_terminal_tx(tx);
-            });
+        let mut tab_pill = shell_tab(
+            k,
+            format!("terminal-tab-{i}"),
+            tab_title,
+            remote,
+            is_active,
+            i,
+        )
+        .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
+            if in_dock && !s.term.open {
+                s.open_terminal();
+            }
+            s.term_switch_tab(i);
+            s.focus_terminal_tx(tx);
+        });
 
         if let Some(btn) = close_tab {
             tab_pill = tab_pill.child(btn);
         }
 
         tabs_strip = tabs_strip.child(tab_pill);
+    }
+
+    let new_tab_label = tr_ref(language, "New terminal tab");
+    tabs_strip = tabs_strip.child(
+        IconButton::new(&super::icons::PLUS)
+            .variant(IconButtonVariant::GhostMuted)
+            .control_size(ControlSize::Small)
+            .label(new_tab_label)
+            .help(super::keymap::tip(
+                new_tab_label,
+                super::keymap::Action::TermNewTab,
+            ))
+            .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
+                if in_dock && !s.term.open {
+                    s.open_terminal();
+                }
+                s.term_new_tab();
+                s.focus_terminal_tx(tx);
+            })
+            .build(k)
+            .key("terminal-tab-new")
+            .preserve_focus_on_press(true),
+    );
+
+    if UiState::is_remote_computer_id(&s.active_session_computer()) {
+        tabs_strip = tabs_strip.child(
+            Button::new(tr_ref(language, "+ Local"))
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .help(tr_ref(language, "New local terminal"))
+                .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
+                    if in_dock && !s.term.open {
+                        s.open_terminal();
+                    }
+                    s.term_new_local_tab();
+                    s.focus_terminal_tx(tx);
+                })
+                .build(k)
+                .key("terminal-tab-new-local")
+                .preserve_focus_on_press(true),
+        );
     }
 
     tabs_strip
@@ -2417,6 +2554,9 @@ pub fn tile_header_tabs(s: &UiState, k: &Kit, tile_idx: Option<usize>) -> El {
             format!("Tab {}", i + 1)
         };
 
+        let remote =
+            tab_remote_computer(s, i).map(|comp| (s.computer_name(comp), s.computer_color(comp)));
+
         let close_tab = if tab_count > 1 {
             Some(
                 IconButton::new(k.glyph.close)
@@ -2441,6 +2581,7 @@ pub fn tile_header_tabs(s: &UiState, k: &Kit, tile_idx: Option<usize>) -> El {
             k,
             format!("tile-terminal-tab{sfx}-{i}"),
             tab_title,
+            remote,
             is_active,
             i,
         )
@@ -2454,6 +2595,43 @@ pub fn tile_header_tabs(s: &UiState, k: &Kit, tile_idx: Option<usize>) -> El {
         }
 
         tabs_strip = tabs_strip.child(tab_pill);
+    }
+
+    let new_tab_label = tr_ref(language, "New terminal tab");
+    tabs_strip = tabs_strip.child(
+        IconButton::new(&super::icons::PLUS)
+            .variant(IconButtonVariant::GhostMuted)
+            .control_size(ControlSize::Small)
+            .label(new_tab_label)
+            .help(super::keymap::tip(
+                new_tab_label,
+                super::keymap::Action::TermNewTab,
+            ))
+            .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
+                s.focus_terminal_tile_tx(tile_idx, tx);
+                s.term_new_tab();
+                s.focus_terminal_tx(tx);
+            })
+            .build(k)
+            .key(format!("tile-terminal-tab-new{sfx}"))
+            .preserve_focus_on_press(true),
+    );
+
+    if UiState::is_remote_computer_id(&s.active_session_computer()) {
+        tabs_strip = tabs_strip.child(
+            Button::new(tr_ref(language, "+ Local"))
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .help(tr_ref(language, "New local terminal"))
+                .on_press_tx(move |s: &mut UiState, tx: &mut Tx| {
+                    s.focus_terminal_tile_tx(tile_idx, tx);
+                    s.term_new_local_tab();
+                    s.focus_terminal_tx(tx);
+                })
+                .build(k)
+                .key(format!("tile-terminal-tab-new-local{sfx}"))
+                .preserve_focus_on_press(true),
+        );
     }
 
     if live && s.term.is_prefix_armed() {
@@ -2762,7 +2940,8 @@ fn context_menu(s: &UiState, k: &Kit, grid: El, layer: &mut Vec<El>) -> El {
         s.term.menu_at = Some(at);
         s.focus_terminal_tx(tx);
     });
-    rune_kit::context_menu("terminal-menu", grid, s.term.menu_at)
+    let is_remote = UiState::is_remote_computer_id(&s.active_session_computer());
+    let mut menu = rune_kit::context_menu("terminal-menu", grid, s.term.menu_at)
         .min_width(220.0)
         .on_close(|s: &mut UiState| s.term.menu_at = None)
         .item(
@@ -2800,33 +2979,53 @@ fn context_menu(s: &UiState, k: &Kit, grid: El, layer: &mut Vec<El>) -> El {
         )
         .separator()
         .item(
-            MenuItem::new(tr_ref(language, "New shell"))
-                .shortcut(label(Action::NewShell))
-                .on_select(|s: &mut UiState| {
+            MenuItem::new(tr_ref(language, "New terminal tab"))
+                .shortcut(label(Action::TermNewTab))
+                .on_select_tx(|s: &mut UiState, tx: &mut Tx| {
                     s.term.menu_at = None;
-                    s.restart_terminal();
+                    s.term_new_tab();
+                    s.focus_terminal_tx(tx);
                 }),
-        )
-        .item(
-            MenuItem::new(tr_ref(language, "Close tab"))
-                .shortcut(label(Action::TermCloseTab))
-                .on_select(|s: &mut UiState| {
+        );
+    if is_remote {
+        menu = menu.item(
+            MenuItem::new(tr_ref(language, "New local terminal")).on_select_tx(
+                |s: &mut UiState, tx: &mut Tx| {
                     s.term.menu_at = None;
-                    s.term_close_tab(s.term.active_tab);
-                }),
-        )
-        .item(
-            MenuItem::new(tr_ref(language, "Hide terminal"))
-                .shortcut(label(Action::ToggleTerminal))
-                .on_select(|s: &mut UiState| {
-                    s.term.menu_at = None;
-                    s.close_terminal();
-                }),
-        )
-        .build(k, layer)
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
+                    s.term_new_local_tab();
+                    s.focus_terminal_tx(tx);
+                },
+            ),
+        );
+    }
+    menu.item(
+        MenuItem::new(tr_ref(language, "New shell"))
+            .shortcut(label(Action::NewShell))
+            .on_select(|s: &mut UiState| {
+                s.term.menu_at = None;
+                s.restart_terminal();
+            }),
+    )
+    .item(
+        MenuItem::new(tr_ref(language, "Close tab"))
+            .shortcut(label(Action::TermCloseTab))
+            .on_select(|s: &mut UiState| {
+                s.term.menu_at = None;
+                s.term_close_tab(s.term.active_tab);
+            }),
+    )
+    .item(
+        MenuItem::new(tr_ref(language, "Hide terminal"))
+            .shortcut(label(Action::ToggleTerminal))
+            .on_select(|s: &mut UiState| {
+                s.term.menu_at = None;
+                s.close_terminal();
+            }),
+    )
+    .build(k, layer)
+    .w_full()
+    .grow(1.0)
+    .min_h(0.0)
 }
 
 /// `~/…` for paths under home.
@@ -4718,5 +4917,61 @@ mod tests {
         assert!(rt.state.term.open);
         assert!(rt.state.term.sink.focused);
         assert!(!rt.state.draft.focused);
+    }
+
+    #[test]
+    fn term_new_local_tab_creates_local_tab_alongside_remote_tab_when_on_remote_computer() {
+        let (tx, _rx) = commands::channel();
+        let mut state = UiState::new(tx);
+        state.cfg.current_computer = "mini".into();
+        state.cfg.general.last_agent = Some("codex".into());
+        let local_dir = std::env::temp_dir();
+        state
+            .cfg
+            .general
+            .last_cwd
+            .insert("codex".into(), local_dir.clone());
+        state.sessions.push(
+            serde_json::from_value(serde_json::json!({
+                "asid": "remote-s1",
+                "agent_id": "codex",
+                "title": "Remote work",
+                "status": "idle",
+                "directory": "/Users/mini/nonexistent-remote-project",
+                "updated_ms": 1
+            }))
+            .unwrap(),
+        );
+        state.selected = Some("remote-s1".into());
+        assert_eq!(state.active_session_computer(), "mini");
+
+        // 1. Default new tab on a remote computer creates a remote tab.
+        state.term_new_tab();
+        assert_eq!(state.term.tabs.len(), 1);
+        let remote_tab_id = state.term.tabs[0].id;
+        assert_eq!(
+            state
+                .term
+                .remote_tabs
+                .get(&remote_tab_id)
+                .map(String::as_str),
+            Some("mini")
+        );
+        assert_eq!(
+            state.term.tabs[0].cwd,
+            PathBuf::from("/Users/mini/nonexistent-remote-project")
+        );
+        assert_eq!(tab_remote_computer(&state, 0), Some("mini"));
+
+        // 2. term_new_local_tab creates a guaranteed-local tab coexisting cleanly with the remote tab.
+        state.term_new_local_tab();
+        assert_eq!(state.term.tabs.len(), 2);
+        assert_eq!(state.term.active_tab, 1);
+        let local_tab_id = state.term.tabs[1].id;
+        assert!(!state.term.remote_tabs.contains_key(&local_tab_id));
+        assert_eq!(state.term.tabs[1].cwd, local_dir);
+        assert!(state.term.tabs[1].cwd.is_dir());
+        assert_eq!(tab_remote_computer(&state, 0), Some("mini"));
+        assert_eq!(tab_remote_computer(&state, 1), None);
     }
 }

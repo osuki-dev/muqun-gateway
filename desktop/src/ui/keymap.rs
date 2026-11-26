@@ -360,7 +360,7 @@ pub static ENTRIES: &[Entry] = &[
     e(A::NewSession, G::Global, "mod+n", "New session"),
     e(A::Home, G::Global, "mod+shift+h", "Home"),
     e(A::Inbox, G::Global, "mod+shift+i", "Inbox"),
-    e(A::Tasks, G::Global, "mod+shift+t", "Tasks"),
+    e(A::Tasks, G::Global, "mod+alt+t", "Tasks"),
     e(A::Mao, G::Global, "mod+shift+o", "MAO"),
     e(A::Settings, G::Global, "mod+comma", "Settings"),
     e(
@@ -589,11 +589,14 @@ pub static ENTRIES: &[Entry] = &[
         Owner::Terminal,
     ),
     owned(
-        e(
-            A::TermCloseTab,
-            G::Terminal,
-            "ctrl+shift+w, alt+escape",
-            "Close terminal tab or pane",
+        on_mac(
+            e(
+                A::TermCloseTab,
+                G::Terminal,
+                "ctrl+shift+w, alt+escape",
+                "Close terminal tab or pane",
+            ),
+            "mod+shift+w, ctrl+shift+w, alt+escape",
         ),
         Owner::Terminal,
     ),
@@ -1519,7 +1522,9 @@ pub fn dispatch_window(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
     }
     if let Some(found) = ENTRIES
         .iter()
-        .filter(|e| e.owner == Owner::Window || e.action == A::PromptHistory)
+        .filter(|e| {
+            e.owner == Owner::Window || matches!(e.action, A::PromptHistory | A::TermNewTab)
+        })
         .find(|e| bind_matches_cfg(e, &s.cfg.keymap, ev, tx))
     {
         return run(s, found.action, ev, tx);
@@ -1562,6 +1567,7 @@ pub fn field_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx, at_end: bool) -> b
         A::SplitHorizontal,
         A::SplitVertical,
         A::PromptHistory,
+        A::TermNewTab,
     ] {
         if bind_matches_cfg(entry(action), &s.cfg.keymap, ev, tx) {
             return run(s, action, ev, tx);
@@ -1620,6 +1626,20 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
         A::NewShell => {
             s.open_terminal_default();
             s.restart_terminal();
+        }
+        A::TermNewTab => {
+            if s.pairing_target.is_some()
+                || s.zoom.is_some()
+                || s.voice.is_some()
+                || s.composer_history_open
+            {
+                return false;
+            }
+            if !s.term.open && !s.has_terminal_tile() {
+                s.open_terminal();
+            }
+            s.term_new_tab();
+            s.focus_terminal_tx(tx);
         }
         A::ToggleInspector => {
             if s.inspect.is_some() {
@@ -2630,5 +2650,88 @@ mod tests {
         rt.frame(1.0 / 60.0);
         assert!(!rt.state.is_leader_armed());
         assert_eq!(rt.state.zoomed_tile, Some(rt.state.focus));
+    }
+
+    #[test]
+    fn window_and_global_terminal_shortcuts_have_no_default_collisions() {
+        for platform in [KeyPlatform::Linux, KeyPlatform::Mac, KeyPlatform::Windows] {
+            let clashes = clashes_for(platform, None, |e| {
+                e.owner == Owner::Window || e.action == A::TermNewTab
+            });
+            assert!(
+                clashes.is_empty(),
+                "default Window + TermNewTab collision on {platform:?}: {clashes:?}"
+            );
+            let tasks_chords = entry(A::Tasks).default_keybind().chords_on(platform);
+            let new_tab_chords = entry(A::TermNewTab).default_keybind().chords_on(platform);
+            for tc in tasks_chords {
+                assert!(
+                    !new_tab_chords.iter().any(|nc| tc.same_keys(nc, platform)),
+                    "Action::Tasks must not collide with Action::TermNewTab on {platform:?}"
+                );
+            }
+        }
+        assert_eq!(entry(A::Tasks).default_spec(), "mod+alt+t");
+        let mac_close = entry(A::TermCloseTab)
+            .default_keybind()
+            .chords_on(KeyPlatform::Mac);
+        assert!(
+            mac_close
+                .iter()
+                .any(|c| c.label_on(KeyPlatform::Mac).contains("⇧W")),
+            "Action::TermCloseTab should include Cmd+Shift+W on macOS, got {:?}",
+            mac_close
+                .iter()
+                .map(|c| c.label_on(KeyPlatform::Mac))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_t_in_session_opens_new_terminal_tab_without_jumping_to_tasks() {
+        use rune::{Env, Key, Mods, Runtime};
+
+        let mut s = state();
+        s.mode = Mode::Session;
+        s.draft.focused = true;
+        s.term.open = false;
+        s.term.sink.focused = false;
+        s.term.tabs.clear();
+
+        let mut rt = Runtime::new(s, super::super::view, (1440.0, 900.0), Env::new(true, 1.0));
+        rt.on_key = Some(super::super::on_key);
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+
+        let ctrl_shift_t = KeyEvent {
+            key: Key::Command('t'),
+            mods: Mods {
+                shift: true,
+                ctrl: true,
+                cmd: !crate::platform::is_macos(),
+                alt: false,
+                logo: false,
+            },
+        };
+
+        // 1. Composer focused (not terminal): opens a new terminal tab and stays in Session mode.
+        rt.key(ctrl_shift_t.clone());
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.mode, Mode::Session);
+        assert!(rt.state.term.open || rt.state.has_terminal_tile());
+        assert_eq!(rt.state.term.tabs.len(), 1);
+        assert!(rt.state.term.sink.focused);
+
+        // 2. Timeline focused (neither composer nor terminal focused): opens a second tab and stays in Session mode.
+        rt.state.term.sink.focused = false;
+        rt.state.draft.focused = false;
+        rt.frame(1.0 / 60.0);
+
+        rt.key(ctrl_shift_t);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.mode, Mode::Session);
+        assert_eq!(rt.state.term.tabs.len(), 2);
+        assert_eq!(rt.state.term.active_tab, 1);
+        assert!(rt.state.term.sink.focused);
     }
 }

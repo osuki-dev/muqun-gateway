@@ -160,12 +160,43 @@ pub(crate) fn dock_actions(
         .on_press(move |s: &mut UiState| s.menu = (!open).then_some(OpenMenu::DockActions))
         .build(k)
         .key("dock-actions-button");
+    let active_comp = s.active_session_computer();
+    let is_remote = UiState::is_remote_computer_id(&active_comp);
     let mut menu = Menu::new("dock-actions")
         .trigger(trigger)
         .open(open)
         .min_width(230.0)
-        .on_close(|s: &mut UiState| s.menu = None)
-        .item(
+        .on_close(|s: &mut UiState| s.menu = None);
+    if is_remote {
+        let host = s.computer_name(&active_comp);
+        menu = menu
+            .item(
+                MenuItem::new(format!("{} ({host})", tr_ref(lang, "New remote terminal")))
+                    .icon(&TERMINAL_WINDOW)
+                    .shortcut(keymap::label(keymap::Action::TermNewTab))
+                    .on_select_tx(|s: &mut UiState, tx| {
+                        s.menu = None;
+                        if !s.term.open && !s.has_terminal_tile() {
+                            s.open_terminal();
+                        }
+                        s.term_new_tab();
+                        s.focus_terminal_tx(tx);
+                    }),
+            )
+            .item(
+                MenuItem::new(tr_ref(lang, "New local terminal"))
+                    .icon(&TERMINAL_WINDOW)
+                    .on_select_tx(|s: &mut UiState, tx| {
+                        s.menu = None;
+                        if !s.term.open && !s.has_terminal_tile() {
+                            s.open_terminal();
+                        }
+                        s.term_new_local_tab();
+                        s.focus_terminal_tx(tx);
+                    }),
+            );
+    } else {
+        menu = menu.item(
             MenuItem::new(tr_ref(lang, "New terminal tab"))
                 .icon(&TERMINAL_WINDOW)
                 .shortcut(keymap::label(keymap::Action::TermNewTab))
@@ -177,19 +208,20 @@ pub(crate) fn dock_actions(
                     s.term_new_tab();
                     s.focus_terminal_tx(tx);
                 }),
-        )
-        .item(
-            MenuItem::new(tr_ref(lang, "Switch terminal to session folder"))
-                .icon(&rune_kit::glyphs::FOLDER)
-                .on_select_tx(|s: &mut UiState, tx| {
-                    s.menu = None;
-                    if !s.term.open && !s.has_terminal_tile() {
-                        s.open_terminal();
-                    }
-                    s.term_sync_cwd();
-                    s.focus_terminal_tx(tx);
-                }),
         );
+    }
+    menu = menu.item(
+        MenuItem::new(tr_ref(lang, "Switch terminal to session folder"))
+            .icon(&rune_kit::glyphs::FOLDER)
+            .on_select_tx(|s: &mut UiState, tx| {
+                s.menu = None;
+                if !s.term.open && !s.has_terminal_tile() {
+                    s.open_terminal();
+                }
+                s.term_sync_cwd();
+                s.focus_terminal_tx(tx);
+            }),
+    );
     if s.plugins
         .get_enabled(super::browser::ID, &s.cfg.plugins_disabled)
         .is_some()

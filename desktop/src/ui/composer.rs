@@ -1026,7 +1026,7 @@ pub(super) fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
             .composer_queue_page
             .as_ref()
             .and_then(|id| queue.iter().position(|q| &q.id == id))
-            .unwrap_or(0);
+            .unwrap_or(queue.len() - 1);
         let mut deck = col().key("queue-deck").w_full().max_w(600.0).gap(6.0);
         if queue.len() > 1 {
             let next = queue[(page + 1) % queue.len()].id.clone();
@@ -1081,15 +1081,15 @@ pub(super) fn chips(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
         } else {
             let depth = (queue.len() - 1).min(2);
             let trailing_w = if queue[page].steer { 88.0 } else { 132.0 };
-            let mut stack = el().w_full().pb(depth as f32 * 4.0);
+            let mut stack = el().w_full().pt(depth as f32 * 5.0);
             for n in (1..=depth).rev() {
                 stack = stack.child(
                     el().key(format!("queue-page-{n}"))
                         .pin(
-                            Some(n as f32 * 6.0),
-                            Some(n as f32 * 4.0),
-                            Some(trailing_w + n as f32 * 6.0),
-                            Some((depth - n) as f32 * 4.0),
+                            Some(n as f32 * 8.0),
+                            Some((depth - n) as f32 * 5.0),
+                            Some(trailing_w + n as f32 * 8.0),
+                            Some(n as f32 * 5.0),
                         )
                         .radius(k.radius.xl)
                         .fill(k.c.layer_01)
@@ -3403,6 +3403,101 @@ mod tests {
         let bare = bare_field(&k);
         assert!(bare.blend_over.is_none());
         assert!(bare.selection().a >= 0.29);
+    }
+
+    #[test]
+    fn queue_deck_defaults_to_latest_item_and_stacks_background_cards_above_front() {
+        use crate::model::compose::InboxItem;
+        use rune::{Env, Runtime};
+
+        let (tx, _rx) = crate::ui::commands::channel();
+        let mut s = UiState::new(tx);
+        s.splash = None;
+        let (_, scene) = crate::ui::scenes::scenes()
+            .iter()
+            .find(|(name, _)| *name == "session")
+            .expect("session scene");
+        scene(&mut s);
+        s.composer_queue_page = None;
+        s.composer_queue_expanded = false;
+        s.queue = vec![
+            InboxItem {
+                id: "q1".into(),
+                text: "First queued prompt".into(),
+                steer: false,
+                files: Vec::new(),
+            },
+            InboxItem {
+                id: "q2".into(),
+                text: "Second queued prompt".into(),
+                steer: false,
+                files: Vec::new(),
+            },
+            InboxItem {
+                id: "q3".into(),
+                text: "Latest queued prompt".into(),
+                steer: false,
+                files: Vec::new(),
+            },
+        ];
+
+        let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+
+        let nodes = rt.elements();
+        let expand = nodes
+            .iter()
+            .find(|n| n.key.as_deref() == Some("queue-deck-expand"))
+            .expect("queue-deck-expand button");
+        assert!(
+            expand.label.as_deref().is_some_and(|l| l.contains("3/3")),
+            "expected default page to show 3/3, got {:?}",
+            expand.label
+        );
+
+        let front = nodes
+            .iter()
+            .find(|n| n.key.as_deref() == Some("queued-row-q3"))
+            .expect("latest queued item should be the front card");
+        assert!(
+            nodes
+                .iter()
+                .all(|n| n.key.as_deref() != Some("queued-row-q1")),
+            "older queued item should not be front card by default"
+        );
+
+        let page1 = nodes
+            .iter()
+            .find(|n| n.key.as_deref() == Some("queue-page-1"))
+            .expect("queue-page-1 background card");
+        let page2 = nodes
+            .iter()
+            .find(|n| n.key.as_deref() == Some("queue-page-2"))
+            .expect("queue-page-2 background card");
+
+        // Background cards sit above the front card (smaller y / top) and recede narrower.
+        assert!(
+            page2.rect[1] < page1.rect[1] && page1.rect[1] < front.rect[1],
+            "expected page2.top ({}) < page1.top ({}) < front.top ({})",
+            page2.rect[1],
+            page1.rect[1],
+            front.rect[1]
+        );
+        assert!(
+            page2.rect[2] < page1.rect[2] && page1.rect[2] < front.rect[2],
+            "expected page2.width ({}) < page1.width ({}) < front.width ({})",
+            page2.rect[2],
+            page1.rect[2],
+            front.rect[2]
+        );
+        assert!(
+            page2.rect[0] > page1.rect[0] && page1.rect[0] > front.rect[0],
+            "expected page2.left ({}) > page1.left ({}) > front.left ({})",
+            page2.rect[0],
+            page1.rect[0],
+            front.rect[0]
+        );
     }
 }
 
