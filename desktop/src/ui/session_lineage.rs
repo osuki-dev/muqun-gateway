@@ -103,6 +103,31 @@ impl UiState {
         None
     }
 
+    fn has_ancestor_path(&self, computer: &str, start: &str, target: &str) -> bool {
+        let mut current = start;
+        let mut visited = std::collections::HashSet::new();
+        while visited.insert(current) {
+            if current == target {
+                return true;
+            }
+            let from_info = self.session_by_id(current).and_then(parent);
+            let from_ctx = self
+                .cfg
+                .ui
+                .subagent_contexts
+                .iter()
+                .rev()
+                .find(|c| c.computer == computer && c.asid == current)
+                .and_then(|c| c.ancestor.as_deref());
+            let from_mao = self.orchestration.parent_session_of(current);
+            let Some(next) = from_info.or(from_ctx).or(from_mao) else {
+                return false;
+            };
+            current = next;
+        }
+        false
+    }
+
     pub(super) fn remember_subagent_context(&mut self, child: &str, ancestor: Option<&str>) {
         self.remember_subagent_context_with_agent(child, ancestor, None);
     }
@@ -123,6 +148,13 @@ impl UiState {
         let Some(computer) = self.lineage_computer(child, ancestor) else {
             return;
         };
+        // Never allow a parent or ancestor session to be demoted into a child of
+        // one of its own descendants (e.g. when a subagent messages its parent).
+        if let Some(anc) = ancestor {
+            if self.has_ancestor_path(&computer, anc, child) {
+                return;
+            }
+        }
         let old = self.subagent_context(child).cloned();
         let agent = self
             .session_by_id(child)
@@ -224,9 +256,41 @@ impl UiState {
     }
 
     pub(super) fn remember_timeline_lineage(&mut self, ancestor: &str, items: &[TimelineItem]) {
+        let ancestor_is_subagent = self
+            .session_by_id(ancestor)
+            .is_some_and(|info| self.is_subagent_session(info))
+            || self.subagent_context(ancestor).is_some();
         for item in items {
             if let AgentPart::Tool(call) = &item.part {
                 if let Some(child) = &call.child_session_id {
+                    // Collab tools inside a subagent (e.g. sendInput / wait / message)
+                    // may reference the parent or sibling thread; only spawn operations
+                    // inside a subagent can establish new parent→child lineage.
+                    if ancestor_is_subagent {
+                        let op = call
+                            .input
+                            .get("operation")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        if !op.is_empty() && !op.to_ascii_lowercase().contains("spawn") {
+                            continue;
+                        }
+                    }
+                    // Never demote a known root session that already owns children.
+                    let child_is_known_root = self
+                        .session_by_id(child)
+                        .is_some_and(|info| !child_metadata(info))
+                        && self
+                            .lineage_computer(child, Some(ancestor))
+                            .is_some_and(|comp| {
+                                self.cfg.ui.subagent_contexts.iter().any(|ctx| {
+                                    ctx.computer == comp
+                                        && ctx.ancestor.as_deref() == Some(child.as_str())
+                                })
+                            });
+                    if child_is_known_root {
+                        continue;
+                    }
                     self.remember_subagent_context(child, Some(ancestor));
                 }
             }
@@ -432,5 +496,41 @@ mod tests {
         assert_eq!(sessions::listed(&state), vec!["root"]);
         assert!(state.session_by_id("child").is_some());
         assert_eq!(state.sidebar_root("child"), Some("root"));
+    }
+
+    #[test]
+    fn subagent_messaging_parent_never_hides_root_session_from_sidebar() {
+        let mut state = state();
+        state.merge_sessions(vec![info("root"), info("child-a"), info("child-b")]);
+        // Root spawns two subagents.
+        let spawn_a: TimelineItem = serde_json::from_value(json!({
+            "id": "spawn-a", "message_id": "m1", "role": "assistant", "seq": 1, "updated_ms": 1,
+            "part": {"type": "tool", "id": "spawn-a", "name": "subagent", "input": {"operation": "spawnAgent"}, "state": "completed", "status": "completed", "child_session_id": "child-a"}
+        })).unwrap();
+        let spawn_b: TimelineItem = serde_json::from_value(json!({
+            "id": "spawn-b", "message_id": "m1", "role": "assistant", "seq": 2, "updated_ms": 2,
+            "part": {"type": "tool", "id": "spawn-b", "name": "subagent", "input": {"operation": "spawnAgent"}, "state": "completed", "status": "completed", "child_session_id": "child-b"}
+        })).unwrap();
+        state.apply_updates(vec![Update::Snapshot(snapshot(
+            info("root"),
+            vec![spawn_a, spawn_b],
+        ))]);
+        assert_eq!(sessions::listed(&state), vec!["root"]);
+
+        // Now child-a sends a collab message whose target points back at root!
+        let reply_to_root: TimelineItem = serde_json::from_value(json!({
+            "id": "msg-parent", "message_id": "m2", "role": "assistant", "seq": 1, "updated_ms": 3,
+            "part": {"type": "tool", "id": "msg-parent", "name": "subagent", "input": {"operation": "sendInput"}, "state": "completed", "status": "completed", "child_session_id": "root"}
+        })).unwrap();
+        state.apply_updates(vec![Update::Snapshot(snapshot(
+            info("child-a"),
+            vec![reply_to_root],
+        ))]);
+
+        // Root must STILL be visible in the sidebar, and no cycle may be recorded.
+        assert_eq!(sessions::listed(&state), vec!["root"]);
+        assert!(!state.is_subagent_session(&info("root")));
+        assert!(state.is_subagent_session(&info("child-a")));
+        assert_eq!(state.sidebar_root("child-a"), Some("root"));
     }
 }

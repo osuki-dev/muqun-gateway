@@ -1081,6 +1081,21 @@ impl DesktopConfig {
             ConfigEdit::CloseToTray(on) => self.general.close_to_tray = on,
             ConfigEdit::RecentCommands(list) => self.ui.recent_commands = list,
             ConfigEdit::RememberSubagent(context) => {
+                if context.asid.trim().is_empty()
+                    || context.ancestor.as_deref() == Some(context.asid.as_str())
+                {
+                    return;
+                }
+                if let Some(ancestor) = context.ancestor.as_deref() {
+                    if subagent_ancestor_reaches(
+                        &self.ui.subagent_contexts,
+                        &context.computer,
+                        ancestor,
+                        &context.asid,
+                    ) {
+                        return;
+                    }
+                }
                 self.ui
                     .subagent_contexts
                     .retain(|old| old.computer != context.computer || old.asid != context.asid);
@@ -1272,13 +1287,110 @@ impl WindowGeometry {
     }
 }
 
+fn subagent_ancestor_reaches(
+    contexts: &[SubagentContext],
+    computer: &str,
+    start: &str,
+    target: &str,
+) -> bool {
+    let mut current = start;
+    let mut visited = std::collections::HashSet::new();
+    while visited.insert(current) {
+        if current == target {
+            return true;
+        }
+        let Some(next) = contexts
+            .iter()
+            .rev()
+            .find(|c| c.computer == computer && c.asid == current)
+            .and_then(|c| c.ancestor.as_deref())
+        else {
+            return false;
+        };
+        current = next;
+    }
+    false
+}
+
+/// Remove self-loops and break parent↔child cycles (which can happen if a
+/// subagent's collab tool referenced its own parent thread), keeping the true
+/// root visible in the sidebar while retaining all real subagent entries.
+pub(crate) fn sanitize_subagent_contexts(contexts: &mut Vec<SubagentContext>) {
+    contexts
+        .retain(|c| !c.asid.trim().is_empty() && c.ancestor.as_deref() != Some(c.asid.as_str()));
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped = Vec::with_capacity(contexts.len());
+    for entry in contexts.iter().rev() {
+        if seen.insert((entry.computer.clone(), entry.asid.clone())) {
+            deduped.push(entry.clone());
+        }
+    }
+    deduped.reverse();
+    *contexts = deduped;
+
+    loop {
+        let mut cycle_to_break: Option<(String, String)> = None;
+        for entry in contexts.iter() {
+            let mut path: Vec<String> = Vec::new();
+            let mut cur = entry.asid.as_str();
+            while let Some(next) = contexts
+                .iter()
+                .rev()
+                .find(|c| c.computer == entry.computer && c.asid == cur)
+                .and_then(|c| c.ancestor.as_deref())
+            {
+                if let Some(pos) = path.iter().position(|id| id == cur) {
+                    let cycle = &path[pos..];
+                    let root = cycle
+                        .iter()
+                        .max_by(|a, b| {
+                            let ca = contexts
+                                .iter()
+                                .filter(|c| {
+                                    c.computer == entry.computer
+                                        && c.ancestor.as_deref() == Some(a.as_str())
+                                })
+                                .count();
+                            let cb = contexts
+                                .iter()
+                                .filter(|c| {
+                                    c.computer == entry.computer
+                                        && c.ancestor.as_deref() == Some(b.as_str())
+                                })
+                                .count();
+                            ca.cmp(&cb).then_with(|| b.cmp(a))
+                        })
+                        .cloned();
+                    if let Some(root) = root {
+                        cycle_to_break = Some((entry.computer.clone(), root));
+                    }
+                    break;
+                }
+                path.push(cur.to_owned());
+                cur = next;
+            }
+            if cycle_to_break.is_some() {
+                break;
+            }
+        }
+        let Some((computer, root_asid)) = cycle_to_break else {
+            break;
+        };
+        contexts.retain(|c| !(c.computer == computer && c.asid == root_asid));
+    }
+}
+
 impl DesktopConfig {
     /// Read `path`. A missing file is the defaults; a file that does not
     /// parse is an error, so a typo is reported instead of silently reset.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|err| anyhow::anyhow!("{} is not valid: {err}", path.display())),
+            Ok(bytes) => {
+                let mut cfg: Self = serde_json::from_slice(&bytes)
+                    .map_err(|err| anyhow::anyhow!("{} is not valid: {err}", path.display()))?;
+                sanitize_subagent_contexts(&mut cfg.ui.subagent_contexts);
+                Ok(cfg)
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(err) => Err(anyhow::anyhow!("cannot read {}: {err}", path.display())),
         }
@@ -1705,5 +1817,54 @@ mod tests {
             on: true,
         });
         assert!(!config.plugins_disabled.contains("quicknotes"));
+    }
+
+    #[test]
+    fn sanitize_subagent_contexts_breaks_parent_child_cycle_preserving_root() {
+        let mut contexts = vec![
+            SubagentContext {
+                computer: "local".into(),
+                agent: "codex".into(),
+                asid: "01a2088d-child1".into(),
+                ancestor: Some("01a207c1-root".into()),
+            },
+            SubagentContext {
+                computer: "local".into(),
+                agent: "codex".into(),
+                asid: "01a20897-child2".into(),
+                ancestor: Some("01a207c1-root".into()),
+            },
+            // Poisoned reverse edge demoting the root under its own child:
+            SubagentContext {
+                computer: "local".into(),
+                agent: "codex".into(),
+                asid: "01a207c1-root".into(),
+                ancestor: Some("01a20897-child2".into()),
+            },
+        ];
+        sanitize_subagent_contexts(&mut contexts);
+        assert!(
+            !contexts.iter().any(|c| c.asid == "01a207c1-root"),
+            "root must not remain marked as a subagent"
+        );
+        assert_eq!(contexts.len(), 2);
+        assert!(contexts
+            .iter()
+            .all(|c| c.ancestor.as_deref() == Some("01a207c1-root")));
+
+        // RememberSubagent also refuses to introduce a cycle at runtime.
+        let mut cfg = DesktopConfig::default();
+        cfg.ui.subagent_contexts = contexts;
+        cfg.apply(ConfigEdit::RememberSubagent(SubagentContext {
+            computer: "local".into(),
+            agent: "codex".into(),
+            asid: "01a207c1-root".into(),
+            ancestor: Some("01a20897-child2".into()),
+        }));
+        assert!(!cfg
+            .ui
+            .subagent_contexts
+            .iter()
+            .any(|c| c.asid == "01a207c1-root"));
     }
 }
