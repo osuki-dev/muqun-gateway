@@ -288,11 +288,28 @@ impl Session {
                         }
                     };
                     if !initial_scrollback.is_empty() {
-                        if initial_scrollback.len() >= 1024 * 1024 {
-                            // Ring buffer wrapped and may begin mid-sequence; reset SGR first.
-                            engine.feed(b"\x1b[0m");
+                        // When reattaching to a legacy pre-v2 daemon (no `scrollback_len`),
+                        // a wrapped alt-screen TUI like Neovim 0.10+ emits `?2026h`
+                        // synchronized frames while its initial `?1049h`/`?2048h` were
+                        // evicted. Feeding raw wrapped frames paints mixed-size garbage
+                        // and leaves Mode 2048 off; start on a clean alt screen with
+                        // Mode 2048 enabled so the immediate resize repaints cleanly.
+                        let legacy_wrapped_tui = is_reattach
+                            && declared_scrollback_len.is_none()
+                            && initial_scrollback.len()
+                                >= super::daemon::DEFAULT_SCROLLBACK_CAPACITY
+                            && initial_scrollback
+                                .windows(b"\x1b[?2026h".len())
+                                .any(|w| w == b"\x1b[?2026h");
+                        if legacy_wrapped_tui {
+                            engine.feed(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?2026l\x1b[0m\x1b[?2048h");
+                        } else {
+                            if initial_scrollback.len() >= 1024 * 1024 {
+                                // Ring buffer wrapped and may begin mid-sequence; reset SGR first.
+                                engine.feed(b"\x1b[0m");
+                            }
+                            engine.feed(&initial_scrollback);
                         }
-                        engine.feed(&initial_scrollback);
                         // Discard historical terminal query replies (DECRQM, DA1, DSR, Kitty)
                         // so reattaching never injects escape sequences into the live PTY stdin.
                         let _ = engine.take_output();

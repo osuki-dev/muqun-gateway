@@ -33,6 +33,10 @@ pub const DEFAULT_COLS: u16 = 80;
 /// Default terminal rows.
 pub const DEFAULT_ROWS: u16 = 24;
 
+/// Protocol version advertised by `list` so upgraded Desktop binaries can
+/// gracefully recycle an idle older daemon without disrupting live shells.
+pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
+
 fn default_cols() -> u16 {
     DEFAULT_COLS
 }
@@ -269,9 +273,23 @@ impl ScrollbackBuffer {
         out
     }
 
-    /// Returns the buffered bytes wrapped with DEC private mode restoration
-    /// sequences when the ring buffer has evicted earlier output.
+    /// Returns the buffered bytes prepared for a newly attaching client.
+    ///
+    /// - When an alternate-screen TUI (`nvim`, `htop`, `lazygit`, etc.) is
+    ///   currently active, replaying raw historical alt-screen frames from
+    ///   earlier terminal sizes always leaves mixed-size ghost cells and
+    ///   corrupted background blocks. Emit only a clean alt-screen entry,
+    ///   clear screen, cursor home, and active DEC private mode restoration
+    ///   (including `?2048` in-band resize) so the client's immediate resize /
+    ///   SIGWINCH redraw paints one pristine frame.
+    /// - On the primary screen (normal shell), preserve full scrollback history
+    ///   and append mode restoration if the ring has wrapped.
     pub fn to_attach_vec(&self) -> Vec<u8> {
+        if let Some(mode) = self.modes.alt_screen {
+            let mut out = format!("\x1b[?{mode}h\x1b[2J\x1b[H").into_bytes();
+            out.extend_from_slice(&self.modes.restore_suffix());
+            return out;
+        }
         if !self.wrapped {
             return self.to_vec();
         }
@@ -359,6 +377,8 @@ pub enum Request {
     Close { id: String },
     /// List all active and recent sessions.
     List,
+    /// Gracefully shut down the daemon if and only if no live sessions remain.
+    Shutdown,
 }
 
 /// Metadata descriptor for a session reported in `list`.
@@ -398,6 +418,8 @@ pub struct Response {
     /// fragile timeout race.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrollback_len: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -410,6 +432,7 @@ impl Response {
             sessions: None,
             scrollback: None,
             scrollback_len: None,
+            protocol_version: None,
             error: None,
         }
     }
@@ -421,6 +444,7 @@ impl Response {
             sessions: None,
             scrollback: None,
             scrollback_len: None,
+            protocol_version: None,
             error: None,
         }
     }
@@ -432,6 +456,7 @@ impl Response {
             sessions: Some(sessions),
             scrollback: None,
             scrollback_len: None,
+            protocol_version: Some(DAEMON_PROTOCOL_VERSION),
             error: None,
         }
     }
@@ -443,6 +468,7 @@ impl Response {
             sessions: None,
             scrollback: Some(scrollback),
             scrollback_len: None,
+            protocol_version: None,
             error: None,
         }
     }
@@ -454,6 +480,7 @@ impl Response {
             sessions: None,
             scrollback: None,
             scrollback_len: Some(scrollback_len),
+            protocol_version: Some(DAEMON_PROTOCOL_VERSION),
             error: None,
         }
     }
@@ -465,6 +492,7 @@ impl Response {
             sessions: None,
             scrollback: None,
             scrollback_len: None,
+            protocol_version: None,
             error: Some(msg.into()),
         }
     }
@@ -997,6 +1025,7 @@ impl Drop for DaemonSession {
 pub struct DaemonServer {
     sessions: Arc<Mutex<HashMap<String, Arc<DaemonSession>>>>,
     counter: Arc<AtomicU64>,
+    shutdown_tx: Option<watch::Sender<bool>>,
 }
 
 impl Default for DaemonServer {
@@ -1010,6 +1039,15 @@ impl DaemonServer {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             counter: Arc::new(AtomicU64::new(1)),
+            shutdown_tx: None,
+        }
+    }
+
+    pub fn with_shutdown(shutdown_tx: watch::Sender<bool>) -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            counter: Arc::new(AtomicU64::new(1)),
+            shutdown_tx: Some(shutdown_tx),
         }
     }
 
@@ -1037,6 +1075,7 @@ impl DaemonServer {
             } => self.handle_resize(&id, cols, rows, cell_w, cell_h),
             Request::Read { id, lines } => self.handle_read(&id, lines),
             Request::Close { id } => self.handle_close(&id),
+            Request::Shutdown => self.handle_shutdown(),
             Request::Attach { .. } => {
                 Response::error("attach command cannot be dispatched synchronously")
             }
@@ -1176,6 +1215,7 @@ impl DaemonServer {
             sessions: None,
             scrollback: Some(text),
             scrollback_len: None,
+            protocol_version: None,
             error: None,
         }
     }
@@ -1258,6 +1298,24 @@ impl DaemonServer {
         } else {
             Response::error(format!("session '{id}' not found"))
         }
+    }
+
+    fn handle_shutdown(&self) -> Response {
+        let alive = {
+            let mut sessions = match self.sessions.lock() {
+                Ok(s) => s,
+                Err(_) => return Response::error("daemon sessions lock poisoned"),
+            };
+            sessions.retain(|_, s| s.is_alive());
+            !sessions.is_empty()
+        };
+        if alive {
+            return Response::error("daemon has active sessions");
+        }
+        if let Some(tx) = &self.shutdown_tx {
+            let _ = tx.send(true);
+        }
+        Response::success()
     }
 
     /// Handles a new client connection on the Unix domain socket.
@@ -1531,7 +1589,8 @@ pub async fn run_daemon_async(path: PathBuf) -> io::Result<()> {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
 
-    let server = Arc::new(DaemonServer::new());
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let server = Arc::new(DaemonServer::with_shutdown(shutdown_tx));
     let _cleanup = SocketCleanup(path.clone());
 
     loop {
@@ -1549,6 +1608,12 @@ pub async fn run_daemon_async(path: PathBuf) -> io::Result<()> {
                     Err(e) => {
                         tracing::warn!("terminal daemon accept error: {e}");
                     }
+                }
+            }
+            res = shutdown_rx.changed() => {
+                if res.is_ok() && *shutdown_rx.borrow() {
+                    tracing::info!("terminal daemon received idle shutdown request");
+                    break;
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -1604,7 +1669,34 @@ pub fn ensure_daemon_running() -> io::Result<PathBuf> {
 pub fn ensure_daemon_running_at(socket_path: Option<PathBuf>) -> io::Result<PathBuf> {
     let path = socket_path.unwrap_or_else(default_socket_path);
     if is_socket_alive(&path) {
-        return Ok(path);
+        let client = SyncDaemonClient::new(Some(path.clone()));
+        let needs_recycle = client
+            .send_request(&Request::List)
+            .ok()
+            .is_some_and(|resp| {
+                resp.ok
+                    && resp.protocol_version != Some(DAEMON_PROTOCOL_VERSION)
+                    && resp
+                        .sessions
+                        .as_deref()
+                        .is_none_or(|list| list.iter().all(|s| !s.alive))
+            });
+        if !needs_recycle {
+            return Ok(path);
+        }
+        // Gracefully recycle an idle outdated daemon so upgraded Desktop
+        // binaries immediately get the latest daemon features.
+        if client.send_request(&Request::Shutdown).is_ok_and(|r| r.ok) {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(1000) && is_socket_alive(&path) {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+        if is_socket_alive(&path) {
+            // Older daemon didn't recognize `shutdown`; keep using it safely
+            // without disrupting anything.
+            return Ok(path);
+        }
     }
 
     if let Some(parent) = path.parent() {
@@ -2861,28 +2953,33 @@ mod tests {
     #[test]
     fn test_scrollback_buffer_preserves_dec_modes_across_wrap() {
         let mut sb = ScrollbackBuffer::new(64);
+        // Primary screen before wrap: attach snapshot is byte-identical to raw scrollback.
+        sb.push(b"prompt$ ls\r\n");
+        assert_eq!(sb.to_attach_vec(), sb.to_vec());
+
         // Simulate Neovim 0.10+ startup: alt screen, in-band resize (2048),
         // mouse tracking/SGR, bracketed paste, split across chunk boundary.
         sb.push(b"\x1b[?1049h\x1b[?1002;1006;20");
         sb.push(b"04;2048h\x1b[?2048$p");
-        // Before wrapping, attach snapshot is byte-identical to raw scrollback.
-        assert_eq!(sb.to_attach_vec(), sb.to_vec());
+        // While alt screen is active, attach emits a clean alt-screen clear +
+        // mode restoration instead of replaying historical mixed-size alt frames.
+        let alt_snap = String::from_utf8(sb.to_attach_vec()).unwrap();
+        assert_eq!(
+            alt_snap,
+            "\x1b[?1049h\x1b[2J\x1b[H\x18\x1b[?2026l\x1b[0m\x1b[?1002;1006;2004;2048h"
+        );
 
         // Overflow the ring so all startup sequences are evicted.
         sb.push(&[b'x'; 128]);
         assert_eq!(sb.len(), 64);
 
         let snap = String::from_utf8(sb.to_attach_vec()).unwrap();
-        assert!(
-            snap.starts_with("\x1b[?1049h"),
-            "wrapped snapshot should re-enter alt screen before replaying: {snap:?}"
-        );
-        assert!(
-            snap.ends_with("\x18\x1b[?2026l\x1b[0m\x1b[?1002;1006;2004;2048h"),
-            "wrapped snapshot should restore active DEC modes after replay: {snap:?}"
+        assert_eq!(
+            snap, "\x1b[?1049h\x1b[2J\x1b[H\x18\x1b[?2026l\x1b[0m\x1b[?1002;1006;2004;2048h",
+            "wrapped alt-screen snapshot should stay clean without stale diff garbage: {snap:?}"
         );
 
-        // DECRST disables a single mode without disturbing the rest.
+        // DECRST exiting alt screen returns to primary scrollback + active modes.
         sb.push(b"\x1b[?1002l\x1b[?1049l");
         let after_reset = String::from_utf8(sb.to_attach_vec()).unwrap();
         assert!(
