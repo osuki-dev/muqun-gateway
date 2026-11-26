@@ -386,8 +386,7 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
     }
 
     // While the input is still arriving, its arguments are all there is.
-    if tv::pending(call.state) && !cx.stopped() && !(kind == ToolKind::Shell && !target.is_empty())
-    {
+    if tv::pending(call.state) && !cx.stopped() && (kind != ToolKind::Shell || target.is_empty()) {
         if let Some(line) = rec
             .as_ref()
             .map(tv::argument_line)

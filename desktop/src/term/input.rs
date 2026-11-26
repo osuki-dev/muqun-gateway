@@ -157,7 +157,7 @@ pub fn key_input(
         .unwrap_or(logical);
     // Control characters never travel as text: the encoder derives them
     // from the key and Ctrl.
-    let text = text.filter(|t| !t.chars().any(char::is_control) && !(m.ctrl && !m.alt));
+    let text = text.filter(|t| (!m.ctrl || m.alt) && !t.chars().any(char::is_control));
     let unshifted = base
         .or_else(|| ch.map(|c| c.to_ascii_lowercase()))
         .unwrap_or('\0');
