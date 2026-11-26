@@ -3296,7 +3296,7 @@ fn grid(
                 let highlight_fill = if is_active {
                     k.c.bg_accent.alpha(0.65)
                 } else {
-                    color(Rgb(250, 204, 21)).alpha(0.35)
+                    k.c.warning.icon.alpha(0.35)
                 };
                 grid = grid.child(
                     el().key(format!("term-match{sfx}-{idx}"))

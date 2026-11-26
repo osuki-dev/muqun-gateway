@@ -9,7 +9,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-pattern='Color::rgb|#[0-9a-fA-F]{6}|\brgba?\('
+pattern='Color::rgb|#[0-9a-fA-F]{6}|\brgba?\(|\boklch\('
 allowed=(desktop/src/theme/tokens.rs desktop/src/theme/agents.rs desktop/src/theme/pack.rs desktop/src/theme/omarchy.rs)
 
 hits=$(grep -rnE "$pattern" desktop/src --include='*.rs' --include='*.css' || true)

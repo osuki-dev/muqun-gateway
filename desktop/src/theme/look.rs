@@ -476,108 +476,54 @@ fn lift_luminous(c: rune::Color, dark: bool) -> rune::Color {
     };
     let chroma = (a * a + b * b).sqrt();
     let scale = if chroma > 0.001 && chroma < 0.12 {
-        (0.12 / chroma).min(1.35)
+        (0.12 / chroma).min(1.25)
     } else {
         1.0
     };
     rune::Color::from_oklab([target_l, a * scale, b * scale, 1.0])
 }
 
-fn distinct_hue(a: rune::Color, b: rune::Color) -> bool {
-    let [_, aa, ab, _] = a.to_oklab();
-    let [_, ba, bb, _] = b.to_oklab();
-    let ca = (aa * aa + ab * ab).sqrt();
-    let cb = (ba * ba + bb * bb).sqrt();
-    if ca < 0.03 || cb < 0.03 {
-        return false;
-    }
-    let cos = ((aa * ba + ab * bb) / (ca * cb)).clamp(-1.0, 1.0);
-    cos < 0.82
+fn shift_tonal(c: rune::Color, delta_l: f32, delta_hue_rad: f32) -> rune::Color {
+    let rotated = oklab_rotate(c, delta_hue_rad);
+    let [l, a, b, alpha] = rotated.to_oklab();
+    rune::Color::from_oklab([(l + delta_l).clamp(0.28, 0.92), a, b, alpha])
 }
 
-/// Extract a vivid 3-stop highlight spectrum `[c0, c1, c2]` from the current
-/// theme (using `terminal.cursor`/`link`/ANSI when `bg_accent` is ink-neutral).
+/// Extract a harmonious 3-stop highlight spectrum `[c0, c1, c2]` strictly from
+/// the current theme's primary accent (never mixing unrelated terminal ANSI
+/// rainbow hues or hardcoded fallback colours).
 pub fn highlight_colors_for(k: &Kit, dark: bool) -> [rune::Color; 3] {
     let scheme = if dark {
         crate::theme::color_scheme::ColorScheme::Dark
     } else {
         crate::theme::color_scheme::ColorScheme::Light
     };
-    let term = crate::theme::apply::terminal(scheme);
-    let parse = |s: &str| rune::color::hex(s);
-    let term_cursor = term.as_ref().and_then(|t| parse(&t.cursor));
-    let term_link = term.as_ref().and_then(|t| parse(&t.link));
-    let term_violet = term
+    let term_cursor = crate::theme::apply::terminal(scheme)
         .as_ref()
-        .and_then(|t| t.ansi.get(5))
-        .and_then(|s| parse(s));
-    let term_amber = term
-        .as_ref()
-        .and_then(|t| t.ansi.get(3))
-        .and_then(|s| parse(s));
+        .and_then(|t| rune::color::hex(&t.cursor));
 
-    let raw_c0 = if oklab_chroma(k.c.bg_accent) >= 0.045 {
+    let raw_c0 = if oklab_chroma(k.c.bg_accent) >= 0.03 {
         k.c.bg_accent
-    } else if let Some(c) = term_cursor.filter(|c| oklab_chroma(*c) >= 0.045) {
-        c
-    } else if let Some(c) = term_link.filter(|c| oklab_chroma(*c) >= 0.045) {
+    } else if oklab_chroma(k.c.text_accent) >= 0.03 {
+        k.c.text_accent
+    } else if let Some(c) = term_cursor.filter(|c| oklab_chroma(*c) >= 0.03) {
         c
     } else {
-        rune::Color::from_oklab([if dark { 0.74 } else { 0.60 }, 0.08, 0.11, 1.0])
+        // Genuinely neutral/monochrome theme: stay neutral using its own border/muted ink.
+        k.c.border_strong.mix(k.c.text_muted, 0.45)
     };
-    let c0 = lift_luminous(raw_c0, dark);
 
-    let raw_c1 = [Some(k.c.info.icon), term_link, term_violet, term_amber]
-        .into_iter()
-        .flatten()
-        .find(|c| oklab_chroma(*c) >= 0.045 && distinct_hue(c0, *c))
-        .unwrap_or_else(|| oklab_rotate(c0, 0.95));
-    let c1 = lift_luminous(raw_c1, dark);
-
-    let raw_c2 = [term_violet, term_amber, Some(k.c.warning.icon)]
-        .into_iter()
-        .flatten()
-        .find(|c| oklab_chroma(*c) >= 0.045 && distinct_hue(c0, *c) && distinct_hue(c1, *c))
-        .unwrap_or_else(|| oklab_rotate(c0, -0.75));
-    let c2 = lift_luminous(raw_c2, dark);
-
-    [c0, c1, c2]
+    companion_highlight_colors(raw_c0, dark)
 }
 
-/// Companion theme highlight stops `[c1, c2]` for a GPU shader given `c0`
-/// (linear RGB) and the current light/dark scheme.
+/// Companion theme highlight stops `[c0, c1, c2]` for a GPU shader given `c0`
+/// (linear RGB) and the current light/dark scheme: stays strictly inside the
+/// theme's own hue family via subtle tonal/analogous shifts.
 pub fn companion_highlight_colors(c0: rune::Color, dark: bool) -> [rune::Color; 3] {
-    let scheme = if dark {
-        crate::theme::color_scheme::ColorScheme::Dark
-    } else {
-        crate::theme::color_scheme::ColorScheme::Light
-    };
-    let term = crate::theme::apply::terminal(scheme);
-    let parse = |s: &str| rune::color::hex(s);
-    let term_link = term.as_ref().and_then(|t| parse(&t.link));
-    let term_violet = term
-        .as_ref()
-        .and_then(|t| t.ansi.get(5))
-        .and_then(|s| parse(s));
-    let term_amber = term
-        .as_ref()
-        .and_then(|t| t.ansi.get(3))
-        .and_then(|s| parse(s));
-
-    let c0 = lift_luminous(c0, dark);
-    let c1 = [term_link, term_violet, term_amber]
-        .into_iter()
-        .flatten()
-        .find(|c| oklab_chroma(*c) >= 0.045 && distinct_hue(c0, *c))
-        .map(|c| lift_luminous(c, dark))
-        .unwrap_or_else(|| lift_luminous(oklab_rotate(c0, 0.95), dark));
-    let c2 = [term_violet, term_amber]
-        .into_iter()
-        .flatten()
-        .find(|c| oklab_chroma(*c) >= 0.045 && distinct_hue(c0, *c) && distinct_hue(c1, *c))
-        .map(|c| lift_luminous(c, dark))
-        .unwrap_or_else(|| lift_luminous(oklab_rotate(c0, -0.75), dark));
-    [c0, c1, c2]
+    let base = lift_luminous(c0, dark);
+    let c1 = shift_tonal(base, if dark { 0.09 } else { 0.08 }, 0.14);
+    let c2 = shift_tonal(base, if dark { -0.07 } else { -0.06 }, -0.12);
+    [base, c1, c2]
 }
 
 #[cfg(test)]
@@ -636,5 +582,45 @@ mod tests {
         assert_eq!(reduced.surface_alpha(0.82), 1.0);
         assert_eq!(reduced.sidebar_alpha(0.50), 1.0);
         assert_eq!(reduced.panel_fill(&Kit::neutral(true)).a, 1.0);
+    }
+
+    #[test]
+    fn highlight_colors_stay_within_theme_hue_and_neutral_themes_stay_neutral() {
+        // A blue theme accent keeps all three aura stops inside the blue hue family
+        // rather than mixing unrelated magenta/amber terminal ANSI colours.
+        let blue = Color {
+            r: 0.15,
+            g: 0.26,
+            b: 1.0,
+            a: 1.0,
+        };
+        let mut blue_kit = Kit::neutral(false);
+        blue_kit.c.bg_accent = blue;
+        blue_kit.c.text_accent = blue;
+        let [c0, c1, c2] = highlight_colors_for(&blue_kit, false);
+        let hue_cos = |x: Color, y: Color| {
+            let [_, xa, xb, _] = x.to_oklab();
+            let [_, ya, yb, _] = y.to_oklab();
+            (xa * ya + xb * yb) / ((xa * xa + xb * xb).sqrt() * (ya * ya + yb * yb).sqrt())
+        };
+        assert!(hue_cos(blue, c0) > 0.99, "c0 drifted from theme accent");
+        assert!(hue_cos(c0, c1) > 0.95, "c1 drifted out of theme hue");
+        assert!(hue_cos(c0, c2) > 0.95, "c2 drifted out of theme hue");
+
+        // A genuinely neutral/monochrome accent stays neutral instead of inventing orange.
+        let gray = Color {
+            r: 0.5,
+            g: 0.5,
+            b: 0.5,
+            a: 1.0,
+        };
+        let [n0, n1, n2] = companion_highlight_colors(gray, true);
+        for c in [n0, n1, n2] {
+            assert!(
+                oklab_chroma(c) < 0.01,
+                "neutral theme glow should stay neutral, got chroma {}",
+                oklab_chroma(c)
+            );
+        }
     }
 }

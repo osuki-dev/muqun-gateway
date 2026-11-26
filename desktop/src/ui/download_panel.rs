@@ -20,9 +20,9 @@ pub(super) struct DownloadPanel<'a> {
 // A luminous travelling band is clipped inside the measured portion of the track.
 // Indeterminate phases use a moving segment instead of inventing a percentage.
 fn meter(k: &Kit, ratio: Option<f32>, motion: bool, label: &str) -> El {
-    let accent = rune::oklch(0.76, 0.18, 165.0).mix(k.c.icon_accent, 0.26);
-    let tail = rune::oklch(0.63, 0.19, 246.0).mix(k.c.info.icon, 0.20);
-    let tip = rune::oklch(0.96, 0.08, 155.0);
+    let accent = k.c.bg_accent;
+    let tail = accent.mix(k.c.bg_base, 0.30);
+    let tip = accent.mix(k.c.white, 0.42);
     let mut track = row()
         .key("download-track")
         .role("progressbar")
@@ -30,14 +30,14 @@ fn meter(k: &Kit, ratio: Option<f32>, motion: bool, label: &str) -> El {
         .w_full()
         .h(12.0)
         .radius(6.0)
-        .fill(rune::oklch(0.21, 0.025, 230.0))
+        .fill(k.c.layer_02)
         .border(1.0, k.c.border_weak);
     let mut beam = el()
         .key("download-beam")
         .h_full()
         .radius(6.0)
         .linear_gradient(1.57, [(0.0, tail), (0.68, accent), (1.0, tip)])
-        .shadow(0.0, 8.0, accent.alpha(0.52));
+        .shadow(0.0, 8.0, accent.alpha(0.45));
     if let Some(ratio) = ratio {
         let v = ratio.clamp(0.0, 1.0);
         track = track
@@ -55,7 +55,7 @@ fn meter(k: &Kit, ratio: Option<f32>, motion: bool, label: &str) -> El {
                     [
                         (0.0, tip.alpha(0.0)),
                         (0.64, tip.alpha(0.65)),
-                        (0.86, rune::Color::WHITE.alpha(0.92)),
+                        (0.86, k.c.white.alpha(0.92)),
                         (1.0, tip.alpha(0.0)),
                     ],
                 )
@@ -67,7 +67,7 @@ fn meter(k: &Kit, ratio: Option<f32>, motion: bool, label: &str) -> El {
                 el().pin(None, Some(2.0), Some(1.0), Some(2.0))
                     .w(2.0)
                     .radius(1.0)
-                    .fill(rune::Color::WHITE),
+                    .fill(k.c.white),
             ),
         );
     }
