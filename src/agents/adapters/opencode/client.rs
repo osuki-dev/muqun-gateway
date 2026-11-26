@@ -31,13 +31,13 @@ const HISTORY_READ_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// The messages of a `GET /session/{id}/message?order=desc` answer, oldest
 /// first: the page is reversed here, so callers always receive oldest-first.
 fn message_list(res: Value) -> Vec<Value> {
-    let mut items = match res.as_array() {
-        Some(arr) => arr.clone(),
-        None => res
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default(),
+    let mut items = match res {
+        Value::Array(arr) => arr,
+        Value::Object(mut map) => match map.remove("data") {
+            Some(Value::Array(arr)) => arr,
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
     };
     items.reverse();
     items
@@ -60,11 +60,22 @@ pub struct OpencodeClient {
 
 impl OpencodeClient {
     pub fn new(endpoint: OpencodeEndpoint) -> Self {
-        let http = Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .unwrap_or_default();
+        let is_loopback = reqwest::Url::parse(&endpoint.url).ok().is_some_and(|u| {
+            matches!(
+                u.host_str(),
+                Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+            )
+        });
+        let mut builder = Client::builder().timeout(Duration::from_secs(60));
+        if is_loopback {
+            builder = builder.no_proxy();
+        }
+        let http = builder.build().unwrap_or_default();
         Self { endpoint, http }
+    }
+
+    pub fn http(&self) -> &Client {
+        &self.http
     }
 
     fn authed_req(&self, mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {

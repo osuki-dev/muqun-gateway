@@ -168,6 +168,9 @@ pub struct OpencodeDriver {
     catalog_cache: Mutex<HashMap<String, CachedCatalog>>,
     /// Where `load_earlier_timeline` stands per session.
     earlier: Mutex<HashMap<String, EarlierCursor>>,
+    /// Remembered session directories so `get_vcs_diff` avoids an extra
+    /// `GET /api/session/{id}` roundtrip when the session was already loaded.
+    session_dirs: Mutex<HashMap<String, String>>,
 }
 
 /// The newest messages of a session delivered so far. OpenCode's message
@@ -201,7 +204,19 @@ impl OpencodeDriver {
             primed: Mutex::new(HashSet::new()),
             catalog_cache: Mutex::new(HashMap::new()),
             earlier: Mutex::new(HashMap::new()),
+            session_dirs: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn remember_session_dir(&self, session_id: &str, directory: Option<&str>) {
+        let Some(dir) = directory.filter(|d| !d.is_empty()) else {
+            return;
+        };
+        let mut dirs = self.session_dirs.lock().unwrap_or_else(|p| p.into_inner());
+        if dirs.len() > 2048 && !dirs.contains_key(session_id) {
+            dirs.clear();
+        }
+        dirs.insert(session_id.to_owned(), dir.to_owned());
     }
 
     /// Remember the newest `messages` as delivered for `session_id`. A
@@ -385,12 +400,14 @@ impl OpencodeDriver {
         F: Fn(Option<&'a str>) -> Fut,
         Fut: std::future::Future<Output = Vec<Value>>,
     {
-        let floor = self.once_present(&fetch, None).await;
         if directory.is_none() {
-            return floor;
+            return self.once_present(&fetch, None).await;
         }
 
-        let mut scoped = self.once_present(&fetch, directory).await;
+        let (floor, mut scoped) = tokio::join!(
+            self.once_present(&fetch, None),
+            self.once_present(&fetch, directory),
+        );
         for wait in AGENT_SETTLE_BACKOFF {
             if missing_ids(&scoped, &floor).is_empty() {
                 return scoped;
@@ -513,10 +530,7 @@ impl AgentPort for OpencodeDriver {
     }
 
     fn probe(&self) -> AgentFuture<'_, bool> {
-        Box::pin(async move {
-            let req_client = reqwest::Client::new();
-            Ok(self.client.endpoint.probe_healthy(&req_client).await)
-        })
+        Box::pin(async move { Ok(self.client.endpoint.probe_healthy(self.client.http()).await) })
     }
 
     fn list_projects(&self) -> AgentFuture<'_, Vec<AgentProject>> {
@@ -557,7 +571,11 @@ impl AgentPort for OpencodeDriver {
                 .client
                 .list_sessions(query.directory.as_deref(), &filter)
                 .await?;
-            map_session_list(&raw_sessions)
+            let sessions = map_session_list(&raw_sessions)?;
+            for info in &sessions {
+                self.remember_session_dir(&info.asid.0, info.directory.as_deref());
+            }
+            Ok(sessions)
         })
     }
 
@@ -612,6 +630,7 @@ impl AgentPort for OpencodeDriver {
                     info.error = mapper::last_failure(&messages);
                 }
             }
+            self.remember_session_dir(&info.asid.0, info.directory.as_deref());
             Ok(info)
         })
     }
@@ -912,12 +931,25 @@ impl AgentPort for OpencodeDriver {
         Box::pin(async move {
             // The diff is scoped to the session's own directory; a global diff
             // is not what the caller asked for.
-            let directory = match self.client.get_session(session_id).await {
-                Ok(raw) => mapper::map_session(&raw).and_then(|s| s.directory),
-                Err(err) => {
-                    tracing::debug!(session_id, %err, "vcs diff: session lookup failed, using server cwd");
-                    None
-                }
+            let cached_dir = self
+                .session_dirs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(session_id)
+                .cloned();
+            let directory = match cached_dir {
+                Some(dir) => Some(dir),
+                None => match self.client.get_session(session_id).await {
+                    Ok(raw) => {
+                        let dir = mapper::map_session(&raw).and_then(|s| s.directory);
+                        self.remember_session_dir(session_id, dir.as_deref());
+                        dir
+                    }
+                    Err(err) => {
+                        tracing::debug!(session_id, %err, "vcs diff: session lookup failed, using server cwd");
+                        None
+                    }
+                },
             };
             let raw_diff = self
                 .client

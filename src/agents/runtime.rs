@@ -2715,6 +2715,7 @@ fn running_binary_path(_pid: u32) -> Option<std::path::PathBuf> {
 
 fn probe_client() -> reqwest::Client {
     reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(60))
         .build()
