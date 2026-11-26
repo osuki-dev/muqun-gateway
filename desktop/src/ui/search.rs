@@ -766,9 +766,9 @@ pub fn titles_shown(s: &UiState) -> bool {
 }
 
 /// Whether the open session's row in the sidebar wears the selection: the
-/// keyboard's row wins while it is on one. In split view, every session open
-/// in a tile stays highlighted so hovering across panes never bounces the
-/// sidebar pill back and forth.
+/// keyboard's row wins while it is on one; otherwise only the currently
+/// focused session is highlighted (other open split panes carry the `split`
+/// detail label instead of competing selection pills).
 pub fn row_selected(s: &UiState, asid: &str) -> bool {
     match &s.content.cursor {
         Some(Cursor::Session(at)) if !s.search.text.trim().is_empty() => at == asid,
@@ -776,12 +776,6 @@ pub fn row_selected(s: &UiState, asid: &str) -> bool {
         _ => {
             if s.mode != Mode::Session {
                 return false;
-            }
-            if s.in_split() {
-                return s
-                    .tiles
-                    .iter()
-                    .any(|t| t.asid.as_deref().and_then(|id| s.sidebar_root(id)) == Some(asid));
             }
             s.selected.as_deref().and_then(|id| s.sidebar_root(id)) == Some(asid)
         }
@@ -823,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn split_view_highlights_all_open_tile_sessions_without_bouncing_on_focus() {
+    fn split_view_highlights_only_the_focused_tile_session() {
         let (tx, _rx) = crate::model::commands::channel();
         let mut s = UiState::new(tx);
         s.mode = Mode::Session;
@@ -833,11 +827,11 @@ mod tests {
         ];
         s.focus_tile(0);
         assert!(row_selected(&s, "one"));
-        assert!(row_selected(&s, "two"));
+        assert!(!row_selected(&s, "two"));
         assert!(!row_selected(&s, "three"));
-        // Moving focus to the second split tile keeps both rows steadily highlighted.
+        // Moving focus to the second split tile moves the single sidebar highlight to it.
         s.focus_tile(1);
-        assert!(row_selected(&s, "one"));
+        assert!(!row_selected(&s, "one"));
         assert!(row_selected(&s, "two"));
         assert!(!row_selected(&s, "three"));
     }
