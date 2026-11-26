@@ -171,6 +171,9 @@ fn layer(
         }
         FOCUS_AURA => {
             let [c0, c1, c2] = aura_triad(d, dark);
+            // Keep idle focus aura static (`breathe: 0.0`, `aura_speed: 0.0`) so
+            // `Fx::animating()` stays false at rest and does not spin 60/120 Hz
+            // full-window Metal/Vulkan redraws on 4K Retina displays.
             rune_fx::Fx::glow(GlowParams {
                 style: GlowStyle::Aura,
                 color: c0,
@@ -181,9 +184,8 @@ fn layer(
                 intensity: d[3].clamp(0.0, 1.2) * if dark { 0.54 } else { 0.42 },
                 inner: if dark { 0.26 } else { 0.20 },
                 occlusion: if dark { 0.65 } else { 0.94 },
-                breathe: 0.12,
-                breathe_period: 4.2,
-                aura_speed: 0.12,
+                breathe: 0.0,
+                aura_speed: 0.0,
                 hot: 0.0,
                 reach: 2.1,
                 ..Default::default()
@@ -201,7 +203,8 @@ fn layer(
                 intensity: d[3].clamp(0.0, 1.0) * if dark { 0.24 } else { 0.18 },
                 inner: if dark { 0.12 } else { 0.10 },
                 occlusion: if dark { 0.72 } else { 0.95 },
-                aura_speed: 0.08,
+                breathe: 0.0,
+                aura_speed: 0.0,
                 hot: 0.0,
                 reach: 1.6,
                 ..Default::default()
