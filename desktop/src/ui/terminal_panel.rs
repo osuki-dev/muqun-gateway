@@ -303,10 +303,11 @@ fn grid_size(pane_width: f32, height: f32, m: Metrics, scale: f32) -> Size {
     }
 }
 
-/// The grid's size in cells inside a split tile laid out at `rect`.
+/// The grid's size in cells inside a laid-out grid canvas `rect` (already
+/// inset inside `body.px(INSET)` — never subtract `INSET` a second time).
 fn tile_grid_size(rect: [f32; 4], m: Metrics, scale: f32) -> Size {
     Size {
-        cols: (((rect[2] - 2.0 * INSET) / m.cw).floor() as u16).max(2),
+        cols: ((rect[2] / m.cw).floor() as u16).max(2),
         rows: ((rect[3] / m.ch).floor() as u16).max(1),
         cell_w: (m.cw * scale).round().max(1.0) as u32,
         cell_h: (m.ch * scale).round().max(1.0) as u32,
@@ -1609,7 +1610,11 @@ impl UiState {
     /// The grid was laid out at `[x, y, w, h]`: the shell's size follows.
     /// Hidden, the shell keeps the size it had.
     fn terminal_layout(&mut self, rect: [f32; 4], scale: f32) {
-        if (!self.term.open && !self.has_terminal_tile()) || rect[2] < 40.0 || rect[3] < 20.0 {
+        let is_page = self.active_plugin_page.as_deref() == Some("terminal");
+        if (!self.term.open && !self.has_terminal_tile() && !is_page)
+            || rect[2] < 40.0
+            || rect[3] < 20.0
+        {
             return;
         }
         // Each tab keeps the size it was last given: after a switch, the grid
@@ -1621,10 +1626,20 @@ impl UiState {
             }
         }
         let m = metrics();
-        let size = if self.has_terminal_tile() {
+        let size = if self.has_terminal_tile() || is_page {
             tile_grid_size(rect, m, scale)
         } else {
-            grid_size(self.term.pane.width(), rect[3], m, scale)
+            let settled = grid_size(self.term.pane.width(), rect[3], m, scale);
+            let sliding = (self.term.pane.shown_width() - self.term.pane.width()).abs() > 1.0;
+            if sliding {
+                settled
+            } else {
+                let actual = tile_grid_size(rect, m, scale);
+                Size {
+                    cols: settled.cols.min(actual.cols),
+                    ..actual
+                }
+            }
         };
         let frame_matches = self
             .term
@@ -2403,11 +2418,10 @@ pub fn view(
         .key("terminal-head")
         .w_full()
         .h(HEAD)
-        .pl(8.0)
-        .pr(8.0)
-        .gap(6.0)
+        .pl(10.0)
+        .pr(6.0)
+        .gap(4.0)
         .center_y()
-        .fill(k.alpha(k.c.layer_01, 0.65))
         .preserve_focus_on_press(true)
         .child(crate::plugin::window::dock_tabs(s, k).unwrap_or_else(|| {
             el().key("shell-tabs-viewport")
@@ -2774,11 +2788,10 @@ pub fn tile_body_with_controls(
         .key(format!("tile-terminal-subhead{sfx}"))
         .w_full()
         .h(HEAD)
-        .pl(8.0)
-        .pr(8.0)
-        .gap(6.0)
+        .pl(10.0)
+        .pr(6.0)
+        .gap(4.0)
         .center_y()
-        .fill(k.alpha(k.c.layer_01, 0.45))
         .preserve_focus_on_press(true)
         .child(
             el().key("shell-tabs-viewport")

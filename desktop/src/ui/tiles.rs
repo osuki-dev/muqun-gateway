@@ -12,7 +12,6 @@
 //! `Primary+\` adds one, `Primary+W` removes the focused one.
 
 use rune::{col, el, row, text, Cursor, El, Key, Phase, Tx};
-use rune_kit::glyphs::CLOSE;
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem,
 };
@@ -427,26 +426,35 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
-            head = head
-                .child(plugin_icon.a11y_hidden())
-                .child(
-                    text(clean_title)
-                        .key("tile-title")
-                        .font(title_font)
-                        .single_line()
-                        .truncate()
-                        .color(if focused {
-                            k.c.text_base
-                        } else {
-                            k.c.text_muted
-                        }),
-                )
-                .child(
-                    text(kind.clone())
+            let kind_label = s
+                .plugins
+                .get(kind)
+                .map(|p| p.title(language))
+                .unwrap_or_else(|| kind.clone());
+            head = head.child(plugin_icon.a11y_hidden()).child(
+                text(clean_title.clone())
+                    .key("tile-title")
+                    .font(title_font)
+                    .single_line()
+                    .truncate()
+                    .color(if focused {
+                        k.c.text_base
+                    } else {
+                        k.c.text_muted
+                    }),
+            );
+            if !kind_label.is_empty() && !kind_label.eq_ignore_ascii_case(&clean_title) {
+                head = head.child(
+                    text(kind_label)
                         .key("tile-agent")
                         .font(k.ty.small)
-                        .color(k.c.text_faint),
+                        .color(k.c.text_faint)
+                        .single_line()
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0),
                 );
+            }
         }
         super::TileContent::Empty => {
             head = head.child(
@@ -720,17 +728,14 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
                 .on_select(|s: &mut UiState| s.unsplit()),
         );
     let menu = menu.build(k, layer);
-    head = head.child(if menu_open || popped {
-        menu
-    } else {
-        menu.group_opacity(0.0, 1.0)
-    });
     let plugin_id = match content {
         super::TileContent::Custom { kind, .. } => Some(kind.as_str()),
         super::TileContent::Diff(_) => Some("diff"),
         super::TileContent::Terminal => Some("terminal"),
         _ => None,
     };
+    // Match `plugin::window::chrome` trailing action order:
+    // [contextual window actions] -> [... overflow menu] -> [surface switcher] -> [close].
     if let Some(plugin_id) = plugin_id {
         if let Some(actions) = s
             .plugins
@@ -739,6 +744,13 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
         {
             head = head.child(actions);
         }
+    }
+    head = head.child(if menu_open || popped {
+        menu
+    } else {
+        menu.group_opacity(0.0, 1.0)
+    });
+    if let Some(plugin_id) = plugin_id {
         head = head.child(crate::plugin::surface_switcher(
             s,
             k,
@@ -749,10 +761,7 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
         ));
     }
     head = head.child(
-        IconButton::new(&CLOSE)
-            .variant(IconButtonVariant::GhostMuted)
-            .control_size(ControlSize::Small)
-            .label(tr_ref(language, "Remove from split view"))
+        super::icons::header_button(k.glyph.close, tr_ref(language, "Remove from split view"))
             .shortcut(if focused {
                 super::keymap::label(super::keymap::Action::RemoveSplit)
             } else {

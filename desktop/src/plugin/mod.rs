@@ -169,11 +169,7 @@ pub fn surface_switcher(
             },
         );
         let terminal = plugin_id == "terminal";
-        let close_btn = rune_kit::IconButton::new(k.glyph.close)
-            .label(close_label)
-            .help(close_label)
-            .variant(rune_kit::IconButtonVariant::GhostMuted)
-            .control_size(ControlSize::Large)
+        let close_btn = crate::ui::icons::header_button(k.glyph.close, close_label)
             .on_press(move |s: &mut UiState| match active {
                 PluginSlot::Page => s.close_plugin_page(),
                 PluginSlot::Drawer if terminal => s.close_terminal(),

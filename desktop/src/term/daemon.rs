@@ -198,11 +198,12 @@ impl DecModeTracker {
         }
     }
 
-    /// Escape sequence emitted *after* wrapped scrollback to clear any dangling
-    /// synchronized-output / SGR state and re-assert active DEC modes (notably
-    /// `?2048` in-band resize for Neovim 0.10+, mouse reporting, bracketed paste).
+    /// Escape sequence emitted *after* wrapped scrollback to cancel any
+    /// truncated trailing escape (`CAN`), clear dangling synchronized-output /
+    /// SGR state, and re-assert active DEC modes (notably `?2048` in-band
+    /// resize for Neovim 0.10+, mouse reporting, bracketed paste).
     fn restore_suffix(&self) -> Vec<u8> {
-        let mut out = String::from("\x1b[?2026l\x1b[0m");
+        let mut out = String::from("\x18\x1b[?2026l\x1b[0m");
         if !self.active.is_empty() {
             out.push_str("\x1b[?");
             for (i, mode) in self.active.iter().enumerate() {
@@ -391,6 +392,12 @@ pub struct Response {
     pub sessions: Option<Vec<SessionInfo>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scrollback: Option<String>,
+    /// Exact byte length of the initial raw replay written immediately after
+    /// the handshake line on `Attach { raw: true }`, so clients can read the
+    /// complete snapshot (including DEC mode restoration suffix) without a
+    /// fragile timeout race.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrollback_len: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -402,6 +409,7 @@ impl Response {
             id: None,
             sessions: None,
             scrollback: None,
+            scrollback_len: None,
             error: None,
         }
     }
@@ -412,6 +420,7 @@ impl Response {
             id: Some(id),
             sessions: None,
             scrollback: None,
+            scrollback_len: None,
             error: None,
         }
     }
@@ -422,6 +431,7 @@ impl Response {
             id: None,
             sessions: Some(sessions),
             scrollback: None,
+            scrollback_len: None,
             error: None,
         }
     }
@@ -432,6 +442,18 @@ impl Response {
             id: Some(id),
             sessions: None,
             scrollback: Some(scrollback),
+            scrollback_len: None,
+            error: None,
+        }
+    }
+
+    pub fn attached_raw(scrollback_len: usize) -> Self {
+        Self {
+            ok: true,
+            id: None,
+            sessions: None,
+            scrollback: None,
+            scrollback_len: Some(scrollback_len),
             error: None,
         }
     }
@@ -442,6 +464,7 @@ impl Response {
             id: None,
             sessions: None,
             scrollback: None,
+            scrollback_len: None,
             error: Some(msg.into()),
         }
     }
@@ -1037,8 +1060,12 @@ impl DaemonServer {
         let size = WinSize {
             cols,
             rows,
-            px_w: cell_w.unwrap_or(0),
-            px_h: cell_h.unwrap_or(0),
+            px_w: cell_w.map_or(0, |cw| {
+                (u32::from(cols) * u32::from(cw)).min(u32::from(u16::MAX)) as u16
+            }),
+            px_h: cell_h.map_or(0, |ch| {
+                (u32::from(rows) * u32::from(ch)).min(u32::from(u16::MAX)) as u16
+            }),
         };
 
         let session_id = match id {
@@ -1148,6 +1175,7 @@ impl DaemonServer {
             id: Some(id.to_string()),
             sessions: None,
             scrollback: Some(text),
+            scrollback_len: None,
             error: None,
         }
     }
@@ -1203,8 +1231,12 @@ impl DaemonServer {
         let size = WinSize {
             cols,
             rows,
-            px_w: cell_w.unwrap_or(0),
-            px_h: cell_h.unwrap_or(0),
+            px_w: cell_w.map_or(0, |cw| {
+                (u32::from(cols) * u32::from(cw)).min(u32::from(u16::MAX)) as u16
+            }),
+            px_h: cell_h.map_or(0, |ch| {
+                (u32::from(rows) * u32::from(ch)).min(u32::from(u16::MAX)) as u16
+            }),
         };
 
         session.resize(size);
@@ -1307,7 +1339,7 @@ impl DaemonServer {
         let scrollback_bytes = session.attach_scrollback();
 
         if raw {
-            let resp = Response::success();
+            let resp = Response::attached_raw(scrollback_bytes.len());
             let mut out = serde_json::to_vec(&resp)?;
             out.push(b'\n');
             writer.write_all(&out).await?;
@@ -2001,6 +2033,37 @@ impl SyncDaemonClient {
         self.create_session_with_options(id, cwd, cols, rows, None, None)
     }
 
+    /// Creates a persistent session on the daemon with optional cell pixel dimensions.
+    pub fn create_session_with_size(
+        &self,
+        id: Option<String>,
+        cwd: Option<PathBuf>,
+        cols: u16,
+        rows: u16,
+        cell_w: Option<u16>,
+        cell_h: Option<u16>,
+    ) -> io::Result<String> {
+        let req = Request::Create {
+            id,
+            cwd,
+            cols,
+            rows,
+            cell_w,
+            cell_h,
+            label: None,
+            command: None,
+        };
+        let resp = self.send_request(&req)?;
+        if resp.ok {
+            resp.id
+                .ok_or_else(|| io::Error::other("missing session id in response"))
+        } else {
+            Err(io::Error::other(
+                resp.error.unwrap_or_else(|| "create session failed".into()),
+            ))
+        }
+    }
+
     /// Creates a persistent session on the daemon with optional label and initial command.
     pub fn create_session_with_options(
         &self,
@@ -2051,6 +2114,16 @@ impl SyncDaemonClient {
     /// Attaches to a persistent session in raw streaming mode, returning the UnixStream.
     #[cfg(unix)]
     pub fn attach_raw(&self, id: &str) -> io::Result<std::os::unix::net::UnixStream> {
+        self.attach_raw_with_len(id).map(|(stream, _)| stream)
+    }
+
+    /// Attaches to a persistent session in raw streaming mode, also returning
+    /// the daemon's declared initial scrollback byte length when supported.
+    #[cfg(unix)]
+    pub fn attach_raw_with_len(
+        &self,
+        id: &str,
+    ) -> io::Result<(std::os::unix::net::UnixStream, Option<usize>)> {
         use std::io::{Read, Write};
         let mut stream = std::os::unix::net::UnixStream::connect(&self.socket_path)?;
         stream.set_read_timeout(Some(Duration::from_secs(3)))?;
@@ -2094,7 +2167,7 @@ impl SyncDaemonClient {
         stream.set_read_timeout(None)?;
         stream.set_write_timeout(None)?;
 
-        Ok(stream)
+        Ok((stream, resp.scrollback_len))
     }
 
     /// Closes a persistent session and terminates its process.
@@ -2112,12 +2185,25 @@ impl SyncDaemonClient {
 
     /// Resizes a persistent session in the daemon.
     pub fn resize_session(&self, id: &str, cols: u16, rows: u16) -> io::Result<()> {
+        self.resize_session_with_cells(id, cols, rows, None, None)
+    }
+
+    /// Resizes a persistent session in the daemon, forwarding cell pixel metrics
+    /// so `TIOCSWINSZ` carries accurate `ws_xpixel`/`ws_ypixel`.
+    pub fn resize_session_with_cells(
+        &self,
+        id: &str,
+        cols: u16,
+        rows: u16,
+        cell_w: Option<u16>,
+        cell_h: Option<u16>,
+    ) -> io::Result<()> {
         let req = Request::Resize {
             id: id.to_string(),
             cols,
             rows,
-            cell_w: None,
-            cell_h: None,
+            cell_w,
+            cell_h,
         };
         let resp = self.send_request(&req)?;
         if resp.ok {
@@ -2792,7 +2878,7 @@ mod tests {
             "wrapped snapshot should re-enter alt screen before replaying: {snap:?}"
         );
         assert!(
-            snap.ends_with("\x1b[?2026l\x1b[0m\x1b[?1002;1006;2004;2048h"),
+            snap.ends_with("\x18\x1b[?2026l\x1b[0m\x1b[?1002;1006;2004;2048h"),
             "wrapped snapshot should restore active DEC modes after replay: {snap:?}"
         );
 
@@ -2804,7 +2890,7 @@ mod tests {
             "exiting alt screen should drop prefix: {after_reset:?}"
         );
         assert!(
-            after_reset.ends_with("\x1b[?2026l\x1b[0m\x1b[?1006;2004;2048h"),
+            after_reset.ends_with("\x18\x1b[?2026l\x1b[0m\x1b[?1006;2004;2048h"),
             "only reset modes should be removed: {after_reset:?}"
         );
 
@@ -2812,7 +2898,7 @@ mod tests {
         sb.push(b"\x1bc");
         let after_ris = String::from_utf8(sb.to_attach_vec()).unwrap();
         assert!(
-            after_ris.ends_with("\x1b[?2026l\x1b[0m"),
+            after_ris.ends_with("\x18\x1b[?2026l\x1b[0m"),
             "RIS should clear all tracked modes: {after_ris:?}"
         );
     }

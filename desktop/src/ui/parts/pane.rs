@@ -8,9 +8,7 @@
 
 use muqun_gateway::agents::{AgentPart, TimelineItem, TimelineRole};
 use rune::{col, row, text, El, PointerPress, ScrollSpec, Tx};
-use rune_kit::{
-    context_menu, ControlSize, IconButton, IconButtonVariant, Kit, MenuItem, ScrollBar,
-};
+use rune_kit::{context_menu, Kit, MenuItem, ScrollBar};
 
 use super::Tcx;
 use crate::model::activity::{self, Block};
@@ -567,10 +565,15 @@ pub fn view(s: &UiState, k: &Kit) -> Option<El> {
         .w_full()
         // Matches `window::chrome` header height and control chrome.
         .h(rune_kit::shell::TOOLBAR_HEIGHT)
-        .px(10.0)
-        .py(4.0)
-        .gap(8.0)
+        .pl(10.0)
+        .pr(6.0)
+        .gap(6.0)
         .center_y()
+        .child(
+            rune::icon(&super::glyphs::DOCUMENT, 14.0)
+                .color(k.c.text_accent)
+                .a11y_hidden(),
+        )
         .child(
             text(cx.t("Details"))
                 .font(k.ty.ui_medium)
@@ -582,12 +585,9 @@ pub fn view(s: &UiState, k: &Kit) -> Option<El> {
                 .grow(1.0),
         )
         .child(
-            IconButton::new(k.glyph.close)
-                .label(cx.t("Close"))
+            crate::ui::icons::header_button(k.glyph.close, cx.t("Close"))
                 .help(cx.t("Close (Esc)"))
                 .shortcut("Esc")
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Large)
                 .on_press(|s: &mut UiState| s.close_inspect())
                 .build(k)
                 .key("pane-close"),
@@ -610,6 +610,12 @@ pub fn view(s: &UiState, k: &Kit) -> Option<El> {
             .h_full()
             .min_h(0.0)
             .child(bar)
+            .child(
+                rune::el()
+                    .w_full()
+                    .h(1.0)
+                    .fill(k.alpha(k.c.border_weak, 0.25)),
+            )
             .child(
                 col()
                     .key("pane-scroll")

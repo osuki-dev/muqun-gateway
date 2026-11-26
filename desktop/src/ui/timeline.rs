@@ -349,9 +349,18 @@ impl UiState {
 
     /// Open a file a timeline card names (a presented file, a glob or grep
     /// hit) in the viewer. Relative paths are the selected session's; `~/` is
-    /// home.
+    /// home. On a remote session, forward the path directly to the remote file
+    /// viewer instead of checking the local filesystem.
     pub fn open_timeline_file(&mut self, path: &str) {
         let path = path.trim();
+        let path = path.strip_prefix("file://").unwrap_or(path);
+        let path = path.strip_prefix("localhost").unwrap_or(path);
+        if Self::is_remote_computer_id(&self.active_session_computer()) {
+            if !path.is_empty() {
+                self.open_file(std::path::PathBuf::from(path));
+            }
+            return;
+        }
         let resolved = if let Some(rest) = path.strip_prefix("~/") {
             dirs::home_dir().map(|h| h.join(rest))
         } else if std::path::Path::new(path).is_absolute() {

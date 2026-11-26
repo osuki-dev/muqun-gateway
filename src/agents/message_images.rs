@@ -143,6 +143,12 @@ impl MessageImages {
                 sources.push(src);
             }
         }
+        for src in workspace_file_paths(text, root) {
+            let file_uri = format!("file://{src}");
+            if !sources.iter().any(|have| have == &src || have == &file_uri) {
+                sources.push(src);
+            }
+        }
         for src in sources.into_iter().take(MAX_IMAGES_PER_PART) {
             let Some((path, fence)) = hosted_file(&src, root) else {
                 continue;
@@ -182,12 +188,54 @@ impl MessageImages {
     }
 }
 
-/// True when a text part could embed an image at all -- the cheap test that
-/// keeps every streamed delta of ordinary prose off the filesystem.
+/// True when a text part could embed an image or workspace file path -- the
+/// cheap test that keeps every streamed delta of ordinary prose off the filesystem.
 fn may_embed_image(item: &TimelineItem) -> bool {
     matches!(&item.part, AgentPart::Text { text }
-        if text.contains("![") || text.to_ascii_lowercase().contains("<img")
-            || text.contains("file://"))
+        if text.contains("![")
+            || text.to_ascii_lowercase().contains("<img")
+            || text.contains("file://")
+            || contains_absolute_path_hint(text))
+}
+
+/// Cheap pre-filter for bare absolute workspace paths such as
+/// `/home/user/repo/docs/guide.md`. Matches a `/` at a token boundary followed
+/// by at least two path segments (`/<seg>/<seg>`), excluding `//` and `/api/`.
+fn contains_absolute_path_hint(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while let Some(rel) = text[i..].find('/') {
+        let pos = i + rel;
+        i = pos + 1;
+        let boundary = match pos.checked_sub(1).map(|p| bytes[p]) {
+            None => true,
+            Some(b) => {
+                b.is_ascii_whitespace()
+                    || matches!(
+                        b,
+                        b'(' | b'<' | b'[' | b'"' | b'\'' | b':' | b',' | b';' | b'*'
+                    )
+                    || !b.is_ascii()
+            }
+        };
+        if !boundary {
+            continue;
+        }
+        let rest = &text[pos + 1..];
+        if rest.is_empty() || rest.starts_with('/') || rest.starts_with("api/") {
+            continue;
+        }
+        let token_end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, ')' | '>' | ']' | '"' | '\'' | '`'))
+            .unwrap_or(rest.len());
+        let token = &rest[..token_end];
+        if let Some(slash) = token.find('/') {
+            if slash > 0 && slash + 1 < token.len() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// A session's directory as an image fence: it has to exist, be a directory,
@@ -1038,6 +1086,193 @@ fn file_uris(text: &str) -> Vec<String> {
         }
     });
     out
+}
+
+/// Bare absolute paths strictly under the session's canonical workspace `root`
+/// (e.g. `/home/user/repo/docs/guide.md`). Agents often emit these in prose or
+/// in plain unlabeled fenced path lists when listing files for the user to open.
+///
+/// Inline Markdown links `[label](/root/...)`, `file://` URIs (handled by
+/// [`file_uris`]), inline code spans, and source-code fenced blocks are skipped.
+fn workspace_file_paths(text: &str, root: &Path) -> Vec<String> {
+    let Some(root_str) = root.to_str() else {
+        return Vec::new();
+    };
+    let root_prefix = format!("{}/", root_str.trim_end_matches('/'));
+    if root_prefix == "/" || !text.contains(&root_prefix) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for_each_prose_segment(text, |segment| {
+        extract_prose_workspace_paths(segment, &root_prefix, &mut out);
+    });
+    extract_path_list_fence_paths(text, &root_prefix, &mut out);
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|src| seen.insert(src.clone()));
+    out
+}
+
+fn extract_prose_workspace_paths(segment: &str, root_prefix: &str, out: &mut Vec<String>) {
+    let mut rest = segment;
+    while let Some(index) = rest.find(root_prefix) {
+        let prefix = &rest[..index];
+        let lower_tail = prefix
+            .get(prefix.len().saturating_sub(16)..)
+            .unwrap_or(prefix)
+            .to_ascii_lowercase();
+        let after_file_scheme =
+            lower_tail.ends_with("file://") || lower_tail.ends_with("file://localhost");
+        let before = prefix.trim_end();
+        let in_markdown_link = before.ends_with("](")
+            || before
+                .strip_suffix('<')
+                .is_some_and(|p| p.trim_end().ends_with("]("));
+        let valid_start = match prefix.chars().next_back() {
+            None => true,
+            Some(c) => {
+                c.is_whitespace()
+                    || matches!(
+                        c,
+                        '(' | '<'
+                            | '['
+                            | '"'
+                            | '\''
+                            | ':'
+                            | ','
+                            | ';'
+                            | '*'
+                            | '：'
+                            | '（'
+                            | '【'
+                            | '「'
+                            | '『'
+                            | '、'
+                            | '，'
+                    )
+            }
+        };
+        let after = &rest[index..];
+        let mut parens = 0usize;
+        let mut end = after.len();
+        for (at, c) in after.char_indices() {
+            if c.is_whitespace()
+                || matches!(
+                    c,
+                    ']' | '"'
+                        | '\''
+                        | '>'
+                        | '`'
+                        | '。'
+                        | '，'
+                        | '；'
+                        | '：'
+                        | '！'
+                        | '？'
+                        | '）'
+                        | '】'
+                        | '」'
+                        | '』'
+                        | '、'
+                )
+                || (c == ')' && parens == 0)
+            {
+                end = at;
+                break;
+            }
+            match c {
+                '(' => parens += 1,
+                ')' => parens -= 1,
+                _ => {}
+            }
+        }
+        let candidate = after[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', '*']);
+        if valid_start
+            && !after_file_scheme
+            && !in_markdown_link
+            && candidate.len() > root_prefix.len()
+            && !candidate.chars().any(char::is_control)
+        {
+            out.push(candidate.to_owned());
+        }
+        rest = &after[end.max(root_prefix.len())..];
+    }
+}
+
+fn is_plain_path_list_fence(info: &str) -> bool {
+    let lang = info.trim().to_ascii_lowercase();
+    lang.is_empty()
+        || matches!(
+            lang.as_str(),
+            "text" | "txt" | "plain" | "plaintext" | "path" | "paths"
+        )
+}
+
+fn looks_like_bare_workspace_path_line(line: &str, root_prefix: &str) -> bool {
+    line.starts_with(root_prefix)
+        && line.len() > root_prefix.len()
+        && !line.chars().any(char::is_control)
+        && !line.contains(" && ")
+        && !line.contains(" || ")
+        && !line.contains("; ")
+        && !line.contains(" | ")
+        && !line.contains(" > ")
+        && !line.contains(" < ")
+        && !line.contains('`')
+        && !line.contains("$(")
+}
+
+fn extract_path_list_fence_paths(markdown: &str, root_prefix: &str, out: &mut Vec<String>) {
+    let mut fence: Option<(u8, usize, bool)> = None;
+    let mut block_lines: Vec<&str> = Vec::new();
+    let flush = |lines: &mut Vec<&str>, allowed: bool, out: &mut Vec<String>| {
+        if allowed {
+            let non_empty: Vec<&str> = lines
+                .iter()
+                .map(|line| line.trim())
+                .filter(|line| !line.is_empty())
+                .collect();
+            if !non_empty.is_empty()
+                && non_empty
+                    .iter()
+                    .all(|line| looks_like_bare_workspace_path_line(line, root_prefix))
+            {
+                for line in non_empty {
+                    out.push(line.to_owned());
+                }
+            }
+        }
+        lines.clear();
+    };
+    for line in markdown.lines() {
+        if let Some((marker, count, rest)) = fence_marker(line) {
+            match fence {
+                None => {
+                    fence = Some((marker, count, is_plain_path_list_fence(rest)));
+                    block_lines.clear();
+                    continue;
+                }
+                Some((open, open_count, allowed))
+                    if open == marker && count >= open_count && rest.trim().is_empty() =>
+                {
+                    flush(&mut block_lines, allowed, out);
+                    fence = None;
+                    continue;
+                }
+                Some((_, _, allowed)) => {
+                    if allowed {
+                        block_lines.push(line);
+                    }
+                    continue;
+                }
+            }
+        }
+        if let Some((_, _, true)) = fence {
+            block_lines.push(line);
+        }
+    }
+    if let Some((_, _, allowed)) = fence {
+        flush(&mut block_lines, allowed, out);
+    }
 }
 
 /// The file an image source names, if it is a regular file strictly inside
@@ -2014,5 +2249,96 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![flow_uri.as_str(), notes_uri.as_str()]
         );
+    }
+
+    #[tokio::test]
+    async fn bare_workspace_paths_in_plain_fences_and_prose_register_assets() {
+        use crate::platform::assets::asset_download;
+        use crate::{bearer_headers, test_device, test_state};
+        use axum::extract::{Path as RoutePath, State};
+        use axum::http::StatusCode;
+
+        let (scratch, root) = workspace();
+        let docs = root.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        let doc_a = docs.join("order-flow-platform-managed.md");
+        let doc_b = docs.join("order-flow-hupun-erp.md");
+        std::fs::write(&doc_a, "# Platform managed\n").unwrap();
+        std::fs::write(&doc_b, "# Hupun ERP\n").unwrap();
+        let notes = root.join("notes.md");
+        let outside = scratch.path().join("outside.png");
+
+        // Exact pattern agents emit when asked for file paths: plain unlabeled
+        // fenced blocks containing one absolute workspace path per line, plus
+        // bare paths in prose.
+        let text = format!(
+            "第一对：\n\n```\n{}\n{}\n```\n\n备注：{}。\n",
+            doc_a.display(),
+            doc_b.display(),
+            notes.display(),
+        );
+        let state = test_state("admin", vec![test_device("d1", "token")]);
+        let mut items = vec![item(&text)];
+        attach_to_items(&state, "bare-workspace-files", root.to_str(), &mut items).await;
+        let assets = items[0]
+            .image_assets
+            .as_ref()
+            .expect("bare workspace file assets");
+        assert_eq!(
+            assets.iter().map(|a| a.src.as_str()).collect::<Vec<_>>(),
+            vec![
+                notes.to_string_lossy().as_ref(),
+                doc_a.to_string_lossy().as_ref(),
+                doc_b.to_string_lossy().as_ref(),
+            ]
+        );
+        for asset in assets {
+            assert_eq!(asset.mime, "text/markdown; charset=utf-8");
+            assert!(asset.download_url.is_some());
+        }
+        let response = asset_download(
+            State(state.clone()),
+            RoutePath(assets[1].asset_id.clone()),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"# Platform managed\n"
+        );
+
+        // In-process Desktop `enrich_timeline` gets the same file assets.
+        let mut desktop_items = vec![item(&text)];
+        enrich_timeline("bare-desktop", root.to_str(), &mut desktop_items);
+        let desktop_assets = desktop_items[0]
+            .image_assets
+            .as_ref()
+            .expect("desktop bare workspace file assets");
+        assert_eq!(desktop_assets.len(), 3);
+
+        // Inline code, language-tagged code fences, mixed non-path fences,
+        // markdown links, missing files, directories, and outside paths must
+        // NOT register as bare workspace assets.
+        for ignored in [
+            format!("`{}`", notes.display()),
+            format!("```rust\n{}\n```", notes.display()),
+            format!("```sh\n{}\n```", notes.display()),
+            format!("```\n{}\necho hello\n```", notes.display()),
+            format!("[notes]({})", notes.display()),
+            format!("[notes](<{}>)", notes.display()),
+            format!("```\n{}\n```", outside.display()),
+            format!("```\n{}/../outside.png\n```", root.display()),
+            format!("```\n{}\n```", root.join("out").display()),
+            format!("```\n{}/missing.md\n```", root.display()),
+        ] {
+            let mut items = vec![item(&ignored)];
+            attach_to_items(&state, "bare-ignored", root.to_str(), &mut items).await;
+            assert!(items[0].image_assets.is_none(), "{ignored}");
+        }
     }
 }

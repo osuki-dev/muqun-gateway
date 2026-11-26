@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 
 use muqun_gateway::agents::message_images::resolve_host_media;
 use muqun_gateway::agents::{MessageImageAsset, TimelineItem, ToolCall};
-use rune::{col, el, icon, row, Cursor, El, SurfaceFit};
+use rune::{col, el, icon, row, text, Cursor, El, SurfaceFit};
 use rune_kit::Kit;
 
-use super::Tcx;
+use super::{glyphs, Tcx};
 use crate::ui::UiState;
 
 const MAX_W: f32 = 480.0;
@@ -278,4 +278,170 @@ pub fn gallery_sized(
         gallery = gallery.child(placeholder(cx.k, format!("img-{id}-p{i}"), height));
     }
     Some(gallery)
+}
+
+/// Non-image workspace files resolved by Gateway into `image_assets` (matching
+/// App `MessageAttachments` `files` filter), shown as compact clickable chips
+/// that open each file in Desktop's built-in viewer (or remote file viewer).
+pub fn file_chips(cx: &Tcx, item: &TimelineItem) -> Option<El> {
+    let directory = session_directory(cx.s, cx.asid);
+    let files = item_file_refs(item, directory);
+    if files.is_empty() {
+        return None;
+    }
+    let k = cx.k;
+    let mut wrap = row()
+        .key(format!("files-{}", item.id))
+        .gap(6.0)
+        .flex_wrap()
+        .w_full();
+    for (i, (src, name, parent)) in files.into_iter().enumerate() {
+        let open_src = src.clone();
+        let label = if parent.is_empty() {
+            name.clone()
+        } else {
+            format!("{parent}/{name}")
+        };
+        let mut chip = row()
+            .key(format!("file-{}-{i}", item.id))
+            .px(9.0)
+            .py(5.0)
+            .gap(6.0)
+            .center_y()
+            .radius(k.radius.sm)
+            .fill(k.c.layer_01.alpha(0.72))
+            .border(1.0, k.c.border_weak)
+            .child(
+                icon(&glyphs::DOCUMENT, 12.5)
+                    .color(k.c.icon_accent)
+                    .a11y_hidden(),
+            )
+            .child(
+                text(name)
+                    .font(k.ty.small_medium)
+                    .color(k.c.text_base)
+                    .single_line(),
+            );
+        if !parent.is_empty() {
+            chip = chip.child(
+                text(parent)
+                    .font(k.ty.small)
+                    .color(k.c.text_faint)
+                    .single_line(),
+            );
+        }
+        chip = chip.child(
+            icon(&glyphs::OPEN, 11.0)
+                .color(k.c.icon_faint)
+                .a11y_hidden(),
+        );
+        wrap = wrap.child(
+            k.interactive(chip)
+                .cursor(Cursor::Pointer)
+                .role("button")
+                .label(format!("{}: {label}", cx.t("Open file")))
+                .help(src)
+                .on_press(move |s: &mut UiState| s.open_timeline_file(&open_src)),
+        );
+    }
+    Some(wrap)
+}
+
+fn item_file_refs(item: &TimelineItem, directory: Option<&str>) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for asset in item.image_assets.iter().flatten() {
+        if asset.unavailable_reason.is_some()
+            || asset.mime.starts_with("image/")
+            || asset.src.trim().is_empty()
+        {
+            continue;
+        }
+        let raw = asset
+            .src
+            .strip_prefix("file://localhost")
+            .or_else(|| asset.src.strip_prefix("file://"))
+            .unwrap_or(&asset.src);
+        let rel = directory
+            .filter(|d| !d.is_empty())
+            .and_then(|d| {
+                let prefix = format!("{}/", d.trim_end_matches('/'));
+                raw.strip_prefix(&prefix)
+            })
+            .unwrap_or(raw);
+        let path = Path::new(rel);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| rel.to_string());
+        let parent = path
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .filter(|p| !p.is_empty() && p != ".")
+            .unwrap_or_default();
+        if !out.iter().any(|(seen, _, _)| seen == &asset.src) {
+            out.push((asset.src.clone(), name, parent));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use muqun_gateway::agents::{AgentPart, TimelineRole};
+
+    #[test]
+    fn item_file_refs_collects_non_image_assets_with_relative_parent() {
+        let item = TimelineItem {
+            id: "1".into(),
+            message_id: "m1".into(),
+            role: TimelineRole::Assistant,
+            part: AgentPart::Text { text: "ok".into() },
+            seq: 1,
+            updated_ms: 0,
+            ordinal: 0,
+            attachments: None,
+            image_assets: Some(vec![
+                MessageImageAsset {
+                    src: "/home/ryu/Work/osuki/docs/order-flow-hupun-erp.md".into(),
+                    asset_id: "a1".into(),
+                    url: "/api/assets/a1/content".into(),
+                    mime: "text/markdown; charset=utf-8".into(),
+                    width: None,
+                    height: None,
+                    thumbnail_url: None,
+                    preview_url: None,
+                    download_url: Some("/api/agent-images/a1/download".into()),
+                    version_url: None,
+                    size: Some(42),
+                    unavailable_reason: None,
+                },
+                MessageImageAsset {
+                    src: "/home/ryu/Work/osuki/out/chart.png".into(),
+                    asset_id: "a2".into(),
+                    url: "/api/assets/a2/content".into(),
+                    mime: "image/png".into(),
+                    width: Some(100),
+                    height: Some(100),
+                    thumbnail_url: None,
+                    preview_url: None,
+                    download_url: None,
+                    version_url: None,
+                    size: Some(100),
+                    unavailable_reason: None,
+                },
+            ]),
+            generation: None,
+            origin: None,
+        };
+        assert_eq!(
+            item_file_refs(&item, Some("/home/ryu/Work/osuki")),
+            vec![(
+                "/home/ryu/Work/osuki/docs/order-flow-hupun-erp.md".into(),
+                "order-flow-hupun-erp.md".into(),
+                "docs".into(),
+            )]
+        );
+    }
 }

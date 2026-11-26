@@ -503,7 +503,8 @@ pub fn part(cx: &Tcx, item: &TimelineItem) -> El {
     let k = cx.k;
     match &item.part {
         AgentPart::Text { .. } => {
-            // An agent's picture follows its words (App MessageAttachments).
+            // An agent's picture or referenced workspace files follow its words
+            // (App MessageAttachments).
             let (body, gallery) = text_parts(cx, item);
             let mut block = col().key(format!("text-{id}")).gap(8.0).w_full();
             if !body.is_empty() {
@@ -511,6 +512,9 @@ pub fn part(cx: &Tcx, item: &TimelineItem) -> El {
             }
             if let Some(g) = gallery {
                 block = block.child(g);
+            }
+            if let Some(files) = images::file_chips(cx, item) {
+                block = block.child(files);
             }
             block
         }

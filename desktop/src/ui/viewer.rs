@@ -746,12 +746,8 @@ fn header(s: &UiState, v: &Viewer, k: &Kit, fit_zoom: f32, layer: &mut Vec<El>) 
         if matches!(v.body, Body::Image(Some(_))) {
             let close = tr_ref(language, "Close");
             bar = bar.child(
-                rune_kit::IconButton::new(k.glyph.close)
-                    .label(close)
-                    .help(close)
+                super::icons::header_button(k.glyph.close, close)
                     .shortcut("Esc")
-                    .variant(rune_kit::IconButtonVariant::GhostMuted)
-                    .control_size(rune_kit::ControlSize::Large)
                     .on_press(|s: &mut UiState| {
                         s.zoom = None;
                         s.menu = None;

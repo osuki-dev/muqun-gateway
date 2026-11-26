@@ -259,21 +259,26 @@ pub fn chrome(id: &str, ctx: &PluginViewContext<'_>, body: El, layer: &mut Vec<E
         .key(format!("window-header-{id}-{:?}", ctx.surface))
         .w_full()
         .h(rune_kit::shell::TOOLBAR_HEIGHT)
-        .px(10.0)
-        .py(4.0)
-        .gap(8.0)
+        .pl(10.0)
+        .pr(6.0)
+        .gap(6.0)
         .center_y();
     if let Some(tabs) = (ctx.surface == PluginSlot::Drawer)
         .then(|| dock_tabs(ctx.s, ctx.k))
         .flatten()
     {
         header = header.child(tabs);
-    } else {
-        if let Some(plugin) = ctx.s.plugins.get(id) {
-            let raw_title = plugin
-                .window_title(ctx.s)
-                .unwrap_or_else(|| plugin.title(ctx.s.cfg.general.language));
-            header = header.child(
+    } else if let Some(plugin) = ctx.s.plugins.get(id) {
+        let raw_title = plugin
+            .window_title(ctx.s)
+            .unwrap_or_else(|| plugin.title(ctx.s.cfg.general.language));
+        header = header
+            .child(
+                plugin
+                    .render_icon(ctx.s, 14.0, ctx.k.c.text_accent)
+                    .a11y_hidden(),
+            )
+            .child(
                 text(sanitize_window_title(&raw_title))
                     .font(ctx.k.ty.ui_medium)
                     .color(ctx.k.c.text_base)
@@ -283,22 +288,25 @@ pub fn chrome(id: &str, ctx: &PluginViewContext<'_>, body: El, layer: &mut Vec<E
                     .w(0.0)
                     .grow(1.0),
             );
-        } else {
-            header = header.child(el().grow(1.0));
-        }
+    } else {
+        header = header.child(el().grow(1.0));
     }
+    let mut controls = row()
+        .key(format!("window-controls-{id}-{:?}", ctx.surface))
+        .gap(4.0)
+        .center_y();
     if let Some(actions) = ctx
         .s
         .plugins
         .get(id)
         .and_then(|p| p.window_actions(ctx.s, ctx.k))
     {
-        header = header.child(actions);
+        controls = controls.child(actions);
     }
     if ctx.surface == PluginSlot::Drawer {
-        header = header.child(dock_actions(ctx.s, ctx.k, false, layer));
+        controls = controls.child(dock_actions(ctx.s, ctx.k, false, layer));
     }
-    header = header.child(super::surface_switcher(
+    controls = controls.child(super::surface_switcher(
         ctx.s,
         ctx.k,
         ctx.s.cfg.general.language,
@@ -306,6 +314,7 @@ pub fn chrome(id: &str, ctx: &PluginViewContext<'_>, body: El, layer: &mut Vec<E
         ctx.surface,
         layer,
     ));
+    header = header.child(controls);
     col()
         .key(format!("plugin-window-{id}-{:?}", ctx.surface))
         .w_full()
@@ -313,5 +322,10 @@ pub fn chrome(id: &str, ctx: &PluginViewContext<'_>, body: El, layer: &mut Vec<E
         .grow(1.0)
         .min_h(0.0)
         .child(header)
+        .child(
+            el().w_full()
+                .h(1.0)
+                .fill(ctx.k.alpha(ctx.k.c.border_weak, 0.25)),
+        )
         .child(body.h(0.0).grow(1.0).min_h(0.0))
 }

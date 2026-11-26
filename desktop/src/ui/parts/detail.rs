@@ -1,7 +1,7 @@
 use muqun_gateway::agents::ports::AgentSessionSnapshot;
 use muqun_gateway::agents::AgentSessionId;
 use rune::{col, row, text, El};
-use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit};
+use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
 
 use crate::config::Language;
 use crate::plugin::{DesktopPlugin, PluginViewContext};
@@ -189,7 +189,7 @@ fn title(s: &UiState, asid: &str) -> String {
 
 fn actions(s: &UiState, k: &Kit, sheet: &DetailSheet, asid: &str) -> El {
     let t = |en| tr_ref(s.cfg.general.language, en);
-    let mut bar = row().center_y().gap(2.0);
+    let mut bar = row().center_y().gap(4.0);
     if sheet.stack.len() > 1 {
         bar = bar.child(
             Button::new(t("Back"))
@@ -202,21 +202,13 @@ fn actions(s: &UiState, k: &Kit, sheet: &DetailSheet, asid: &str) -> El {
     }
     let (refresh, open) = (asid.to_string(), asid.to_string());
     bar.child(
-        IconButton::new(&crate::ui::icons::REFRESH)
-            .variant(IconButtonVariant::Ghost)
-            .label(t("Refresh"))
-            .help(t("Refresh"))
-            .control_size(ControlSize::Small)
+        crate::ui::icons::header_button(&crate::ui::icons::REFRESH, t("Refresh"))
             .on_press(move |s: &mut UiState| s.refresh_detail(&refresh))
             .build(k)
             .key("detail-refresh"),
     )
     .child(
-        IconButton::new(&crate::ui::icons::OPEN_EXTERNAL)
-            .label(t("Open session"))
-            .help(t("Open session"))
-            .variant(IconButtonVariant::Ghost)
-            .control_size(ControlSize::Small)
+        crate::ui::icons::header_button(&crate::ui::icons::OPEN_EXTERNAL, t("Open session"))
             .build(k)
             .key("detail-open")
             .on_press_tx(move |s: &mut UiState, tx: &mut rune::Tx| {

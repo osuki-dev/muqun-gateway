@@ -179,30 +179,54 @@ impl Session {
         let is_reattach = session_id.is_some();
         let id = match session_id {
             Some(existing) => existing,
-            None => client.create_session(None, Some(cwd.clone()), size.cols, size.rows)?,
+            None => client.create_session_with_size(
+                None,
+                Some(cwd.clone()),
+                size.cols,
+                size.rows,
+                u16::try_from(size.cell_w).ok(),
+                u16::try_from(size.cell_h).ok(),
+            )?,
         };
-        let mut stream = client.attach_raw(&id)?;
+        let (mut stream, declared_scrollback_len) = client.attach_raw_with_len(&id)?;
         let mut initial_scrollback = Vec::new();
         if is_reattach {
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(25)));
-            let mut sb_buf = [0u8; 64 * 1024];
-            // Allow room beyond the 1 MiB daemon ring for synthetic DEC mode
-            // restoration prefix/suffix emitted on wrapped reattach.
             const MAX_INITIAL_REPLAY: usize = super::daemon::DEFAULT_SCROLLBACK_CAPACITY + 4096;
-            loop {
-                match stream.read(&mut sb_buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        initial_scrollback.extend_from_slice(&sb_buf[..n]);
-                        if initial_scrollback.len() >= MAX_INITIAL_REPLAY {
-                            break;
+            if let Some(expected) = declared_scrollback_len {
+                let target = expected.min(MAX_INITIAL_REPLAY);
+                if target > 0 {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    initial_scrollback.resize(target, 0);
+                    let mut filled = 0;
+                    while filled < target {
+                        match stream.read(&mut initial_scrollback[filled..]) {
+                            Ok(0) => break,
+                            Ok(n) => filled += n,
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(_) => break,
                         }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
+                    initial_scrollback.truncate(filled);
+                    let _ = stream.set_read_timeout(None);
                 }
+            } else {
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(25)));
+                let mut sb_buf = [0u8; 64 * 1024];
+                loop {
+                    match stream.read(&mut sb_buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            initial_scrollback.extend_from_slice(&sb_buf[..n]);
+                            if initial_scrollback.len() >= MAX_INITIAL_REPLAY {
+                                break;
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                let _ = stream.set_read_timeout(None);
             }
-            let _ = stream.set_read_timeout(None);
         }
         let mut reader_stream = stream.try_clone()?;
         let mut writer_stream = stream;
@@ -298,10 +322,12 @@ impl Session {
                                 nudge_restore = None;
                                 if engine.size() != target {
                                     log(engine.resize(target));
-                                    let _ = client_clone.resize_session(
+                                    let _ = client_clone.resize_session_with_cells(
                                         &id_clone,
                                         target.cols,
                                         target.rows,
+                                        u16::try_from(target.cell_w).ok(),
+                                        u16::try_from(target.cell_h).ok(),
                                     );
                                     nudged = true;
                                     pending = true;
@@ -320,8 +346,13 @@ impl Session {
                                     ..cur
                                 };
                                 log(engine.resize(nudge));
-                                let _ =
-                                    client_clone.resize_session(&id_clone, nudge.cols, nudge.rows);
+                                let _ = client_clone.resize_session_with_cells(
+                                    &id_clone,
+                                    nudge.cols,
+                                    nudge.rows,
+                                    u16::try_from(nudge.cell_w).ok(),
+                                    u16::try_from(nudge.cell_h).ok(),
+                                );
                                 nudge_restore = Some((now + Duration::from_millis(90), cur));
                                 nudged = true;
                                 pending = true;
@@ -422,8 +453,13 @@ impl Session {
                                         reattach_nudge_at = None;
                                         nudge_restore = None;
                                         log(engine.resize(s));
-                                        let _ =
-                                            client_clone.resize_session(&id_clone, s.cols, s.rows);
+                                        let _ = client_clone.resize_session_with_cells(
+                                            &id_clone,
+                                            s.cols,
+                                            s.rows,
+                                            u16::try_from(s.cell_w).ok(),
+                                            u16::try_from(s.cell_h).ok(),
+                                        );
                                     } else {
                                         // Cell pixel metrics (HiDPI scale) may still differ from the
                                         // daemon attach fallback; update pixel size without cancelling
