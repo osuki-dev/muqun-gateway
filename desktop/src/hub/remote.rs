@@ -71,7 +71,6 @@ struct EncryptedResponsePayload {
     headers: HashMap<String, String>,
     body: String,
     #[serde(default)]
-    #[allow(dead_code)]
     content_encoding: Option<String>,
 }
 
@@ -289,7 +288,8 @@ impl RemoteHub {
                 .http
                 .request(method.clone(), url)
                 .header("x-muqun-transport", "1")
-                .header("x-muqun-device", device_id);
+                .header("x-muqun-device", device_id)
+                .header("x-muqun-envelope-accept", "gzip");
 
             if method == Method::GET {
                 let envelope_json = serde_json::to_vec(&envelope).map_err(|e| {
@@ -336,12 +336,14 @@ impl RemoteHub {
                             "invalid decrypted response payload: {e}"
                         )))
                     })?;
-                let inner_body = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                let raw_body = base64::engine::general_purpose::URL_SAFE_NO_PAD
                     .decode(&resp_payload.body)
                     .or_else(|_| {
                         base64::engine::general_purpose::STANDARD.decode(&resp_payload.body)
                     })
                     .unwrap_or_default();
+                let inner_body =
+                    decode_envelope_body(raw_body, resp_payload.content_encoding.as_deref())?;
                 Ok((resp_payload.status, inner_body))
             } else {
                 Ok((outer_status, outer_bytes))
@@ -458,7 +460,9 @@ impl RemoteHub {
             };
         }
         let mut snapshot: AgentSessionSnapshot = decode(data)?;
-        enrich_local_media(&mut snapshot);
+        if self.targets_local_machine() {
+            enrich_local_media(&mut snapshot);
+        }
         Ok(snapshot)
     }
 
@@ -2569,6 +2573,32 @@ fn parse_task_frame(frame: &Value) -> Option<TaskHubEvent> {
     }
 }
 
+const MAX_DECOMPRESSED_ENVELOPE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn decode_envelope_body(
+    raw_body: Vec<u8>,
+    content_encoding: Option<&str>,
+) -> Result<Vec<u8>, HubError> {
+    if !content_encoding.is_some_and(|enc| enc.eq_ignore_ascii_case("gzip")) {
+        return Ok(raw_body);
+    }
+    use std::io::Read as _;
+    let mut decoder = flate2::read::GzDecoder::new(raw_body.as_slice());
+    let mut out = Vec::new();
+    let mut limited = (&mut decoder).take(MAX_DECOMPRESSED_ENVELOPE_BYTES + 1);
+    limited.read_to_end(&mut out).map_err(|err| {
+        HubError::Agent(AgentError::Network(format!(
+            "failed to decompress remote response: {err}"
+        )))
+    })?;
+    if out.len() as u64 > MAX_DECOMPRESSED_ENVELOPE_BYTES {
+        return Err(HubError::Agent(AgentError::Network(
+            "decompressed remote response exceeded 64 MiB limit".into(),
+        )));
+    }
+    Ok(out)
+}
+
 /// True when `path` looks like an absolute path on Unix, macOS, or Windows, or
 /// starts with `~` for remote gateway expansion. Used instead of `Path::is_dir`
 /// so remote sessions can search directories that do not exist on this machine.
@@ -3086,5 +3116,21 @@ mod tests {
             clean_err,
             HubError::Agent(AgentError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn decode_envelope_body_decompresses_gzip_and_passes_plain_bytes() {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write as _;
+
+        let plain = br#"{"ok":true,"data":{"timeline":[1,2,3]}}"#.to_vec();
+        assert_eq!(decode_envelope_body(plain.clone(), None).unwrap(), plain);
+
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&plain).unwrap();
+        let gz = enc.finish().unwrap();
+        assert_eq!(decode_envelope_body(gz, Some("gzip")).unwrap(), plain);
+
+        assert!(decode_envelope_body(b"not-gzip".to_vec(), Some("gzip")).is_err());
     }
 }
