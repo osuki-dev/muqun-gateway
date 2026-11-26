@@ -126,8 +126,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: test desktop
         run: cargo test -p muqun-desktop --locked
-      - name: Check Linux WebView helper
-        if: runner.os == 'Linux'
+      - name: Check WebView helper
+        if: runner.os == 'Linux' || runner.os == 'macOS'
         run: |
           cargo fmt --manifest-path desktop/webview-helper/Cargo.toml -- --check
           cargo clippy --manifest-path desktop/webview-helper/Cargo.toml --all-targets --locked -- -D warnings

@@ -34,6 +34,6 @@ fi
 # recovery; do not inject target-cpu=native, panic=abort or UPX into releases.
 export CARGO_INCREMENTAL=0
 cargo build --manifest-path "$ROOT/Cargo.toml" -p muqun-desktop --release --locked
-if [[ "$(uname -s)" == Linux ]]; then
+if [[ "$(uname -s)" == Linux || "$(uname -s)" == Darwin ]]; then
   cargo build --manifest-path "$ROOT/desktop/webview-helper/Cargo.toml" --release --locked
 fi

@@ -19,6 +19,7 @@ mkdir -p "$RES/installers" "$APP/Contents/Helpers"
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$APP/Contents/Helpers/muqun-desktop-install" "$ROOT"/desktop/installer/*.go
 cp "$ROOT/install-desktop.sh" "$ROOT/install.sh" "$RES/installers/"
 cp "$TARGET/release/muqun-desktop" "$APP/Contents/MacOS/"
+cp "$TARGET/release/muqun-wry-embedded" "$APP/Contents/MacOS/"
 cp "$ROOT/LICENSE" "$ROOT/LICENSE-MIT" "$ROOT/desktop/assets/glyphs/LICENSE-octicons" "$RES/"
 for file in plugin.json review.ts README.md; do
   cp "$ROOT/desktop/assets/plugins/review-center/$file" "$RES/bundled-plugins/review-center/"
@@ -56,8 +57,11 @@ if [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then
 fi
 if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
   codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$APP/Contents/Helpers/muqun-desktop-install"
+  codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$APP/Contents/MacOS/muqun-wry-embedded"
   codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$APP"
 else
+  codesign --force --sign - "$APP/Contents/Helpers/muqun-desktop-install"
+  codesign --force --sign - "$APP/Contents/MacOS/muqun-wry-embedded"
   codesign --force --sign - "$APP"
   echo 'Ad-hoc candidate: not notarized for public distribution.' >&2
 fi

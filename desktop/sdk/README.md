@@ -149,7 +149,7 @@ an optional `placeholder`. No input automatically submits a form.
 
 A Form has an action, a submitLabel, and TextField children. Each field has a unique name within the form, a label, an optional initial value and an optional multiline flag. The callback receives the submitted strings in context.form. The host keeps drafts in the originating view until a successful response replaces it or the user closes it. Raw field values are excluded from the diagnostics journal.
 
-Declare required native features in the package's muqun.requires array. This host recognizes "native-view", "forms", "terminal-entry" and (on Linux) "webview-entry". For forms, require SDK >=0.0.3-dev and list "forms". Discovery rejects an unsupported required capability and ignores unknown optional manifest metadata.
+Declare required native features in the package's muqun.requires array. This host recognizes "native-view", "forms", "terminal-entry" and (on Linux and macOS) "webview-entry". For forms, require SDK >=0.0.3-dev and list "forms". Discovery rejects an unsupported required capability and ignores unknown optional manifest metadata.
 
 ### Embed a local web application
 

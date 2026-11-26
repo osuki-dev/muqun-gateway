@@ -1,33 +1,29 @@
-use futures_util::StreamExt;
-use gtk::glib;
-use gtk::prelude::*;
 use serde_json::Value;
 use std::{
-    cell::Cell,
-    io::{self, BufRead, Write},
+    io::{self, Write},
     sync::{
         Arc,
         atomic::{AtomicU8, Ordering},
         mpsc,
     },
 };
-use webkit2gtk::WebViewExt;
-use wry::{WebViewBuilder, WebViewBuilderExtUnix, WebViewExtUnix};
 
 /// GTK allocates in its monitor's integer scale. WebKit zoom reconciles it
 /// with the owning Rune window (which can also have a fractional scale).
-struct Viewport {
-    widget: (i32, i32),
-    zoom: f64,
-    raster: (i32, i32),
+pub(crate) struct Viewport {
+    #[allow(dead_code)]
+    pub(crate) widget: (i32, i32),
+    #[allow(dead_code)]
+    pub(crate) zoom: f64,
+    pub(crate) raster: (i32, i32),
 }
 
-fn viewport(event: &Value, gtk_scale: i32) -> Viewport {
+pub(crate) fn viewport(event: &Value, native_scale: i32) -> Viewport {
     let dimension =
         |key: &str, default: i64| event[key].as_i64().unwrap_or(default).clamp(64, 8192) as f64;
     let w = dimension("width", 800);
     let h = dimension("height", 600);
-    let native = gtk_scale.max(1);
+    let native = native_scale.max(1);
     // Bound the raw frame to 64 MiB. Choose one scale for both dimensions so
     // hitting the budget doesn't change the page's aspect ratio or CSS layout.
     let max_scale = (8192.0 / w.max(h)).min((16_777_216.0 / (w * h)).sqrt());
@@ -56,20 +52,58 @@ fn viewport(event: &Value, gtk_scale: i32) -> Viewport {
     }
 }
 
+#[cfg(target_os = "linux")]
 mod context;
+#[cfg(target_os = "linux")]
 mod cursor;
+#[cfg(target_os = "linux")]
 mod draft;
+#[cfg(target_os = "linux")]
 mod frames;
+#[cfg(target_os = "linux")]
 mod input;
+#[cfg(target_os = "macos")]
+mod macos;
 mod navigation;
+
+fn spawn_writer(idle: Arc<AtomicU8>) -> mpsc::SyncSender<Vec<u8>> {
+    // Only the writer owns the previous frame. The capture loop backs off
+    // after repeated identical images, and resumes immediately on host input.
+    let (pixels, writer) = mpsc::sync_channel::<Vec<u8>>(1);
+    std::thread::spawn(move || {
+        let mut out = io::stdout().lock();
+        let mut previous = Vec::new();
+        for frame in writer {
+            let metadata = frame.starts_with(&[0; 4]);
+            if !metadata && frame == previous {
+                let old = idle.load(Ordering::Relaxed);
+                let _ = idle.compare_exchange(
+                    old,
+                    old.saturating_add(1),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+                continue;
+            }
+            if out.write_all(&frame).and_then(|_| out.flush()).is_err() {
+                return;
+            }
+            if !metadata {
+                idle.store(0, Ordering::Relaxed);
+                previous = frame;
+            }
+        }
+    });
+    pixels
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let read = io::stdin();
     let mut start = String::new();
     read.read_line(&mut start)?;
     let event: Value = serde_json::from_str(&start)?;
-    let url = event["url"].as_str().ok_or("Expected URL")?;
-    let uri = url::Url::parse(url)?;
+    let url = event["url"].as_str().ok_or("Expected URL")?.to_owned();
+    let uri = url::Url::parse(&url)?;
     let browser = event["mode"] == "browser";
     if event["type"] != "open"
         || !navigation::allowed(&uri, None)
@@ -77,6 +111,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("Expected a local panel".into());
     }
+    let idle = Arc::new(AtomicU8::new(0));
+    let pixels = spawn_writer(Arc::clone(&idle));
+
+    #[cfg(target_os = "linux")]
+    {
+        run_linux(read, event, &url, uri, browser, pixels, idle)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        drop(read);
+        macos::run(event, url, uri, browser, pixels, idle)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (read, event, url, uri, browser, pixels, idle);
+        Err("Embedded WebView helper is only supported on Linux and macOS".into())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux(
+    read: io::Stdin,
+    event: Value,
+    url: &str,
+    uri: url::Url,
+    browser: bool,
+    pixels: mpsc::SyncSender<Vec<u8>>,
+    idle: Arc<AtomicU8>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use futures_util::StreamExt;
+    use gtk::glib;
+    use gtk::prelude::*;
+    use std::cell::Cell;
+    use std::io::BufRead;
+    use webkit2gtk::WebViewExt;
+    use wry::{WebViewBuilder, WebViewBuilderExtUnix, WebViewExtUnix};
+
     configure_linux_renderer();
     gtk::init()?;
     let window = gtk::OffscreenWindow::new();
@@ -120,35 +191,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 && tx.unbounded_send(command).is_err()
             {
                 break;
-            }
-        }
-    });
-    // Only the writer owns the previous frame. The capture thread backs off
-    // after repeated identical images, and resumes immediately on host input.
-    let idle = Arc::new(AtomicU8::new(0));
-    let writer_idle = Arc::clone(&idle);
-    let (pixels, writer) = mpsc::sync_channel::<Vec<u8>>(1);
-    std::thread::spawn(move || {
-        let mut out = io::stdout().lock();
-        let mut previous = Vec::new();
-        for frame in writer {
-            let metadata = frame.starts_with(&[0; 4]);
-            if !metadata && frame == previous {
-                let old = writer_idle.load(Ordering::Relaxed);
-                let _ = writer_idle.compare_exchange(
-                    old,
-                    old.saturating_add(1),
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
-                continue;
-            }
-            if out.write_all(&frame).and_then(|_| out.flush()).is_err() {
-                return;
-            }
-            if !metadata {
-                writer_idle.store(0, Ordering::Relaxed);
-                previous = frame;
             }
         }
     });
@@ -235,6 +277,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// WebKitGTK drawing into an offscreen GDK window needs a usable EGL context.
 /// NVIDIA GLVND can abort the process during GTK initialization on Wayland.
 /// Select Mesa software rendering for this helper on affected systems only.
+#[cfg(target_os = "linux")]
 fn configure_linux_renderer() {
     use std::{env, path::Path};
     let mesa = "/usr/share/glvnd/egl_vendor.d/50_mesa.json";

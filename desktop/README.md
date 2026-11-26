@@ -83,7 +83,7 @@ and JetBrains Mono Nerd Font (`src/platform/fonts.rs`) — missing ones fall bac
 
 ## Release build
 
-Linux builds include a sibling executable, `muqun-wry-embedded`, for embedded browser
+Linux and macOS builds include a sibling executable, `muqun-wry-embedded`, for embedded browser
 and plugin tabs. It uses the system WebKitGTK 4.1 library. Building the helper requires
 the GTK 3 and WebKitGTK 4.1 development packages. For a local debug build, run
 `cargo build --locked --manifest-path desktop/webview-helper/Cargo.toml` alongside the

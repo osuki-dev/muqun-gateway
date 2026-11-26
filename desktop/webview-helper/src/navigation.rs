@@ -1,14 +1,18 @@
 //! Emit location and history state after WebKit navigation. An idle browser
 //! has no navigation timer. Backpressure coalesces updates to the latest state.
+#[cfg(target_os = "linux")]
 use gtk::{glib, prelude::*};
+#[cfg(target_os = "linux")]
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
     sync::mpsc::{SyncSender, TrySendError},
     time::Duration,
 };
+#[cfg(target_os = "linux")]
 use webkit2gtk::{LoadEvent, WebContextExt, WebViewExt};
 
+#[cfg(target_os = "linux")]
 fn favicon(web: &webkit2gtk::WebView) -> Option<Vec<u8>> {
     use webkit2gtk::FaviconDatabaseExt;
     web.context()?
@@ -32,7 +36,7 @@ fn favicon(web: &webkit2gtk::WebView) -> Option<Vec<u8>> {
     Some(image.read_pixel_bytes().to_vec())
 }
 
-fn title(value: &str) -> String {
+pub fn clean_title(value: &str) -> String {
     value
         .chars()
         .filter(|c| {
@@ -44,6 +48,7 @@ fn title(value: &str) -> String {
         .into()
 }
 
+#[cfg(target_os = "linux")]
 struct Updates {
     frames: SyncSender<Vec<u8>>,
     web: glib::WeakRef<webkit2gtk::WebView>,
@@ -54,6 +59,7 @@ struct Updates {
     document: RefCell<Option<(String, String)>>,
 }
 
+#[cfg(target_os = "linux")]
 impl Updates {
     fn queue(self: &Rc<Self>, delay: Duration) {
         if self.queued.replace(true) {
@@ -97,6 +103,7 @@ impl Updates {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub fn observe(web: &webkit2gtk::WebView, frames: SyncSender<Vec<u8>>) {
     let state = Rc::new(Updates {
         frames,
@@ -148,6 +155,7 @@ pub fn observe(web: &webkit2gtk::WebView, frames: SyncSender<Vec<u8>>) {
     state.queue(Duration::ZERO);
 }
 
+#[cfg(target_os = "linux")]
 fn observe_icon_changes(web: &webkit2gtk::WebView, state: &Rc<Updates>) {
     use webkit2gtk::{
         UserContentInjectedFrames, UserContentManagerExt, UserScript, UserScriptInjectionTime,
@@ -177,7 +185,7 @@ fn observe_icon_changes(web: &webkit2gtk::WebView, state: &Rc<Updates>) {
         if let Some(value) = data["title"].as_str() {
             state.document.replace(Some((
                 data["url"].as_str().unwrap_or_default().into(),
-                title(value),
+                clean_title(value),
             )));
             state.queue(Duration::ZERO);
             return;
