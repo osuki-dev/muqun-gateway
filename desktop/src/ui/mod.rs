@@ -452,12 +452,6 @@ pub struct UiState {
     pub right_open: bool,
     /// Target session binding for the Git and Activity panels (follow focus or pinned).
     pub panel_target: PanelTarget,
-    /// Latest monotonic frame clock (seconds) observed in [`UiState::poll_frame`].
-    pub frame_clock: f64,
-    /// Pending hover-to-focus tile switch `(tile_index, entered_at_secs)` waiting for
-    /// the dwell threshold so rapid mouse transit across middle tiles toward the right
-    /// dock never steals focus.
-    pub hover_focus_pending: Option<(usize, f64)>,
     /// The open dropdown or row menu.
     pub menu: Option<OpenMenu>,
 
@@ -785,8 +779,6 @@ impl UiState {
                 .with_width(cfg.ui.right()),
             right_open: false,
             panel_target: PanelTarget::FollowFocused,
-            frame_clock: 0.0,
-            hover_focus_pending: None,
             menu: None,
             sessions: Vec::new(),
             directories: HashMap::new(),
@@ -1027,7 +1019,6 @@ impl UiState {
     /// Keep the window waking while the splash is animating.
     /// Every frame Rune asks: the splash and a recording's waveform animate.
     pub fn poll_frame(&mut self, t: f64, tx: &mut Tx) -> bool {
-        self.frame_clock = t;
         if std::mem::take(&mut self.restart_on_frame) {
             tx.quit();
             return true;
@@ -1041,7 +1032,6 @@ impl UiState {
         let term = self.poll_terminal(t, tx);
         let search = self.poll_search(tx);
         let echoes = self.poll_echoes(tx);
-        let hover_focus = self.poll_hover_focus(t, tx);
         self.poll_local_invite(tx)
             | self.poll_splash(t, tx)
             | voice
@@ -1049,30 +1039,7 @@ impl UiState {
             | term
             | search
             | echoes
-            | hover_focus
             | plugins
-    }
-
-    /// Commit a pending hover-to-focus tile switch once the pointer has dwelled
-    /// long enough that it is not merely crossing toward the right dock.
-    pub fn poll_hover_focus(&mut self, t: f64, tx: &mut Tx) -> bool {
-        let Some((tile_idx, since)) = self.hover_focus_pending else {
-            return false;
-        };
-        if !tiles::can_hover_focus_tile(self, tile_idx) {
-            self.hover_focus_pending = None;
-            return false;
-        }
-        let elapsed = (t - since).max(0.0);
-        if elapsed >= tiles::HOVER_FOCUS_DWELL_SECS {
-            self.hover_focus_pending = None;
-            tiles::commit_hovered_tile(self, tile_idx, tx);
-            return true;
-        }
-        tx.wake_after(std::time::Duration::from_secs_f64(
-            (tiles::HOVER_FOCUS_DWELL_SECS - elapsed).max(0.01),
-        ));
-        false
     }
 
     pub fn poll_splash(&mut self, t: f64, _: &mut Tx) -> bool {

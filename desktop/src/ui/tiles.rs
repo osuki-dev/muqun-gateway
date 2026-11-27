@@ -1086,43 +1086,22 @@ struct Place {
     corner: bool,
 }
 
-/// Dwell threshold (seconds) before hover-to-focus switches the active split tile.
-/// Short enough to feel instant when pausing on a pane, long enough that
-/// crossing intermediate tiles toward the right dock does not steal focus.
-pub(super) const HOVER_FOCUS_DWELL_SECS: f64 = 0.15;
-
 /// Hover activation leaves modal interactions and composition with their owner.
-pub(super) fn can_hover_focus_tile(s: &UiState, i: usize) -> bool {
-    i != s.focus
-        && i < s.tiles.len()
-        && s.mode == Mode::Session
-        && s.menu.is_none()
-        && s.row_menu.is_none()
-        && s.context_open.is_none()
-        && s.zoom.is_none()
-        && s.voice.is_none()
-        && s.draft.preedit().is_none()
-        && !s.timeline_search.active
-        && s.tile_drag.is_none()
-        && s.tile_card_drag.is_none()
-        && !s.drop_hover
-}
-
-/// Schedule a dwell-guarded hover focus on tile `i`.
-fn schedule_hovered_tile(s: &mut UiState, i: usize, tx: &mut rune::Tx) {
-    if !can_hover_focus_tile(s, i) {
-        return;
-    }
-    if s.hover_focus_pending.is_some_and(|(idx, _)| idx == i) {
-        return;
-    }
-    s.hover_focus_pending = Some((i, s.frame_clock));
-    tx.wake_after(std::time::Duration::from_secs_f64(HOVER_FOCUS_DWELL_SECS));
-}
-
-/// Commit a hover focus switch once dwell completes.
-pub(super) fn commit_hovered_tile(s: &mut UiState, i: usize, tx: &mut rune::Tx) {
-    if !can_hover_focus_tile(s, i) {
+fn focus_hovered_tile(s: &mut UiState, i: usize, tx: &mut rune::Tx) {
+    if i == s.focus
+        || i >= s.tiles.len()
+        || s.mode != Mode::Session
+        || s.menu.is_some()
+        || s.row_menu.is_some()
+        || s.context_open.is_some()
+        || s.zoom.is_some()
+        || s.voice.is_some()
+        || s.draft.preedit().is_some()
+        || s.timeline_search.active
+        || s.tile_drag.is_some()
+        || s.tile_card_drag.is_some()
+        || s.drop_hover
+    {
         return;
     }
     s.focus_tile(i);
@@ -1176,13 +1155,10 @@ fn tile(
         })
         .on_hover_change(move |s: &mut UiState, inside, tx| {
             if inside {
-                schedule_hovered_tile(s, i, tx);
-            } else if s.hover_focus_pending.is_some_and(|(idx, _)| idx == i) {
-                s.hover_focus_pending = None;
+                focus_hovered_tile(s, i, tx);
             }
         })
         .on_background_press(move |s: &mut UiState| {
-            s.hover_focus_pending = None;
             if s.focus != i {
                 s.focus_tile(i);
             }
@@ -2047,59 +2023,6 @@ mod tests {
             rt.selection().map(|s| s.text().to_owned()).as_deref(),
             Some("Reading")
         );
-    }
-
-    #[test]
-    fn rapid_hover_transit_across_tile_does_not_steal_focus() {
-        use rune::{Env, Runtime};
-        let (tx, _) = crate::model::commands::channel();
-        let mut s = UiState::new(tx);
-        crate::ui::scenes::scenes()
-            .iter()
-            .find(|(name, _)| *name == "split2")
-            .unwrap()
-            .1(&mut s);
-        s.splash = None;
-        s.focus_tile(0);
-        s.open_activity_panel();
-        let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
-        rt.poll = Some(UiState::poll_frame);
-        for _ in 0..10 {
-            rt.frame(1.0 / 60.0);
-        }
-        let mut drafts: Vec<_> = rt
-            .elements()
-            .into_iter()
-            .filter(|n| n.key.as_deref() == Some("draft"))
-            .collect();
-        drafts.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
-        let tile1_rect = drafts[1].rect;
-        // Move quickly across tile 1 toward the right panel (< 150ms dwell).
-        rt.pointer_move(tile1_rect[0] + 20.0, tile1_rect[1] + 10.0);
-        for _ in 0..4 {
-            rt.frame(1.0 / 60.0);
-        }
-        assert_eq!(
-            rt.state.focus, 0,
-            "crossing tile 1 for <150ms must not steal focus"
-        );
-        assert_eq!(rt.state.hover_focus_pending.map(|(i, _)| i), Some(1));
-        // Exit tile 1 onto the right dock panel before dwell elapses.
-        let panel_rect = rt
-            .elements()
-            .into_iter()
-            .find(|n| n.key.as_deref() == Some("activity-panel"))
-            .expect("activity panel mounted")
-            .rect;
-        rt.pointer_move(panel_rect[0] + 20.0, panel_rect[1] + 20.0);
-        for _ in 0..20 {
-            rt.frame(1.0 / 60.0);
-        }
-        assert_eq!(
-            rt.state.focus, 0,
-            "crossing tile 1 to reach the right panel keeps tile 0 focused"
-        );
-        assert!(rt.state.hover_focus_pending.is_none());
     }
 
     #[test]
