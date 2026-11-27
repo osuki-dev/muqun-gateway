@@ -37,6 +37,7 @@ use crate::{
 
 mod originals;
 mod previews;
+pub(crate) mod tool_media;
 mod versions;
 pub(crate) use originals::content as image_content;
 pub use originals::original_asset_id;
@@ -283,26 +284,140 @@ fn promote_uploaded_attachment_suffix(items: &mut [TimelineItem]) {
 
 /// Attach `image_assets` the way the HTTP egress does for the App
 /// (`attach_to_items` / `originals::attach`), for an in-process desktop that
-/// never hits `/api`. Same fields the App reads on each text part.
+/// never hits `/api`. Same fields the App reads on each text part and tool row.
 pub fn enrich_timeline(asid: &str, directory: Option<&str>, items: &mut [TimelineItem]) {
     promote_uploaded_attachment_suffix(items);
-    // Tool `content` media is resolved at paint time; only text embeds and
-    // attachments need the host map (and must not run on every tool delta).
-    if !items.iter().any(may_embed_image) && !items.iter().any(|item| item.attachments.is_some()) {
+    let mut has_tool = false;
+    for item in items.iter_mut() {
+        if let AgentPart::Tool(call) = &mut item.part {
+            tool_media::normalize_tool_call(call);
+            has_tool = true;
+        }
+    }
+    let has_text_or_attach =
+        items.iter().any(may_embed_image) || items.iter().any(|item| item.attachments.is_some());
+    if !has_text_or_attach && !has_tool {
         return;
     }
     let images = local_images();
     let root = directory
         .filter(|d| !d.is_empty())
         .and_then(|d| images.remember_root(asid, Some(d)));
-    if let Some(root) = root.as_ref() {
-        images.attach(root, items);
+    if has_text_or_attach {
+        if let Some(root) = root.as_ref() {
+            images.attach(root, items);
+        }
+        // Codex / Cursor put user photos in `attachments` (often absolute uploads)
+        // with `[Image #N]` in the text. The HTTP path runs `originals::attach`;
+        // Desktop gets the same `image_assets` shape here, including when the
+        // session directory is not known yet.
+        attach_local_attachments(root.as_deref(), items);
     }
-    // Codex / Cursor put user photos in `attachments` (often absolute uploads)
-    // with `[Image #N]` in the text. The HTTP path runs `originals::attach`;
-    // Desktop gets the same `image_assets` shape here, including when the
-    // session directory is not known yet.
-    attach_local_attachments(root.as_deref(), items);
+    if has_tool {
+        attach_local_tool_files(root.as_deref(), items);
+    }
+}
+
+/// Resolve canonical tool `file` content blocks (and completed empty-output
+/// workspace file reads) into `image_assets` for in-process Desktop clients,
+/// matching the HTTP egress contract in `originals::attach`.
+fn attach_local_tool_files(root: Option<&Path>, items: &mut [TimelineItem]) {
+    for item in items {
+        let AgentPart::Tool(call) = &mut item.part else {
+            continue;
+        };
+        if tool_media::is_read_file_tool(&call.name)
+            && call.state == crate::agents::domain::ToolCallStatus::Completed
+            && !tool_media::has_text_output(call)
+            && !call
+                .content
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| part["type"] == "file" && part["uri"].is_string())
+                })
+        {
+            if let (Some(session_root), Some(path)) = (root, tool_media::input_path(&call.input)) {
+                if hosted_file(path, session_root).is_some() {
+                    if let Some(uri) = tool_media::path_to_uri(path) {
+                        let block = serde_json::json!({ "type": "file", "uri": uri });
+                        match &mut call.content {
+                            Some(serde_json::Value::Array(existing)) => existing.push(block),
+                            _ => call.content = Some(serde_json::Value::Array(vec![block])),
+                        }
+                    }
+                }
+            }
+        }
+        let viewed_uri = tool_media::viewed_image_uri(call);
+        let Some(serde_json::Value::Array(content)) = &mut call.content else {
+            continue;
+        };
+        let mut discovered = Vec::new();
+        for part in content.iter_mut() {
+            if part["type"] != "file" {
+                continue;
+            }
+            let Some(uri) = part.get("uri").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if uri.starts_with("data:") || uri.starts_with("/api/") {
+                continue;
+            }
+            let allow_account_image = viewed_uri.as_deref() == Some(uri);
+            let resolved = if allow_account_image {
+                root.and_then(|r| account_file(uri, r).map(|(p, _)| p))
+                    .or_else(|| resolve_host_media(uri, None))
+            } else {
+                root.and_then(|r| hosted_file(uri, r).map(|(p, _)| p))
+            };
+            let Some(path) = resolved else {
+                continue;
+            };
+            let head = read_asset_head(&path);
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| uri.to_owned());
+            let kind = sniff_asset_type(&head, &name);
+            if allow_account_image && kind.kind != AssetKind::Image {
+                continue;
+            }
+            part["mime"] = serde_json::Value::String(kind.mime.to_owned());
+            let (width, height) = if kind.kind == AssetKind::Image {
+                image_dimensions(&head).unzip()
+            } else {
+                (None, None)
+            };
+            discovered.push(MessageImageAsset {
+                src: path.to_string_lossy().into_owned(),
+                asset_id: String::new(),
+                url: path.to_string_lossy().into_owned(),
+                mime: kind.mime.to_owned(),
+                width,
+                height,
+                thumbnail_url: None,
+                preview_url: None,
+                download_url: None,
+                version_url: None,
+                size: std::fs::metadata(&path).ok().map(|m| m.len()),
+                unavailable_reason: None,
+            });
+        }
+        if !discovered.is_empty() {
+            let assets = item.image_assets.get_or_insert_with(Vec::new);
+            for asset in discovered {
+                if !assets
+                    .iter()
+                    .any(|existing| existing.src == asset.src || existing.url == asset.url)
+                {
+                    assets.push(asset);
+                }
+            }
+        }
+    }
 }
 
 /// Resolve bare `attachments` paths into `image_assets` for in-process clients.

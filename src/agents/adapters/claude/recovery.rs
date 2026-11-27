@@ -350,20 +350,42 @@ fn replay_updates(chain: &[Chained]) -> Vec<Value> {
             })),
             (Some("user"), _) => {
                 for part in parts.iter().filter(|p| p["type"] == "tool_result") {
-                    let output = match &part["content"] {
-                        Value::String(text) => text.clone(),
-                        Value::Array(items) => items
-                            .iter()
-                            .filter_map(|item| item["text"].as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                        _ => String::new(),
-                    };
+                    let mut content_blocks = Vec::new();
+                    match &part["content"] {
+                        Value::String(text) => {
+                            content_blocks.push(
+                                json!({"type": "content", "content": {"type": "text", "text": text}}),
+                            );
+                        }
+                        Value::Array(items) => {
+                            let mut texts = Vec::new();
+                            for item in items {
+                                if let Some(text) = item["text"].as_str() {
+                                    texts.push(text);
+                                } else if let Some(file_block) =
+                                    crate::agents::message_images::tool_media::normalize_content_block(item)
+                                {
+                                    content_blocks.push(file_block);
+                                }
+                            }
+                            if !texts.is_empty() || content_blocks.is_empty() {
+                                content_blocks.insert(
+                                    0,
+                                    json!({"type": "content", "content": {"type": "text", "text": texts.join("\n")}}),
+                                );
+                            }
+                        }
+                        _ => {
+                            content_blocks.push(
+                                json!({"type": "content", "content": {"type": "text", "text": ""}}),
+                            );
+                        }
+                    }
                     updates.push(json!({
                         "sessionUpdate": "tool_call_update",
                         "toolCallId": part["tool_use_id"],
                         "status": if part["is_error"] == true { "failed" } else { "completed" },
-                        "content": [{"type": "content", "content": {"type": "text", "text": output}}],
+                        "content": content_blocks,
                     }));
                 }
             }

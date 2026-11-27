@@ -913,6 +913,109 @@ fn base_scenes() -> &'static [Scene] {
                 unreachable: true,
             });
         }),
+        ("tool-media-cards", |s| {
+            use muqun_gateway::agents::{ToolCall, ToolCallStatus};
+            session_scene(s);
+            let dir = std::env::temp_dir().join("muqun-tool-media-scene");
+            let _ = std::fs::create_dir_all(&dir);
+            let shot_path = dir.join("mao_dev_light_v2.png");
+            let mut img = image::RgbImage::new(640, 360);
+            for (x, y, px) in img.enumerate_pixels_mut() {
+                let r = ((x * 220) / 640 + 24) as u8;
+                let g = ((y * 180) / 360 + 50) as u8;
+                let b = 210u8;
+                *px = image::Rgb([r, g, b]);
+            }
+            let _ = img.save(&shot_path);
+            let doc_path = dir.join("architecture-spec.md");
+            let _ = std::fs::write(&doc_path, b"# Architecture\nUnified tool file cards.");
+
+            let asid = s.selected.clone().unwrap_or_else(|| "s-main".into());
+            if let Some(info) = s.sessions.iter_mut().find(|i| i.asid.0 == asid) {
+                info.directory = Some(dir.to_string_lossy().into_owned());
+            }
+            let mut items = vec![
+                item(
+                    "u1",
+                    TimelineRole::User,
+                    AgentPart::Text {
+                        text: "检查一下 Antigravity read_file、Codex image_view 和文件卡片的统一渲染效果。".into(),
+                    },
+                ),
+                item(
+                    "t-ag-img",
+                    TimelineRole::Assistant,
+                    AgentPart::Tool(ToolCall {
+                        id: "ag-read-img".into(),
+                        name: "read_file".into(),
+                        title: Some("File mao_dev_light_v2.png".into()),
+                        input: serde_json::json!({ "Path": shot_path }),
+                        output: None,
+                        content: None,
+                        metadata: None,
+                        state: ToolCallStatus::Completed,
+                        status: ToolCallStatus::Completed,
+                        error: None,
+                        child_session_id: None,
+                        background: false,
+                        input_partial: None,
+                        truncated: false,
+                        time: Default::default(),
+                    }),
+                ),
+                item(
+                    "t-codex-img",
+                    TimelineRole::Assistant,
+                    AgentPart::Tool(ToolCall {
+                        id: "codex-img-view".into(),
+                        name: "image_view".into(),
+                        title: None,
+                        input: serde_json::json!({ "path": shot_path }),
+                        output: None,
+                        content: None,
+                        metadata: Some(serde_json::json!({ "type": "imageView", "path": shot_path })),
+                        state: ToolCallStatus::Completed,
+                        status: ToolCallStatus::Completed,
+                        error: None,
+                        child_session_id: None,
+                        background: false,
+                        input_partial: None,
+                        truncated: false,
+                        time: Default::default(),
+                    }),
+                ),
+                item(
+                    "t-ag-doc",
+                    TimelineRole::Assistant,
+                    AgentPart::Tool(ToolCall {
+                        id: "ag-read-doc".into(),
+                        name: "read_file".into(),
+                        title: Some("File architecture-spec.md".into()),
+                        input: serde_json::json!({ "Path": doc_path }),
+                        output: None,
+                        content: None,
+                        metadata: None,
+                        state: ToolCallStatus::Completed,
+                        status: ToolCallStatus::Completed,
+                        error: None,
+                        child_session_id: None,
+                        background: false,
+                        input_partial: None,
+                        truncated: false,
+                        time: Default::default(),
+                    }),
+                ),
+                item(
+                    "a1",
+                    TimelineRole::Assistant,
+                    AgentPart::Text {
+                        text: "所有 Agent 读取图片与文件现在统一走卡片渲染，不再展示原始 JSON 字段。".into(),
+                    },
+                ),
+            ];
+            muqun_gateway::agents::message_images::enrich_timeline(&asid, dir.to_str(), &mut items);
+            s.timelines.entry(asid).or_default().replace(items);
+        }),
         ("plugin-image-settings", |s| {
             settings(s);
             s.settings_tab = SettingsTab::Plugins;

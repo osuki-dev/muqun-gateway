@@ -1183,14 +1183,46 @@ impl Projection {
                 if let Some(input) = update.get("rawInput") {
                     call.input = input.clone();
                 }
+                if crate::agents::message_images::tool_media::is_read_file_tool(&call.name)
+                    && crate::agents::message_images::tool_media::input_path(&call.input).is_none()
+                {
+                    if let Some(loc_path) = update
+                        .get("locations")
+                        .and_then(Value::as_array)
+                        .and_then(|locs| locs.first())
+                        .and_then(|loc| loc.get("path"))
+                        .and_then(Value::as_str)
+                        .filter(|p| !p.is_empty())
+                    {
+                        match &mut call.input {
+                            Value::Object(map) => {
+                                map.insert("path".into(), Value::String(loc_path.to_owned()));
+                            }
+                            Value::Null => {
+                                call.input = serde_json::json!({ "path": loc_path });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 if let Some(content) = update.get("content") {
                     let texts: Vec<&str> = content
                         .as_array()
                         .into_iter()
                         .flatten()
-                        .filter_map(|part| part.pointer("/content/text").and_then(Value::as_str))
+                        .filter_map(|part| {
+                            part.pointer("/content/text")
+                                .and_then(Value::as_str)
+                                .or_else(|| {
+                                    (part.get("type").and_then(Value::as_str) == Some("text"))
+                                        .then(|| part.get("text").and_then(Value::as_str))
+                                        .flatten()
+                                })
+                        })
                         .collect();
-                    call.output = Some(Value::String(texts.join("\n")));
+                    if !texts.is_empty() || call.output.is_none() {
+                        call.output = Some(Value::String(texts.join("\n")));
+                    }
                     call.content = Some(content.clone());
                 }
                 if let Some(output) = update.get("rawOutput") {
@@ -1219,6 +1251,7 @@ impl Projection {
                         call.set_state(status);
                     }
                 }
+                crate::agents::message_images::tool_media::normalize_tool_call(&mut call);
                 if self.permission_turn_active {
                     if matches!(
                         call.state,

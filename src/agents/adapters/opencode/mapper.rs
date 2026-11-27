@@ -777,13 +777,18 @@ fn normalize_tool_output(output: Option<Value>) -> Option<Value> {
 pub fn tool_title(name: &str, input: &Value) -> Option<String> {
     let s = |key: &str| input.get(key).and_then(Value::as_str);
     let title = match name {
-        "read" | "write" | "edit" | "patch" => s("path").map(|p| {
-            std::path::Path::new(p)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(p)
-                .to_string()
-        })?,
+        "read" | "read_file" | "view_file" | "write" | "edit" | "patch" => {
+            crate::agents::message_images::tool_media::INPUT_PATH_KEYS
+                .iter()
+                .find_map(|key| s(key))
+                .map(|p| {
+                    std::path::Path::new(p)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(p)
+                        .to_string()
+                })?
+        }
         "shell" | "bash" => s("command")?.lines().next().unwrap_or("").to_string(),
         "glob" => s("pattern")?.to_string(),
         "grep" | "search" => s("pattern").or_else(|| s("query"))?.to_string(),
@@ -908,6 +913,7 @@ pub fn map_tool_call(val: &Value) -> ToolCall {
         time,
     };
     apply_tool_metadata(&mut call);
+    crate::agents::message_images::tool_media::normalize_tool_call(&mut call);
     call
 }
 

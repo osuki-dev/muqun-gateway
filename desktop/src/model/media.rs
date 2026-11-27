@@ -123,11 +123,17 @@ pub fn missing(items: &[TimelineItem]) -> Vec<String> {
             .iter()
             .flatten()
             .filter(|a| item.image_assets.is_none() && file_name(a).is_some());
+        let has_image_assets =
+            item.image_assets.iter().flatten().any(|asset| {
+                asset.unavailable_reason.is_none() && asset.mime.starts_with("image/")
+            });
         let tool_refs = match &item.part {
-            muqun_gateway::agents::AgentPart::Tool(call) => tool_image_refs(call)
-                .into_iter()
-                .filter(|r| file_name(r).is_some())
-                .collect(),
+            muqun_gateway::agents::AgentPart::Tool(call) if !has_image_assets => {
+                tool_image_refs(call)
+                    .into_iter()
+                    .filter(|r| file_name(r).is_some())
+                    .collect()
+            }
             _ => Vec::new(),
         };
         let urls = assets
@@ -145,12 +151,24 @@ pub fn missing(items: &[TimelineItem]) -> Vec<String> {
 
 fn image_path(path: &str) -> bool {
     matches!(
-        Path::new(path.split('?').next().unwrap_or(path))
+        Path::new(path.split(['?', '#']).next().unwrap_or(path))
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
             .as_deref(),
-        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
+        Some(
+            "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
+                | "bmp"
+                | "tif"
+                | "tiff"
+                | "avif"
+                | "heic"
+                | "heif"
+        )
     )
 }
 
@@ -177,20 +195,19 @@ pub fn tool_image_refs(call: &ToolCall) -> Vec<String> {
         else {
             continue;
         };
-        let is_image = ["mime", "mimeType", "mediaType"]
+        let mime = ["mime", "mimeType", "mediaType"]
             .iter()
-            .filter_map(|k| media.get(*k).and_then(Value::as_str))
-            .any(|m| m.starts_with("image/"))
-            || media.get("type").and_then(Value::as_str) == Some("image")
-            || part.get("type").and_then(Value::as_str) == Some("image")
-            || image_path(uri);
+            .find_map(|k| media.get(*k).and_then(Value::as_str));
+        let is_image = mime.is_some_and(|m| m.starts_with("image/"))
+            || (mime.is_none()
+                && (media.get("type").and_then(Value::as_str) == Some("image")
+                    || part.get("type").and_then(Value::as_str) == Some("image")
+                    || image_path(uri)));
         if is_image && !refs.iter().any(|r| r == uri) {
             refs.push(uri.to_string());
         }
     }
-    let lower = call.name.to_ascii_lowercase();
-    let read_like =
-        tv::classify(&call.name) == tv::ToolKind::Read || lower == "view" || lower == "view_image";
+    let read_like = tv::classify(&call.name) == tv::ToolKind::Read;
     if refs.is_empty() && read_like {
         let target = tv::target(tv::ToolKind::Read, tv::input_record(call).as_ref());
         if image_path(&target) {
@@ -285,5 +302,67 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(missing(&[item]), ["/api/agent-images/ai_1/preview"]);
+    }
+
+    #[test]
+    fn tool_image_refs_covers_all_read_and_image_tools_without_claiming_pdfs() {
+        let make = |name: &str, input: Value, content: Option<Value>| -> ToolCall {
+            serde_json::from_value(serde_json::json!({
+                "id": "t1", "name": name, "input": input, "content": content,
+                "state": "completed", "status": "completed",
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            tool_image_refs(&make(
+                "image_view",
+                serde_json::json!({"path": "/tmp/a.png"}),
+                None
+            )),
+            vec!["/tmp/a.png"]
+        );
+        assert_eq!(
+            tool_image_refs(&make(
+                "read_file",
+                serde_json::json!({"Path": "/home/demo/b.webp"}),
+                None
+            )),
+            vec!["/home/demo/b.webp"]
+        );
+        assert_eq!(
+            tool_image_refs(&make(
+                "view",
+                serde_json::json!({"file_path": "/home/demo/c.jpg"}),
+                None
+            )),
+            vec!["/home/demo/c.jpg"]
+        );
+        // Non-image PDF file block must not be treated as an image.
+        assert!(tool_image_refs(&make(
+            "read_file",
+            serde_json::json!({"path": "/w/spec.pdf"}),
+            Some(serde_json::json!([{"type": "file", "uri": "/api/agent-images/ai_pdf/original", "mime": "application/pdf"}]))
+        ))
+        .is_empty());
+
+        // When `image_assets` already covers the tool image, `missing` only fetches `preview_url`.
+        let item: TimelineItem = serde_json::from_value(serde_json::json!({
+            "id": "t-img", "message_id": "m1", "role": "assistant", "seq": 1, "updated_ms": 0, "ordinal": 0,
+            "part": {
+                "type": "tool",
+                "id": "call-1", "name": "read_file",
+                "input": {"path": "/remote/shot.png"},
+                "content": [{"type": "file", "uri": "/api/agent-images/ai_shot/original", "mime": "image/png"}],
+                "state": "completed", "status": "completed",
+            },
+            "image_assets": [{
+                "asset_id": "ai_shot", "mime": "image/png",
+                "src": "file:///remote/shot.png",
+                "url": "/api/agent-images/ai_shot/original",
+                "preview_url": "/api/agent-images/ai_shot/preview",
+            }],
+        }))
+        .unwrap();
+        assert_eq!(missing(&[item]), ["/api/agent-images/ai_shot/preview"]);
     }
 }

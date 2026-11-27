@@ -295,12 +295,12 @@ pub fn file_chips(cx: &Tcx, item: &TimelineItem) -> Option<El> {
         .gap(6.0)
         .flex_wrap()
         .w_full();
-    for (i, (src, name, parent)) in files.into_iter().enumerate() {
-        let open_src = src.clone();
-        let label = if parent.is_empty() {
-            name.clone()
+    for (i, file) in files.into_iter().enumerate() {
+        let open_src = file.src.clone();
+        let label = if file.parent.is_empty() {
+            file.name.clone()
         } else {
-            format!("{parent}/{name}")
+            format!("{}/{}", file.parent, file.name)
         };
         let mut chip = row()
             .key(format!("file-{}-{i}", item.id))
@@ -317,14 +317,14 @@ pub fn file_chips(cx: &Tcx, item: &TimelineItem) -> Option<El> {
                     .a11y_hidden(),
             )
             .child(
-                text(name)
+                text(file.name)
                     .font(k.ty.small_medium)
                     .color(k.c.text_base)
                     .single_line(),
             );
-        if !parent.is_empty() {
+        if !file.parent.is_empty() {
             chip = chip.child(
-                text(parent)
+                text(file.parent)
                     .font(k.ty.small)
                     .color(k.c.text_faint)
                     .single_line(),
@@ -340,15 +340,237 @@ pub fn file_chips(cx: &Tcx, item: &TimelineItem) -> Option<El> {
                 .cursor(Cursor::Pointer)
                 .role("button")
                 .label(format!("{}: {label}", cx.t("Open file")))
-                .help(src)
+                .help(file.src)
                 .on_press(move |s: &mut UiState| s.open_timeline_file(&open_src)),
         );
     }
     Some(wrap)
 }
 
-fn item_file_refs(item: &TimelineItem, directory: Option<&str>) -> Vec<(String, String, String)> {
-    let mut out = Vec::new();
+fn format_bytes(bytes: u64) -> String {
+    match bytes {
+        b if b < 1024 => format!("{b} B"),
+        b if b < 1024 * 1024 => format!("{:.0} KB", b as f64 / 1024.0),
+        b => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
+    }
+}
+
+/// Unified inline media/file card for any tool call that read or returned
+/// images or files (Codex `image_view`, Antigravity `read_file`, Claude `Read`,
+/// OpenCode/Pi/DeepSeek `read`, Copilot `view`, Cursor/FX/Qoder/T3).
+pub fn tool_media_preview(
+    cx: &Tcx,
+    item: &TimelineItem,
+    call: &ToolCall,
+    target_path: &str,
+) -> Option<El> {
+    let k = cx.k;
+    let directory = session_directory(cx.s, cx.asid);
+
+    // Prefer gateway-resolved `image_assets` (which use remote cached
+    // `preview_url` cleanly), then merge any direct local tool image refs.
+    let mut pictures = if item.image_assets.is_some() {
+        item_image_paths(cx.s, cx.asid, item)
+    } else {
+        Vec::new()
+    };
+    for path in tool_image_paths(cx.s, cx.asid, call) {
+        if pictures.len() >= MAX_IMAGES {
+            break;
+        }
+        if !pictures.iter().any(|existing| existing == &path) {
+            pictures.push(path);
+        }
+    }
+    let pending = pending_images(item, pictures.len());
+    let files = item_file_refs(item, directory);
+
+    let mut stack = col()
+        .key(format!("tool-media-{}", item.id))
+        .w_full()
+        .gap(6.0);
+    let mut any = false;
+
+    if let Some(gallery) =
+        gallery_sized(cx, &format!("tool-{}", item.id), &pictures, pending, 210.0)
+    {
+        let first_asset = item
+            .image_assets
+            .iter()
+            .flatten()
+            .find(|a| a.unavailable_reason.is_none() && a.mime.starts_with("image/"));
+        let display_src = if !target_path.is_empty() {
+            target_path.to_owned()
+        } else if let Some(asset) = first_asset {
+            asset
+                .src
+                .strip_prefix("file://localhost")
+                .or_else(|| asset.src.strip_prefix("file://"))
+                .unwrap_or(&asset.src)
+                .to_owned()
+        } else {
+            pictures
+                .first()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        let display_name = Path::new(&display_src)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| display_src.clone());
+        let mut meta_parts: Vec<String> = Vec::new();
+        if let Some((w, h)) = first_asset.and_then(|a| a.width.zip(a.height)) {
+            meta_parts.push(format!("{w} × {h}"));
+        } else if let Some([w, h]) = pictures.first().and_then(|p| dimensions(p)) {
+            meta_parts.push(format!("{w} × {h}"));
+        }
+        if let Some(size) = first_asset.and_then(|a| a.size) {
+            meta_parts.push(format_bytes(size));
+        }
+        let parent = crate::model::tool_view::dirname(&display_src);
+        if !parent.is_empty() && parent != "." && meta_parts.is_empty() {
+            meta_parts.push(parent.to_owned());
+        }
+
+        let mut card = col()
+            .key(format!("img-card-{}", item.id))
+            .w_full()
+            .gap(8.0)
+            .px(8.0)
+            .py(8.0)
+            .radius(k.radius.md)
+            .border(1.0, k.c.border_weak)
+            .fill(k.c.layer_01.alpha(0.55))
+            .child(gallery);
+
+        if !display_name.is_empty() && !display_name.starts_with("/api/") {
+            let mut footer = row()
+                .key("img-meta")
+                .w_full()
+                .gap(8.0)
+                .center_y()
+                .child(
+                    icon(&rune_kit::glyphs::FILE_IMAGE, 13.0)
+                        .color(k.c.icon_accent)
+                        .a11y_hidden(),
+                )
+                .child(
+                    text(display_name.clone())
+                        .font(k.ty.small_medium)
+                        .color(k.c.text_base)
+                        .single_line()
+                        .truncate_middle()
+                        .shrink(),
+                );
+            if !meta_parts.is_empty() {
+                footer = footer.child(
+                    text(meta_parts.join(" · "))
+                        .font(k.ty.small)
+                        .color(k.c.text_faint)
+                        .single_line()
+                        .truncate_head()
+                        .shrink()
+                        .grow(1.0),
+                );
+            } else {
+                footer = footer.child(col().grow(1.0));
+            }
+            if let Some(open_img) = pictures.first().cloned() {
+                footer = footer.child(
+                    icon(&glyphs::OPEN, 12.0)
+                        .color(k.c.icon_muted)
+                        .a11y_hidden(),
+                );
+                let footer = k
+                    .interactive(footer.px(4.0).py(2.0).radius(k.radius.sm))
+                    .cursor(Cursor::Pointer)
+                    .label(display_name)
+                    .help(display_src)
+                    .on_press(move |s: &mut UiState| s.open_attachment_image(&open_img));
+                card = card.child(footer);
+            } else {
+                card = card.child(footer);
+            }
+        }
+        stack = stack.child(card);
+        any = true;
+    }
+
+    for (i, file) in files.into_iter().enumerate() {
+        let open_src = file.src.clone();
+        let mut meta_parts: Vec<String> = Vec::new();
+        if let Some(size) = file.size {
+            meta_parts.push(format_bytes(size));
+        }
+        if !file.parent.is_empty() {
+            meta_parts.push(file.parent.clone());
+        }
+        let meta = meta_parts.join(" · ");
+        let file_card = k
+            .interactive(
+                row()
+                    .key(format!("tool-file-{}-{i}", item.id))
+                    .w_full()
+                    .gap(10.0)
+                    .px(10.0)
+                    .py(8.0)
+                    .center_y()
+                    .radius(k.radius.md)
+                    .border(1.0, k.c.border_weak)
+                    .fill(k.c.surface_base)
+                    .child(
+                        row()
+                            .size(28.0, 28.0)
+                            .center()
+                            .radius(k.radius.sm)
+                            .fill(k.alpha(k.c.icon_accent, 0.12))
+                            .child(icon(&glyphs::DOCUMENT, 14.0).color(k.c.icon_accent)),
+                    )
+                    .child(
+                        col()
+                            .gap(1.0)
+                            .shrink()
+                            .grow(1.0)
+                            .child(
+                                text(file.name.clone())
+                                    .font(k.ty.ui_medium)
+                                    .color(k.c.text_base)
+                                    .single_line()
+                                    .truncate_middle(),
+                            )
+                            .child(
+                                text(meta)
+                                    .font(k.ty.small)
+                                    .color(k.c.text_faint)
+                                    .single_line()
+                                    .truncate_head(),
+                            ),
+                    )
+                    .child(icon(&glyphs::OPEN, 13.0).color(k.c.icon_muted)),
+            )
+            .cursor(Cursor::Pointer)
+            .role("button")
+            .label(format!("{}: {}", cx.t("Open file"), file.name))
+            .help(file.src)
+            .on_press(move |s: &mut UiState| s.open_timeline_file(&open_src));
+        stack = stack.child(file_card);
+        any = true;
+    }
+
+    any.then_some(stack)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FileRef {
+    src: String,
+    name: String,
+    parent: String,
+    size: Option<u64>,
+}
+
+fn item_file_refs(item: &TimelineItem, directory: Option<&str>) -> Vec<FileRef> {
+    let mut out: Vec<FileRef> = Vec::new();
     for asset in item.image_assets.iter().flatten() {
         if asset.unavailable_reason.is_some()
             || asset.mime.starts_with("image/")
@@ -379,8 +601,13 @@ fn item_file_refs(item: &TimelineItem, directory: Option<&str>) -> Vec<(String, 
             .map(|p| p.to_string_lossy().into_owned())
             .filter(|p| !p.is_empty() && p != ".")
             .unwrap_or_default();
-        if !out.iter().any(|(seen, _, _)| seen == &asset.src) {
-            out.push((asset.src.clone(), name, parent));
+        if !out.iter().any(|seen| seen.src == asset.src) {
+            out.push(FileRef {
+                src: asset.src.clone(),
+                name,
+                parent,
+                size: asset.size,
+            });
         }
     }
     out
@@ -437,11 +664,12 @@ mod tests {
         };
         assert_eq!(
             item_file_refs(&item, Some("/home/ryu/Work/osuki")),
-            vec![(
-                "/home/ryu/Work/osuki/docs/order-flow-hupun-erp.md".into(),
-                "order-flow-hupun-erp.md".into(),
-                "docs".into(),
-            )]
+            vec![FileRef {
+                src: "/home/ryu/Work/osuki/docs/order-flow-hupun-erp.md".into(),
+                name: "order-flow-hupun-erp.md".into(),
+                parent: "docs".into(),
+                size: Some(42),
+            }]
         );
     }
 }

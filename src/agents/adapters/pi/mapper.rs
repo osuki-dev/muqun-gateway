@@ -443,6 +443,7 @@ impl ToolOutcome {
             call.content = content.cloned();
             call.metadata = result.get("details").filter(|d| !d.is_null()).cloned();
         }
+        crate::agents::message_images::tool_media::normalize_tool_call(call);
     }
 }
 

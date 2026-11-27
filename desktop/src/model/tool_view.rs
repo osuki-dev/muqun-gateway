@@ -41,7 +41,8 @@ pub fn classify(name: &str) -> ToolKind {
     match n.as_str() {
         "shell" | "bash" | "terminal" | "run" | "exec_command" | "local_shell" | "bashoutput"
         | "run_command" => ToolKind::Shell,
-        "read" | "list" | "cat" | "ls" | "read_file" => ToolKind::Read,
+        "read" | "list" | "cat" | "ls" | "read_file" | "view_file" | "view" | "image_view"
+        | "view_image" => ToolKind::Read,
         "edit" | "multiedit" | "str_replace" | "str_replace_editor" | "notebookedit"
         | "edit_file" => ToolKind::Edit,
         "write" | "create" | "new_file" | "write_file" => ToolKind::Write,
@@ -243,6 +244,9 @@ pub fn target(kind: ToolKind, rec: Option<&Map<String, Value>>) -> String {
             "filePath",
             "file_path",
             "file",
+            "Path",
+            "AbsolutePath",
+            "TargetFile",
             "query",
             "url",
             "pattern",

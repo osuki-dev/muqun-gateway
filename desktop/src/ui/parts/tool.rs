@@ -247,6 +247,16 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
             }
         }
         ToolKind::Read => {
+            let is_image_read = !crate::model::media::tool_image_refs(call).is_empty()
+                || item
+                    .image_assets
+                    .iter()
+                    .flatten()
+                    .any(|a| a.unavailable_reason.is_none() && a.mime.starts_with("image/"));
+            if is_image_read {
+                card.glyph = &rune_kit::glyphs::FILE_IMAGE;
+                card.verb = cx.t("Image").to_string();
+            }
             card.open_file_on_press = true;
             card.body = files::read_body(cx, call, &target);
         }
@@ -401,14 +411,9 @@ pub fn card(cx: &Tcx, item: &TimelineItem, call: &ToolCall) -> El {
             );
         }
     }
-    // What the tool returned, else the pictures the gateway attached to
-    // the row (a read of an image on a computer that is not this one).
-    let mut pictures = images::tool_image_paths(cx.s, cx.asid, call);
-    if pictures.is_empty() && item.image_assets.is_some() {
-        pictures = images::item_image_paths(cx.s, cx.asid, item);
-    }
-    if let Some(gallery) = images::gallery(cx, &format!("tool-{id}"), &pictures) {
-        card.preview = Some(gallery);
+    // Unified image/file card for any tool that read or returned media/files.
+    if let Some(media_card) = images::tool_media_preview(cx, item, call, &target) {
+        card.preview = Some(media_card);
     }
     if let Some(ms) = tv::duration_ms(call).filter(|ms| *ms >= 1000) {
         if card.chips.is_empty() || kind == ToolKind::Shell {

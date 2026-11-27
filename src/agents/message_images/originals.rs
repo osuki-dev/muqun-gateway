@@ -398,20 +398,43 @@ async fn attach_with_originals_dir(
             ));
         }
         if let AgentPart::Tool(call) = &mut item.part {
-            // Only the native structured imageView's exact file gets the same
-            // explicit account-artifact roots as a paired device file open.
-            // Arbitrary output text and other tool files retain their session fence.
-            let viewed_uri = (call.name == "image_view"
-                && call
-                    .metadata
+            super::tool_media::normalize_tool_call(call);
+            // Completed read-file calls inside the session workspace that carry
+            // no inline text output (e.g. Antigravity ACP replay) get a typed
+            // session-fenced file entry so clients render a file card instead
+            // of raw JSON input.
+            if super::tool_media::is_read_file_tool(&call.name)
+                && call.state == crate::agents::domain::ToolCallStatus::Completed
+                && !super::tool_media::has_text_output(call)
+                && !call
+                    .content
                     .as_ref()
-                    .is_some_and(|m| m["type"] == "imageView" && m["path"] == call.input["path"]))
-            .then(|| {
-                call.input["path"]
-                    .as_str()
-                    .and_then(|p| reqwest::Url::from_file_path(p).ok())
-            })
-            .flatten();
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| {
+                        parts
+                            .iter()
+                            .any(|part| part["type"] == "file" && part["uri"].is_string())
+                    })
+            {
+                if let (Some(session_root), Some(path)) =
+                    (root.as_deref(), super::tool_media::input_path(&call.input))
+                {
+                    if hosted_file(path, session_root).is_some() {
+                        if let Some(uri) = super::tool_media::path_to_uri(path) {
+                            let block = serde_json::json!({ "type": "file", "uri": uri });
+                            match &mut call.content {
+                                Some(Value::Array(existing)) => existing.push(block),
+                                _ => call.content = Some(Value::Array(vec![block])),
+                            }
+                        }
+                    }
+                }
+            }
+            // Only canonical image-view / read-image calls' exact file gets the
+            // same explicit account-artifact roots as a paired device file open
+            // (with strict image-byte sniffing). Unrelated tools and arbitrary
+            // output text retain their session fence.
+            let viewed_uri = super::tool_media::viewed_image_uri(call);
             if let Some(Value::Array(content)) = &call.content {
                 let raw = call.output.as_ref() == call.content.as_ref();
                 let has_file = content
@@ -430,7 +453,7 @@ async fn attach_with_originals_dir(
                             .and_then(|uri| uri.as_str().map(str::to_owned))
                         {
                             part["uri"] = Value::Null;
-                            let scope = if viewed_uri.as_ref().is_some_and(|v| v.as_str() == uri) {
+                            let scope = if viewed_uri.as_deref() == Some(uri.as_str()) {
                                 FileScope::AccountImageView
                             } else {
                                 FileScope::Session
@@ -1867,5 +1890,185 @@ mod tests {
             .0,
             StatusCode::UNSUPPORTED_MEDIA_TYPE
         );
+    }
+
+    #[tokio::test]
+    async fn unified_tool_media_covers_acp_antigravity_pi_claude_opencode_deepseek_and_t3() {
+        let (_scratch, root) = workspace();
+        let (_outside_scratch, outside) = workspace();
+        let outside_png = outside.join("mao_dev_light_v2.png");
+        std::fs::write(&outside_png, png(320, 200, 42)).unwrap();
+        let fake_png = outside.join("secret.png");
+        std::fs::write(&fake_png, b"not-an-image-credential").unwrap();
+        let workspace_md = root.join("design.md");
+        std::fs::write(&workspace_md, b"# Design\nUnified card").unwrap();
+        let outside_txt = outside.join("private.txt");
+        std::fs::write(&outside_txt, b"private outside text").unwrap();
+
+        let state = crate::test_state("admin", vec![crate::test_device("phone", "token")]);
+
+        // 1. Antigravity ACP `read_file` with PascalCase `Path` pointing outside workspace.
+        let mut projection = crate::agents::adapters::acp::mapper::Projection::new(false);
+        projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "ag-img",
+                "name": "read_file",
+                "title": "File ../../../.gemini/scratch/mao_dev_light_v2.png",
+                "status": "completed",
+                "rawInput": { "Path": outside_png },
+            }))
+            .unwrap();
+        // 2. Antigravity ACP `read_file` on a fake `.png` outside workspace -> must be refused.
+        projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "ag-fake",
+                "name": "read_file",
+                "status": "completed",
+                "rawInput": { "Path": fake_png },
+            }))
+            .unwrap();
+        // 3. Antigravity ACP `read_file` on a workspace `.md` with empty output -> workspace file card.
+        projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "ag-md",
+                "name": "read_file",
+                "status": "completed",
+                "rawInput": { "Path": workspace_md },
+            }))
+            .unwrap();
+        // 4. Antigravity ACP `read_file` on an outside non-image file -> must NOT synthesize file asset.
+        projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "ag-outside-txt",
+                "name": "read_file",
+                "status": "completed",
+                "rawInput": { "Path": outside_txt },
+            }))
+            .unwrap();
+        // 5. Claude ACP `Read` returning nested ACP inline image content block.
+        let encoded = base64::engine::general_purpose::STANDARD.encode(png(160, 120, 7));
+        projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "claude-img",
+                "name": "Read",
+                "status": "completed",
+                "rawInput": { "file_path": "/tmp/claude.png" },
+                "content": [{
+                    "type": "content",
+                    "content": { "type": "image", "data": encoded, "mimeType": "image/png" }
+                }],
+            }))
+            .unwrap();
+
+        let mut items = projection.timeline();
+        super::super::attach_to_items(&state, "acp-unified", root.to_str(), &mut items).await;
+
+        let by_id = |call_id: &str| {
+            items
+                .iter()
+                .find(|row| matches!(&row.part, AgentPart::Tool(c) if c.id == call_id))
+                .expect(call_id)
+        };
+
+        // Antigravity image read: normalized `path`, served preview + download.
+        let ag_img = by_id("ag-img");
+        let AgentPart::Tool(call) = &ag_img.part else {
+            panic!()
+        };
+        assert_eq!(
+            call.input.get("path").and_then(Value::as_str),
+            outside_png.to_str()
+        );
+        assert!(call.input.get("Path").is_none());
+        let asset = &ag_img.image_assets.as_ref().unwrap()[0];
+        assert!(asset.unavailable_reason.is_none());
+        assert_eq!(asset.mime, "image/png");
+        assert!(asset.preview_url.is_some());
+        assert_eq!(call.content.as_ref().unwrap()[0]["uri"], asset.url);
+
+        // Fake `.png` outside workspace: strictly refused with no download URL.
+        let ag_fake = by_id("ag-fake");
+        let fake_asset = &ag_fake.image_assets.as_ref().unwrap()[0];
+        assert_eq!(
+            fake_asset.unavailable_reason.as_deref(),
+            Some("image_content_unavailable")
+        );
+        assert!(fake_asset.download_url.is_none());
+
+        // Workspace `.md` empty-output read: session-fenced file card asset.
+        let ag_md = by_id("ag-md");
+        let md_asset = &ag_md.image_assets.as_ref().unwrap()[0];
+        assert!(md_asset.unavailable_reason.is_none());
+        assert!(md_asset.mime.starts_with("text/"));
+        assert!(md_asset.download_url.is_some());
+
+        // Outside non-image text file: zero assets attached.
+        let ag_outside = by_id("ag-outside-txt");
+        assert!(ag_outside.image_assets.is_none());
+
+        // Claude ACP nested inline image: base64 stripped, authenticated asset minted.
+        let claude_img = by_id("claude-img");
+        assert!(!serde_json::to_string(claude_img)
+            .unwrap()
+            .contains("base64"));
+        let c_asset = &claude_img.image_assets.as_ref().unwrap()[0];
+        assert!(c_asset.unavailable_reason.is_none());
+        assert_eq!(c_asset.mime, "image/png");
+
+        // 6. Pi `read` toolResult with `{type:"image", data, mimeType}`.
+        let pi_entries = vec![
+            serde_json::json!({
+                "type": "message",
+                "id": "m1",
+                "timestamp": "2026-11-27T00:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "type": "toolCall", "id": "pi-read", "name": "read", "arguments": { "path": "shot.png" } }]
+                }
+            }),
+            serde_json::json!({
+                "type": "message",
+                "id": "m2",
+                "timestamp": "2026-11-27T00:00:01Z",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": "pi-read",
+                    "isError": false,
+                    "content": [
+                        { "type": "text", "text": "Read image file [image/png]" },
+                        { "type": "image", "data": encoded, "mimeType": "image/png" }
+                    ]
+                }
+            }),
+        ];
+        let mut pi_items = crate::agents::adapters::pi::mapper::timeline_from_entries(&pi_entries);
+        super::super::attach_to_items(&state, "pi-unified", root.to_str(), &mut pi_items).await;
+        assert!(!serde_json::to_string(&pi_items).unwrap().contains("base64"));
+        let pi_asset = &pi_items[0].image_assets.as_ref().unwrap()[0];
+        assert!(pi_asset.unavailable_reason.is_none());
+        assert_eq!(pi_asset.mime, "image/png");
+
+        // 7. In-process Desktop `enrich_timeline` gets the same unified assets.
+        let mut desktop_projection = crate::agents::adapters::acp::mapper::Projection::new(false);
+        desktop_projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "desk-img",
+                "name": "read_file",
+                "status": "completed",
+                "rawInput": { "Path": outside_png },
+            }))
+            .unwrap();
+        let mut desktop_items = desktop_projection.timeline();
+        super::super::enrich_timeline("desk-unified", root.to_str(), &mut desktop_items);
+        let d_asset = &desktop_items[0].image_assets.as_ref().unwrap()[0];
+        assert_eq!(d_asset.mime, "image/png");
+        assert_eq!(d_asset.width, Some(320));
+        assert_eq!(d_asset.height, Some(200));
     }
 }

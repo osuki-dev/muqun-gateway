@@ -257,9 +257,11 @@ pub fn change_body(
 }
 
 /// A read: the file's text, numbers stripped, coloured by its extension.
+/// Skips outputs that are only bare media/file URIs already rendered as cards.
 pub fn read_body(cx: &Tcx, call: &ToolCall, path: &str) -> Option<El> {
     let out = tv::output_text(call);
-    if out.stdout.trim().is_empty() {
+    let trimmed = out.stdout.trim();
+    if trimmed.is_empty() || is_only_media_uris(trimmed) {
         return None;
     }
     let body = tv::strip_read_line_numbers(&out.stdout);
@@ -274,4 +276,19 @@ pub fn read_body(cx: &Tcx, call: &ToolCall, path: &str) -> Option<El> {
         block = block.child(super::caption(cx.k, cx.t("Truncated")));
     }
     Some(block)
+}
+
+fn is_only_media_uris(text: &str) -> bool {
+    let mut saw_any = false;
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        saw_any = true;
+        if !(line.starts_with("/api/agent-images/")
+            || line.starts_with("/api/assets/")
+            || line.starts_with("file://")
+            || line.starts_with("data:"))
+        {
+            return false;
+        }
+    }
+    saw_any
 }
