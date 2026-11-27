@@ -2,6 +2,11 @@
 
 ## Changes and fixes
 
+- **Remote & macOS responsiveness fixes, per-tile inline Git & Activity drawer, cross-computer Queue images, and split-pane popup anchor fix**:
+  - Capped busy indicator and pulse/breathe animations via Rune `Cycle` (12–15 fps) and froze `COMPOSER_RIM`, added `.no_proxy()` for loopback, LAN, and Tailscale remote Gateway connections (avoiding system proxy stalls on remote computers), and skipped local filesystem probes (`enrich_timeline` / `resolve_host_media`) on remote sessions.
+  - Replaced the global Inspector with first-class **Git** (branch switcher, staged/unstaged changes, commit/sync, recent commits, worktrees, and paginated GitHub/Gitea PRs with checkout) and **Activity** (`Queue | Tree | Saved | Shells`) panels that open as an independent inline side drawer inside each session window or split tile (never colliding across split panes when moving focus), while preserving instant hover-to-focus.
+  - Fixed queued message image thumbnails across remote computers by carrying uploaded Gateway `media_url` assets and loading them via the authenticated remote asset pipeline.
+  - Unified window surface controls into the always-visible `...` menu across Tile, Float, Dock, and Page chrome; redesigned the computer pairing dialog into a clean 8-character OTP-style modal; and fixed split-pane `@` mentions / `/` / `$` / prompt history popups so they always anchor to the active tile's own composer card instead of the left pane.
 - **Unified tool & media cards, Desktop memory reduction, and single-workspace Neovim reuse**:
   - Aligned Desktop in-process `enrich_timeline` with Gateway's unified tool normalization across all 11 agents (canonical `read`/`edit`/`write`/`bash` names, unified diffs, shell exit status, image/PDF file cards, bounded workspace line-numbered `read` excerpts, and Antigravity `mcp_muqun_` tool recognition) while keeping source-code reads folded cleanly and avoiding raw `/api/.../original` filenames.
   - Bounded Linux glibc allocator arenas (`MALLOC_ARENA_MAX=2`), Tokio worker pools, SQLite `cache_size` / `mmap_size`, and periodic `malloc_trim(0)` + `PRAGMA shrink_memory`, cutting Desktop resident memory (~493 MiB → ~290 MiB RSS, ~235 MiB PSS) and thread count.
