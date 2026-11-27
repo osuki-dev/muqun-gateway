@@ -322,10 +322,28 @@ pub fn enrich_timeline(asid: &str, directory: Option<&str>, items: &mut [Timelin
 /// workspace file reads) into `image_assets` for in-process Desktop clients,
 /// matching the HTTP egress contract in `originals::attach`.
 fn attach_local_tool_files(root: Option<&Path>, items: &mut [TimelineItem]) {
+    let mut hydrated_reads = 0usize;
     for item in items {
         let AgentPart::Tool(call) = &mut item.part else {
             continue;
         };
+        if let Some(session_root) = root {
+            if hydrated_reads < tool_media::MAX_HYDRATED_READS_PER_BATCH {
+                if let Some((path, start, end)) = tool_media::empty_text_read_request(call) {
+                    if let Some((resolved, fence)) = hosted_file(&path, session_root) {
+                        if let Some((text, truncated)) =
+                            tool_media::read_workspace_excerpt(&resolved, &fence, start, end)
+                        {
+                            call.output = Some(serde_json::Value::String(text));
+                            if truncated {
+                                call.truncated = true;
+                            }
+                            hydrated_reads += 1;
+                        }
+                    }
+                }
+            }
+        }
         if tool_media::is_read_file_tool(&call.name)
             && call.state == crate::agents::domain::ToolCallStatus::Completed
             && !tool_media::has_text_output(call)
@@ -765,9 +783,19 @@ async fn attach_rows(
     // Same client-side recovery the App runs in `parseTimelineItem`, so HTTP
     // and Desktop both attach originals for ByPath handoffs.
     promote_uploaded_attachment_suffix(items);
+    for item in items.iter_mut() {
+        if let AgentPart::Tool(call) = &mut item.part {
+            tool_media::normalize_tool_call(call);
+        }
+    }
     let needs_files = items.iter().any(|item| {
         item.attachments.is_some()
-            || matches!(&item.part, AgentPart::Tool(call) if call.content.is_some())
+            || matches!(
+                &item.part,
+                AgentPart::Tool(call)
+                    if call.content.is_some()
+                        || tool_media::needs_workspace_read_enrichment(call)
+            )
     });
     if !needs_files && !items.iter().any(may_embed_image) {
         return;

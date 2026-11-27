@@ -369,6 +369,7 @@ async fn attach_with_originals_dir(
 ) {
     let mut inputs = Vec::new();
     let mut mirrored_outputs = Vec::new();
+    let mut read_hydrations = Vec::new();
     for (index, item) in items.iter_mut().enumerate() {
         if let Some(sources) = item.attachments.take() {
             let sources = sources
@@ -432,6 +433,15 @@ async fn attach_with_originals_dir(
                     }
                 }
             }
+            if root.is_some()
+                && read_hydrations.len() < super::tool_media::MAX_HYDRATED_READS_PER_BATCH
+            {
+                if let Some((path, start_line, end_line)) =
+                    super::tool_media::empty_text_read_request(call)
+                {
+                    read_hydrations.push((index, path, start_line, end_line));
+                }
+            }
             // Only canonical image-view / read-image calls' exact file gets the
             // same explicit account-artifact roots as a paired device file open
             // (with strict image-byte sniffing). Unrelated tools and arbitrary
@@ -467,17 +477,17 @@ async fn attach_with_originals_dir(
             }
         }
     }
-    if inputs.is_empty() {
+    if inputs.is_empty() && read_hydrations.is_empty() {
         return;
     }
     let Ok(permit) = ADMISSION.clone().acquire_owned().await else {
         return;
     };
     let asid = asid.to_owned();
-    let Ok(outputs) = tokio::task::spawn_blocking(move || {
+    let Ok((outputs, hydrated_reads)) = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let mut budget = RESPONSE_WORK_BYTES;
-        inputs
+        let outputs = inputs
             .into_iter()
             .map(|(index, position, sources, scope)| {
                 let sources = sources
@@ -503,7 +513,21 @@ async fn attach_with_originals_dir(
                     .collect::<Vec<_>>();
                 (index, position, sources)
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        let hydrated_reads = match root.as_deref() {
+            Some(session_root) => read_hydrations
+                .into_iter()
+                .filter_map(|(index, path, start_line, end_line)| {
+                    let (hosted, fence) = hosted_file(&path, session_root)?;
+                    let (text, truncated) = super::tool_media::read_workspace_excerpt(
+                        &hosted, &fence, start_line, end_line,
+                    )?;
+                    Some((index, text, truncated))
+                })
+                .collect::<Vec<_>>(),
+            None => Vec::new(),
+        };
+        (outputs, hydrated_reads)
     })
     .await
     else {
@@ -564,6 +588,16 @@ async fn attach_with_originals_dir(
                             .join("\n"),
                     ))
                 };
+            }
+        }
+    }
+    for (index, text, truncated) in hydrated_reads {
+        if let AgentPart::Tool(call) = &mut items[index].part {
+            if !super::tool_media::has_text_output(call) {
+                call.output = Some(Value::String(text));
+                if truncated {
+                    call.truncated = true;
+                }
             }
         }
     }
@@ -1905,7 +1939,7 @@ mod tests {
         let workspace_pdf = root.join("design.pdf");
         std::fs::write(&workspace_pdf, b"%PDF-1.7\nUnified card").unwrap();
         let workspace_rs = root.join("lib.rs");
-        std::fs::write(&workspace_rs, b"pub fn hi() {}\n").unwrap();
+        std::fs::write(&workspace_rs, b"fn one() {}\nfn two() {}\nfn three() {}\n").unwrap();
         let outside_txt = outside.join("private.txt");
         std::fs::write(&outside_txt, b"private outside text").unwrap();
 
@@ -1943,14 +1977,14 @@ mod tests {
                 "rawInput": { "Path": workspace_pdf },
             }))
             .unwrap();
-        // 3b. Antigravity ACP `read_file` on a workspace `.rs` code file -> stays a compact Read row (no file card).
+        // 3b. Antigravity ACP `read_file` on a workspace `.rs` code file -> stays a compact Read row with hydrated lines.
         projection
             .update(&serde_json::json!({
                 "sessionUpdate": "tool_call",
                 "toolCallId": "ag-rs",
                 "name": "read_file",
                 "status": "completed",
-                "rawInput": { "Path": workspace_rs },
+                "rawInput": { "Path": workspace_rs, "StartLine": 2, "EndLine": 3 },
             }))
             .unwrap();
         // 4. Antigravity ACP `read_file` on an outside non-image file -> must NOT synthesize file asset.
@@ -2048,13 +2082,24 @@ mod tests {
         assert_eq!(pdf_asset.mime, "application/pdf");
         assert!(pdf_asset.download_url.is_some());
 
-        // Workspace `.rs` source-code read: stays a compact foldable Read row (no bloated file card).
+        // Workspace `.rs` source-code read: compact Read row (no file card) with hydrated line-numbered excerpt.
         let ag_rs = by_id("ag-rs");
         assert!(ag_rs.image_assets.is_none());
+        let AgentPart::Tool(rs_call) = &ag_rs.part else {
+            panic!()
+        };
+        assert_eq!(
+            rs_call.output.as_ref().and_then(Value::as_str),
+            Some("2: fn two() {}\n3: fn three() {}")
+        );
 
-        // Outside non-image text file: zero assets attached.
+        // Outside non-image text file: zero assets attached and NEVER hydrated.
         let ag_outside = by_id("ag-outside-txt");
         assert!(ag_outside.image_assets.is_none());
+        let AgentPart::Tool(out_call) = &ag_outside.part else {
+            panic!()
+        };
+        assert!(out_call.output.is_none());
 
         // Claude ACP nested inline image: base64 stripped, authenticated asset minted.
         let claude_img = by_id("claude-img");
@@ -2115,7 +2160,32 @@ mod tests {
         assert!(pi_asset.unavailable_reason.is_none());
         assert_eq!(pi_asset.mime, "image/png");
 
-        // 7. In-process Desktop `enrich_timeline` gets the same unified assets.
+        // 7. Single standalone read tool event (like a live SSE TimelineUpsert
+        //    with `content: None`) must NOT be short-circuited by `attach_rows`.
+        let mut sse_projection = crate::agents::adapters::acp::mapper::Projection::new(false);
+        sse_projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "sse-rs",
+                "name": "read_file",
+                "status": "completed",
+                "rawInput": { "Path": workspace_rs, "StartLine": 2, "EndLine": 3 },
+                "rawOutput": {},
+            }))
+            .unwrap();
+        let mut sse_items = sse_projection.timeline();
+        super::super::attach_to_items(&state, "sse-unified", root.to_str(), &mut sse_items).await;
+        let AgentPart::Tool(sse_call) = &sse_items[0].part else {
+            panic!()
+        };
+        assert_eq!(sse_call.name, "read");
+        assert_eq!(
+            sse_call.output.as_ref().and_then(Value::as_str),
+            Some("2: fn two() {}\n3: fn three() {}")
+        );
+
+        // 8. In-process Desktop `enrich_timeline` gets the same unified assets
+        //    and hydrated workspace read excerpts.
         let mut desktop_projection = crate::agents::adapters::acp::mapper::Projection::new(false);
         desktop_projection
             .update(&serde_json::json!({
@@ -2126,11 +2196,29 @@ mod tests {
                 "rawInput": { "Path": outside_png },
             }))
             .unwrap();
+        desktop_projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "desk-rs",
+                "name": "read_file",
+                "status": "completed",
+                "rawInput": { "Path": workspace_rs, "StartLine": 1, "EndLine": 2 },
+                "rawOutput": {},
+            }))
+            .unwrap();
         let mut desktop_items = desktop_projection.timeline();
         super::super::enrich_timeline("desk-unified", root.to_str(), &mut desktop_items);
         let d_asset = &desktop_items[0].image_assets.as_ref().unwrap()[0];
         assert_eq!(d_asset.mime, "image/png");
         assert_eq!(d_asset.width, Some(320));
         assert_eq!(d_asset.height, Some(200));
+        let AgentPart::Tool(desk_rs_call) = &desktop_items[1].part else {
+            panic!()
+        };
+        assert_eq!(desk_rs_call.name, "read");
+        assert_eq!(
+            desk_rs_call.output.as_ref().and_then(Value::as_str),
+            Some("1: fn one() {}\n2: fn two() {}")
+        );
     }
 }

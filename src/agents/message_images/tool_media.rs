@@ -39,6 +39,11 @@ use crate::agents::domain::{ToolCall, ToolCallStatus};
 const MAX_LCS_CELLS: usize = 200_000;
 /// Maximum diff body lines emitted into synthesized `metadata.files[].patch`.
 const MAX_SYNTHETIC_PATCH_LINES: usize = 400;
+/// Maximum lines / bytes hydrated for a workspace read tool whose agent
+/// omitted the file body on the wire (e.g. Antigravity ACP `read_file`).
+pub(crate) const MAX_HYDRATED_READ_LINES: usize = 200;
+pub(crate) const MAX_HYDRATED_READ_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_HYDRATED_READS_PER_BATCH: usize = 32;
 
 /// Canonical file/image read tool names across all supported agents.
 pub(crate) fn is_read_file_tool(name: &str) -> bool {
@@ -1136,6 +1141,136 @@ pub(crate) fn normalize_tool_call(call: &mut ToolCall) {
             }
         }
     }
+}
+
+/// Extract optional 1-based `(start_line, end_line)` from a read tool's input.
+pub(crate) fn read_line_range(input: &Value) -> (usize, Option<usize>) {
+    let Some(map) = input.as_object() else {
+        return (1, None);
+    };
+    let u = |keys: &[&str]| -> Option<usize> {
+        keys.iter()
+            .find_map(|k| map.get(*k).and_then(Value::as_u64))
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n >= 1)
+    };
+    let start = u(&["StartLine", "start_line", "startLine", "offset"]).unwrap_or(1);
+    let end = u(&["EndLine", "end_line", "endLine"]).or_else(|| {
+        u(&["limit", "Limit"]).map(|limit| start.saturating_add(limit.saturating_sub(1)))
+    });
+    (start, end)
+}
+
+/// Whether `call` is a completed workspace text-file read whose adapter omitted
+/// the file body (e.g. Antigravity ACP `read_file`), returning `(path, start, end)`.
+pub(crate) fn empty_text_read_request(call: &ToolCall) -> Option<(String, usize, Option<usize>)> {
+    if !is_read_file_tool(&call.name)
+        || call.state != ToolCallStatus::Completed
+        || has_text_output(call)
+        || has_file_block(call.content.as_ref())
+    {
+        return None;
+    }
+    let path = input_path(&call.input)?;
+    if has_image_extension(path) || has_rich_document_extension(path) {
+        return None;
+    }
+    let (start, end) = read_line_range(&call.input);
+    Some((path.to_owned(), start, end))
+}
+
+/// Whether `call` is a completed read-file call with no text output or file
+/// block that should be checked against the session workspace (either to attach
+/// a rich-document card or to hydrate a bounded line-numbered text excerpt).
+pub(crate) fn needs_workspace_read_enrichment(call: &ToolCall) -> bool {
+    is_read_file_tool(&call.name)
+        && call.state == ToolCallStatus::Completed
+        && !has_text_output(call)
+        && !has_file_block(call.content.as_ref())
+        && input_path(&call.input).is_some()
+}
+
+/// Read a bounded, line-numbered text excerpt from a workspace-fenced file
+/// (`open_fenced`), rejecting binary files and capping both line count and bytes.
+/// Returns `(numbered_text, truncated)`.
+pub(crate) fn read_workspace_excerpt(
+    path: &Path,
+    fence: &Path,
+    start_line: usize,
+    end_line: Option<usize>,
+) -> Option<(String, bool)> {
+    use std::io::{BufRead as _, Read as _};
+
+    let file = super::originals::open_fenced(path, fence).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let head = reader.fill_buf().ok()?;
+    if head.is_empty() || head.iter().take(512).any(|&b| b == 0) {
+        return None;
+    }
+    let start = start_line.max(1);
+    let requested_end = end_line.map(|e| e.max(start));
+    let max_end = requested_end
+        .map(|e| e.min(start.saturating_add(MAX_HYDRATED_READ_LINES - 1)))
+        .unwrap_or_else(|| start.saturating_add(MAX_HYDRATED_READ_LINES - 1));
+
+    let mut out = String::new();
+    let mut line_no = 0usize;
+    let mut truncated = false;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        // Bound single-line reads so a multi-MB minified line cannot blow RAM.
+        let n = (&mut reader)
+            .take((MAX_HYDRATED_READ_BYTES as u64) + 1)
+            .read_until(b'\n', &mut buf)
+            .ok()?;
+        if n == 0 {
+            break;
+        }
+        line_no += 1;
+        if line_no < start {
+            // Skip any remaining tail of an oversized skipped line.
+            while buf.last() != Some(&b'\n') {
+                buf.clear();
+                let more = (&mut reader).take(8192).read_until(b'\n', &mut buf).ok()?;
+                if more == 0 {
+                    break;
+                }
+            }
+            continue;
+        }
+        if line_no > max_end {
+            truncated = true;
+            break;
+        }
+        if buf.contains(&0) {
+            return None;
+        }
+        let line_str = String::from_utf8_lossy(&buf);
+        let line_clean = line_str.trim_end_matches(['\r', '\n']);
+        let prefix = format!("{line_no}: ");
+        let needed = prefix.len() + line_clean.len() + usize::from(!out.is_empty());
+        if out.len() + needed > MAX_HYDRATED_READ_BYTES {
+            truncated = true;
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&prefix);
+        out.push_str(line_clean);
+        if buf.len() > MAX_HYDRATED_READ_BYTES {
+            truncated = true;
+            break;
+        }
+        if requested_end.is_some_and(|end| line_no >= end) {
+            break;
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some((out, truncated))
 }
 
 /// The exact `file://` URI authorized for `FileScope::AccountImageView` on a
