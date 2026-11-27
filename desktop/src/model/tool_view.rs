@@ -40,23 +40,32 @@ pub fn classify(name: &str) -> ToolKind {
     let n = name.to_ascii_lowercase();
     match n.as_str() {
         "shell" | "bash" | "terminal" | "run" | "exec_command" | "local_shell" | "bashoutput"
-        | "run_command" => ToolKind::Shell,
+        | "run_command" | "run_shell_command" | "execute_command" | "shell_command" => {
+            ToolKind::Shell
+        }
         "read" | "list" | "cat" | "ls" | "read_file" | "view_file" | "view" | "image_view"
-        | "view_image" => ToolKind::Read,
-        "edit" | "multiedit" | "str_replace" | "str_replace_editor" | "notebookedit"
-        | "edit_file" => ToolKind::Edit,
-        "write" | "create" | "new_file" | "write_file" => ToolKind::Write,
+        | "view_image" | "list_dir" | "open_file" => ToolKind::Read,
+        "edit"
+        | "multiedit"
+        | "str_replace"
+        | "str_replace_editor"
+        | "notebookedit"
+        | "edit_file"
+        | "replace_file_content"
+        | "multi_replace_file_content"
+        | "fs_edit" => ToolKind::Edit,
+        "write" | "create" | "new_file" | "write_file" | "write_to_file" => ToolKind::Write,
         "patch" | "apply_patch" => ToolKind::Patch,
-        "glob" | "find" => ToolKind::Glob,
-        "grep" | "ripgrep" => ToolKind::Grep,
+        "glob" | "find" | "find_by_name" | "find_files" | "file_search" => ToolKind::Glob,
+        "grep" | "ripgrep" | "grep_search" | "grep_files" | "search_files" => ToolKind::Grep,
         "search" | "codesearch" => ToolKind::Search,
-        "webfetch" | "fetch" | "websearch" | "web_search" => ToolKind::Web,
+        "webfetch" | "fetch" | "web_fetch" | "read_url_content" | "websearch" | "web_search"
+        | "search_web" => ToolKind::Web,
         "subagent" | "task" | "spawn" | "agent" | "invoke_subagent" => ToolKind::Subagent,
         "skill" | "load_skill" => ToolKind::Skill,
-        "todowrite" | "todoread" | "todo" | "tasks" | "updatetodos" | "todo_write" => {
-            ToolKind::Todo
-        }
-        "question" | "ask" | "askuserquestion" => ToolKind::Question,
+        "todowrite" | "todoread" | "todo" | "tasks" | "updatetodos" | "todo_write"
+        | "update_steps" => ToolKind::Todo,
+        "question" | "ask" | "askuserquestion" | "ask_question" => ToolKind::Question,
         "execute" | "code" => ToolKind::Execute,
         "browser" => ToolKind::Browser,
         _ => ToolKind::Mcp,
@@ -1151,18 +1160,21 @@ pub fn question_answers(call: &ToolCall) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// A todo tool's checklist (`todos` / `items`, `content` / `text`).
+/// A todo tool's checklist (`todos` / `items` / `steps`, `content` / `text` / `title`).
 pub fn todo_items(rec: Option<&Map<String, Value>>) -> Vec<(String, bool)> {
     let Some(rec) = rec else {
         return Vec::new();
     };
-    let raw = rec.get("todos").or_else(|| rec.get("items"));
+    let raw = rec
+        .get("todos")
+        .or_else(|| rec.get("items"))
+        .or_else(|| rec.get("steps"));
     let mut out = Vec::new();
     for entry in raw.and_then(Value::as_array).into_iter().flatten() {
         match entry {
             Value::String(s) => out.push((s.clone(), false)),
             Value::Object(o) => {
-                if let Some(text) = pick(o, &["content", "text"]) {
+                if let Some(text) = pick(o, &["content", "text", "title"]) {
                     // `completed`, Cursor's `TODO_STATUS_COMPLETED`, `done`.
                     let status = o
                         .get("status")

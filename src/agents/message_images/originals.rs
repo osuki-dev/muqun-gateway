@@ -1964,6 +1964,33 @@ mod tests {
                 }],
             }))
             .unwrap();
+        // 6. Antigravity ACP `edit_file` -> canonical `edit` with unified `metadata.files` diff & no `{}` output.
+        projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "ag-edit",
+                "name": "edit_file",
+                "title": "File src/lib.rs",
+                "status": "completed",
+                "rawInput": { "Path": "/w/src/lib.rs", "Target": "let a = 1;\n", "Replacement": "let a = 2;\n" },
+                "rawOutput": {},
+            }))
+            .unwrap();
+        // 7. Antigravity ACP `update_steps` -> native Todo checklist part.
+        let todo_row = projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "ag-steps",
+                "name": "update_steps",
+                "status": "completed",
+                "rawInput": { "steps": [{ "title": "Audit adapters", "status": "done" }, { "title": "Verify UI", "status": "in_progress" }] },
+            }))
+            .unwrap()
+            .expect("update_steps produces Todo row");
+        assert!(matches!(
+            &todo_row.part,
+            AgentPart::Todo { items } if items.len() == 2 && items[0].done && !items[1].done
+        ));
 
         let mut items = projection.timeline();
         super::super::attach_to_items(&state, "acp-unified", root.to_str(), &mut items).await;
@@ -2019,6 +2046,23 @@ mod tests {
         let c_asset = &claude_img.image_assets.as_ref().unwrap()[0];
         assert!(c_asset.unavailable_reason.is_none());
         assert_eq!(c_asset.mime, "image/png");
+
+        // Antigravity `edit_file`: canonical `edit`, unified diff in `metadata.files`, empty `{}` cleared.
+        let ag_edit = by_id("ag-edit");
+        let AgentPart::Tool(edit_call) = &ag_edit.part else {
+            panic!()
+        };
+        assert_eq!(edit_call.name, "edit");
+        assert!(edit_call.output.is_none());
+        assert!(edit_call.title.is_none());
+        assert_eq!(
+            edit_call.metadata.as_ref().unwrap()["files"][0]["additions"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            edit_call.metadata.as_ref().unwrap()["files"][0]["deletions"],
+            serde_json::json!(1)
+        );
 
         // 6. Pi `read` toolResult with `{type:"image", data, mimeType}`.
         let pi_entries = vec![

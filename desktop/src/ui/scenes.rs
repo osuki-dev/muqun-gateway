@@ -985,6 +985,55 @@ fn base_scenes() -> &'static [Scene] {
                     }),
                 ),
                 item(
+                    "t-ag-edit",
+                    TimelineRole::Assistant,
+                    AgentPart::Tool(ToolCall {
+                        id: "ag-edit-1".into(),
+                        name: "edit_file".into(),
+                        title: Some("File src/agents/message_images/tool_media.rs".into()),
+                        input: serde_json::json!({
+                            "Path": "/home/ryu/Work/muqun/gateway-desktop/src/agents/message_images/tool_media.rs",
+                            "Target": "    let (inner, wrapped) = if outer_type == \"content\" {\n        match obj.get(\"content\").filter(|v| v.is_object()) {\n            Some(inner) => (inner, true),\n            None => return None,\n        }\n    } else {",
+                            "Replacement": "    let (inner, wrapped) = if outer_type == \"content\" {\n        (obj.get(\"content\").filter(|v| v.is_object())?, true)\n    } else {"
+                        }),
+                        output: Some(serde_json::json!({})),
+                        content: None,
+                        metadata: None,
+                        state: ToolCallStatus::Completed,
+                        status: ToolCallStatus::Completed,
+                        error: None,
+                        child_session_id: None,
+                        background: false,
+                        input_partial: None,
+                        truncated: false,
+                        time: Default::default(),
+                    }),
+                ),
+                item(
+                    "t-ag-shell",
+                    TimelineRole::Assistant,
+                    AgentPart::Tool(ToolCall {
+                        id: "ag-shell-1".into(),
+                        name: "run_command".into(),
+                        title: None,
+                        input: serde_json::json!({
+                            "CommandLine": "cargo test --workspace --locked",
+                            "Cwd": "/home/ryu/Work/muqun/gateway-desktop"
+                        }),
+                        output: Some(serde_json::json!({ "exit_code": 0, "output": "test result: ok. 2366 passed; 0 failed" })),
+                        content: None,
+                        metadata: None,
+                        state: ToolCallStatus::Completed,
+                        status: ToolCallStatus::Completed,
+                        error: None,
+                        child_session_id: None,
+                        background: false,
+                        input_partial: None,
+                        truncated: false,
+                        time: Default::default(),
+                    }),
+                ),
+                item(
                     "t-ag-doc",
                     TimelineRole::Assistant,
                     AgentPart::Tool(ToolCall {

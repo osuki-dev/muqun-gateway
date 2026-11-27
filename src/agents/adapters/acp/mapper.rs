@@ -596,7 +596,13 @@ fn row_bytes(part: &AgentPart) -> usize {
 fn is_todo_tool_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "updatetodos" | "update_todos" | "todowrite" | "todoread" | "todo" | "tasks"
+        "updatetodos"
+            | "update_todos"
+            | "update_steps"
+            | "todowrite"
+            | "todoread"
+            | "todo"
+            | "tasks"
     )
 }
 
@@ -618,6 +624,7 @@ fn todo_entries(params: &Value) -> Vec<(String, Option<String>, Option<bool>)> {
     let Some(arr) = params
         .get("todos")
         .or_else(|| params.get("items"))
+        .or_else(|| params.get("steps"))
         .and_then(Value::as_array)
     else {
         return Vec::new();
@@ -642,7 +649,7 @@ fn todo_entries(params: &Value) -> Vec<(String, Option<String>, Option<bool>)> {
             let done = item
                 .get("status")
                 .and_then(Value::as_str)
-                .map(|s| s.eq_ignore_ascii_case("completed"))
+                .map(|s| s.eq_ignore_ascii_case("completed") || s.eq_ignore_ascii_case("done"))
                 .or_else(|| item.get("done").and_then(Value::as_bool));
             if text.is_none() && done.is_none() && item.get("id").is_none() {
                 return None;
@@ -1183,9 +1190,7 @@ impl Projection {
                 if let Some(input) = update.get("rawInput") {
                     call.input = input.clone();
                 }
-                if crate::agents::message_images::tool_media::is_read_file_tool(&call.name)
-                    && crate::agents::message_images::tool_media::input_path(&call.input).is_none()
-                {
+                if crate::agents::message_images::tool_media::input_path(&call.input).is_none() {
                     if let Some(loc_path) = update
                         .get("locations")
                         .and_then(Value::as_array)
