@@ -1229,6 +1229,18 @@ impl<P: AcpProvider> AcpDriver<P> {
         }
     }
 
+    fn has_muqun_mcp(&self) -> bool {
+        self.mcp_servers
+            .lock()
+            .unwrap()
+            .as_array()
+            .is_some_and(|servers| {
+                servers
+                    .iter()
+                    .any(|server| server["name"] == crate::mcp::hosts::SERVER_NAME)
+            })
+    }
+
     /// Add `mcpServers` and the provider's [`AcpProvider::session_meta`] to
     /// the params of a session start.
     fn add_mcp_servers(&self, params: &mut Value) {
@@ -5276,6 +5288,17 @@ impl<P: AcpProvider> AgentPort for AcpDriver<P> {
             }
             self.rename(id, command, &title).await
         })
+    }
+    fn adds_mcp_servers(&self) -> bool {
+        self.has_muqun_mcp()
+    }
+    fn mcp_server_connected<'a>(
+        &'a self,
+        name: &'a str,
+        _directory: Option<&'a str>,
+    ) -> AgentFuture<'a, bool> {
+        let connected = name == crate::mcp::hosts::SERVER_NAME && self.has_muqun_mcp();
+        Box::pin(async move { Ok(connected) })
     }
     fn takes_session_instructions(&self) -> bool {
         P::SYSTEM_PROMPT

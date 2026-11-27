@@ -1246,9 +1246,16 @@ const MUQUN_OPS: &[(&str, MuqunOp)] = &[
 ];
 
 pub fn muqun_op(name: &str) -> Option<MuqunOp> {
-    let tool = ["mcp__muqun__", "muqun__", "muqun_", "muqun.", "muqun:"]
-        .iter()
-        .find_map(|p| name.strip_prefix(p))?;
+    let tool = [
+        "mcp__muqun__",
+        "mcp_muqun_",
+        "muqun__",
+        "muqun_",
+        "muqun.",
+        "muqun:",
+    ]
+    .iter()
+    .find_map(|p| name.strip_prefix(p))?;
     MUQUN_OPS
         .iter()
         .find(|(op, _)| tool == *op || tool == op.replace('.', "_"))
@@ -1827,6 +1834,12 @@ mod tests {
         assert_eq!(m.command.as_deref(), Some("ls"));
         assert_eq!(m.machine.as_deref(), Some("mini"));
         assert!(muqun_op("muqun_tasks_wait").is_some() && muqun_op("other__tasks_wait").is_none());
+        assert_eq!(muqun_op("mcp_muqun_exec_run"), Some(MuqunOp::ExecRun));
+        assert_eq!(muqun_op("mcp_muqun_fleet_list"), Some(MuqunOp::FleetList));
+        assert_eq!(
+            muqun_op("mcp_muqun_tasks_delegate"),
+            Some(MuqunOp::TasksDelegate)
+        );
     }
 
     #[test]

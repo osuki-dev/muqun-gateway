@@ -409,11 +409,13 @@ async fn serve(
     } else {
         None
     };
+    let underscore_tool_names = tools::uses_underscore_tool_names(&state, &session).await;
     let service = StreamableHttpService::new(
         move || {
             Ok(tools::MuqunMcp::new(state.clone(), session.clone())
                 .in_task(in_task)
-                .fleet(fleet.clone()))
+                .fleet(fleet.clone())
+                .underscore_tool_names(underscore_tool_names))
         },
         Arc::new(NeverSessionManager::default()),
         config(),
@@ -599,6 +601,72 @@ mod tests {
         let machines = answer["machines"].as_array().unwrap();
         assert_eq!(machines.len(), 1, "{answer}");
         assert_eq!(machines[0]["machineId"], state.config.server_id, "{answer}");
+    }
+
+    #[tokio::test]
+    async fn antigravity_caller_lists_underscore_tools_and_calls_them_over_mcp() {
+        let state = crate::test_state("admin", Vec::new());
+        let token = state
+            .mcp_tokens
+            .issue(
+                TokenBinding::Runtime {
+                    agent_id: "antigravity".into(),
+                },
+                "antigravity (native sessions)".into(),
+                60_000,
+            )
+            .await
+            .unwrap()
+            .token;
+        let (status, body) = send(&state, post("127.0.0.1:5", Some(&token), &[])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let names: Vec<&str> = body["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"exec_run"), "{body}");
+        assert!(names.contains(&"fleet_list"), "{body}");
+        assert!(names.contains(&"tasks_delegate"), "{body}");
+        assert!(
+            names.iter().all(|name| {
+                let prefixed = format!("mcp_muqun_{name}");
+                prefixed.len() <= 64
+                    && prefixed
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            }),
+            "every tool exposed to Antigravity must satisfy strict ^[a-zA-Z0-9_-]{{1,64}}$: {names:?}"
+        );
+        let call_req = rpc(
+            "127.0.0.1:5",
+            Some(&token),
+            &[("mcp-name", "fleet_list")],
+            "tools/call",
+            json!({ "name": "fleet_list", "arguments": {} }),
+        );
+        let (status, body) = send(&state, call_req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_ne!(body["result"]["isError"], true, "{body}");
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let answer: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            answer["machines"][0]["machineId"], state.config.server_id,
+            "{answer}"
+        );
+
+        let standard_token = issue(&state).await;
+        let alias_req = rpc(
+            "127.0.0.1:5",
+            Some(&standard_token),
+            &[("mcp-name", "fleet_list")],
+            "tools/call",
+            json!({ "name": "fleet_list", "arguments": {} }),
+        );
+        let (status, body) = send(&state, alias_req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_ne!(body["result"]["isError"], true, "{body}");
     }
 
     /// The listener's 128 KiB body limit holds on `/mcp` too: a 200 KiB call

@@ -346,14 +346,22 @@ pub(crate) async fn prepare_session_agent(
         _ => &OTHER,
     };
     let _one = registering.lock().await;
-    // DSH's official MCP client is loaded once by a launcher overlay. There
-    // is no supported runtime registration RPC. Never mint a useless token
-    // or restart a user's adopted service while preparing a message.
-    if agent.kind() == "deepseek" {
+    // DSH, Pi, and ACP agents receive the Muqun MCP server from their launch
+    // overlay, child environment, or session `mcpServers` list. There is no
+    // supported runtime registration RPC. Never mint a useless token or
+    // restart a user's adopted service while preparing a message.
+    if matches!(
+        agent.kind(),
+        "deepseek" | "claude" | "antigravity" | "cursor" | "copilot" | "fx" | "qoder" | "pi"
+    ) {
         return if agent.mcp_server_connected(SERVER_NAME, directory).await? {
             Ok(())
-        } else {
+        } else if agent.kind() == "deepseek" {
             Err(crate::agents::adapters::deepseek::mcp::unavailable())
+        } else {
+            Err(AgentError::NotAvailable(
+                "Computer tools are not loaded for this agent".into(),
+            ))
         };
     }
     if agent.kind() == "codex" {

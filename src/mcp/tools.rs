@@ -603,7 +603,86 @@ pub(crate) struct MuqunMcp {
     /// The computers the task's agent may hand work to ([`fleet_line`]),
     /// told in its instructions.
     fleet: Option<String>,
+    /// Whether `tools/list`, `get_tool`, and instructions expose underscore
+    /// tool names (`exec_run`, `fleet_list`, …) for strict hosts like
+    /// Antigravity whose tool-name validator forbids dots. `tools/call`
+    /// always accepts both dotted and underscore spellings.
+    underscore_tool_names: bool,
     tool_router: ToolRouter<Self>,
+}
+
+/// Canonical dotted built-in tool names paired with their underscore aliases
+/// (`^[a-zA-Z0-9_-]{1,64}$`, even with host prefixes like `mcp_muqun_`).
+const BUILTIN_TOOL_ALIASES: &[(&str, &str)] = &[
+    ("exec.run", "exec_run"),
+    ("files.present", "files_present"),
+    ("fleet.describe", "fleet_describe"),
+    ("fleet.list", "fleet_list"),
+    ("hub.call_tool", "hub_call_tool"),
+    ("hub.search_tools", "hub_search_tools"),
+    ("skills.read", "skills_read"),
+    ("tasks.cancel", "tasks_cancel"),
+    ("tasks.complete", "tasks_complete"),
+    ("tasks.delegate", "tasks_delegate"),
+    ("tasks.read", "tasks_read"),
+    ("tasks.wait", "tasks_wait"),
+];
+
+pub(crate) fn canonical_tool_name(name: &str) -> Option<&'static str> {
+    BUILTIN_TOOL_ALIASES
+        .iter()
+        .find(|&&(dotted, underscored)| name == dotted || name == underscored)
+        .map(|&(dotted, _)| dotted)
+}
+
+fn underscore_tool_name(name: &str) -> Option<&'static str> {
+    BUILTIN_TOOL_ALIASES
+        .iter()
+        .find(|&&(dotted, underscored)| name == dotted || name == underscored)
+        .map(|&(_, underscored)| underscored)
+}
+
+fn rewrite_tool_names_to_underscore(text: &str) -> String {
+    let mut out = text.to_owned();
+    for &(dotted, underscored) in BUILTIN_TOOL_ALIASES {
+        out = out.replace(dotted, underscored);
+    }
+    out
+}
+
+pub(crate) fn agent_uses_underscore_tool_names(agent_id: &str) -> bool {
+    agent_id == "antigravity"
+}
+
+fn session_uses_underscore_tool_names(session: &AssistantSession) -> bool {
+    match &session.binding {
+        crate::mcp::tokens::TokenBinding::Runtime { agent_id }
+        | crate::mcp::tokens::TokenBinding::Agent { agent_id } => {
+            agent_uses_underscore_tool_names(agent_id)
+        }
+        crate::mcp::tokens::TokenBinding::Pane { .. }
+        | crate::mcp::tokens::TokenBinding::Task { .. } => false,
+    }
+}
+
+pub(crate) async fn uses_underscore_tool_names(
+    state: &AppState,
+    session: &AssistantSession,
+) -> bool {
+    if session_uses_underscore_tool_names(session) {
+        return true;
+    }
+    let Some(task) = task_of(state, session).await else {
+        return false;
+    };
+    match &task.binding {
+        TaskBinding::AgentSession { agent_id, .. } => agent_uses_underscore_tool_names(agent_id),
+        TaskBinding::Pane {
+            agent_id: Some(agent_id),
+            ..
+        } => agent_uses_underscore_tool_names(agent_id),
+        _ => false,
+    }
 }
 
 static CACHED_TOOL_ROUTER: OnceLock<ToolRouter<MuqunMcp>> = OnceLock::new();
@@ -631,11 +710,13 @@ pub(crate) fn builtin_tool_previews() -> Vec<super::hub::UpstreamToolPreview> {
 impl MuqunMcp {
     pub(crate) fn new(state: AppState, session: AssistantSession) -> Self {
         let tool_router = CACHED_TOOL_ROUTER.get_or_init(Self::tool_router).clone();
+        let underscore_tool_names = session_uses_underscore_tool_names(&session);
         Self {
             state,
             session,
             in_task: false,
             fleet: None,
+            underscore_tool_names,
             tool_router,
         }
     }
@@ -650,6 +731,27 @@ impl MuqunMcp {
     pub(crate) fn in_task(mut self, in_task: bool) -> Self {
         self.in_task = in_task;
         self
+    }
+
+    /// Expose underscore tool names (`exec_run`, `fleet_list`, …) to strict
+    /// hosts whose MCP tool-name validator rejects dots.
+    pub(crate) fn underscore_tool_names(mut self, enabled: bool) -> Self {
+        self.underscore_tool_names = enabled;
+        self
+    }
+
+    fn format_tool(&self, mut tool: rmcp::model::Tool) -> rmcp::model::Tool {
+        if self.underscore_tool_names {
+            if let Some(underscored) = underscore_tool_name(tool.name.as_ref()) {
+                tool.name = std::borrow::Cow::Borrowed(underscored);
+            }
+            if let Some(desc) = tool.description {
+                tool.description = Some(std::borrow::Cow::Owned(rewrite_tool_names_to_underscore(
+                    desc.as_ref(),
+                )));
+            }
+        }
+        tool
     }
 
     fn by(&self) -> TaskPrincipal {
@@ -1522,7 +1624,57 @@ impl ServerHandler for MuqunMcp {
                 "muqun-gateway",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions(instructions(self.in_task, self.fleet.as_deref()))
+            .with_instructions(instructions_for(
+                self.in_task,
+                self.fleet.as_deref(),
+                self.underscore_tool_names,
+            ))
+    }
+
+    async fn call_tool(
+        &self,
+        mut request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        if !self.tool_router.map.contains_key(request.name.as_ref()) {
+            if let Some(canonical) = canonical_tool_name(request.name.as_ref()) {
+                request.name = std::borrow::Cow::Borrowed(canonical);
+            }
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        let tools = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| self.format_tool(tool))
+            .collect();
+        Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Private),
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        let lookup = canonical_tool_name(name).unwrap_or(name);
+        self.tool_router
+            .get(lookup)
+            .cloned()
+            .map(|tool| self.format_tool(tool))
     }
 
     async fn list_resources(
@@ -1630,7 +1782,11 @@ impl ServerHandler for MuqunMcp {
 /// What the server tells a caller about itself and about finishing a task:
 /// plainly to one started for a task (`in_task`), conditionally to anyone
 /// else, who may never have been given one.
-pub(crate) fn instructions(in_task: bool, fleet: Option<&str>) -> String {
+pub(crate) fn instructions_for(
+    in_task: bool,
+    fleet: Option<&str>,
+    underscore_tool_names: bool,
+) -> String {
     let about = "Muqun Gateway on this computer. Use fleet.describe for capabilities/peers, \
                  exec.run for commands/scripts (prefer over SSH), and tasks.delegate for \
                  sub-tasks (use barrier_group for single-wakeup parallel fan-out; end your \
@@ -1643,7 +1799,7 @@ pub(crate) fn instructions(in_task: bool, fleet: Option<&str>) -> String {
                   end with MUQUN_TASK_DONE: <summary> or MUQUN_TASK_BLOCKED: <reason>. \
                   If tasks.complete answers task_not_found, ignore the task protocol and \
                   print no marker.";
-    if in_task {
+    let text = if in_task {
         // First and imperative: a host may show this beside many other
         // instructions, and an agent that just stops leaves its task paused.
         let fleet = fleet.map(|fleet| format!(" {fleet}")).unwrap_or_default();
@@ -1659,6 +1815,11 @@ pub(crate) fn instructions(in_task: bool, fleet: Option<&str>) -> String {
              task_id tells you -- then when the whole task is finished, {finish} If \
              tasks.read says this session has no task, ignore the task protocol."
         )
+    };
+    if underscore_tool_names {
+        rewrite_tool_names_to_underscore(&text)
+    } else {
+        text
     }
 }
 
@@ -2503,6 +2664,19 @@ mod tests {
                 "tasks.wait"
             ]
         );
+        for name in &names {
+            let alias = underscore_tool_name(name)
+                .unwrap_or_else(|| panic!("missing underscore alias for {name}"));
+            assert_eq!(canonical_tool_name(alias), Some(name.as_str()));
+            let prefixed = format!("mcp_muqun_{alias}");
+            assert!(
+                prefixed.len() <= 64
+                    && prefixed
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                "invalid strict host tool name: {prefixed}"
+            );
+        }
     }
 
     /// Another session under the same agent token cancelling a child is not

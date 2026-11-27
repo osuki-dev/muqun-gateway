@@ -289,6 +289,16 @@ impl PiDriver {
         !self.stop.is_cancelled() && !self.failed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    fn has_muqun_mcp(&self) -> bool {
+        self.env
+            .iter()
+            .any(|(k, v)| k == "MUQUN_MCP_URL" && !v.is_empty())
+            && self
+                .env
+                .iter()
+                .any(|(k, v)| k == "MUQUN_MCP_TOKEN" && !v.is_empty())
+    }
+
     fn ensure_open(&self) -> Result<(), AgentError> {
         if self.is_connected() {
             Ok(())
@@ -1285,6 +1295,23 @@ impl AgentPort for PiDriver {
     fn slash_commands_listed(&self) -> bool {
         self.commands_listed
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn adds_mcp_servers(&self) -> bool {
+        self.has_muqun_mcp()
+    }
+
+    fn mcp_server_connected<'a>(
+        &'a self,
+        name: &'a str,
+        _directory: Option<&'a str>,
+    ) -> AgentFuture<'a, bool> {
+        let connected = name == crate::mcp::hosts::SERVER_NAME && self.has_muqun_mcp();
+        Box::pin(async move { Ok(connected) })
+    }
+
+    fn takes_session_instructions(&self) -> bool {
+        false
     }
 
     /// Healthy while any child is alive: a failed probe makes the runtime

@@ -1066,8 +1066,11 @@ mod tests {
     fn a_host_s_prefixed_tool_name_still_names_the_tool() {
         for name in [
             "tasks.delegate",
+            "tasks_delegate",
             "muqun_tasks_delegate",
+            "mcp_muqun_tasks_delegate",
             "mcp__muqun__tasks.delegate",
+            "mcp__muqun__tasks_delegate",
             "muqun.tasks.delegate",
         ] {
             assert!(names_tool(name, "tasks.delegate"), "{name}");
@@ -1075,5 +1078,6 @@ mod tests {
         assert!(!names_tool("muqun_tasks_wait", "tasks.delegate"));
         assert!(!names_tool("muqun_mytasks_delegate_x", "tasks.delegate"));
         assert!(names_tool("muqun_exec_run", "exec.run"));
+        assert!(names_tool("mcp_muqun_exec_run", "exec.run"));
     }
 }

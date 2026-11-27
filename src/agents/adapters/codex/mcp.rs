@@ -101,7 +101,8 @@ pub(super) async fn connected(
                 .get("tools")
                 .and_then(Value::as_object)
                 .is_some_and(|tools| {
-                    tools.contains_key("exec.run") && tools.contains_key("fleet.list")
+                    (tools.contains_key("exec.run") || tools.contains_key("exec_run"))
+                        && (tools.contains_key("fleet.list") || tools.contains_key("fleet_list"))
                 })
     }))
 }
