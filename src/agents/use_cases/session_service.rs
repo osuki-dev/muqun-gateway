@@ -270,10 +270,26 @@ impl SessionService {
             self.agent.get_pending_forms(&asid.0),
         );
         let mut info = info?;
+        let prepared = prepared?;
+        if info.context_usage.is_none() {
+            if let Some(mut observed) = self.agent.observed_context_usage(&asid.0) {
+                if observed.limit.is_none() {
+                    observed.limit = info.limit.clone();
+                } else if let (
+                    Some(serde_json::Value::Object(dst)),
+                    Some(serde_json::Value::Object(src)),
+                ) = (observed.limit.as_mut(), info.limit.as_ref())
+                {
+                    for (k, v) in src {
+                        dst.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
+                info.context_usage = Some(observed);
+            }
+        }
         self.stamp(&mut info);
         self.observe_runtime(&mut info).await;
         self.mirror.update_session(info.clone()).await;
-        let prepared = prepared?;
         let timeline = prepared.items;
         if let (Some(memory), Some(gate)) = (&self.memory, &history_gate) {
             if !memory

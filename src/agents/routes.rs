@@ -1057,6 +1057,7 @@ async fn socket_read_agent_session(
     }
     message_images::attach_to_items(state, asid, directory.as_deref(), &mut snapshot.timeline)
         .await;
+    dedupe_redundant_tool_content(&mut snapshot.timeline);
     message_images::attach_to_inbox(state, asid, &mut snapshot.inbox).await;
     state.preview_cache.maybe_save(&state.db, &snapshot);
 
@@ -1283,6 +1284,7 @@ async fn project_history_window(
         hide_in_inbox(&mut snapshot.inbox);
     }
     message_images::attach_window(state, asid, snapshot).await;
+    dedupe_redundant_tool_content(&mut snapshot.timeline);
     let mut data = json!(window);
     if window.unchanged {
         data.as_object_mut().unwrap().remove("timeline");
@@ -1312,7 +1314,48 @@ async fn socket_history_page(
         .map_err(agent_error)?;
     hide_in_items(&mut page.items, for_session(state, asid).await);
     message_images::attach_to_items(state, asid, None, &mut page.items).await;
+    dedupe_redundant_tool_content(&mut page.items);
     Ok(Json(content_envelope(json!(page))))
+}
+
+/// Drop `ToolCall.content` on the wire when it is an exact pure-text duplicate
+/// of `ToolCall.output`. Any content array carrying files, images, diffs, or
+/// non-text structured blocks is preserved verbatim.
+fn dedupe_redundant_tool_content(items: &mut [super::domain::TimelineItem]) {
+    for item in items {
+        let super::domain::AgentPart::Tool(call) = &mut item.part else {
+            continue;
+        };
+        let (Some(Value::String(output)), Some(Value::Array(blocks))) =
+            (&call.output, &call.content)
+        else {
+            continue;
+        };
+        let pure_text = !blocks.is_empty()
+            && blocks.iter().all(|block| match block {
+                Value::String(_) => true,
+                Value::Object(map) => {
+                    map.get("type").and_then(Value::as_str) == Some("text")
+                        && map.get("text").and_then(Value::as_str).is_some()
+                        && map.len() <= 2
+                }
+                _ => false,
+            });
+        if !pure_text {
+            continue;
+        }
+        let flattened: Vec<&str> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                Value::String(s) => Some(s.as_str()),
+                Value::Object(map) => map.get("text").and_then(Value::as_str),
+                _ => None,
+            })
+            .collect();
+        if flattened.join("\n") == *output {
+            call.content = None;
+        }
+    }
 }
 
 async fn do_get_agent_session_events(
@@ -3056,12 +3099,21 @@ async fn do_list_agent_session_descendants(
         let mut next = Vec::new();
         for parent in &frontier {
             session_query.parent_id = Some(parent.clone());
-            for manager in &all_managers {
-                let list = match manager.sessions().list_sessions(&session_query).await {
+            let q = session_query.clone();
+            let results = futures::future::join_all(all_managers.iter().map(|manager| {
+                let q = q.clone();
+                async move {
+                    let res = manager.sessions().list_sessions(&q).await;
+                    (manager.agent().kind(), res)
+                }
+            }))
+            .await;
+            for (kind, res) in results {
+                let list = match res {
                     Ok(list) => list,
                     Err(e) => {
                         tracing::warn!(
-                            agent_id = manager.agent().kind(),
+                            agent_id = kind,
                             error = %e,
                             "agent children list failed; skipping this agent"
                         );
@@ -3080,7 +3132,7 @@ async fn do_list_agent_session_descendants(
                     }
                     state
                         .agent_runtime
-                        .record_session_route(&session.asid.0, manager.agent().kind())
+                        .record_session_route(&session.asid.0, kind)
                         .await;
                     next.push(session.asid.0.clone());
                     sessions.push(session);
@@ -4886,6 +4938,43 @@ mod tests {
         }
         .force_refresh());
         assert!(!AccountLimitsQuery::default().force_refresh());
+    }
+
+    #[test]
+    fn dedupe_redundant_tool_content_drops_exact_text_copies_and_keeps_rich_blocks() {
+        let mut items: Vec<crate::agents::domain::TimelineItem> = vec![
+            serde_json::from_value(json!({
+                "id": "t1", "message_id": "m1", "role": "assistant", "seq": 1, "updated_ms": 1,
+                "part": {
+                    "type": "tool", "id": "c1", "name": "read", "input": {}, "state": "completed", "status": "completed",
+                    "output": "line 1\nline 2",
+                    "content": [{"type": "text", "text": "line 1"}, {"type": "text", "text": "line 2"}]
+                }
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "id": "t2", "message_id": "m1", "role": "assistant", "seq": 2, "updated_ms": 2,
+                "part": {
+                    "type": "tool", "id": "c2", "name": "read", "input": {}, "state": "completed", "status": "completed",
+                    "output": "img.png",
+                    "content": [{"type": "file", "uri": "file:///tmp/img.png", "mime": "image/png"}]
+                }
+            }))
+            .unwrap(),
+        ];
+        dedupe_redundant_tool_content(&mut items);
+        let crate::agents::domain::AgentPart::Tool(pure) = &items[0].part else {
+            panic!("tool");
+        };
+        assert!(pure.content.is_none(), "exact pure-text duplicate dropped");
+        assert_eq!(
+            pure.output.as_ref().and_then(Value::as_str),
+            Some("line 1\nline 2")
+        );
+        let crate::agents::domain::AgentPart::Tool(rich) = &items[1].part else {
+            panic!("tool");
+        };
+        assert!(rich.content.is_some(), "file/image block preserved");
     }
 
     /// A session whose recorded owner is not attached is retryable, never

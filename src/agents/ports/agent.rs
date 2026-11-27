@@ -310,6 +310,15 @@ pub trait AgentPort: Send + Sync {
         Some(0)
     }
 
+    /// Latest context occupancy observed from an adapter's ordinary timeline
+    /// reads without issuing an extra upstream roundtrip.
+    fn observed_context_usage(
+        &self,
+        _session_id: &str,
+    ) -> Option<crate::agents::domain::SessionContextUsage> {
+        None
+    }
+
     /// Health check / availability probe
     fn probe(&self) -> AgentFuture<'_, bool>;
 

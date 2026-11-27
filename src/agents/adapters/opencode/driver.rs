@@ -171,6 +171,9 @@ pub struct OpencodeDriver {
     /// Remembered session directories so `get_vcs_diff` avoids an extra
     /// `GET /api/session/{id}` roundtrip when the session was already loaded.
     session_dirs: Mutex<HashMap<String, String>>,
+    /// Latest context usage observed from `get_timeline` messages so opening a
+    /// session populates `info.context_usage` without an extra `/context` read.
+    context_usage: Mutex<HashMap<String, crate::agents::domain::SessionContextUsage>>,
 }
 
 /// The newest messages of a session delivered so far. OpenCode's message
@@ -205,7 +208,23 @@ impl OpencodeDriver {
             catalog_cache: Mutex::new(HashMap::new()),
             earlier: Mutex::new(HashMap::new()),
             session_dirs: Mutex::new(HashMap::new()),
+            context_usage: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn remember_context_usage(
+        &self,
+        session_id: &str,
+        usage: Option<crate::agents::domain::SessionContextUsage>,
+    ) {
+        let Some(usage) = usage else {
+            return;
+        };
+        let mut map = self.context_usage.lock().unwrap_or_else(|p| p.into_inner());
+        if map.len() >= 256 && !map.contains_key(session_id) {
+            map.clear();
+        }
+        map.insert(session_id.to_string(), usage);
     }
 
     fn remember_session_dir(&self, session_id: &str, directory: Option<&str>) {
@@ -560,6 +579,13 @@ impl AgentPort for OpencodeDriver {
         query: &'a SessionQuery,
     ) -> AgentFuture<'a, Vec<AgentSessionInfo>> {
         Box::pin(async move {
+            // OpenCode v2 validates `parentID` as an OpenCode session id (`ses_...`)
+            // and answers HTTP 400 for foreign agent ids (UUIDs from Codex/Claude/etc.).
+            if let Some(parent) = query.parent_id.as_deref() {
+                if parent != "null" && !parent.starts_with("ses_") {
+                    return Ok(Vec::new());
+                }
+            }
             let filter = SessionListFilter {
                 parent_id: query.parent_id.as_deref(),
                 limit: query.limit,
@@ -581,6 +607,17 @@ impl AgentPort for OpencodeDriver {
 
     fn list_sessions_page<'a>(&'a self, query: &'a SessionQuery) -> AgentFuture<'a, SessionPage> {
         Box::pin(async move {
+            if let Some(parent) = query.parent_id.as_deref() {
+                if parent != "null" && !parent.starts_with("ses_") {
+                    return Ok(SessionPage {
+                        data: Vec::new(),
+                        cursor: crate::agents::domain::SessionCursor {
+                            next: None,
+                            previous: None,
+                        },
+                    });
+                }
+            }
             let filter = SessionListFilter {
                 parent_id: query.parent_id.as_deref(),
                 limit: query.limit,
@@ -628,6 +665,14 @@ impl AgentPort for OpencodeDriver {
             {
                 if let Ok(messages) = self.client.get_messages(session_id, 5).await {
                     info.error = mapper::last_failure(&messages);
+                }
+            }
+            if info.context_usage.is_none() {
+                if let Some(mut observed) = self.observed_context_usage(&info.asid.0) {
+                    if observed.limit.is_none() {
+                        observed.limit = info.limit.clone();
+                    }
+                    info.context_usage = Some(observed);
                 }
             }
             self.remember_session_dir(&info.asid.0, info.directory.as_deref());
@@ -1017,6 +1062,17 @@ impl AgentPort for OpencodeDriver {
         })
     }
 
+    fn observed_context_usage(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::agents::domain::SessionContextUsage> {
+        self.context_usage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session_id)
+            .cloned()
+    }
+
     fn get_timeline<'a>(
         &'a self,
         session_id: &'a str,
@@ -1024,6 +1080,7 @@ impl AgentPort for OpencodeDriver {
     ) -> AgentFuture<'a, Vec<crate::agents::domain::TimelineItem>> {
         Box::pin(async move {
             let messages = self.client.get_messages(session_id, limit).await?;
+            self.remember_context_usage(session_id, mapper::map_context_usage(&messages, None));
             self.hold_newest(session_id, &messages, limit);
             let asid = crate::agents::domain::AgentSessionId(session_id.to_string());
             Ok(mapper::map_messages_to_timeline(&messages, &asid))
