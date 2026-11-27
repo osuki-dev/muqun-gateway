@@ -1433,6 +1433,7 @@ pub fn dispatch(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         && !s.search.focused
         && s.palette.is_none()
         && s.keys_sheet.is_none()
+        && s.pairing_target.is_none()
     {
         return s.terminal_key(ev, tx);
     }

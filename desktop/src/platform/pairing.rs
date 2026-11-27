@@ -178,19 +178,6 @@ pub fn normalize_pairing_code(input: &str) -> String {
     }
 }
 
-/// Formats a code into spaced terminal display format: `V D K Q - 7 Q U F`.
-pub fn format_spaced_code(code: &str) -> String {
-    let clean = normalize_pairing_code(code);
-    if clean.is_empty() {
-        return String::new();
-    }
-    clean
-        .chars()
-        .map(|c| c.to_string())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// Claim an app token using a pairing code (`POST /api/pair/claim`).
 pub async fn claim_app_pairing(
     url: &str,
@@ -340,13 +327,5 @@ mod tests {
         assert_eq!(normalize_pairing_code("vdkq-7quf"), "VDKQ-7QUF");
         assert_eq!(normalize_pairing_code("V D K Q - 7 Q U F"), "VDKQ-7QUF");
         assert_eq!(normalize_pairing_code("vdkq7qufextra"), "VDKQ-7QUF");
-    }
-
-    #[test]
-    fn test_format_spaced_code() {
-        assert_eq!(format_spaced_code(""), "");
-        assert_eq!(format_spaced_code("vdkq"), "V D K Q");
-        assert_eq!(format_spaced_code("vdkq7quf"), "V D K Q - 7 Q U F");
-        assert_eq!(format_spaced_code("VDKQ-7QUF"), "V D K Q - 7 Q U F");
     }
 }

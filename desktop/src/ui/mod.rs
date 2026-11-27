@@ -1395,15 +1395,18 @@ impl UiState {
 
     pub fn open_pairing(&mut self, target_id: String) {
         let default_url = self.peer_url(&target_id).unwrap_or_default();
+        let url_empty = default_url.trim().is_empty();
         self.pairing_target = Some(target_id);
         self.pairing_offer = None;
         self.pairing_busy = false;
         self.pairing_error = None;
         self.pairing_manual_token_mode = false;
         self.pairing_code_input.clear();
-        self.pairing_code_input.focused = true;
+        self.pairing_code_input.focused = false;
         self.pairing_token_input.clear();
+        self.pairing_token_input.focused = false;
         self.pairing_url_input = TextEdit::new(default_url);
+        self.pairing_url_input.focused = url_empty;
     }
 
     pub fn close_pairing(&mut self) {
@@ -1413,8 +1416,10 @@ impl UiState {
         self.pairing_error = None;
         self.pairing_manual_token_mode = false;
         self.pairing_code_input.clear();
-        self.pairing_code_input.focused = true;
+        self.pairing_code_input.focused = false;
         self.pairing_token_input.clear();
+        self.pairing_token_input.focused = false;
+        self.pairing_url_input.focused = false;
     }
 
     fn start_default_directory(&self, agent: &str) -> PathBuf {
@@ -3531,8 +3536,11 @@ impl UiState {
                     match result {
                         Ok(offer) => {
                             self.pairing_url_input = TextEdit::new(url);
+                            self.pairing_url_input.focused = false;
+                            self.pairing_token_input.focused = false;
                             self.pairing_offer = Some(offer);
                             self.pairing_error = None;
+                            self.pairing_code_input.clear();
                             self.pairing_code_input.focused = true;
                             self.toast(
                                 copy::tr(
@@ -3581,7 +3589,12 @@ impl UiState {
                             );
                             self.switch_computer(server_id);
                         }
-                        Err(error) => self.pairing_error = Some(error),
+                        Err(error) => {
+                            self.pairing_error = Some(error);
+                            if self.pairing_offer.is_some() && !self.pairing_manual_token_mode {
+                                self.pairing_code_input.focused = true;
+                            }
+                        }
                     }
                 }
                 Update::AgentSessions { agent, sessions } => {
@@ -4612,6 +4625,8 @@ impl UiState {
             &self.project_edit,
             &self.quick_notes_edit,
             &self.browser.address,
+            &self.pairing_url_input,
+            &self.pairing_code_input,
         ]
         .into_iter()
         .chain(self.form_inputs.values())
