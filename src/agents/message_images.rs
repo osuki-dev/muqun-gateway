@@ -340,7 +340,9 @@ fn attach_local_tool_files(root: Option<&Path>, items: &mut [TimelineItem]) {
                 })
         {
             if let (Some(session_root), Some(path)) = (root, tool_media::input_path(&call.input)) {
-                if hosted_file(path, session_root).is_some() {
+                if tool_media::has_rich_document_extension(path)
+                    && hosted_file(path, session_root).is_some()
+                {
                     if let Some(uri) = tool_media::path_to_uri(path) {
                         let block = serde_json::json!({ "type": "file", "uri": uri });
                         match &mut call.content {

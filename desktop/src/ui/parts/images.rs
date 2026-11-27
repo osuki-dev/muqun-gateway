@@ -383,7 +383,7 @@ pub fn tool_media_preview(
         }
     }
     let pending = pending_images(item, pictures.len());
-    let files = item_file_refs(item, directory);
+    let files = tool_file_refs(item, directory, target_path);
 
     let mut stack = col()
         .key(format!("tool-media-{}", item.id))
@@ -569,8 +569,62 @@ struct FileRef {
     size: Option<u64>,
 }
 
+fn file_ref_from_path(raw: &str, directory: Option<&str>, size: Option<u64>) -> FileRef {
+    let stripped = raw
+        .strip_prefix("file://localhost")
+        .or_else(|| raw.strip_prefix("file://"))
+        .unwrap_or(raw);
+    let rel = directory
+        .filter(|d| !d.is_empty())
+        .and_then(|d| {
+            let prefix = format!("{}/", d.trim_end_matches('/'));
+            stripped.strip_prefix(&prefix)
+        })
+        .unwrap_or(stripped);
+    let path = Path::new(rel);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| rel.to_string());
+    let parent = path
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| !p.is_empty() && p != ".")
+        .unwrap_or_default();
+    FileRef {
+        src: raw.to_owned(),
+        name,
+        parent,
+        size,
+    }
+}
+
+fn is_api_media_url(src: &str) -> bool {
+    src.starts_with("/api/agent-images/") || src.starts_with("/api/assets/")
+}
+
 fn item_file_refs(item: &TimelineItem, directory: Option<&str>) -> Vec<FileRef> {
     let mut out: Vec<FileRef> = Vec::new();
+    for asset in item.image_assets.iter().flatten() {
+        if asset.unavailable_reason.is_some()
+            || asset.mime.starts_with("image/")
+            || asset.src.trim().is_empty()
+            || is_api_media_url(&asset.src)
+        {
+            continue;
+        }
+        let file = file_ref_from_path(&asset.src, directory, asset.size);
+        if !out.iter().any(|seen| seen.src == file.src) {
+            out.push(file);
+        }
+    }
+    out
+}
+
+fn tool_file_refs(item: &TimelineItem, directory: Option<&str>, target_path: &str) -> Vec<FileRef> {
+    let mut out: Vec<FileRef> = Vec::new();
+    let target = target_path.trim();
     for asset in item.image_assets.iter().flatten() {
         if asset.unavailable_reason.is_some()
             || asset.mime.starts_with("image/")
@@ -578,36 +632,18 @@ fn item_file_refs(item: &TimelineItem, directory: Option<&str>) -> Vec<FileRef> 
         {
             continue;
         }
-        let raw = asset
-            .src
-            .strip_prefix("file://localhost")
-            .or_else(|| asset.src.strip_prefix("file://"))
-            .unwrap_or(&asset.src);
-        let rel = directory
-            .filter(|d| !d.is_empty())
-            .and_then(|d| {
-                let prefix = format!("{}/", d.trim_end_matches('/'));
-                raw.strip_prefix(&prefix)
-            })
-            .unwrap_or(raw);
-        let path = Path::new(rel);
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| rel.to_string());
-        let parent = path
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .filter(|p| !p.is_empty() && p != ".")
-            .unwrap_or_default();
-        if !out.iter().any(|seen| seen.src == asset.src) {
-            out.push(FileRef {
-                src: asset.src.clone(),
-                name,
-                parent,
-                size: asset.size,
-            });
+        let resolved_src = if is_api_media_url(&asset.src) {
+            if !target.is_empty() {
+                target
+            } else {
+                continue;
+            }
+        } else {
+            asset.src.as_str()
+        };
+        let file = file_ref_from_path(resolved_src, directory, asset.size);
+        if !out.iter().any(|seen| seen.src == file.src) {
+            out.push(file);
         }
     }
     out
@@ -669,6 +705,50 @@ mod tests {
                 name: "order-flow-hupun-erp.md".into(),
                 parent: "docs".into(),
                 size: Some(42),
+            }]
+        );
+    }
+
+    #[test]
+    fn tool_file_refs_never_displays_api_original_url_as_filename() {
+        let item = TimelineItem {
+            id: "2".into(),
+            message_id: "m2".into(),
+            role: TimelineRole::Assistant,
+            part: AgentPart::Text { text: "ok".into() },
+            seq: 2,
+            updated_ms: 0,
+            ordinal: 0,
+            attachments: None,
+            image_assets: Some(vec![MessageImageAsset {
+                src: "/api/agent-images/ai_deadbeef/original".into(),
+                asset_id: "ai_deadbeef".into(),
+                url: "/api/agent-images/ai_deadbeef/original".into(),
+                mime: "application/pdf".into(),
+                width: None,
+                height: None,
+                thumbnail_url: None,
+                preview_url: None,
+                download_url: Some("/api/agent-images/ai_deadbeef/download".into()),
+                version_url: None,
+                size: Some(85_000),
+                unavailable_reason: None,
+            }]),
+            generation: None,
+            origin: None,
+        };
+        assert!(item_file_refs(&item, Some("/home/ryu/Work/osuki")).is_empty());
+        assert_eq!(
+            tool_file_refs(
+                &item,
+                Some("/home/ryu/Work/osuki"),
+                "/home/ryu/Work/osuki/docs/spec.pdf"
+            ),
+            vec![FileRef {
+                src: "/home/ryu/Work/osuki/docs/spec.pdf".into(),
+                name: "spec.pdf".into(),
+                parent: "docs".into(),
+                size: Some(85_000),
             }]
         );
     }

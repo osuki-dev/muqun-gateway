@@ -242,6 +242,21 @@ pub(crate) fn has_image_extension(path: &str) -> bool {
     )
 }
 
+/// Whether `path` is a rich binary document/media file that benefits from an
+/// inline file card when a read tool returns no text body (unlike ordinary
+/// source code / plain text reads, which stay compact foldable `Read` rows).
+pub(crate) fn has_rich_document_extension(path: &str) -> bool {
+    let raw = path.split(['?', '#']).next().unwrap_or(path);
+    matches!(
+        Path::new(raw)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("pdf" | "docx" | "xlsx" | "pptx" | "mp4" | "mov" | "webm" | "mp3" | "wav" | "m4a")
+    )
+}
+
 /// Convert an absolute host path into a `file://` URI (matching Codex `imageView`),
 /// leaving relative paths and existing URIs untouched.
 pub(crate) fn path_to_uri(path: &str) -> Option<String> {

@@ -399,10 +399,10 @@ async fn attach_with_originals_dir(
         }
         if let AgentPart::Tool(call) = &mut item.part {
             super::tool_media::normalize_tool_call(call);
-            // Completed read-file calls inside the session workspace that carry
-            // no inline text output (e.g. Antigravity ACP replay) get a typed
-            // session-fenced file entry so clients render a file card instead
-            // of raw JSON input.
+            // Completed read-file calls on rich binary/document files (PDF,
+            // Office, audio/video) inside the session workspace that carry no
+            // inline text output get a typed session-fenced file entry. Normal
+            // source code / text reads stay compact foldable `Read` rows.
             if super::tool_media::is_read_file_tool(&call.name)
                 && call.state == crate::agents::domain::ToolCallStatus::Completed
                 && !super::tool_media::has_text_output(call)
@@ -419,7 +419,9 @@ async fn attach_with_originals_dir(
                 if let (Some(session_root), Some(path)) =
                     (root.as_deref(), super::tool_media::input_path(&call.input))
                 {
-                    if hosted_file(path, session_root).is_some() {
+                    if super::tool_media::has_rich_document_extension(path)
+                        && hosted_file(path, session_root).is_some()
+                    {
                         if let Some(uri) = super::tool_media::path_to_uri(path) {
                             let block = serde_json::json!({ "type": "file", "uri": uri });
                             match &mut call.content {
@@ -1900,8 +1902,10 @@ mod tests {
         std::fs::write(&outside_png, png(320, 200, 42)).unwrap();
         let fake_png = outside.join("secret.png");
         std::fs::write(&fake_png, b"not-an-image-credential").unwrap();
-        let workspace_md = root.join("design.md");
-        std::fs::write(&workspace_md, b"# Design\nUnified card").unwrap();
+        let workspace_pdf = root.join("design.pdf");
+        std::fs::write(&workspace_pdf, b"%PDF-1.7\nUnified card").unwrap();
+        let workspace_rs = root.join("lib.rs");
+        std::fs::write(&workspace_rs, b"pub fn hi() {}\n").unwrap();
         let outside_txt = outside.join("private.txt");
         std::fs::write(&outside_txt, b"private outside text").unwrap();
 
@@ -1929,14 +1933,24 @@ mod tests {
                 "rawInput": { "Path": fake_png },
             }))
             .unwrap();
-        // 3. Antigravity ACP `read_file` on a workspace `.md` with empty output -> workspace file card.
+        // 3. Antigravity ACP `read_file` on a workspace `.pdf` with empty output -> workspace file card.
         projection
             .update(&serde_json::json!({
                 "sessionUpdate": "tool_call",
-                "toolCallId": "ag-md",
+                "toolCallId": "ag-pdf",
                 "name": "read_file",
                 "status": "completed",
-                "rawInput": { "Path": workspace_md },
+                "rawInput": { "Path": workspace_pdf },
+            }))
+            .unwrap();
+        // 3b. Antigravity ACP `read_file` on a workspace `.rs` code file -> stays a compact Read row (no file card).
+        projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "ag-rs",
+                "name": "read_file",
+                "status": "completed",
+                "rawInput": { "Path": workspace_rs },
             }))
             .unwrap();
         // 4. Antigravity ACP `read_file` on an outside non-image file -> must NOT synthesize file asset.
@@ -2027,12 +2041,16 @@ mod tests {
         );
         assert!(fake_asset.download_url.is_none());
 
-        // Workspace `.md` empty-output read: session-fenced file card asset.
-        let ag_md = by_id("ag-md");
-        let md_asset = &ag_md.image_assets.as_ref().unwrap()[0];
-        assert!(md_asset.unavailable_reason.is_none());
-        assert!(md_asset.mime.starts_with("text/"));
-        assert!(md_asset.download_url.is_some());
+        // Workspace `.pdf` empty-output read: session-fenced file card asset.
+        let ag_pdf = by_id("ag-pdf");
+        let pdf_asset = &ag_pdf.image_assets.as_ref().unwrap()[0];
+        assert!(pdf_asset.unavailable_reason.is_none());
+        assert_eq!(pdf_asset.mime, "application/pdf");
+        assert!(pdf_asset.download_url.is_some());
+
+        // Workspace `.rs` source-code read: stays a compact foldable Read row (no bloated file card).
+        let ag_rs = by_id("ag-rs");
+        assert!(ag_rs.image_assets.is_none());
 
         // Outside non-image text file: zero assets attached.
         let ag_outside = by_id("ag-outside-txt");

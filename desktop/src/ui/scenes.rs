@@ -927,8 +927,8 @@ fn base_scenes() -> &'static [Scene] {
                 *px = image::Rgb([r, g, b]);
             }
             let _ = img.save(&shot_path);
-            let doc_path = dir.join("architecture-spec.md");
-            let _ = std::fs::write(&doc_path, b"# Architecture\nUnified tool file cards.");
+            let doc_path = dir.join("architecture-spec.pdf");
+            let _ = std::fs::write(&doc_path, b"%PDF-1.7\nUnified tool file cards.");
 
             let asid = s.selected.clone().unwrap_or_else(|| "s-main".into());
             if let Some(info) = s.sessions.iter_mut().find(|i| i.asid.0 == asid) {
@@ -1039,7 +1039,7 @@ fn base_scenes() -> &'static [Scene] {
                     AgentPart::Tool(ToolCall {
                         id: "ag-read-doc".into(),
                         name: "read_file".into(),
-                        title: Some("File architecture-spec.md".into()),
+                        title: Some("File architecture-spec.pdf".into()),
                         input: serde_json::json!({ "Path": doc_path }),
                         output: None,
                         content: None,
