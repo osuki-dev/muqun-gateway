@@ -3181,6 +3181,9 @@ pub(crate) fn git_error(err: git::GitError) -> (StatusCode, Json<Value>) {
             "git_missing",
             "git is not installed on this host",
         ),
+        git::GitError::InvalidInput(message) => {
+            api_error(StatusCode::BAD_REQUEST, "invalid_request", &message)
+        }
         git::GitError::Failed(_) => api_error(StatusCode::BAD_GATEWAY, "git_failed", "git failed"),
     }
 }

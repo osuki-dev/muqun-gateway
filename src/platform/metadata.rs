@@ -104,6 +104,11 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // `vcs/files`, `vcs/file` and `vcs/discard` on an agent session: git in
     // the session's directory, for every agent.
     "agent_vcs_files",
+    // Developer Git Workbench operations (`vcs/overview`, `stage`, `unstage`,
+    // `checkout`, `commit`, `sync`, `commits`) on an agent session.
+    "vcs_git_ops_v1",
+    // Paginated pull requests (`vcs/prs`) and PR checkout on an agent session.
+    "vcs_prs_v1",
     "assets",
     "agent_audio_assets",
     "agent_file_assets",

@@ -13,7 +13,7 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::platform::git;
+use crate::platform::{git, git_prs};
 use crate::terminal::routes::git_error;
 use crate::{api_error, content_envelope, ApiResult};
 
@@ -37,6 +37,48 @@ pub struct VcsFileQuery {
 pub struct VcsDiscardBody {
     /// Repo-relative.
     pub path: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct VcsStageBody {
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub all: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct VcsCheckoutBody {
+    pub branch: Option<String>,
+    pub pr_number: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VcsCommitBody {
+    pub message: String,
+    #[serde(default)]
+    pub stage_all: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VcsSyncBody {
+    pub action: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct VcsCommitsQuery {
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct VcsPrsQuery {
+    pub state: Option<String>,
+    pub author: Option<String>,
+    pub page: Option<u32>,
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub refresh: bool,
 }
 
 /// `mode` for the git routes: `working` when absent.
@@ -162,6 +204,144 @@ pub(crate) async fn discard(
             "action": action.as_str(),
         }))),
     ))
+}
+
+/// `vcs/overview`: outside a checkout returns `is_repo: false` with empty
+/// collections rather than 404.
+pub(crate) async fn overview(toplevel: Option<&Path>) -> ApiResult<Json<Value>> {
+    let Some(toplevel) = toplevel else {
+        return Ok(Json(content_envelope(
+            git::RepoOverview::not_a_repo().to_json(),
+        )));
+    };
+    let overview = Box::pin(git::overview(toplevel)).await.map_err(git_error)?;
+    Ok(Json(content_envelope(overview.to_json())))
+}
+
+/// `vcs/stage`: stage validated paths or all changes.
+pub(crate) async fn stage(toplevel: Option<&Path>, body: &VcsStageBody) -> ApiResult<Json<Value>> {
+    let toplevel = toplevel.ok_or_else(not_a_repository)?;
+    Box::pin(git::stage(toplevel, &body.paths, body.all))
+        .await
+        .map_err(git_error)?;
+    Ok(Json(content_envelope(json!({
+        "ok": true,
+        "all": body.all,
+        "paths": body.paths,
+    }))))
+}
+
+/// `vcs/unstage`: unstage validated paths or all staged changes.
+pub(crate) async fn unstage(
+    toplevel: Option<&Path>,
+    body: &VcsStageBody,
+) -> ApiResult<Json<Value>> {
+    let toplevel = toplevel.ok_or_else(not_a_repository)?;
+    Box::pin(git::unstage(toplevel, &body.paths, body.all))
+        .await
+        .map_err(git_error)?;
+    Ok(Json(content_envelope(json!({
+        "ok": true,
+        "all": body.all,
+        "paths": body.paths,
+    }))))
+}
+
+/// `vcs/checkout`: switch to an existing branch or check out a PR by number.
+pub(crate) async fn checkout(
+    toplevel: Option<&Path>,
+    body: &VcsCheckoutBody,
+) -> ApiResult<Json<Value>> {
+    let toplevel = toplevel.ok_or_else(not_a_repository)?;
+    let branch = match (body.branch.as_deref(), body.pr_number) {
+        (Some(branch), None) => Box::pin(git::checkout_branch(toplevel, branch))
+            .await
+            .map_err(git_error)?,
+        (None, Some(pr_number)) => Box::pin(git_prs::checkout_pr(toplevel, pr_number))
+            .await
+            .map_err(git_error)?,
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Provide either 'branch' or 'pr_number'",
+            ));
+        }
+    };
+    Ok(Json(content_envelope(json!({
+        "ok": true,
+        "branch": branch,
+    }))))
+}
+
+/// `vcs/commit`: create a git commit.
+pub(crate) async fn commit(
+    toplevel: Option<&Path>,
+    body: &VcsCommitBody,
+) -> ApiResult<Json<Value>> {
+    let toplevel = toplevel.ok_or_else(not_a_repository)?;
+    let summary = Box::pin(git::commit(toplevel, &body.message, body.stage_all))
+        .await
+        .map_err(git_error)?;
+    Ok(Json(content_envelope(json!({
+        "ok": true,
+        "summary": summary,
+    }))))
+}
+
+/// `vcs/sync`: fetch, pull, or push against the configured remote.
+pub(crate) async fn sync(toplevel: Option<&Path>, body: &VcsSyncBody) -> ApiResult<Json<Value>> {
+    let toplevel = toplevel.ok_or_else(not_a_repository)?;
+    let summary = Box::pin(git::sync(toplevel, &body.action))
+        .await
+        .map_err(git_error)?;
+    Ok(Json(content_envelope(json!({
+        "ok": true,
+        "action": body.action,
+        "summary": summary,
+    }))))
+}
+
+/// `vcs/commits`: paginated recent commits.
+pub(crate) async fn commits(
+    toplevel: Option<&Path>,
+    query: &VcsCommitsQuery,
+) -> ApiResult<Json<Value>> {
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(10);
+    let Some(toplevel) = toplevel else {
+        return Ok(Json(content_envelope(
+            git::CommitsPage::empty(offset).to_json(),
+        )));
+    };
+    let page = Box::pin(git::recent_commits(toplevel, offset, limit))
+        .await
+        .map_err(git_error)?;
+    Ok(Json(content_envelope(page.to_json())))
+}
+
+/// `vcs/prs`: paginated pull requests for the checkout's origin remote.
+pub(crate) async fn prs(toplevel: Option<&Path>, query: &VcsPrsQuery) -> ApiResult<Json<Value>> {
+    let state = query.state.as_deref().unwrap_or("open");
+    let author = query.author.as_deref().unwrap_or("all");
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(10);
+    let Some(toplevel) = toplevel else {
+        return Ok(Json(content_envelope(
+            git_prs::PullRequestsPage::unsupported("none", "Not a git repository", None, page)
+                .to_json(),
+        )));
+    };
+    let result = Box::pin(git_prs::list_pull_requests(
+        toplevel,
+        state,
+        author,
+        page,
+        limit,
+        query.refresh,
+    ))
+    .await;
+    Ok(Json(content_envelope(result.to_json())))
 }
 
 #[cfg(test)]

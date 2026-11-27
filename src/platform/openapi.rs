@@ -780,6 +780,109 @@ pub fn openapi_spec() -> Value {
             }
         }
     });
+    spec["paths"]["/api/agent-sessions/{asid}/vcs/overview"] = json!({
+        "get": {
+            "summary": "Repository overview: summary, local branches (up to 200), normalized remote URL/host, and worktrees. Returns is_repo: false outside a checkout rather than 404. Announced as vcs_git_ops_v1",
+            "parameters": [path_param("asid")],
+            "responses": ok_response()
+        }
+    });
+    spec["paths"]["/api/agent-sessions/{asid}/vcs/stage"] = json!({
+        "post": {
+            "summary": "Stage validated repo-relative paths or all changes. Announced as vcs_git_ops_v1",
+            "parameters": [path_param("asid")],
+            "requestBody": json_body(json!({
+                "type": "object",
+                "properties": {
+                    "paths": { "type": "array", "items": { "type": "string" } },
+                    "all": { "type": "boolean" }
+                }
+            })),
+            "responses": ok_response()
+        }
+    });
+    spec["paths"]["/api/agent-sessions/{asid}/vcs/unstage"] = json!({
+        "post": {
+            "summary": "Unstage validated repo-relative paths or all staged changes (including unborn HEAD). Announced as vcs_git_ops_v1",
+            "parameters": [path_param("asid")],
+            "requestBody": json_body(json!({
+                "type": "object",
+                "properties": {
+                    "paths": { "type": "array", "items": { "type": "string" } },
+                    "all": { "type": "boolean" }
+                }
+            })),
+            "responses": ok_response()
+        }
+    });
+    spec["paths"]["/api/agent-sessions/{asid}/vcs/checkout"] = json!({
+        "post": {
+            "summary": "Switch to an existing local/origin branch or check out a pull request by number. Announced as vcs_git_ops_v1 / vcs_prs_v1",
+            "parameters": [path_param("asid")],
+            "requestBody": json_body(json!({
+                "type": "object",
+                "properties": {
+                    "branch": { "type": "string" },
+                    "pr_number": { "type": "integer", "minimum": 1 }
+                }
+            })),
+            "responses": ok_response()
+        }
+    });
+    spec["paths"]["/api/agent-sessions/{asid}/vcs/commit"] = json!({
+        "post": {
+            "summary": "Create a git commit (optionally staging all changes first). Announced as vcs_git_ops_v1",
+            "parameters": [path_param("asid")],
+            "requestBody": json_body(json!({
+                "type": "object",
+                "required": ["message"],
+                "properties": {
+                    "message": { "type": "string" },
+                    "stage_all": { "type": "boolean" }
+                }
+            })),
+            "responses": ok_response()
+        }
+    });
+    spec["paths"]["/api/agent-sessions/{asid}/vcs/sync"] = json!({
+        "post": {
+            "summary": "Run fetch (--prune), pull (--ff-only), or push (auto-setting upstream on origin when absent). Announced as vcs_git_ops_v1",
+            "parameters": [path_param("asid")],
+            "requestBody": json_body(json!({
+                "type": "object",
+                "required": ["action"],
+                "properties": {
+                    "action": { "type": "string", "enum": ["fetch", "pull", "push"] }
+                }
+            })),
+            "responses": ok_response()
+        }
+    });
+    spec["paths"]["/api/agent-sessions/{asid}/vcs/commits"] = json!({
+        "get": {
+            "summary": "Paginated recent commits (limit clamped 1..=50). Announced as vcs_git_ops_v1",
+            "parameters": [
+                path_param("asid"),
+                query_param("offset", "Number of commits to skip (default 0)"),
+                query_param("limit", "Commits per page, clamped 1..=50 (default 10)")
+            ],
+            "responses": ok_response()
+        }
+    });
+    spec["paths"]["/api/agent-sessions/{asid}/vcs/prs"] = json!({
+        "get": {
+            "summary": "Paginated pull requests for the checkout's origin remote (GitHub via gh CLI, Gitea via tea CLI), with a 30s TTL cache. Announced as vcs_prs_v1",
+            "parameters": [
+                path_param("asid"),
+                query_param("state", "open (default), closed, or all"),
+                query_param("author", "all (default) or me"),
+                query_param("page", "1-based page number (default 1)"),
+                query_param("limit", "Items per page, clamped 1..=30 (default 10)"),
+                query_param("refresh", "Bypass the 30s cache when true")
+            ],
+            "responses": ok_response()
+        }
+    });
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history"] = captured_history_path();
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history/segments"] =
         captured_history_segments_path();

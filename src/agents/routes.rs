@@ -17,7 +17,10 @@ use super::domain::{AgentSessionId, ModelRef, PermissionDecision, SessionQuery};
 use super::message_images;
 use super::ports::mirror::SessionMirrorPort;
 use crate::platform::git;
-use crate::platform::vcs_routes::{self, VcsDiscardBody, VcsFileQuery};
+use crate::platform::vcs_routes::{
+    self, VcsCheckoutBody, VcsCommitBody, VcsCommitsQuery, VcsDiscardBody, VcsFileQuery,
+    VcsPrsQuery, VcsStageBody, VcsSyncBody,
+};
 use crate::tasks::transcript::{for_session, hide_in_event, hide_in_inbox, hide_in_items};
 use crate::terminal::routes::git_error;
 use crate::{
@@ -582,6 +585,32 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             "/api/agent-sessions/{asid}/vcs/discard",
             post(discard_agent_vcs_file),
         )
+        .route(
+            "/api/agent-sessions/{asid}/vcs/overview",
+            get(get_agent_vcs_overview),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/vcs/stage",
+            post(stage_agent_vcs_files),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/vcs/unstage",
+            post(unstage_agent_vcs_files),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/vcs/checkout",
+            post(checkout_agent_vcs),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/vcs/commit",
+            post(commit_agent_vcs),
+        )
+        .route("/api/agent-sessions/{asid}/vcs/sync", post(sync_agent_vcs))
+        .route(
+            "/api/agent-sessions/{asid}/vcs/commits",
+            get(get_agent_vcs_commits),
+        )
+        .route("/api/agent-sessions/{asid}/vcs/prs", get(get_agent_vcs_prs))
         .route(
             "/api/agent-sessions/{asid}/abort",
             post(interrupt_agent_session_global),
@@ -2023,6 +2052,93 @@ async fn discard_agent_vcs_file(
         "discarded an agent session change"
     );
     Ok(answer)
+}
+
+async fn get_agent_vcs_overview(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    vcs_routes::overview(toplevel.as_deref()).await
+}
+
+async fn stage_agent_vcs_files(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<VcsStageBody>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    vcs_routes::stage(toplevel.as_deref(), &body).await
+}
+
+async fn unstage_agent_vcs_files(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<VcsStageBody>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    vcs_routes::unstage(toplevel.as_deref(), &body).await
+}
+
+async fn checkout_agent_vcs(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<VcsCheckoutBody>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    vcs_routes::checkout(toplevel.as_deref(), &body).await
+}
+
+async fn commit_agent_vcs(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<VcsCommitBody>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    vcs_routes::commit(toplevel.as_deref(), &body).await
+}
+
+async fn sync_agent_vcs(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<VcsSyncBody>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    vcs_routes::sync(toplevel.as_deref(), &body).await
+}
+
+async fn get_agent_vcs_commits(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    Query(query): Query<VcsCommitsQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    vcs_routes::commits(toplevel.as_deref(), &query).await
+}
+
+async fn get_agent_vcs_prs(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    Query(query): Query<VcsPrsQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    vcs_routes::prs(toplevel.as_deref(), &query).await
 }
 
 /// Whether a catalog is one a client should be allowed to keep.
@@ -7071,6 +7187,143 @@ mod tests {
             );
         }
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn vcs_workbench_routes_handle_repo_non_repo_and_capabilities() {
+        assert!(crate::API_CAPABILITIES.contains(&"vcs_git_ops_v1"));
+        assert!(crate::API_CAPABILITIES.contains(&"vcs_prs_v1"));
+
+        let (state, root, repo) = Box::pin(vcs_state("agent-vcs-workbench")).await;
+
+        // Non-repo overview returns 200 with is_repo: false (NOT 404).
+        let Json(plain_ov) = Box::pin(get_agent_vcs_overview(
+            State(state.clone()),
+            Path("ses_plain".into()),
+            device_headers(),
+        ))
+        .await
+        .expect("non-repo overview succeeds");
+        assert_eq!(plain_ov["data"]["is_repo"], false);
+        assert!(plain_ov["data"]["repo"].is_null());
+        assert_eq!(plain_ov["data"]["local_branches"], json!([]));
+        assert!(plain_ov["data"]["remote_url"].is_null());
+        assert!(plain_ov["data"]["remote_host"].is_null());
+        assert_eq!(plain_ov["data"]["worktrees"], json!([]));
+
+        // Repo overview returns branch, local_branches, worktrees.
+        let Json(repo_ov) = Box::pin(get_agent_vcs_overview(
+            State(state.clone()),
+            Path("ses_git".into()),
+            device_headers(),
+        ))
+        .await
+        .expect("repo overview succeeds");
+        assert_eq!(repo_ov["data"]["is_repo"], true);
+        assert_eq!(repo_ov["data"]["repo"]["branch"], "main");
+        assert!(repo_ov["data"]["local_branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b == "main"));
+
+        // Stage, unstage, commit, and commits pagination via route handlers.
+        let Json(staged) = Box::pin(stage_agent_vcs_files(
+            State(state.clone()),
+            Path("ses_git".into()),
+            device_headers(),
+            Json(VcsStageBody {
+                paths: vec!["notes.md".into()],
+                all: false,
+            }),
+        ))
+        .await
+        .expect("stage succeeds");
+        assert_eq!(staged["data"]["ok"], true);
+
+        let Json(unstaged) = Box::pin(unstage_agent_vcs_files(
+            State(state.clone()),
+            Path("ses_git".into()),
+            device_headers(),
+            Json(VcsStageBody {
+                paths: vec!["notes.md".into()],
+                all: false,
+            }),
+        ))
+        .await
+        .expect("unstage succeeds");
+        assert_eq!(unstaged["data"]["ok"], true);
+
+        let Json(committed) = Box::pin(commit_agent_vcs(
+            State(state.clone()),
+            Path("ses_git".into()),
+            device_headers(),
+            Json(VcsCommitBody {
+                message: "workbench commit".into(),
+                stage_all: true,
+            }),
+        ))
+        .await
+        .expect("commit succeeds");
+        assert_eq!(committed["data"]["ok"], true);
+
+        let Json(commits) = Box::pin(get_agent_vcs_commits(
+            State(state.clone()),
+            Path("ses_git".into()),
+            Query(VcsCommitsQuery {
+                offset: Some(0),
+                limit: Some(1),
+            }),
+            device_headers(),
+        ))
+        .await
+        .expect("commits succeeds");
+        assert_eq!(commits["data"]["items"][0]["subject"], "workbench commit");
+        assert_eq!(commits["data"]["has_more"], true);
+        assert_eq!(commits["data"]["next_offset"], 1);
+
+        // PRs on a repo without origin returns supported: false cleanly.
+        let Json(prs) = Box::pin(get_agent_vcs_prs(
+            State(state.clone()),
+            Path("ses_git".into()),
+            Query(VcsPrsQuery {
+                refresh: true,
+                ..VcsPrsQuery::default()
+            }),
+            device_headers(),
+        ))
+        .await
+        .expect("prs succeeds");
+        assert_eq!(prs["data"]["supported"], false);
+        assert_eq!(prs["data"]["items"], json!([]));
+
+        // Checkout with neither branch nor pr_number returns 400.
+        let bad_checkout = Box::pin(checkout_agent_vcs(
+            State(state.clone()),
+            Path("ses_git".into()),
+            device_headers(),
+            Json(VcsCheckoutBody::default()),
+        ))
+        .await
+        .expect_err("must reject empty checkout");
+        assert_eq!(bad_checkout.0, StatusCode::BAD_REQUEST);
+
+        // Mutating route outside a repo returns 404 not_a_repository.
+        let non_repo_stage = Box::pin(stage_agent_vcs_files(
+            State(state.clone()),
+            Path("ses_plain".into()),
+            device_headers(),
+            Json(VcsStageBody {
+                paths: vec![],
+                all: true,
+            }),
+        ))
+        .await
+        .expect_err("non-repo stage fails");
+        assert_eq!(non_repo_stage.0, StatusCode::NOT_FOUND);
+
+        let _ = repo;
         std::fs::remove_dir_all(&root).ok();
     }
 }

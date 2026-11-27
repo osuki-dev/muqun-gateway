@@ -5,7 +5,8 @@ pub(crate) mod chunked_uploads;
 pub mod config;
 pub mod discovery;
 pub(crate) mod file_ranges;
-pub(crate) mod git;
+pub mod git;
+pub mod git_prs;
 pub(crate) mod http;
 pub mod i18n;
 #[cfg(any(target_os = "macos", test))]
