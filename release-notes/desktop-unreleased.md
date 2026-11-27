@@ -2,6 +2,13 @@
 
 ## Changes and fixes
 
+- **Unified tool & media cards, Desktop memory reduction, and single-workspace Neovim reuse**:
+  - Aligned Desktop in-process `enrich_timeline` with Gateway's unified tool normalization across all 11 agents (canonical `read`/`edit`/`write`/`bash` names, unified diffs, shell exit status, image/PDF file cards, bounded workspace line-numbered `read` excerpts, and Antigravity `mcp_muqun_` tool recognition) while keeping source-code reads folded cleanly and avoiding raw `/api/.../original` filenames.
+  - Bounded Linux glibc allocator arenas (`MALLOC_ARENA_MAX=2`), Tokio worker pools, SQLite `cache_size` / `mmap_size`, and periodic `malloc_trim(0)` + `PRAGMA shrink_memory`, cutting Desktop resident memory (~493 MiB → ~290 MiB RSS, ~235 MiB PSS) and thread count.
+  - Fixed Neovim multi-instance launches for the same workspace by routing `nvim --listen` sockets onto a short canonical path under `$XDG_RUNTIME_DIR`/`/tmp` (preventing Unix socket `SUN_LEN` truncation), checking socket liveness with `--server ... --remote-expr 1`, and retrying briefly while the first Neovim binds its server socket.
+- **Action-first MAO workspace redesign and unified Account Limits & Quota views**:
+  - Redesigned the Multi-Agent Orchestration (MAO) workspace with a 3-step progress stepper, decision hero card with inline guidance, one-click recovery actions for `ChangesRequested` and `Failed` runs, interactive severity-filtered review findings with checkboxes, directory-grouped collapsible file lists, automatic terminology adaptation for non-developer tasks, humanized dispatch errors with trace details, and 12-locale translations.
+  - Brought the Desktop context popover to parity with Mobile App (quota bars, local reset date/time, credits, session token breakdown, git snapshot, compaction gating) and upgraded `Settings → Agents` with full quota cards, honest empty states for non-quota agents, per-agent refresh, and 12-locale translations.
 - **Unified Desktop Window System, 5-Tab Inspector, Session Tree & Compact Context**:
   - Unified window chrome across single-pane, split tiles, floating windows, and dockable drawers; removed legacy inline split panels and double headers; aligned single and split session menus.
   - Redesigned the Inspector into 5 focused tabs (`Queue | Git | Tree | Saved | Shells`) with real Git staging/commit/push/worktree actions, hierarchical **Session Tree** navigation, and one-click **Compact context**.

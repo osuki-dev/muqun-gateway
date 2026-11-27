@@ -8,6 +8,15 @@ On a fresh computer with Muqun Desktop, Gateway can pair before Desktop opens an
 
 ## Agents, messages and history
 
+- **Unified tool normalization, media/file cards, and workspace read hydration across all 11 agents**:
+  - Canonicalized provider-specific tool names (`read_file` → `read`, `edit_file` → `edit`, `write_file` → `write`, `run_command` → `bash`, search tools), PascalCase inputs (`Path` → `path`, `CommandLine` → `command`), unified `metadata.files` diffs, shell `metadata.exit` status, and bare empty `{}`/`[]` outputs across ACP (Antigravity, Claude, Cursor, Copilot, Qoder, Fx), Pi, Codex, OpenCode, DeepSeek, and T3.
+  - Unified image/file tool media normalization with explicit image-view byte sniffing (`AccountImageView`), rich document cards (PDF/Office/media), and bounded workspace-fenced line-numbered text excerpt hydration (`StartLine`/`EndLine`/`offset`/`limit`, capped at 200 lines / 16 KiB) for completed `read` calls whose adapters omit file bodies, while keeping source-code reads compact and never showing raw `/api/.../original` URLs as filenames.
+- **Memory & runtime footprint reduction (`malloc_arena`, Tokio workers, SQLite cache, and remote wire size)**:
+  - Bounded Linux glibc allocator arenas (`MALLOC_ARENA_MAX=2`), Tokio worker/blocking thread pools (`2–4` workers), and SQLite `cache_size` / `mmap_size`, with periodic `malloc_trim(0)` and `PRAGMA shrink_memory` maintenance cutting idle Gateway RSS by ~65% (~463 MiB → ~162 MiB).
+  - Deduplicated redundant pure-text `ToolCall.content` copies on wire responses, routed >128 KiB WebSocket snapshot/window replies to gzip-compressed sealed HTTP via 413 fallback, parallelized cross-agent descendant lookups, skipped OpenCode queries for non-`ses_` parent IDs, and reused `context_usage` from OpenCode timeline fetches.
+- **Unified account limits caching, Antigravity MCP compatibility, and cross-agent `@computer` support**:
+  - Added single-flight 30 s manager-level `account_limits` caching with `?refresh=1` force refresh (shared by orchestration candidate selection).
+  - Exposed underscore MCP tool names (`exec_run`, `fleet_list`, …) for Antigravity while accepting both dotted and underscore names on `tools/call`, and enabled `adds_mcp_servers` / `mcp_server_connected` across ACP and Pi drivers so `@computer` mentions (`computerTools` / `computer_ids`) work reliably across all agents.
 - **OpenCode & Tailscale latency optimization and MCP Hub live tool testing**:
   - **OpenCode cold-open & session-load speedups**: Eliminated redundant message cloning in `OpencodeClient::message_list`, bypassed ambient HTTP proxies (`no_proxy`) on loopback OpenCode connections, parallelized `settled_list` catalog fetches, and cached session directories for `get_vcs_diff` so opening OpenCode sessions locally and over Tailscale is dramatically faster.
   - **MCP Hub tool schema inspection & live call endpoint**: `GET /api/mcp/upstreams` tool previews now include full `input_schema` definitions, and `POST /api/mcp/upstreams/{id}/call` allows authorized Desktop clients to invoke and test upstream MCP tools directly with bounded responses and secret redaction.
