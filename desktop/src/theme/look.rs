@@ -449,12 +449,19 @@ impl Look {
     }
 
     /// A gentle breathing pulse on `e` (opacity 0.55..1 over 1.8 s); still
-    /// under reduce motion.
+    /// under reduce motion. Uses bounded `Cycle` fps so working sidebar dots
+    /// never spin 60/120 Hz full-window redraws on 4K displays.
     pub fn pulse(&self, e: El) -> El {
         if !self.motion {
             return e;
         }
-        e.looping(rune::LoopSpec::opacity(1.8, 0.0, 0.55, 1.0))
+        e.cycle(rune::Cycle {
+            period: 1.8,
+            phase: 0.0,
+            stops: &[(0.0, 0.55), (0.5, 1.0), (1.0, 0.55)],
+            still: 1.0,
+            fps: 12.0,
+        })
     }
 
     /// A slower, softer breath for a mark that waits (opacity 0.4..1 over
@@ -463,7 +470,13 @@ impl Look {
         if !self.motion {
             return e;
         }
-        e.looping(rune::LoopSpec::opacity(2.8, 0.0, 0.4, 1.0))
+        e.cycle(rune::Cycle {
+            period: 2.8,
+            phase: 0.0,
+            stops: &[(0.0, 0.4), (0.5, 1.0), (1.0, 0.4)],
+            still: 1.0,
+            fps: 12.0,
+        })
     }
 
     /// The kit's hover and press overlays on a card, with a slight press

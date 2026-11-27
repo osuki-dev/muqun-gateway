@@ -153,6 +153,9 @@ fn layer(
         }),
         COMPOSER_RIM => {
             let [c0, c1, c2] = aura_triad(d, dark);
+            // Keep busy composer aura static (`breathe: 0.0`, `aura_speed: 0.0`)
+            // so `Fx::animating()` stays false and does not spin 60/120 Hz
+            // full-window Metal/Vulkan redraws while an agent turn is working.
             rune_fx::Fx::glow(GlowParams {
                 style: GlowStyle::Aura,
                 color: c0,
@@ -163,7 +166,8 @@ fn layer(
                 intensity: d[3].clamp(0.0, 1.2) * if dark { 0.62 } else { 0.48 },
                 inner: if dark { 0.30 } else { 0.24 },
                 occlusion: if dark { 0.62 } else { 0.92 },
-                aura_speed: 0.24,
+                breathe: 0.0,
+                aura_speed: 0.0,
                 hot: 0.0,
                 reach: 2.2,
                 ..Default::default()

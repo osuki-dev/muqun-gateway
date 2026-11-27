@@ -42,11 +42,13 @@ fn push_resolved(out: &mut Vec<PathBuf>, src: &str, directory: Option<&str>) {
     }
 }
 
-/// A gateway URL's picture: the local file it stands for, else the copy
-/// fetched into the media cache.
-fn push_hosted(out: &mut Vec<PathBuf>, src: &str, directory: Option<&str>) {
+/// A gateway URL's picture: the local file it stands for (on local sessions),
+/// else the copy fetched into the media cache.
+fn push_hosted(out: &mut Vec<PathBuf>, src: &str, directory: Option<&str>, remote: bool) {
     let before = out.len();
-    push_resolved(out, src, directory);
+    if !remote {
+        push_resolved(out, src, directory);
+    }
     if out.len() == before {
         if let Some(path) = crate::model::media::cached(src) {
             if !out.iter().any(|p| p == &path) {
@@ -83,7 +85,12 @@ fn looks_like_image_uri(uri: &str) -> bool {
         )
 }
 
-fn push_asset(out: &mut Vec<PathBuf>, asset: &MessageImageAsset, directory: Option<&str>) {
+fn push_asset(
+    out: &mut Vec<PathBuf>,
+    asset: &MessageImageAsset,
+    directory: Option<&str>,
+    remote: bool,
+) {
     let before = out.len();
     for candidate in [
         asset.thumbnail_url.as_deref(),
@@ -94,7 +101,7 @@ fn push_asset(out: &mut Vec<PathBuf>, asset: &MessageImageAsset, directory: Opti
     .into_iter()
     .flatten()
     {
-        push_hosted(out, candidate, directory);
+        push_hosted(out, candidate, directory, remote);
         if out.len() > before {
             break;
         }
@@ -105,7 +112,8 @@ fn push_asset(out: &mut Vec<PathBuf>, asset: &MessageImageAsset, directory: Opti
 /// `image_assets`, else treat a clear image URI as a local file; with no
 /// attachments, the assets a markdown body embeds.
 pub fn item_image_paths(s: &UiState, asid: &str, item: &TimelineItem) -> Vec<PathBuf> {
-    let directory = session_directory(s, asid);
+    let remote = s.is_remote_session();
+    let directory = (!remote).then(|| session_directory(s, asid)).flatten();
     let mut paths = Vec::new();
     let assets = item.image_assets.as_deref();
     for src in item.attachments.iter().flatten() {
@@ -114,9 +122,9 @@ pub fn item_image_paths(s: &UiState, asid: &str, item: &TimelineItem) -> Vec<Pat
                 paths.push(path);
             }
         } else if let Some(asset) = message_image_for_source(assets, src) {
-            push_asset(&mut paths, asset, directory);
+            push_asset(&mut paths, asset, directory, remote);
         } else if looks_like_image_uri(src) || src.starts_with("/api/") {
-            push_hosted(&mut paths, src, directory);
+            push_hosted(&mut paths, src, directory, remote);
         }
         if paths.len() >= MAX_IMAGES {
             return paths;
@@ -127,7 +135,7 @@ pub fn item_image_paths(s: &UiState, asid: &str, item: &TimelineItem) -> Vec<Pat
             if asset.unavailable_reason.is_some() || !asset.mime.starts_with("image/") {
                 continue;
             }
-            push_asset(&mut paths, asset, directory);
+            push_asset(&mut paths, asset, directory, remote);
             if paths.len() >= MAX_IMAGES {
                 break;
             }
@@ -166,10 +174,11 @@ pub fn carries_images(item: &TimelineItem) -> bool {
 /// `content`, inline pictures the core kept as files), and the picture a
 /// read-like tool opened.
 pub fn tool_image_paths(s: &UiState, asid: &str, call: &ToolCall) -> Vec<PathBuf> {
-    let directory = session_directory(s, asid);
+    let remote = s.is_remote_session();
+    let directory = (!remote).then(|| session_directory(s, asid)).flatten();
     let mut paths = Vec::new();
     for src in crate::model::media::tool_image_refs(call) {
-        push_hosted(&mut paths, &src, directory);
+        push_hosted(&mut paths, &src, directory, remote);
         if paths.len() >= MAX_IMAGES {
             break;
         }

@@ -4218,16 +4218,20 @@ impl UiState {
                 if !self.timelines.contains_key(&asid.0) {
                     return;
                 }
-                // Same egress step the App gets over HTTP/SSE (`attach_to_event`):
-                // fill `image_assets` before the timeline paints.
-                let directory = self
-                    .sessions
-                    .iter()
-                    .find(|s| s.asid == asid)
-                    .and_then(|s| s.directory.as_deref());
-                muqun_gateway::agents::message_images::enrich_timeline(
-                    &asid.0, directory, &mut items,
-                );
+                // Remote Gateways already ran `attach_to_event` before sending
+                // the WS frame. Running `enrich_timeline` on the UI thread for a
+                // remote computer would run blocking `std::fs::canonicalize`
+                // against another machine's paths on every streamed delta.
+                if !self.is_remote_session() {
+                    let directory = self
+                        .sessions
+                        .iter()
+                        .find(|s| s.asid == asid)
+                        .and_then(|s| s.directory.as_deref());
+                    muqun_gateway::agents::message_images::enrich_timeline(
+                        &asid.0, directory, &mut items,
+                    );
+                }
                 self.remember_timeline_lineage(&asid.0, &items);
                 if let Some(tl) = self.timelines.get_mut(&asid.0) {
                     tl.upsert(items);

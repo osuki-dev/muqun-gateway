@@ -114,11 +114,58 @@ fn read_credential(path: &Path) -> Option<LocalGateway> {
     serde_json::from_str(&text).ok()
 }
 
+fn is_loopback_url(url: &reqwest::Url) -> bool {
+    let Some(raw) = url.host_str() else {
+        return false;
+    };
+    let host = raw.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    let h = host.trim_end_matches('.');
+    h.eq_ignore_ascii_case("localhost") || h.ends_with(".localhost")
+}
+
+/// Bypass ambient HTTP/HTTPS proxy settings for loopback, private LAN, and
+/// Tailscale (`100.64.0.0/10`, `.ts.net`, `.local`) Gateways so remote traffic
+/// never detours through a local proxy daemon.
+fn should_bypass_proxy(url: &reqwest::Url) -> bool {
+    let Some(raw) = url.host_str() else {
+        return false;
+    };
+    let host = raw.trim_start_matches('[').trim_end_matches(']');
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            let o = ip.octets();
+            let is_cgnat = o[0] == 100 && (o[1] & 0b1100_0000) == 64; // 100.64.0.0/10 (Tailscale)
+            ip.is_loopback() || ip.is_private() || ip.is_link_local() || is_cgnat
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            let seg = ip.segments()[0];
+            let is_ula = (seg & 0xfe00) == 0xfc00;
+            let is_link_local = (seg & 0xffc0) == 0xfe80;
+            ip.is_loopback() || is_ula || is_link_local
+        }
+        Err(_) => {
+            let h = host.trim_end_matches('.').to_ascii_lowercase();
+            h == "localhost"
+                || h.ends_with(".localhost")
+                || h.ends_with(".local")
+                || h.ends_with(".ts.net")
+                || !h.contains('.')
+        }
+    }
+}
+
 async fn probe(gateway: &LocalGateway) -> Result<(), String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(3));
+    if reqwest::Url::parse(&gateway.url)
+        .ok()
+        .is_some_and(|u| should_bypass_proxy(&u))
+    {
+        builder = builder.no_proxy();
+    }
+    let client = builder.build().map_err(|e| e.to_string())?;
     let answer = client
         .get(format!("{}/api/meta", gateway.url.trim_end_matches('/')))
         .bearer_auth(&gateway.token)
@@ -173,15 +220,22 @@ impl RemoteHub {
             .transport_key
             .as_deref()
             .and_then(|k| muqun_gateway::connectivity::transport::decode_key(k).ok());
-        let http = reqwest::Client::builder()
+        let base = reqwest::Url::parse(gateway.url.trim_end_matches('/'))?;
+        let mut builder = reqwest::Client::builder()
             .redirect(redirects)
             .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(120))
-            .build()?;
+            .timeout(Duration::from_secs(120));
+        // Bypass ambient HTTP/HTTPS proxies (Clash/Surge/http_proxy) for direct
+        // loopback, LAN, and Tailscale (100.64.0.0/10, .ts.net) Gateways so
+        // remote computer switching and streaming never detour through a proxy.
+        if should_bypass_proxy(&base) {
+            builder = builder.no_proxy();
+        }
+        let http = builder.build()?;
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let hub = Arc::new(Self {
             http,
-            base: reqwest::Url::parse(gateway.url.trim_end_matches('/'))?,
+            base,
             token: gateway.token,
             device_id: gateway.device_id,
             material,
@@ -194,6 +248,10 @@ impl RemoteHub {
             shutdown: shutdown_tx,
         });
         Ok(hub)
+    }
+
+    fn is_loopback(&self) -> bool {
+        is_loopback_url(&self.base)
     }
 
     /// Revoke only the device authenticated by this saved login. Older profiles
@@ -1005,12 +1063,14 @@ impl SessionHub for RemoteHub {
                     .map(Value::take)
                     .unwrap_or(Value::Null),
             )?;
-            let directory = self.snapshot_directory(asid).await;
-            muqun_gateway::agents::message_images::enrich_timeline(
-                &asid.0,
-                directory.as_deref(),
-                &mut items,
-            );
+            if self.is_loopback() {
+                let directory = self.snapshot_directory(asid).await;
+                muqun_gateway::agents::message_images::enrich_timeline(
+                    &asid.0,
+                    directory.as_deref(),
+                    &mut items,
+                );
+            }
             Ok(items)
         })
     }
@@ -1660,12 +1720,14 @@ impl SessionHub for RemoteHub {
                     .cloned()
                     .unwrap_or(Value::Array(Vec::new())),
             )?;
-            let directory = self.snapshot_directory(asid).await;
-            muqun_gateway::agents::message_images::enrich_timeline(
-                &asid.0,
-                directory.as_deref(),
-                &mut items,
-            );
+            if self.is_loopback() {
+                let directory = self.snapshot_directory(asid).await;
+                muqun_gateway::agents::message_images::enrich_timeline(
+                    &asid.0,
+                    directory.as_deref(),
+                    &mut items,
+                );
+            }
             Ok(TimelineCatchUp {
                 items,
                 latest_seq: data.get("latest_seq").and_then(Value::as_u64).unwrap_or(0),
@@ -3133,5 +3195,23 @@ mod tests {
         assert_eq!(decode_envelope_body(gz, Some("gzip")).unwrap(), plain);
 
         assert!(decode_envelope_body(b"not-gzip".to_vec(), Some("gzip")).is_err());
+    }
+
+    #[test]
+    fn direct_local_lan_and_tailscale_gateways_bypass_system_proxy() {
+        let u = |s: &str| reqwest::Url::parse(s).unwrap();
+        assert!(should_bypass_proxy(&u("http://127.0.0.1:23847")));
+        assert!(should_bypass_proxy(&u("http://localhost:23847")));
+        assert!(should_bypass_proxy(&u("http://100.83.99.56:23847")));
+        assert!(should_bypass_proxy(&u("http://100.126.182.72:23847")));
+        assert!(should_bypass_proxy(&u("http://192.168.1.50:23847")));
+        assert!(should_bypass_proxy(&u("http://10.0.0.2:23847")));
+        assert!(should_bypass_proxy(&u("https://mini.tail123.ts.net")));
+        assert!(!should_bypass_proxy(&u("https://gateway.example.com")));
+        assert!(!should_bypass_proxy(&u("http://100.128.0.1:23847")));
+
+        assert!(is_loopback_url(&u("http://127.0.0.1:23847")));
+        assert!(is_loopback_url(&u("http://localhost:23847")));
+        assert!(!is_loopback_url(&u("http://100.83.99.56:23847")));
     }
 }

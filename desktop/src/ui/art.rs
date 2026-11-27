@@ -56,7 +56,15 @@ impl ActivityMark {
                     (1.0, accent.alpha(0.0)),
                 ],
             )
-            .looping(rune::LoopSpec::opacity(1.6, 0.0, 0.36, 1.0));
+            // Use Cycle (bounded fps) instead of unbounded LoopSpec::opacity so
+            // Rune does not wake 60/120 Hz full-window redraws while working.
+            .cycle(rune::Cycle {
+                period: 1.6,
+                phase: 0.0,
+                stops: &[(0.0, 0.36), (0.5, 1.0), (1.0, 0.36)],
+                still: 0.68,
+                fps: 15.0,
+            });
         let mut mark = el()
             .size(size, size)
             .role("progressbar")
@@ -81,7 +89,7 @@ impl ActivityMark {
                     (1.0, 0.0),
                 ],
                 still: 2.0 * phase,
-                fps: 30.0,
+                fps: 15.0,
             });
             mark = mark.child(layer(accent)).child(flash);
         }

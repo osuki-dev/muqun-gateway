@@ -1,8 +1,8 @@
 //! Computer Pairing Modal: shown when pairing a remote computer by code or access token.
 
 use rune::{
-    col, el, icon, row, spacer, text, text_input, Color, Cursor, El, Key, KeyEvent, LoopSpec,
-    Shadow, TextEdit, TextStyle, Tx,
+    col, el, icon, row, spacer, text, text_input, Color, Cursor, El, Key, KeyEvent, Shadow,
+    TextEdit, TextStyle, Tx,
 };
 use rune_kit::{Button, ButtonVariant, Kit, Loader, TextInput};
 
@@ -1003,7 +1003,13 @@ fn render_otp_cell(index: usize, chars: &[char], style: OtpStyle, k: &Kit) -> El
             .radius(1.0)
             .fill(slot_accent);
         if style.motion {
-            caret = caret.looping(LoopSpec::opacity(1.05, 0.0, 0.18, 1.0));
+            caret = caret.cycle(rune::Cycle {
+                period: 1.05,
+                phase: 0.0,
+                stops: &[(0.0, 1.0), (0.5, 0.18), (1.0, 1.0)],
+                still: 1.0,
+                fps: 12.0,
+            });
         }
         cell = cell
             .fill(
