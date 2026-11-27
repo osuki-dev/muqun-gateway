@@ -382,6 +382,11 @@ pub struct View {
     pub rework_note: TextEdit,
     pub rework_note_run: Option<String>,
     pub excluded_findings: HashMap<String, HashSet<usize>>,
+    pub finding_severity_filter: Option<&'static str>,
+    pub expanded_findings: HashMap<String, HashSet<usize>>,
+    pub expanded_file_groups: HashMap<String, HashSet<String>>,
+    pub expanded_details: HashMap<String, bool>,
+    pub expanded_turns: HashSet<String>,
     pub dismissed_runs: HashSet<String>,
     pub next_seq: u64,
 }
@@ -457,6 +462,11 @@ impl Default for View {
             rework_note: TextEdit::new(""),
             rework_note_run: None,
             excluded_findings: HashMap::new(),
+            finding_severity_filter: None,
+            expanded_findings: HashMap::new(),
+            expanded_file_groups: HashMap::new(),
+            expanded_details: HashMap::new(),
+            expanded_turns: HashSet::new(),
             dismissed_runs: HashSet::new(),
             next_seq,
         }
@@ -2549,21 +2559,34 @@ pub fn continue_rework(s: &mut UiState, run_id: &str) {
     let lang = s.cfg.general.language;
     let now = now_ms();
     let Some((coder_asid, prompt, echo, next_round, reviewer_name)) = (|| {
+        let excluded = s.orchestration.excluded_findings.get(run_id).cloned();
         let run = s.orchestration.runs.iter_mut().find(|r| r.id == run_id)?;
-        let MaoPhase::ChangesRequested {
-            round,
-            ref feedback,
-        } = run.phase
-        else {
-            return None;
+        let (round, base_feedback) = match &run.phase {
+            MaoPhase::ChangesRequested { round, feedback } => (*round, feedback.clone()),
+            MaoPhase::Failed { error } => (
+                run.round,
+                if !run.review_summary.trim().is_empty() {
+                    run.review_summary.clone()
+                } else {
+                    error.clone()
+                },
+            ),
+            _ => return None,
         };
         let feedback = match extra_note.as_deref() {
-            Some(note) if !feedback.trim().is_empty() => {
-                format!("{feedback}\n\nAdditional user guidance:\n{note}")
+            Some(note) if !base_feedback.trim().is_empty() => {
+                format!("{base_feedback}\n\nAdditional user guidance:\n{note}")
             }
             Some(note) => note.to_string(),
-            None => feedback.clone(),
+            None => base_feedback,
         };
+        let chosen_findings: Vec<MaoFinding> = run
+            .findings
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| excluded.as_ref().is_none_or(|ex| !ex.contains(idx)))
+            .map(|(_, f)| f.clone())
+            .collect();
         let next_round = round.saturating_add(1);
         if next_round > run.max_rounds {
             run.max_rounds = next_round;
@@ -2589,12 +2612,12 @@ pub fn continue_rework(s: &mut UiState, run_id: &str) {
             run.max_rounds,
             &reviewer_name,
             &feedback,
-            &run.findings,
+            &chosen_findings,
         );
         let echo = format!(
             "[MAO · Manual Rework Round {next_round}]\n\n{}{}",
             concise_excerpt(&feedback, 600),
-            format_findings_block(&run.findings)
+            format_findings_block(&chosen_findings)
         );
         Some((
             run.coder_asid.clone(),
@@ -2664,6 +2687,133 @@ fn toggle_finding_selected(s: &mut UiState, run_id: &str, index: usize) {
     if !entry.remove(&index) {
         entry.insert(index);
     }
+}
+
+fn select_high_findings_only(s: &mut UiState, run_id: &str) {
+    let Some(run) = s.orchestration.runs.iter().find(|r| r.id == run_id) else {
+        return;
+    };
+    let excluded: HashSet<usize> = run
+        .findings
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.severity != "high")
+        .map(|(idx, _)| idx)
+        .collect();
+    s.orchestration
+        .excluded_findings
+        .insert(run_id.to_string(), excluded);
+}
+
+fn select_all_findings(s: &mut UiState, run_id: &str) {
+    s.orchestration.excluded_findings.remove(run_id);
+}
+
+fn toggle_finding_expanded(s: &mut UiState, run_id: &str, index: usize) {
+    let entry = s
+        .orchestration
+        .expanded_findings
+        .entry(run_id.to_string())
+        .or_default();
+    if !entry.remove(&index) {
+        entry.insert(index);
+    }
+}
+
+fn toggle_file_group(s: &mut UiState, run_id: &str, dir: &str) {
+    let entry = s
+        .orchestration
+        .expanded_file_groups
+        .entry(run_id.to_string())
+        .or_default();
+    if !entry.remove(dir) {
+        entry.insert(dir.to_string());
+    }
+}
+
+fn details_expanded(s: &UiState, run: &MaoRun) -> bool {
+    s.orchestration
+        .expanded_details
+        .get(&run.id)
+        .copied()
+        .unwrap_or_else(|| run.is_active())
+}
+
+fn toggle_details_expanded(s: &mut UiState, run_id: &str, currently_open: bool) {
+    s.orchestration
+        .expanded_details
+        .insert(run_id.to_string(), !currently_open);
+}
+
+fn toggle_turns_expanded(s: &mut UiState, group_key: &str) {
+    if !s.orchestration.expanded_turns.remove(group_key) {
+        s.orchestration.expanded_turns.insert(group_key.to_string());
+    }
+}
+
+/// Whether this orchestration run operates on workspace/code artifacts vs.
+/// general writing, analysis, or research deliverables.
+fn is_code_task(run: &MaoRun) -> bool {
+    !run.files.is_empty()
+        || run.base_commit.is_some()
+        || !run.base_commits.is_empty()
+        || run
+            .findings
+            .iter()
+            .any(|f| f.location.contains('/') || f.location.contains(':'))
+}
+
+fn is_reviewer_failure(run: &MaoRun, error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("reviewer")
+        || lower.contains("review ")
+        || (!run.files.is_empty() && !run.findings.is_empty())
+        || run
+            .steps
+            .last()
+            .is_some_and(|st| st.kind == MaoStepKind::Review && st.status == "failed")
+}
+
+/// Translate raw internal dispatch errors (such as missing terminal session
+/// UUIDs) into plain, calm guidance while preserving the raw error inside the
+/// collapsible technical trace.
+fn humanize_failure_reason(run: &MaoRun, raw: &str, language: Language) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("no terminal session") || lower.contains("session not found") {
+        if is_reviewer_failure(run, raw) {
+            if !run.findings.is_empty() {
+                return tr(
+                    language,
+                    "The review session disconnected before finishing. Earlier findings were preserved — you can fix selected issues or accept the current result.",
+                );
+            }
+            return tr(
+                language,
+                "The review session disconnected before finishing. You can retry the review or accept the current result.",
+            );
+        }
+        return tr(
+            language,
+            "The previous agent session is no longer available. Retry to continue seamlessly in a fresh session.",
+        );
+    }
+    if lower.contains("quota")
+        || lower.contains("rate limit")
+        || lower.contains("429")
+        || lower.contains("exhausted")
+    {
+        return tr(
+            language,
+            "The selected agent reached its usage limit. Add backup agents to your pool or retry with another model.",
+        );
+    }
+    if lower.contains("reviewer dispatch failed") {
+        return tr(
+            language,
+            "Could not start the independent review pass. Check that your reviewer agent is connected, or accept the current result.",
+        );
+    }
+    clean_one_line(raw)
 }
 
 pub fn mark_approved(s: &mut UiState, run_id: &str) {
@@ -3381,11 +3531,18 @@ struct QualityGate {
 }
 
 fn quality_gates_for_run(run: &MaoRun, language: Language) -> [QualityGate; 4] {
+    let reviewer_failed =
+        matches!(&run.phase, MaoPhase::Failed { error } if is_reviewer_failure(run, error));
     let coding_gate = match &run.phase {
         MaoPhase::Coding { round } => QualityGate {
             title: tr_ref(language, "Gate: Coding"),
             detail: format!("{} #{round}", tr_ref(language, "Coding")),
             status: "running",
+        },
+        MaoPhase::Failed { .. } if reviewer_failed => QualityGate {
+            title: tr_ref(language, "Gate: Coding"),
+            detail: tr(language, "Completed"),
+            status: "completed",
         },
         MaoPhase::Failed { .. } => QualityGate {
             title: tr_ref(language, "Gate: Coding"),
@@ -3455,6 +3612,11 @@ fn quality_gates_for_run(run: &MaoRun, language: Language) -> [QualityGate; 4] {
             title: tr_ref(language, "Gate: Review"),
             detail: format!("{} #{round}", tr_ref(language, "Needs fix")),
             status: "warning",
+        },
+        MaoPhase::Failed { .. } if reviewer_failed => QualityGate {
+            title: tr_ref(language, "Gate: Review"),
+            detail: tr(language, "Interrupted"),
+            status: "failed",
         },
         MaoPhase::Coding { round } if *round > 1 => QualityGate {
             title: tr_ref(language, "Gate: Review"),
@@ -4642,7 +4804,7 @@ pub fn page_view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 None => col()
                     .key("mao-detail-empty")
                     .w(0.0)
-                    .grow(0.58)
+                    .grow(0.64)
                     .min_w(0.0)
                     .h_full()
                     .center()
@@ -4687,23 +4849,24 @@ fn page_head(s: &UiState, k: &Kit, layer: &mut Vec<El>, stacked: bool) -> El {
         &coder_id,
         &reviewer,
         max_rounds,
-        Placement::BottomStart,
+        Placement::BottomEnd,
     );
 
     let controls = row()
         .gap(8.0)
         .center_y()
         .flex_wrap()
+        .child(reviewer_menu)
         .child(
             Button::new(if enabled {
-                tr_ref(language, "MAO enabled")
+                tr_ref(language, "Auto-collaborate: On")
             } else {
-                tr_ref(language, "Enable MAO")
+                tr_ref(language, "Auto-collaborate: Off")
             })
             .variant(if enabled {
-                ButtonVariant::Submit
-            } else {
                 ButtonVariant::Neutral
+            } else {
+                ButtonVariant::GhostMuted
             })
             .control_size(ControlSize::Small)
             .on_press(|s: &mut UiState| toggle_enabled(s, Slot::Start))
@@ -4711,8 +4874,8 @@ fn page_head(s: &UiState, k: &Kit, layer: &mut Vec<El>, stacked: bool) -> El {
             .key("mao-page-toggle"),
         )
         .child(
-            Button::new(tr_ref(language, "New MAO task"))
-                .variant(ButtonVariant::GhostMuted)
+            Button::new(tr_ref(language, "New task"))
+                .variant(ButtonVariant::Submit)
                 .control_size(ControlSize::Small)
                 .on_press(|s: &mut UiState| {
                     if !s.cfg.ui.mao.enabled {
@@ -4722,23 +4885,15 @@ fn page_head(s: &UiState, k: &Kit, layer: &mut Vec<El>, stacked: bool) -> El {
                 })
                 .build(k)
                 .key("mao-page-new"),
-        )
-        .child(
-            Button::new(tr_ref(language, "Sync"))
-                .variant(ButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .on_press(request_gateway_sync)
-                .build(k)
-                .key("mao-page-sync"),
         );
 
     let line = if stacked { col() } else { row().center_y() };
     line.key("mao-head")
         .w_full()
         .px(28.0)
-        .pt(26.0)
-        .pb(14.0)
-        .gap(if stacked { 12.0 } else { 24.0 })
+        .pt(24.0)
+        .pb(12.0)
+        .gap(if stacked { 12.0 } else { 20.0 })
         .child(
             col()
                 .key("mao-title")
@@ -4749,11 +4904,11 @@ fn page_head(s: &UiState, k: &Kit, layer: &mut Vec<El>, stacked: bool) -> El {
                 .child(
                     row()
                         .w_full()
-                        .gap(10.0)
+                        .gap(8.0)
                         .center_y()
                         .flex_wrap()
                         .child(
-                            text(tr_ref(language, "MAO · Orchestration"))
+                            text(tr_ref(language, "Collaborate"))
                                 .key("page-title")
                                 .font(TextStyle {
                                     size: 22.0,
@@ -4762,12 +4917,12 @@ fn page_head(s: &UiState, k: &Kit, layer: &mut Vec<El>, stacked: bool) -> El {
                                 })
                                 .color(k.c.text_base),
                         )
-                        .child(reviewer_menu),
+                        .child(Badge::new("MAO").variant(BadgeVariant::Subtle).build(k)),
                 )
                 .child(
                     text(tr_ref(
                         language,
-                        "Session-centric orchestration: Sticky Lead Advisor, zero-token signal routing, on-demand Advisor, and automated code review.",
+                        "Set a goal once. Agents execute, review independently, and switch automatically if quotas run out.",
                     ))
                     .key("page-subtitle")
                     .font(k.ty.small)
@@ -4801,6 +4956,8 @@ fn page_filters(s: &UiState, k: &Kit) -> El {
         .w_full()
         .px(28.0)
         .pb(12.0)
+        .center_y()
+        .gap(10.0)
         .child(super::settings::segmented(
             k,
             "mao-state-filter",
@@ -4812,6 +4969,15 @@ fn page_filters(s: &UiState, k: &Kit) -> El {
                 s.orchestration.filter = Filter::ALL[i];
             },
         ))
+        .child(el().grow(1.0))
+        .child(
+            Button::new(tr_ref(language, "Refresh"))
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .on_press(request_gateway_sync)
+                .build(k)
+                .key("mao-page-sync"),
+        )
 }
 
 fn page_empty(s: &UiState, k: &Kit) -> El {
@@ -4819,26 +4985,26 @@ fn page_empty(s: &UiState, k: &Kit) -> El {
     let steps = [
         (
             "1",
-            tr_ref(language, "Sticky Lead Advisor & fast path"),
+            tr_ref(language, "Describe your goal once"),
             tr_ref(
                 language,
-                "Primary session stays warm to preserve prompt cache; lightweight Q&A finishes directly with zero extra review tokens.",
+                "Works for coding, writing, research, or planning. The lead agent works autonomously and delegates subtasks only when helpful.",
             ),
         ),
         (
             "2",
-            tr_ref(language, "Dynamic delegation & Advisor"),
+            tr_ref(language, "Independent review loop"),
             tr_ref(
                 language,
-                "Delegates subtasks only when beneficial and lets you consult a different healthy Advisor in one click.",
+                "A second agent reviews the output, surfaces high-priority issues clearly, and iterates with you until ready.",
             ),
         ),
         (
             "3",
-            tr_ref(language, "Quota failover & review gate"),
+            tr_ref(language, "Smart pool & quota failover"),
             tr_ref(
                 language,
-                "Auto-switches on rate limits and triggers independent code review only when workspace changes are produced.",
+                "Routes across your configured agent pool automatically and switches seamlessly when a model hits its quota limit.",
             ),
         ),
     ];
@@ -4903,13 +5069,13 @@ fn page_empty(s: &UiState, k: &Kit) -> El {
                 .child(icon(&glyphs::WORKFLOW, 26.0).color(k.c.text_accent)),
         )
         .child(
-            text(tr_ref(language, "No MAO runs yet"))
+            text(tr_ref(language, "No collaboration runs yet"))
                 .font(k.ty.ui_medium)
                 .color(k.c.text_base),
         )
         .child(cards)
         .child(
-            Button::new(tr_ref(language, "Start with MAO"))
+            Button::new(tr_ref(language, "Start collaborating"))
                 .variant(ButtonVariant::Submit)
                 .on_press(|s: &mut UiState| {
                     if !s.cfg.ui.mao.enabled {
@@ -4930,33 +5096,15 @@ fn page_list(
 ) -> El {
     let language = s.cfg.general.language;
     let now = now_ms();
-    let mut rows = col().key("mao-rows").w_full().padding(16.0).gap(10.0);
+    let mut rows = col().key("mao-rows").w_full().padding(14.0).gap(8.0);
     for &(run, turn_count) in groups {
         let is_selected = selected_group_key == Some(run.session_group_key());
         let id = run.id.clone();
         let session_title = session_display_title(s, run);
-        let coder_name = s.agent_name(&run.coder.agent);
-        let rev_name = s.agent_name(&run.reviewer.agent);
+        let lead_name = s.agent_name(&run.coder.agent);
         let accent = phase_color(k, &run.phase);
-        let coder_live = inspect_agent_live(
-            s,
-            k,
-            Some(run.coder_asid.as_str()),
-            matches!(run.phase, MaoPhase::Coding { .. }),
-            language,
-        );
-        let rev_live = inspect_agent_live(
-            s,
-            k,
-            run.reviewer_asid.as_deref(),
-            matches!(run.phase, MaoPhase::Reviewing { .. }),
-            language,
-        );
         let (adds, dels) = diff_totals(&run.files);
-        let route_chip = run
-            .route_decision
-            .as_ref()
-            .and_then(|d| route_badge_el(k, d, language));
+        let high_count = run.findings.iter().filter(|f| f.severity == "high").count();
 
         let header = row()
             .w_full()
@@ -4971,82 +5119,114 @@ fn page_list(
                     .grow(1.0)
                     .min_w(0.0),
             )
-            .children((turn_count > 1).then(|| {
-                Badge::new(format!("{turn_count} {}", tr_ref(language, "turns")))
-                    .variant(BadgeVariant::Subtle)
-                    .build(k)
-            }))
             .child(phase_badge(k, &run.phase, language));
 
-        let goal_line = text(concise_excerpt(&run.goal, 92))
+        let goal_line = text(concise_excerpt(&run.goal, 88))
             .font(k.ty.small)
             .color(k.c.text_muted)
             .single_line()
             .truncate()
             .w_full();
 
-        let coder_pill = row()
-            .px(8.0)
-            .py(4.0)
+        let lead_chip = row()
+            .px(7.0)
+            .py(3.0)
             .gap(5.0)
             .center_y()
             .radius(k.radius.sm)
             .fill(k.c.layer_02)
-            .child(el().size(6.0, 6.0).radius(3.0).fill(coder_live.dot_color))
             .child(agents::mark(&run.coder.agent, 12.0, s.dark))
             .child(
-                text(if run.files.is_empty() {
-                    format!("{coder_name} · {}", coder_live.status_label)
-                } else {
-                    format!(
-                        "{coder_name} · {} {}",
-                        run.files.len(),
-                        tr_ref(language, "changed files")
-                    )
-                })
-                .font(k.ty.small)
-                .color(k.c.text_base)
-                .truncate(),
-            )
-            .children((!run.files.is_empty()).then(|| {
-                text(format!("+{adds} -{dels}"))
-                    .font(k.ty.small_medium)
-                    .color(k.c.success.fg)
-            }));
-
-        let rev_pill = row()
-            .px(8.0)
-            .py(4.0)
-            .gap(5.0)
-            .center_y()
-            .radius(k.radius.sm)
-            .fill(k.c.layer_02)
-            .child(el().size(6.0, 6.0).radius(3.0).fill(rev_live.dot_color))
-            .child(agents::mark(&run.reviewer.agent, 12.0, s.dark))
-            .child(
-                text(format!("{rev_name} · {}", rev_live.status_label))
+                text(lead_name)
                     .font(k.ty.small)
                     .color(k.c.text_base)
-                    .truncate(),
+                    .single_line(),
             );
+
+        let signal_chip = if high_count > 0 && run.needs_attention() {
+            Some(
+                row()
+                    .px(7.0)
+                    .py(3.0)
+                    .radius(k.radius.sm)
+                    .fill(k.c.danger.icon.alpha(0.12))
+                    .border(1.0, k.c.danger.icon.alpha(0.32))
+                    .child(
+                        text(format!(
+                            "{high_count} {}",
+                            tr_ref(language, "high priority")
+                        ))
+                        .font(k.ty.small_medium)
+                        .color(k.c.danger.fg)
+                        .single_line(),
+                    ),
+            )
+        } else if !run.files.is_empty() {
+            Some(
+                row()
+                    .px(7.0)
+                    .py(3.0)
+                    .gap(4.0)
+                    .radius(k.radius.sm)
+                    .fill(k.c.layer_02)
+                    .child(
+                        text(format!("{} {}", run.files.len(), tr_ref(language, "files")))
+                            .font(k.ty.small)
+                            .color(k.c.text_muted)
+                            .single_line(),
+                    )
+                    .child(
+                        text(format!("+{adds}"))
+                            .font(k.ty.small_medium)
+                            .color(k.c.success.fg)
+                            .single_line(),
+                    )
+                    .child(
+                        text(format!("-{dels}"))
+                            .font(k.ty.small_medium)
+                            .color(k.c.danger.fg)
+                            .single_line(),
+                    ),
+            )
+        } else if !run.findings.is_empty() {
+            Some(
+                row()
+                    .px(7.0)
+                    .py(3.0)
+                    .radius(k.radius.sm)
+                    .fill(k.c.warning.icon.alpha(0.12))
+                    .child(
+                        text(format!(
+                            "{} {}",
+                            run.findings.len(),
+                            tr_ref(language, "issues")
+                        ))
+                        .font(k.ty.small_medium)
+                        .color(k.c.warning.fg)
+                        .single_line(),
+                    ),
+            )
+        } else {
+            None
+        };
 
         let meta = row()
             .w_full()
             .gap(6.0)
             .center_y()
             .flex_wrap()
-            .child(coder_pill)
-            .child(rev_pill)
-            .children(route_chip)
-            .children((!run.subtasks.is_empty()).then(|| {
-                Badge::new(format!(
-                    "{} {}",
-                    run.subtasks.len(),
-                    tr_ref(language, "Delegated subtasks")
-                ))
-                .variant(BadgeVariant::Subtle)
-                .build(k)
+            .child(lead_chip)
+            .children(signal_chip)
+            .children((turn_count > 1).then(|| {
+                Badge::new(format!("{turn_count} {}", tr_ref(language, "turns")))
+                    .variant(BadgeVariant::Subtle)
+                    .build(k)
             }))
+            .children(
+                run.route_decision
+                    .as_ref()
+                    .and_then(|d| route_badge_el(k, d, language)),
+            )
             .child(el().grow(1.0))
             .child(
                 text(ago(run.updated_ms, now, language))
@@ -5058,12 +5238,20 @@ fn page_list(
         let mut row_card = col()
             .key(format!("mao-row-{}", run.session_group_key()))
             .w_full()
-            .padding(14.0)
+            .padding(13.0)
             .gap(7.0)
             .radius(k.radius.lg)
-            .border(0.0, c0.alpha(0.0))
+            .border(
+                1.0,
+                if is_selected {
+                    c0.alpha(0.35)
+                } else {
+                    k.c.border_weak.alpha(0.55)
+                },
+            )
             .on_press(move |s: &mut UiState| {
                 s.orchestration.selected_run = Some(id.clone());
+                s.orchestration.finding_severity_filter = None;
             })
             .child(header)
             .child(goal_line)
@@ -5071,18 +5259,18 @@ fn page_list(
         if is_selected {
             row_card = row_card.linear_gradient(
                 std::f32::consts::FRAC_PI_2,
-                [(0.0, c0.alpha(0.18)), (1.0, c1.alpha(0.10))],
+                [(0.0, c0.alpha(0.16)), (1.0, c1.alpha(0.08))],
             );
         } else {
-            row_card = row_card.fill(k.c.layer_01.alpha(0.55));
+            row_card = row_card.fill(k.c.layer_01.alpha(0.60));
         }
         rows = rows.child(row_card);
     }
     col()
         .key("mao-list")
         .w(0.0)
-        .grow(0.42)
-        .min_w(0.0)
+        .grow(0.36)
+        .min_w(260.0)
         .h_full()
         .min_h(0.0)
         .child(
@@ -5221,10 +5409,249 @@ fn agent_live_card(
     card
 }
 
+struct FileDirGroup<'a> {
+    dir: String,
+    files: Vec<&'a MaoDeliverableFile>,
+    additions: usize,
+    deletions: usize,
+}
+
+fn group_files_by_dir(files: &[MaoDeliverableFile]) -> Vec<FileDirGroup<'_>> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_dir: HashMap<String, Vec<&MaoDeliverableFile>> = HashMap::new();
+    for file in files {
+        let dir = file
+            .path
+            .rsplit_once('/')
+            .map(|(d, _)| format!("{d}/"))
+            .unwrap_or_default();
+        if !by_dir.contains_key(&dir) {
+            order.push(dir.clone());
+        }
+        by_dir.entry(dir).or_default().push(file);
+    }
+    order
+        .into_iter()
+        .filter_map(|dir| {
+            let group_files = by_dir.remove(&dir)?;
+            let (additions, deletions) = group_files.iter().fold((0usize, 0usize), |(a, d), f| {
+                (a.saturating_add(f.additions), d.saturating_add(f.deletions))
+            });
+            Some(FileDirGroup {
+                dir,
+                files: group_files,
+                additions,
+                deletions,
+            })
+        })
+        .collect()
+}
+
+fn progress_stepper(k: &Kit, run: &MaoRun, code_task: bool, language: Language) -> El {
+    let reviewer_failed =
+        matches!(&run.phase, MaoPhase::Failed { error } if is_reviewer_failure(run, error));
+    let exec_step = match &run.phase {
+        MaoPhase::Coding { round } => (
+            if *round > 1 {
+                format!("{} #{round}", tr_ref(language, "Rework"))
+            } else {
+                tr(language, "Executing")
+            },
+            "running",
+        ),
+        MaoPhase::Failed { .. } if !reviewer_failed => (tr(language, "Interrupted"), "failed"),
+        MaoPhase::Cancelled => (tr(language, "Stopped"), "idle"),
+        _ => (tr(language, "Done"), "completed"),
+    };
+    let review_step = match &run.phase {
+        MaoPhase::Reviewing { round } => (
+            format!("{} {round}/{}", tr_ref(language, "Pass"), run.max_rounds),
+            "running",
+        ),
+        MaoPhase::Approved { .. } if run.skip_review && !code_task => {
+            (tr(language, "Fast path"), "completed")
+        }
+        MaoPhase::Approved { round, .. } => (
+            format!("{} #{round}", tr_ref(language, "Passed")),
+            "completed",
+        ),
+        MaoPhase::ChangesRequested { round, .. } => (
+            format!("{} {round}/{}", tr_ref(language, "Pass"), run.max_rounds),
+            "warning",
+        ),
+        MaoPhase::Failed { .. } if reviewer_failed => (
+            format!(
+                "{} · {}/{}",
+                tr_ref(language, "Interrupted"),
+                run.round,
+                run.max_rounds
+            ),
+            "failed",
+        ),
+        MaoPhase::Coding { round } if *round > 1 => (
+            format!("{} {}/{}", tr_ref(language, "Pass"), round, run.max_rounds),
+            "warning",
+        ),
+        _ => (tr(language, "Pending"), "idle"),
+    };
+    let outcome_step = match &run.phase {
+        MaoPhase::Approved { .. } => (tr(language, "Approved"), "completed"),
+        MaoPhase::ChangesRequested { .. } | MaoPhase::Failed { .. } => {
+            (tr(language, "Needs decision"), "warning")
+        }
+        MaoPhase::Cancelled => (tr(language, "Stopped"), "idle"),
+        MaoPhase::Coding { .. } | MaoPhase::Reviewing { .. } => {
+            (tr(language, "In progress"), "idle")
+        }
+    };
+
+    let steps = [
+        ("1", tr_ref(language, "Execute"), exec_step.0, exec_step.1),
+        (
+            "2",
+            tr_ref(language, "Review"),
+            review_step.0,
+            review_step.1,
+        ),
+        (
+            "3",
+            tr_ref(language, "Outcome"),
+            outcome_step.0,
+            outcome_step.1,
+        ),
+    ];
+
+    let mut bar = row()
+        .key("mao-stepper")
+        .w_full()
+        .gap(6.0)
+        .center_y()
+        .flex_wrap();
+    for (idx, (num, label, detail, status)) in steps.into_iter().enumerate() {
+        let (fill, border, ink) = gate_status_colors(k, status);
+        let dot = match status {
+            "completed" => k.c.success.icon,
+            "running" => k.c.bg_accent,
+            "warning" => k.c.warning.icon,
+            "failed" => k.c.danger.icon,
+            _ => k.c.text_faint,
+        };
+        if idx > 0 {
+            bar = bar.child(el().w(14.0).h(1.0).fill(k.c.border_weak).a11y_hidden());
+        }
+        bar = bar.child(
+            row()
+                .key(format!("mao-step-pill-{idx}"))
+                .px(9.0)
+                .py(5.0)
+                .gap(6.0)
+                .center_y()
+                .radius(k.radius.md)
+                .fill(fill)
+                .border(1.0, border)
+                .child(
+                    el().size(16.0, 16.0)
+                        .radius(8.0)
+                        .fill(dot.alpha(0.18))
+                        .center()
+                        .child(text(num).font(k.ty.small_medium).color(dot)),
+                )
+                .child(
+                    text(label)
+                        .font(k.ty.small_medium)
+                        .color(k.c.text_base)
+                        .single_line(),
+                )
+                .child(text(detail).font(k.ty.small).color(ink).single_line()),
+        );
+    }
+    bar
+}
+
+fn detail_headline(
+    run: &MaoRun,
+    lead_name: &str,
+    reviewer_name: &str,
+    code_task: bool,
+    language: Language,
+) -> String {
+    let high = run.findings.iter().filter(|f| f.severity == "high").count();
+    let total = run.findings.len();
+    match &run.phase {
+        MaoPhase::Coding { round } if *round == 1 => format!(
+            "{lead_name} {}",
+            tr_ref(language, "is working on your goal.")
+        ),
+        MaoPhase::Coding { round } => format!(
+            "{lead_name} {} (#{round}/{})",
+            tr_ref(language, "is applying review feedback"),
+            run.max_rounds
+        ),
+        MaoPhase::Reviewing { round } => format!(
+            "{reviewer_name} {} ({round}/{})",
+            if code_task {
+                tr_ref(language, "is reviewing workspace changes")
+            } else {
+                tr_ref(language, "is reviewing the deliverable")
+            },
+            run.max_rounds
+        ),
+        MaoPhase::Approved { round, .. } => {
+            if run.skip_review && !code_task {
+                format!(
+                    "{lead_name} {}",
+                    tr_ref(language, "finished directly on the fast path.")
+                )
+            } else {
+                format!(
+                    "{} (#{round})",
+                    tr_ref(language, "Review passed and ready to use")
+                )
+            }
+        }
+        MaoPhase::ChangesRequested { .. } => {
+            if high > 0 {
+                format!(
+                    "{high} {} · {} {total}",
+                    tr_ref(language, "high-priority issues need your decision"),
+                    tr_ref(language, "Total")
+                )
+            } else if total > 0 {
+                format!(
+                    "{total} {}",
+                    tr_ref(language, "review items need your decision")
+                )
+            } else {
+                tr(
+                    language,
+                    "Reviewer suggested improvements before finishing.",
+                )
+            }
+        }
+        MaoPhase::Failed { error } => {
+            if is_reviewer_failure(run, error) && total > 0 {
+                format!(
+                    "{} · {total} {}",
+                    tr_ref(language, "Review interrupted"),
+                    tr_ref(language, "earlier findings preserved")
+                )
+            } else if is_reviewer_failure(run, error) {
+                tr(language, "Review interrupted before completion")
+            } else {
+                tr(language, "Execution paused due to an error")
+            }
+        }
+        MaoPhase::Cancelled => tr(language, "Collaboration stopped."),
+    }
+}
+
 fn page_detail(s: &UiState, k: &Kit, run: &MaoRun) -> El {
     let language = s.cfg.general.language;
-    let coder_name = s.agent_name(&run.coder.agent);
+    let now = now_ms();
+    let code_task = is_code_task(run);
+    let lead_name = s.agent_name(&run.coder.agent);
     let reviewer_name = s.agent_name(&run.reviewer.agent);
+    let session_title = session_display_title(s, run);
     let coder_live = inspect_agent_live(
         s,
         k,
@@ -5239,36 +5666,226 @@ fn page_detail(s: &UiState, k: &Kit, run: &MaoRun) -> El {
         matches!(run.phase, MaoPhase::Reviewing { .. }),
         language,
     );
+    let actionable = matches!(
+        run.phase,
+        MaoPhase::ChangesRequested { .. } | MaoPhase::Failed { .. }
+    );
+    let diff_target = (!run.coder_asid.starts_with("new-")).then(|| run.coder_asid.clone());
 
-    let mut actions = row().w_full().gap(8.0).flex_wrap();
-    if run.id.starts_with("o_") && !run.advisor_running {
-        let id_adv = run.id.clone();
-        actions = actions.child(
-            Button::new(tr_ref(language, "Ask Advisor"))
+    // Compact turn navigator (replaces cluttered multi-row grey turn pills).
+    let session_turns = s.orchestration.turns_for_group(run.session_group_key());
+    let group_key = run.session_group_key().to_string();
+    let turns_open = s.orchestration.expanded_turns.contains(&group_key);
+    let turn_pos = session_turns
+        .iter()
+        .position(|t| t.id == run.id)
+        .unwrap_or(0);
+    let turn_nav = (session_turns.len() > 1).then(|| {
+        let total = session_turns.len();
+        let display_num = total.saturating_sub(turn_pos);
+        let prev_id = session_turns.get(turn_pos + 1).map(|t| t.id.clone());
+        let next_id = turn_pos
+            .checked_sub(1)
+            .and_then(|i| session_turns.get(i))
+            .map(|t| t.id.clone());
+        let gk = group_key.clone();
+        row()
+            .key("mao-turn-nav")
+            .gap(4.0)
+            .center_y()
+            .child(
+                Button::new("‹")
+                    .variant(ButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
+                    .disabled(prev_id.is_none())
+                    .on_press(move |s: &mut UiState| {
+                        if let Some(id) = prev_id.clone() {
+                            s.orchestration.selected_run = Some(id);
+                            s.orchestration.finding_severity_filter = None;
+                        }
+                    })
+                    .build(k)
+                    .key("mao-turn-prev"),
+            )
+            .child(
+                Button::new(format!(
+                    "{} {display_num}/{total} {}",
+                    tr_ref(language, "Turn"),
+                    if turns_open { "▴" } else { "▾" }
+                ))
                 .variant(ButtonVariant::Neutral)
                 .control_size(ControlSize::Small)
-                .on_press(move |s: &mut UiState| ask_gateway_advisor(s, &id_adv, None))
+                .on_press(move |s: &mut UiState| toggle_turns_expanded(s, &gk))
                 .build(k)
-                .key("mao-detail-advisor"),
-        );
-    }
-    if !run.coder_asid.starts_with("new-") {
-        let diff_target = run.coder_asid.clone();
-        actions = actions.child(
-            Button::new(tr_ref(language, "View diff"))
-                .variant(ButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .on_press(move |s: &mut UiState| open_run_diff(s, &diff_target))
-                .build(k)
-                .key("mao-detail-diff"),
-        );
-    }
-    if matches!(run.phase, MaoPhase::ChangesRequested { .. }) {
+                .key("mao-turn-toggle"),
+            )
+            .child(
+                Button::new("›")
+                    .variant(ButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
+                    .disabled(next_id.is_none())
+                    .on_press(move |s: &mut UiState| {
+                        if let Some(id) = next_id.clone() {
+                            s.orchestration.selected_run = Some(id);
+                            s.orchestration.finding_severity_filter = None;
+                        }
+                    })
+                    .build(k)
+                    .key("mao-turn-next"),
+            )
+    });
+
+    let turn_drawer = (session_turns.len() > 1 && turns_open).then(|| {
+        let total = session_turns.len();
+        let mut drawer = col()
+            .key("mao-turn-drawer")
+            .w_full()
+            .padding(8.0)
+            .gap(4.0)
+            .radius(k.radius.md)
+            .fill(k.c.layer_01)
+            .border(1.0, k.c.border_weak);
+        for (idx, item) in session_turns.iter().take(10).enumerate() {
+            let active = item.id == run.id;
+            let id = item.id.clone();
+            let gk = group_key.clone();
+            let num = total.saturating_sub(idx);
+            drawer = drawer.child(
+                row()
+                    .key(format!("mao-turn-pick-{idx}-{}", item.id))
+                    .w_full()
+                    .px(8.0)
+                    .py(6.0)
+                    .gap(8.0)
+                    .center_y()
+                    .radius(k.radius.sm)
+                    .fill(if active {
+                        k.c.bg_accent.alpha(0.12)
+                    } else {
+                        k.c.layer_02.alpha(0.5)
+                    })
+                    .on_press(move |s: &mut UiState| {
+                        s.orchestration.selected_run = Some(id.clone());
+                        s.orchestration.finding_severity_filter = None;
+                        s.orchestration.expanded_turns.remove(&gk);
+                    })
+                    .child(
+                        text(format!("#{num}"))
+                            .font(k.ty.small_medium)
+                            .color(if active {
+                                k.c.text_accent
+                            } else {
+                                k.c.text_faint
+                            })
+                            .single_line(),
+                    )
+                    .child(
+                        text(concise_excerpt(&item.goal, 76))
+                            .font(k.ty.small)
+                            .color(k.c.text_base)
+                            .single_line()
+                            .truncate()
+                            .grow(1.0)
+                            .min_w(0.0),
+                    )
+                    .child(phase_badge(k, &item.phase, language))
+                    .child(
+                        text(ago(item.updated_ms, now, language))
+                            .font(k.ty.small)
+                            .color(k.c.text_faint)
+                            .single_line(),
+                    ),
+            );
+        }
+        drawer
+    });
+
+    // Top detail header: session title + mode tag + compact turn nav + linear stepper.
+    let detail_header = col()
+        .key("mao-detail-header")
+        .w_full()
+        .gap(10.0)
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .center_y()
+                .flex_wrap()
+                .child(
+                    text(session_title)
+                        .font(TextStyle {
+                            size: 18.0,
+                            line_height: 24.0,
+                            ..k.ty.ui_medium
+                        })
+                        .color(k.c.text_base)
+                        .truncate()
+                        .grow(1.0)
+                        .min_w(140.0),
+                )
+                .child(
+                    Badge::new(if code_task {
+                        tr_ref(language, "Workspace task")
+                    } else {
+                        tr_ref(language, "General task")
+                    })
+                    .variant(BadgeVariant::Subtle)
+                    .build(k),
+                )
+                .children(turn_nav),
+        )
+        .children(turn_drawer)
+        .child(progress_stepper(k, run, code_task, language));
+
+    // Layer 1: Action / Decision Hero Card (first thing user sees).
+    let (hero_wash, hero_border, hero_ink) = match &run.phase {
+        MaoPhase::Approved { .. } => (
+            k.c.layer_01.mix(k.c.success.icon, 0.06),
+            k.c.success.icon.alpha(0.32),
+            k.c.success.fg,
+        ),
+        MaoPhase::Coding { .. } | MaoPhase::Reviewing { .. } => (
+            k.c.layer_01.mix(k.c.bg_accent, 0.06),
+            k.c.bg_accent.alpha(0.35),
+            k.c.text_base,
+        ),
+        MaoPhase::ChangesRequested { .. } => (
+            k.c.layer_01.mix(k.c.warning.icon, 0.07),
+            k.c.warning.icon.alpha(0.36),
+            k.c.warning.fg,
+        ),
+        MaoPhase::Failed { .. } => (
+            k.c.layer_01.mix(k.c.danger.icon, 0.06),
+            k.c.danger.icon.alpha(0.34),
+            k.c.danger.fg,
+        ),
+        MaoPhase::Cancelled => (k.c.layer_01, k.c.border_weak, k.c.text_muted),
+    };
+    let excluded = s.orchestration.excluded_findings.get(&run.id);
+    let selected_findings_count = run
+        .findings
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| excluded.is_none_or(|ex| !ex.contains(idx)))
+        .count();
+
+    let mut hero_actions = row().w_full().gap(8.0).center_y().flex_wrap();
+    if actionable {
         let id_rework = run.id.clone();
         let id_approve = run.id.clone();
-        actions = actions
+        let fix_label = if !run.findings.is_empty() && selected_findings_count > 0 {
+            format!(
+                "{} ({selected_findings_count})",
+                tr_ref(language, "Fix selected issues")
+            )
+        } else if matches!(run.phase, MaoPhase::Failed { .. }) {
+            tr(language, "Retry round")
+        } else {
+            tr(language, "Continue rework")
+        };
+        hero_actions = hero_actions
             .child(
-                Button::new(tr_ref(language, "Continue rework"))
+                Button::new(fix_label)
                     .variant(ButtonVariant::Submit)
                     .control_size(ControlSize::Small)
                     .on_press(move |s: &mut UiState| continue_rework(s, &id_rework))
@@ -5276,16 +5893,41 @@ fn page_detail(s: &UiState, k: &Kit, run: &MaoRun) -> El {
                     .key("mao-detail-rework"),
             )
             .child(
-                Button::new(tr_ref(language, "Mark approved"))
-                    .variant(ButtonVariant::GhostMuted)
+                Button::new(tr_ref(language, "Accept & finish"))
+                    .variant(ButtonVariant::Neutral)
                     .control_size(ControlSize::Small)
                     .on_press(move |s: &mut UiState| mark_approved(s, &id_approve))
                     .build(k)
                     .key("mao-detail-approve"),
             );
     } else if run.is_active() {
+        let active_target =
+            if matches!(run.phase, MaoPhase::Reviewing { .. }) || rev_live.waiting_attention {
+                run.reviewer_asid
+                    .clone()
+                    .filter(|id| !id.is_empty() && !id.starts_with("new-"))
+                    .or_else(|| diff_target.clone())
+            } else {
+                diff_target.clone()
+            };
+        if let Some(target) = active_target {
+            hero_actions = hero_actions.child(
+                Button::new(
+                    if coder_live.waiting_attention || rev_live.waiting_attention {
+                        tr_ref(language, "Review action")
+                    } else {
+                        tr_ref(language, "Open live session")
+                    },
+                )
+                .variant(ButtonVariant::Neutral)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut UiState| s.open_session(&target))
+                .build(k)
+                .key("mao-detail-open-live"),
+            );
+        }
         let id_stop = run.id.clone();
-        actions = actions.child(
+        hero_actions = hero_actions.child(
             Button::new(tr_ref(language, "Stop"))
                 .variant(ButtonVariant::GhostMuted)
                 .control_size(ControlSize::Small)
@@ -5295,186 +5937,276 @@ fn page_detail(s: &UiState, k: &Kit, run: &MaoRun) -> El {
         );
     }
 
-    let agents_pair = row()
-        .w_full()
-        .gap(10.0)
-        .flex_wrap()
-        .child(
-            agent_live_card(
-                s,
-                k,
-                tr_ref(language, "Coder"),
-                &run.coder,
-                Some(run.coder_asid.as_str()),
-                None,
-                &coder_live,
-                language,
-                "coder",
-            )
-            .w(0.0)
-            .grow(1.0)
-            .min_w(180.0),
-        )
-        .child(
-            agent_live_card(
-                s,
-                k,
-                tr_ref(language, "Reviewer"),
-                &run.reviewer,
-                run.reviewer_asid.as_deref(),
-                Some(run.coder_asid.as_str()),
-                &rev_live,
-                language,
-                "reviewer",
-            )
-            .w(0.0)
-            .grow(1.0)
-            .min_w(180.0),
-        );
-
-    let mut gates_row = row().w_full().gap(8.0).flex_wrap();
-    for (i, gate) in quality_gates_for_run(run, language).into_iter().enumerate() {
-        let (fill, border, ink) = gate_status_colors(k, gate.status);
-        gates_row = gates_row.child(
-            col()
-                .key(format!("mao-gate-{i}"))
-                .grow(1.0)
-                .min_w(130.0)
-                .px(10.0)
-                .py(8.0)
-                .gap(2.0)
-                .radius(k.radius.md)
-                .fill(fill)
-                .border(1.0, border)
-                .child(text(gate.title).font(k.ty.small).color(ink.alpha(0.85)))
-                .child(text(gate.detail).font(k.ty.small_medium).color(ink)),
+    if run.id.starts_with("o_") && !run.advisor_running {
+        let id_adv = run.id.clone();
+        hero_actions = hero_actions.child(
+            Button::new(tr_ref(language, "Ask Advisor"))
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut UiState| ask_gateway_advisor(s, &id_adv, None))
+                .build(k)
+                .key("mao-detail-advisor"),
         );
     }
+    if code_task {
+        if let Some(ref target) = diff_target {
+            let t = target.clone();
+            hero_actions = hero_actions.child(
+                Button::new(tr_ref(language, "View diff"))
+                    .variant(ButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
+                    .on_press(move |s: &mut UiState| open_run_diff(s, &t))
+                    .build(k)
+                    .key("mao-detail-diff"),
+            );
+        }
+    }
+    if !run.is_active() {
+        if let Some(ref target) = diff_target {
+            let t = target.clone();
+            hero_actions = hero_actions.child(
+                Button::new(tr_ref(language, "Enter session"))
+                    .variant(ButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
+                    .on_press(move |s: &mut UiState| s.open_session(&t))
+                    .build(k)
+                    .key("mao-detail-open-session"),
+            );
+        }
+    }
 
-    let diff_target = (!run.coder_asid.starts_with("new-")).then(|| run.coder_asid.clone());
+    let failure_guidance = match &run.phase {
+        MaoPhase::Failed { error } => Some(humanize_failure_reason(run, error, language)),
+        MaoPhase::ChangesRequested { feedback, .. } if !feedback.trim().is_empty() => {
+            Some(concise_excerpt(&clean_one_line(feedback), 240))
+        }
+        _ => None,
+    };
 
-    let repo_count = run.base_commits.len();
-    let mut files_box = col()
+    let guidance_input = actionable.then(|| {
+        let note_run_edit = run.id.clone();
+        let note_run_submit = run.id.clone();
+        TextInput::new(&s.orchestration.rework_note)
+            .placeholder(tr_ref(
+                language,
+                "Optional guidance for the next round (e.g. only fix high-priority items)…",
+            ))
+            .width(None)
+            .on_edit(move |s: &mut UiState| {
+                s.orchestration.rework_note_run = Some(note_run_edit.clone());
+                &mut s.orchestration.rework_note
+            })
+            .on_submit(move |s: &mut UiState, _: &mut Tx| {
+                s.orchestration.rework_note_run = Some(note_run_submit.clone());
+                continue_rework(s, &note_run_submit);
+            })
+            .build(k)
+            .key("mao-detail-rework-note")
+            .w_full()
+    });
+
+    let hero_card = col()
+        .key("mao-decision-card")
         .w_full()
-        .padding(12.0)
-        .gap(6.0)
-        .radius(k.radius.md)
-        .fill(k.c.layer_01)
-        .border(1.0, k.c.border_weak)
+        .padding(16.0)
+        .gap(10.0)
+        .radius(k.radius.lg)
+        .fill(hero_wash)
+        .border(1.0, hero_border)
         .child(
             row()
                 .w_full()
                 .gap(8.0)
                 .center_y()
+                .flex_wrap()
+                .child(phase_badge(k, &run.phase, language))
                 .child(
-                    text(tr_ref(language, "Changed files"))
-                        .font(k.ty.small_medium)
-                        .color(k.c.text_faint)
-                        .grow(1.0),
+                    text(detail_headline(
+                        run,
+                        &lead_name,
+                        &reviewer_name,
+                        code_task,
+                        language,
+                    ))
+                    .font(k.ty.ui_medium)
+                    .color(hero_ink)
+                    .wrap()
+                    .grow(1.0)
+                    .min_w(140.0),
                 )
-                .children((repo_count > 1).then(|| {
-                    Badge::new(format!("{repo_count} {}", tr_ref(language, "repos")))
-                        .variant(BadgeVariant::Subtle)
-                        .build(k)
-                }))
-                .children((!run.files.is_empty()).then(|| {
-                    let (adds, dels) = diff_totals(&run.files);
-                    row()
-                        .gap(6.0)
-                        .child(
-                            text(format!("+{adds}"))
-                                .font(k.ty.small_medium)
-                                .color(k.c.success.fg),
-                        )
-                        .child(
-                            text(format!("-{dels}"))
-                                .font(k.ty.small_medium)
-                                .color(k.c.danger.fg),
-                        )
-                })),
-        );
-    if run.files.is_empty() {
-        files_box = files_box.child(
-            text(tr_ref(language, "No changed files captured yet."))
-                .font(k.ty.small)
-                .color(k.c.text_faint),
-        );
-    } else {
-        for (idx, file) in run.files.iter().take(12).enumerate() {
-            let mut frow = row()
-                .key(format!("mao-file-{idx}"))
+                .children(
+                    run.route_decision
+                        .as_ref()
+                        .and_then(|d| route_badge_el(k, d, language)),
+                ),
+        )
+        .child(
+            col()
                 .w_full()
-                .gap(8.0)
-                .py(2.0)
-                .center_y()
+                .px(10.0)
+                .py(8.0)
+                .radius(k.radius.md)
+                .fill(k.c.layer_01.alpha(0.82))
+                .border(1.0, k.c.border_weak.alpha(0.6))
                 .child(
-                    text(file.path.clone())
-                        .font(k.ty.mono)
+                    text(run.goal.clone())
+                        .font(k.ty.small)
                         .color(k.c.text_base)
-                        .truncate()
-                        .grow(1.0)
-                        .min_w(0.0),
-                )
-                .child(
-                    text(format!("+{}", file.additions))
-                        .font(k.ty.small_medium)
-                        .color(k.c.success.fg),
-                )
-                .child(
-                    text(format!("-{}", file.deletions))
-                        .font(k.ty.small_medium)
-                        .color(k.c.danger.fg),
-                );
-            if let Some(ref target) = diff_target {
-                let target = target.clone();
-                frow = frow.on_press(move |s: &mut UiState| open_run_diff(s, &target));
-            }
-            files_box = files_box.child(frow);
-        }
-    }
+                        .wrap()
+                        .w_full(),
+                ),
+        )
+        .children(failure_guidance.map(|msg| {
+            text(msg)
+                .font(k.ty.small)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full()
+        }))
+        .children(guidance_input)
+        .child(hero_actions);
 
-    let findings_box = (!run.findings.is_empty()).then(|| {
+    // Layer 2: Interactive Issues & Review Findings (promoted ABOVE files!).
+    let findings_section = (!run.findings.is_empty()).then(|| {
+        let high_n = run.findings.iter().filter(|f| f.severity == "high").count();
+        let med_n = run
+            .findings
+            .iter()
+            .filter(|f| f.severity != "high" && f.severity != "low")
+            .count();
+        let low_n = run.findings.iter().filter(|f| f.severity == "low").count();
+        let active_sev = s.orchestration.finding_severity_filter;
+
+        let mut sev_filters = row().gap(4.0).center_y().flex_wrap();
+        let sev_choices: [(Option<&'static str>, String); 4] = [
+            (
+                None,
+                format!("{} ({})", tr_ref(language, "All"), run.findings.len()),
+            ),
+            (
+                Some("high"),
+                format!("{} ({high_n})", tr_ref(language, "High")),
+            ),
+            (
+                Some("medium"),
+                format!("{} ({med_n})", tr_ref(language, "Medium")),
+            ),
+            (
+                Some("low"),
+                format!("{} ({low_n})", tr_ref(language, "Low")),
+            ),
+        ];
+        for (sev_key, label) in sev_choices {
+            if sev_key == Some("high") && high_n == 0 {
+                continue;
+            }
+            if sev_key == Some("medium") && med_n == 0 {
+                continue;
+            }
+            if sev_key == Some("low") && low_n == 0 {
+                continue;
+            }
+            let is_on = active_sev == sev_key;
+            sev_filters = sev_filters.child(
+                Button::new(label)
+                    .variant(if is_on {
+                        ButtonVariant::Neutral
+                    } else {
+                        ButtonVariant::GhostMuted
+                    })
+                    .control_size(ControlSize::Small)
+                    .on_press(move |s: &mut UiState| {
+                        s.orchestration.finding_severity_filter = sev_key;
+                    })
+                    .build(k)
+                    .key(format!("mao-sev-filter-{}", sev_key.unwrap_or("all"))),
+            );
+        }
+
+        let quick_select = (actionable && run.findings.len() > 1).then(|| {
+            let rid_high = run.id.clone();
+            let rid_all = run.id.clone();
+            row()
+                .gap(4.0)
+                .center_y()
+                .children((high_n > 0 && high_n < run.findings.len()).then(|| {
+                    Button::new(tr_ref(language, "High only"))
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut UiState| select_high_findings_only(s, &rid_high))
+                        .build(k)
+                        .key("mao-findings-high-only")
+                }))
+                .child(
+                    Button::new(tr_ref(language, "Select all"))
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut UiState| select_all_findings(s, &rid_all))
+                        .build(k)
+                        .key("mao-findings-select-all"),
+                )
+        });
+
         let mut box_col = col()
             .key("mao-findings-box")
             .w_full()
-            .padding(12.0)
-            .gap(6.0)
-            .radius(k.radius.md)
+            .padding(14.0)
+            .gap(8.0)
+            .radius(k.radius.lg)
             .fill(k.c.layer_01)
             .border(1.0, k.c.border_weak)
             .child(
                 row()
                     .w_full()
+                    .gap(8.0)
                     .center_y()
-                    .gap(6.0)
+                    .flex_wrap()
                     .child(
                         text(tr_ref(language, "Review findings"))
-                            .font(k.ty.small_medium)
-                            .color(k.c.text_faint)
-                            .grow(1.0),
+                            .font(k.ty.ui_medium)
+                            .color(k.c.text_base),
                     )
-                    .child(
-                        Badge::new(run.findings.len().to_string())
-                            .variant(BadgeVariant::Subtle)
-                            .build(k),
-                    ),
+                    .child(sev_filters)
+                    .child(el().grow(1.0))
+                    .children(quick_select),
             );
-        for (idx, finding) in run.findings.iter().take(12).enumerate() {
-            let (sev_fill, sev_border, sev_ink) = match finding.severity.as_str() {
+
+        let expanded_set = s.orchestration.expanded_findings.get(&run.id);
+        for (idx, finding) in run.findings.iter().enumerate() {
+            let sev_bucket = match finding.severity.as_str() {
+                "high" => "high",
+                "low" => "low",
+                _ => "medium",
+            };
+            if active_sev.is_some_and(|want| want != sev_bucket) {
+                continue;
+            }
+            let is_checked = excluded.is_none_or(|ex| !ex.contains(&idx));
+            let is_expanded = expanded_set.is_some_and(|set| set.contains(&idx));
+            let long_msg = finding.message.chars().count() > 190;
+            let shown_msg = if long_msg && !is_expanded {
+                concise_excerpt(&finding.message, 190)
+            } else {
+                finding.message.clone()
+            };
+            let (sev_fill, sev_border, sev_ink, sev_label) = match sev_bucket {
                 "high" => (
                     k.c.danger.icon.alpha(0.14),
-                    k.c.danger.icon.alpha(0.45),
+                    k.c.danger.icon.alpha(0.42),
                     k.c.danger.fg,
+                    tr_ref(language, "High"),
                 ),
                 "low" => (
                     k.c.info.icon.alpha(0.12),
-                    k.c.info.icon.alpha(0.35),
+                    k.c.info.icon.alpha(0.32),
                     k.c.text_muted,
+                    tr_ref(language, "Low"),
                 ),
                 _ => (
                     k.c.warning.icon.alpha(0.14),
-                    k.c.warning.icon.alpha(0.45),
+                    k.c.warning.icon.alpha(0.42),
                     k.c.warning.fg,
+                    tr_ref(language, "Medium"),
                 ),
             };
             let sev_badge = el()
@@ -5484,281 +6216,535 @@ fn page_detail(s: &UiState, k: &Kit, run: &MaoRun) -> El {
                 .fill(sev_fill)
                 .border(1.0, sev_border)
                 .child(
-                    text(finding.severity.to_ascii_uppercase())
+                    text(sev_label)
                         .font(k.ty.small_medium)
-                        .color(sev_ink),
+                        .color(sev_ink)
+                        .single_line(),
                 );
+
+            let rid_toggle = run.id.clone();
+            let rid_expand = run.id.clone();
+            let mut top_row = row().w_full().gap(8.0).center_y();
+            if actionable {
+                top_row = top_row.child(
+                    el().key(format!("mao-finding-chk-{idx}"))
+                        .px(4.0)
+                        .py(2.0)
+                        .radius(k.radius.sm)
+                        .on_press(move |s: &mut UiState| {
+                            toggle_finding_selected(s, &rid_toggle, idx)
+                        })
+                        .child(
+                            text(if is_checked { "☑" } else { "☐" })
+                                .font(k.ty.ui_medium)
+                                .color(if is_checked {
+                                    k.c.text_accent
+                                } else {
+                                    k.c.text_faint
+                                }),
+                        ),
+                );
+            }
+            top_row = top_row.child(sev_badge).child(
+                text(finding.location.clone())
+                    .font(if code_task {
+                        k.ty.mono
+                    } else {
+                        k.ty.small_medium
+                    })
+                    .color(if is_checked || !actionable {
+                        k.c.text_base
+                    } else {
+                        k.c.text_faint
+                    })
+                    .truncate()
+                    .grow(1.0)
+                    .min_w(0.0),
+            );
+            if code_task {
+                if let Some(ref target) = diff_target {
+                    let t = target.clone();
+                    top_row = top_row.child(
+                        Button::new(tr_ref(language, "Diff"))
+                            .variant(ButtonVariant::GhostMuted)
+                            .control_size(ControlSize::Small)
+                            .on_press(move |s: &mut UiState| open_run_diff(s, &t))
+                            .build(k)
+                            .key(format!("mao-finding-diff-{idx}")),
+                    );
+                }
+            }
+
             let mut item_col = col()
                 .key(format!("mao-finding-{idx}"))
                 .w_full()
-                .px(8.0)
-                .py(6.0)
-                .gap(3.0)
-                .radius(k.radius.sm)
-                .fill(k.c.layer_02)
-                .child(
-                    row().w_full().gap(6.0).center_y().child(sev_badge).child(
-                        text(finding.location.clone())
-                            .font(k.ty.mono)
-                            .color(k.c.text_base)
-                            .truncate()
-                            .grow(1.0)
-                            .min_w(0.0),
-                    ),
+                .px(10.0)
+                .py(8.0)
+                .gap(4.0)
+                .radius(k.radius.md)
+                .fill(if is_checked || !actionable {
+                    k.c.layer_02
+                } else {
+                    k.c.layer_02.alpha(0.45)
+                })
+                .border(
+                    1.0,
+                    if is_checked && sev_bucket == "high" && actionable {
+                        k.c.danger.icon.alpha(0.24)
+                    } else {
+                        k.c.border_weak.alpha(0.45)
+                    },
                 )
+                .child(top_row)
                 .child(
-                    text(finding.message.clone())
+                    text(shown_msg)
                         .font(k.ty.small)
-                        .color(k.c.text_muted)
+                        .color(if is_checked || !actionable {
+                            k.c.text_muted
+                        } else {
+                            k.c.text_faint
+                        })
                         .wrap()
                         .w_full(),
                 );
-            if let Some(ref target) = diff_target {
-                let target = target.clone();
-                item_col = item_col.on_press(move |s: &mut UiState| open_run_diff(s, &target));
+            if long_msg {
+                item_col = item_col.child(
+                    row().w_full().child(
+                        Button::new(if is_expanded {
+                            tr_ref(language, "Show less")
+                        } else {
+                            tr_ref(language, "Show full detail")
+                        })
+                        .variant(ButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut UiState| {
+                            toggle_finding_expanded(s, &rid_expand, idx)
+                        })
+                        .build(k)
+                        .key(format!("mao-finding-more-{idx}")),
+                    ),
+                );
             }
             box_col = box_col.child(item_col);
         }
         box_col
     });
 
-    let coder_report = col()
-        .grow(1.0)
-        .min_w(210.0)
-        .padding(12.0)
-        .gap(4.0)
-        .radius(k.radius.md)
-        .fill(k.c.layer_01)
-        .border(1.0, k.c.border_weak)
-        .child(
-            text(tr_ref(language, "Coder summary"))
-                .font(k.ty.small_medium)
-                .color(k.c.text_faint),
-        )
-        .child(
-            text(if run.coder_summary.is_empty() {
-                tr(
-                    language,
-                    "Waiting for Coder to finish before collecting deliverables.",
-                )
-            } else {
-                run.coder_summary.clone()
-            })
-            .font(k.ty.small)
-            .color(k.c.text_base)
-            .wrap()
-            .w_full(),
-        );
+    // Layer 3: Deliverables (directory-grouped workspace changes + clean outcome summaries).
+    let files_box = (code_task && !run.files.is_empty()).then(|| {
+        let repo_count = run.base_commits.len();
+        let (adds, dels) = diff_totals(&run.files);
+        let groups = group_files_by_dir(&run.files);
+        let expanded_dirs = s.orchestration.expanded_file_groups.get(&run.id);
 
-    let review_report = col()
-        .grow(1.0)
-        .min_w(210.0)
-        .padding(12.0)
-        .gap(4.0)
-        .radius(k.radius.md)
-        .fill(k.c.layer_01)
-        .border(1.0, k.c.border_weak)
-        .child(
-            text(tr_ref(language, "Review report"))
-                .font(k.ty.small_medium)
-                .color(k.c.text_faint),
-        )
-        .child(
-            text(if run.review_summary.is_empty() {
-                tr(language, "Waiting for Reviewer report.")
-            } else {
-                run.review_summary.clone()
-            })
-            .font(k.ty.small)
-            .color(k.c.text_base)
-            .wrap()
-            .w_full(),
-        );
-
-    let mut steps_col = col().w_full().gap(6.0);
-    let coder_parent = (!run.coder_asid.is_empty() && !run.coder_asid.starts_with("new-"))
-        .then_some(run.coder_asid.as_str());
-    for (idx, step) in run.steps.iter().enumerate() {
-        steps_col = steps_col.child(step_row(k, idx, step, coder_parent));
-    }
-
-    let session_turns = s.orchestration.turns_for_group(run.session_group_key());
-    let turn_switcher = (session_turns.len() > 1).then(|| {
-        let mut strip = row().w_full().gap(6.0).center_y().flex_wrap().child(
-            text(tr_ref(language, "Session turns"))
-                .font(k.ty.small_medium)
-                .color(k.c.text_faint),
-        );
-        for (idx, item) in session_turns.iter().take(6).enumerate() {
-            let active = item.id == run.id;
-            let id = item.id.clone();
-            strip = strip.child(
-                Button::new(concise_excerpt(&item.goal, 26))
-                    .variant(if active {
-                        ButtonVariant::Neutral
-                    } else {
-                        ButtonVariant::GhostMuted
-                    })
-                    .control_size(ControlSize::Small)
-                    .on_press(move |s: &mut UiState| {
-                        s.orchestration.selected_run = Some(id.clone());
-                    })
-                    .build(k)
-                    .key(format!("mao-turn-pick-{idx}-{}", item.id)),
-            );
-        }
-        strip
-    });
-
-    let route_panel = run.route_decision.as_ref().and_then(|rd| {
-        if rd.reason.is_empty() && rd.candidates.is_empty() {
-            return None;
-        }
         let mut box_col = col()
-            .key("mao-detail-route")
+            .key("mao-files-box")
             .w_full()
-            .padding(10.0)
+            .padding(14.0)
             .gap(6.0)
-            .radius(k.radius.md)
+            .radius(k.radius.lg)
             .fill(k.c.layer_01)
-            .border(1.0, k.c.border_weak);
-        if !rd.reason.is_empty() {
-            box_col = box_col.child(
+            .border(1.0, k.c.border_weak)
+            .child(
                 row()
                     .w_full()
-                    .gap(6.0)
+                    .gap(8.0)
                     .center_y()
-                    .children(route_badge_el(k, rd, language))
                     .child(
                         text(format!(
-                            "{} ({}ms)",
-                            clean_one_line(&rd.reason),
-                            rd.latency_ms
+                            "{} ({})",
+                            tr_ref(language, "Workspace changes"),
+                            run.files.len()
                         ))
-                        .font(k.ty.small)
-                        .color(k.c.text_muted)
-                        .truncate()
-                        .grow(1.0)
-                        .min_w(0.0),
+                        .font(k.ty.ui_medium)
+                        .color(k.c.text_base)
+                        .grow(1.0),
+                    )
+                    .children((repo_count > 1).then(|| {
+                        Badge::new(format!("{repo_count} {}", tr_ref(language, "repos")))
+                            .variant(BadgeVariant::Subtle)
+                            .build(k)
+                    }))
+                    .child(
+                        text(format!("+{adds}"))
+                            .font(k.ty.small_medium)
+                            .color(k.c.success.fg),
+                    )
+                    .child(
+                        text(format!("-{dels}"))
+                            .font(k.ty.small_medium)
+                            .color(k.c.danger.fg),
+                    ),
+            );
+
+        for (gidx, group) in groups.into_iter().enumerate() {
+            let should_collapse = group.files.len() >= 4 && !group.dir.is_empty();
+            let dir_open =
+                !should_collapse || expanded_dirs.is_some_and(|set| set.contains(&group.dir));
+            if should_collapse {
+                let rid = run.id.clone();
+                let dir_key = group.dir.clone();
+                box_col = box_col.child(
+                    row()
+                        .key(format!("mao-file-dir-{gidx}"))
+                        .w_full()
+                        .px(8.0)
+                        .py(6.0)
+                        .gap(8.0)
+                        .center_y()
+                        .radius(k.radius.sm)
+                        .fill(k.c.layer_02)
+                        .on_press(move |s: &mut UiState| toggle_file_group(s, &rid, &dir_key))
+                        .child(
+                            text(if dir_open { "▾" } else { "▸" })
+                                .font(k.ty.small_medium)
+                                .color(k.c.text_muted),
+                        )
+                        .child(
+                            text(group.dir.clone())
+                                .font(k.ty.mono)
+                                .color(k.c.text_base)
+                                .truncate()
+                                .grow(1.0)
+                                .min_w(0.0),
+                        )
+                        .child(
+                            Badge::new(format!(
+                                "{} {}",
+                                group.files.len(),
+                                tr_ref(language, "files")
+                            ))
+                            .variant(BadgeVariant::Subtle)
+                            .build(k),
+                        )
+                        .child(
+                            text(format!("+{}", group.additions))
+                                .font(k.ty.small_medium)
+                                .color(k.c.success.fg),
+                        )
+                        .child(
+                            text(format!("-{}", group.deletions))
+                                .font(k.ty.small_medium)
+                                .color(k.c.danger.fg),
+                        ),
+                );
+            }
+            if dir_open {
+                for (fidx, file) in group.files.iter().enumerate() {
+                    let mut frow = row()
+                        .key(format!("mao-file-{gidx}-{fidx}"))
+                        .w_full()
+                        .pl(if should_collapse { 22.0 } else { 4.0 })
+                        .pr(4.0)
+                        .py(3.0)
+                        .gap(8.0)
+                        .center_y()
+                        .child(
+                            text(file.path.clone())
+                                .font(k.ty.mono)
+                                .color(k.c.text_base)
+                                .truncate()
+                                .grow(1.0)
+                                .min_w(0.0),
+                        )
+                        .child(
+                            text(format!("+{}", file.additions))
+                                .font(k.ty.small_medium)
+                                .color(k.c.success.fg),
+                        )
+                        .child(
+                            text(format!("-{}", file.deletions))
+                                .font(k.ty.small_medium)
+                                .color(k.c.danger.fg),
+                        );
+                    if let Some(ref target) = diff_target {
+                        let target = target.clone();
+                        frow = frow.on_press(move |s: &mut UiState| open_run_diff(s, &target));
+                    }
+                    box_col = box_col.child(frow);
+                }
+            }
+        }
+        box_col
+    });
+
+    let has_lead_summary = !run.coder_summary.trim().is_empty();
+    let has_review_summary = !run.review_summary.trim().is_empty()
+        && !matches!(&run.phase, MaoPhase::Failed { error } if run.review_summary.trim() == error.trim());
+    let summaries_row = (has_lead_summary || has_review_summary).then(|| {
+        let mut srow = row().key("mao-summaries").w_full().gap(10.0).flex_wrap();
+        if has_lead_summary {
+            srow = srow.child(
+                col()
+                    .grow(1.0)
+                    .min_w(220.0)
+                    .padding(14.0)
+                    .gap(6.0)
+                    .radius(k.radius.lg)
+                    .fill(k.c.layer_01)
+                    .border(1.0, k.c.border_weak)
+                    .child(
+                        text(tr_ref(language, "Execution summary"))
+                            .font(k.ty.small_medium)
+                            .color(k.c.text_faint),
+                    )
+                    .child(
+                        text(run.coder_summary.clone())
+                            .font(k.ty.small)
+                            .color(k.c.text_base)
+                            .wrap()
+                            .w_full(),
                     ),
             );
         }
-        if let Some(strip) = candidate_health_strip(s, k, &rd.candidates, "detail") {
-            box_col = box_col.child(strip);
+        if has_review_summary {
+            srow = srow.child(
+                col()
+                    .grow(1.0)
+                    .min_w(220.0)
+                    .padding(14.0)
+                    .gap(6.0)
+                    .radius(k.radius.lg)
+                    .fill(k.c.layer_01)
+                    .border(1.0, k.c.border_weak)
+                    .child(
+                        text(tr_ref(language, "Review summary"))
+                            .font(k.ty.small_medium)
+                            .color(k.c.text_faint),
+                    )
+                    .child(
+                        text(run.review_summary.clone())
+                            .font(k.ty.small)
+                            .color(k.c.text_base)
+                            .wrap()
+                            .w_full(),
+                    ),
+            );
         }
-        Some(box_col)
+        srow
     });
+
+    // Layer 4: Collapsible Execution & Routing Details (Developer X-Ray).
+    let trace_open = details_expanded(s, run);
+    let rid_trace = run.id.clone();
+    let trace_header = row()
+        .key("mao-trace-toggle")
+        .w_full()
+        .px(14.0)
+        .py(10.0)
+        .gap(8.0)
+        .center_y()
+        .flex_wrap()
+        .on_press(move |s: &mut UiState| toggle_details_expanded(s, &rid_trace, trace_open))
+        .child(
+            text(if trace_open { "▾" } else { "▸" })
+                .font(k.ty.small_medium)
+                .color(k.c.text_muted),
+        )
+        .child(
+            text(tr_ref(language, "Execution & routing details"))
+                .font(k.ty.small_medium)
+                .color(k.c.text_base),
+        )
+        .child(
+            row()
+                .gap(5.0)
+                .center_y()
+                .child(agents::mark(&run.coder.agent, 12.0, s.dark))
+                .child(
+                    text(lead_name.clone())
+                        .font(k.ty.small)
+                        .color(k.c.text_muted)
+                        .single_line(),
+                )
+                .child(text("→").font(k.ty.small).color(k.c.text_faint))
+                .child(agents::mark(&run.reviewer.agent, 12.0, s.dark))
+                .child(
+                    text(reviewer_name.clone())
+                        .font(k.ty.small)
+                        .color(k.c.text_muted)
+                        .single_line(),
+                ),
+        )
+        .children((!run.subtasks.is_empty()).then(|| {
+            Badge::new(format!(
+                "{} {}",
+                run.subtasks.len(),
+                tr_ref(language, "Delegated subtasks")
+            ))
+            .variant(BadgeVariant::Subtle)
+            .build(k)
+        }))
+        .child(el().grow(1.0))
+        .child(
+            text(if trace_open {
+                tr_ref(language, "Hide details")
+            } else {
+                tr_ref(language, "Show details")
+            })
+            .font(k.ty.small)
+            .color(k.c.text_faint),
+        );
+
+    let mut trace_box = col()
+        .key("mao-trace-box")
+        .w_full()
+        .radius(k.radius.lg)
+        .fill(k.c.layer_01.alpha(0.72))
+        .border(1.0, k.c.border_weak)
+        .child(trace_header);
+
+    if trace_open {
+        let agents_pair = row()
+            .w_full()
+            .gap(10.0)
+            .flex_wrap()
+            .child(
+                agent_live_card(
+                    s,
+                    k,
+                    tr_ref(language, "Lead"),
+                    &run.coder,
+                    Some(run.coder_asid.as_str()),
+                    None,
+                    &coder_live,
+                    language,
+                    "coder",
+                )
+                .w(0.0)
+                .grow(1.0)
+                .min_w(180.0),
+            )
+            .child(
+                agent_live_card(
+                    s,
+                    k,
+                    tr_ref(language, "Reviewer"),
+                    &run.reviewer,
+                    run.reviewer_asid.as_deref(),
+                    Some(run.coder_asid.as_str()),
+                    &rev_live,
+                    language,
+                    "reviewer",
+                )
+                .w(0.0)
+                .grow(1.0)
+                .min_w(180.0),
+            );
+
+        let route_panel = run.route_decision.as_ref().and_then(|rd| {
+            if rd.reason.is_empty() && rd.candidates.is_empty() {
+                return None;
+            }
+            let mut box_col = col()
+                .key("mao-detail-route")
+                .w_full()
+                .padding(10.0)
+                .gap(6.0)
+                .radius(k.radius.md)
+                .fill(k.c.layer_02)
+                .border(1.0, k.c.border_weak.alpha(0.6));
+            if !rd.reason.is_empty() {
+                box_col = box_col.child(
+                    row()
+                        .w_full()
+                        .gap(6.0)
+                        .center_y()
+                        .children(route_badge_el(k, rd, language))
+                        .child(
+                            text(format!(
+                                "{} ({}ms)",
+                                clean_one_line(&rd.reason),
+                                rd.latency_ms
+                            ))
+                            .font(k.ty.small)
+                            .color(k.c.text_muted)
+                            .truncate()
+                            .grow(1.0)
+                            .min_w(0.0),
+                        ),
+                );
+            }
+            if let Some(strip) = candidate_health_strip(s, k, &rd.candidates, "detail") {
+                box_col = box_col.child(strip);
+            }
+            Some(box_col)
+        });
+
+        let mut steps_col = col().w_full().gap(6.0);
+        let coder_parent = (!run.coder_asid.is_empty() && !run.coder_asid.starts_with("new-"))
+            .then_some(run.coder_asid.as_str());
+        for (idx, step) in run.steps.iter().enumerate() {
+            steps_col = steps_col.child(step_row(k, idx, step, coder_parent));
+        }
+
+        let raw_error_box = match &run.phase {
+            MaoPhase::Failed { error } if !error.trim().is_empty() => Some(
+                col()
+                    .w_full()
+                    .px(10.0)
+                    .py(8.0)
+                    .gap(3.0)
+                    .radius(k.radius.md)
+                    .fill(k.c.layer_02)
+                    .border(1.0, k.c.danger.icon.alpha(0.28))
+                    .child(
+                        text(tr_ref(language, "Technical detail"))
+                            .font(k.ty.small_medium)
+                            .color(k.c.danger.fg),
+                    )
+                    .child(
+                        text(error.clone())
+                            .font(k.ty.mono)
+                            .color(k.c.text_muted)
+                            .wrap()
+                            .w_full(),
+                    ),
+            ),
+            _ => None,
+        };
+
+        let trace_body = col()
+            .w_full()
+            .px(14.0)
+            .pb(14.0)
+            .pt(2.0)
+            .gap(12.0)
+            .child(agents_pair)
+            .children(route_panel)
+            .children(subtasks_box_el(s, k, run, language, "detail"))
+            .children(raw_error_box)
+            .children((!run.steps.is_empty()).then(|| {
+                col()
+                    .w_full()
+                    .gap(6.0)
+                    .child(
+                        text(tr_ref(language, "Pipeline timeline"))
+                            .font(k.ty.small_medium)
+                            .color(k.c.text_faint),
+                    )
+                    .child(steps_col)
+            }));
+        trace_box = trace_box.child(trace_body);
+    }
 
     let content = col()
         .key(format!("mao-detail-body-{}", run.id))
         .w_full()
-        .padding(20.0)
+        .padding(22.0)
         .gap(14.0)
-        .children(turn_switcher)
-        .child(
-            row()
-                .w_full()
-                .gap(8.0)
-                .center_y()
-                .child(phase_badge(k, &run.phase, language))
-                .children(
-                    run.route_decision
-                        .as_ref()
-                        .and_then(|d| route_badge_el(k, d, language)),
-                )
-                .child(
-                    text(format!(
-                        "{} {}/{}",
-                        tr_ref(language, "Review round"),
-                        run.round,
-                        run.max_rounds
-                    ))
-                    .font(k.ty.small_medium)
-                    .color(k.c.text_muted),
-                )
-                .child(el().grow(1.0))
-                .child(actions),
-        )
-        .child(
-            text(run.goal.clone())
-                .font(k.ty.ui_medium)
-                .color(k.c.text_base)
-                .wrap()
-                .w_full(),
-        )
-        .child(
-            text(phase_summary_line(
-                run,
-                &coder_name,
-                &reviewer_name,
-                language,
-            ))
-            .font(k.ty.small)
-            .color(k.c.text_muted)
-            .wrap()
-            .w_full(),
-        )
-        .children(route_panel)
+        .child(detail_header)
+        .child(hero_card)
         .children(advisor_box_el(s, k, run, language, "detail"))
-        .children(subtasks_box_el(s, k, run, language, "detail"))
-        .child(
-            col()
-                .w_full()
-                .gap(6.0)
-                .child(
-                    text(tr_ref(language, "Agent live status"))
-                        .font(k.ty.small_medium)
-                        .color(k.c.text_faint),
-                )
-                .child(agents_pair),
-        )
-        .child(
-            col()
-                .w_full()
-                .gap(6.0)
-                .child(
-                    text(tr_ref(language, "Quality gates"))
-                        .font(k.ty.small_medium)
-                        .color(k.c.text_faint),
-                )
-                .child(gates_row),
-        )
-        .child(
-            col()
-                .w_full()
-                .gap(8.0)
-                .child(
-                    text(tr_ref(language, "Deliverables & review report"))
-                        .font(k.ty.small_medium)
-                        .color(k.c.text_faint),
-                )
-                .child(files_box)
-                .children(findings_box)
-                .child(
-                    row()
-                        .w_full()
-                        .gap(10.0)
-                        .flex_wrap()
-                        .child(coder_report)
-                        .child(review_report),
-                ),
-        )
-        .child(
-            col()
-                .w_full()
-                .gap(6.0)
-                .child(
-                    text(tr_ref(language, "Pipeline timeline"))
-                        .font(k.ty.small_medium)
-                        .color(k.c.text_faint),
-                )
-                .child(steps_col),
-        );
+        .children(findings_section)
+        .children(files_box)
+        .children(summaries_row)
+        .child(trace_box);
 
     col()
         .key(format!("mao-detail-{}", run.id))
         .w(0.0)
-        .grow(0.58)
+        .grow(0.64)
         .min_w(0.0)
         .h_full()
         .min_h(0.0)
@@ -8979,5 +9965,63 @@ MAO_VERDICT: CHANGES_REQUESTED";
             }
         }
         assert!(saw_rework);
+    }
+
+    #[test]
+    fn universal_task_classification_dir_grouping_and_error_humanization() {
+        let general = MaoRun {
+            id: "o_gen".into(),
+            goal: "Draft Q3 pricing plan".into(),
+            findings: vec![MaoFinding {
+                severity: "high".into(),
+                location: "Pricing · Legacy users".into(),
+                message: "Explain migration protection".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(!is_code_task(&general));
+
+        let mut code = MaoRun {
+            id: "o_code".into(),
+            files: [
+                "desktop/locales/desktop/en.json",
+                "desktop/locales/desktop/zh-CN.json",
+                "desktop/locales/desktop/ja.json",
+                "desktop/locales/desktop/ko.json",
+                "src/orchestration/routes.rs",
+            ]
+            .into_iter()
+            .map(|p| MaoDeliverableFile {
+                path: p.into(),
+                additions: 10,
+                deletions: 2,
+            })
+            .collect(),
+            ..Default::default()
+        };
+        assert!(is_code_task(&code));
+
+        let groups = group_files_by_dir(&code.files);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].dir, "desktop/locales/desktop/");
+        assert_eq!(groups[0].files.len(), 4);
+        assert_eq!(groups[0].additions, 40);
+        assert_eq!(groups[0].deletions, 8);
+        assert_eq!(groups[1].dir, "src/orchestration/");
+        assert_eq!(groups[1].files.len(), 1);
+
+        code.findings.push(MaoFinding {
+            severity: "high".into(),
+            location: "src/orchestration/routes.rs:10".into(),
+            message: "Fix".into(),
+        });
+        let raw =
+            "Reviewer dispatch failed: no terminal session '0facb893-322a-41a5-8419-b65bcc398e2d'";
+        let human = humanize_failure_reason(&code, raw, Language::En);
+        assert!(
+            !human.contains("0facb893"),
+            "humanized message should not expose raw internal UUID: {human}"
+        );
+        assert!(human.contains("findings were preserved"));
     }
 }

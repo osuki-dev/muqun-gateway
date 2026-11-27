@@ -1647,6 +1647,8 @@ fn base_scenes() -> &'static [Scene] {
         ("viewer-video", viewer_video),
         ("mao", mao_session_scene),
         ("mao-page", mao_page_scene),
+        ("mao-page-zh", mao_page_zh_scene),
+        ("mao-general-zh", mao_general_zh_scene),
     ]
 }
 
@@ -1862,6 +1864,174 @@ fn mao_session_scene(s: &mut UiState) {
 fn mao_page_scene(s: &mut UiState) {
     mao_session_scene(s);
     s.go(Mode::Mao);
+}
+
+fn mao_page_zh_scene(s: &mut UiState) {
+    use super::orchestration::{
+        MaoDeliverableFile, MaoFinding, MaoPhase, MaoRole, MaoRun, MaoStep, MaoStepKind,
+    };
+    use muqun_gateway::agents::ModelRef;
+
+    mao_session_scene(s);
+    s.cfg.general.language = crate::config::Language::ZhCn;
+    let now = super::now_ms();
+    let mut locale_files: Vec<MaoDeliverableFile> = [
+        "de", "en", "es", "fr", "ja", "ko", "pt", "ru", "th", "vi", "zh-CN", "zh-TW",
+    ]
+    .into_iter()
+    .map(|l| MaoDeliverableFile {
+        path: format!("desktop/locales/desktop/{l}.json"),
+        additions: 15,
+        deletions: 1,
+    })
+    .collect();
+    locale_files.push(MaoDeliverableFile {
+        path: "src/orchestration/routes.rs".into(),
+        additions: 184,
+        deletions: 28,
+    });
+    locale_files.push(MaoDeliverableFile {
+        path: "desktop/src/ui/orchestration.rs".into(),
+        additions: 312,
+        deletions: 86,
+    });
+
+    let dev_run = MaoRun {
+        id: "o_dev_zh".into(),
+        computer: "local".into(),
+        goal: "不应该让我手动指定架构或前后端，应该由编排器根据任务自动从我配置的 Agent 池里分配模型，额度用完自动切换备用 Agent。".into(),
+        cwd: "/home/ryu/Work/muqun/gateway-desktop".into(),
+        coder: MaoRole {
+            agent: "antigravity".into(),
+            model: Some(ModelRef {
+                provider_id: "antigravity".into(),
+                model_id: "gemini-4-neon".into(),
+                variant: Some("high".into()),
+            }),
+            machine: None,
+        },
+        reviewer: MaoRole {
+            agent: "claude".into(),
+            model: Some(ModelRef {
+                provider_id: "anthropic".into(),
+                model_id: "claude-sonnet-5-5".into(),
+                variant: Some("high".into()),
+            }),
+            machine: None,
+        },
+        coder_asid: "s1".into(),
+        reviewer_asid: Some("s2".into()),
+        base_commit: Some("25b0902".into()),
+        round: 3,
+        max_rounds: 3,
+        phase: MaoPhase::Failed {
+            error: "Reviewer dispatch failed: no terminal session '0facb893-322a-41a5-8419-b65bcc398e2d'".into(),
+        },
+        files: locale_files,
+        coder_summary: "已实现基于 Agent 池的自动路由与额度耗尽切换，更新了 Gateway 编排逻辑和 12 语言文案。".into(),
+        review_summary: "前两轮审查共发现 4 项问题（2 项高危、2 项中危），第 3 轮复核因会话断开中断。".into(),
+        findings: vec![
+            MaoFinding {
+                severity: "high".into(),
+                location: "src/orchestration/routes.rs:1783".into(),
+                message: "启动期即时故障切换创建了 parent: None 的任务且只更新了内存中的 run.task_id，重启后可能丢失任务关联。".into(),
+            },
+            MaoFinding {
+                severity: "high".into(),
+                location: "src/orchestration/mod.rs:251".into(),
+                message: "当订阅账号 has_credits=false 但包含配额窗口仍有余量时，不应直接判定为额度耗尽。".into(),
+            },
+            MaoFinding {
+                severity: "medium".into(),
+                location: "src/orchestration/routes.rs:261".into(),
+                message: "运行时故障切换产生的子任务应排除在用户可见子任务计数之外，避免重复统计。".into(),
+            },
+            MaoFinding {
+                severity: "medium".into(),
+                location: "desktop/src/ui/orchestration.rs:5689".into(),
+                message: "向不支持 pool 能力的旧版 Gateway 发送请求前应先检查能力标志。".into(),
+            },
+        ],
+        steps: vec![
+            MaoStep {
+                kind: MaoStepKind::Coding,
+                round: 1,
+                title: "执行 #1 · Antigravity".into(),
+                detail: "完成 Agent 池路由与自动切换实现".into(),
+                status: "completed",
+                asid: Some("s1".into()),
+                time_ms: now.saturating_sub(240_000),
+            },
+            MaoStep {
+                kind: MaoStepKind::Review,
+                round: 3,
+                title: "复核 #3 · Claude".into(),
+                detail: "Reviewer dispatch failed: no terminal session '0facb893-322a-41a5-8419-b65bcc398e2d'".into(),
+                status: "failed",
+                asid: None,
+                time_ms: now.saturating_sub(30_000),
+            },
+        ],
+        created_ms: now.saturating_sub(300_000),
+        updated_ms: now.saturating_sub(30_000),
+        ..Default::default()
+    };
+
+    let general_run = MaoRun {
+        id: "o_general_zh".into(),
+        computer: "local".into(),
+        goal: "帮我起草一份 Q3 产品发布与订阅定价方案，包含面向个人用户和团队版的权益对比、上线节奏与风险清单。".into(),
+        cwd: "/home/ryu/Documents".into(),
+        coder: MaoRole {
+            agent: "claude".into(),
+            model: None,
+            machine: None,
+        },
+        reviewer: MaoRole {
+            agent: "codex".into(),
+            model: None,
+            machine: None,
+        },
+        coder_asid: "s3".into(),
+        reviewer_asid: None,
+        round: 1,
+        max_rounds: 2,
+        phase: MaoPhase::ChangesRequested {
+            round: 1,
+            feedback: "整体结构清晰，建议补充年付折扣测算和老用户平滑迁移说明后再定稿。".into(),
+        },
+        files: Vec::new(),
+        coder_summary: "已完成 Q3 发布计划与三档订阅定价方案，涵盖个人版、专业版与团队版权益矩阵、3 周上线里程碑及宣发清单。".into(),
+        review_summary: "方案逻辑完整，有 2 项内容建议在对外发布前补齐：年付折扣利润测算和现有老用户的价格保护策略。".into(),
+        findings: vec![
+            MaoFinding {
+                severity: "high".into(),
+                location: "定价与权益 · 老用户迁移".into(),
+                message: "缺少对现有订阅用户的价格保护与过渡期说明，直接切换新定价容易引发客诉。".into(),
+            },
+            MaoFinding {
+                severity: "medium".into(),
+                location: "上线节奏 · 风险预案".into(),
+                message: "建议为灰度发布阶段补充回滚触发条件与客服 FAQ 准备时间。".into(),
+            },
+        ],
+        steps: Vec::new(),
+        created_ms: now.saturating_sub(900_000),
+        updated_ms: now.saturating_sub(120_000),
+        ..Default::default()
+    };
+
+    let mut runs = mao_sample_runs(now);
+    runs.push(general_run);
+    runs.push(dev_run);
+    s.orchestration.runs = runs;
+    s.orchestration.selected_run = Some("o_dev_zh".into());
+    s.go(Mode::Mao);
+}
+
+fn mao_general_zh_scene(s: &mut UiState) {
+    mao_page_zh_scene(s);
+    s.orchestration.selected_run = Some("o_general_zh".into());
 }
 
 #[cfg(test)]

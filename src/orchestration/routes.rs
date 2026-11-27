@@ -211,7 +211,7 @@ pub(super) async fn check_candidate_quota(
             true,
         ));
     }
-    if let Ok(limits) = manager.agent().account_limits().await {
+    if let Ok(limits) = manager.account_limits(false).await {
         if let Some((reason, agent_wide)) =
             is_account_limits_exhausted(&limits, spec.model.as_deref())
         {
@@ -2681,42 +2681,73 @@ async fn rework(
         server_id: None,
     };
     let active_coder = run.effective_coder();
-    let delegated = state
+    let make_rework_req = |suffix: &str| DelegateRequest {
+        goal: rework_goal.clone(),
+        cwd: Some(run.request.cwd.clone()),
+        agent_id: Some(active_coder.agent.clone()),
+        model: active_coder.model.clone(),
+        variant: active_coder.variant.clone(),
+        client_ref: Some(format!("{}:rework:{next_round}{suffix}", run.task_ref())),
+        label: Some(format!("Rework #{next_round}")),
+        delivery: Some(Delivery::Session),
+        computer_ids: run.request.computer_ids.clone(),
+        mode: run.request.mode.clone(),
+        machine: active_coder
+            .machine
+            .clone()
+            .or_else(|| run.request.machine.clone()),
+        mentions: run.request.mentions.clone(),
+        session_id: None,
+        attachments: vec![],
+    };
+    let mut delegated = state
         .tasks
         .delegate_in_session(
             &state,
-            by,
-            DelegateRequest {
-                goal: rework_goal,
-                cwd: Some(run.request.cwd.clone()),
-                agent_id: Some(active_coder.agent.clone()),
-                model: active_coder.model.clone(),
-                variant: active_coder.variant.clone(),
-                client_ref: Some(format!("{}:rework:{next_round}", run.task_ref())),
-                label: Some(format!("Rework #{next_round}")),
-                delivery: Some(Delivery::Session),
-                computer_ids: run.request.computer_ids.clone(),
-                mode: run.request.mode.clone(),
-                machine: active_coder
-                    .machine
-                    .clone()
-                    .or_else(|| run.request.machine.clone()),
-                mentions: run.request.mentions.clone(),
-                session_id: None,
-                attachments: vec![],
-            },
+            by.clone(),
+            make_rework_req(""),
             run.state.coder_asid.as_deref(),
             Some(&format!("MAO Rework #{next_round}")),
             run.request.auto_approve.unwrap_or(true),
             None,
         )
         .await;
-    let rework_tid = delegated.as_ref().ok().map(|t| t.task_id.clone());
+    if delegated.is_err() && run.state.coder_asid.is_some() {
+        // Previous lead session may have disappeared across a restart; retry cleanly in a fresh session.
+        delegated = state
+            .tasks
+            .delegate_in_session(
+                &state,
+                by,
+                make_rework_req(":fresh"),
+                None,
+                Some(&format!("MAO Rework #{next_round}")),
+                run.request.auto_approve.unwrap_or(true),
+                None,
+            )
+            .await;
+    }
+    let rework_tid = match &delegated {
+        Ok(task) => {
+            if let Some((_, asid)) = agent_asid(&task.binding) {
+                run.state.coder_asid = Some(asid);
+            }
+            Some(task.task_id.clone())
+        }
+        Err(error) => {
+            run.state.mao_phase = "failed".into();
+            run.state.review_summary = Some(format!("Rework dispatch failed: {error}"));
+            None
+        }
+    };
     run.state.steps.push(PipelineStep {
         kind: "rework".into(),
         round: next_round,
         title: format!("Rework #{next_round} · {}", active_coder.agent),
-        detail: concise_excerpt(&feedback, 220),
+        detail: match &delegated {
+            Ok(_) => concise_excerpt(&feedback, 220),
+            Err(error) => error.to_string(),
+        },
         status: if delegated.is_ok() {
             "running".into()
         } else {
