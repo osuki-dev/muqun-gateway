@@ -143,8 +143,27 @@ pub(crate) fn new_generation() -> Arc<str> {
     uuid::Uuid::new_v4().to_string().into()
 }
 
+/// glibc keeps a heap arena per thread and retains freed pages: on a many-core
+/// machine, 24+ Tokio workers parsing large JSON/transcript bursts hold 400+ MB
+/// across 64 MB arenas. Two arenas, prompt trimming, and mmap for large blocks
+/// return freed memory to the OS immediately (matching `muqun-desktop`).
+#[cfg(target_env = "gnu")]
+fn tune_allocator() {
+    // SAFETY: plain glibc mallopt tuning calls, invoked single-threaded before
+    // any runtime or worker thread exists.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 128 * 1024);
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 256 * 1024);
+    }
+}
+
+#[cfg(not(target_env = "gnu"))]
+fn tune_allocator() {}
+
 /// The headless binary's entry point: parse the command line and dispatch it.
 pub fn run_main() -> anyhow::Result<()> {
+    tune_allocator();
     let cli = Cli::parse();
     // Before any subcommand, because every one of them either spawns a backend
     // program or writes down how to. An init system starts this process with an
@@ -170,7 +189,13 @@ pub fn run_main() -> anyhow::Result<()> {
         }
     }
     init_tracing();
+    // Gateway is I/O-bound; capping Tokio workers keeps thread stacks,
+    // allocator caches, and glibc arenas compact on high-core-count machines.
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 4))
+        .unwrap_or(4);
     tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
         .enable_all()
         .build()
         .context("failed to start the async runtime")?

@@ -333,7 +333,11 @@ fn start_core(
     store: Arc<ConfigStore>,
     commands: CommandReceiver,
 ) -> anyhow::Result<()> {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 4))
+        .unwrap_or(4);
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
         .enable_all()
         .thread_name("muqun-core")
         .build()?;

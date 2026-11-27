@@ -1558,6 +1558,7 @@ pub fn run_daemon(socket_path: Option<PathBuf>) -> io::Result<()> {
         handle.block_on(run_daemon_async(path))
     } else {
         let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()?;
         rt.block_on(run_daemon_async(path))

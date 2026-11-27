@@ -128,6 +128,10 @@ fn open_connection(path: &Path, key: Option<&DbKey>) -> anyhow::Result<Connectio
     connection.busy_timeout(std::time::Duration::from_secs(1))?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
+    // Bound SQLite's page cache (4 MiB) and disable mmap so large FTS5/store
+    // files (hundreds of MB) do not inflate process RSS.
+    connection.pragma_update(None, "cache_size", -4096)?;
+    connection.pragma_update(None, "mmap_size", 0)?;
     super::lock_down_secret_file(path)?;
     Ok(connection)
 }

@@ -131,11 +131,12 @@ pub struct TermHoverLink {
 
 /// Tracks an embedded terminal tab opened as a per-workspace editor so opening
 /// additional files in the same working directory reuses one editor instance.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct EditorTabMeta {
     pub workspace: PathBuf,
     pub editor_kind: String,
     pub ipc: Option<String>,
+    pub launched_at: Option<std::time::Instant>,
 }
 
 /// What the panel keeps between frames.
@@ -730,10 +731,59 @@ fn find_git_root(path: &std::path::Path) -> Option<PathBuf> {
         .map(canonical_or_self)
 }
 
-fn nvim_socket_path(tab_id: u64) -> String {
-    let path =
-        std::env::temp_dir().join(format!("muqun-nvim-{}-{tab_id}.sock", std::process::id()));
-    path.to_string_lossy().into_owned()
+fn is_generic_root(dir: &std::path::Path) -> bool {
+    if dir.parent().is_none() {
+        return true;
+    }
+    dirs::home_dir().is_some_and(|home| canonical_or_self(&home) == dir)
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+/// Deterministic per-workspace Neovim RPC socket path so surviving `--term-daemon`
+/// tabs can be rediscovered and reused even after `muqun-desktop` restarts.
+fn nvim_workspace_socket(workspace: &std::path::Path) -> String {
+    let hash = fnv1a_64(workspace.to_string_lossy().as_bytes());
+    std::env::temp_dir()
+        .join(format!("muqun-nvim-{hash:016x}.sock"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn nvim_socket_alive(sock: &str) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(sock).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        std::path::Path::new(sock).exists()
+    }
+}
+
+/// Wait briefly for a freshly launched Neovim process to bind its `--listen`
+/// socket, then open `file_path` in that instance via `--remote-silent`.
+fn nvim_remote_open_when_ready(sock: String, file_path: String, workspace: PathBuf) {
+    std::thread::spawn(move || {
+        for _ in 0..60 {
+            if nvim_socket_alive(&sock) {
+                let _ = spawn_detached(
+                    "nvim",
+                    &["--server", &sock, "--remote-silent", &file_path],
+                    &workspace,
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
 }
 
 fn spawn_detached(program: &str, args: &[&str], cwd: &std::path::Path) -> bool {
@@ -767,6 +817,12 @@ fn append_file_to_pending_command(pending: &mut String, escaped_path: &str) {
 impl UiState {
     fn editor_workspace_for(&self, path: &std::path::Path) -> PathBuf {
         let abs = canonical_or_self(path);
+        // Prefer the file's own git repository / worktree root so every file in
+        // a repo maps to the exact same editor workspace regardless of which
+        // session or terminal tab (e.g. `~`) happens to be focused.
+        if let Some(git_root) = find_git_root(&abs) {
+            return git_root;
+        }
         let session_dir = self
             .current()
             .and_then(|s| s.directory.as_deref())
@@ -777,13 +833,10 @@ impl UiState {
         {
             if candidate.is_dir() {
                 let root = canonical_or_self(&candidate);
-                if abs.starts_with(&root) {
+                if !is_generic_root(&root) && abs.starts_with(&root) {
                     return root;
                 }
             }
-        }
-        if let Some(git_root) = find_git_root(&abs) {
-            return git_root;
         }
         path.parent()
             .filter(|p| p.is_dir())
@@ -796,7 +849,9 @@ impl UiState {
         if let Some(meta) = self.term.editor_tabs.remove(&tab_id) {
             if meta.editor_kind == "nvim" {
                 if let Some(sock) = meta.ipc {
-                    let _ = std::fs::remove_file(sock);
+                    if !nvim_socket_alive(&sock) {
+                        let _ = std::fs::remove_file(sock);
+                    }
                 }
             }
         }
@@ -804,6 +859,7 @@ impl UiState {
 
     /// Open a remote file in an embedded terminal running a remote PTY on
     /// `computer` (via `GET /api/pty/ws`), launching `editor` (e.g. `nvim`).
+    /// Reuses an existing live remote editor tab for the same `(computer, workspace)`.
     pub fn open_remote_file_in_terminal(
         &mut self,
         computer: &str,
@@ -823,24 +879,13 @@ impl UiState {
                     .map(PathBuf::from)
             })
             .unwrap_or_else(|| PathBuf::from("~"));
-        let escaped_path = shell_quote(remote_path);
-        let cmd = format!("{editor} {escaped_path}\n");
-        self.term_new_tab_on(Some(computer.to_owned()), workspace, Some(cmd));
-    }
-
-    /// Open a file in the embedded terminal using a terminal editor (e.g. nvim).
-    /// Reuses one editor tab/instance per working directory instead of spawning
-    /// multiple editor tabs for files inside the same workspace.
-    pub fn open_file_in_terminal(&mut self, path: &std::path::Path, editor: &str) {
-        self.close_viewer();
-
-        let workspace = self.editor_workspace_for(path);
         let editor_kind = normalized_editor_kind(editor);
-        let path_str = path.to_string_lossy();
-        let escaped_path = shell_quote(&path_str);
+        let escaped_path = shell_quote(remote_path);
 
-        // Reuse an existing live editor tab for the same workspace & editor.
         let existing_idx = self.term.tabs.iter().enumerate().find_map(|(idx, tab)| {
+            if self.term.remote_tabs.get(&tab.id).map(String::as_str) != Some(computer) {
+                return None;
+            }
             let meta = self.term.editor_tabs.get(&tab.id)?;
             if meta.workspace != workspace || meta.editor_kind != editor_kind {
                 return None;
@@ -848,6 +893,113 @@ impl UiState {
             let alive = tab.session.as_ref().is_none_or(|s| s.ended().is_none());
             alive.then_some(idx)
         });
+        if let Some(idx) = existing_idx {
+            if let Some(pending) = self.term.tabs[idx].pending_command.as_mut() {
+                append_file_to_pending_command(pending, &escaped_path);
+                self.reveal_terminal_tab(idx);
+                return;
+            }
+            self.reveal_terminal_tab(idx);
+            let session = self.term.tabs[idx]
+                .session
+                .clone()
+                .or_else(|| self.term.session.clone());
+            if let Some(s) = session {
+                let cmd = match editor_kind.as_str() {
+                    "nvim" | "vim" | "vi" => format!("\x1b:edit {escaped_path}\r"),
+                    "hx" | "helix" => format!("\x1b:open {escaped_path}\r"),
+                    _ => format!("{editor} {escaped_path}\n"),
+                };
+                s.send(Msg::Text(cmd));
+            }
+            return;
+        }
+
+        let cmd = format!("{editor} {escaped_path}\n");
+        self.term_new_tab_on(Some(computer.to_owned()), workspace.clone(), Some(cmd));
+        if let Some(tab) = self.term.tabs.get(self.term.active_tab) {
+            self.term.editor_tabs.insert(
+                tab.id,
+                EditorTabMeta {
+                    workspace,
+                    editor_kind,
+                    ipc: None,
+                    launched_at: Some(std::time::Instant::now()),
+                },
+            );
+        }
+    }
+
+    /// Open a file in the embedded terminal using a terminal editor (e.g. nvim).
+    /// Reuses one editor tab/instance per working directory (including surviving
+    /// `--term-daemon` tabs after Desktop restarts) instead of spawning multiple
+    /// editor tabs for files inside the same workspace.
+    pub fn open_file_in_terminal(&mut self, path: &std::path::Path, editor: &str) {
+        self.close_viewer();
+
+        let workspace = self.editor_workspace_for(path);
+        let editor_kind = normalized_editor_kind(editor);
+        let path_str = path.to_string_lossy();
+        let escaped_path = shell_quote(&path_str);
+        let workspace_sock = (editor_kind == "nvim").then(|| nvim_workspace_socket(&workspace));
+
+        // 1. Reuse an existing tracked live local editor tab for the same workspace & editor.
+        let mut existing_idx = self.term.tabs.iter().enumerate().find_map(|(idx, tab)| {
+            if self.term.remote_tabs.contains_key(&tab.id) {
+                return None;
+            }
+            let meta = self.term.editor_tabs.get(&tab.id)?;
+            if meta.workspace != workspace || meta.editor_kind != editor_kind {
+                return None;
+            }
+            let alive = tab.session.as_ref().is_none_or(|s| s.ended().is_none());
+            alive.then_some(idx)
+        });
+
+        // 2. If Desktop restarted while `--term-daemon` kept a workspace Neovim
+        //    alive, rediscover that tab via the deterministic workspace socket.
+        if existing_idx.is_none() {
+            if let Some(sock) = workspace_sock.as_deref().filter(|s| nvim_socket_alive(s)) {
+                let rediscovered = self
+                    .term
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .find_map(|(idx, tab)| {
+                        if self.term.remote_tabs.contains_key(&tab.id) {
+                            return None;
+                        }
+                        let alive = tab.session.as_ref().is_none_or(|s| s.ended().is_none());
+                        (alive && canonical_or_self(&tab.cwd) == workspace).then_some(idx)
+                    })
+                    .or_else(|| {
+                        self.term.tabs.iter().enumerate().find_map(|(idx, tab)| {
+                            if self.term.remote_tabs.contains_key(&tab.id) {
+                                return None;
+                            }
+                            let alive = tab.session.as_ref().is_none_or(|s| s.ended().is_none());
+                            let has_nvim = tab
+                                .title
+                                .as_deref()
+                                .is_some_and(|t| t.to_ascii_lowercase().contains("nvim"));
+                            (alive && has_nvim).then_some(idx)
+                        })
+                    });
+                if let Some(idx) = rediscovered {
+                    let tab_id = self.term.tabs[idx].id;
+                    self.term.editor_tabs.insert(
+                        tab_id,
+                        EditorTabMeta {
+                            workspace: workspace.clone(),
+                            editor_kind: editor_kind.clone(),
+                            ipc: Some(sock.to_owned()),
+                            launched_at: None,
+                        },
+                    );
+                    existing_idx = Some(idx);
+                }
+            }
+        }
 
         if let Some(idx) = existing_idx {
             let tab_id = self.term.tabs[idx].id;
@@ -865,9 +1017,10 @@ impl UiState {
             match editor_kind.as_str() {
                 "nvim" => {
                     let sock = meta
-                        .and_then(|m| m.ipc)
-                        .unwrap_or_else(|| nvim_socket_path(tab_id));
-                    if std::path::Path::new(&sock).exists()
+                        .as_ref()
+                        .and_then(|m| m.ipc.clone())
+                        .unwrap_or_else(|| nvim_workspace_socket(&workspace));
+                    if nvim_socket_alive(&sock)
                         && spawn_detached(
                             "nvim",
                             &["--server", &sock, "--remote-silent", path_str.as_ref()],
@@ -876,9 +1029,24 @@ impl UiState {
                     {
                         return;
                     }
+                    // If Neovim was launched moments ago and hasn't bound its
+                    // socket yet, wait in the background and open via RPC
+                    // instead of typing a second `nvim` command into the PTY.
+                    if meta
+                        .as_ref()
+                        .and_then(|m| m.launched_at)
+                        .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(3))
+                    {
+                        nvim_remote_open_when_ready(sock, path_str.into_owned(), workspace);
+                        return;
+                    }
                     // Neovim exited back to the shell prompt in this tab: relaunch inside the same tab.
                     let _ = std::fs::remove_file(&sock);
                     let cmd = format!("{editor} --listen {} {escaped_path}\n", shell_quote(&sock));
+                    if let Some(entry) = self.term.editor_tabs.get_mut(&tab_id) {
+                        entry.ipc = Some(sock);
+                        entry.launched_at = Some(std::time::Instant::now());
+                    }
                     if let Some(s) = session {
                         s.send(Msg::Text(cmd));
                     }
@@ -919,18 +1087,19 @@ impl UiState {
             return;
         }
 
-        let next_id = self.term.next_tab_id;
         let (cmd, ipc) = match editor_kind.as_str() {
             "nvim" => {
-                let sock = nvim_socket_path(next_id);
-                let _ = std::fs::remove_file(&sock);
+                let sock = workspace_sock.unwrap_or_else(|| nvim_workspace_socket(&workspace));
+                if !nvim_socket_alive(&sock) {
+                    let _ = std::fs::remove_file(&sock);
+                }
                 (
                     format!("{editor} --listen {} {escaped_path}\n", shell_quote(&sock)),
                     Some(sock),
                 )
             }
             "vim" => {
-                let server = format!("MUQUN_{}_{next_id}", std::process::id());
+                let server = format!("MUQUN_{}_{}", std::process::id(), self.term.next_tab_id);
                 (
                     format!("{editor} --servername {server} {escaped_path}\n"),
                     Some(server),
@@ -947,6 +1116,7 @@ impl UiState {
                     workspace,
                     editor_kind,
                     ipc,
+                    launched_at: Some(std::time::Instant::now()),
                 },
             );
         }
@@ -3880,6 +4050,32 @@ mod tests {
         let pending = state.term.tabs[0].pending_command.as_deref().unwrap();
         assert!(pending.contains(&file_a.to_string_lossy().to_string()));
         assert!(pending.contains(&file_b.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn open_file_in_terminal_prefers_git_root_over_home_dir_and_reuses_remote_tabs() {
+        let (tx, _rx) = commands::channel();
+        let mut state = UiState::new(tx);
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let git_root = find_git_root(&repo).expect("repo has .git");
+        let file_a = git_root.join("src/main.rs");
+        let file_b = repo.join("src/main.rs");
+        // Even if current session/home points to `~`, both files resolve to the repo root.
+        assert_eq!(state.editor_workspace_for(&file_a), git_root);
+        assert_eq!(state.editor_workspace_for(&file_b), git_root);
+
+        state.open_file_in_terminal(&file_a, "nvim");
+        state.open_file_in_terminal(&file_b, "nvim");
+        assert_eq!(state.term.tabs.len(), 1);
+        assert_eq!(canonical_or_self(&state.term.tabs[0].cwd), git_root);
+
+        // Remote editor tabs also reuse one tab per (computer, workspace).
+        state.open_remote_file_in_terminal("mini", "/Users/mini/work/a.rs", "nvim");
+        state.open_remote_file_in_terminal("mini", "/Users/mini/work/b.rs", "nvim");
+        assert_eq!(state.term.tabs.len(), 2);
+        let remote_pending = state.term.tabs[1].pending_command.as_deref().unwrap();
+        assert!(remote_pending.contains("'/Users/mini/work/a.rs'"));
+        assert!(remote_pending.contains("'/Users/mini/work/b.rs'"));
     }
 
     #[cfg(unix)]
