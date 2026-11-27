@@ -751,16 +751,30 @@ async fn warm_agent(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[derive(Default, Deserialize)]
+struct AccountLimitsQuery {
+    #[serde(default)]
+    refresh: Option<String>,
+}
+
+impl AccountLimitsQuery {
+    fn force_refresh(&self) -> bool {
+        self.refresh
+            .as_deref()
+            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
+    }
+}
+
 async fn get_account_limits(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
+    Query(query): Query<AccountLimitsQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     require_device(&state, &headers)?;
     let manager = agent_manager_or_err(&state, &agent_id).await?;
     let snapshot = manager
-        .agent()
-        .account_limits()
+        .account_limits(query.force_refresh())
         .await
         .map_err(agent_error)?;
     let mut response = Json(snapshot).into_response();
@@ -4513,10 +4527,14 @@ mod tests {
                 crate::test_support::error_body(&edit_refusal)["error"]["code"],
                 code
             );
-            let limits_refusal =
-                get_account_limits(State(state.clone()), Path("codex".into()), headers.clone())
-                    .await
-                    .unwrap_err();
+            let limits_refusal = get_account_limits(
+                State(state.clone()),
+                Path("codex".into()),
+                Query(AccountLimitsQuery::default()),
+                headers.clone(),
+            )
+            .await
+            .unwrap_err();
             assert_eq!(limits_refusal.0, status);
             for selected in [None, Some("fx")] {
                 let refusal = do_prepare_agent_session(&state, "fixture", selected, &headers)
@@ -4859,6 +4877,15 @@ mod tests {
             .await;
             assert_eq!(response.status(), status);
         }
+        assert!(AccountLimitsQuery {
+            refresh: Some("1".into())
+        }
+        .force_refresh());
+        assert!(AccountLimitsQuery {
+            refresh: Some("true".into())
+        }
+        .force_refresh());
+        assert!(!AccountLimitsQuery::default().force_refresh());
     }
 
     /// A session whose recorded owner is not attached is retryable, never

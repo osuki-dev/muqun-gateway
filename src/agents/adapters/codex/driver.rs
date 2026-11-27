@@ -2820,6 +2820,14 @@ impl AgentPort for CodexDriver {
         Box::pin(async { Ok(self.account_limits.read(&self.client).await) })
     }
 
+    fn invalidate_account_limits(&self) {
+        CodexDriver::invalidate_account_limits(self);
+    }
+
+    fn account_limits_cache_key(&self) -> Option<u64> {
+        self.client.is_ready().then(|| self.account_limits.epoch())
+    }
+
     fn prepare_terminal_launch<'a>(
         &'a self,
         directory: &'a str,

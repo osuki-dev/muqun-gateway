@@ -938,12 +938,13 @@ impl SessionHub for RemoteHub {
         Box::pin(async move { self.read_snapshot(asid).await })
     }
 
-    fn account_limits<'a>(&'a self, agent: &'a str) -> HubFuture<'a, Value> {
+    fn account_limits<'a>(&'a self, agent: &'a str, refresh: bool) -> HubFuture<'a, Value> {
         Box::pin(async move {
+            let query: &[(&str, &str)] = if refresh { &[("refresh", "1")] } else { &[] };
             self.call(
                 Method::GET,
                 &["api", "agents", agent, "account-limits"],
-                &[],
+                query,
                 None,
             )
             .await

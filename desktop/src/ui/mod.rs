@@ -481,6 +481,8 @@ pub struct UiState {
     pub compacting_sessions: HashSet<String>,
     /// Account rate windows by agent, once asked for (`None`: it has none).
     pub account_limits: HashMap<String, Option<serde_json::Value>>,
+    /// Agents whose account limits are currently being fetched/refreshed.
+    pub account_limits_loading: HashSet<String>,
     pub agent_details: std::collections::HashSet<String>,
     pub status: String,
     pub hub_label: String,
@@ -791,6 +793,7 @@ impl UiState {
             context_open: None,
             compacting_sessions: HashSet::new(),
             account_limits: HashMap::new(),
+            account_limits_loading: HashSet::new(),
             agent_details: std::collections::HashSet::new(),
             status: "Starting…".into(),
             hub_label: String::new(),
@@ -2245,13 +2248,35 @@ impl UiState {
         self.timeline_search_jump_to_current(tx);
     }
 
-    pub fn refresh_account_limits(&self) {
-        for a in &self.agents {
-            if a.features.extra.get("accountLimits") == Some(&serde_json::Value::Bool(true)) {
-                self.send(Command::LoadAccountLimits {
-                    agent: a.id.clone(),
-                });
-            }
+    pub fn refresh_agent_account_limits(&mut self, agent: &str, force: bool) {
+        if !self.agents.iter().any(|a| {
+            a.id == agent
+                && a.features.extra.get("accountLimits") == Some(&serde_json::Value::Bool(true))
+        }) {
+            return;
+        }
+        self.account_limits_loading.insert(agent.to_string());
+        self.send(Command::LoadAccountLimits {
+            agent: agent.to_string(),
+            refresh: force,
+        });
+    }
+
+    pub fn refresh_account_limits(&mut self, force: bool) {
+        let agents: Vec<String> = self
+            .agents
+            .iter()
+            .filter(|a| {
+                a.features.extra.get("accountLimits") == Some(&serde_json::Value::Bool(true))
+            })
+            .map(|a| a.id.clone())
+            .collect();
+        for agent in agents {
+            self.account_limits_loading.insert(agent.clone());
+            self.send(Command::LoadAccountLimits {
+                agent,
+                refresh: force,
+            });
         }
     }
 
@@ -2292,7 +2317,7 @@ impl UiState {
                 ));
             }
             Mode::Settings => {
-                self.refresh_account_limits();
+                self.refresh_account_limits(false);
                 self.send(Command::ThemeRefresh);
                 self.send(Command::ScanStorage);
             }
@@ -3665,6 +3690,7 @@ impl UiState {
                 Update::Detail { asid, result } => self.on_detail(asid, result),
                 Update::RemoteFileLoaded { path, result } => self.remote_file_loaded(&path, result),
                 Update::AccountLimits { agent, limits } => {
+                    self.account_limits_loading.remove(&agent);
                     self.account_limits.insert(agent, limits);
                 }
                 Update::Earlier {

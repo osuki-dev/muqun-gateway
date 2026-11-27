@@ -133,7 +133,7 @@ pub(super) fn open(s: &mut UiState, tab: SettingsTab) {
     match tab {
         SettingsTab::About if s.desktop_update == Default::default() => s.check_desktop_update(),
         SettingsTab::Computers => s.refresh_local_pairings(),
-        SettingsTab::Agents => s.refresh_account_limits(),
+        SettingsTab::Agents => s.refresh_account_limits(false),
         SettingsTab::McpHub => s.refresh_mcp_upstreams(),
         SettingsTab::Themes => s.send(Command::ThemeRefresh),
         SettingsTab::Plugins => s.refresh_runtimes(),

@@ -1751,3 +1751,210 @@ async fn a_changed_catalog_surface_clears_the_cached_catalog() {
         "a turn's output is not a catalog change"
     );
 }
+
+#[tokio::test]
+async fn account_limits_cache_reuses_snapshot_until_forced_or_key_changes() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    struct LimitsStub {
+        reads: AtomicU64,
+        invalidations: AtomicU64,
+        ready: AtomicBool,
+        epoch: AtomicU64,
+    }
+
+    impl AgentPort for LimitsStub {
+        fn kind(&self) -> &'static str {
+            "fx"
+        }
+        fn account_limits(
+            &self,
+        ) -> crate::agents::ports::agent::AgentFuture<
+            '_,
+            crate::agents::domain::account_limits::AccountLimits,
+        > {
+            Box::pin(async move {
+                let n = self.reads.fetch_add(1, Ordering::AcqRel) + 1;
+                Ok(crate::agents::domain::account_limits::AccountLimits {
+                    status: "available",
+                    reason: None,
+                    observed_at_ms: n,
+                    ordinary_usage_allowed: Some(true),
+                    reset_credits: None,
+                    limits: vec![],
+                })
+            })
+        }
+        fn invalidate_account_limits(&self) {
+            self.invalidations.fetch_add(1, Ordering::AcqRel);
+        }
+        fn account_limits_cache_key(&self) -> Option<u64> {
+            self.ready
+                .load(Ordering::Acquire)
+                .then(|| self.epoch.load(Ordering::Acquire))
+        }
+        fn probe(&self) -> crate::agents::ports::agent::AgentFuture<'_, bool> {
+            Box::pin(async { Ok(true) })
+        }
+        fn list_projects(
+            &self,
+        ) -> crate::agents::ports::agent::AgentFuture<'_, Vec<crate::agents::domain::AgentProject>>
+        {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn list_sessions<'a>(
+            &'a self,
+            _query: &'a crate::agents::domain::SessionQuery,
+        ) -> crate::agents::ports::agent::AgentFuture<
+            'a,
+            Vec<crate::agents::domain::AgentSessionInfo>,
+        > {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn create_session<'a>(
+            &'a self,
+            _directory: Option<&'a str>,
+            _model: Option<&'a crate::agents::domain::ModelRef>,
+            _mode: Option<&'a str>,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, crate::agents::domain::AgentSessionInfo>
+        {
+            Box::pin(async { Err(AgentError::Unsupported("create".into())) })
+        }
+        fn get_session<'a>(
+            &'a self,
+            _session_id: &'a str,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, crate::agents::domain::AgentSessionInfo>
+        {
+            Box::pin(async { Err(AgentError::Unsupported("get".into())) })
+        }
+        fn send_prompt<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _text: &'a str,
+            _attachments: &'a [String],
+            _delivery: Option<&'a str>,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, ()> {
+            Box::pin(async { Err(AgentError::Unsupported("prompt".into())) })
+        }
+        fn interrupt<'a>(
+            &'a self,
+            _session_id: &'a str,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, ()> {
+            Box::pin(async { Err(AgentError::Unsupported("interrupt".into())) })
+        }
+        fn get_timeline<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _limit: usize,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, Vec<TimelineItem>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn get_catalog<'a>(
+            &'a self,
+            _directory: Option<&'a str>,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, crate::agents::domain::AgentCatalog>
+        {
+            Box::pin(async { Ok(Default::default()) })
+        }
+        fn get_pending_permissions<'a>(
+            &'a self,
+            _session_id: &'a str,
+        ) -> crate::agents::ports::agent::AgentFuture<
+            'a,
+            Vec<crate::agents::domain::PermissionRequest>,
+        > {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn get_pending_forms<'a>(
+            &'a self,
+            _session_id: &'a str,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, Vec<crate::agents::domain::FormRequest>>
+        {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn reply_permission<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _request_id: &'a str,
+            _decision: crate::agents::domain::PermissionDecision,
+            _message: Option<&'a str>,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, ()> {
+            Box::pin(async { Err(AgentError::Unsupported("perm".into())) })
+        }
+        fn reply_form<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _request_id: &'a str,
+            _answers: serde_json::Value,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, ()> {
+            Box::pin(async { Err(AgentError::Unsupported("form".into())) })
+        }
+        fn revert_session<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _message_id: &'a str,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, ()> {
+            Box::pin(async { Err(AgentError::Unsupported("revert".into())) })
+        }
+        fn switch_model<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _model: &'a crate::agents::domain::ModelRef,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, ()> {
+            Box::pin(async { Err(AgentError::Unsupported("model".into())) })
+        }
+        fn switch_mode<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _mode: &'a str,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, ()> {
+            Box::pin(async { Err(AgentError::Unsupported("mode".into())) })
+        }
+        fn find_files<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+            _directory: Option<&'a str>,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, Vec<serde_json::Value>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn get_vcs_diff<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _mode: &'a str,
+        ) -> crate::agents::ports::agent::AgentFuture<
+            'a,
+            Vec<crate::agents::ports::agent::FileDiffItem>,
+        > {
+            Box::pin(async { Ok(vec![]) })
+        }
+    }
+
+    let stub = Arc::new(LimitsStub {
+        reads: AtomicU64::new(0),
+        invalidations: AtomicU64::new(0),
+        ready: AtomicBool::new(true),
+        epoch: AtomicU64::new(1),
+    });
+    let manager = AgentManager::for_test(stub.clone());
+
+    let first = manager.account_limits(false).await.unwrap();
+    let second = manager.account_limits(false).await.unwrap();
+    assert_eq!(first.observed_at_ms, 1);
+    assert_eq!(second.observed_at_ms, 1, "cached within TTL");
+    assert_eq!(stub.reads.load(Ordering::Acquire), 1);
+
+    let forced = manager.account_limits(true).await.unwrap();
+    assert_eq!(forced.observed_at_ms, 2);
+    assert_eq!(stub.invalidations.load(Ordering::Acquire), 1);
+
+    // Changing cache key invalidates manager cache automatically.
+    stub.epoch.store(2, Ordering::Release);
+    let after_epoch = manager.account_limits(false).await.unwrap();
+    assert_eq!(after_epoch.observed_at_ms, 3);
+
+    // Disconnected adapter (`None` cache key) never serves a cached snapshot.
+    stub.ready.store(false, Ordering::Release);
+    let disconnected = manager.account_limits(false).await.unwrap();
+    assert_eq!(disconnected.observed_at_ms, 4);
+}

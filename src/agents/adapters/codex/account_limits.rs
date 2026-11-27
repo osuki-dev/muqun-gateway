@@ -18,6 +18,10 @@ pub(super) struct Cache {
 }
 
 impl Cache {
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
     pub fn invalidate(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
     }

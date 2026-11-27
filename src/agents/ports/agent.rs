@@ -300,6 +300,16 @@ pub trait AgentPort: Send + Sync {
         Box::pin(async { Err(AgentError::Unsupported("account limits".into())) })
     }
 
+    /// Drop any adapter-internal account-limits snapshot ahead of a forced refresh.
+    fn invalidate_account_limits(&self) {}
+
+    /// Cache key for manager-level account-limits caching. `None` disables
+    /// serving a previously cached snapshot (for example while a live provider
+    /// connection is down); changing the value invalidates cached snapshots.
+    fn account_limits_cache_key(&self) -> Option<u64> {
+        Some(0)
+    }
+
     /// Health check / availability probe
     fn probe(&self) -> AgentFuture<'_, bool>;
 

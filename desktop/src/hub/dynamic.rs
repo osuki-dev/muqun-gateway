@@ -297,9 +297,13 @@ impl SessionHub for DynamicHub {
         Box::pin(async move { active.snapshot(asid).await })
     }
 
-    fn account_limits<'a>(&'a self, agent: &'a str) -> HubFuture<'a, serde_json::Value> {
+    fn account_limits<'a>(
+        &'a self,
+        agent: &'a str,
+        refresh: bool,
+    ) -> HubFuture<'a, serde_json::Value> {
         let active = self.active();
-        Box::pin(async move { active.account_limits(agent).await })
+        Box::pin(async move { active.account_limits(agent, refresh).await })
     }
 
     fn media<'a>(&'a self, path: &'a str) -> HubFuture<'a, Vec<u8>> {

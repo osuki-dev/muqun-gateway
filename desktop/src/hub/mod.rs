@@ -629,7 +629,11 @@ pub trait SessionHub: Send + Sync {
     fn snapshot<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, AgentSessionSnapshot>;
     /// The agent's provider-account rate windows (`GET /api/agents/{id}/account-limits`),
     /// as the gateway words them. Unsupported by default.
-    fn account_limits<'a>(&'a self, _agent: &'a str) -> HubFuture<'a, serde_json::Value> {
+    fn account_limits<'a>(
+        &'a self,
+        _agent: &'a str,
+        _refresh: bool,
+    ) -> HubFuture<'a, serde_json::Value> {
         Box::pin(async {
             Err(HubError::Agent(AgentError::Unsupported(
                 "account limits".into(),

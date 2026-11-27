@@ -377,12 +377,15 @@ impl SessionHub for LocalHub {
         })
     }
 
-    fn account_limits<'a>(&'a self, agent: &'a str) -> HubFuture<'a, serde_json::Value> {
+    fn account_limits<'a>(
+        &'a self,
+        agent: &'a str,
+        refresh: bool,
+    ) -> HubFuture<'a, serde_json::Value> {
         Box::pin(async move {
             let manager = self.manager_for_agent(agent).await?;
             let limits = manager
-                .agent()
-                .account_limits()
+                .account_limits(refresh)
                 .await
                 .map_err(HubError::Agent)?;
             Ok(serde_json::to_value(limits).unwrap_or_default())

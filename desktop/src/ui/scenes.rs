@@ -1102,6 +1102,45 @@ fn base_scenes() -> &'static [Scene] {
         ("settings-agents-zh", |s| {
             settings(s);
             s.cfg.general.language = crate::config::Language::ZhCn;
+            if let Some(agent) = s.agents.iter_mut().find(|a| a.id == "codex") {
+                agent.version = Some("0.172.0".into());
+                agent
+                    .features
+                    .extra
+                    .insert("accountLimits".into(), json!(true));
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            s.account_limits.insert(
+                "codex".into(),
+                Some(json!({
+                    "status": "available",
+                    "reason": null,
+                    "observed_at_ms": now,
+                    "ordinary_usage_allowed": true,
+                    "reset_credits": { "available_count": 0, "credits": [] },
+                    "limits": [{
+                        "id": "codex",
+                        "name": null,
+                        "plan_type": "pro",
+                        "credits": { "has_credits": true, "unlimited": false, "balance": "13905.2351075000" },
+                        "windows": [
+                            {
+                                "id": "primary",
+                                "label": null,
+                                "unit": "percent",
+                                "used": 33.0,
+                                "limit": 100.0,
+                                "remaining": 67.0,
+                                "window_duration_minutes": 10080,
+                                "resets_at_ms": now + 6 * 86_400_000 + 7 * 3_600_000
+                            }
+                        ]
+                    }]
+                })),
+            );
         }),
         ("settings-appearance-zh", |s| {
             settings(s);

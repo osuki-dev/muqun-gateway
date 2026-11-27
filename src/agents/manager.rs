@@ -127,12 +127,62 @@ impl DeltaCoalescer {
     }
 }
 
+const ACCOUNT_LIMITS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Single-flight, bounded-TTL cache for `AgentPort::account_limits` shared across
+/// all adapters (Codex, FX, and future providers) and paired clients.
+#[derive(Default)]
+struct AccountLimitsCache {
+    entry: Mutex<
+        Option<(
+            std::time::Instant,
+            u64,
+            super::domain::account_limits::AccountLimits,
+        )>,
+    >,
+}
+
+impl AccountLimitsCache {
+    async fn read(
+        &self,
+        agent: &dyn AgentPort,
+        force_refresh: bool,
+    ) -> Result<super::domain::account_limits::AccountLimits, AgentError> {
+        let mut guard = self.entry.lock().await;
+        if force_refresh {
+            agent.invalidate_account_limits();
+            *guard = None;
+        }
+        let key_before = agent.account_limits_cache_key();
+        if !force_refresh {
+            if let (Some(key), Some((at, cached_key, value))) = (key_before, guard.as_ref()) {
+                if *cached_key == key && at.elapsed() < ACCOUNT_LIMITS_TTL {
+                    return Ok(value.clone());
+                }
+            }
+        }
+        let snapshot = agent.account_limits().await?;
+        let key_after = agent.account_limits_cache_key();
+        if let (Some(before), Some(after)) = (key_before, key_after) {
+            if before == after {
+                *guard = Some((std::time::Instant::now(), after, snapshot.clone()));
+            } else {
+                *guard = None;
+            }
+        } else {
+            *guard = None;
+        }
+        Ok(snapshot)
+    }
+}
+
 pub struct AgentManager {
     agent: Arc<dyn AgentPort>,
     mirror: Arc<MemoryMirror>,
     session_service: Arc<SessionService>,
     prompt_service: Arc<PromptService>,
     interaction_service: Arc<InteractionService>,
+    account_limits: AccountLimitsCache,
     events_tx: broadcast::Sender<AgentDomainEvent>,
     endpoint_url: String,
     endpoint_version: Option<String>,
@@ -442,6 +492,7 @@ impl AgentManager {
             )),
             prompt_service: Arc::new(PromptService::new(agent.clone())),
             interaction_service: Arc::new(InteractionService::new(agent.clone(), mirror.clone())),
+            account_limits: AccountLimitsCache::default(),
             agent,
             mirror,
             events_tx,
@@ -897,6 +948,18 @@ impl AgentManager {
 
     pub fn agent(&self) -> &Arc<dyn AgentPort> {
         &self.agent
+    }
+
+    /// Read provider-account rate limits through the manager's single-flight
+    /// cache. `force_refresh` bypasses the cached snapshot and asks the adapter
+    /// to drop any internal cache before reading again.
+    pub async fn account_limits(
+        &self,
+        force_refresh: bool,
+    ) -> Result<super::domain::account_limits::AccountLimits, AgentError> {
+        self.account_limits
+            .read(self.agent.as_ref(), force_refresh)
+            .await
     }
 
     pub fn mirror(&self) -> &Arc<MemoryMirror> {

@@ -582,8 +582,8 @@ impl Core {
                     .map_err(|err| err.to_string());
                 self.inbox.push(Update::RemoteFileLoaded { path, result });
             }
-            Command::LoadAccountLimits { agent } => {
-                let limits = match self.hub.account_limits(&agent).await {
+            Command::LoadAccountLimits { agent, refresh } => {
+                let limits = match self.hub.account_limits(&agent, refresh).await {
                     Ok(limits) => Some(limits),
                     Err(err) => {
                         tracing::debug!(%agent, %err, "account limits unavailable");

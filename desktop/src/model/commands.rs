@@ -72,6 +72,7 @@ pub enum Command {
     /// An agent's account rate windows (`Update::AccountLimits`).
     LoadAccountLimits {
         agent: String,
+        refresh: bool,
     },
     /// Open a session into a split tile: read its snapshot and stream its
     /// events, without taking the active (focused) place.

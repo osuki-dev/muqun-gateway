@@ -283,7 +283,7 @@ pub(super) fn actions(s: &UiState, k: &Kit) -> Vec<El> {
         .help(tr_ref(language, "Probe this computer for agents again"))
         .on_press(|s: &mut UiState| {
             s.send(Command::Refresh);
-            s.refresh_account_limits();
+            s.refresh_account_limits(true);
         })
         .build(k)
         .key("agents-refresh")]
@@ -309,11 +309,22 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
         crate::ui::agents::by_standing(&s.agents)
             .into_iter()
             .map(|(a, standing)| {
-                let quota =
-                    crate::ui::parts::context::limits_section(s, k, &a.id).unwrap_or_else(|| {
-                        crate::ui::muted(k, tr_ref(language, "No quota values reported"))
-                    });
-                let mut rows = vec![quota.py(8.0)];
+                let mut rows = Vec::new();
+                if let Some(quota) = crate::ui::parts::context::limits_section(s, k, &a.id) {
+                    rows.push(quota.py(6.0));
+                } else {
+                    rows.push(
+                        crate::ui::muted(
+                            k,
+                            tr_ref(language, "Account quota not provided by this agent"),
+                        )
+                        .py(4.0),
+                    );
+                    let total = usage(s.sessions.iter(), &a.id);
+                    if total.sessions > 0 {
+                        rows.push(usage_card(s, k, &a.id));
+                    }
+                }
                 let expanded = s.agent_details.contains(&a.id);
                 let id = a.id.clone();
                 rows.push(
@@ -332,7 +343,9 @@ pub(super) fn page(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> Vec<El> {
                     ),
                 );
                 if expanded {
-                    rows.push(usage_card(s, k, &a.id));
+                    if crate::ui::parts::context::supports_limits(s, &a.id) {
+                        rows.push(usage_card(s, k, &a.id));
+                    }
                     if let Some(reason) = &a.reason {
                         rows.push(el().key("reason").w_full().py(10.0).child(status(
                             k,

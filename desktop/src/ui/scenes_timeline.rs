@@ -299,29 +299,49 @@ fn timeline_context(s: &mut UiState) {
     if let Some(info) = s.sessions.iter_mut().find(|i| i.asid.0 == "s1") {
         info.context_usage = serde_json::from_value(json!({
             "tokens": { "input": 820, "output": 1190, "cache_read": 174208, "cache_write": 0, "reasoning": 310 },
-            "total_tokens": 211_400, "limit": { "context": 258_400 },
+            "total_tokens": 235_517, "limit": { "context": 258_400 },
+        }))
+        .ok();
+        info.tokens = serde_json::from_value(json!({
+            "input": 10_378_975,
+            "output": 618_129,
+            "reasoning": 213_973,
+            "cache_read": 956_003_712,
+            "cache_write": 0
+        }))
+        .ok();
+        info.git_info = serde_json::from_value(json!({
+            "branch": "feat/desktop-refactor-v2",
+            "sha": "25b0902abcdef123456789"
         }))
         .ok();
     }
     if let Some(agent) = s.agents.iter_mut().find(|a| a.id == "codex") {
+        agent.features.compaction = true;
         agent.features.extra.insert("accountLimits".into(), json!(true));
     }
-    let soon = |mins: u64| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64 + mins * 60_000)
-            .unwrap_or(0)
-    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let soon = |mins: u64| now + mins * 60_000;
     s.account_limits.insert(
         "codex".into(),
         Some(json!({
-            "status": "available", "reason": null, "observed_at_ms": 0, "ordinary_usage_allowed": true,
-            "limits": [{ "id": "codex", "name": null, "windows": [
-                { "id": "primary", "label": null, "unit": "percent", "used": 62.0, "limit": 100.0,
-                  "remaining": 38.0, "window_duration_minutes": 300, "resets_at_ms": soon(134) },
-                { "id": "secondary", "label": null, "unit": "percent", "used": 21.0, "limit": 100.0,
-                  "remaining": 79.0, "window_duration_minutes": 10080, "resets_at_ms": soon(4 * 1440 + 200) },
-            ] }],
+            "status": "available", "reason": null, "observed_at_ms": now, "ordinary_usage_allowed": true,
+            "reset_credits": { "available_count": 0, "credits": [] },
+            "limits": [{
+                "id": "codex",
+                "name": null,
+                "plan_type": "pro",
+                "credits": { "has_credits": true, "unlimited": false, "balance": "13905.2351075000" },
+                "windows": [
+                    { "id": "primary", "label": null, "unit": "percent", "used": 62.0, "limit": 100.0,
+                      "remaining": 38.0, "window_duration_minutes": 300, "resets_at_ms": soon(134) },
+                    { "id": "secondary", "label": null, "unit": "percent", "used": 33.0, "limit": 100.0,
+                      "remaining": 67.0, "window_duration_minutes": 10080, "resets_at_ms": soon(6 * 1440 + 420) },
+                ]
+            }],
         })),
     );
     s.context_open = Some("s1".into());
