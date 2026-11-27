@@ -516,7 +516,7 @@ fn tree_row(s: &UiState, k: &Kit, node: &TreeNode, root_asid: &str) -> El {
 /// Render the hierarchical session tree for the active session.
 pub(crate) fn view(s: &UiState, k: &Kit) -> Vec<El> {
     let language = s.cfg.general.language;
-    let current_asid = s.selected.as_deref();
+    let current_asid = s.panel_target_asid();
     let root_id = current_asid.map(|id| s.session_tree_root_id(id));
     let root_info = root_id
         .and_then(|id| s.session_by_id(id))

@@ -368,7 +368,8 @@ impl PluginRegistry {
         }
         r.register(Arc::new(FilePlugin));
         r.register(Arc::new(DiffPlugin));
-        r.register(Arc::new(InspectorPlugin));
+        r.register(Arc::new(GitPlugin));
+        r.register(Arc::new(ActivityPlugin));
         r.register(Arc::new(TasksPlugin));
         r.register(Arc::new(MaoPlugin));
         r.register(Arc::new(InboxPlugin));
@@ -1203,9 +1204,8 @@ impl DesktopPlugin for DiffPlugin {
                 s.show_diff = true;
                 true
             }
-            "diff.open_inspector" => {
-                s.close_plugin_drawer();
-                s.open_git_inspector();
+            "diff.open_git" | "diff.open_inspector" => {
+                s.open_git_panel();
                 true
             }
             "diff.refresh" => {
@@ -1250,15 +1250,14 @@ impl DesktopPlugin for DiffPlugin {
                     .key(format!("diff-full-view-{tile_id}")),
             )
             .child(
-                Button::new(tr_ref(lang, "Open Git Inspector"))
+                Button::new(tr_ref(lang, "Open Git"))
                     .variant(ButtonVariant::Ghost)
                     .control_size(ControlSize::Small)
                     .on_press(|s: &mut UiState| {
-                        s.close_plugin_drawer();
-                        s.open_git_inspector();
+                        s.open_git_panel();
                     })
                     .build(k)
-                    .key(format!("diff-open-inspector-{tile_id}")),
+                    .key(format!("diff-open-git-{tile_id}")),
             )
             .child(el().grow(1.0))
             .child(
@@ -1403,29 +1402,29 @@ impl DesktopPlugin for DiffPlugin {
 }
 
 // ---------------------------------------------------------------------------
-// Built-in Plugin 5: Workspace Inspector Plugin (Queue, Git, Subagents, Saved, Shells)
+// Built-in Plugin 5: Developer Git Workbench Plugin
 // ---------------------------------------------------------------------------
 
-pub struct InspectorPlugin;
+pub struct GitPlugin;
 
-impl DesktopPlugin for InspectorPlugin {
+impl DesktopPlugin for GitPlugin {
     fn id(&self) -> &'static str {
-        "inspector"
+        "git"
     }
 
-    fn title(&self, lang: Language) -> String {
-        tr_ref(lang, "Inspector").to_string()
+    fn title(&self, _lang: Language) -> String {
+        "Git".to_string()
     }
 
     fn icon(&self) -> &'static Icon {
-        &rune_kit::shell::INSPECTOR
+        &icons::BRANCH
     }
 
     fn description(&self, lang: Language) -> Option<String> {
         Some(
             tr_ref(
                 lang,
-                "Session queue, Git commits & worktrees, sub-agents, permissions, and background shells",
+                "Branches, staged & unstaged changes, commits, pull requests, and worktrees",
             )
             .to_string(),
         )
@@ -1440,28 +1439,17 @@ impl DesktopPlugin for InspectorPlugin {
     }
 
     fn commands(&self) -> Vec<PluginCommand> {
-        vec![
-            PluginCommand {
-                id: "inspector.toggle",
-                title: "Toggle Inspector".to_string(),
-                shortcut: Some("Ctrl+Alt+B"),
-            },
-            PluginCommand {
-                id: "inspector.git",
-                title: "Open Git Inspector".to_string(),
-                shortcut: Some("Ctrl+Alt+G"),
-            },
-        ]
+        vec![PluginCommand {
+            id: "git.open",
+            title: "Toggle Git Panel".to_string(),
+            shortcut: Some("Ctrl+Alt+G"),
+        }]
     }
 
     fn on_command(&self, s: &mut UiState, command_id: &str) -> bool {
         match command_id {
-            "inspector.toggle" => {
-                s.toggle_inspector();
-                true
-            }
-            "inspector.git" => {
-                s.open_git_inspector();
+            "git.open" => {
+                s.toggle_git_panel();
                 true
             }
             _ => false,
@@ -1469,7 +1457,67 @@ impl DesktopPlugin for InspectorPlugin {
     }
 
     fn render_tile(&self, ctx: &PluginViewContext<'_>, layer: &mut Vec<El>) -> Option<El> {
-        Some(crate::ui::inspector::view(ctx.s, ctx.k, layer))
+        Some(crate::ui::git_panel::view(ctx.s, ctx.k, layer))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in Plugin 6: Session Activity Plugin (Queue + Multi-tile + Tree)
+// ---------------------------------------------------------------------------
+
+pub struct ActivityPlugin;
+
+impl DesktopPlugin for ActivityPlugin {
+    fn id(&self) -> &'static str {
+        "activity"
+    }
+
+    fn title(&self, lang: Language) -> String {
+        tr_ref(lang, "Activity").to_string()
+    }
+
+    fn icon(&self) -> &'static Icon {
+        &rune_kit::shell::INSPECTOR
+    }
+
+    fn description(&self, lang: Language) -> Option<String> {
+        Some(
+            tr_ref(
+                lang,
+                "Waiting approvals, queued prompts across open tiles, and sub-agent session tree",
+            )
+            .to_string(),
+        )
+    }
+
+    fn category(&self) -> PluginCategory {
+        PluginCategory::Core
+    }
+
+    fn surfaces(&self) -> Vec<PluginSlot> {
+        vec![PluginSlot::Drawer, PluginSlot::Tile, PluginSlot::Page]
+    }
+
+    fn commands(&self) -> Vec<PluginCommand> {
+        vec![PluginCommand {
+            id: "activity.toggle",
+            title: "Toggle Activity Panel".to_string(),
+            shortcut: Some("Ctrl+Alt+B"),
+        }]
+    }
+
+    fn on_command(&self, s: &mut UiState, command_id: &str) -> bool {
+        match command_id {
+            "activity.toggle" => {
+                s.toggle_activity_panel();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn render_tile(&self, ctx: &PluginViewContext<'_>, layer: &mut Vec<El>) -> Option<El> {
+        Some(crate::ui::activity_panel::view(ctx.s, ctx.k, layer))
     }
 }
 

@@ -149,6 +149,53 @@ pub fn missing(items: &[TimelineItem]) -> Vec<String> {
     out
 }
 
+/// Gateway media URLs carried by queued prompts that are not yet cached locally.
+pub fn missing_inbox(items: &[super::compose::InboxItem], remote: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in items {
+        for file in &item.files {
+            if !file.image {
+                continue;
+            }
+            let Some(url) = file.media_url.as_deref() else {
+                continue;
+            };
+            if file_name(url).is_none() || cached(url).is_some() {
+                continue;
+            }
+            if !remote && local_file(&file.path) {
+                continue;
+            }
+            if !out.iter().any(|existing| existing == url) {
+                out.push(url.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Resolve a queued image attachment to a readable local file: sender cache,
+/// fetched gateway media cache, or local filesystem (only on local sessions).
+pub fn resolve_queued_image(
+    computer: &str,
+    remote: bool,
+    file: &super::compose::QueuedFile,
+) -> Option<PathBuf> {
+    if let Some(path) = cached_upload(computer, &file.path) {
+        return Some(path);
+    }
+    if let Some(path) = file.media_url.as_deref().and_then(cached) {
+        return Some(path);
+    }
+    if !remote {
+        let path = PathBuf::from(&file.path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 fn image_path(path: &str) -> bool {
     matches!(
         Path::new(path.split(['?', '#']).next().unwrap_or(path))

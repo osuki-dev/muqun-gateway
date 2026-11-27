@@ -74,6 +74,36 @@ impl LocalHub {
             .map_err(|_| HubError::SessionNotFound(asid.0.clone()))
     }
 
+    async fn session_checkout(
+        &self,
+        asid: &AgentSessionId,
+    ) -> Result<Option<std::path::PathBuf>, HubError> {
+        let manager = self.manager_for_session(asid).await?;
+        let dir = manager
+            .agent()
+            .get_session(&asid.0)
+            .await?
+            .directory
+            .filter(|d| !d.trim().is_empty());
+        let Some(dir) = dir else {
+            return Ok(None);
+        };
+        muqun_gateway::platform::git::repository_root(std::path::Path::new(&dir))
+            .await
+            .map_err(|e| HubError::Agent(AgentError::Network(e.to_string())))
+    }
+
+    async fn require_session_checkout(
+        &self,
+        asid: &AgentSessionId,
+    ) -> Result<std::path::PathBuf, HubError> {
+        self.session_checkout(asid).await?.ok_or_else(|| {
+            HubError::Agent(AgentError::InvalidRequest(
+                "This folder is not a git repository".into(),
+            ))
+        })
+    }
+
     /// The gateway's own reason an agent is not attached, when it has one.
     async fn unavailable(&self, agent: &str) -> HubError {
         let reason = self
@@ -661,6 +691,255 @@ impl SessionHub for LocalHub {
         Box::pin(async move {
             let manager = self.manager_for_session(asid).await?;
             Ok(manager.sessions().get_vcs_diff(asid, "working").await?)
+        })
+    }
+
+    fn vcs_overview<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+    ) -> HubFuture<'a, super::GitRepoOverview> {
+        Box::pin(async move {
+            let Some(toplevel) = self.session_checkout(asid).await? else {
+                return Ok(super::GitRepoOverview::default());
+            };
+            let ov = muqun_gateway::platform::git::overview(&toplevel)
+                .await
+                .map_err(|e| HubError::Agent(AgentError::Network(e.to_string())))?;
+            let repo = ov.repo.as_ref();
+            let worktrees = ov
+                .worktrees
+                .into_iter()
+                .map(|w| {
+                    let is_root = w.path == toplevel;
+                    WorktreeRow {
+                        directory: w.path.to_string_lossy().into_owned(),
+                        strategy: if is_root {
+                            None
+                        } else {
+                            w.branch.or_else(|| Some("worktree".into()))
+                        },
+                    }
+                })
+                .collect();
+            Ok(super::GitRepoOverview {
+                is_repo: ov.is_repo,
+                toplevel: repo.map(|r| r.toplevel.to_string_lossy().into_owned()),
+                branch: repo.and_then(|r| r.branch.clone()),
+                upstream: repo.and_then(|r| r.upstream.clone()),
+                ahead: repo.and_then(|r| r.ahead).unwrap_or(0),
+                behind: repo.and_then(|r| r.behind).unwrap_or(0),
+                detached: repo.is_some_and(|r| r.detached),
+                head: repo.and_then(|r| r.head.clone()),
+                changed_files: repo.map_or(0, |r| r.changed_files),
+                local_branches: ov.local_branches,
+                remote_url: ov.remote_url,
+                remote_host: ov.remote_host,
+                worktrees,
+            })
+        })
+    }
+
+    fn vcs_files<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        mode: &'a str,
+    ) -> HubFuture<'a, super::GitChangedFiles> {
+        Box::pin(async move {
+            let Some(toplevel) = self.session_checkout(asid).await? else {
+                return Ok(super::GitChangedFiles {
+                    mode: mode.to_string(),
+                    is_repo: false,
+                    truncated: false,
+                    files: Vec::new(),
+                });
+            };
+            let vcs_mode = muqun_gateway::platform::git::VcsMode::parse(mode)
+                .unwrap_or(muqun_gateway::platform::git::VcsMode::Working);
+            let changes = muqun_gateway::platform::git::changed_files(&toplevel, vcs_mode)
+                .await
+                .map_err(|e| HubError::Agent(AgentError::Network(e.to_string())))?;
+            let files = changes
+                .files
+                .into_iter()
+                .map(|f| super::GitChangedFile {
+                    path: f.path,
+                    old_path: f.old_path,
+                    status: f.status.as_str().to_string(),
+                    staged: f.staged,
+                    unstaged: f.unstaged,
+                    binary: f.binary,
+                    added: f.additions,
+                    removed: Some(f.deletions),
+                })
+                .collect();
+            Ok(super::GitChangedFiles {
+                mode: mode.to_string(),
+                is_repo: true,
+                truncated: changes.truncated,
+                files,
+            })
+        })
+    }
+
+    fn vcs_stage<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        paths: &'a [String],
+        all: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let toplevel = self.require_session_checkout(asid).await?;
+            muqun_gateway::platform::git::stage(&toplevel, paths, all)
+                .await
+                .map_err(|e| HubError::Agent(AgentError::Network(e.to_string())))
+        })
+    }
+
+    fn vcs_unstage<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        paths: &'a [String],
+        all: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let toplevel = self.require_session_checkout(asid).await?;
+            muqun_gateway::platform::git::unstage(&toplevel, paths, all)
+                .await
+                .map_err(|e| HubError::Agent(AgentError::Network(e.to_string())))
+        })
+    }
+
+    fn vcs_discard<'a>(&'a self, asid: &'a AgentSessionId, path: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let toplevel = self.require_session_checkout(asid).await?;
+            muqun_gateway::platform::git::discard(&toplevel, path)
+                .await
+                .map(|_| ())
+                .map_err(|e| HubError::Agent(AgentError::Network(format!("{e:?}"))))
+        })
+    }
+
+    fn vcs_checkout<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        branch: Option<&'a str>,
+        pr_number: Option<u64>,
+    ) -> HubFuture<'a, String> {
+        Box::pin(async move {
+            let toplevel = self.require_session_checkout(asid).await?;
+            if let Some(pr) = pr_number {
+                muqun_gateway::platform::git_prs::checkout_pr(&toplevel, pr)
+                    .await
+                    .map_err(|e| HubError::Agent(AgentError::Network(e.to_string())))
+            } else if let Some(b) = branch {
+                muqun_gateway::platform::git::checkout_branch(&toplevel, b)
+                    .await
+                    .map_err(|e| HubError::Agent(AgentError::Network(e.to_string())))
+            } else {
+                Err(HubError::Agent(AgentError::InvalidRequest(
+                    "branch or pr_number is required".into(),
+                )))
+            }
+        })
+    }
+
+    fn vcs_commit<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        message: &'a str,
+        stage_all: bool,
+    ) -> HubFuture<'a, String> {
+        Box::pin(async move {
+            let toplevel = self.require_session_checkout(asid).await?;
+            muqun_gateway::platform::git::commit(&toplevel, message, stage_all)
+                .await
+                .map_err(|e| HubError::Agent(AgentError::Network(e.to_string())))
+        })
+    }
+
+    fn vcs_sync<'a>(&'a self, asid: &'a AgentSessionId, action: &'a str) -> HubFuture<'a, String> {
+        Box::pin(async move {
+            let toplevel = self.require_session_checkout(asid).await?;
+            muqun_gateway::platform::git::sync(&toplevel, action)
+                .await
+                .map_err(|e| HubError::Agent(AgentError::Network(e.to_string())))
+        })
+    }
+
+    fn vcs_commits<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        offset: usize,
+        limit: usize,
+    ) -> HubFuture<'a, super::GitCommitsPage> {
+        Box::pin(async move {
+            let Some(toplevel) = self.session_checkout(asid).await? else {
+                return Ok(super::GitCommitsPage::default());
+            };
+            let page = muqun_gateway::platform::git::recent_commits(&toplevel, offset, limit)
+                .await
+                .map_err(|e| HubError::Agent(AgentError::Network(e.to_string())))?;
+            Ok(super::GitCommitsPage {
+                items: page
+                    .items
+                    .into_iter()
+                    .map(|c| super::GitCommitRow {
+                        hash: c.hash,
+                        short_hash: c.short_hash,
+                        subject: c.subject,
+                        author: c.author,
+                        timestamp_ms: c.timestamp_ms,
+                    })
+                    .collect(),
+                offset: page.offset,
+                next_offset: page.next_offset,
+                has_more: page.has_more,
+            })
+        })
+    }
+
+    fn vcs_prs<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        state: &'a str,
+        author: &'a str,
+        page: u32,
+        limit: u32,
+        refresh: bool,
+    ) -> HubFuture<'a, super::GitPrsPage> {
+        Box::pin(async move {
+            let Some(toplevel) = self.session_checkout(asid).await? else {
+                return Ok(super::GitPrsPage::default());
+            };
+            let page = muqun_gateway::platform::git_prs::list_pull_requests(
+                &toplevel, state, author, page, limit, refresh,
+            )
+            .await;
+            Ok(super::GitPrsPage {
+                host: page.host,
+                supported: page.supported,
+                reason: page.reason,
+                repo_url: page.repo_url,
+                items: page
+                    .items
+                    .into_iter()
+                    .map(|p| super::GitPrRow {
+                        number: p.number,
+                        title: p.title,
+                        state: p.state,
+                        draft: p.draft,
+                        url: p.url,
+                        author: p.author,
+                        head_branch: p.head_branch,
+                        base_branch: p.base_branch,
+                        updated_at: p.updated_at,
+                        checks_status: p.checks_status,
+                    })
+                    .collect(),
+                page: page.page,
+                next_page: page.next_page,
+                has_more: page.has_more,
+            })
         })
     }
 

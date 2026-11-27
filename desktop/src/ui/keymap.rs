@@ -1176,7 +1176,7 @@ fn handle_leader_group(
         LeaderGroup::Git => match ch {
             Some('g') => {
                 if !run(s, Action::ToggleGit, ev, tx) {
-                    s.open_git_inspector();
+                    s.open_git_panel();
                 }
             }
             Some('d') => s.show_diff = !s.show_diff,
@@ -1283,7 +1283,7 @@ pub fn handle_leader_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
         Some('b') => s.sidebar.toggle(),
         Some('i') => {
             if !run(s, Action::ToggleInspector, ev, tx) {
-                s.toggle_inspector();
+                s.toggle_activity_panel();
             }
         }
         Some('c' | 'C') => {
@@ -1370,7 +1370,7 @@ pub fn intercept_global_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool
         && s.mode == Mode::Session
         && s.in_split()
         && s.right_open
-        && s.active_plugin_drawer.as_deref() == Some("inspector")
+        && matches!(s.active_plugin_drawer.as_deref(), Some("git" | "activity"))
         && s.menu.is_none()
         && s.row_menu.is_none()
         && s.context_open.is_none()
@@ -1382,7 +1382,7 @@ pub fn intercept_global_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool
         && !s.timeline_search.active
         && s.voice.is_none()
     {
-        s.close_inspector();
+        s.toggle_right_panel();
         return true;
     }
     if is_leader_event(s, ev, tx) {
@@ -1645,17 +1645,17 @@ pub fn run(s: &mut UiState, action: Action, ev: &KeyEvent, tx: &mut Tx) -> bool 
         A::ToggleInspector => {
             if s.inspect.is_some() {
                 s.close_inspect();
-            } else if session && !s.in_split() {
-                s.toggle_inspector();
+            } else if session {
+                s.toggle_activity_panel();
             } else {
                 return false;
             }
         }
         A::ToggleGit => {
-            if session && !s.in_split() {
-                s.toggle_git_inspector();
+            if session {
+                s.toggle_git_panel();
             } else if s.selected.is_some() {
-                s.open_git_inspector();
+                s.open_git_panel();
             } else {
                 return false;
             }
@@ -2361,13 +2361,13 @@ mod tests {
             crate::ui::Tile::session("two"),
         ];
         s.selected = Some("one".into());
-        s.open_git_inspector();
+        s.open_git_panel();
         s.draft = rune::TextEdit::new("pending");
         let mut rt = Runtime::new(s, super::super::view, (1440.0, 900.0), Env::new(true, 1.0));
         rt.on_key = Some(super::super::on_key);
         rt.frame(0.0);
         assert!(rt.state.right_open);
-        assert_eq!(rt.state.active_plugin_drawer.as_deref(), Some("inspector"));
+        assert_eq!(rt.state.active_plugin_drawer.as_deref(), Some("git"));
         rt.key(Key::Escape.into());
         rt.frame(1.0 / 60.0);
         assert!(!rt.state.right_open);

@@ -1437,15 +1437,15 @@ mod tests {
             crate::ui::Tile::session("two"),
         ];
         s.selected = Some("one".into());
-        s.open_git_inspector();
+        s.open_git_panel();
         assert!(s.right_open);
-        assert_eq!(s.active_plugin_drawer.as_deref(), Some("inspector"));
-        assert_eq!(s.selected_dock_tab(), Some("inspector"));
+        assert_eq!(s.active_plugin_drawer.as_deref(), Some("git"));
+        assert_eq!(s.selected_dock_tab(), Some("git"));
         s.open_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/icons/app-icon.png"));
         assert!(s.file_window_focused());
         s.focus_tile(0);
         assert!(s.right_open);
-        assert_eq!(s.selected_dock_tab(), Some("inspector"));
+        assert_eq!(s.selected_dock_tab(), Some("git"));
     }
 
     #[test]

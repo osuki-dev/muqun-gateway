@@ -744,6 +744,123 @@ pub trait SessionHub: Send + Sync {
     /// The working-tree changes in the session's folder, as the agent's
     /// `get_vcs_diff` reports them (`working` mode).
     fn vcs_diff<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<FileDiffItem>>;
+    /// Repository overview (branch, ahead/behind, branches, remote, universal worktrees).
+    fn vcs_overview<'a>(&'a self, _asid: &'a AgentSessionId) -> HubFuture<'a, GitRepoOverview> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "vcs_git_ops_v1".into(),
+            )))
+        })
+    }
+    /// Agent-independent changed file list (`working` or `branch` mode).
+    fn vcs_files<'a>(
+        &'a self,
+        _asid: &'a AgentSessionId,
+        _mode: &'a str,
+    ) -> HubFuture<'a, GitChangedFiles> {
+        Box::pin(async { Err(HubError::Agent(AgentError::Unsupported("vcs_files".into()))) })
+    }
+    /// Stage specific paths or all working-tree changes.
+    fn vcs_stage<'a>(
+        &'a self,
+        _asid: &'a AgentSessionId,
+        _paths: &'a [String],
+        _all: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "vcs_git_ops_v1".into(),
+            )))
+        })
+    }
+    /// Unstage specific paths or all staged changes.
+    fn vcs_unstage<'a>(
+        &'a self,
+        _asid: &'a AgentSessionId,
+        _paths: &'a [String],
+        _all: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "vcs_git_ops_v1".into(),
+            )))
+        })
+    }
+    /// Discard one changed or untracked file via Gateway.
+    fn vcs_discard<'a>(&'a self, _asid: &'a AgentSessionId, _path: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "vcs_discard".into(),
+            )))
+        })
+    }
+    /// Switch to a local branch or check out a Pull Request branch.
+    fn vcs_checkout<'a>(
+        &'a self,
+        _asid: &'a AgentSessionId,
+        _branch: Option<&'a str>,
+        _pr_number: Option<u64>,
+    ) -> HubFuture<'a, String> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "vcs_git_ops_v1".into(),
+            )))
+        })
+    }
+    /// Commit staged changes (or stage all then commit).
+    fn vcs_commit<'a>(
+        &'a self,
+        _asid: &'a AgentSessionId,
+        _message: &'a str,
+        _stage_all: bool,
+    ) -> HubFuture<'a, String> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "vcs_git_ops_v1".into(),
+            )))
+        })
+    }
+    /// Sync with remote (`fetch`, `pull`, `push`).
+    fn vcs_sync<'a>(
+        &'a self,
+        _asid: &'a AgentSessionId,
+        _action: &'a str,
+    ) -> HubFuture<'a, String> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "vcs_git_ops_v1".into(),
+            )))
+        })
+    }
+    /// Paginated recent commits.
+    fn vcs_commits<'a>(
+        &'a self,
+        _asid: &'a AgentSessionId,
+        _offset: usize,
+        _limit: usize,
+    ) -> HubFuture<'a, GitCommitsPage> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "vcs_git_ops_v1".into(),
+            )))
+        })
+    }
+    /// Paginated Pull Requests (`open` / `closed` / `all`, `me` / `all`).
+    fn vcs_prs<'a>(
+        &'a self,
+        _asid: &'a AgentSessionId,
+        _state: &'a str,
+        _author: &'a str,
+        _page: u32,
+        _limit: u32,
+        _refresh: bool,
+    ) -> HubFuture<'a, GitPrsPage> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "vcs_prs_v1".into(),
+            )))
+        })
+    }
     /// Mark the session read as of now (the App's `POST …/view`).
     fn view<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()>;
     /// Stage a rollback to `message_id` without applying it; `files` also
@@ -962,6 +1079,132 @@ pub trait SessionHub: Send + Sync {
     fn task_events(&self) -> Option<broadcast::Receiver<TaskHubEvent>> {
         None
     }
+}
+
+/// Full repository overview for a session's checkout (local or remote).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct GitRepoOverview {
+    #[serde(default)]
+    pub is_repo: bool,
+    #[serde(default)]
+    pub toplevel: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub upstream: Option<String>,
+    #[serde(default)]
+    pub ahead: i64,
+    #[serde(default)]
+    pub behind: i64,
+    #[serde(default)]
+    pub detached: bool,
+    #[serde(default)]
+    pub head: Option<String>,
+    #[serde(default)]
+    pub changed_files: usize,
+    #[serde(default)]
+    pub local_branches: Vec<String>,
+    #[serde(default)]
+    pub remote_url: Option<String>,
+    #[serde(default)]
+    pub remote_host: Option<String>,
+    #[serde(default)]
+    pub worktrees: Vec<WorktreeRow>,
+}
+
+/// One changed file in `working` or `branch` diff mode.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct GitChangedFile {
+    pub path: String,
+    #[serde(default)]
+    pub old_path: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub staged: bool,
+    #[serde(default)]
+    pub unstaged: bool,
+    #[serde(default)]
+    pub binary: bool,
+    #[serde(default, alias = "additions")]
+    pub added: Option<u64>,
+    #[serde(default, alias = "deletions")]
+    pub removed: Option<u64>,
+}
+
+/// Changed file list returned by `GET /api/agent-sessions/{asid}/vcs/files`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitChangedFiles {
+    pub mode: String,
+    pub is_repo: bool,
+    pub truncated: bool,
+    pub files: Vec<GitChangedFile>,
+}
+
+/// One commit row from paginated `GET /api/agent-sessions/{asid}/vcs/commits`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct GitCommitRow {
+    pub hash: String,
+    pub short_hash: String,
+    pub subject: String,
+    pub author: String,
+    #[serde(default)]
+    pub timestamp_ms: i64,
+}
+
+/// One page of recent commits.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct GitCommitsPage {
+    #[serde(default)]
+    pub items: Vec<GitCommitRow>,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default)]
+    pub next_offset: Option<usize>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+/// One Pull Request row from paginated `GET /api/agent-sessions/{asid}/vcs/prs`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct GitPrRow {
+    pub number: u64,
+    pub title: String,
+    pub state: String,
+    #[serde(default)]
+    pub draft: bool,
+    pub url: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub head_branch: String,
+    #[serde(default)]
+    pub base_branch: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub checks_status: Option<String>,
+}
+
+/// One page of Pull Requests.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct GitPrsPage {
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub supported: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub repo_url: Option<String>,
+    #[serde(default)]
+    pub items: Vec<GitPrRow>,
+    #[serde(default)]
+    pub page: u32,
+    #[serde(default)]
+    pub next_page: Option<u32>,
+    #[serde(default)]
+    pub has_more: bool,
 }
 
 /// Why a hub call did not happen.

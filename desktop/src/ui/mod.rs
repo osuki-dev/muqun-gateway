@@ -4,6 +4,7 @@
 //! every core update into it, each page sends [`Command`]s back, and [`view`] lays the
 //! shell out from it.
 
+pub(crate) mod activity_panel;
 mod agent_marks;
 mod agents;
 pub(crate) mod art;
@@ -16,11 +17,11 @@ mod dwindle;
 mod echo;
 pub mod fx;
 mod gateway_setup;
+pub(crate) mod git_panel;
 mod home;
 pub mod i18n;
 pub(crate) mod icons;
 pub(crate) mod inbox;
-pub(crate) mod inspector;
 pub mod keymap;
 mod labels;
 mod model_picker;
@@ -95,14 +96,14 @@ pub enum Mode {
     Settings,
 }
 
-/// The inspector's tabs (worktrees live under Git).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InspectorTab {
-    Queue,
-    Git,
-    Subagents,
-    Saved,
-    Shells,
+/// Which session the right-side Git and Activity panels bind to.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PanelTarget {
+    /// Follow the currently focused tile / selected session.
+    #[default]
+    FollowFocused,
+    /// Stay locked on one specific session even when hovering/focusing other tiles.
+    Pinned(String),
 }
 
 /// Which composer a submit came from, so the right draft clears on success.
@@ -173,8 +174,10 @@ pub enum OpenMenu {
     Model,
     Effort,
     Branch,
-    /// The Git inspector's inline branch switcher dropdown.
-    InspectorBranch,
+    /// The Git panel's inline branch switcher dropdown.
+    GitBranch,
+    /// The Git / Activity panel's target session picker dropdown.
+    PanelTargetPicker,
     /// The session composer's permission mode menu, and its overflow
     /// (what a narrow composer folds away).
     Mode,
@@ -447,7 +450,14 @@ pub struct UiState {
     pub sidebar: PaneState,
     pub right: PaneState,
     pub right_open: bool,
-    pub inspector_tab: InspectorTab,
+    /// Target session binding for the Git and Activity panels (follow focus or pinned).
+    pub panel_target: PanelTarget,
+    /// Latest monotonic frame clock (seconds) observed in [`UiState::poll_frame`].
+    pub frame_clock: f64,
+    /// Pending hover-to-focus tile switch `(tile_index, entered_at_secs)` waiting for
+    /// the dwell threshold so rapid mouse transit across middle tiles toward the right
+    /// dock never steals focus.
+    pub hover_focus_pending: Option<(usize, f64)>,
     /// The open dropdown or row menu.
     pub menu: Option<OpenMenu>,
 
@@ -553,10 +563,10 @@ pub struct UiState {
     pub saved_permissions: Vec<SavedPermission>,
     pub shells: Vec<ShellRow>,
     pub worktrees: Vec<WorktreeRow>,
-    /// Whether the Git inspector expanded beyond the initial 12 changed files.
-    pub inspector_git_show_all: bool,
-    /// Pending two-step confirmation key inside the Inspector (discard/remove/stop).
-    pub inspector_confirm: Option<String>,
+    /// First-class Developer Git Workbench panel state.
+    pub git_panel: git_panel::GitPanelState,
+    /// First-class Activity (Queue + Tree + capability-gated extras) panel state.
+    pub activity_panel: activity_panel::ActivityPanelState,
     /// Guards against stale in-flight `Update::Shells` after switching sessions/computers.
     inspector_shells_expect: bool,
     /// Guards against stale in-flight `Update::Worktrees` after switching sessions/computers.
@@ -774,7 +784,9 @@ impl UiState {
                 .range(240.0, panes::UNBOUNDED)
                 .with_width(cfg.ui.right()),
             right_open: false,
-            inspector_tab: InspectorTab::Queue,
+            panel_target: PanelTarget::FollowFocused,
+            frame_clock: 0.0,
+            hover_focus_pending: None,
             menu: None,
             sessions: Vec::new(),
             directories: HashMap::new(),
@@ -846,8 +858,8 @@ impl UiState {
             saved_permissions: Vec::new(),
             shells: Vec::new(),
             worktrees: Vec::new(),
-            inspector_git_show_all: false,
-            inspector_confirm: None,
+            git_panel: git_panel::GitPanelState::default(),
+            activity_panel: activity_panel::ActivityPanelState::default(),
             inspector_shells_expect: true,
             inspector_worktrees_expect: true,
             search: TextEdit::new(""),
@@ -1015,6 +1027,7 @@ impl UiState {
     /// Keep the window waking while the splash is animating.
     /// Every frame Rune asks: the splash and a recording's waveform animate.
     pub fn poll_frame(&mut self, t: f64, tx: &mut Tx) -> bool {
+        self.frame_clock = t;
         if std::mem::take(&mut self.restart_on_frame) {
             tx.quit();
             return true;
@@ -1028,6 +1041,7 @@ impl UiState {
         let term = self.poll_terminal(t, tx);
         let search = self.poll_search(tx);
         let echoes = self.poll_echoes(tx);
+        let hover_focus = self.poll_hover_focus(t, tx);
         self.poll_local_invite(tx)
             | self.poll_splash(t, tx)
             | voice
@@ -1035,7 +1049,30 @@ impl UiState {
             | term
             | search
             | echoes
+            | hover_focus
             | plugins
+    }
+
+    /// Commit a pending hover-to-focus tile switch once the pointer has dwelled
+    /// long enough that it is not merely crossing toward the right dock.
+    pub fn poll_hover_focus(&mut self, t: f64, tx: &mut Tx) -> bool {
+        let Some((tile_idx, since)) = self.hover_focus_pending else {
+            return false;
+        };
+        if !tiles::can_hover_focus_tile(self, tile_idx) {
+            self.hover_focus_pending = None;
+            return false;
+        }
+        let elapsed = (t - since).max(0.0);
+        if elapsed >= tiles::HOVER_FOCUS_DWELL_SECS {
+            self.hover_focus_pending = None;
+            tiles::commit_hovered_tile(self, tile_idx, tx);
+            return true;
+        }
+        tx.wake_after(std::time::Duration::from_secs_f64(
+            (tiles::HOVER_FOCUS_DWELL_SECS - elapsed).max(0.01),
+        ));
+        false
     }
 
     pub fn poll_splash(&mut self, t: f64, _: &mut Tx) -> bool {
@@ -1441,7 +1478,7 @@ impl UiState {
         if prev != id {
             self.waiting_perms.clear();
             self.waiting_forms.clear();
-            self.reset_inspector_session_state();
+            self.reset_panel_session_state(true);
             self.persist_draft(Slot::Session);
             let slot = self.take_slot();
             let default_cwd = if id == "local" {
@@ -1900,7 +1937,7 @@ impl UiState {
             self.diff = None;
             self.diff_active_file = 0;
             self.show_diff = false;
-            self.reset_inspector_session_state();
+            self.reset_panel_session_state(false);
         }
         self.status = format!("Opening {asid}");
         let is_optimistic = asid.starts_with("new-")
@@ -2472,15 +2509,136 @@ impl UiState {
         current
     }
 
-    /// Ask the core for the complete session tree rooted above the current session.
+    /// Ask the core for the complete session tree rooted above the panel target session.
     pub fn refresh_session_tree(&mut self) {
-        let Some(current) = self.selected.clone() else {
+        let Some(current) = self.panel_target_asid().map(str::to_owned) else {
             return;
         };
         let root = self.session_tree_root_id(&current).to_owned();
         self.send(Command::LoadDescendants {
             asid: AgentSessionId(root),
         });
+    }
+
+    /// Target session ID for the Git and Activity panels (respects Pin lock).
+    pub fn panel_target_asid(&self) -> Option<&str> {
+        if let PanelTarget::Pinned(ref pinned) = self.panel_target {
+            if self.session_by_id(pinned).is_some() || self.tile_of(pinned).is_some() {
+                return Some(pinned.as_str());
+            }
+        }
+        self.selected.as_deref()
+    }
+
+    pub fn panel_target_session(&self) -> Option<&AgentSessionInfo> {
+        self.panel_target_asid()
+            .and_then(|asid| self.session_by_id(asid))
+    }
+
+    pub fn panel_target_computer(&self) -> String {
+        self.panel_target_asid()
+            .and_then(|asid| self.computer_of_session(asid))
+            .unwrap_or_else(|| self.current_computer().to_string())
+    }
+
+    pub fn panel_target_is_remote(&self) -> bool {
+        Self::is_remote_computer_id(&self.panel_target_computer())
+    }
+
+    pub fn queue_for_session(&self, asid: &str) -> &[InboxItem] {
+        if self.selected.as_deref() == Some(asid) {
+            return &self.queue;
+        }
+        if let Some(i) = self.tile_of(asid) {
+            return &self.tiles[i].slot.queue;
+        }
+        &[]
+    }
+
+    pub fn panel_target_queue(&self) -> &[InboxItem] {
+        match self.panel_target_asid() {
+            Some(asid) => self.queue_for_session(asid),
+            None => &[],
+        }
+    }
+
+    pub fn toggle_queue_steer_for(&mut self, asid: &str, item_id: &str, next_steer: bool) {
+        if self.selected.as_deref() == Some(asid) {
+            if let Some(item) = self.queue.iter_mut().find(|x| x.id == item_id) {
+                item.steer = next_steer;
+            }
+        } else if let Some(i) = self.tile_of(asid) {
+            if let Some(item) = self.tiles[i]
+                .slot
+                .queue
+                .iter_mut()
+                .find(|x| x.id == item_id)
+            {
+                item.steer = next_steer;
+            }
+        }
+    }
+
+    pub fn remove_queue_item_for(&mut self, asid: &str, item_id: &str) {
+        if self.selected.as_deref() == Some(asid) {
+            self.queue.retain(|x| x.id != item_id);
+        } else if let Some(i) = self.tile_of(asid) {
+            self.tiles[i].slot.queue.retain(|x| x.id != item_id);
+        }
+    }
+
+    /// Every open session tile as `(tile_index, asid, display_title)`.
+    pub fn open_tile_sessions(&self) -> Vec<(usize, String, String)> {
+        let mut out = Vec::new();
+        for (idx, tile) in self.tiles.iter().enumerate() {
+            let Some(asid) = tile.asid.as_deref() else {
+                continue;
+            };
+            let title = self
+                .session_by_id(asid)
+                .map(|i| {
+                    let t = i.title.trim();
+                    if t.is_empty() {
+                        "Untitled session".to_string()
+                    } else {
+                        t.to_string()
+                    }
+                })
+                .unwrap_or_else(|| asid.to_string());
+            out.push((idx, asid.to_string(), title));
+        }
+        if out.is_empty() {
+            if let Some(asid) = self.selected.as_deref() {
+                let title = self
+                    .session_by_id(asid)
+                    .map(|i| i.title.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| asid.to_string());
+                out.push((0, asid.to_string(), title));
+            }
+        }
+        out
+    }
+
+    pub fn set_panel_target(&mut self, target: PanelTarget) {
+        if self.panel_target == target {
+            return;
+        }
+        self.panel_target = target;
+        let asid = self.panel_target_asid().map(str::to_string);
+        self.git_panel.reset_for_session(asid);
+        self.refresh_active_right_panel();
+    }
+
+    pub fn toggle_panel_pin(&mut self) {
+        match &self.panel_target {
+            PanelTarget::Pinned(_) => self.set_panel_target(PanelTarget::FollowFocused),
+            PanelTarget::FollowFocused => {
+                if let Some(asid) = self.selected.clone() {
+                    self.set_panel_target(PanelTarget::Pinned(asid));
+                }
+            }
+        }
     }
 
     /// The catalog loaded for `asid` (focused session or a parked tile), if any.
@@ -2496,95 +2654,173 @@ impl UiState {
         self.catalog.as_deref()
     }
 
-    /// Clear session-scoped inspector state when switching sessions, tiles, or computers.
-    fn reset_inspector_session_state(&mut self) {
+    /// Clear session-scoped panel state when switching sessions, tiles, or computers.
+    /// If the user pinned a specific session and we only switched tiles on the same computer,
+    /// keep the pinned panel state intact.
+    fn reset_panel_session_state(&mut self, force_unpin: bool) {
+        if force_unpin {
+            self.panel_target = PanelTarget::FollowFocused;
+        } else if let PanelTarget::Pinned(ref pinned) = self.panel_target {
+            if self.session_by_id(pinned).is_some() || self.tile_of(pinned).is_some() {
+                return;
+            }
+            self.panel_target = PanelTarget::FollowFocused;
+        }
         self.shells.clear();
         self.worktrees.clear();
-        self.inspector_git_show_all = false;
-        self.inspector_confirm = None;
+        self.git_panel
+            .reset_for_session(self.panel_target_asid().map(str::to_string));
+        self.activity_panel.confirm = None;
         self.inspector_shells_expect = false;
         self.inspector_worktrees_expect = false;
     }
 
-    /// Ask the core for what the inspector's current tab shows.
-    pub fn refresh_inspector(&mut self) {
-        let Some(info) = self.current().cloned() else {
+    pub fn request_git_prs(&mut self, asid: &str, page: u32, refresh: bool) {
+        if asid.is_empty() {
+            return;
+        }
+        self.git_panel.target_asid = Some(asid.to_string());
+        self.git_panel.pr_loading = true;
+        if page <= 1 {
+            self.git_panel.pr_page = 0;
+            if refresh {
+                self.git_panel.prs.clear();
+            }
+        }
+        self.send(Command::VcsLoadPrs {
+            asid: AgentSessionId(asid.to_string()),
+            state: self.git_panel.pr_state.to_string(),
+            author: self.git_panel.pr_author.to_string(),
+            page: page.max(1),
+            limit: git_panel::PRS_LIMIT,
+            refresh,
+        });
+    }
+
+    pub fn request_git_commits(&mut self, asid: &str, offset: usize) {
+        if asid.is_empty() {
+            return;
+        }
+        self.git_panel.target_asid = Some(asid.to_string());
+        self.git_panel.commits_loading = true;
+        self.send(Command::VcsLoadCommits {
+            asid: AgentSessionId(asid.to_string()),
+            offset,
+            limit: git_panel::COMMITS_LIMIT,
+        });
+    }
+
+    /// Refresh the Git Workbench panel for the target session (works local & remote).
+    pub fn refresh_git_panel(&mut self, force_prs: bool) {
+        let Some(info) = self.panel_target_session().cloned() else {
             return;
         };
         let asid = info.asid.clone();
-        let remote = self.is_remote_session();
-        match self.inspector_tab {
-            InspectorTab::Queue => {}
-            InspectorTab::Git => {
-                if let Some(directory) = info.directory.clone() {
-                    self.inspector_worktrees_expect = true;
-                    self.send(Command::LoadWorktrees {
-                        agent: info.agent_id.clone(),
-                        directory: directory.clone(),
-                    });
-                    if !remote {
-                        self.send(Command::Compose(
-                            crate::model::compose::ComposeCommand::Branch { cwd: directory },
-                        ));
-                    }
-                }
-                self.send(Command::RefreshDiff(asid));
+        self.git_panel.reset_for_session(Some(asid.0.clone()));
+        self.git_panel.overview_loading = true;
+        let mode = self.git_panel.diff_mode.as_str().to_string();
+        self.send(Command::VcsLoadOverview {
+            asid: asid.clone(),
+            mode,
+        });
+        if force_prs || (self.git_panel.pr_supported.is_none() && !self.git_panel.pr_loading) {
+            self.request_git_prs(&asid.0, 1, force_prs);
+        }
+        if self.git_panel.commits_open && !self.git_panel.commits_loading {
+            self.request_git_commits(&asid.0, 0);
+        }
+        if let Some(directory) = info.directory.clone() {
+            self.inspector_worktrees_expect = true;
+            self.send(Command::LoadWorktrees {
+                agent: info.agent_id.clone(),
+                directory: directory.clone(),
+            });
+            if !self.panel_target_is_remote() {
+                self.send(Command::Compose(
+                    crate::model::compose::ComposeCommand::Branch { cwd: directory },
+                ));
             }
-            InspectorTab::Subagents => self.refresh_session_tree(),
-            InspectorTab::Saved => self.send(Command::LoadSavedPermissions { asid }),
-            InspectorTab::Shells => {
-                self.inspector_shells_expect = true;
-                self.send(Command::LoadShells {
-                    agent: info.agent_id.clone(),
-                    directory: info.directory.clone(),
-                });
-            }
+        }
+        self.send(Command::RefreshDiff(asid));
+    }
+
+    /// Refresh the Activity panel (Session Tree + capability-gated Saved / Shells).
+    pub fn refresh_activity_panel(&mut self) {
+        let Some(info) = self.panel_target_session().cloned() else {
+            return;
+        };
+        self.refresh_session_tree();
+        if activity_panel::agent_supports_saved_permissions(self) {
+            self.send(Command::LoadSavedPermissions {
+                asid: info.asid.clone(),
+            });
+        }
+        if activity_panel::agent_supports_shells(self) {
+            self.inspector_shells_expect = true;
+            self.send(Command::LoadShells {
+                agent: info.agent_id.clone(),
+                directory: info.directory.clone(),
+            });
         }
     }
 
-    pub fn close_inspector(&mut self) {
-        self.close_plugin_drawer();
-    }
-
-    pub fn toggle_inspector(&mut self) {
-        if self.right_open
-            && self
-                .active_plugin_drawer
-                .as_deref()
-                .is_none_or(|id| id == "inspector")
-        {
-            self.close_inspector();
-        } else {
-            self.open_plugin_drawer("inspector");
+    /// Refresh whichever of Git / Activity is currently visible in the dock, a tile, or page.
+    pub fn refresh_active_right_panel(&mut self) {
+        let git_open = (self.right_open && self.active_plugin_drawer.as_deref() == Some("git"))
+            || self.active_plugin_page.as_deref() == Some("git")
+            || self.tile_of_plugin("git").is_some();
+        let activity_open = (self.right_open
+            && self.active_plugin_drawer.as_deref() == Some("activity"))
+            || self.active_plugin_page.as_deref() == Some("activity")
+            || self.tile_of_plugin("activity").is_some();
+        if git_open {
+            self.refresh_git_panel(false);
+        }
+        if activity_open {
+            self.refresh_activity_panel();
         }
     }
 
-    pub fn open_git_inspector(&mut self) {
-        if !crate::plugin::is_enabled("inspector", &self.cfg.plugins_disabled) {
+    pub fn open_git_panel(&mut self) {
+        if !crate::plugin::is_enabled("git", &self.cfg.plugins_disabled) {
             return;
         }
         if self.mode != Mode::Session && self.selected.is_some() {
             self.go(Mode::Session);
         }
-        self.inspector_tab = InspectorTab::Git;
-        self.open_plugin_drawer("inspector");
+        self.open_plugin_drawer("git");
     }
 
-    pub fn toggle_git_inspector(&mut self) {
+    pub fn toggle_git_panel(&mut self) {
         if self.mode != Mode::Session && self.selected.is_some() {
             self.go(Mode::Session);
         }
+        if self.right_open && self.active_plugin_drawer.as_deref() == Some("git") && !self.term.open
+        {
+            self.close_plugin_drawer();
+        } else {
+            self.open_git_panel();
+        }
+    }
+
+    pub fn open_activity_panel(&mut self) {
+        if !crate::plugin::is_enabled("activity", &self.cfg.plugins_disabled) {
+            return;
+        }
+        if self.mode != Mode::Session && self.selected.is_some() {
+            self.go(Mode::Session);
+        }
+        self.open_plugin_drawer("activity");
+    }
+
+    pub fn toggle_activity_panel(&mut self) {
         if self.right_open
-            && self
-                .active_plugin_drawer
-                .as_deref()
-                .is_none_or(|id| id == "inspector")
-            && self.inspector_tab == InspectorTab::Git
+            && self.active_plugin_drawer.as_deref() == Some("activity")
             && !self.term.open
         {
-            self.close_inspector();
+            self.close_plugin_drawer();
         } else {
-            self.open_git_inspector();
+            self.open_activity_panel();
         }
     }
 
@@ -2633,7 +2869,7 @@ impl UiState {
         }
         self.send(Command::Compose(C::ListPeers));
         if self.right_open {
-            self.refresh_inspector();
+            self.refresh_active_right_panel();
         }
     }
 
@@ -2776,7 +3012,7 @@ impl UiState {
         }
         self.menu = None;
         self.context_open = None;
-        self.reset_inspector_session_state();
+        self.reset_panel_session_state(false);
         self.mode = Mode::Session;
 
         match &self.tiles[i].content {
@@ -2789,7 +3025,7 @@ impl UiState {
                         self.session_opened(&info);
                     }
                 } else if self.right_open {
-                    self.refresh_inspector();
+                    self.refresh_active_right_panel();
                 }
             }
             TileContent::Terminal => {
@@ -3812,6 +4048,57 @@ impl UiState {
                         self.worktrees = rows;
                     }
                 }
+                Update::VcsOverviewLoaded {
+                    asid,
+                    overview,
+                    files,
+                } => {
+                    self.git_panel.apply_overview(&asid, overview, files);
+                }
+                Update::VcsCommitsLoaded {
+                    asid,
+                    append,
+                    result,
+                } => {
+                    self.git_panel.apply_commits(&asid, append, result);
+                }
+                Update::VcsPrsLoaded {
+                    asid,
+                    state,
+                    author,
+                    append,
+                    result,
+                } => {
+                    self.git_panel
+                        .apply_prs(&asid, &state, &author, append, result);
+                }
+                Update::VcsActionResult {
+                    asid,
+                    action,
+                    result,
+                } => {
+                    if self.git_panel.target_asid.as_deref() == Some(asid.as_str()) {
+                        self.git_panel.busy_action = None;
+                    }
+                    let lang = self.cfg.general.language;
+                    match result {
+                        Ok(summary) => {
+                            if matches!(
+                                action.as_str(),
+                                "commit" | "commit_push" | "push" | "pull" | "fetch" | "checkout"
+                            ) {
+                                self.notify(
+                                    ToastLevel::Success,
+                                    copy::tr(lang, "Git"),
+                                    Some(summary),
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            self.notify(ToastLevel::Error, copy::tr(lang, "Git error"), Some(err));
+                        }
+                    }
+                }
                 Update::HubMode(mode) => self.hub_label = mode.to_string(),
                 Update::GatewayUpdate(status) => {
                     let lang = self.cfg.general.language;
@@ -4317,8 +4604,10 @@ impl UiState {
                 self.apply_session_inbox(&asid.0, InboxItem::list(&items), seq);
             }
             AgentDomainEvent::WorktreeChanged { .. } => {
-                if self.right_open && self.inspector_tab == InspectorTab::Git {
-                    self.refresh_inspector();
+                if (self.right_open && self.active_plugin_drawer.as_deref() == Some("git"))
+                    || self.tile_of_plugin("git").is_some()
+                {
+                    self.refresh_git_panel(false);
                 }
             }
             AgentDomainEvent::Resync { asid, .. } => {

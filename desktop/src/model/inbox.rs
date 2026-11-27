@@ -252,6 +252,32 @@ pub enum Update {
     Shells(Vec<crate::hub::ShellRow>),
     /// Worktrees under the open session's project folder.
     Worktrees(Vec<crate::hub::WorktreeRow>),
+    /// Git workbench overview + changed files loaded for `asid`.
+    VcsOverviewLoaded {
+        asid: String,
+        overview: Result<crate::hub::GitRepoOverview, String>,
+        files: Result<crate::hub::GitChangedFiles, String>,
+    },
+    /// One page of recent commits loaded for `asid`.
+    VcsCommitsLoaded {
+        asid: String,
+        append: bool,
+        result: Result<crate::hub::GitCommitsPage, String>,
+    },
+    /// One page of Pull Requests loaded for `asid`.
+    VcsPrsLoaded {
+        asid: String,
+        state: String,
+        author: String,
+        append: bool,
+        result: Result<crate::hub::GitPrsPage, String>,
+    },
+    /// Result of a Git mutation (`commit`, `push`, `pull`, `fetch`, `checkout`, `stage`, `unstage`, `discard`).
+    VcsActionResult {
+        asid: String,
+        action: String,
+        result: Result<String, String>,
+    },
     /// Where this desktop's sessions run, applied by the drain to a binding.
     HubMode(crate::hub::HubMode),
     /// Status of checking or updating the connected Muqun Gateway.

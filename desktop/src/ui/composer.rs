@@ -714,7 +714,69 @@ fn chip_thumb(k: &Kit, images: Option<&ImageCache>, path: &str, key: &str) -> El
         .fill(k.c.layer_02)
 }
 
-/// Thumbnails for queued image attachments (composer chips and the inspector).
+/// Thumbnails for queued image attachments (composer chips and the activity panel),
+/// supporting both local files and cross-computer fetched gateway media.
+pub(super) fn queued_file_thumbs(
+    s: &UiState,
+    k: &Kit,
+    prefix: &str,
+    files: &[&crate::model::compose::QueuedFile],
+) -> Option<El> {
+    if files.is_empty() {
+        return None;
+    }
+    let computer = s.current_computer();
+    let remote = s.is_remote_session();
+    let mut row = row().key(format!("{prefix}-thumbs")).gap(4.0).center_y();
+    for (i, file) in files.iter().take(4).enumerate() {
+        if let Some(resolved) = crate::model::media::resolve_queued_image(computer, remote, file) {
+            let thumb = chip_thumb(
+                k,
+                s.images.as_ref(),
+                &resolved.to_string_lossy(),
+                &format!("{prefix}-thumb-{i}"),
+            );
+            let label = if !file.name.is_empty() {
+                file.name.as_str()
+            } else {
+                "image"
+            };
+            row = row.child(openable_picture(
+                k,
+                thumb,
+                format!("{prefix}-preview-{i}"),
+                label,
+                &resolved,
+            ));
+        } else {
+            row = row.child(
+                col()
+                    .key(format!("{prefix}-thumb-pending-{i}"))
+                    .w(CHIP_THUMB_W)
+                    .h(CHIP_THUMB_H)
+                    .center()
+                    .radius(k.radius.sm)
+                    .fill(k.c.layer_02)
+                    .border(1.0, k.c.border_weak)
+                    .child(
+                        rune::icon(&rune_kit::glyphs::FILE_IMAGE, 12.0)
+                            .color(k.c.icon_muted)
+                            .a11y_hidden(),
+                    ),
+            );
+        }
+    }
+    if files.len() > 4 {
+        row = row.child(
+            Badge::new(format!("+{}", files.len() - 4))
+                .variant(BadgeVariant::Subtle)
+                .build(k),
+        );
+    }
+    Some(row)
+}
+
+/// Thumbnails for queued image attachments from local/echo paths.
 pub(super) fn queue_thumbs(s: &UiState, k: &Kit, prefix: &str, paths: &[&str]) -> Option<El> {
     image_thumbs(s, k, prefix, paths)
 }
@@ -900,19 +962,23 @@ fn queued_chip(
         .radius(k.radius.xl)
         .fill(k.c.surface_raised_base)
         .border(1.0, k.c.border_weak);
-    let mut thumbs: Vec<&str> = item
-        .files
-        .iter()
-        .filter(|f| f.image)
-        .map(|f| f.path.as_str())
-        .collect();
-    if item.files.is_empty() {
-        if let Some(asid) = s.selected.as_deref() {
-            thumbs.extend(s.queue_echo_images(asid, &id).iter().map(String::as_str));
+    let queued_images: Vec<&crate::model::compose::QueuedFile> =
+        item.files.iter().filter(|f| f.image).collect();
+    if !queued_images.is_empty() {
+        if let Some(thumbs) = queued_file_thumbs(s, k, &format!("q-{id}"), &queued_images) {
+            content = content.child(thumbs);
         }
-    }
-    if let Some(thumbs) = queue_thumbs(s, k, &format!("q-{id}"), &thumbs) {
-        content = content.child(thumbs);
+    } else if item.files.is_empty() {
+        if let Some(asid) = s.selected.as_deref() {
+            let echo_thumbs: Vec<&str> = s
+                .queue_echo_images(asid, &id)
+                .iter()
+                .map(String::as_str)
+                .collect();
+            if let Some(thumbs) = queue_thumbs(s, k, &format!("q-{id}"), &echo_thumbs) {
+                content = content.child(thumbs);
+            }
+        }
     }
     let mut chip_row = chip_row.child(content.child(pill.grow(1.0).min_w(0.0)));
     if !item.steer {
@@ -2436,7 +2502,7 @@ pub(super) fn session_footer(
     let language = s.cfg.general.language;
     let busy = asid.is_some_and(|id| s.session_busy(id));
     let show_git_btn = asid.is_some_and(|id| {
-        crate::plugin::is_enabled("inspector", &s.cfg.plugins_disabled)
+        crate::plugin::is_enabled("git", &s.cfg.plugins_disabled)
             && s.session_by_id(id)
                 .and_then(|info| info.directory.as_ref())
                 .and_then(|dir| s.branches.get(dir))
@@ -2493,7 +2559,7 @@ pub(super) fn session_footer(
                 Button::new(git_label)
                     .variant(ButtonVariant::Neutral)
                     .control_size(ControlSize::Small)
-                    .on_press(|s: &mut UiState| s.toggle_git_inspector())
+                    .on_press(|s: &mut UiState| s.toggle_git_panel())
                     .build(k)
                     .key("composer-git")
                     .h(32.0)
@@ -2861,6 +2927,7 @@ mod tests {
                 path: "/uploads/image.png".into(),
                 name: "image.png".into(),
                 image: true,
+                media_url: Some("/api/agent-images/ai_pending/preview".into()),
             }],
         });
         edit_queued(&mut s, "pending", "Look at this image".into());

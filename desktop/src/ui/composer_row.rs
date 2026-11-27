@@ -899,7 +899,7 @@ fn branch_control(
         Button::new(label.to_string())
             .variant(ButtonVariant::Neutral)
             .control_size(ControlSize::Small)
-            .on_press(|s: &mut UiState| s.toggle_git_inspector())
+            .on_press(|s: &mut UiState| s.toggle_git_panel())
             .build(k)
             .key("branch")
             .h(32.0)
@@ -961,12 +961,12 @@ fn more_menu(s: &UiState, c: &Controls, k: &Kit, layer: &mut Vec<El>, f: Fold) -
     }
     if let (true, Some((_, info))) = (f.more_branch, c.branch.as_ref()) {
         menu = section(menu).item(
-            MenuItem::new(c.tr("Git inspector"))
+            MenuItem::new("Git")
                 .lead(icon(&super::icons::BRANCH, GLYPH).color(k.c.icon_muted))
                 .description(info.current.clone().unwrap_or_default())
                 .on_select(|s: &mut UiState| {
                     s.menu = None;
-                    s.toggle_git_inspector();
+                    s.toggle_git_panel();
                 }),
         );
     }

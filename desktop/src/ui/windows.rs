@@ -58,7 +58,10 @@ impl UiState {
                 Mode::Home
             });
         }
-        if id == "inspector" && self.active_plugin_drawer.is_none() && self.right_open {
+        if matches!(id, "git" | "activity" | "inspector")
+            && self.active_plugin_drawer.is_none()
+            && self.right_open
+        {
             self.close_plugin_drawer();
         }
         if self.active_plugin_page.as_deref() == Some(id) {
@@ -147,7 +150,7 @@ impl UiState {
         if self.term.open {
             Some("terminal")
         } else if self.right_open {
-            Some(self.active_plugin_drawer.as_deref().unwrap_or("inspector"))
+            Some(self.active_plugin_drawer.as_deref().unwrap_or("git"))
         } else {
             None
         }
@@ -182,8 +185,10 @@ impl UiState {
                 return;
             }
         }
-        let default = if crate::plugin::is_enabled("inspector", &self.cfg.plugins_disabled) {
-            "inspector"
+        let default = if crate::plugin::is_enabled("git", &self.cfg.plugins_disabled) {
+            "git"
+        } else if crate::plugin::is_enabled("activity", &self.cfg.plugins_disabled) {
+            "activity"
         } else {
             "terminal"
         };
@@ -228,6 +233,11 @@ impl UiState {
 
     /// Open or select one registered plugin in the shared right dock.
     pub fn open_plugin_drawer(&mut self, plugin_id: &str) {
+        let plugin_id = if plugin_id == "inspector" {
+            "git"
+        } else {
+            plugin_id
+        };
         if !self
             .plugins
             .get_enabled(plugin_id, &self.cfg.plugins_disabled)
@@ -258,8 +268,10 @@ impl UiState {
         self.active_plugin_drawer = Some(plugin_id.to_owned());
         self.right_open = true;
         self.right.set_open(true);
-        if plugin_id == "inspector" {
-            self.refresh_inspector();
+        if plugin_id == "git" {
+            self.refresh_git_panel(false);
+        } else if plugin_id == "activity" {
+            self.refresh_activity_panel();
         } else if plugin_id == "sysinfo" {
             self.refresh_runtimes();
         } else if plugin_id == "quicknotes" {
@@ -279,7 +291,7 @@ impl UiState {
         let closing = self
             .active_plugin_drawer
             .take()
-            .unwrap_or_else(|| "inspector".into());
+            .unwrap_or_else(|| "git".into());
         self.quick_notes_edit.focused = false;
         self.right_open = false;
         self.right.set_open(false);
@@ -687,20 +699,20 @@ mod tests {
             s.go(mode);
             assert_eq!(s.mode, mode);
         }
-        s.toggle_inspector();
+        s.toggle_activity_panel();
         assert!(s.right_open);
         s.edit(ConfigEdit::PluginEnabled {
-            plugin: "inspector".into(),
+            plugin: "activity".into(),
             on: false,
         });
         assert!(!s.right_open);
-        s.toggle_inspector();
+        s.toggle_activity_panel();
         assert!(!s.right_open);
         s.edit(ConfigEdit::PluginEnabled {
-            plugin: "inspector".into(),
+            plugin: "activity".into(),
             on: true,
         });
-        s.toggle_inspector();
+        s.toggle_activity_panel();
         assert!(s.right_open);
     }
 
@@ -716,10 +728,10 @@ mod tests {
         assert!(!s.right_open);
         assert!(!s.right.is_open());
         assert!(s.draft.focused);
-        s.toggle_inspector();
+        s.toggle_activity_panel();
         assert!(s.right_open);
-        assert_eq!(s.active_plugin_drawer.as_deref(), Some("inspector"));
-        assert_eq!(s.selected_dock_tab(), Some("inspector"));
+        assert_eq!(s.active_plugin_drawer.as_deref(), Some("activity"));
+        assert_eq!(s.selected_dock_tab(), Some("activity"));
         s.close_plugin_drawer();
         assert!(!s.right_open);
     }

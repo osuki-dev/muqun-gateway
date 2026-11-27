@@ -56,13 +56,17 @@ impl FileHit {
     }
 }
 
-/// One file a queued prompt carries (path for a local thumb, when it is an image).
+/// One file a queued prompt carries (host path for editing/local reads, plus
+/// optional gateway media URL so other computers can fetch and view it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedFile {
     /// Host path (`file://` stripped) or the original URI when that is all we have.
     pub path: String,
     pub name: String,
     pub image: bool,
+    /// Authenticated gateway media route (`/api/agent-images/...` or
+    /// `/api/assets/...`) injected by Gateway `attach_to_inbox`.
+    pub media_url: Option<String>,
 }
 
 /// One queued or steered prompt waiting for the agent (`Session.Inbox.Info`).
@@ -141,20 +145,69 @@ fn host_path(raw: &str) -> String {
         .unwrap_or_else(|| raw.to_string())
 }
 
-fn queued_file(path: String, name: Option<String>, mime: Option<&str>) -> QueuedFile {
+fn gateway_media_route(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("/api/agent-images/") || trimmed.starts_with("/api/assets/") {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+fn asset_media_url(asset: &Value) -> Option<(Option<String>, String)> {
+    if asset
+        .get("unavailable_reason")
+        .is_some_and(|v| !v.is_null())
+    {
+        return None;
+    }
+    let mime = asset.get("mime").and_then(Value::as_str).unwrap_or("");
+    if !mime.starts_with("image/") {
+        return None;
+    }
+    let url = ["preview_url", "url", "src", "thumbnail_url"]
+        .iter()
+        .find_map(|k| {
+            asset
+                .get(*k)
+                .and_then(Value::as_str)
+                .and_then(gateway_media_route)
+        })?;
+    let src = asset.get("src").and_then(Value::as_str).map(str::to_string);
+    Some((src, url))
+}
+
+fn queued_file(
+    path: String,
+    name: Option<String>,
+    mime: Option<&str>,
+    media_url: Option<String>,
+) -> QueuedFile {
     let name = name.unwrap_or_else(|| {
         PathBuf::from(&path)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "attachment".into())
     });
-    let image = mime
-        .map(|m| m.starts_with("image/"))
-        .unwrap_or_else(|| image_name(&name) || image_name(&path));
-    QueuedFile { path, name, image }
+    let media_url = media_url.or_else(|| gateway_media_route(&path));
+    let image = media_url.is_some()
+        || mime
+            .map(|m| m.starts_with("image/"))
+            .unwrap_or_else(|| image_name(&name) || image_name(&path));
+    QueuedFile {
+        path,
+        name,
+        image,
+        media_url,
+    }
 }
 
 fn queued_files(value: &Value) -> Vec<QueuedFile> {
+    let image_assets: Vec<(Option<String>, String)> = value
+        .get("image_assets")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(asset_media_url).collect())
+        .unwrap_or_default();
     let payload_files = value
         .get("payload")
         .and_then(|p| p.get("files"))
@@ -170,7 +223,7 @@ fn queued_files(value: &Value) -> Vec<QueuedFile> {
                         .or_else(|| source?.get("uri")?.as_str())?;
                     let name = obj.get("name").and_then(Value::as_str).map(str::to_string);
                     let mime = obj.get("mime").and_then(Value::as_str);
-                    Some(queued_file(host_path(raw), name, mime))
+                    Some(queued_file(host_path(raw), name, mime, None))
                 })
                 .collect::<Vec<_>>()
         })
@@ -184,10 +237,16 @@ fn queued_files(value: &Value) -> Vec<QueuedFile> {
                 .filter_map(|(i, entry)| match entry {
                     Value::String(uri) => {
                         let hint = payload_files.get(i);
+                        let matched_asset = image_assets
+                            .iter()
+                            .find(|(src, _)| src.as_deref() == Some(uri.as_str()))
+                            .or_else(|| image_assets.get(i))
+                            .map(|(_, url)| url.clone());
                         Some(queued_file(
                             host_path(uri),
                             hint.map(|f| f.name.clone()),
                             None,
+                            matched_asset.or_else(|| gateway_media_route(uri)),
                         ))
                     }
                     Value::Object(obj) => {
@@ -196,7 +255,17 @@ fn queued_files(value: &Value) -> Vec<QueuedFile> {
                             .find_map(|k| obj.get(*k).and_then(Value::as_str))?;
                         let name = obj.get("name").and_then(Value::as_str).map(str::to_string);
                         let mime = obj.get("mime").and_then(Value::as_str);
-                        Some(queued_file(host_path(raw), name, mime))
+                        let matched_asset = image_assets
+                            .iter()
+                            .find(|(src, _)| src.as_deref() == Some(raw))
+                            .or_else(|| image_assets.get(i))
+                            .map(|(_, url)| url.clone());
+                        Some(queued_file(
+                            host_path(raw),
+                            name,
+                            mime,
+                            matched_asset.or_else(|| gateway_media_route(raw)),
+                        ))
                     }
                     _ => None,
                 })
@@ -210,8 +279,17 @@ fn queued_files(value: &Value) -> Vec<QueuedFile> {
             .map(|(i, mut file)| {
                 if let Some(att) = top.get(i) {
                     file.image = file.image || att.image;
+                    if file.media_url.is_none() {
+                        file.media_url = att.media_url.clone();
+                    }
                     if file.name == "attachment" && att.name != "attachment" {
                         file.name = att.name.clone();
+                    }
+                }
+                if file.media_url.is_none() {
+                    if let Some((_, url)) = image_assets.get(i) {
+                        file.media_url = Some(url.clone());
+                        file.image = true;
                     }
                 }
                 file
@@ -1241,6 +1319,39 @@ mod tests {
         );
         assert_eq!(items[0].files[0].name, "1234.png");
         assert!(items[0].files[0].image);
+        assert_eq!(
+            items[0].files[0].media_url.as_deref(),
+            Some("/api/agent-images/ai_abc123/original")
+        );
+
+        let with_assets = InboxItem::list(&[json!({
+            "id": "pic-asset",
+            "delivery": "queue",
+            "payload": {
+                "text": "remote queued image",
+                "files": [{
+                    "uri": "/Users/mac/.local/share/muqun-gateway/uploads/5678.png",
+                    "name": "5678.png",
+                    "mime": "image/png"
+                }]
+            },
+            "attachments": ["/api/agent-images/ai_5678/original"],
+            "image_assets": [{
+                "src": "/api/agent-images/ai_5678/original",
+                "url": "/api/agent-images/ai_5678/original",
+                "preview_url": "/api/agent-images/ai_5678/preview",
+                "thumbnail_url": "/api/agent-images/ai_5678/thumbnail",
+                "mime": "image/png"
+            }]
+        })]);
+        assert_eq!(
+            with_assets[0].files[0].path,
+            "/Users/mac/.local/share/muqun-gateway/uploads/5678.png"
+        );
+        assert_eq!(
+            with_assets[0].files[0].media_url.as_deref(),
+            Some("/api/agent-images/ai_5678/preview")
+        );
     }
 
     #[test]

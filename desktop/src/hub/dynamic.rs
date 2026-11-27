@@ -470,6 +470,100 @@ impl SessionHub for DynamicHub {
         Box::pin(async move { active.vcs_diff(asid).await })
     }
 
+    fn vcs_overview<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+    ) -> HubFuture<'a, super::GitRepoOverview> {
+        let active = self.active();
+        Box::pin(async move { active.vcs_overview(asid).await })
+    }
+
+    fn vcs_files<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        mode: &'a str,
+    ) -> HubFuture<'a, super::GitChangedFiles> {
+        let active = self.active();
+        Box::pin(async move { active.vcs_files(asid, mode).await })
+    }
+
+    fn vcs_stage<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        paths: &'a [String],
+        all: bool,
+    ) -> HubFuture<'a, ()> {
+        let active = self.active();
+        Box::pin(async move { active.vcs_stage(asid, paths, all).await })
+    }
+
+    fn vcs_unstage<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        paths: &'a [String],
+        all: bool,
+    ) -> HubFuture<'a, ()> {
+        let active = self.active();
+        Box::pin(async move { active.vcs_unstage(asid, paths, all).await })
+    }
+
+    fn vcs_discard<'a>(&'a self, asid: &'a AgentSessionId, path: &'a str) -> HubFuture<'a, ()> {
+        let active = self.active();
+        Box::pin(async move { active.vcs_discard(asid, path).await })
+    }
+
+    fn vcs_checkout<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        branch: Option<&'a str>,
+        pr_number: Option<u64>,
+    ) -> HubFuture<'a, String> {
+        let active = self.active();
+        Box::pin(async move { active.vcs_checkout(asid, branch, pr_number).await })
+    }
+
+    fn vcs_commit<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        message: &'a str,
+        stage_all: bool,
+    ) -> HubFuture<'a, String> {
+        let active = self.active();
+        Box::pin(async move { active.vcs_commit(asid, message, stage_all).await })
+    }
+
+    fn vcs_sync<'a>(&'a self, asid: &'a AgentSessionId, action: &'a str) -> HubFuture<'a, String> {
+        let active = self.active();
+        Box::pin(async move { active.vcs_sync(asid, action).await })
+    }
+
+    fn vcs_commits<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        offset: usize,
+        limit: usize,
+    ) -> HubFuture<'a, super::GitCommitsPage> {
+        let active = self.active();
+        Box::pin(async move { active.vcs_commits(asid, offset, limit).await })
+    }
+
+    fn vcs_prs<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        state: &'a str,
+        author: &'a str,
+        page: u32,
+        limit: u32,
+        refresh: bool,
+    ) -> HubFuture<'a, super::GitPrsPage> {
+        let active = self.active();
+        Box::pin(async move {
+            active
+                .vcs_prs(asid, state, author, page, limit, refresh)
+                .await
+        })
+    }
+
     fn view<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
         let active = self.active();
         Box::pin(async move { active.view(asid).await })

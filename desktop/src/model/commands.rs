@@ -227,6 +227,68 @@ pub enum Command {
         agent: String,
         directory: String,
     },
+    /// Load repository overview (branch, ahead/behind, branches, remote, worktrees)
+    /// and changed files (`working` or `branch`) for the target session.
+    VcsLoadOverview {
+        asid: AgentSessionId,
+        mode: String,
+    },
+    /// Stage one or more paths (or all working changes) for a session's repo.
+    VcsStage {
+        asid: AgentSessionId,
+        paths: Vec<String>,
+        all: bool,
+        mode: String,
+    },
+    /// Unstage one or more paths (or all staged changes) for a session's repo.
+    VcsUnstage {
+        asid: AgentSessionId,
+        paths: Vec<String>,
+        all: bool,
+        mode: String,
+    },
+    /// Discard one changed or untracked file via Gateway.
+    VcsDiscard {
+        asid: AgentSessionId,
+        path: String,
+        mode: String,
+    },
+    /// Switch to a branch or check out a Pull Request.
+    VcsCheckout {
+        asid: AgentSessionId,
+        branch: Option<String>,
+        pr_number: Option<u64>,
+        mode: String,
+    },
+    /// Commit staged changes (or stage all then commit), optionally pushing after.
+    VcsCommit {
+        asid: AgentSessionId,
+        message: String,
+        stage_all: bool,
+        push: bool,
+        mode: String,
+    },
+    /// Fetch, pull, or push the session's repository.
+    VcsSync {
+        asid: AgentSessionId,
+        action: String,
+        mode: String,
+    },
+    /// Load one page of recent commits (`offset == 0` replaces, `> 0` appends).
+    VcsLoadCommits {
+        asid: AgentSessionId,
+        offset: usize,
+        limit: usize,
+    },
+    /// Load one page of Pull Requests (`page == 1` replaces, `> 1` appends).
+    VcsLoadPrs {
+        asid: AgentSessionId,
+        state: String,
+        author: String,
+        page: u32,
+        limit: u32,
+        refresh: bool,
+    },
     /// Re-read the delegated task list (and the default folder).
     RefreshTasks,
     CheckDesktopUpdate,

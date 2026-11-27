@@ -549,8 +549,8 @@ impl UiState {
             }
             Act::Split => self.split(),
             Act::Unsplit => self.unsplit(),
-            Act::Inspector => self.toggle_inspector(),
-            Act::Git => self.toggle_git_inspector(),
+            Act::Inspector => self.toggle_activity_panel(),
+            Act::Git => self.toggle_git_panel(),
             Act::Theme(id) => self.send(Command::ThemeApply(id, self.cfg.appearance.scheme)),
             Act::ToggleScheme => self.set_scheme(if self.dark {
                 Scheme::Light

@@ -14,8 +14,8 @@ use rune_kit::{
 
 use super::copy::{tr, tr_ref};
 use super::{
-    art, composer, home, inbox, inspector, sessions, settings, tasks, tiles, timeline, title_of,
-    Activity, OpenMenu,
+    art, composer, home, inbox, sessions, settings, tasks, tiles, timeline, title_of, Activity,
+    OpenMenu,
 };
 use super::{Mode, UiState};
 use crate::branding::{APP_MARK_PNG, APP_NAME};
@@ -238,7 +238,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
         );
     } else if inspector_here {
         right_w = s.right.shown_width();
-        let pid = s.active_plugin_drawer.as_deref().unwrap_or("inspector");
+        let pid = s.active_plugin_drawer.as_deref().unwrap_or("git");
         let ctx = crate::plugin::PluginViewContext {
             s,
             k,
@@ -251,7 +251,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             .plugins
             .get(pid)
             .and_then(|p| crate::plugin::window::render(p.as_ref(), &ctx, layer))
-            .unwrap_or_else(|| inspector::view(s, k, layer));
+            .unwrap_or_else(|| super::git_panel::view(s, k, layer));
         split = split.inspector(
             &s.right,
             super::right_pane,

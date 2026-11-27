@@ -545,7 +545,7 @@ fn mount_which_key(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                     which_key_item(k, "palette", &["k"], tr_ref(language, "Palette")),
                     which_key_item(k, "new-session", &["n"], tr_ref(language, "New session")),
                     which_key_item(k, "sidebar", &["b"], tr_ref(language, "Sidebar")),
-                    which_key_item(k, "inspector", &["i"], tr_ref(language, "Inspector")),
+                    which_key_item(k, "activity", &["i"], tr_ref(language, "Activity")),
                     which_key_item(k, "pages", &["H/I/T/S"], tr_ref(language, "Pages")),
                     which_key_item(k, "help", &["?"], tr_ref(language, "Help")),
                 ],

@@ -8,7 +8,7 @@ use rune::TextEdit;
 use rune_kit::diff::{parse, DiffState};
 use serde_json::json;
 
-use super::{InspectorTab, Mode, SessionSlot, SettingsTab, Tile, UiState};
+use super::{Mode, SessionSlot, SettingsTab, Tile, UiState};
 use crate::hub::TaskRow;
 use crate::model::compose::InboxItem;
 use crate::model::types::{DiffFile, DiffStat};
@@ -430,7 +430,6 @@ fn session_scene(s: &mut UiState) {
     }];
     s.right_open = true;
     s.right.set_open(true);
-    s.inspector_tab = InspectorTab::Queue;
     s.draft = TextEdit::new("");
     s.demo = true;
 }
@@ -440,8 +439,7 @@ fn diff(s: &mut UiState) {
     timeline(s);
     diff_stat(s);
     s.show_diff = true;
-    s.right_open = true;
-    s.inspector_tab = InspectorTab::Git;
+    s.open_git_panel();
     s.git_commit_msg = rune::TextEdit::new("feat: update greeting copy");
     s.demo = true;
 }

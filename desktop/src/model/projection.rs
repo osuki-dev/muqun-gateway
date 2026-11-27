@@ -846,6 +846,185 @@ impl Core {
                     Err(err) => self.fail(err),
                 }
             }
+            Command::VcsLoadOverview { asid, mode } => {
+                self.load_vcs_overview(asid, mode).await;
+            }
+            Command::VcsStage {
+                asid,
+                paths,
+                all,
+                mode,
+            } => {
+                let res = self
+                    .hub
+                    .vcs_stage(&asid, &paths, all)
+                    .await
+                    .map(|()| "Staged changes".to_string())
+                    .map_err(|e| e.to_string());
+                let ok = res.is_ok();
+                self.inbox.push(Update::VcsActionResult {
+                    asid: asid.0.clone(),
+                    action: "stage".into(),
+                    result: res,
+                });
+                if ok {
+                    self.load_vcs_overview(asid.clone(), mode).await;
+                    crate::hub::spawn_connected(self.clone().diff(asid));
+                }
+            }
+            Command::VcsUnstage {
+                asid,
+                paths,
+                all,
+                mode,
+            } => {
+                let res = self
+                    .hub
+                    .vcs_unstage(&asid, &paths, all)
+                    .await
+                    .map(|()| "Unstaged changes".to_string())
+                    .map_err(|e| e.to_string());
+                let ok = res.is_ok();
+                self.inbox.push(Update::VcsActionResult {
+                    asid: asid.0.clone(),
+                    action: "unstage".into(),
+                    result: res,
+                });
+                if ok {
+                    self.load_vcs_overview(asid.clone(), mode).await;
+                    crate::hub::spawn_connected(self.clone().diff(asid));
+                }
+            }
+            Command::VcsDiscard { asid, path, mode } => {
+                let res = self
+                    .hub
+                    .vcs_discard(&asid, &path)
+                    .await
+                    .map(|()| format!("Discarded {path}"))
+                    .map_err(|e| e.to_string());
+                let ok = res.is_ok();
+                self.inbox.push(Update::VcsActionResult {
+                    asid: asid.0.clone(),
+                    action: "discard".into(),
+                    result: res,
+                });
+                if ok {
+                    self.load_vcs_overview(asid.clone(), mode).await;
+                    crate::hub::spawn_connected(self.clone().diff(asid));
+                }
+            }
+            Command::VcsCheckout {
+                asid,
+                branch,
+                pr_number,
+                mode,
+            } => {
+                let res = self
+                    .hub
+                    .vcs_checkout(&asid, branch.as_deref(), pr_number)
+                    .await
+                    .map_err(|e| e.to_string());
+                let ok = res.is_ok();
+                self.inbox.push(Update::VcsActionResult {
+                    asid: asid.0.clone(),
+                    action: "checkout".into(),
+                    result: res,
+                });
+                if ok {
+                    self.load_vcs_overview(asid.clone(), mode).await;
+                    crate::hub::spawn_connected(self.clone().diff(asid));
+                }
+            }
+            Command::VcsCommit {
+                asid,
+                message,
+                stage_all,
+                push,
+                mode,
+            } => {
+                let mut res = self
+                    .hub
+                    .vcs_commit(&asid, &message, stage_all)
+                    .await
+                    .map_err(|e| e.to_string());
+                if res.is_ok() && push {
+                    res = match (res, self.hub.vcs_sync(&asid, "push").await) {
+                        (Ok(summary), Ok(_)) => Ok(format!("{summary} · Pushed")),
+                        (Ok(summary), Err(err)) => {
+                            Err(format!("{summary}, but push failed: {err}"))
+                        }
+                        (Err(e), _) => Err(e),
+                    };
+                }
+                let ok = res.is_ok();
+                self.inbox.push(Update::VcsActionResult {
+                    asid: asid.0.clone(),
+                    action: if push {
+                        "commit_push".into()
+                    } else {
+                        "commit".into()
+                    },
+                    result: res,
+                });
+                if ok {
+                    self.load_vcs_overview(asid.clone(), mode).await;
+                    crate::hub::spawn_connected(self.clone().diff(asid));
+                }
+            }
+            Command::VcsSync { asid, action, mode } => {
+                let res = self
+                    .hub
+                    .vcs_sync(&asid, &action)
+                    .await
+                    .map_err(|e| e.to_string());
+                let ok = res.is_ok();
+                self.inbox.push(Update::VcsActionResult {
+                    asid: asid.0.clone(),
+                    action,
+                    result: res,
+                });
+                if ok {
+                    self.load_vcs_overview(asid.clone(), mode).await;
+                    crate::hub::spawn_connected(self.clone().diff(asid));
+                }
+            }
+            Command::VcsLoadCommits {
+                asid,
+                offset,
+                limit,
+            } => {
+                let result = self
+                    .hub
+                    .vcs_commits(&asid, offset, limit)
+                    .await
+                    .map_err(|e| e.to_string());
+                self.inbox.push(Update::VcsCommitsLoaded {
+                    asid: asid.0,
+                    append: offset > 0,
+                    result,
+                });
+            }
+            Command::VcsLoadPrs {
+                asid,
+                state,
+                author,
+                page,
+                limit,
+                refresh,
+            } => {
+                let result = self
+                    .hub
+                    .vcs_prs(&asid, &state, &author, page, limit, refresh)
+                    .await
+                    .map_err(|e| e.to_string());
+                self.inbox.push(Update::VcsPrsLoaded {
+                    asid: asid.0,
+                    state,
+                    author,
+                    append: page > 1,
+                    result,
+                });
+            }
             Command::Orchestration {
                 computer,
                 ticket,
@@ -1961,6 +2140,31 @@ impl Core {
         }
     }
 
+    async fn load_vcs_overview(&self, asid: AgentSessionId, mode: String) {
+        let (overview_res, files_res) = tokio::join!(
+            tokio::time::timeout(LIST_TIMEOUT, self.hub.vcs_overview(&asid)),
+            tokio::time::timeout(LIST_TIMEOUT, self.hub.vcs_files(&asid, &mode)),
+        );
+        if !self.connection_is_current() {
+            return;
+        }
+        let overview = match overview_res {
+            Ok(Ok(o)) => Ok(o),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("Git overview timed out".into()),
+        };
+        let files = match files_res {
+            Ok(Ok(f)) => Ok(f),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("Git file list timed out".into()),
+        };
+        self.inbox.push(Update::VcsOverviewLoaded {
+            asid: asid.0,
+            overview,
+            files,
+        });
+    }
+
     /// Kick off one `list_sessions` per agent, briefly staggered so a cold
     /// attach storm does not spike the first frames.
     async fn spawn_lists(self: &Arc<Self>, agents: Vec<String>) {
@@ -2077,12 +2281,7 @@ impl Core {
         }
     }
 
-    /// Rows on their way to the UI: slimmed, and any picture only the
-    /// gateway holds fetched into the media cache (the UI redraws when it
-    /// lands).
-    fn ready_rows(&self, items: &mut [muqun_gateway::agents::TimelineItem]) {
-        super::compact::slim(items);
-        let urls = super::media::missing(items);
+    fn fetch_media_urls(&self, urls: Vec<String>) {
         if urls.is_empty() {
             return;
         }
@@ -2112,6 +2311,27 @@ impl Core {
         }
     }
 
+    /// Rows on their way to the UI: slimmed, and any picture only the
+    /// gateway holds fetched into the media cache (the UI redraws when it
+    /// lands).
+    fn ready_rows(&self, items: &mut [muqun_gateway::agents::TimelineItem]) {
+        super::compact::slim(items);
+        let urls = super::media::missing(items);
+        self.fetch_media_urls(urls);
+    }
+
+    /// Fetch remote gateway images carried by queued prompts so thumbnails and
+    /// full-size previews work across computers.
+    fn ready_inbox(&self, items: &[serde_json::Value]) {
+        if items.is_empty() {
+            return;
+        }
+        let parsed = super::compose::InboxItem::list(items);
+        let remote = self.connection.lock().unwrap().computer != "local";
+        let urls = super::media::missing_inbox(&parsed, remote);
+        self.fetch_media_urls(urls);
+    }
+
     /// A session's snapshot to the view, and its waiting prompts to the
     /// composer (the view keeps no inbox).
     fn push_snapshot(&self, mut snapshot: muqun_gateway::agents::ports::AgentSessionSnapshot) {
@@ -2119,6 +2339,7 @@ impl Core {
             return;
         }
         self.ready_rows(&mut snapshot.timeline);
+        self.ready_inbox(&snapshot.inbox);
         self.state()
             .last_seq
             .lock()
@@ -2455,8 +2676,14 @@ impl Core {
                                 .or_insert(event.seq());
                         }
                         let mut event = event;
-                        if let AgentDomainEvent::TimelineUpsert { items, .. } = &mut event {
-                            self.ready_rows(items);
+                        match &mut event {
+                            AgentDomainEvent::TimelineUpsert { items, .. } => {
+                                self.ready_rows(items);
+                            }
+                            AgentDomainEvent::InboxChanged { items, .. } => {
+                                self.ready_inbox(items);
+                            }
+                            _ => {}
                         }
                         self.inbox.push(Update::event(event));
                     }

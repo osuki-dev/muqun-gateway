@@ -47,6 +47,10 @@ const CAPABILITIES_FRESH: Duration = Duration::from_secs(60);
 const SEARCH_CAPABILITY: &str = "session_search_v1";
 /// The capability `/api/mcp/upstreams*` comes with.
 const MCP_HUB_CAPABILITY: &str = "mcp_hub_v1";
+/// The capability `/api/agent-sessions/{asid}/vcs/{overview,stage,unstage,checkout,commit,sync,commits}` comes with.
+const VCS_GIT_OPS_CAPABILITY: &str = "vcs_git_ops_v1";
+/// The capability `/api/agent-sessions/{asid}/vcs/prs` comes with.
+const VCS_PRS_CAPABILITY: &str = "vcs_prs_v1";
 
 fn now_unix_ms() -> u128 {
     std::time::SystemTime::now()
@@ -1489,6 +1493,365 @@ impl SessionHub for RemoteHub {
                     .cloned()
                     .unwrap_or(Value::Array(Vec::new())),
             )
+        })
+    }
+
+    fn vcs_overview<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+    ) -> HubFuture<'a, super::GitRepoOverview> {
+        Box::pin(async move {
+            if !self.has_capability(VCS_GIT_OPS_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Upgrade Gateway for remote Git workbench operations (vcs_git_ops_v1).".into(),
+                )));
+            }
+            let json = self
+                .session_call(Method::GET, asid, &["vcs", "overview"], &[], None)
+                .await?;
+            let data = json.get("data").unwrap_or(&json);
+            let is_repo = data
+                .get("is_repo")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let repo = data.get("repo").and_then(Value::as_object);
+            let local_branches = data
+                .get("local_branches")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let worktrees = data
+                .get("worktrees")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| {
+                            let directory = v
+                                .get("path")
+                                .or_else(|| v.get("directory"))
+                                .and_then(Value::as_str)?
+                                .to_string();
+                            let is_main = v
+                                .get("is_main")
+                                .or_else(|| v.get("isMain"))
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                            let branch =
+                                v.get("branch").and_then(Value::as_str).map(str::to_string);
+                            let strategy = if is_main {
+                                Some("root".to_string())
+                            } else {
+                                branch.or_else(|| Some("worktree".to_string()))
+                            };
+                            Some(WorktreeRow {
+                                directory,
+                                strategy,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(super::GitRepoOverview {
+                is_repo,
+                toplevel: repo
+                    .and_then(|r| r.get("toplevel"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                branch: repo
+                    .and_then(|r| r.get("branch"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                upstream: repo
+                    .and_then(|r| r.get("upstream"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                ahead: repo
+                    .and_then(|r| r.get("ahead"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                behind: repo
+                    .and_then(|r| r.get("behind"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                detached: repo
+                    .and_then(|r| r.get("detached"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                head: repo
+                    .and_then(|r| r.get("head"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                changed_files: repo
+                    .and_then(|r| r.get("changed_files"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize,
+                local_branches,
+                remote_url: data
+                    .get("remote_url")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                remote_host: data
+                    .get("remote_host")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                worktrees,
+            })
+        })
+    }
+
+    fn vcs_files<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        mode: &'a str,
+    ) -> HubFuture<'a, super::GitChangedFiles> {
+        Box::pin(async move {
+            let json = self
+                .session_call(
+                    Method::GET,
+                    asid,
+                    &["vcs", "files"],
+                    &[("mode", mode)],
+                    None,
+                )
+                .await?;
+            let data = json.get("data").unwrap_or(&json);
+            let is_repo = data.get("reason").and_then(Value::as_str) != Some("not_a_repository");
+            let truncated = data
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let files: Vec<super::GitChangedFile> = decode(
+                data.get("files")
+                    .cloned()
+                    .unwrap_or(Value::Array(Vec::new())),
+            )?;
+            Ok(super::GitChangedFiles {
+                mode: mode.to_string(),
+                is_repo,
+                truncated,
+                files,
+            })
+        })
+    }
+
+    fn vcs_stage<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        paths: &'a [String],
+        all: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            if !self.has_capability(VCS_GIT_OPS_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Upgrade Gateway for git stage/unstage (vcs_git_ops_v1).".into(),
+                )));
+            }
+            Self::unit(
+                self.session_call(
+                    Method::POST,
+                    asid,
+                    &["vcs", "stage"],
+                    &[],
+                    Some(json!({ "paths": paths, "all": all })),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn vcs_unstage<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        paths: &'a [String],
+        all: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            if !self.has_capability(VCS_GIT_OPS_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Upgrade Gateway for git stage/unstage (vcs_git_ops_v1).".into(),
+                )));
+            }
+            Self::unit(
+                self.session_call(
+                    Method::POST,
+                    asid,
+                    &["vcs", "unstage"],
+                    &[],
+                    Some(json!({ "paths": paths, "all": all })),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn vcs_discard<'a>(&'a self, asid: &'a AgentSessionId, path: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(
+                    Method::POST,
+                    asid,
+                    &["vcs", "discard"],
+                    &[],
+                    Some(json!({ "path": path })),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn vcs_checkout<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        branch: Option<&'a str>,
+        pr_number: Option<u64>,
+    ) -> HubFuture<'a, String> {
+        Box::pin(async move {
+            if !self.has_capability(VCS_GIT_OPS_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Upgrade Gateway for remote branch checkout (vcs_git_ops_v1).".into(),
+                )));
+            }
+            let json = self
+                .session_call(
+                    Method::POST,
+                    asid,
+                    &["vcs", "checkout"],
+                    &[],
+                    Some(json!({ "branch": branch, "pr_number": pr_number })),
+                )
+                .await?;
+            let data = json.get("data").unwrap_or(&json);
+            Ok(data
+                .get("summary")
+                .or_else(|| data.get("branch"))
+                .and_then(Value::as_str)
+                .unwrap_or("Switched branch")
+                .to_string())
+        })
+    }
+
+    fn vcs_commit<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        message: &'a str,
+        stage_all: bool,
+    ) -> HubFuture<'a, String> {
+        Box::pin(async move {
+            if !self.has_capability(VCS_GIT_OPS_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Upgrade Gateway for remote git commit (vcs_git_ops_v1).".into(),
+                )));
+            }
+            let json = self
+                .session_call(
+                    Method::POST,
+                    asid,
+                    &["vcs", "commit"],
+                    &[],
+                    Some(json!({ "message": message, "stage_all": stage_all })),
+                )
+                .await?;
+            let data = json.get("data").unwrap_or(&json);
+            Ok(data
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("Committed changes")
+                .to_string())
+        })
+    }
+
+    fn vcs_sync<'a>(&'a self, asid: &'a AgentSessionId, action: &'a str) -> HubFuture<'a, String> {
+        Box::pin(async move {
+            if !self.has_capability(VCS_GIT_OPS_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Upgrade Gateway for remote git sync (vcs_git_ops_v1).".into(),
+                )));
+            }
+            let json = self
+                .session_call(
+                    Method::POST,
+                    asid,
+                    &["vcs", "sync"],
+                    &[],
+                    Some(json!({ "action": action })),
+                )
+                .await?;
+            let data = json.get("data").unwrap_or(&json);
+            Ok(data
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("Synced")
+                .to_string())
+        })
+    }
+
+    fn vcs_commits<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        offset: usize,
+        limit: usize,
+    ) -> HubFuture<'a, super::GitCommitsPage> {
+        Box::pin(async move {
+            if !self.has_capability(VCS_GIT_OPS_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Upgrade Gateway for commit history (vcs_git_ops_v1).".into(),
+                )));
+            }
+            let offset_s = offset.to_string();
+            let limit_s = limit.to_string();
+            let json = self
+                .session_call(
+                    Method::GET,
+                    asid,
+                    &["vcs", "commits"],
+                    &[("offset", &offset_s), ("limit", &limit_s)],
+                    None,
+                )
+                .await?;
+            let data = json.get("data").cloned().unwrap_or(json);
+            decode(data)
+        })
+    }
+
+    fn vcs_prs<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        state: &'a str,
+        author: &'a str,
+        page: u32,
+        limit: u32,
+        refresh: bool,
+    ) -> HubFuture<'a, super::GitPrsPage> {
+        Box::pin(async move {
+            if !self.has_capability(VCS_PRS_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Upgrade Gateway for Pull Requests (vcs_prs_v1).".into(),
+                )));
+            }
+            let page_s = page.to_string();
+            let limit_s = limit.to_string();
+            let refresh_s = if refresh { "true" } else { "false" };
+            let json = self
+                .session_call(
+                    Method::GET,
+                    asid,
+                    &["vcs", "prs"],
+                    &[
+                        ("state", state),
+                        ("author", author),
+                        ("page", &page_s),
+                        ("limit", &limit_s),
+                        ("refresh", refresh_s),
+                    ],
+                    None,
+                )
+                .await?;
+            let data = json.get("data").cloned().unwrap_or(json);
+            decode(data)
         })
     }
 
