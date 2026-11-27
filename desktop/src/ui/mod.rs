@@ -208,7 +208,6 @@ pub enum OpenMenu {
     PluginSelect(String),
     PluginTextSelection(String),
     WindowSurface(String),
-    DockActions,
     ViewerImageActions,
     /// The tasks page's computer filter picker.
     TasksComputerPicker,

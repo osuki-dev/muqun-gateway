@@ -86,39 +86,16 @@ impl<'a> PluginViewContext<'a> {
     }
 }
 
-/// Unified Surface Switcher bar rendered on plugin headers so users can seamlessly
-/// switch any plugin between **Tile (Split View) ⇄ Page (Full Screen) ⇄ Drawer (Right Panel)**.
-pub fn surface_switcher(
+/// Append unified window placement items (`Tile` / `Floating window` / `Page` / `Dock`)
+/// with checkmarks into any window's `...` menu.
+pub fn append_surface_items(
+    mut menu: rune_kit::Menu,
     s: &UiState,
-    k: &Kit,
     lang: Language,
     plugin_id: &str,
     active: PluginSlot,
-    layer: &mut Vec<El>,
-) -> El {
-    let menu_id = format!("surface-{plugin_id}-{active:?}");
-    let open = s.menu == Some(crate::ui::OpenMenu::WindowSurface(menu_id.clone()));
-    let Some(kind) = WindowKind::from_slot(active) else {
-        return el();
-    };
-    let label = format!(
-        "{} · {}",
-        tr_ref(lang, "Window"),
-        tr_ref(lang, kind.label())
-    );
-    let mut menu = rune_kit::Menu::new(menu_id.clone())
-        .trigger(
-            crate::ui::icons::header_button(kind.glyph(), label)
-                .expanded(open)
-                .on_press(move |s: &mut UiState| {
-                    s.menu = (!open).then(|| crate::ui::OpenMenu::WindowSurface(menu_id.clone()));
-                })
-                .build(k)
-                .key(format!("surf-menu-{plugin_id}-{active:?}")),
-        )
-        .open(open)
-        .min_width(180.0)
-        .on_close(|s: &mut UiState| s.menu = None);
+    pop_shortcut: Option<String>,
+) -> rune_kit::Menu {
     let is_popped = active == PluginSlot::Tile
         && s.tile_of_plugin(plugin_id)
             .and_then(|i| s.tiles.get(i))
@@ -133,28 +110,100 @@ pub fn surface_switcher(
             continue;
         }
         let pid = plugin_id.to_string();
-        menu = menu.item(
-            rune_kit::MenuItem::new(tr_ref(lang, kind.label()))
-                .checked(active == slot && (slot != PluginSlot::Tile || !is_popped))
-                .on_select(move |s: &mut UiState| {
-                    s.menu = None;
-                    s.switch_plugin_surface(&pid, slot);
-                }),
-        );
+        let mut item = rune_kit::MenuItem::new(tr_ref(lang, kind.label()))
+            .icon(kind.glyph())
+            .checked(active == slot && (slot != PluginSlot::Tile || !is_popped))
+            .on_select(move |s: &mut UiState| {
+                s.menu = None;
+                s.switch_plugin_surface(&pid, slot);
+            });
+        if slot == PluginSlot::Tile && is_popped {
+            if let Some(sc) = pop_shortcut.as_deref().filter(|s| !s.is_empty()) {
+                item = item.shortcut(sc);
+            }
+        }
+        menu = menu.item(item);
         if slot == PluginSlot::Tile {
             let pid_float = plugin_id.to_string();
-            menu = menu.item(
-                rune_kit::MenuItem::new(tr_ref(lang, "Floating window"))
-                    .checked(is_popped)
-                    .on_select(move |s: &mut UiState| {
-                        s.menu = None;
-                        s.open_plugin_float(&pid_float);
-                    }),
-            );
+            let mut float_item = rune_kit::MenuItem::new(tr_ref(lang, "Floating window"))
+                .icon(WindowKind::float_glyph())
+                .checked(is_popped)
+                .on_select(move |s: &mut UiState| {
+                    s.menu = None;
+                    s.open_plugin_float(&pid_float);
+                });
+            if !is_popped {
+                if let Some(sc) = pop_shortcut.as_deref().filter(|s| !s.is_empty()) {
+                    float_item = float_item.shortcut(sc);
+                }
+            }
+            menu = menu.item(float_item);
         }
     }
+    menu
+}
+
+/// Unified trailing window controls rendered on Drawer and Page headers:
+/// an always-visible `...` menu (window placement + plugin/dock actions) followed
+/// by the Close/Restore button. Matches Split Tile and Floating Window headers.
+pub fn window_controls(
+    s: &UiState,
+    k: &Kit,
+    lang: Language,
+    plugin_id: &str,
+    active: PluginSlot,
+    layer: &mut Vec<El>,
+) -> El {
+    let menu_id = format!("window-{plugin_id}-{active:?}");
+    let open = s.menu == Some(crate::ui::OpenMenu::WindowSurface(menu_id.clone()));
+    if WindowKind::from_slot(active).is_none() {
+        return el();
+    }
+    let label = tr_ref(lang, "Actions");
+    let mut menu = rune_kit::Menu::new(menu_id.clone())
+        .trigger(
+            crate::ui::icons::header_button(&crate::ui::icons::MORE, label)
+                .expanded(open)
+                .on_press(move |s: &mut UiState| {
+                    s.menu = (!open).then(|| crate::ui::OpenMenu::WindowSurface(menu_id.clone()));
+                })
+                .build(k)
+                .key(format!("window-menu-{plugin_id}-{active:?}")),
+        )
+        .open(open)
+        .min_width(230.0)
+        .on_close(|s: &mut UiState| s.menu = None);
+
+    menu = append_surface_items(menu, s, lang, plugin_id, active, None);
+
+    if plugin_id != "terminal" {
+        if let Some(plugin) = s.plugins.get(plugin_id) {
+            let cmds = plugin.commands();
+            if !cmds.is_empty() {
+                menu = menu.separator();
+                for cmd in cmds {
+                    let cmd_id = cmd.id;
+                    let p = plugin.clone();
+                    menu = menu.item(
+                        rune_kit::MenuItem::new(cmd.title)
+                            .shortcut(cmd.shortcut.unwrap_or_default())
+                            .on_select(move |s: &mut UiState| {
+                                s.menu = None;
+                                p.on_command(s, cmd_id);
+                            }),
+                    );
+                }
+            }
+        }
+    }
+
+    if active == PluginSlot::Drawer || plugin_id == "terminal" {
+        menu = menu.separator();
+        menu = window::append_dock_action_items(menu, s, plugin_id == "terminal");
+    }
+
     let mut bar = row()
-        .key(format!("surface-switcher-{plugin_id}-{active:?}"))
+        .key(format!("window-controls-bar-{plugin_id}-{active:?}"))
         .gap(4.0)
         .center_y()
         .child(menu.build(k, layer));
@@ -496,20 +545,14 @@ impl DesktopPlugin for TerminalPlugin {
         } else {
             ColorScheme::Light
         };
-        let controls = Some(
-            row()
-                .gap(4.0)
-                .center_y()
-                .child(window::dock_actions(ctx.s, ctx.k, true, layer))
-                .child(surface_switcher(
-                    ctx.s,
-                    ctx.k,
-                    ctx.s.cfg.general.language,
-                    "terminal",
-                    ctx.surface,
-                    layer,
-                )),
-        );
+        let controls = Some(window_controls(
+            ctx.s,
+            ctx.k,
+            ctx.s.cfg.general.language,
+            "terminal",
+            ctx.surface,
+            layer,
+        ));
         Some(terminal_panel::tile_body_with_controls(
             ctx.s, ctx.k, scheme, ctx.scale, layer, None, controls,
         ))

@@ -206,7 +206,7 @@ pub fn view(s: &UiState, cx: &mut Cx<UiState>, k: &Kit, layer: &mut Vec<El>) -> 
             look.surface_alpha(1.0)
         };
         let surface = super::terminal_panel::surface(s, k, scheme).alpha(alpha);
-        let controls = crate::plugin::surface_switcher(
+        let controls = crate::plugin::window_controls(
             s,
             k,
             s.cfg.general.language,

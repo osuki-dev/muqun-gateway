@@ -504,10 +504,33 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
         )
         .open(menu_open)
         .on_close(|s: &mut UiState| s.menu = None);
+    let plugin_id = match content {
+        super::TileContent::Custom { kind, .. } => Some(kind.as_str()),
+        super::TileContent::Diff(_) => Some("diff"),
+        super::TileContent::Terminal => Some("terminal"),
+        _ => None,
+    };
+    let zoomed = s.zoomed_tile == Some(i);
+    let popped = s.tiles.get(i).is_some_and(|t| t.popped);
+    let pop_shortcut = focused.then(|| super::keymap::label(super::keymap::Action::ToggleTilePop));
+
+    let mut has_section = false;
+    if let Some(pid) = plugin_id {
+        menu = crate::plugin::append_surface_items(
+            menu,
+            s,
+            language,
+            pid,
+            crate::plugin::PluginSlot::Tile,
+            pop_shortcut.clone(),
+        );
+        has_section = true;
+    }
+
     // Swap places with a neighbour, as the panes sit.
     let tree = s.tile_layout();
     let chords = super::keymap::labels(super::keymap::Action::SwapPaneToward);
-    for (n, (key, en)) in [
+    let swaps: Vec<_> = [
         (Key::Left, "Swap with the pane on the left"),
         (Key::Right, "Swap with the pane on the right"),
         (Key::Up, "Swap with the pane above"),
@@ -515,8 +538,15 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
     ]
     .into_iter()
     .enumerate()
-    {
-        if let Some(j) = super::dwindle::neighbour(&tree, s.tile_grid, i, &key) {
+    .filter_map(|(n, (key, en))| {
+        super::dwindle::neighbour(&tree, s.tile_grid, i, &key).map(|j| (n, en, j))
+    })
+    .collect();
+    if !swaps.is_empty() {
+        if has_section {
+            menu = menu.separator();
+        }
+        for (n, en, j) in swaps {
             menu = menu.item(
                 MenuItem::new(tr(language, en))
                     .shortcut(if focused {
@@ -527,9 +557,14 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
                     .on_select(move |s: &mut UiState| s.swap_tiles(i, j)),
             );
         }
+        has_section = true;
     }
+
     match content {
         super::TileContent::Session(a) => {
+            if has_section {
+                menu = menu.separator();
+            }
             let a = a.clone();
             let fork_id = a.clone();
             let compact_id = a.clone();
@@ -578,8 +613,12 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
                         }
                     },
                 ));
+            has_section = true;
         }
         super::TileContent::Terminal => {
+            if has_section {
+                menu = menu.separator();
+            }
             menu = menu
                 .item(
                     MenuItem::new(tr(language, "New terminal tab"))
@@ -610,20 +649,6 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
                         }),
                 )
                 .separator()
-                .item(
-                    MenuItem::new(tr(language, "Open as Full-Screen Page")).on_select(
-                        move |s: &mut UiState| {
-                            s.switch_plugin_surface("terminal", crate::plugin::PluginSlot::Page);
-                        },
-                    ),
-                )
-                .item(
-                    MenuItem::new(tr(language, "Move to Right Drawer")).on_select(
-                        move |s: &mut UiState| {
-                            s.switch_plugin_surface("terminal", crate::plugin::PluginSlot::Drawer);
-                        },
-                    ),
-                )
                 .item(MenuItem::new(tr(language, "Show only this one")).on_select(
                     move |s: &mut UiState| {
                         if i < s.tiles.len() {
@@ -638,76 +663,63 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
                         }
                     },
                 ));
+            has_section = true;
         }
         super::TileContent::Custom { kind, .. } => {
-            let kind_page = kind.clone();
-            let kind_drawer = kind.clone();
-            menu = menu
-                .item(
-                    MenuItem::new(tr(language, "Open as Full-Screen Page")).on_select(
-                        move |s: &mut UiState| {
-                            s.switch_plugin_surface(&kind_page, crate::plugin::PluginSlot::Page);
-                        },
-                    ),
-                )
-                .item(
-                    MenuItem::new(tr(language, "Move to Right Drawer")).on_select(
-                        move |s: &mut UiState| {
-                            s.switch_plugin_surface(
-                                &kind_drawer,
-                                crate::plugin::PluginSlot::Drawer,
-                            );
-                        },
-                    ),
-                );
             if let Some(plugin) = s.plugins.get(kind) {
-                for cmd in plugin.commands() {
-                    let cmd_id = cmd.id;
-                    let p = plugin.clone();
-                    menu = menu.item(
-                        MenuItem::new(cmd.title)
-                            .shortcut(cmd.shortcut.unwrap_or_default())
-                            .on_select(move |s: &mut UiState| {
-                                p.on_command(s, cmd_id);
-                            }),
-                    );
+                let cmds = plugin.commands();
+                if !cmds.is_empty() {
+                    if has_section {
+                        menu = menu.separator();
+                    }
+                    for cmd in cmds {
+                        let cmd_id = cmd.id;
+                        let p = plugin.clone();
+                        menu = menu.item(
+                            MenuItem::new(cmd.title)
+                                .shortcut(cmd.shortcut.unwrap_or_default())
+                                .on_select(move |s: &mut UiState| {
+                                    s.menu = None;
+                                    p.on_command(s, cmd_id);
+                                }),
+                        );
+                    }
+                    has_section = true;
                 }
             }
         }
         _ => {}
     }
-    let zoomed = s.zoomed_tile == Some(i);
-    let popped = s.tiles.get(i).is_some_and(|t| t.popped);
-    menu = menu
-        .separator()
-        .item(
-            MenuItem::new(tr(
-                language,
-                if zoomed {
-                    "Restore pane size"
-                } else {
-                    "Maximize pane"
-                },
-            ))
-            .shortcut(if focused {
-                super::keymap::label(super::keymap::Action::ToggleTileZoom)
+    if has_section {
+        menu = menu.separator();
+    }
+    menu = menu.item(
+        MenuItem::new(tr(
+            language,
+            if zoomed {
+                "Restore pane size"
             } else {
-                String::new()
-            })
-            .on_select(move |s: &mut UiState| s.toggle_tile_zoom_at(i)),
-        )
-        .item(
+                "Maximize pane"
+            },
+        ))
+        .shortcut(if focused {
+            super::keymap::label(super::keymap::Action::ToggleTileZoom)
+        } else {
+            String::new()
+        })
+        .on_select(move |s: &mut UiState| s.toggle_tile_zoom_at(i)),
+    );
+    if plugin_id.is_none() {
+        menu = menu.item(
             MenuItem::new(tr(
                 language,
                 if popped { "Dock pane" } else { "Pop out pane" },
             ))
-            .shortcut(if focused {
-                super::keymap::label(super::keymap::Action::ToggleTilePop)
-            } else {
-                String::new()
-            })
+            .shortcut(pop_shortcut.unwrap_or_default())
             .on_select(move |s: &mut UiState| s.toggle_tile_pop_at(i)),
-        )
+        );
+    }
+    menu = menu
         .item(
             MenuItem::new(tr(language, "Cycle tile layout")).on_select(|s: &mut UiState| {
                 s.cycle_tile_layout();
@@ -728,14 +740,8 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
                 .on_select(|s: &mut UiState| s.unsplit()),
         );
     let menu = menu.build(k, layer);
-    let plugin_id = match content {
-        super::TileContent::Custom { kind, .. } => Some(kind.as_str()),
-        super::TileContent::Diff(_) => Some("diff"),
-        super::TileContent::Terminal => Some("terminal"),
-        _ => None,
-    };
-    // Match `plugin::window::chrome` trailing action order:
-    // [contextual window actions] -> [... overflow menu] -> [surface switcher] -> [close].
+    // Unified window header trailing order across Tile, Float, Dock, and Page:
+    // [contextual window actions] -> [... always-visible menu] -> [close].
     if let Some(plugin_id) = plugin_id {
         if let Some(actions) = s
             .plugins
@@ -745,21 +751,7 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
             head = head.child(actions);
         }
     }
-    head = head.child(if menu_open || popped {
-        menu
-    } else {
-        menu.group_opacity(0.0, 1.0)
-    });
-    if let Some(plugin_id) = plugin_id {
-        head = head.child(crate::plugin::surface_switcher(
-            s,
-            k,
-            language,
-            plugin_id,
-            crate::plugin::PluginSlot::Tile,
-            layer,
-        ));
-    }
+    head = head.child(menu);
     head = head.child(
         super::icons::header_button(k.glyph.close, tr_ref(language, "Remove from split view"))
             .shortcut(if focused {
@@ -770,7 +762,7 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
             .on_press(move |s: &mut UiState| s.close_tile(i))
             .build(k)
             .key(format!("tile-close-{i}"))
-            .group_opacity(if focused { 0.7 } else { 0.0 }, 1.0),
+            .group_opacity(if focused || popped { 0.85 } else { 0.55 }, 1.0),
     );
     // The split view has no toolbar: the top-right pane's header carries
     // what it held, adding a pane and toggling the right panel, always in view.

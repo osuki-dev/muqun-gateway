@@ -2087,8 +2087,62 @@ mod tests {
         assert!(rt
             .elements()
             .iter()
-            .any(|e| e.key.as_deref() == Some("surf-menu-sysinfo-Tile")));
+            .any(|e| e.key.as_deref() == Some("tile-menu-btn-0")));
+        assert!(!rt.elements().iter().any(|e| e
+            .key
+            .as_deref()
+            .is_some_and(|k| k.starts_with("surf-menu-"))));
         assert!(rt.state.active_plugin_page.is_none());
+    }
+
+    #[test]
+    fn all_window_surfaces_use_unified_more_menu_without_separate_surface_button() {
+        use rune::{Env, Runtime};
+        // 1. Dock / Drawer plugin window (`sysinfo`).
+        let mut s = state();
+        s.open_plugin_drawer("sysinfo");
+        let mut rt = Runtime::new(s, super::super::view, (1280.0, 800.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        assert!(rt
+            .elements()
+            .iter()
+            .any(|e| e.key.as_deref() == Some("window-menu-sysinfo-Drawer")));
+        assert!(rt
+            .elements()
+            .iter()
+            .any(|e| e.key.as_deref() == Some("surf-close-sysinfo-Drawer")));
+        assert!(!rt.elements().iter().any(|e| e
+            .key
+            .as_deref()
+            .is_some_and(|k| k.starts_with("surf-menu-") || k == "dock-actions-button")));
+
+        // 2. Full-Screen Page plugin window (`sysinfo`).
+        rt.update(|s, _| s.switch_plugin_surface("sysinfo", crate::plugin::PluginSlot::Page));
+        rt.frame(0.0);
+        assert!(rt
+            .elements()
+            .iter()
+            .any(|e| e.key.as_deref() == Some("window-menu-sysinfo-Page")));
+        assert!(rt
+            .elements()
+            .iter()
+            .any(|e| e.key.as_deref() == Some("surf-close-sysinfo-Page")));
+        assert!(!rt.elements().iter().any(|e| e
+            .key
+            .as_deref()
+            .is_some_and(|k| k.starts_with("surf-menu-"))));
+
+        // 3. Split Tile & Floating window (`sysinfo`).
+        rt.update(|s, _| s.switch_plugin_surface("sysinfo", crate::plugin::PluginSlot::Tile));
+        rt.frame(0.0);
+        assert!(rt.elements().iter().any(|e| e
+            .key
+            .as_deref()
+            .is_some_and(|k| k.starts_with("tile-menu-btn-"))));
+        assert!(!rt.elements().iter().any(|e| e
+            .key
+            .as_deref()
+            .is_some_and(|k| k.starts_with("surf-menu-"))));
     }
 
     #[test]

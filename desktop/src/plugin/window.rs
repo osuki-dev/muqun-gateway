@@ -53,6 +53,15 @@ impl WindowKind {
             Self::Dock => &DOCK,
         }
     }
+
+    pub(super) fn float_glyph() -> &'static rune::Icon {
+        static FLOAT: rune::Icon = rune::Icon {
+            name: "window-float",
+            view: 24.0,
+            body: r#"<path d="M5 7h14v11H5zM5 10h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>"#,
+        };
+        &FLOAT
+    }
 }
 
 /// Every window is framed by the host. Plugins return their content only.
@@ -142,31 +151,18 @@ pub(crate) fn dock_tabs(s: &crate::ui::UiState, k: &rune_kit::Kit) -> Option<El>
     )
 }
 
-/// Workspace actions stay reachable from every tab in the right dock.
-pub(crate) fn dock_actions(
+/// Append workspace/terminal actions to the unified `...` window menu.
+pub(crate) fn append_dock_action_items(
+    mut menu: rune_kit::Menu,
     s: &crate::ui::UiState,
-    k: &rune_kit::Kit,
     terminal: bool,
-    layer: &mut Vec<El>,
-) -> El {
-    use crate::ui::{copy::tr_ref, keymap, terminal_panel::TERMINAL_WINDOW, OpenMenu, UiState};
-    use rune_kit::{Menu, MenuItem};
+) -> rune_kit::Menu {
+    use crate::ui::{copy::tr_ref, keymap, terminal_panel::TERMINAL_WINDOW, UiState};
+    use rune_kit::MenuItem;
 
     let lang = s.cfg.general.language;
-    let open = s.menu == Some(OpenMenu::DockActions);
-    let label = tr_ref(lang, "Actions");
-    let trigger = crate::ui::icons::header_button(&crate::ui::icons::MORE, label)
-        .expanded(open)
-        .on_press(move |s: &mut UiState| s.menu = (!open).then_some(OpenMenu::DockActions))
-        .build(k)
-        .key("dock-actions-button");
     let active_comp = s.active_session_computer();
     let is_remote = UiState::is_remote_computer_id(&active_comp);
-    let mut menu = Menu::new("dock-actions")
-        .trigger(trigger)
-        .open(open)
-        .min_width(230.0)
-        .on_close(|s: &mut UiState| s.menu = None);
     if is_remote {
         let host = s.computer_name(&active_comp);
         menu = menu
@@ -247,7 +243,7 @@ pub(crate) fn dock_actions(
                 }),
         );
     }
-    menu.build(k, layer)
+    menu
 }
 
 pub fn chrome(id: &str, ctx: &PluginViewContext<'_>, body: El, layer: &mut Vec<El>) -> El {
@@ -303,10 +299,7 @@ pub fn chrome(id: &str, ctx: &PluginViewContext<'_>, body: El, layer: &mut Vec<E
     {
         controls = controls.child(actions);
     }
-    if ctx.surface == PluginSlot::Drawer {
-        controls = controls.child(dock_actions(ctx.s, ctx.k, false, layer));
-    }
-    controls = controls.child(super::surface_switcher(
+    controls = controls.child(super::window_controls(
         ctx.s,
         ctx.k,
         ctx.s.cfg.general.language,

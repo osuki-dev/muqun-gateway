@@ -2601,8 +2601,7 @@ pub fn view(
                 .shrink()
                 .min_w(0.0)
                 .child(shell_tabs(s, k, false))
-        }))
-        .child(crate::plugin::window::dock_actions(s, k, true, layer));
+        }));
     if s.term.is_prefix_armed() {
         header = header.child(prefix_badge(k, ""));
     }
@@ -2644,7 +2643,7 @@ pub fn view(
         .min_h(0.0)
         .preserve_focus_on_press(true)
         .child(header)
-        .child(el().w_full().h(1.0).fill(k.alpha(k.c.border_weak, 0.35)))
+        .child(el().w_full().h(1.0).fill(k.alpha(k.c.border_weak, 0.25)))
         .child(body)
 }
 
