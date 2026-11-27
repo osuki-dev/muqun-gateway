@@ -96,7 +96,7 @@ pub enum Mode {
     Settings,
 }
 
-/// Which session the right-side Git and Activity panels bind to.
+/// Which session the standalone Git / Activity dock panels bind to.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PanelTarget {
     /// Follow the currently focused tile / selected session.
@@ -104,6 +104,13 @@ pub enum PanelTarget {
     FollowFocused,
     /// Stay locked on one specific session even when hovering/focusing other tiles.
     Pinned(String),
+}
+
+/// Inline side drawer opened directly inside a session window / split tile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TileInlinePanel {
+    Git,
+    Activity,
 }
 
 /// Which composer a submit came from, so the right draft clears on success.
@@ -331,6 +338,8 @@ pub struct Tile {
     pub popped: bool,
     /// Custom floating geometry `[x, y, w, h]` when floating or popped out.
     pub floating_rect: Option<[f32; 4]>,
+    /// Inline Git / Activity side drawer opened inside this tile.
+    pub inline_panel: Option<TileInlinePanel>,
 }
 
 impl Tile {
@@ -554,11 +563,13 @@ pub struct UiState {
     pub task_cwd: Option<String>,
     pub task_goal: TextEdit,
     pub descendants: Vec<AgentSessionInfo>,
+    /// Per-root-session descendants cache so each split tile renders its own Session Tree.
+    pub descendants_by_root: HashMap<String, Vec<AgentSessionInfo>>,
     pub saved_permissions: Vec<SavedPermission>,
     pub shells: Vec<ShellRow>,
     pub worktrees: Vec<WorktreeRow>,
-    /// First-class Developer Git Workbench panel state.
-    pub git_panel: git_panel::GitPanelState,
+    /// Per-session Developer Git Workbench state, keyed by `asid`.
+    pub git_panels: HashMap<String, git_panel::GitPanelState>,
     /// First-class Activity (Queue + Tree + capability-gated extras) panel state.
     pub activity_panel: activity_panel::ActivityPanelState,
     /// Guards against stale in-flight `Update::Shells` after switching sessions/computers.
@@ -847,10 +858,11 @@ impl UiState {
             task_cwd: None,
             task_goal: TextEdit::new(""),
             descendants: Vec::new(),
+            descendants_by_root: HashMap::new(),
             saved_permissions: Vec::new(),
             shells: Vec::new(),
             worktrees: Vec::new(),
-            git_panel: git_panel::GitPanelState::default(),
+            git_panels: HashMap::new(),
             activity_panel: activity_panel::ActivityPanelState::default(),
             inspector_shells_expect: true,
             inspector_worktrees_expect: true,
@@ -2476,15 +2488,87 @@ impl UiState {
         current
     }
 
+    /// Ask the core for the complete session tree rooted above `asid`.
+    pub fn refresh_session_tree_for(&mut self, asid: &str) {
+        if asid.is_empty() {
+            return;
+        }
+        let root = self.session_tree_root_id(asid).to_owned();
+        self.send(Command::LoadDescendants {
+            asid: AgentSessionId(root),
+        });
+    }
+
     /// Ask the core for the complete session tree rooted above the panel target session.
     pub fn refresh_session_tree(&mut self) {
         let Some(current) = self.panel_target_asid().map(str::to_owned) else {
             return;
         };
-        let root = self.session_tree_root_id(&current).to_owned();
-        self.send(Command::LoadDescendants {
-            asid: AgentSessionId(root),
+        self.refresh_session_tree_for(&current);
+    }
+
+    pub fn descendants_for_session(&self, asid: &str) -> &[AgentSessionInfo] {
+        let root = self.session_tree_root_id(asid);
+        if let Some(list) = self.descendants_by_root.get(root) {
+            return list;
+        }
+        if self.selected.as_deref() == Some(asid) {
+            return &self.descendants;
+        }
+        &[]
+    }
+
+    pub fn git_panel_for(&self, asid: &str) -> &git_panel::GitPanelState {
+        static EMPTY: std::sync::OnceLock<git_panel::GitPanelState> = std::sync::OnceLock::new();
+        self.git_panels
+            .get(asid)
+            .unwrap_or_else(|| EMPTY.get_or_init(git_panel::GitPanelState::default))
+    }
+
+    pub fn git_panel_mut(&mut self, asid: &str) -> &mut git_panel::GitPanelState {
+        let entry =
+            self.git_panels
+                .entry(asid.to_string())
+                .or_insert_with(|| git_panel::GitPanelState {
+                    target_asid: Some(asid.to_string()),
+                    ..Default::default()
+                });
+        entry.target_asid = Some(asid.to_string());
+        entry
+    }
+
+    pub fn active_tile_inline_panel(&self) -> Option<TileInlinePanel> {
+        self.tiles.get(self.focus).and_then(|t| t.inline_panel)
+    }
+
+    pub fn set_tile_inline_panel(&mut self, tile_idx: usize, panel: Option<TileInlinePanel>) {
+        if tile_idx >= self.tiles.len() {
+            return;
+        }
+        self.tiles[tile_idx].inline_panel = panel;
+        let asid = self.tiles[tile_idx].asid.clone().or_else(|| {
+            (tile_idx == self.focus)
+                .then(|| self.selected.clone())
+                .flatten()
         });
+        if let (Some(panel), Some(asid)) = (panel, asid) {
+            match panel {
+                TileInlinePanel::Git => self.refresh_git_panel_for(&asid, false),
+                TileInlinePanel::Activity => self.refresh_activity_panel_for(&asid),
+            }
+        }
+    }
+
+    pub fn toggle_tile_inline_panel(&mut self, tile_idx: usize, panel: TileInlinePanel) {
+        if tile_idx >= self.tiles.len() {
+            return;
+        }
+        let next = if self.tiles[tile_idx].inline_panel == Some(panel) {
+            None
+        } else {
+            Some(panel)
+        };
+        self.set_tile_inline_panel(tile_idx, next);
     }
 
     /// Target session ID for the Git and Activity panels (respects Pin lock).
@@ -2592,8 +2676,6 @@ impl UiState {
             return;
         }
         self.panel_target = target;
-        let asid = self.panel_target_asid().map(str::to_string);
-        self.git_panel.reset_for_session(asid);
         self.refresh_active_right_panel();
     }
 
@@ -2622,11 +2704,11 @@ impl UiState {
     }
 
     /// Clear session-scoped panel state when switching sessions, tiles, or computers.
-    /// If the user pinned a specific session and we only switched tiles on the same computer,
-    /// keep the pinned panel state intact.
     fn reset_panel_session_state(&mut self, force_unpin: bool) {
         if force_unpin {
             self.panel_target = PanelTarget::FollowFocused;
+            self.git_panels.clear();
+            self.descendants_by_root.clear();
         } else if let PanelTarget::Pinned(ref pinned) = self.panel_target {
             if self.session_by_id(pinned).is_some() || self.tile_of(pinned).is_some() {
                 return;
@@ -2635,8 +2717,6 @@ impl UiState {
         }
         self.shells.clear();
         self.worktrees.clear();
-        self.git_panel
-            .reset_for_session(self.panel_target_asid().map(str::to_string));
         self.activity_panel.confirm = None;
         self.inspector_shells_expect = false;
         self.inspector_worktrees_expect = false;
@@ -2646,18 +2726,21 @@ impl UiState {
         if asid.is_empty() {
             return;
         }
-        self.git_panel.target_asid = Some(asid.to_string());
-        self.git_panel.pr_loading = true;
-        if page <= 1 {
-            self.git_panel.pr_page = 0;
-            if refresh {
-                self.git_panel.prs.clear();
+        let (state, author) = {
+            let gp = self.git_panel_mut(asid);
+            gp.pr_loading = true;
+            if page <= 1 {
+                gp.pr_page = 0;
+                if refresh {
+                    gp.prs.clear();
+                }
             }
-        }
+            (gp.pr_state.to_string(), gp.pr_author.to_string())
+        };
         self.send(Command::VcsLoadPrs {
             asid: AgentSessionId(asid.to_string()),
-            state: self.git_panel.pr_state.to_string(),
-            author: self.git_panel.pr_author.to_string(),
+            state,
+            author,
             page: page.max(1),
             limit: git_panel::PRS_LIMIT,
             refresh,
@@ -2668,8 +2751,7 @@ impl UiState {
         if asid.is_empty() {
             return;
         }
-        self.git_panel.target_asid = Some(asid.to_string());
-        self.git_panel.commits_loading = true;
+        self.git_panel_mut(asid).commits_loading = true;
         self.send(Command::VcsLoadCommits {
             asid: AgentSessionId(asid.to_string()),
             offset,
@@ -2677,24 +2759,29 @@ impl UiState {
         });
     }
 
-    /// Refresh the Git Workbench panel for the target session (works local & remote).
-    pub fn refresh_git_panel(&mut self, force_prs: bool) {
-        let Some(info) = self.panel_target_session().cloned() else {
+    /// Refresh the Git Workbench state for a specific session `asid`.
+    pub fn refresh_git_panel_for(&mut self, asid: &str, force_prs: bool) {
+        let Some(info) = self.session_by_id(asid).cloned() else {
             return;
         };
-        let asid = info.asid.clone();
-        self.git_panel.reset_for_session(Some(asid.0.clone()));
-        self.git_panel.overview_loading = true;
-        let mode = self.git_panel.diff_mode.as_str().to_string();
+        let (mode, should_load_prs, should_load_commits) = {
+            let gp = self.git_panel_mut(asid);
+            gp.overview_loading = true;
+            (
+                gp.diff_mode.as_str().to_string(),
+                force_prs || (gp.pr_supported.is_none() && !gp.pr_loading),
+                gp.commits_open && !gp.commits_loading,
+            )
+        };
         self.send(Command::VcsLoadOverview {
-            asid: asid.clone(),
+            asid: info.asid.clone(),
             mode,
         });
-        if force_prs || (self.git_panel.pr_supported.is_none() && !self.git_panel.pr_loading) {
-            self.request_git_prs(&asid.0, 1, force_prs);
+        if should_load_prs {
+            self.request_git_prs(asid, 1, force_prs);
         }
-        if self.git_panel.commits_open && !self.git_panel.commits_loading {
-            self.request_git_commits(&asid.0, 0);
+        if should_load_commits {
+            self.request_git_commits(asid, 0);
         }
         if let Some(directory) = info.directory.clone() {
             self.inspector_worktrees_expect = true;
@@ -2702,27 +2789,39 @@ impl UiState {
                 agent: info.agent_id.clone(),
                 directory: directory.clone(),
             });
-            if !self.panel_target_is_remote() {
+            let remote = Self::is_remote_computer_id(
+                &self
+                    .computer_of_session(asid)
+                    .unwrap_or_else(|| self.current_computer().to_string()),
+            );
+            if !remote {
                 self.send(Command::Compose(
                     crate::model::compose::ComposeCommand::Branch { cwd: directory },
                 ));
             }
         }
-        self.send(Command::RefreshDiff(asid));
+        self.send(Command::RefreshDiff(info.asid));
     }
 
-    /// Refresh the Activity panel (Session Tree + capability-gated Saved / Shells).
-    pub fn refresh_activity_panel(&mut self) {
-        let Some(info) = self.panel_target_session().cloned() else {
+    /// Refresh the Git Workbench panel for the target session (works local & remote).
+    pub fn refresh_git_panel(&mut self, force_prs: bool) {
+        if let Some(asid) = self.panel_target_asid().map(str::to_string) {
+            self.refresh_git_panel_for(&asid, force_prs);
+        }
+    }
+
+    /// Refresh the Activity panel state for a specific session `asid`.
+    pub fn refresh_activity_panel_for(&mut self, asid: &str) {
+        let Some(info) = self.session_by_id(asid).cloned() else {
             return;
         };
-        self.refresh_session_tree();
-        if activity_panel::agent_supports_saved_permissions(self) {
+        self.refresh_session_tree_for(asid);
+        if activity_panel::agent_supports_saved_permissions_for(self, asid) {
             self.send(Command::LoadSavedPermissions {
                 asid: info.asid.clone(),
             });
         }
-        if activity_panel::agent_supports_shells(self) {
+        if activity_panel::agent_supports_shells_for(self, asid) {
             self.inspector_shells_expect = true;
             self.send(Command::LoadShells {
                 agent: info.agent_id.clone(),
@@ -2731,8 +2830,34 @@ impl UiState {
         }
     }
 
-    /// Refresh whichever of Git / Activity is currently visible in the dock, a tile, or page.
+    /// Refresh the Activity panel (Session Tree + capability-gated Saved / Shells).
+    pub fn refresh_activity_panel(&mut self) {
+        if let Some(asid) = self.panel_target_asid().map(str::to_string) {
+            self.refresh_activity_panel_for(&asid);
+        }
+    }
+
+    /// Refresh whichever inline or standalone Git / Activity panels are visible.
     pub fn refresh_active_right_panel(&mut self) {
+        let inline_targets: Vec<(String, TileInlinePanel)> = self
+            .tiles
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, tile)| {
+                let panel = tile.inline_panel?;
+                let asid = tile
+                    .asid
+                    .clone()
+                    .or_else(|| (idx == self.focus).then(|| self.selected.clone()).flatten())?;
+                Some((asid, panel))
+            })
+            .collect();
+        for (asid, panel) in inline_targets {
+            match panel {
+                TileInlinePanel::Git => self.refresh_git_panel_for(&asid, false),
+                TileInlinePanel::Activity => self.refresh_activity_panel_for(&asid),
+            }
+        }
         let git_open = (self.right_open && self.active_plugin_drawer.as_deref() == Some("git"))
             || self.active_plugin_page.as_deref() == Some("git")
             || self.tile_of_plugin("git").is_some();
@@ -2752,21 +2877,40 @@ impl UiState {
         if !crate::plugin::is_enabled("git", &self.cfg.plugins_disabled) {
             return;
         }
-        if self.mode != Mode::Session && self.selected.is_some() {
-            self.go(Mode::Session);
+        if self.selected.is_some() {
+            if self.mode != Mode::Session {
+                self.go(Mode::Session);
+            }
+            if self.tiles.is_empty() {
+                self.tiles.push(Tile::default());
+                self.focus = 0;
+            }
+            self.set_tile_inline_panel(self.focus, Some(TileInlinePanel::Git));
+        } else {
+            self.open_plugin_drawer("git");
         }
-        self.open_plugin_drawer("git");
     }
 
     pub fn toggle_git_panel(&mut self) {
-        if self.mode != Mode::Session && self.selected.is_some() {
-            self.go(Mode::Session);
+        if !crate::plugin::is_enabled("git", &self.cfg.plugins_disabled) {
+            return;
         }
-        if self.right_open && self.active_plugin_drawer.as_deref() == Some("git") && !self.term.open
+        if self.selected.is_some() {
+            if self.mode != Mode::Session {
+                self.go(Mode::Session);
+            }
+            if self.tiles.is_empty() {
+                self.tiles.push(Tile::default());
+                self.focus = 0;
+            }
+            self.toggle_tile_inline_panel(self.focus, TileInlinePanel::Git);
+        } else if self.right_open
+            && self.active_plugin_drawer.as_deref() == Some("git")
+            && !self.term.open
         {
             self.close_plugin_drawer();
         } else {
-            self.open_git_panel();
+            self.open_plugin_drawer("git");
         }
     }
 
@@ -2774,20 +2918,40 @@ impl UiState {
         if !crate::plugin::is_enabled("activity", &self.cfg.plugins_disabled) {
             return;
         }
-        if self.mode != Mode::Session && self.selected.is_some() {
-            self.go(Mode::Session);
+        if self.selected.is_some() {
+            if self.mode != Mode::Session {
+                self.go(Mode::Session);
+            }
+            if self.tiles.is_empty() {
+                self.tiles.push(Tile::default());
+                self.focus = 0;
+            }
+            self.set_tile_inline_panel(self.focus, Some(TileInlinePanel::Activity));
+        } else {
+            self.open_plugin_drawer("activity");
         }
-        self.open_plugin_drawer("activity");
     }
 
     pub fn toggle_activity_panel(&mut self) {
-        if self.right_open
+        if !crate::plugin::is_enabled("activity", &self.cfg.plugins_disabled) {
+            return;
+        }
+        if self.selected.is_some() {
+            if self.mode != Mode::Session {
+                self.go(Mode::Session);
+            }
+            if self.tiles.is_empty() {
+                self.tiles.push(Tile::default());
+                self.focus = 0;
+            }
+            self.toggle_tile_inline_panel(self.focus, TileInlinePanel::Activity);
+        } else if self.right_open
             && self.active_plugin_drawer.as_deref() == Some("activity")
             && !self.term.open
         {
             self.close_plugin_drawer();
         } else {
-            self.open_activity_panel();
+            self.open_plugin_drawer("activity");
         }
     }
 
@@ -3968,6 +4132,8 @@ impl UiState {
                     self.tasks_view.history.insert(id, steps);
                 }
                 Update::Descendants { asid, sessions } => {
+                    self.descendants_by_root
+                        .insert(asid.clone(), sessions.clone());
                     for info in &sessions {
                         self.remember_session_lineage(info);
                         self.remember_subagent_context(
@@ -4020,14 +4186,16 @@ impl UiState {
                     overview,
                     files,
                 } => {
-                    self.git_panel.apply_overview(&asid, overview, files);
+                    self.git_panel_mut(&asid)
+                        .apply_overview(&asid, overview, files);
                 }
                 Update::VcsCommitsLoaded {
                     asid,
                     append,
                     result,
                 } => {
-                    self.git_panel.apply_commits(&asid, append, result);
+                    self.git_panel_mut(&asid)
+                        .apply_commits(&asid, append, result);
                 }
                 Update::VcsPrsLoaded {
                     asid,
@@ -4036,7 +4204,7 @@ impl UiState {
                     append,
                     result,
                 } => {
-                    self.git_panel
+                    self.git_panel_mut(&asid)
                         .apply_prs(&asid, &state, &author, append, result);
                 }
                 Update::VcsActionResult {
@@ -4044,8 +4212,8 @@ impl UiState {
                     action,
                     result,
                 } => {
-                    if self.git_panel.target_asid.as_deref() == Some(asid.as_str()) {
-                        self.git_panel.busy_action = None;
+                    if let Some(gp) = self.git_panels.get_mut(&asid) {
+                        gp.busy_action = None;
                     }
                     let lang = self.cfg.general.language;
                     match result {

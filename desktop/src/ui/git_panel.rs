@@ -1,15 +1,11 @@
-//! First-class Developer Git Workbench panel (local & remote unified).
+//! First-class Developer Git Workbench panel (local & remote unified) and
+//! shared per-tile inline drawer chrome.
 //!
-//! Replaces the old nested Git tab inside Inspector with a dedicated top-level
-//! panel offering:
-//! - Target Session Bar (pick any open split tile or Pin to stay locked)
-//! - Single-card non-repo empty state
-//! - Repo & Sync bar: branch switcher, ahead/behind badges, Fetch / Pull / Push, New PR
-//! - Changes card: `Working` / `Branch` toggle, Staged vs Unstaged/Untracked grouping,
-//!   per-file Stage / Unstage / Diff / Discard, paginated file list, and Commit Box
-//! - Pull Requests card: `Open` / `Mine` / `All` filters, 10/page pagination with
-//!   scroll-to-bottom auto-load + explicit Load more, Open & Checkout actions
-//! - Collapsible Recent Commits (10/page) and universal Git Worktrees
+//! Can be rendered either:
+//! - Directly inside a session window / split tile via [`tile_inline_drawer`]
+//!   (bound strictly to that tile's `asid` so every tile has its own independent
+//!   Git / Activity drawer right inside its own window!), or
+//! - Standalone in the Dock / Tile / Page via [`view`].
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -22,7 +18,7 @@ use rune_kit::{
 };
 
 use super::copy::{tr, tr_ref};
-use super::{icons, parts, timeline, Mode, OpenMenu, PanelTarget, UiState};
+use super::{icons, parts, timeline, Mode, OpenMenu, PanelTarget, TileInlinePanel, UiState};
 use crate::hub::{
     GitChangedFile, GitChangedFiles, GitCommitRow, GitCommitsPage, GitPrRow, GitPrsPage,
     GitRepoOverview, WorktreeRow,
@@ -116,22 +112,6 @@ impl Default for GitPanelState {
 }
 
 impl GitPanelState {
-    pub fn reset_for_session(&mut self, asid: Option<String>) {
-        if self.target_asid == asid {
-            return;
-        }
-        let diff_mode = self.diff_mode;
-        let pr_state = self.pr_state;
-        let pr_author = self.pr_author;
-        *self = Self {
-            target_asid: asid,
-            diff_mode,
-            pr_state,
-            pr_author,
-            ..Self::default()
-        };
-    }
-
     pub fn apply_overview(
         &mut self,
         asid: &str,
@@ -310,35 +290,36 @@ pub(crate) fn short_path(path: &str) -> String {
     path.to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn confirm_btn(
     s: &UiState,
     k: &Kit,
+    asid: &str,
     confirm_id: String,
     labels: (&str, &str),
     idle_variant: ButtonVariant,
     key: String,
     on_confirm: impl Fn(&mut UiState) + 'static,
 ) -> El {
-    let armed = s.git_panel.confirm.as_deref() == Some(confirm_id.as_str());
+    let armed = s.git_panel_for(asid).confirm.as_deref() == Some(confirm_id.as_str());
     let label = if armed { labels.1 } else { labels.0 };
     let variant = if armed {
         ButtonVariant::Danger
     } else {
         idle_variant
     };
+    let asid_owned = asid.to_string();
     small_btn(k, label, variant, key, move |s| {
-        if s.git_panel.confirm.as_deref() == Some(confirm_id.as_str()) {
-            s.git_panel.confirm = None;
+        if s.git_panel_for(&asid_owned).confirm.as_deref() == Some(confirm_id.as_str()) {
+            s.git_panel_mut(&asid_owned).confirm = None;
             on_confirm(s);
         } else {
-            s.git_panel.confirm = Some(confirm_id.clone());
+            s.git_panel_mut(&asid_owned).confirm = Some(confirm_id.clone());
         }
     })
 }
 
-/// Shared 30px Target Session Bar mounted at the top of both Git and Activity panels.
-/// Lets the user inspect any open split tile or Pin a session so moving across tiles
-/// never shifts the panel away from the target session.
+/// Shared 30px Target Session Bar used only in standalone Dock/Tile/Page views.
 pub(crate) fn target_session_bar(
     s: &UiState,
     k: &Kit,
@@ -529,6 +510,104 @@ fn filter_pill(
     k.interactive(b).on_press(on_press)
 }
 
+/// Inline drawer rendered directly inside a session window or split tile, right beside
+/// that tile's chat timeline and composer. Keeps each tile's Git / Activity strictly
+/// scoped to that tile with zero cross-tile focus interference.
+pub(crate) fn tile_inline_drawer(
+    s: &UiState,
+    k: &Kit,
+    layer: &mut Vec<El>,
+    tile_idx: usize,
+    asid: &str,
+    panel: TileInlinePanel,
+    width: f32,
+) -> El {
+    let language = s.cfg.general.language;
+    let t = |en: &'static str| tr_ref(language, en);
+    let git_count = {
+        let gp = s.git_panel_for(asid);
+        if !gp.files.files.is_empty() {
+            gp.files.files.len()
+        } else if s.selected.as_deref() == Some(asid) {
+            s.diff_stat.files
+        } else {
+            0
+        }
+    };
+    let act_count = super::activity_panel::badge_count_for(s, asid);
+
+    let git_label = if git_count > 0 {
+        format!("Git ({git_count})")
+    } else {
+        "Git".to_string()
+    };
+    let act_label = if act_count > 0 {
+        format!("{} ({act_count})", t("Activity"))
+    } else {
+        t("Activity").to_string()
+    };
+
+    let header = row()
+        .key(format!("tile-inline-header-{tile_idx}"))
+        .w_full()
+        .h(34.0)
+        .px(10.0)
+        .gap(6.0)
+        .center_y()
+        .child(filter_pill(
+            k,
+            &git_label,
+            panel == TileInlinePanel::Git,
+            format!("tile-inline-tab-git-{tile_idx}"),
+            move |s| s.set_tile_inline_panel(tile_idx, Some(TileInlinePanel::Git)),
+        ))
+        .child(filter_pill(
+            k,
+            &act_label,
+            panel == TileInlinePanel::Activity,
+            format!("tile-inline-tab-activity-{tile_idx}"),
+            move |s| s.set_tile_inline_panel(tile_idx, Some(TileInlinePanel::Activity)),
+        ))
+        .child(el().grow(1.0))
+        .child(
+            IconButton::new(k.glyph.close)
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .label(t("Close"))
+                .help(t("Close"))
+                .on_press(move |s: &mut UiState| s.set_tile_inline_panel(tile_idx, None))
+                .build(k)
+                .key(format!("tile-inline-close-{tile_idx}")),
+        );
+
+    let content = match panel {
+        TileInlinePanel::Git => view_for_session(s, k, layer, asid, true),
+        TileInlinePanel::Activity => {
+            super::activity_panel::view_for_session(s, k, layer, asid, true)
+        }
+    };
+
+    row()
+        .key(format!("tile-inline-drawer-{tile_idx}"))
+        .h_full()
+        .min_h(0.0)
+        .w(width)
+        .min_w(240.0)
+        .shrink()
+        .child(el().w(1.0).h_full().fill(k.c.border_muted).a11y_hidden())
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .h_full()
+                .min_h(0.0)
+                .fill(k.c.bg_base.alpha(0.32))
+                .child(header)
+                .child(el().w_full().h(1.0).fill(k.c.border_muted).a11y_hidden())
+                .child(content.grow(1.0).min_h(0.0)),
+        )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn branch_switcher_dropdown(
     s: &UiState,
@@ -546,7 +625,7 @@ fn branch_switcher_dropdown(
     let chevron = if open { "▴" } else { "▾" };
 
     let mut trigger = row()
-        .key("git-branch-switcher-trigger")
+        .key(format!("git-branch-switcher-trigger-{asid}"))
         .w_full()
         .h(30.0)
         .px(10.0)
@@ -587,7 +666,7 @@ fn branch_switcher_dropdown(
         .on_press(move |s: &mut UiState| {
             s.menu = (!open).then_some(OpenMenu::GitBranch);
         });
-    let mut menu = Menu::new("git-branch-switcher")
+    let mut menu = Menu::new(format!("git-branch-switcher-{asid}"))
         .trigger(trigger)
         .open(open)
         .min_width(220.0)
@@ -604,8 +683,11 @@ fn branch_switcher_dropdown(
                     return;
                 }
                 if use_gateway_vcs && !asid_owned.is_empty() {
-                    s.git_panel.busy_action = Some("checkout".into());
-                    let mode = s.git_panel.diff_mode.as_str().to_string();
+                    let mode = {
+                        let gp = s.git_panel_mut(&asid_owned);
+                        gp.busy_action = Some("checkout".into());
+                        gp.diff_mode.as_str().to_string()
+                    };
                     s.send(Command::VcsCheckout {
                         asid: AgentSessionId(asid_owned.clone()),
                         branch: Some(target_branch.clone()),
@@ -663,9 +745,14 @@ fn file_row_view(
         k,
         t("Diff"),
         ButtonVariant::Outline,
-        format!("git-diff-{staged_group}-{idx}"),
+        format!("git-diff-{asid}-{staged_group}-{idx}"),
         move |s| {
             if !asid_for_diff.is_empty() {
+                if s.selected.as_deref() != Some(asid_for_diff.as_str()) {
+                    if let Some(tile_idx) = s.tile_of(&asid_for_diff) {
+                        s.focus_tile(tile_idx);
+                    }
+                }
                 s.send(Command::OpenDiff {
                     asid: AgentSessionId(asid_for_diff.clone()),
                     file: Some(path_for_diff.clone()),
@@ -685,9 +772,9 @@ fn file_row_view(
                 k,
                 "−",
                 ButtonVariant::GhostMuted,
-                format!("git-unstage-{idx}"),
+                format!("git-unstage-{asid}-{idx}"),
                 move |s| {
-                    let mode = s.git_panel.diff_mode.as_str().to_string();
+                    let mode = s.git_panel_for(&a).diff_mode.as_str().to_string();
                     s.send(Command::VcsUnstage {
                         asid: AgentSessionId(a.clone()),
                         paths: vec![p.clone()],
@@ -701,9 +788,9 @@ fn file_row_view(
                 k,
                 "+",
                 ButtonVariant::GhostMuted,
-                format!("git-stage-{idx}"),
+                format!("git-stage-{asid}-{idx}"),
                 move |s| {
-                    let mode = s.git_panel.diff_mode.as_str().to_string();
+                    let mode = s.git_panel_for(&a).diff_mode.as_str().to_string();
                     s.send(Command::VcsStage {
                         asid: AgentSessionId(a.clone()),
                         paths: vec![p.clone()],
@@ -722,12 +809,13 @@ fn file_row_view(
         actions = actions.child(confirm_btn(
             s,
             k,
+            asid,
             confirm_key,
             (t("Discard"), t("Confirm")),
             ButtonVariant::GhostMuted,
-            format!("git-discard-{idx}"),
+            format!("git-discard-{asid}-{idx}"),
             move |s| {
-                let mode = s.git_panel.diff_mode.as_str().to_string();
+                let mode = s.git_panel_for(&a).diff_mode.as_str().to_string();
                 s.send(Command::VcsDiscard {
                     asid: AgentSessionId(a.clone()),
                     path: p.clone(),
@@ -768,7 +856,7 @@ fn file_row_view(
     }
 
     row()
-        .key(format!("gf-{staged_group}-{}", file.path))
+        .key(format!("gf-{asid}-{staged_group}-{}", file.path))
         .w_full()
         .gap(8.0)
         .center_y()
@@ -794,19 +882,19 @@ fn file_row_view(
         .child(actions)
 }
 
-fn commit_changes(s: &mut UiState, push: bool, stage_all: bool) {
+fn commit_changes(s: &mut UiState, asid: &str, push: bool, stage_all: bool) {
     let msg = s.git_commit_msg.text.trim().to_string();
-    if msg.is_empty() {
+    if msg.is_empty() || asid.is_empty() {
         return;
     }
-    let Some(asid) = s.panel_target_asid().map(str::to_string) else {
-        return;
-    };
     s.git_commit_msg.clear();
-    s.git_panel.busy_action = Some(if push { "commit_push" } else { "commit" }.into());
-    let mode = s.git_panel.diff_mode.as_str().to_string();
+    let mode = {
+        let gp = s.git_panel_mut(asid);
+        gp.busy_action = Some(if push { "commit_push" } else { "commit" }.into());
+        gp.diff_mode.as_str().to_string()
+    };
     s.send(Command::VcsCommit {
-        asid: AgentSessionId(asid),
+        asid: AgentSessionId(asid.to_string()),
         message: msg,
         stage_all,
         push,
@@ -817,7 +905,7 @@ fn commit_changes(s: &mut UiState, push: bool, stage_all: bool) {
 fn pull_requests_card(s: &UiState, k: &Kit, asid: &str, repo_url: Option<&str>) -> El {
     let language = s.cfg.general.language;
     let t = |en: &'static str| tr_ref(language, en);
-    let gp = &s.git_panel;
+    let gp = s.git_panel_for(asid);
 
     let mut trailing = Vec::new();
     if let Some(url) = gp.pr_repo_url.as_deref().or(repo_url) {
@@ -829,7 +917,7 @@ fn pull_requests_card(s: &UiState, k: &Kit, asid: &str, repo_url: Option<&str>) 
                 k,
                 t("New PR"),
                 ButtonVariant::Outline,
-                "git-prs-new".into(),
+                format!("git-prs-new-{asid}"),
                 move |_| crate::platform::shell::open_url(&pr_url),
             ));
         }
@@ -845,14 +933,14 @@ fn pull_requests_card(s: &UiState, k: &Kit, asid: &str, repo_url: Option<&str>) 
                 s.request_git_prs(&refresh_asid, 1, true);
             })
             .build(k)
-            .key("git-prs-refresh"),
+            .key(format!("git-prs-refresh-{asid}")),
     );
 
     let asid_open = asid.to_string();
     let asid_mine = asid.to_string();
     let asid_all = asid.to_string();
     let filter_bar = row()
-        .key("git-prs-filters")
+        .key(format!("git-prs-filters-{asid}"))
         .w_full()
         .gap(4.0)
         .center_y()
@@ -860,10 +948,11 @@ fn pull_requests_card(s: &UiState, k: &Kit, asid: &str, repo_url: Option<&str>) 
             k,
             t("Open"),
             gp.pr_state == "open" && gp.pr_author == "all",
-            "pr-filter-open".into(),
+            format!("pr-filter-open-{asid}"),
             move |s| {
-                s.git_panel.pr_state = "open";
-                s.git_panel.pr_author = "all";
+                let gp = s.git_panel_mut(&asid_open);
+                gp.pr_state = "open";
+                gp.pr_author = "all";
                 s.request_git_prs(&asid_open, 1, false);
             },
         ))
@@ -871,10 +960,11 @@ fn pull_requests_card(s: &UiState, k: &Kit, asid: &str, repo_url: Option<&str>) 
             k,
             t("Mine"),
             gp.pr_author == "me",
-            "pr-filter-mine".into(),
+            format!("pr-filter-mine-{asid}"),
             move |s| {
-                s.git_panel.pr_state = "open";
-                s.git_panel.pr_author = "me";
+                let gp = s.git_panel_mut(&asid_mine);
+                gp.pr_state = "open";
+                gp.pr_author = "me";
                 s.request_git_prs(&asid_mine, 1, false);
             },
         ))
@@ -882,10 +972,11 @@ fn pull_requests_card(s: &UiState, k: &Kit, asid: &str, repo_url: Option<&str>) 
             k,
             t("All"),
             gp.pr_state == "all" && gp.pr_author == "all",
-            "pr-filter-all".into(),
+            format!("pr-filter-all-{asid}"),
             move |s| {
-                s.git_panel.pr_state = "all";
-                s.git_panel.pr_author = "all";
+                let gp = s.git_panel_mut(&asid_all);
+                gp.pr_state = "all";
+                gp.pr_author = "all";
                 s.request_git_prs(&asid_all, 1, false);
             },
         ));
@@ -911,7 +1002,7 @@ fn pull_requests_card(s: &UiState, k: &Kit, asid: &str, repo_url: Option<&str>) 
                 k,
                 t("Open PRs in browser"),
                 ButtonVariant::Outline,
-                "git-prs-open-web".into(),
+                format!("git-prs-open-web-{asid}"),
                 move |_| crate::platform::shell::open_url(&prs_url),
             )));
         }
@@ -966,17 +1057,20 @@ fn pull_requests_card(s: &UiState, k: &Kit, asid: &str, repo_url: Option<&str>) 
                     k,
                     t("Open"),
                     ButtonVariant::GhostMuted,
-                    format!("pr-open-{}", pr.number),
+                    format!("pr-open-{asid}-{}", pr.number),
                     move |_| crate::platform::shell::open_url(&open_url),
                 ))
                 .child(small_btn(
                     k,
                     t("Checkout"),
                     ButtonVariant::Outline,
-                    format!("pr-co-{}", pr.number),
+                    format!("pr-co-{asid}-{}", pr.number),
                     move |s| {
-                        s.git_panel.busy_action = Some("checkout".into());
-                        let mode = s.git_panel.diff_mode.as_str().to_string();
+                        let mode = {
+                            let gp = s.git_panel_mut(&checkout_asid);
+                            gp.busy_action = Some("checkout".into());
+                            gp.diff_mode.as_str().to_string()
+                        };
                         s.send(Command::VcsCheckout {
                             asid: AgentSessionId(checkout_asid.clone()),
                             branch: None,
@@ -993,7 +1087,7 @@ fn pull_requests_card(s: &UiState, k: &Kit, asid: &str, repo_url: Option<&str>) 
             if !pr.author.is_empty() {
                 meta_parts.push(format!("@{}", pr.author));
             }
-            let card = sub_card(k, format!("pr-{}", pr.number))
+            let card = sub_card(k, format!("pr-{asid}-{}", pr.number))
                 .child(top_row)
                 .child(
                     text(pr.title.clone())
@@ -1031,7 +1125,7 @@ fn pull_requests_card(s: &UiState, k: &Kit, asid: &str, repo_url: Option<&str>) 
                         s.request_git_prs(&more_asid, next_page, false);
                     })
                     .build(k)
-                    .key("git-prs-load-more")
+                    .key(format!("git-prs-load-more-{asid}"))
                     .w_full(),
             );
         }
@@ -1046,7 +1140,7 @@ fn pull_requests_card(s: &UiState, k: &Kit, asid: &str, repo_url: Option<&str>) 
     });
     section_card(
         k,
-        "git-prs-card",
+        format!("git-prs-card-{asid}"),
         &icons::FORK,
         t("Pull Requests"),
         badge,
@@ -1058,18 +1152,21 @@ fn pull_requests_card(s: &UiState, k: &Kit, asid: &str, repo_url: Option<&str>) 
 fn commits_card(s: &UiState, k: &Kit, asid: &str) -> El {
     let language = s.cfg.general.language;
     let t = |en: &'static str| tr_ref(language, en);
-    let gp = &s.git_panel;
+    let gp = s.git_panel_for(asid);
     let open = gp.commits_open;
     let toggle_asid = asid.to_string();
     let toggle_btn = small_btn(
         k,
         if open { t("Hide") } else { t("Show") },
         ButtonVariant::GhostMuted,
-        "git-commits-toggle".into(),
+        format!("git-commits-toggle-{asid}"),
         move |s| {
-            let next = !s.git_panel.commits_open;
-            s.git_panel.commits_open = next;
-            if next && s.git_panel.commits.is_empty() && !s.git_panel.commits_loading {
+            let should_load = {
+                let gp = s.git_panel_mut(&toggle_asid);
+                gp.commits_open = !gp.commits_open;
+                gp.commits_open && gp.commits.is_empty() && !gp.commits_loading
+            };
+            if should_load {
                 s.request_git_commits(&toggle_asid, 0);
             }
         },
@@ -1098,7 +1195,7 @@ fn commits_card(s: &UiState, k: &Kit, asid: &str) -> El {
                     format!("{} · {rel}", c.author)
                 };
                 body.push(
-                    sub_card(k, format!("commit-{}", c.hash))
+                    sub_card(k, format!("commit-{asid}-{}", c.hash))
                         .child(
                             row()
                                 .w_full()
@@ -1138,7 +1235,7 @@ fn commits_card(s: &UiState, k: &Kit, asid: &str) -> El {
                         s.request_git_commits(&more_asid, next_offset);
                     })
                     .build(k)
-                    .key("git-commits-more")
+                    .key(format!("git-commits-more-{asid}"))
                     .w_full(),
                 );
             }
@@ -1147,7 +1244,7 @@ fn commits_card(s: &UiState, k: &Kit, asid: &str) -> El {
 
     section_card(
         k,
-        "git-commits-card",
+        format!("git-commits-card-{asid}"),
         &parts::glyphs::TIME,
         t("Recent Commits"),
         (!gp.commits.is_empty()).then(|| gp.commits.len().to_string()),
@@ -1156,17 +1253,26 @@ fn commits_card(s: &UiState, k: &Kit, asid: &str) -> El {
     )
 }
 
-fn worktrees_card(s: &UiState, k: &Kit, worktrees: &[WorktreeRow], agent: &str, dir: &str) -> El {
+fn worktrees_card(
+    s: &UiState,
+    k: &Kit,
+    asid: &str,
+    worktrees: &[WorktreeRow],
+    agent: &str,
+    dir: &str,
+) -> El {
     let language = s.cfg.general.language;
     let t = |en: &'static str| tr_ref(language, en);
-    let open = s.git_panel.worktrees_open;
+    let open = s.git_panel_for(asid).worktrees_open;
+    let toggle_asid = asid.to_string();
     let toggle_btn = small_btn(
         k,
         if open { t("Hide") } else { t("Show") },
         ButtonVariant::GhostMuted,
-        "git-wt-toggle".into(),
+        format!("git-wt-toggle-{asid}"),
         move |s| {
-            s.git_panel.worktrees_open = !s.git_panel.worktrees_open;
+            let gp = s.git_panel_mut(&toggle_asid);
+            gp.worktrees_open = !gp.worktrees_open;
         },
     );
 
@@ -1185,7 +1291,7 @@ fn worktrees_card(s: &UiState, k: &Kit, worktrees: &[WorktreeRow], agent: &str, 
                     k,
                     t("Terminal"),
                     ButtonVariant::Outline,
-                    format!("term-wt-{}", w.directory),
+                    format!("term-wt-{asid}-{}", w.directory),
                     move |s| {
                         s.term_new_tab_in(dir_path.clone(), None);
                     },
@@ -1197,10 +1303,11 @@ fn worktrees_card(s: &UiState, k: &Kit, worktrees: &[WorktreeRow], agent: &str, 
                     actions = actions.child(confirm_btn(
                         s,
                         k,
+                        asid,
                         confirm_key,
                         (t("Remove"), t("Confirm")),
                         ButtonVariant::GhostMuted,
-                        format!("rmw-{}", w.directory),
+                        format!("rmw-{asid}-{}", w.directory),
                         move |s| {
                             s.worktrees.retain(|x| x.directory != worktree);
                             s.send(Command::RemoveWorktree {
@@ -1217,7 +1324,7 @@ fn worktrees_card(s: &UiState, k: &Kit, worktrees: &[WorktreeRow], agent: &str, 
                     .filter(|st| !st.is_empty())
                     .unwrap_or_else(|| tr(language, "root"));
                 body.push(
-                    sub_card(k, format!("wt-{}", w.directory))
+                    sub_card(k, format!("wt-{asid}-{}", w.directory))
                         .child(
                             row()
                                 .w_full()
@@ -1241,7 +1348,7 @@ fn worktrees_card(s: &UiState, k: &Kit, worktrees: &[WorktreeRow], agent: &str, 
     let linked_count = worktrees.iter().filter(|w| !w.is_root()).count();
     section_card(
         k,
-        "git-worktrees-card",
+        format!("git-worktrees-card-{asid}"),
         &icons::BRANCH,
         t("Worktrees"),
         (linked_count > 0).then(|| linked_count.to_string()),
@@ -1250,16 +1357,26 @@ fn worktrees_card(s: &UiState, k: &Kit, worktrees: &[WorktreeRow], agent: &str, 
     )
 }
 
-/// Render the top-level Git Workbench panel.
-pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+/// Render the Git Workbench for a specific session `asid`.
+/// When `inline == true`, renders without the Target Session Bar (used inside a tile drawer).
+pub(crate) fn view_for_session(
+    s: &UiState,
+    k: &Kit,
+    layer: &mut Vec<El>,
+    asid: &str,
+    inline: bool,
+) -> El {
     let language = s.cfg.general.language;
     let t = |en: &'static str| tr_ref(language, en);
-    let info = s.panel_target_session();
-    let asid = s.panel_target_asid().unwrap_or_default().to_string();
+    let info = (!asid.is_empty()).then(|| s.session_by_id(asid)).flatten();
     let cwd = info.and_then(|i| i.directory.clone());
     let agent_id = info.map(|i| i.agent_id.clone()).unwrap_or_default();
-    let is_remote = s.panel_target_is_remote();
-    let gp = &s.git_panel;
+    let comp = (!asid.is_empty())
+        .then(|| s.computer_of_session(asid))
+        .flatten()
+        .unwrap_or_else(|| s.current_computer().to_string());
+    let is_remote = UiState::is_remote_computer_id(&comp);
+    let gp = s.git_panel_for(asid);
 
     let local_branch_fallback = (!is_remote)
         .then(|| cwd.as_ref().and_then(|c| s.branches.get(c)))
@@ -1277,15 +1394,15 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     };
 
     let mut cards = Vec::new();
-
+    let refresh_asid = asid.to_string();
     let refresh_btn = IconButton::new(&icons::REFRESH)
         .variant(IconButtonVariant::Ghost)
         .control_size(ControlSize::Small)
         .label(t("Refresh"))
         .help(t("Refresh"))
-        .on_press(|s: &mut UiState| s.refresh_git_panel(true))
+        .on_press(move |s: &mut UiState| s.refresh_git_panel_for(&refresh_asid, true))
         .build(k)
-        .key("git-refresh-btn");
+        .key(format!("git-refresh-btn-{asid}"));
 
     if asid.is_empty() {
         cards.push(section_card(
@@ -1307,13 +1424,12 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             ],
         ));
     } else if !is_repo && !gp.overview_loading {
-        // Non-git folder: clean single-card empty state (no empty Changes/PR/Worktree clutter!)
         let cwd_path = cwd.as_ref().map(PathBuf::from);
         let init_btn = small_btn(
             k,
             t("Initialize Git in Terminal"),
             ButtonVariant::Outline,
-            "git-init-term".into(),
+            format!("git-init-term-{asid}"),
             move |s| {
                 let dir = cwd_path.clone().unwrap_or_else(|| s.terminal_cwd());
                 s.term_new_tab_in(dir, Some("git init && git status\n".into()));
@@ -1339,7 +1455,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         body.push(row().pt(2.0).child(init_btn));
         cards.push(section_card(
             k,
-            "git-no-repo-card",
+            format!("git-no-repo-card-{asid}"),
             &icons::BRANCH,
             t("No repository"),
             None,
@@ -1375,7 +1491,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             k,
             t("Terminal"),
             ButtonVariant::Outline,
-            "git-open-term".into(),
+            format!("git-open-term-{asid}"),
             move |s| {
                 let dir = cwd_path.clone().unwrap_or_else(|| s.terminal_cwd());
                 s.term_new_tab_in(dir, Some("git status\n".into()));
@@ -1386,7 +1502,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             s,
             k,
             layer,
-            &asid,
+            asid,
             &cur_branch,
             &local_branches,
             has_gateway_ops,
@@ -1420,7 +1536,6 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             repo_body.push(sync_info);
         }
 
-        // Sync action buttons: Fetch / Pull / Push + Open Repo
         let mut action_row = row().w_full().gap(6.0).center_y().flex_wrap();
         if has_gateway_ops {
             let busy = gp.busy_action.is_some();
@@ -1429,7 +1544,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 ("pull", t("Pull")),
                 ("push", t("Push")),
             ] {
-                let a_asid = asid.clone();
+                let a_asid = asid.to_string();
                 let act = action_id.to_string();
                 action_row = action_row.child(
                     Button::new(label)
@@ -1441,8 +1556,11 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                         .control_size(ControlSize::Small)
                         .disabled(busy)
                         .on_press(move |s: &mut UiState| {
-                            s.git_panel.busy_action = Some(act.clone());
-                            let mode = s.git_panel.diff_mode.as_str().to_string();
+                            let mode = {
+                                let gp = s.git_panel_mut(&a_asid);
+                                gp.busy_action = Some(act.clone());
+                                gp.diff_mode.as_str().to_string()
+                            };
                             s.send(Command::VcsSync {
                                 asid: AgentSessionId(a_asid.clone()),
                                 action: act.clone(),
@@ -1450,7 +1568,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                             });
                         })
                         .build(k)
-                        .key(format!("git-sync-{action_id}")),
+                        .key(format!("git-sync-{asid}-{action_id}")),
                 );
             }
         }
@@ -1460,7 +1578,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 k,
                 t("Repo"),
                 ButtonVariant::GhostMuted,
-                "git-view-repo".into(),
+                format!("git-view-repo-{asid}"),
                 move |_| crate::platform::shell::open_url(&repo_view_url),
             ));
         }
@@ -1472,7 +1590,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
 
         cards.push(section_card(
             k,
-            "git-branch-card",
+            format!("git-branch-card-{asid}"),
             &icons::BRANCH,
             t("Repository"),
             (!local_branches.is_empty()).then(|| local_branches.len().to_string()),
@@ -1480,9 +1598,9 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             repo_body,
         ));
 
-        // ---- 2. Changes Card (Working vs Branch + Staged / Unstaged + Commit Box) ----
-        let mode_asid_w = asid.clone();
-        let mode_asid_b = asid.clone();
+        // ---- 2. Changes Card ----
+        let mode_asid_w = asid.to_string();
+        let mode_asid_b = asid.to_string();
         let mode_toggle = row()
             .gap(4.0)
             .center_y()
@@ -1490,11 +1608,12 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 k,
                 t("Working"),
                 gp.diff_mode == GitDiffMode::Working,
-                "git-mode-working".into(),
+                format!("git-mode-working-{asid}"),
                 move |s| {
-                    if s.git_panel.diff_mode != GitDiffMode::Working {
-                        s.git_panel.diff_mode = GitDiffMode::Working;
-                        s.git_panel.files_limit = INITIAL_FILES_LIMIT;
+                    if s.git_panel_for(&mode_asid_w).diff_mode != GitDiffMode::Working {
+                        let gp = s.git_panel_mut(&mode_asid_w);
+                        gp.diff_mode = GitDiffMode::Working;
+                        gp.files_limit = INITIAL_FILES_LIMIT;
                         s.send(Command::VcsLoadOverview {
                             asid: AgentSessionId(mode_asid_w.clone()),
                             mode: "working".into(),
@@ -1506,11 +1625,12 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 k,
                 t("Branch"),
                 gp.diff_mode == GitDiffMode::Branch,
-                "git-mode-branch".into(),
+                format!("git-mode-branch-{asid}"),
                 move |s| {
-                    if s.git_panel.diff_mode != GitDiffMode::Branch {
-                        s.git_panel.diff_mode = GitDiffMode::Branch;
-                        s.git_panel.files_limit = INITIAL_FILES_LIMIT;
+                    if s.git_panel_for(&mode_asid_b).diff_mode != GitDiffMode::Branch {
+                        let gp = s.git_panel_mut(&mode_asid_b);
+                        gp.diff_mode = GitDiffMode::Branch;
+                        gp.files_limit = INITIAL_FILES_LIMIT;
                         s.send(Command::VcsLoadOverview {
                             asid: AgentSessionId(mode_asid_b.clone()),
                             mode: "branch".into(),
@@ -1522,8 +1642,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         let files_list: Vec<GitChangedFile> = if !gp.files.files.is_empty() || gp.overview.is_some()
         {
             gp.files.files.clone()
-        } else {
-            // Fallback to legacy diff_stat when connected to an older gateway
+        } else if s.selected.as_deref() == Some(asid) {
             s.diff_stat
                 .paths
                 .iter()
@@ -1538,6 +1657,8 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                     removed: Some(p.removed as u64),
                 })
                 .collect()
+        } else {
+            Vec::new()
         };
 
         let mut changes_body = vec![mode_toggle];
@@ -1571,7 +1692,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             let mut remaining = gp.files_limit;
 
             if !staged_files.is_empty() {
-                let unstage_asid = asid.clone();
+                let unstage_asid = asid.to_string();
                 let mut hdr = row()
                     .w_full()
                     .center_y()
@@ -1587,9 +1708,13 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                         k,
                         t("Unstage all"),
                         ButtonVariant::GhostMuted,
-                        "git-unstage-all".into(),
+                        format!("git-unstage-all-{asid}"),
                         move |s| {
-                            let mode = s.git_panel.diff_mode.as_str().to_string();
+                            let mode = s
+                                .git_panel_for(&unstage_asid)
+                                .diff_mode
+                                .as_str()
+                                .to_string();
                             s.send(Command::VcsUnstage {
                                 asid: AgentSessionId(unstage_asid.clone()),
                                 paths: Vec::new(),
@@ -1604,7 +1729,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                     changes_body.push(file_row_view(
                         s,
                         k,
-                        &asid,
+                        asid,
                         f,
                         i,
                         true,
@@ -1616,7 +1741,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             }
 
             if !unstaged_files.is_empty() && remaining > 0 {
-                let stage_asid = asid.clone();
+                let stage_asid = asid.to_string();
                 let group_title = if gp.diff_mode == GitDiffMode::Working {
                     format!("{} ({})", t("Changes"), unstaged_files.len())
                 } else {
@@ -1637,9 +1762,9 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                         k,
                         t("Stage all"),
                         ButtonVariant::GhostMuted,
-                        "git-stage-all".into(),
+                        format!("git-stage-all-{asid}"),
                         move |s| {
-                            let mode = s.git_panel.diff_mode.as_str().to_string();
+                            let mode = s.git_panel_for(&stage_asid).diff_mode.as_str().to_string();
                             s.send(Command::VcsStage {
                                 asid: AgentSessionId(stage_asid.clone()),
                                 paths: Vec::new(),
@@ -1654,7 +1779,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                     changes_body.push(file_row_view(
                         s,
                         k,
-                        &asid,
+                        asid,
                         f,
                         i,
                         false,
@@ -1667,6 +1792,8 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             let shown_total = staged_files.len() + unstaged_files.len();
             if shown_total > gp.files_limit {
                 let more_count = shown_total - gp.files_limit;
+                let more_asid = asid.to_string();
+                let all_asid = asid.to_string();
                 changes_body.push(
                     row()
                         .w_full()
@@ -1676,8 +1803,8 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                                 k,
                                 &format!("{} ({more_count})", t("Show more")),
                                 ButtonVariant::Outline,
-                                "git-files-more".into(),
-                                |s| s.git_panel.files_limit += FILES_PAGE_STEP,
+                                format!("git-files-more-{asid}"),
+                                move |s| s.git_panel_mut(&more_asid).files_limit += FILES_PAGE_STEP,
                             )
                             .grow(1.0),
                         )
@@ -1685,13 +1812,12 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                             k,
                             t("Show all"),
                             ButtonVariant::GhostMuted,
-                            "git-files-all".into(),
-                            move |s| s.git_panel.files_limit = shown_total,
+                            format!("git-files-all-{asid}"),
+                            move |s| s.git_panel_mut(&all_asid).files_limit = shown_total,
                         )),
                 );
             }
 
-            // Integrated Commit Box (Working mode only)
             if gp.diff_mode == GitDiffMode::Working && (has_gateway_ops || !is_remote) {
                 let stage_all = staged_files.is_empty();
                 let commit_label = if stage_all {
@@ -1701,19 +1827,22 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 };
                 let has_msg = !s.git_commit_msg.text.trim().is_empty();
                 let busy = gp.busy_action.is_some();
+                let sub_asid = asid.to_string();
+                let btn_asid = asid.to_string();
+                let push_asid = asid.to_string();
                 let commit_input = TextInput::new(&s.git_commit_msg)
                     .placeholder(t("Commit message…"))
                     .label(t("Commit message"))
                     .on_edit(|s: &mut UiState| &mut s.git_commit_msg)
                     .on_submit(move |s: &mut UiState, _: &mut Tx| {
-                        commit_changes(s, false, stage_all)
+                        commit_changes(s, &sub_asid, false, stage_all)
                     })
                     .build(k)
-                    .key("git-commit-msg-field")
+                    .key(format!("git-commit-msg-field-{asid}"))
                     .w_full();
                 changes_body.push(
                     col()
-                        .key("git-commit-box")
+                        .key(format!("git-commit-box-{asid}"))
                         .w_full()
                         .pt(4.0)
                         .gap(6.0)
@@ -1730,10 +1859,10 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                                         .control_size(ControlSize::Small)
                                         .disabled(!has_msg || busy)
                                         .on_press(move |s: &mut UiState| {
-                                            commit_changes(s, false, stage_all)
+                                            commit_changes(s, &btn_asid, false, stage_all)
                                         })
                                         .build(k)
-                                        .key("git-commit-btn"),
+                                        .key(format!("git-commit-btn-{asid}")),
                                 )
                                 .child(
                                     Button::new(t("Commit & Push"))
@@ -1741,23 +1870,29 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                                         .control_size(ControlSize::Small)
                                         .disabled(!has_msg || busy)
                                         .on_press(move |s: &mut UiState| {
-                                            commit_changes(s, true, stage_all)
+                                            commit_changes(s, &push_asid, true, stage_all)
                                         })
                                         .build(k)
-                                        .key("git-commit-push-btn"),
+                                        .key(format!("git-commit-push-btn-{asid}")),
                                 ),
                         ),
                 );
             }
         }
 
+        let diff_asid = asid.to_string();
         let view_diff_btn = (total_files > 0).then(|| {
             small_btn(
                 k,
                 t("View diff"),
                 ButtonVariant::Outline,
-                "view-changes".into(),
-                |s| {
+                format!("view-changes-{asid}"),
+                move |s| {
+                    if s.selected.as_deref() != Some(diff_asid.as_str()) {
+                        if let Some(tile_idx) = s.tile_of(&diff_asid) {
+                            s.focus_tile(tile_idx);
+                        }
+                    }
                     s.mode = Mode::Session;
                     s.show_diff = true;
                 },
@@ -1765,7 +1900,7 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         });
         cards.push(section_card(
             k,
-            "git-changes-card",
+            format!("git-changes-card-{asid}"),
             &parts::glyphs::DIFF,
             t("Changes"),
             (total_files > 0).then(|| total_files.to_string()),
@@ -1774,11 +1909,11 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         ));
 
         // ---- 3. Pull Requests Card (Paginated) ----
-        cards.push(pull_requests_card(s, k, &asid, remote_url.as_deref()));
+        cards.push(pull_requests_card(s, k, asid, remote_url.as_deref()));
 
         // ---- 4. Collapsible Recent Commits Card ----
         if has_gateway_ops {
-            cards.push(commits_card(s, k, &asid));
+            cards.push(commits_card(s, k, asid));
         }
 
         // ---- 5. Collapsible Universal Worktrees Card ----
@@ -1791,53 +1926,67 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         cards.push(worktrees_card(
             s,
             k,
+            asid,
             worktrees,
             &agent_id,
             cwd.as_deref().unwrap_or(""),
         ));
     }
 
-    let scroll_asid = asid.clone();
-    col()
-        .key("git-panel")
+    let scroll_asid = asid.to_string();
+    let scroll = col()
+        .key(format!("git-panel-scroll-{asid}"))
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .px(12.0)
+        .py(12.0)
+        .gap(10.0)
+        .children(cards)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .on_at_bottom(move |s: &mut UiState, at| {
+            if !at || scroll_asid.is_empty() {
+                return;
+            }
+            let next_page = {
+                let gp = s.git_panel_for(&scroll_asid);
+                if !gp.pr_has_more || gp.pr_loading || gp.prs.is_empty() {
+                    return;
+                }
+                if gp
+                    .pr_last_auto_load
+                    .is_some_and(|t| t.elapsed() < PR_AUTO_LOAD_COOLDOWN)
+                {
+                    return;
+                }
+                gp.pr_page.saturating_add(1).max(2)
+            };
+            s.git_panel_mut(&scroll_asid).pr_last_auto_load = Some(Instant::now());
+            s.request_git_prs(&scroll_asid, next_page, false);
+        })
+        .scroll_bar(k);
+
+    let mut root = col()
+        .key(if inline {
+            format!("git-panel-inline-{asid}")
+        } else {
+            "git-panel".to_string()
+        })
         .w_full()
         .h_full()
-        .min_h(0.0)
-        .child(target_session_bar(s, k, layer, "git"))
-        .child(
-            col()
-                .key("git-panel-scroll")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .px(12.0)
-                .py(12.0)
-                .gap(10.0)
-                .children(cards)
-                .scroll(ScrollSpec {
-                    stick_bottom: false,
-                })
-                .on_at_bottom(move |s: &mut UiState, at| {
-                    if !at
-                        || scroll_asid.is_empty()
-                        || !s.git_panel.pr_has_more
-                        || s.git_panel.pr_loading
-                        || s.git_panel.prs.is_empty()
-                    {
-                        return;
-                    }
-                    if s.git_panel
-                        .pr_last_auto_load
-                        .is_some_and(|t| t.elapsed() < PR_AUTO_LOAD_COOLDOWN)
-                    {
-                        return;
-                    }
-                    s.git_panel.pr_last_auto_load = Some(Instant::now());
-                    let next = s.git_panel.pr_page.saturating_add(1).max(2);
-                    s.request_git_prs(&scroll_asid, next, false);
-                })
-                .scroll_bar(k),
-        )
+        .min_h(0.0);
+    if !inline {
+        root = root.child(target_session_bar(s, k, layer, "git"));
+    }
+    root.child(scroll)
+}
+
+/// Render the standalone top-level Git Workbench plugin panel.
+pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+    let asid = s.panel_target_asid().unwrap_or_default().to_string();
+    view_for_session(s, k, layer, &asid, false)
 }
 
 pub(crate) const COMMITS_LIMIT: usize = COMMITS_PAGE_SIZE;
@@ -1887,7 +2036,6 @@ mod tests {
         assert!(gp.pr_has_more);
         assert_eq!(gp.pr_page, 1);
 
-        // Appending page 2 deduplicates #10 and adds #9.
         gp.apply_prs(
             "ses-1",
             "open",
@@ -1933,7 +2081,6 @@ mod tests {
         assert!(!gp.pr_has_more);
         assert_eq!(gp.pr_page, 2);
 
-        // Stale response for another filter is ignored.
         gp.pr_author = "me";
         gp.apply_prs("ses-1", "open", "all", false, Ok(GitPrsPage::default()));
         assert_eq!(gp.prs.len(), 2);

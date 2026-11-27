@@ -513,16 +513,19 @@ fn tree_row(s: &UiState, k: &Kit, node: &TreeNode, root_asid: &str) -> El {
     outer.child(card)
 }
 
-/// Render the hierarchical session tree for the active session.
-pub(crate) fn view(s: &UiState, k: &Kit) -> Vec<El> {
+/// Render the hierarchical session tree for a specific session `asid`.
+pub(crate) fn view_for_session(s: &UiState, k: &Kit, asid: &str) -> Vec<El> {
     let language = s.cfg.general.language;
-    let current_asid = s.panel_target_asid();
+    let current_asid = (!asid.is_empty()).then_some(asid);
     let root_id = current_asid.map(|id| s.session_tree_root_id(id));
     let root_info = root_id
         .and_then(|id| s.session_by_id(id))
-        .or_else(|| s.current());
+        .or_else(|| current_asid.and_then(|id| s.session_by_id(id)));
+    let descendants = current_asid
+        .map(|id| s.descendants_for_session(id))
+        .unwrap_or(&[]);
 
-    let nodes = build_tree(root_info, &s.descendants, &s.sessions, current_asid);
+    let nodes = build_tree(root_info, descendants, &s.sessions, current_asid);
     if nodes.is_empty() {
         return vec![col()
             .key("empty-session-tree")
@@ -753,7 +756,7 @@ mod tests {
         assert_eq!(s.descendants.len(), 2);
 
         let k = Kit::neutral(true);
-        let els = view(&s, &k);
+        let els = view_for_session(&s, &k, "child");
         assert!(els.len() >= 4, "header + root + 2 children");
     }
 }

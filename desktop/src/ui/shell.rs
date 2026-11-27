@@ -822,6 +822,37 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
                 );
             }
             if !asid.is_empty() {
+                if crate::plugin::is_enabled("git", &s.cfg.plugins_disabled) {
+                    let active = s.active_tile_inline_panel() == Some(super::TileInlinePanel::Git);
+                    bar = bar.trailing(
+                        super::icons::header_button(&super::icons::BRANCH, tr_ref(language, "Git"))
+                            .variant(if active {
+                                IconButtonVariant::Contrast
+                            } else {
+                                IconButtonVariant::GhostMuted
+                            })
+                            .help(tr_ref(language, "Git"))
+                            .on_press(|s: &mut UiState| s.toggle_git_panel())
+                            .build(k)
+                            .key("session-git"),
+                    );
+                }
+                if crate::plugin::is_enabled("activity", &s.cfg.plugins_disabled) {
+                    let active =
+                        s.active_tile_inline_panel() == Some(super::TileInlinePanel::Activity);
+                    bar = bar.trailing(
+                        super::icons::header_button(&INSPECTOR, tr_ref(language, "Activity"))
+                            .variant(if active {
+                                IconButtonVariant::Contrast
+                            } else {
+                                IconButtonVariant::GhostMuted
+                            })
+                            .help(tr_ref(language, "Activity"))
+                            .on_press(|s: &mut UiState| s.toggle_activity_panel())
+                            .build(k)
+                            .key("session-activity"),
+                    );
+                }
                 bar = bar.trailing(session_more(s, k, layer, &asid, busy));
             }
         }
@@ -909,9 +940,28 @@ fn session(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> El {
     if s.revert_staged {
         page = page.child(revert_banner(s, k));
     }
-    page.children(super::orchestration::session_banner(s, k))
+    let chat = col()
+        .key("session-chat")
+        .grow(1.0)
+        .min_w(0.0)
+        .h_full()
+        .min_h(0.0)
         .child(body)
-        .child(composer::view(s, k, layer))
+        .child(composer::view(s, k, layer));
+    let main = match (s.active_tile_inline_panel(), s.selected.as_deref()) {
+        (Some(panel), Some(asid)) => row()
+            .key("session-split-body")
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .child(chat)
+            .child(super::git_panel::tile_inline_drawer(
+                s, k, layer, s.focus, asid, panel, 380.0,
+            )),
+        _ => chat.w_full(),
+    };
+    page.children(super::orchestration::session_banner(s, k))
+        .child(main)
 }
 
 fn revert_banner(s: &UiState, k: &Kit) -> El {

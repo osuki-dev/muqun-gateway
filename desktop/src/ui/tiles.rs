@@ -742,6 +742,44 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
     let menu = menu.build(k, layer);
     // Unified window header trailing order across Tile, Float, Dock, and Page:
     // [contextual window actions] -> [... always-visible menu] -> [close].
+    if matches!(content, super::TileContent::Session(_)) {
+        let active_inline = s.tiles.get(i).and_then(|t| t.inline_panel);
+        if crate::plugin::is_enabled("git", &s.cfg.plugins_disabled) {
+            head = head.child(
+                super::icons::header_button(&super::icons::BRANCH, tr_ref(language, "Git"))
+                    .variant(if active_inline == Some(super::TileInlinePanel::Git) {
+                        IconButtonVariant::Contrast
+                    } else {
+                        IconButtonVariant::GhostMuted
+                    })
+                    .help(tr_ref(language, "Git"))
+                    .on_press(move |s: &mut UiState| {
+                        s.toggle_tile_inline_panel(i, super::TileInlinePanel::Git);
+                    })
+                    .build(k)
+                    .key(format!("tile-git-{i}")),
+            );
+        }
+        if crate::plugin::is_enabled("activity", &s.cfg.plugins_disabled) {
+            head = head.child(
+                super::icons::header_button(
+                    &rune_kit::shell::INSPECTOR,
+                    tr_ref(language, "Activity"),
+                )
+                .variant(if active_inline == Some(super::TileInlinePanel::Activity) {
+                    IconButtonVariant::Contrast
+                } else {
+                    IconButtonVariant::GhostMuted
+                })
+                .help(tr_ref(language, "Activity"))
+                .on_press(move |s: &mut UiState| {
+                    s.toggle_tile_inline_panel(i, super::TileInlinePanel::Activity);
+                })
+                .build(k)
+                .key(format!("tile-activity-{i}")),
+            );
+        }
+    }
     if let Some(plugin_id) = plugin_id {
         if let Some(actions) = s
             .plugins
@@ -1218,7 +1256,7 @@ fn tile(
                 }
             }
         }
-        (super::TileContent::Session(_), true) => {
+        (super::TileContent::Session(asid), true) => {
             let feed = if s.show_diff {
                 timeline::changes(s, k)
             } else {
@@ -1227,10 +1265,37 @@ fn tile(
             let feed = feed
                 .on_drop_files(|s: &mut UiState, files, _| composer::attach_dropped_files(s, files))
                 .on_drop_hover(|s: &mut UiState, over, _| s.drop_hover = over);
-            body = body.child(feed).child(composer::view(s, k, layer));
+            let chat = col()
+                .key(format!("tile-chat-{i}"))
+                .grow(1.0)
+                .min_w(0.0)
+                .h_full()
+                .min_h(0.0)
+                .child(feed)
+                .child(composer::view(s, k, layer));
+            if let Some(panel) = s.tiles[i].inline_panel {
+                body = body.child(
+                    row()
+                        .key(format!("tile-split-body-{i}"))
+                        .w_full()
+                        .grow(1.0)
+                        .min_h(0.0)
+                        .child(chat)
+                        .child(super::git_panel::tile_inline_drawer(
+                            s, k, layer, i, asid, panel, 320.0,
+                        )),
+                );
+            } else {
+                body = body.child(chat.w_full());
+            }
         }
         (super::TileContent::Session(asid), false) => {
-            body = body
+            let chat = col()
+                .key(format!("tile-chat-{i}"))
+                .grow(1.0)
+                .min_w(0.0)
+                .h_full()
+                .min_h(0.0)
                 .child(
                     timeline::session_view(s, k, asid)
                         .on_drop_files(move |s: &mut UiState, files, _| {
@@ -1245,6 +1310,21 @@ fn tile(
                         }),
                 )
                 .child(parked_composer(s, k, look, i));
+            if let Some(panel) = s.tiles[i].inline_panel {
+                body = body.child(
+                    row()
+                        .key(format!("tile-split-body-{i}"))
+                        .w_full()
+                        .grow(1.0)
+                        .min_h(0.0)
+                        .child(chat)
+                        .child(super::git_panel::tile_inline_drawer(
+                            s, k, layer, i, asid, panel, 320.0,
+                        )),
+                );
+            } else {
+                body = body.child(chat.w_full());
+            }
         }
     }
     // Focus is contrast: the other panes' content sits a step back under a
@@ -2599,11 +2679,14 @@ mod tests {
         s.focus_tile(0);
         s.splash = None;
 
-        // Opening Git panel in split view uses the unified right dock, never an inline overlay.
+        // Opening Git panel in a session tile opens an inline side drawer inside that tile.
         s.open_git_panel();
-        assert!(s.right_open);
-        assert_eq!(s.active_plugin_drawer.as_deref(), Some("git"));
-        assert_eq!(s.selected_dock_tab(), Some("git"));
+        assert!(!s.right_open);
+        assert_eq!(
+            s.tiles[0].inline_panel,
+            Some(crate::ui::TileInlinePanel::Git)
+        );
+        assert!(s.tiles[1].inline_panel.is_none());
 
         s.menu = Some(OpenMenu::Tile(0));
         let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
@@ -2614,12 +2697,14 @@ mod tests {
         assert!(
             nodes
                 .iter()
-                .all(|n| n.key.as_deref() != Some("tile-git-panel")),
-            "split tiles must never render the legacy inline inspector overlay"
+                .any(|n| n.key.as_deref() == Some("tile-inline-drawer-0")),
+            "git panel must render inline inside tile 0"
         );
         assert!(
-            nodes.iter().any(|n| n.key.as_deref() == Some("git-panel")),
-            "git panel must render inside the unified right dock"
+            nodes
+                .iter()
+                .all(|n| n.key.as_deref() != Some("tile-inline-drawer-1")),
+            "tile 1 must not open an inline drawer when only tile 0 opened git"
         );
 
         let click_item = |rt: &mut Runtime<UiState>, label: &str| {
@@ -2824,5 +2909,123 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn split_tiles_keep_independent_inline_git_and_activity_drawers() {
+        use muqun_gateway::agents::AgentSessionInfo;
+        use rune::{Env, Runtime};
+
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let s1: AgentSessionInfo = serde_json::from_value(serde_json::json!({
+            "asid": "s-left",
+            "agent_id": "claude",
+            "title": "Left session",
+            "status": "idle",
+            "updated_ms": 1000u64,
+        }))
+        .unwrap();
+        let s2: AgentSessionInfo = serde_json::from_value(serde_json::json!({
+            "asid": "s-right",
+            "agent_id": "claude",
+            "title": "Right session",
+            "status": "idle",
+            "updated_ms": 1000u64,
+        }))
+        .unwrap();
+        s.sessions = vec![s1, s2];
+        s.open_session("s-left");
+        s.open_in_tile("s-right");
+        s.splash = None;
+
+        s.toggle_tile_inline_panel(0, crate::ui::TileInlinePanel::Git);
+        s.toggle_tile_inline_panel(1, crate::ui::TileInlinePanel::Activity);
+        assert!(!s.right_open);
+        assert_eq!(
+            s.tiles[0].inline_panel,
+            Some(crate::ui::TileInlinePanel::Git)
+        );
+        assert_eq!(
+            s.tiles[1].inline_panel,
+            Some(crate::ui::TileInlinePanel::Activity)
+        );
+
+        let mut rt = Runtime::new(s, crate::ui::view, (1600.0, 900.0), Env::new(true, 1.0));
+        for _ in 0..4 {
+            rt.frame(1.0 / 60.0);
+        }
+        let nodes = rt.elements();
+        let d0 = nodes
+            .iter()
+            .find(|n| n.key.as_deref() == Some("tile-inline-drawer-0"))
+            .expect("left tile inline drawer");
+        let d1 = nodes
+            .iter()
+            .find(|n| n.key.as_deref() == Some("tile-inline-drawer-1"))
+            .expect("right tile inline drawer");
+        assert!(
+            d0.rect[0] + d0.rect[2] <= d1.rect[0] + 1.0,
+            "left inline drawer ({:?}) must sit strictly to the left of right inline drawer ({:?})",
+            d0.rect,
+            d1.rect
+        );
+    }
+
+    #[test]
+    fn split_tile_right_pane_mention_popup_anchors_on_right_tile() {
+        use muqun_gateway::agents::AgentSessionInfo;
+        use rune::{Env, Runtime};
+
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let s1: AgentSessionInfo = serde_json::from_value(serde_json::json!({
+            "asid": "s-left",
+            "agent_id": "claude",
+            "title": "Left session",
+            "status": "idle",
+            "updated_ms": 1000u64,
+        }))
+        .unwrap();
+        let s2: AgentSessionInfo = serde_json::from_value(serde_json::json!({
+            "asid": "s-right",
+            "agent_id": "claude",
+            "title": "Right session",
+            "status": "idle",
+            "updated_ms": 1000u64,
+        }))
+        .unwrap();
+        s.sessions = vec![s1, s2];
+        s.open_session("s-left");
+        s.open_in_tile("s-right");
+        s.focus_tile(1);
+        s.splash = None;
+        s.draft = rune::TextEdit::new("@");
+        s.draft.anchor = 1;
+        s.draft.focus = 1;
+        s.draft.focused = true;
+        s.cfg.computers.insert(
+            "mini".into(),
+            crate::config::ComputerProfile {
+                url: Some("http://100.83.99.56:23847".into()),
+                token: Some("tok".into()),
+                ..Default::default()
+            },
+        );
+
+        let mut rt = Runtime::new(s, crate::ui::view, (1440.0, 900.0), Env::new(true, 1.0));
+        for _ in 0..4 {
+            rt.frame(1.0 / 60.0);
+        }
+        let nodes = rt.elements();
+        let popup = nodes
+            .iter()
+            .find(|n| n.key.as_deref() == Some("mention-popup-panel"))
+            .expect("mention popup should open for right split tile");
+        assert!(
+            popup.rect[0] > 600.0,
+            "mention popup for right tile must anchor on the right tile, got {:?}",
+            popup.rect
+        );
     }
 }

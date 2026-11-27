@@ -58,6 +58,20 @@ impl UiState {
                 Mode::Home
             });
         }
+        if id == "git" {
+            for tile in &mut self.tiles {
+                if tile.inline_panel == Some(super::TileInlinePanel::Git) {
+                    tile.inline_panel = None;
+                }
+            }
+        }
+        if id == "activity" {
+            for tile in &mut self.tiles {
+                if tile.inline_panel == Some(super::TileInlinePanel::Activity) {
+                    tile.inline_panel = None;
+                }
+            }
+        }
         if matches!(id, "git" | "activity" | "inspector")
             && self.active_plugin_drawer.is_none()
             && self.right_open

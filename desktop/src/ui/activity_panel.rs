@@ -1,13 +1,11 @@
-//! First-class Activity panel (unified Queue + Multi-tile Awareness + Session Tree
-//! + capability-gated Saved approvals & Background shells).
+//! First-class Activity panel (unified Queue + Session Tree + capability-gated
+//! Saved approvals & Background shells).
 //!
-//! Replaces the old 5-tab Inspector soup so:
-//! - Waiting approvals & queued prompts (with cross-computer fetched images!) sit at the top
-//! - In split-tile mode, other open tiles' queued/waiting items stay visible below so
-//!   moving focus never hides the leftmost tile's Queue
-//! - Session Tree (Subagents / Forks) sits directly below Queue
-//! - OpenCode-only Saved approvals & Background shells only appear when the target
-//!   agent actually supports them (or has live items), never as empty clutter.
+//! Can be rendered either:
+//! - Inline inside a session window / split tile (`inline = true`, bound strictly
+//!   to that tile's `asid`, zero cross-tile conflicts!), or
+//! - Standalone in the Dock / Tile / Page (`inline = false`, with Target Session
+//!   Bar and multi-tile Queue overview).
 
 use muqun_gateway::agents::{AgentSessionId, AgentSessionStatus};
 use rune::{col, el, row, text, El, ScrollSpec};
@@ -54,13 +52,13 @@ fn confirm_btn(
     })
 }
 
-/// Whether the target session's agent supports saved "always allow" permissions
+/// Whether `asid`'s agent supports saved "always allow" permissions
 /// (declared via `features.extra["savedPermissions"]`, currently OpenCode).
-pub(crate) fn agent_supports_saved_permissions(s: &UiState) -> bool {
-    if !s.saved_permissions.is_empty() {
+pub(crate) fn agent_supports_saved_permissions_for(s: &UiState, asid: &str) -> bool {
+    if !s.saved_permissions.is_empty() && s.selected.as_deref() == Some(asid) {
         return true;
     }
-    let Some(info) = s.panel_target_session() else {
+    let Some(info) = s.session_by_id(asid) else {
         return false;
     };
     s.agents.iter().any(|agent| {
@@ -74,12 +72,14 @@ pub(crate) fn agent_supports_saved_permissions(s: &UiState) -> bool {
     })
 }
 
-/// Whether the target session's agent supports background shells or can park its turn.
-pub(crate) fn agent_supports_shells(s: &UiState) -> bool {
-    if !s.shells.is_empty() || can_background_target_turn(s) {
+/// Whether `asid`'s agent supports background shells or can park its turn.
+pub(crate) fn agent_supports_shells_for(s: &UiState, asid: &str) -> bool {
+    if (!s.shells.is_empty() && s.selected.as_deref() == Some(asid))
+        || can_background_turn_for(s, asid)
+    {
         return true;
     }
-    let Some(info) = s.panel_target_session() else {
+    let Some(info) = s.session_by_id(asid) else {
         return false;
     };
     s.agents
@@ -87,8 +87,8 @@ pub(crate) fn agent_supports_shells(s: &UiState) -> bool {
         .any(|agent| agent.id == info.agent_id && agent.features.background_shells)
 }
 
-pub(crate) fn can_background_target_turn(s: &UiState) -> bool {
-    let Some(info) = s.panel_target_session() else {
+pub(crate) fn can_background_turn_for(s: &UiState, asid: &str) -> bool {
+    let Some(info) = s.session_by_id(asid) else {
         return false;
     };
     if info.status != AgentSessionStatus::Busy {
@@ -99,19 +99,23 @@ pub(crate) fn can_background_target_turn(s: &UiState) -> bool {
         .any(|agent| agent.id == info.agent_id && agent.features.background_shells)
 }
 
-fn render_queue_item(
-    s: &UiState,
-    k: &Kit,
-    asid: &str,
-    q: &InboxItem,
-    can_edit_directly: bool,
-) -> El {
+/// Badge count (waiting approvals/forms + queued prompts) for `asid`.
+pub(crate) fn badge_count_for(s: &UiState, asid: &str) -> usize {
+    if asid.is_empty() {
+        return 0;
+    }
+    s.waiting_perms.get(asid).map_or(0, Vec::len)
+        + s.waiting_forms.get(asid).map_or(0, Vec::len)
+        + s.queue_for_session(asid).len()
+}
+
+fn render_queue_item(s: &UiState, k: &Kit, asid: &str, q: &InboxItem) -> El {
     let language = s.cfg.general.language;
     let t = |en: &'static str| tr_ref(language, en);
     let (id, a) = (q.id.clone(), AgentSessionId(asid.to_string()));
     let steer = q.steer;
     let (id2, a2) = (id.clone(), a.clone());
-    let (edit_id, edit_text) = (q.id.clone(), q.text.clone());
+    let (edit_asid, edit_id, edit_text) = (asid.to_string(), q.id.clone(), q.text.clone());
 
     let image_files: Vec<&crate::model::compose::QueuedFile> =
         q.files.iter().filter(|f| f.image).collect();
@@ -137,52 +141,60 @@ fn render_queue_item(
         status_row = status_row.child(Badge::new(att_label).variant(BadgeVariant::Subtle).build(k));
     }
 
-    let mut actions = row().w_full().gap(6.0).center_y().child(small_btn(
-        k,
-        if steer {
-            t("Keep queued")
-        } else {
-            t("Send now")
-        },
-        if steer {
-            ButtonVariant::Outline
-        } else {
-            ButtonVariant::Neutral
-        },
-        format!("dl-{asid}-{id}"),
-        move |s| {
-            s.toggle_queue_steer_for(&a.0, &id, !steer);
-            s.send(Command::Compose(ComposeCommand::InboxDelivery {
-                asid: a.clone(),
-                item: id.clone(),
-                steer: !steer,
-            }));
-        },
-    ));
-    if can_edit_directly {
-        actions = actions.child(small_btn(
+    let actions = row()
+        .w_full()
+        .gap(6.0)
+        .center_y()
+        .child(small_btn(
+            k,
+            if steer {
+                t("Keep queued")
+            } else {
+                t("Send now")
+            },
+            if steer {
+                ButtonVariant::Outline
+            } else {
+                ButtonVariant::Neutral
+            },
+            format!("dl-{asid}-{id}"),
+            move |s| {
+                s.toggle_queue_steer_for(&a.0, &id, !steer);
+                s.send(Command::Compose(ComposeCommand::InboxDelivery {
+                    asid: a.clone(),
+                    item: id.clone(),
+                    steer: !steer,
+                }));
+            },
+        ))
+        .child(small_btn(
             k,
             t("Edit"),
             ButtonVariant::Outline,
             format!("ed-{asid}-{edit_id}"),
             move |s| {
+                if s.selected.as_deref() != Some(edit_asid.as_str()) {
+                    if let Some(tile_idx) = s.tile_of(&edit_asid) {
+                        s.focus_tile(tile_idx);
+                    }
+                }
                 super::composer::edit_queued(s, &edit_id, edit_text.clone());
             },
+        ))
+        .child(el().grow(1.0))
+        .child(small_btn(
+            k,
+            t("Cancel"),
+            ButtonVariant::GhostMuted,
+            format!("cx-{asid}-{id2}"),
+            move |s| {
+                s.remove_queue_item_for(&a2.0, &id2);
+                s.send(Command::Compose(ComposeCommand::InboxCancel {
+                    asid: a2.clone(),
+                    item: id2.clone(),
+                }));
+            },
         ));
-    }
-    actions = actions.child(el().grow(1.0)).child(small_btn(
-        k,
-        t("Cancel"),
-        ButtonVariant::GhostMuted,
-        format!("cx-{asid}-{id2}"),
-        move |s| {
-            s.remove_queue_item_for(&a2.0, &id2);
-            s.send(Command::Compose(ComposeCommand::InboxCancel {
-                asid: a2.clone(),
-                item: id2.clone(),
-            }));
-        },
-    ));
 
     let mut card = sub_card(k, format!("q-{asid}-{}", q.id)).child(status_row);
     if !image_files.is_empty() {
@@ -200,89 +212,88 @@ fn render_queue_item(
     .child(actions)
 }
 
-fn waiting_and_queue_cards(s: &UiState, k: &Kit) -> Vec<El> {
+fn waiting_and_queue_cards(s: &UiState, k: &Kit, target_asid: &str, inline: bool) -> Vec<El> {
     let language = s.cfg.general.language;
     let t = |en: &'static str| tr_ref(language, en);
     let mut out = Vec::new();
-    let target_asid = s.panel_target_asid().unwrap_or_default().to_string();
-    let is_focused_target = s.selected.as_deref() == Some(target_asid.as_str());
 
-    // ---- 1. Waiting on you (target session + any other waiting open tile) ----
+    // ---- 1. Waiting on you ----
     let perms = s
         .waiting_perms
-        .get(&target_asid)
+        .get(target_asid)
         .map(Vec::as_slice)
         .unwrap_or_default();
     let forms = s
         .waiting_forms
-        .get(&target_asid)
+        .get(target_asid)
         .map(Vec::as_slice)
         .unwrap_or_default();
     let mut waiting_body: Vec<El> = Vec::new();
     waiting_body.extend(
         perms
             .iter()
-            .map(|p| timeline::permission_card(s, k, p).key(format!("wp-{}", p.id))),
+            .map(|p| timeline::permission_card(s, k, p).key(format!("wp-{target_asid}-{}", p.id))),
     );
     waiting_body.extend(
         forms
             .iter()
-            .map(|f| timeline::form_card(s, k, f).key(format!("wf-{}", f.id))),
+            .map(|f| timeline::form_card(s, k, f).key(format!("wf-{target_asid}-{}", f.id))),
     );
-    // Surface waiting approvals from OTHER open split tiles too!
-    for (tile_idx, other_asid, other_title) in s.open_tile_sessions() {
-        if other_asid == target_asid {
-            continue;
+    if !inline {
+        for (tile_idx, other_asid, other_title) in s.open_tile_sessions() {
+            if other_asid == target_asid {
+                continue;
+            }
+            let op = s
+                .waiting_perms
+                .get(&other_asid)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let of = s
+                .waiting_forms
+                .get(&other_asid)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if op.is_empty() && of.is_empty() {
+                continue;
+            }
+            let count = op.len() + of.len();
+            waiting_body.push(
+                sub_card(k, format!("wp-other-{other_asid}")).child(
+                    row()
+                        .w_full()
+                        .gap(6.0)
+                        .center_y()
+                        .child(
+                            Badge::new(format!("Tile {}", tile_idx + 1))
+                                .variant(BadgeVariant::Accent)
+                                .build(k),
+                        )
+                        .child(
+                            text(format!("{} ({count})", timeline::clip(&other_title, 26)))
+                                .font(k.ty.small_medium)
+                                .color(k.c.text_base)
+                                .truncate()
+                                .grow(1.0)
+                                .shrink()
+                                .min_w(0.0),
+                        )
+                        .child(small_btn(
+                            k,
+                            t("Focus"),
+                            ButtonVariant::Outline,
+                            format!("wp-jump-{other_asid}"),
+                            move |s| s.focus_tile(tile_idx),
+                        )),
+                ),
+            );
         }
-        let op = s
-            .waiting_perms
-            .get(&other_asid)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let of = s
-            .waiting_forms
-            .get(&other_asid)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        if op.is_empty() && of.is_empty() {
-            continue;
-        }
-        let count = op.len() + of.len();
-        waiting_body.push(
-            sub_card(k, format!("wp-other-{other_asid}")).child(
-                row()
-                    .w_full()
-                    .gap(6.0)
-                    .center_y()
-                    .child(
-                        Badge::new(format!("Tile {}", tile_idx + 1))
-                            .variant(BadgeVariant::Accent)
-                            .build(k),
-                    )
-                    .child(
-                        text(format!("{} ({count})", timeline::clip(&other_title, 26)))
-                            .font(k.ty.small_medium)
-                            .color(k.c.text_base)
-                            .truncate()
-                            .grow(1.0)
-                            .shrink()
-                            .min_w(0.0),
-                    )
-                    .child(small_btn(
-                        k,
-                        t("Focus"),
-                        ButtonVariant::Outline,
-                        format!("wp-jump-{other_asid}"),
-                        move |s| s.focus_tile(tile_idx),
-                    )),
-            ),
-        );
     }
 
     if !waiting_body.is_empty() {
         out.push(section_card(
             k,
-            "activity-waiting-card",
+            format!("activity-waiting-card-{target_asid}"),
             &icons::INBOX,
             t("Waiting on you"),
             Some(waiting_body.len().to_string()),
@@ -291,17 +302,20 @@ fn waiting_and_queue_cards(s: &UiState, k: &Kit) -> Vec<El> {
         ));
     }
 
-    // ---- 2. Queued Prompts (Target + Other Open Tiles!) ----
-    let target_queue = s.panel_target_queue();
-    let other_queues: Vec<(usize, String, String, Vec<InboxItem>)> = s
-        .open_tile_sessions()
-        .into_iter()
-        .filter(|(_, asid, _)| asid != &target_asid)
-        .filter_map(|(tile_idx, asid, title)| {
-            let items = s.queue_for_session(&asid).to_vec();
-            (!items.is_empty()).then_some((tile_idx, asid, title, items))
-        })
-        .collect();
+    // ---- 2. Queued Prompts ----
+    let target_queue = s.queue_for_session(target_asid);
+    let other_queues: Vec<(usize, String, String, Vec<InboxItem>)> = if inline {
+        Vec::new()
+    } else {
+        s.open_tile_sessions()
+            .into_iter()
+            .filter(|(_, asid, _)| asid != target_asid)
+            .filter_map(|(tile_idx, asid, title)| {
+                let items = s.queue_for_session(&asid).to_vec();
+                (!items.is_empty()).then_some((tile_idx, asid, title, items))
+            })
+            .collect()
+    };
 
     let total_queued = target_queue.len()
         + other_queues
@@ -318,7 +332,7 @@ fn waiting_and_queue_cards(s: &UiState, k: &Kit) -> Vec<El> {
         );
     } else {
         for q in target_queue {
-            queue_body.push(render_queue_item(s, k, &target_asid, q, is_focused_target));
+            queue_body.push(render_queue_item(s, k, target_asid, q));
         }
         for (tile_idx, other_asid, other_title, items) in other_queues {
             queue_body.push(
@@ -351,14 +365,14 @@ fn waiting_and_queue_cards(s: &UiState, k: &Kit) -> Vec<El> {
                     )),
             );
             for q in &items {
-                queue_body.push(render_queue_item(s, k, &other_asid, q, false));
+                queue_body.push(render_queue_item(s, k, &other_asid, q));
             }
         }
     }
 
     out.push(section_card(
         k,
-        "activity-queue-card",
+        format!("activity-queue-card-{target_asid}"),
         &parts::glyphs::TIME,
         t("Queue"),
         (total_queued > 0).then(|| total_queued.to_string()),
@@ -369,44 +383,45 @@ fn waiting_and_queue_cards(s: &UiState, k: &Kit) -> Vec<El> {
     out
 }
 
-fn tree_card(s: &UiState, k: &Kit) -> El {
+fn tree_card(s: &UiState, k: &Kit, asid: &str) -> El {
     let language = s.cfg.general.language;
     let t = |en: &'static str| tr_ref(language, en);
+    let asid_refresh = asid.to_string();
     let refresh_btn = IconButton::new(&icons::REFRESH)
         .variant(IconButtonVariant::Ghost)
         .control_size(ControlSize::Small)
         .label(t("Refresh"))
         .help(t("Refresh"))
-        .on_press(|s: &mut UiState| s.refresh_session_tree())
+        .on_press(move |s: &mut UiState| s.refresh_session_tree_for(&asid_refresh))
         .build(k)
-        .key("activity-tree-refresh");
-    let tree_items = super::session_tree::view(s, k);
+        .key(format!("activity-tree-refresh-{asid}"));
+    let descendants = s.descendants_for_session(asid);
+    let tree_items = super::session_tree::view_for_session(s, k, asid);
     section_card(
         k,
-        "activity-tree-card",
+        format!("activity-tree-card-{asid}"),
         &icons::FORK,
         t("Session Tree"),
-        (!s.descendants.is_empty()).then(|| s.descendants.len().to_string()),
+        (!descendants.is_empty()).then(|| descendants.len().to_string()),
         vec![refresh_btn],
         tree_items,
     )
 }
 
-fn saved_card(s: &UiState, k: &Kit) -> Option<El> {
-    if !agent_supports_saved_permissions(s) {
+fn saved_card(s: &UiState, k: &Kit, asid: &str) -> Option<El> {
+    if !agent_supports_saved_permissions_for(s, asid) {
         return None;
     }
     let language = s.cfg.general.language;
     let t = |en: &'static str| tr_ref(language, en);
     let open = s.activity_panel.saved_open || !s.saved_permissions.is_empty();
-    let asid = s.panel_target_asid().unwrap_or_default().to_string();
-    let asid_load = asid.clone();
+    let asid_load = asid.to_string();
 
     let mut trailing = vec![small_btn(
         k,
         if open { t("Hide") } else { t("Show") },
         ButtonVariant::GhostMuted,
-        "activity-saved-toggle".into(),
+        format!("activity-saved-toggle-{asid}"),
         move |s| {
             let next = !s.activity_panel.saved_open;
             s.activity_panel.saved_open = next;
@@ -418,7 +433,7 @@ fn saved_card(s: &UiState, k: &Kit) -> Option<El> {
         },
     )];
     if open && !asid.is_empty() {
-        let a = asid.clone();
+        let a = asid.to_string();
         trailing.push(
             IconButton::new(&icons::REFRESH)
                 .variant(IconButtonVariant::Ghost)
@@ -431,7 +446,7 @@ fn saved_card(s: &UiState, k: &Kit) -> Option<El> {
                     });
                 })
                 .build(k)
-                .key("activity-saved-refresh"),
+                .key(format!("activity-saved-refresh-{asid}")),
         );
     }
 
@@ -445,7 +460,7 @@ fn saved_card(s: &UiState, k: &Kit) -> Option<El> {
             );
         } else {
             for p in &s.saved_permissions {
-                let (a, id) = (AgentSessionId(asid.clone()), p.id.clone());
+                let (a, id) = (AgentSessionId(asid.to_string()), p.id.clone());
                 let kind = if p.action.is_empty() {
                     tr(language, "rule")
                 } else {
@@ -457,7 +472,7 @@ fn saved_card(s: &UiState, k: &Kit) -> Option<El> {
                     p.resource.clone()
                 };
                 body.push(
-                    sub_card(k, format!("sp-{}", p.id))
+                    sub_card(k, format!("sp-{asid}-{}", p.id))
                         .child(
                             row()
                                 .w_full()
@@ -469,7 +484,7 @@ fn saved_card(s: &UiState, k: &Kit) -> Option<El> {
                                     k,
                                     t("Forget"),
                                     ButtonVariant::GhostMuted,
-                                    format!("fp-{}", p.id),
+                                    format!("fp-{asid}-{}", p.id),
                                     move |s| {
                                         s.saved_permissions.retain(|x| x.id != id);
                                         s.send(Command::ForgetSavedPermission {
@@ -492,7 +507,7 @@ fn saved_card(s: &UiState, k: &Kit) -> Option<El> {
 
     Some(section_card(
         k,
-        "activity-saved-card",
+        format!("activity-saved-card-{asid}"),
         &parts::glyphs::COMPLETED,
         t("Saved approvals"),
         (!s.saved_permissions.is_empty()).then(|| s.saved_permissions.len().to_string()),
@@ -501,16 +516,16 @@ fn saved_card(s: &UiState, k: &Kit) -> Option<El> {
     ))
 }
 
-fn shells_card(s: &UiState, k: &Kit) -> Option<El> {
-    if !agent_supports_shells(s) {
+fn shells_card(s: &UiState, k: &Kit, asid: &str) -> Option<El> {
+    if !agent_supports_shells_for(s, asid) {
         return None;
     }
     let language = s.cfg.general.language;
     let t = |en: &'static str| tr_ref(language, en);
     let open =
-        s.activity_panel.shells_open || !s.shells.is_empty() || can_background_target_turn(s);
+        s.activity_panel.shells_open || !s.shells.is_empty() || can_background_turn_for(s, asid);
     let (agent, dir) = s
-        .panel_target_session()
+        .session_by_id(asid)
         .map(|i| (i.agent_id.clone(), i.directory.clone()))
         .unwrap_or_default();
     let (a_toggle, d_toggle) = (agent.clone(), dir.clone());
@@ -518,7 +533,7 @@ fn shells_card(s: &UiState, k: &Kit) -> Option<El> {
         k,
         if open { t("Hide") } else { t("Show") },
         ButtonVariant::GhostMuted,
-        "activity-shells-toggle".into(),
+        format!("activity-shells-toggle-{asid}"),
         move |s| {
             let next = !s.activity_panel.shells_open;
             s.activity_panel.shells_open = next;
@@ -545,26 +560,25 @@ fn shells_card(s: &UiState, k: &Kit) -> Option<El> {
                     });
                 })
                 .build(k)
-                .key("activity-shells-refresh"),
+                .key(format!("activity-shells-refresh-{asid}")),
         );
     }
 
     let mut body = Vec::new();
     if open {
-        if can_background_target_turn(s) {
-            if let Some(asid) = s.panel_target_asid().map(str::to_string) {
-                body.push(small_btn(
-                    k,
-                    t("Move turn to background"),
-                    ButtonVariant::Outline,
-                    "bg-session".into(),
-                    move |s| {
-                        s.send(Command::BackgroundSession {
-                            asid: AgentSessionId(asid.clone()),
-                        });
-                    },
-                ));
-            }
+        if can_background_turn_for(s, asid) && !asid.is_empty() {
+            let bg_asid = asid.to_string();
+            body.push(small_btn(
+                k,
+                t("Move turn to background"),
+                ButtonVariant::Outline,
+                format!("bg-session-{asid}"),
+                move |s| {
+                    s.send(Command::BackgroundSession {
+                        asid: AgentSessionId(bg_asid.clone()),
+                    });
+                },
+            ));
         }
         if s.shells.is_empty() {
             body.push(
@@ -575,14 +589,14 @@ fn shells_card(s: &UiState, k: &Kit) -> Option<El> {
         } else {
             for sh in &s.shells {
                 let (a, id, d) = (agent.clone(), sh.id.clone(), dir.clone());
-                let confirm_key = format!("stop-sh:{}", sh.id);
+                let confirm_key = format!("stop-sh:{asid}:{}", sh.id);
                 let stop_btn = confirm_btn(
                     s,
                     k,
                     confirm_key,
                     (t("Stop"), t("Confirm")),
                     ButtonVariant::GhostMuted,
-                    format!("ks-{}", sh.id),
+                    format!("ks-{asid}-{}", sh.id),
                     move |s| {
                         s.shells.retain(|x| x.id != id);
                         s.send(Command::KillShell {
@@ -598,7 +612,7 @@ fn shells_card(s: &UiState, k: &Kit) -> Option<El> {
                     sh.command.clone()
                 };
                 body.push(
-                    sub_card(k, format!("sh-{}", sh.id))
+                    sub_card(k, format!("sh-{asid}-{}", sh.id))
                         .child(
                             row()
                                 .w_full()
@@ -624,7 +638,7 @@ fn shells_card(s: &UiState, k: &Kit) -> Option<El> {
 
     Some(section_card(
         k,
-        "activity-shells-card",
+        format!("activity-shells-card-{asid}"),
         &parts::glyphs::TERMINAL,
         t("Background shells"),
         (!s.shells.is_empty()).then(|| s.shells.len().to_string()),
@@ -633,38 +647,57 @@ fn shells_card(s: &UiState, k: &Kit) -> Option<El> {
     ))
 }
 
-/// Render the top-level Activity panel (Queue + Multi-tile + Session Tree + capability-gated extras).
-pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
-    let mut cards = waiting_and_queue_cards(s, k);
-    cards.push(tree_card(s, k));
-    if let Some(saved) = saved_card(s, k) {
+/// Render the Activity panel for a specific session `asid`.
+/// When `inline == true`, renders without the Target Session Bar (used inside a tile drawer).
+pub(crate) fn view_for_session(
+    s: &UiState,
+    k: &Kit,
+    layer: &mut Vec<El>,
+    asid: &str,
+    inline: bool,
+) -> El {
+    let mut cards = waiting_and_queue_cards(s, k, asid, inline);
+    cards.push(tree_card(s, k, asid));
+    if let Some(saved) = saved_card(s, k, asid) {
         cards.push(saved);
     }
-    if let Some(shells) = shells_card(s, k) {
+    if let Some(shells) = shells_card(s, k, asid) {
         cards.push(shells);
     }
 
-    col()
-        .key("activity-panel")
+    let scroll = col()
+        .key(format!("activity-panel-scroll-{asid}"))
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .px(12.0)
+        .py(12.0)
+        .gap(10.0)
+        .children(cards)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .scroll_bar(k);
+
+    let mut root = col()
+        .key(if inline {
+            format!("activity-panel-inline-{asid}")
+        } else {
+            "activity-panel".to_string()
+        })
         .w_full()
         .h_full()
-        .min_h(0.0)
-        .child(target_session_bar(s, k, layer, "activity"))
-        .child(
-            col()
-                .key("activity-panel-scroll")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .px(12.0)
-                .py(12.0)
-                .gap(10.0)
-                .children(cards)
-                .scroll(ScrollSpec {
-                    stick_bottom: false,
-                })
-                .scroll_bar(k),
-        )
+        .min_h(0.0);
+    if !inline {
+        root = root.child(target_session_bar(s, k, layer, "activity"));
+    }
+    root.child(scroll)
+}
+
+/// Render the standalone top-level Activity plugin panel.
+pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
+    let asid = s.panel_target_asid().unwrap_or_default().to_string();
+    view_for_session(s, k, layer, &asid, false)
 }
 
 #[cfg(test)]
@@ -730,12 +763,10 @@ mod tests {
         s.sessions.push(fake_session("s-codex", "codex"));
         s.sessions.push(fake_session("s-oc", "opencode"));
 
-        s.selected = Some("s-codex".into());
-        assert!(!agent_supports_saved_permissions(&s));
-        assert!(!agent_supports_shells(&s));
+        assert!(!agent_supports_saved_permissions_for(&s, "s-codex"));
+        assert!(!agent_supports_shells_for(&s, "s-codex"));
 
-        s.selected = Some("s-oc".into());
-        assert!(agent_supports_saved_permissions(&s));
-        assert!(agent_supports_shells(&s));
+        assert!(agent_supports_saved_permissions_for(&s, "s-oc"));
+        assert!(agent_supports_shells_for(&s, "s-oc"));
     }
 }

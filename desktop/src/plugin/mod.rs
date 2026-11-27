@@ -2071,7 +2071,10 @@ mod tests {
         assert!(diff_plugin.on_command(&mut s, "diff.open_view"));
         assert!(s.show_diff);
         assert!(diff_plugin.on_command(&mut s, "diff.open_inspector"));
-        assert!(s.right_open);
+        assert_eq!(
+            s.active_tile_inline_panel(),
+            Some(crate::ui::TileInlinePanel::Git)
+        );
 
         let term_plugin = s.plugins.get("terminal").expect("terminal registered");
         assert!(term_plugin.supports_surface(PluginSlot::Tile));

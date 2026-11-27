@@ -1530,8 +1530,8 @@ fn mount_popup(
     let active = active_row(s, &state);
     let look = s.look();
     let anchor = match slot {
-        Slot::Session => "draft",
-        Slot::Start => "start-draft",
+        Slot::Session => card_layout_key(s.selected.as_deref(), s.in_split()),
+        Slot::Start => "start-draft".to_string(),
     };
 
     let close_query = query.clone();
@@ -1722,7 +1722,7 @@ fn mount_popup(
     let panel = look.floating_surface(k, panel, k.radius.lg);
 
     let anchored_panel = panel
-        .anchored_fit(anchor, rune::Side::Top, rune::Align::Start, 6.0)
+        .anchored_fit(&anchor, rune::Side::Top, rune::Align::Start, 6.0)
         .transition(rune::Transition::opacity().combined(rune::Transition::scale(0.97)))
         .token_motion(k.motion.overlay);
 
@@ -1744,8 +1744,8 @@ pub(super) fn history_popup(s: &UiState, k: &Kit, layer: &mut Vec<El>, slot: Slo
     let language = s.cfg.general.language;
     let look = s.look();
     let anchor = match slot {
-        Slot::Session => "draft",
-        Slot::Start => "start-draft",
+        Slot::Session => card_layout_key(s.selected.as_deref(), s.in_split()),
+        Slot::Start => "start-draft".to_string(),
     };
 
     // Scrim overlay to catch outside clicks
@@ -1907,7 +1907,7 @@ pub(super) fn history_popup(s: &UiState, k: &Kit, layer: &mut Vec<El>, slot: Slo
     let panel = look.floating_surface(k, panel, k.radius.lg);
 
     let anchored_panel = panel
-        .anchored_fit(anchor, rune::Side::Top, rune::Align::Start, 6.0)
+        .anchored_fit(&anchor, rune::Side::Top, rune::Align::Start, 6.0)
         .transition(rune::Transition::opacity().combined(rune::Transition::scale(0.97)))
         .token_motion(k.motion.overlay);
 

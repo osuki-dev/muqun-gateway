@@ -1368,9 +1368,6 @@ pub fn intercept_global_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool
     if ev.key == rune::Key::Escape
         && !(ev.mods.shift || ev.mods.alt || ev.mods.ctrl || ev.mods.cmd || ev.mods.logo)
         && s.mode == Mode::Session
-        && s.in_split()
-        && s.right_open
-        && matches!(s.active_plugin_drawer.as_deref(), Some("git" | "activity"))
         && s.menu.is_none()
         && s.row_menu.is_none()
         && s.context_open.is_none()
@@ -1382,8 +1379,17 @@ pub fn intercept_global_key(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool
         && !s.timeline_search.active
         && s.voice.is_none()
     {
-        s.toggle_right_panel();
-        return true;
+        if s.active_tile_inline_panel().is_some() {
+            s.set_tile_inline_panel(s.focus, None);
+            return true;
+        }
+        if s.in_split()
+            && s.right_open
+            && matches!(s.active_plugin_drawer.as_deref(), Some("git" | "activity"))
+        {
+            s.toggle_right_panel();
+            return true;
+        }
     }
     if is_leader_event(s, ev, tx) {
         s.arm_leader(tx);
@@ -1846,7 +1852,10 @@ pub fn esc_step(s: &UiState) -> Option<EscStep> {
     if s.show_diff {
         return Some(EscStep::Diff);
     }
-    if s.inspect.is_some() || (s.right_open && s.active_plugin_drawer.is_some()) {
+    if s.active_tile_inline_panel().is_some()
+        || s.inspect.is_some()
+        || (s.right_open && s.active_plugin_drawer.is_some())
+    {
         return Some(EscStep::Pane);
     }
     if s.term.search.open {
@@ -1911,7 +1920,9 @@ pub fn escape(s: &mut UiState) -> bool {
         }
         EscStep::Diff => s.show_diff = false,
         EscStep::Pane => {
-            if s.inspect.is_some() {
+            if s.active_tile_inline_panel().is_some() {
+                s.set_tile_inline_panel(s.focus, None);
+            } else if s.inspect.is_some() {
                 s.close_inspect();
             } else {
                 s.close_plugin_drawer();
@@ -2361,16 +2372,20 @@ mod tests {
             crate::ui::Tile::session("two"),
         ];
         s.selected = Some("one".into());
+        s.right_open = false;
         s.open_git_panel();
         s.draft = rune::TextEdit::new("pending");
         let mut rt = Runtime::new(s, super::super::view, (1440.0, 900.0), Env::new(true, 1.0));
         rt.on_key = Some(super::super::on_key);
         rt.frame(0.0);
-        assert!(rt.state.right_open);
-        assert_eq!(rt.state.active_plugin_drawer.as_deref(), Some("git"));
+        assert!(!rt.state.right_open);
+        assert_eq!(
+            rt.state.active_tile_inline_panel(),
+            Some(crate::ui::TileInlinePanel::Git)
+        );
         rt.key(Key::Escape.into());
         rt.frame(1.0 / 60.0);
-        assert!(!rt.state.right_open);
+        assert!(rt.state.active_tile_inline_panel().is_none());
         assert_eq!(rt.state.tiles.len(), 2);
         assert_eq!(rt.state.draft.text, "pending");
     }

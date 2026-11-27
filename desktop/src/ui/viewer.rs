@@ -1438,14 +1438,18 @@ mod tests {
         ];
         s.selected = Some("one".into());
         s.open_git_panel();
-        assert!(s.right_open);
-        assert_eq!(s.active_plugin_drawer.as_deref(), Some("git"));
-        assert_eq!(s.selected_dock_tab(), Some("git"));
+        assert!(!s.right_open);
+        assert_eq!(
+            s.active_tile_inline_panel(),
+            Some(crate::ui::TileInlinePanel::Git)
+        );
         s.open_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/icons/app-icon.png"));
         assert!(s.file_window_focused());
         s.focus_tile(0);
-        assert!(s.right_open);
-        assert_eq!(s.selected_dock_tab(), Some("git"));
+        assert_eq!(
+            s.active_tile_inline_panel(),
+            Some(crate::ui::TileInlinePanel::Git)
+        );
     }
 
     #[test]
