@@ -52,8 +52,6 @@ fn mode_glyph(id: &str) -> (&'static Icon, bool) {
 const PILL_PAD: f32 = 22.0;
 /// `composer::pill` (`model_menu` / `effort_menu`): 12 pt each side + 1 pt border each side.
 const MENU_PILL_PAD: f32 = 26.0;
-/// Width of `ActivityMark::Compact` (12 pt) plus its 5 pt gap inside `agent_chip`.
-const BUSY_MARK_W: f32 = 17.0;
 /// Compact controls keep enough room around their glyph.
 const ICON_PILL: f32 = 32.0;
 const GLYPH: f32 = 14.0;
@@ -375,11 +373,9 @@ impl Controls {
             items.push(if f.agent_icon {
                 ICON_PILL
             } else {
-                let busy_w = if self.busy { BUSY_MARK_W } else { 0.0 };
                 7.0 + super::composer::AGENT_ICON
                     + 5.0
                     + text_w(&self.agent_name, k.ty.small_medium)
-                    + busy_w
                     + 7.0
             });
         }
@@ -548,7 +544,7 @@ fn pill_button(
 
 fn agent_chip(c: &Controls, k: &Kit, f: Fold) -> El {
     let mark = super::agents::mark(&c.agent_id, super::composer::AGENT_ICON, c.dark).a11y_hidden();
-    let mut chip = row()
+    let chip = row()
         .key("agent")
         .role("image")
         .label(c.agent_name.clone())
@@ -565,16 +561,12 @@ fn agent_chip(c: &Controls, k: &Kit, f: Fold) -> El {
             .center()
             .help(c.agent_name.clone());
     }
-    chip = chip.gap(5.0).px(7.0).child(
+    chip.gap(5.0).px(7.0).child(
         text(c.agent_name.clone())
             .font(k.ty.small_medium)
             .color(k.c.text_muted)
             .a11y_hidden(),
-    );
-    if c.busy {
-        chip = chip.child(crate::ui::art::ActivityMark::Compact.build(k));
-    }
-    chip
+    )
 }
 
 fn reload_model(k: &Kit, c: &Controls, label: String) -> El {
