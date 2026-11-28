@@ -27,6 +27,7 @@ pub(crate) use connectivity::push::*;
 pub(crate) use connectivity::{authority, gateway_listener, transport};
 pub(crate) use platform::assets::*;
 pub(crate) use platform::config::*;
+pub use platform::gateway_control;
 pub(crate) use platform::http::*;
 pub(crate) use platform::manage::*;
 pub(crate) use platform::metadata::*;

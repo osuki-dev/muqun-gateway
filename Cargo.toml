@@ -107,11 +107,11 @@ opt-level = 3
 
 # Rune platform patches, pinned with the UI framework.
 [patch.crates-io]
-wgpu-hal = { git = "https://github.com/ryuhzk/rune", rev = "6a5672222eed1c967c0a216b28e85f5a2972e6d3" }
-naga = { git = "https://github.com/ryuhzk/rune", rev = "6a5672222eed1c967c0a216b28e85f5a2972e6d3" }
-winit = { git = "https://github.com/ryuhzk/rune", rev = "6a5672222eed1c967c0a216b28e85f5a2972e6d3" }
-sctk-adwaita = { git = "https://github.com/ryuhzk/rune", rev = "6a5672222eed1c967c0a216b28e85f5a2972e6d3" }
-parley_engine = { git = "https://github.com/ryuhzk/rune", rev = "6a5672222eed1c967c0a216b28e85f5a2972e6d3" }
-accesskit_windows = { git = "https://github.com/ryuhzk/rune", rev = "6a5672222eed1c967c0a216b28e85f5a2972e6d3" }
-accesskit_atspi_common = { git = "https://github.com/ryuhzk/rune", rev = "6a5672222eed1c967c0a216b28e85f5a2972e6d3" }
-accesskit_macos = { git = "https://github.com/ryuhzk/rune", rev = "6a5672222eed1c967c0a216b28e85f5a2972e6d3" }
+wgpu-hal = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f" }
+naga = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f" }
+winit = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f" }
+sctk-adwaita = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f" }
+parley_engine = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f" }
+accesskit_windows = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f" }
+accesskit_atspi_common = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f" }
+accesskit_macos = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f" }

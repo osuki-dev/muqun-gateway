@@ -5,6 +5,7 @@ pub(crate) mod chunked_uploads;
 pub mod config;
 pub mod discovery;
 pub(crate) mod file_ranges;
+pub mod gateway_control;
 pub mod git;
 pub mod git_prs;
 pub(crate) mod http;

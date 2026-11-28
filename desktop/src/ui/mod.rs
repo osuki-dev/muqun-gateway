@@ -642,6 +642,7 @@ pub struct UiState {
     forgotten_computers: HashSet<String>,
     pub local_revoke: settings::revoke_device::State,
     pub(crate) local_invite: Option<settings::local_devices::InvitePanel>,
+    pub(crate) local_gateway: settings::local_gateway::LocalGatewayPanel,
     pub gateway_setup: Option<crate::platform::gateway_bootstrap::Status>,
     desktop_update_panel: bool,
     restart_checkpoint_pending: bool,
@@ -916,6 +917,7 @@ impl UiState {
             plugin_fields: HashMap::new(),
             diagnostic_filter: Default::default(),
             local_invite: None,
+            local_gateway: Default::default(),
             gateway_setup: gateway_setup::required(crate::platform::gateway_bootstrap::status()),
             desktop_update_panel: false,
             restart_checkpoint_pending: false,
@@ -4792,6 +4794,10 @@ impl UiState {
             UiAction::LocalPairings(devices) => {
                 self.local_revoke.cancel_confirmation();
                 self.local_pairings = devices;
+            }
+            UiAction::LocalGatewayControl(result) => self.receive_local_gateway_control(result),
+            UiAction::LocalGatewayControlApplied(result) => {
+                self.finish_local_gateway_action(result)
             }
             UiAction::LocalGatewayStatus(status) => self.receive_gateway_setup(status),
             UiAction::LocalGatewayReady => {

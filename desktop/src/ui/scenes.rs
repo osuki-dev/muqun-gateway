@@ -917,6 +917,64 @@ fn base_scenes() -> &'static [Scene] {
             s.right.set_open(false);
             s.open_git_panel();
         }),
+        ("settings-computers-gateway", |s| {
+            base(s);
+            s.mode = Mode::Settings;
+            s.settings_tab = SettingsTab::Computers;
+            s.local_pairings = crate::platform::paired_devices::List::Ready(vec![
+                crate::platform::paired_devices::Client {
+                    id: "dev-iphone".into(),
+                    name: "iPhone 16 Pro".into(),
+                    kind: Some("app".into()),
+                    last_seen_unix_ms: Some(super::now_ms().saturating_sub(120_000)),
+                },
+                crate::platform::paired_devices::Client {
+                    id: "dev-mini".into(),
+                    name: "Mac mini".into(),
+                    kind: Some("gateway".into()),
+                    last_seen_unix_ms: Some(super::now_ms().saturating_sub(600_000)),
+                },
+            ]);
+            s.receive_local_gateway_control(Ok(
+                muqun_gateway::gateway_control::GatewayControlSnapshot {
+                    configured: true,
+                    running: true,
+                    pid: Some(42180),
+                    service_state: muqun_gateway::gateway_control::ServiceState::Installed,
+                    config_changed_since_start: false,
+                    cli_available: true,
+                    server_id: "srv-demo".into(),
+                    label: "workstation".into(),
+                    public_url: "http://100.64.0.12:23847".into(),
+                    listen: "0.0.0.0:23847".into(),
+                    port: 23847,
+                    transport_encryption: true,
+                    allow_remote_auto_approve: true,
+                    agent_trust_folders: true,
+                    rich_agent_pushes: false,
+                    backends: vec![
+                        muqun_gateway::gateway_control::GatewayBackendInfo {
+                            id: "tmux".into(),
+                            label: "tmux".into(),
+                            kind: "tmux".into(),
+                            endpoint: "default".into(),
+                            is_default: true,
+                            autostart: true,
+                        },
+                        muqun_gateway::gateway_control::GatewayBackendInfo {
+                            id: "desktop-terminal".into(),
+                            label: "Muqun Terminal".into(),
+                            kind: "desktop-terminal".into(),
+                            endpoint: "~/.local/state/muqun-desktop/term.sock".into(),
+                            is_default: false,
+                            autostart: false,
+                        },
+                    ],
+                    config_path: "~/.config/muqun-gateway/config.json".into(),
+                },
+            ));
+            s.demo = true;
+        }),
         ("split-pick", |s| {
             session_scene(s);
             s.right_open = false;

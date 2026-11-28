@@ -302,6 +302,8 @@ pub enum Command {
     RefreshLocalPairings,
     ReadLocalInvite(u64),
     RevokeLocalPairing(String),
+    RefreshLocalGatewayControl,
+    RunLocalGatewayControl(muqun_gateway::gateway_control::GatewayControlAction),
     UnpairComputer {
         computer: String,
         request: uuid::Uuid,

@@ -337,6 +337,76 @@ pub fn submit_active_form(s: &mut UiState) -> bool {
     submit_form(s, &form)
 }
 
+fn insert_pasted_paths(edit: &mut TextEdit, paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    let joined = paths.join(" ");
+    let prefix = if !edit.text.is_empty() && !edit.text.ends_with(char::is_whitespace) {
+        " "
+    } else {
+        ""
+    };
+    let appended = format!("{}{prefix}{joined}", edit.text);
+    let len = appended.len();
+    edit.text = appended;
+    edit.anchor = len;
+    edit.focus = len;
+}
+
+/// Handle clipboard file or image pastes inside a question answer field.
+/// Because agent `ReplyForm` payloads carry JSON text answers (not binary
+/// attachments), pasted screenshots are saved to local uploads and their path
+/// (or pasted file paths) are inserted so the agent can read them directly.
+fn paste_into_form_slot(
+    s: &mut UiState,
+    edit_slot: &str,
+    answer_slot: &str,
+    content: &rune::ClipboardContent,
+) -> bool {
+    let lang = s.cfg.general.language;
+    let files = content.files();
+    let paths: Vec<String> = if !files.is_empty() {
+        files
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect()
+    } else if let Some(image) = content.image() {
+        match muqun_gateway::platform::store_upload("question-clipboard.png", image.png()) {
+            Ok(stored) => vec![stored.path.to_string_lossy().into_owned()],
+            Err(err) => {
+                s.toast_error(
+                    tr_ref(lang, "Could not save pasted image"),
+                    Some(err.message()),
+                );
+                return true;
+            }
+        }
+    } else {
+        return false;
+    };
+    if paths.is_empty() {
+        return false;
+    }
+    let entry = s
+        .form_inputs
+        .entry(edit_slot.to_string())
+        .or_insert_with(|| TextEdit::new(""));
+    insert_pasted_paths(entry, &paths);
+    let updated = entry.text.clone();
+    if answer_slot != edit_slot {
+        s.form_inputs
+            .insert(answer_slot.to_string(), TextEdit::new(updated));
+    }
+    let msg = if content.image().is_some() {
+        tr_ref(lang, "Pasted image path into answer")
+    } else {
+        tr_ref(lang, "Inserted file path into answer")
+    };
+    s.toast(msg.to_string(), None);
+    true
+}
+
 fn text_input(
     s: &UiState,
     k: &Kit,
@@ -351,6 +421,7 @@ fn text_input(
         .cloned()
         .unwrap_or_else(|| TextEdit::new(current.to_string()));
     let (target, current) = (slot.to_string(), current.to_string());
+    let paste_slot = slot.to_string();
     let submit_target = form.clone();
     TextInput::new(&edit)
         .placeholder(placeholder)
@@ -359,6 +430,11 @@ fn text_input(
                 .entry(target.clone())
                 .or_insert_with(|| TextEdit::new(current.clone()))
         })
+        .on_input_paste(
+            move |s: &mut UiState, content: &rune::ClipboardContent, _: &mut rune::Tx| {
+                paste_into_form_slot(s, &paste_slot, &paste_slot, content)
+            },
+        )
         .on_key(
             move |s: &mut UiState, ev: &rune::KeyEvent, _: &mut rune::Tx| {
                 if ev.key == rune::Key::Enter
@@ -477,6 +553,8 @@ fn field_input(s: &UiState, k: &Kit, form: &FormRequest, field: &FormField) -> E
                     .unwrap_or_else(|| TextEdit::new(typed.clone()));
                 let (edit_slot, answer_slot, init_typed) =
                     (custom_slot.clone(), slot.clone(), typed);
+                let paste_edit = custom_slot.clone();
+                let paste_answer = slot.clone();
                 let sync_slot = custom_slot.clone();
                 let sync_answer = slot.clone();
                 let submit_target = form.clone();
@@ -488,6 +566,13 @@ fn field_input(s: &UiState, k: &Kit, form: &FormRequest, field: &FormField) -> E
                                 .entry(edit_slot.clone())
                                 .or_insert_with(|| TextEdit::new(init_typed.clone()))
                         })
+                        .on_input_paste(
+                            move |s: &mut UiState,
+                                  content: &rune::ClipboardContent,
+                                  _: &mut rune::Tx| {
+                                paste_into_form_slot(s, &paste_edit, &paste_answer, content)
+                            },
+                        )
                         .on_change(move |s: &mut UiState, _: &mut rune::Tx| {
                             let val = s
                                 .form_inputs
@@ -793,5 +878,17 @@ mod tests {
             Command::ReplyForm { ref id, ref answers, .. }
                 if id == "f-1" && answers["target"] == serde_json::json!("prod")
         ));
+    }
+
+    #[test]
+    fn pasted_paths_append_cleanly_to_question_answer() {
+        let mut edit = TextEdit::new("see");
+        insert_pasted_paths(
+            &mut edit,
+            &["/tmp/a.png".to_string(), "/tmp/b.log".to_string()],
+        );
+        assert_eq!(edit.text, "see /tmp/a.png /tmp/b.log");
+        assert_eq!(edit.anchor, edit.text.len());
+        assert_eq!(edit.focus, edit.text.len());
     }
 }

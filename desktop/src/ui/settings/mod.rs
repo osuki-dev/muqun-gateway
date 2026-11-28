@@ -12,6 +12,7 @@ mod about;
 pub(super) mod computers;
 mod diagnostics;
 pub(crate) mod local_devices;
+pub(crate) mod local_gateway;
 pub(super) mod revoke_device;
 pub use diagnostics::DiagnosticFilter;
 mod agents;
@@ -97,7 +98,10 @@ impl SettingsTab {
                 language,
                 "Language, where new sessions start, and notifications.",
             ),
-            Self::Computers => tr_ref(language, "Manage connections to other computers."),
+            Self::Computers => tr_ref(
+                language,
+                "Computers, device pairing, and this computer's Gateway.",
+            ),
             Self::Appearance => tr_ref(language, "Light or dark, text size, density and motion."),
             Self::Themes => tr_ref(
                 language,
@@ -132,7 +136,10 @@ pub(super) fn open(s: &mut UiState, tab: SettingsTab) {
     s.menu = None;
     match tab {
         SettingsTab::About if s.desktop_update == Default::default() => s.check_desktop_update(),
-        SettingsTab::Computers => s.refresh_local_pairings(),
+        SettingsTab::Computers => {
+            s.refresh_local_pairings();
+            s.refresh_local_gateway_control();
+        }
         SettingsTab::Agents => s.refresh_account_limits(false),
         SettingsTab::McpHub => s.refresh_mcp_upstreams(),
         SettingsTab::Themes => s.send(Command::ThemeRefresh),

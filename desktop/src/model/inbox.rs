@@ -107,6 +107,10 @@ pub enum UiAction {
     DesktopUpdate(crate::platform::update::Status),
     DesktopRestartCheckpoint(bool),
     LocalPairings(crate::platform::paired_devices::List),
+    LocalGatewayControl(Result<muqun_gateway::gateway_control::GatewayControlSnapshot, String>),
+    LocalGatewayControlApplied(
+        Result<muqun_gateway::gateway_control::GatewayControlOutcome, String>,
+    ),
     LocalPairingRevoked {
         id: String,
         result: Result<(), String>,

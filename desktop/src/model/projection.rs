@@ -451,6 +451,8 @@ impl Core {
                     | Command::InstallDesktopUpdate(_)
                     | Command::CheckDesktopUpdate
                     | Command::RefreshLocalPairings
+                    | Command::RefreshLocalGatewayControl
+                    | Command::RunLocalGatewayControl(_)
                     | Command::ScanStorage
                     | Command::ClearStorage
                     | Command::PluginPackage(..)
@@ -1229,6 +1231,27 @@ impl Core {
                     .push(Update::Ui(crate::model::inbox::UiAction::LocalPairings(
                         devices,
                     )));
+            }
+            Command::RefreshLocalGatewayControl => {
+                let result =
+                    tokio::task::spawn_blocking(muqun_gateway::gateway_control::load_snapshot)
+                        .await
+                        .map_err(|err| err.to_string())
+                        .and_then(|res| res.map_err(|err| err.to_string()));
+                self.inbox.push(Update::Ui(
+                    crate::model::inbox::UiAction::LocalGatewayControl(result),
+                ));
+            }
+            Command::RunLocalGatewayControl(action) => {
+                let result = tokio::task::spawn_blocking(move || {
+                    muqun_gateway::gateway_control::apply(action)
+                })
+                .await
+                .map_err(|err| err.to_string())
+                .and_then(|res| res.map_err(|err| err.to_string()));
+                self.inbox.push(Update::Ui(
+                    crate::model::inbox::UiAction::LocalGatewayControlApplied(result),
+                ));
             }
             Command::ScanStorage => {
                 if let Ok(report) = tokio::task::spawn_blocking(super::storage::scan).await {

@@ -11,17 +11,16 @@ publish = false
 name = "muqun-desktop"
 path = "src/main.rs"
 
-# UI: Rune. `muqun-sync-20261124` carries `TextInput`/`TextArea::on_input_paste`
-# and `SplitView::sidebar_leading` on top of anomalyco/rune@46f334ef until those
-# land upstream (CJK .ttc fallbacks and native Wayland file drops are now upstream);
+# UI: Rune. `muqun-sync-20261128` carries `SplitView::sidebar_leading` on top of
+# anomalyco/rune@dd15d6a7 until it lands upstream (`on_input_paste` landed in #1921);
 # patches live in desktop/patches/rune/ for review.
 [dependencies]
 muqun-gateway = { path = ".." }
-rune = { git = "https://github.com/ryuhzk/rune", rev = "6a5672222eed1c967c0a216b28e85f5a2972e6d3", features = ["tooling"] }
-rune-kit = { git = "https://github.com/ryuhzk/rune", rev = "6a5672222eed1c967c0a216b28e85f5a2972e6d3", features = ["markdown"] }
+rune = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f", features = ["tooling"] }
+rune-kit = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f", features = ["markdown"] }
 # GPU effect layers (`ui/fx.rs`): glow and liquid metal at effect slots.
-rune-fx = { git = "https://github.com/ryuhzk/rune", rev = "6a5672222eed1c967c0a216b28e85f5a2972e6d3" }
-rune-i18n = { git = "https://github.com/ryuhzk/rune", rev = "6a5672222eed1c967c0a216b28e85f5a2972e6d3" }
+rune-fx = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f" }
+rune-i18n = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f" }
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl"] }
 anyhow = "1.0.103"
 uuid = { version = "1.29.0", features = ["v4", "serde"] }
@@ -62,7 +61,7 @@ unicode-width = "0.2"
 zbus = { version = "6.2.1", default-features = false, features = ["tokio", "proxy"] }
 
 [build-dependencies]
-rune-i18n = { git = "https://github.com/ryuhzk/rune", rev = "6a5672222eed1c967c0a216b28e85f5a2972e6d3", features = ["codegen"] }
+rune-i18n = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f", features = ["codegen"] }
 
 
 [dev-dependencies]

@@ -256,6 +256,7 @@ pub(super) fn page(s: &UiState, k: &Kit) -> Vec<El> {
         ));
     }
     groups.push(super::local_devices::group(s, k));
+    groups.extend(super::local_gateway::groups(s, k));
     groups
 }
 
