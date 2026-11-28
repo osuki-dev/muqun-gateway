@@ -5062,7 +5062,7 @@ fn page_empty(s: &UiState, k: &Kit) -> El {
         .gap(18.0)
         .child(
             el().size(52.0, 52.0)
-                .radius(16.0)
+                .radius(k.radius.xl)
                 .fill(k.c.bg_accent.alpha(0.12))
                 .border(1.0, k.c.bg_accent.alpha(0.35))
                 .center()

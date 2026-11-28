@@ -23,19 +23,20 @@ fn meter(k: &Kit, ratio: Option<f32>, motion: bool, label: &str) -> El {
     let accent = k.c.bg_accent;
     let tail = accent.mix(k.c.bg_base, 0.30);
     let tip = accent.mix(k.c.white, 0.42);
+    let track_r = k.radius.sm.min(6.0);
     let mut track = row()
         .key("download-track")
         .role("progressbar")
         .label(label)
         .w_full()
         .h(12.0)
-        .radius(6.0)
+        .radius(track_r)
         .fill(k.c.layer_02)
         .border(1.0, k.c.border_weak);
     let mut beam = el()
         .key("download-beam")
         .h_full()
-        .radius(6.0)
+        .radius(track_r)
         .linear_gradient(1.57, [(0.0, tail), (0.68, accent), (1.0, tip)])
         .shadow(0.0, 8.0, accent.alpha(0.45));
     if let Some(ratio) = ratio {

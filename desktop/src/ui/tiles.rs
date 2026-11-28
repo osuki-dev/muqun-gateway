@@ -1159,7 +1159,7 @@ fn picker(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
             if activity != Activity::Idle {
                 line = line.child(activity_pill(k, look, activity, language));
             }
-            let mut card = look.pressable(k, look.row_card(k, line, 10.0));
+            let mut card = look.pressable(k, look.row_card(k, line, k.radius.md));
             if is_sel {
                 card = look.accent_rim(k, card, k.c.bg_accent);
             }
@@ -1177,7 +1177,7 @@ fn picker(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
 
     let new_session = Button::new(tr_ref(language, "New session…"))
         .variant(ButtonVariant::Submit)
-        .control_size(ControlSize::Small)
+        .control_size(ControlSize::Regular)
         .on_press(move |s: &mut UiState| {
             s.pending_tile = Some(i);
             s.go(Mode::Home);

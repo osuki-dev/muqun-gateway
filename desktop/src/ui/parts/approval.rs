@@ -240,7 +240,7 @@ pub fn permission_card(s: &UiState, k: &Kit, request: &PermissionRequest) -> El 
         };
         let mut button = Button::new(option_label(language, option))
             .variant(variant)
-            .control_size(ControlSize::Small)
+            .control_size(ControlSize::Regular)
             .on_press(reply(request, option.decision))
             .build(k)
             .key(format!("perm-{}-{i}", request.id));

@@ -923,6 +923,111 @@ fn base_scenes() -> &'static [Scene] {
             s.right.set_open(false);
             s.split();
         }),
+        ("question-answered", |s| {
+            base(s);
+            let answered_q = tool_item(
+                "qa1",
+                "question",
+                "completed",
+                json!({
+                    "input": {
+                        "questions": [
+                            {
+                                "header": "Target branch",
+                                "question": "Where should the fix go?",
+                                "options": [
+                                    { "label": "main", "description": "Ship it today" },
+                                    { "label": "release/0.14", "description": "Backport only" }
+                                ]
+                            },
+                            {
+                                "header": "Release action",
+                                "question": "Should we push after committing?",
+                                "options": [
+                                    { "label": "Push & open PR" },
+                                    { "label": "Push only" }
+                                ]
+                            }
+                        ]
+                    },
+                    "metadata": {
+                        "answers": [["main"], ["Keep local commit only"]]
+                    }
+                }),
+            );
+            let resolved_form: FormRequest = serde_json::from_value(json!({
+                "id": "f-done",
+                "asid": "s1",
+                "title": "Confirm release branch",
+                "fields": [{
+                    "type": "string",
+                    "key": "branch",
+                    "title": "Branch",
+                    "options": [
+                        { "value": "main", "label": "main" },
+                        { "value": "release/0.14", "label": "release/0.14" }
+                    ]
+                }]
+            }))
+            .expect("resolved form");
+            let pending_form: FormRequest = serde_json::from_value(json!({
+                "id": "f-live",
+                "asid": "s1",
+                "title": "Choose verification target",
+                "fields": [{
+                    "type": "string",
+                    "key": "env",
+                    "title": "Environment",
+                    "required": true,
+                    "custom": true,
+                    "options": [
+                        { "value": "staging", "label": "Staging", "description": "Run against staging cluster" },
+                        { "value": "local", "label": "Local only", "description": "Verify on this computer" }
+                    ]
+                }]
+            }))
+            .expect("pending form");
+            s.form_inputs
+                .insert("f-done/branch".into(), TextEdit::new("main"));
+            s.form_inputs
+                .insert("f-live/env".into(), TextEdit::new("local"));
+            let items = vec![
+                answered_q,
+                item(
+                    "qf1",
+                    TimelineRole::Assistant,
+                    AgentPart::Form {
+                        request: resolved_form,
+                    },
+                ),
+                item(
+                    "qf2",
+                    TimelineRole::Assistant,
+                    AgentPart::Form {
+                        request: pending_form.clone(),
+                    },
+                ),
+            ];
+            s.open_session_current("s1");
+            s.apply_updates(vec![crate::model::inbox::Update::Snapshot(Box::new(
+                muqun_gateway::agents::ports::AgentSessionSnapshot {
+                    info: s.sessions[0].clone(),
+                    timeline: items,
+                    permissions: vec![],
+                    forms: vec![pending_form],
+                    inbox: vec![],
+                    seq: 1,
+                },
+            ))]);
+            if let Some(tl) = s.timelines.get_mut("s1") {
+                tl.flip("qa1");
+                tl.earlier_exhausted = true;
+            }
+            s.mode = Mode::Session;
+            s.right_open = false;
+            s.right.set_open(false);
+            s.demo = true;
+        }),
         ("desktop-update-toast", |s| {
             session_scene(s);
             s.right_open = false;

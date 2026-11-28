@@ -94,7 +94,7 @@ fn banner(s: &UiState, k: &Kit) -> El {
                 .children(crate::theme::omarchy::available().then(|| {
                     Button::new(tr_ref(language, "Follow Omarchy theme"))
                         .variant(ButtonVariant::Neutral)
-                        .control_size(ControlSize::Small)
+                        .control_size(ControlSize::Regular)
                         .disabled(s.cfg.appearance.theme_id == crate::theme::omarchy::ID)
                         .on_press(|s: &mut UiState| {
                             s.send(crate::model::commands::Command::ThemeApply(
@@ -108,7 +108,7 @@ fn banner(s: &UiState, k: &Kit) -> El {
                 .child(
                     Button::new(tr_ref(language, "Browse themes"))
                         .variant(ButtonVariant::Neutral)
-                        .control_size(ControlSize::Small)
+                        .control_size(ControlSize::Regular)
                         .on_press(|s: &mut UiState| super::open(s, SettingsTab::Themes))
                         .build(k)
                         .key("goto-themes"),

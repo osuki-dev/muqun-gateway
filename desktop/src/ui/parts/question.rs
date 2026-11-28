@@ -51,6 +51,15 @@ pub fn question_card(
     card.accent = Some(cx.k.c.info.icon);
     if tv::pending(call.state) && !cx.stopped() {
         card.open_default = true;
+    } else if !answers.is_empty() {
+        let summary: Vec<String> = answers
+            .iter()
+            .filter(|a| !a.is_empty())
+            .map(|a| a.join(", "))
+            .collect();
+        if !summary.is_empty() {
+            card.caption = summary.join(" · ");
+        }
     }
     if questions.is_empty() {
         if !out.stdout.trim().is_empty() {
@@ -79,7 +88,12 @@ pub fn question_card(
         if !q.question.is_empty() {
             block = block.child(prose(cx, &format!("q{qi}"), &q.question));
         }
-        let mut opts = row().key("opts").w_full().gap(6.0).flex_wrap();
+        let mut opts = row()
+            .key("opts")
+            .w_full()
+            .gap(6.0)
+            .flex_wrap()
+            .items_start();
         for (oi, o) in q.options.iter().take(OPTION_MAX).enumerate() {
             let chosen = picked.contains(&o.label);
             opts = opts.child(option_pill(
@@ -90,25 +104,14 @@ pub fn question_card(
                 chosen,
             ));
         }
-        block = block.child(opts);
-        let unlisted: Vec<&String> = picked
+        for (ui, custom) in picked
             .iter()
             .filter(|a| !q.options.iter().any(|o| &o.label == *a))
-            .collect();
-        if !unlisted.is_empty() {
-            block = block.child(
-                text(
-                    unlisted
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" · "),
-                )
-                .font(k.ty.small)
-                .color(k.c.text_muted)
-                .wrap(),
-            );
+            .enumerate()
+        {
+            opts = opts.child(option_pill(k, format!("u{ui}"), custom, None, true));
         }
+        block = block.child(opts);
         body = body.child(block);
     }
     card.body = Some(body);
@@ -117,8 +120,14 @@ pub fn question_card(
 /// An option as a pill: its label, its description under it, and a mark
 /// when it is (or was) the answer.
 fn option_pill(k: &Kit, key: String, label: &str, description: Option<&str>, chosen: bool) -> El {
-    let ink = if chosen { k.c.info.fg } else { k.c.text_base };
-    let mut copy = col().gap(1.0).shrink().child(
+    let ink = k.c.text_base;
+    let desc_ink = if chosen {
+        k.c.text_muted
+    } else {
+        k.c.text_faint
+    };
+    let has_desc = description.is_some_and(|d| !d.is_empty());
+    let mut copy = col().gap(2.0).shrink().child(
         text(label.to_string())
             .font(if chosen {
                 k.ty.small_medium
@@ -129,12 +138,7 @@ fn option_pill(k: &Kit, key: String, label: &str, description: Option<&str>, cho
             .wrap(),
     );
     if let Some(d) = description.filter(|d| !d.is_empty()) {
-        copy = copy.child(
-            text(d.to_string())
-                .font(k.ty.small)
-                .color(k.c.text_faint)
-                .wrap(),
-        );
+        copy = copy.child(text(d.to_string()).font(k.ty.small).color(desc_ink).wrap());
     }
     let [c0, c1, _] = crate::theme::look::highlight_colors_for(k, k.dark);
     let mut pill = row()
@@ -142,17 +146,27 @@ fn option_pill(k: &Kit, key: String, label: &str, description: Option<&str>, cho
         .gap(6.0)
         .px(10.0)
         .py(6.0)
+        .min_h(30.0)
         .radius(k.radius.md)
         .max_w(360.0)
         .token_motion(k.motion.disclosure);
+    pill = if has_desc {
+        pill.items_start()
+    } else {
+        pill.center_y()
+    };
     if chosen {
+        let mut mark = icon(&glyphs::DONE, 12.0).color(c0);
+        if has_desc {
+            mark = mark.mt(2.0);
+        }
         pill = pill
             .border(1.0, c0.alpha(0.60))
             .linear_gradient(
                 std::f32::consts::FRAC_PI_2,
                 [(0.0, c0.alpha(0.20)), (1.0, c1.alpha(0.13))],
             )
-            .child(icon(&glyphs::DONE, 12.0).color(c0).mt(2.0));
+            .child(mark);
     } else {
         pill = pill
             .border(1.0, k.c.border_weak)
@@ -259,6 +273,7 @@ fn missing_required(s: &UiState, form: &FormRequest) -> bool {
 
 fn pick(form: &str, key: &str, value: String, multi: bool) -> impl Fn(&mut UiState) + 'static {
     let slot = form_key(form, key);
+    let custom_slot = format!("{slot}#custom");
     move |s: &mut UiState| {
         let next = if multi {
             let mut chosen: Vec<String> = s
@@ -282,6 +297,7 @@ fn pick(form: &str, key: &str, value: String, multi: bool) -> impl Fn(&mut UiSta
         } else {
             value.clone()
         };
+        s.form_inputs.remove(&custom_slot);
         s.form_inputs.insert(slot.clone(), TextEdit::new(next));
         s.draft.focused = false;
     }
@@ -442,19 +458,62 @@ fn field_input(s: &UiState, k: &Kit, form: &FormRequest, field: &FormField) -> E
             }
             list = list.child(line);
             if custom {
-                let typed = if options.iter().any(|o| o.value == current) {
-                    String::new()
-                } else {
-                    current.clone()
-                };
-                list = list.child(text_input(
-                    s,
-                    k,
-                    form,
-                    &slot,
-                    &typed,
-                    tr_ref(language, "Or type an answer"),
-                ));
+                let custom_slot = format!("{slot}#custom");
+                let typed = s
+                    .form_inputs
+                    .get(&custom_slot)
+                    .map(|e| e.text.clone())
+                    .unwrap_or_else(|| {
+                        if options.iter().any(|o| o.value == current) {
+                            String::new()
+                        } else {
+                            current.clone()
+                        }
+                    });
+                let edit = s
+                    .form_inputs
+                    .get(&custom_slot)
+                    .cloned()
+                    .unwrap_or_else(|| TextEdit::new(typed.clone()));
+                let (edit_slot, answer_slot, init_typed) =
+                    (custom_slot.clone(), slot.clone(), typed);
+                let sync_slot = custom_slot.clone();
+                let sync_answer = slot.clone();
+                let submit_target = form.clone();
+                list = list.child(
+                    TextInput::new(&edit)
+                        .placeholder(tr_ref(language, "Or type an answer"))
+                        .on_edit(move |s: &mut UiState| {
+                            s.form_inputs
+                                .entry(edit_slot.clone())
+                                .or_insert_with(|| TextEdit::new(init_typed.clone()))
+                        })
+                        .on_change(move |s: &mut UiState, _: &mut rune::Tx| {
+                            let val = s
+                                .form_inputs
+                                .get(&sync_slot)
+                                .map(|e| e.text.clone())
+                                .unwrap_or_default();
+                            s.form_inputs
+                                .insert(sync_answer.clone(), TextEdit::new(val));
+                        })
+                        .on_key(
+                            move |s: &mut UiState, ev: &rune::KeyEvent, _: &mut rune::Tx| {
+                                if ev.key == rune::Key::Enter
+                                    && !(ev.mods.shift
+                                        || ev.mods.ctrl
+                                        || ev.mods.cmd
+                                        || ev.mods.alt
+                                        || ev.mods.logo)
+                                {
+                                    return submit_form(s, &submit_target);
+                                }
+                                false
+                            },
+                        )
+                        .build(k)
+                        .key(format!("in-{answer_slot}")),
+                );
             }
             list
         }
@@ -499,7 +558,7 @@ pub fn form_fields(s: &UiState, k: &Kit, form: &FormRequest, compact: bool) -> E
     let mut submit_row = row().key("submit-row").w_full().center_y().gap(8.0).child(
         Button::new(tr_ref(language, "Submit"))
             .variant(ButtonVariant::Submit)
-            .control_size(ControlSize::Small)
+            .control_size(ControlSize::Regular)
             .shortcut("↵")
             .disabled(blocked)
             .on_press({
@@ -533,22 +592,79 @@ fn form_pending(s: &UiState, form: &FormRequest) -> bool {
         .is_some_and(|l| l.iter().any(|f| f.id == form.id))
 }
 
+/// Compact summary of what the owner answered on a resolved form, when known.
+fn answered_summary(s: &UiState, k: &Kit, form: &FormRequest) -> Option<El> {
+    let mut pills = row()
+        .key("answered-pills")
+        .w_full()
+        .gap(6.0)
+        .flex_wrap()
+        .items_start();
+    let mut any = false;
+    for field in form.fields.iter().filter(|f| visible(s, form, f)) {
+        let (key, _) = field_meta(field);
+        let slot = form_key(&form.id, key);
+        let Some(raw) = s
+            .form_inputs
+            .get(&slot)
+            .map(|e| e.text.trim())
+            .filter(|t| !t.is_empty())
+        else {
+            continue;
+        };
+        let label = match field {
+            FormField::String { options, .. } => options
+                .iter()
+                .find(|o| o.value == raw)
+                .map(|o| o.label.clone())
+                .unwrap_or_else(|| raw.to_string()),
+            FormField::Multiselect { options, .. } => raw
+                .split(',')
+                .filter(|v| !v.is_empty())
+                .map(|v| {
+                    options
+                        .iter()
+                        .find(|o| o.value == v)
+                        .map(|o| o.label.as_str())
+                        .unwrap_or(v)
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            FormField::Boolean { title, .. } => {
+                format!("{title}: {}", if raw == "true" { "On" } else { "Off" })
+            }
+            _ => raw.to_string(),
+        };
+        if label.is_empty() {
+            continue;
+        }
+        pills = pills.child(option_pill(k, format!("ans-{key}"), &label, None, true));
+        any = true;
+    }
+    any.then_some(pills)
+}
+
 /// A form as a card: its title, then its fields while it waits, or a quiet
-/// "Answered" line once it has been.
+/// "Answered" line (plus the recorded answer pills when present) once it has been.
 pub fn form_card(s: &UiState, k: &Kit, form: &FormRequest) -> El {
     let language = s.cfg.general.language;
     let pending = form_pending(s, form);
     let accent = if pending {
         k.c.info.icon
     } else {
-        k.c.icon_faint
+        k.c.success.icon
+    };
+    let head_icon = if pending {
+        &glyphs::CHOICE
+    } else {
+        &glyphs::DONE
     };
     let head = row()
         .key("head")
         .w_full()
         .gap(8.0)
         .center_y()
-        .child(icon(&glyphs::CHOICE, 15.0).color(accent))
+        .child(icon(head_icon, 15.0).color(accent))
         .child(
             col()
                 .gap(1.0)
@@ -588,6 +704,8 @@ pub fn form_card(s: &UiState, k: &Kit, form: &FormRequest) -> El {
         .child(head);
     if pending {
         card = card.child(form_fields(s, k, form, false));
+    } else if let Some(summary) = answered_summary(s, k, form) {
+        card = card.child(summary);
     }
     card
 }

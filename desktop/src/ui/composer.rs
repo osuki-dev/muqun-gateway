@@ -945,7 +945,7 @@ fn queued_chip(
         .min_w(0.0)
         .center_y()
         .px(4.0)
-        .radius(k.radius.xl)
+        .radius(k.radius.lg)
         .fill(k.c.surface_raised_base)
         .border(1.0, k.c.border_weak);
     let queued_images: Vec<&crate::model::compose::QueuedFile> =
@@ -978,7 +978,7 @@ fn queued_chip(
                 .on_press(move |s: &mut UiState| toggle_queued_steer(s, &send_id, true))
                 .build(k)
                 .key(format!("queued-send-{id}"))
-                .radius(k.radius.xl)
+                .radius(k.radius.lg)
                 .fill(k.c.bg_accent.alpha(0.12))
                 .border(1.0, k.c.border_active.alpha(0.45)),
         );
@@ -994,7 +994,7 @@ fn queued_chip(
                 .on_press(move |s: &mut UiState| edit_queued(s, &edit_id, text.clone()))
                 .build(k)
                 .key(format!("queued-edit-{id}"))
-                .radius(k.radius.xl)
+                .radius(k.radius.lg)
                 .fill(k.c.surface_raised_base)
                 .border(1.0, k.c.border_weak),
         );
@@ -1008,7 +1008,7 @@ fn queued_chip(
             .on_press(move |s: &mut UiState| cancel_queued(s, &cancel_inline_id))
             .build(k)
             .key(format!("queued-cancel-{id}"))
-            .radius(k.radius.xl)
+            .radius(k.radius.lg)
             .fill(k.c.surface_raised_base)
             .border(1.0, k.c.border_weak),
     )

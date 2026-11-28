@@ -45,7 +45,7 @@ fn notice(
         .w(width)
         .gap(8.0)
         .padding(12.0)
-        .radius(8.0)
+        .radius(k.radius.lg)
         .fill(k.c.layer_01)
         .border(1.0, k.c.border_muted)
         .child(

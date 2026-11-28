@@ -197,7 +197,7 @@ fn scope(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                         .h(16.0)
                         .px(5.5)
                         .center()
-                        .radius(8.0)
+                        .radius(k.radius.sm)
                         .fill(k.c.text_base.alpha(0.08))
                         .child(
                             rune::text(count.to_string())

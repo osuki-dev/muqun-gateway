@@ -901,11 +901,11 @@ fn mark(s: &UiState, k: &Kit, look: &Look, w: f32, dock_top: f32) -> Option<El> 
             look.glow(
                 el().key("home-badge")
                     .size(56.0, 56.0)
-                    .radius(16.0)
+                    .radius(k.radius.xl)
                     .center()
                     .fill(k.c.layer_02)
                     .children(s.fx_on().then(|| {
-                        super::fx::metal("home-metal", 56.0, 16.0, k.c.bg_accent, 0.0)
+                        super::fx::metal("home-metal", 56.0, k.radius.xl, k.c.bg_accent, 0.0)
                             .absolute(0.0, 0.0)
                     }))
                     .child(

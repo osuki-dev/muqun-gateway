@@ -1119,7 +1119,7 @@ fn pull_requests_card(s: &UiState, k: &Kit, asid: &str, repo_url: Option<&str>) 
             body.push(
                 Button::new(label)
                     .variant(ButtonVariant::Outline)
-                    .control_size(ControlSize::Small)
+                    .control_size(ControlSize::Regular)
                     .disabled(gp.pr_loading)
                     .on_press(move |s: &mut UiState| {
                         s.request_git_prs(&more_asid, next_page, false);
@@ -1856,7 +1856,7 @@ pub(crate) fn view_for_session(
                                 .child(
                                     Button::new(commit_label)
                                         .variant(ButtonVariant::Neutral)
-                                        .control_size(ControlSize::Small)
+                                        .control_size(ControlSize::Regular)
                                         .disabled(!has_msg || busy)
                                         .on_press(move |s: &mut UiState| {
                                             commit_changes(s, &btn_asid, false, stage_all)
@@ -1867,7 +1867,7 @@ pub(crate) fn view_for_session(
                                 .child(
                                     Button::new(t("Commit & Push"))
                                         .variant(ButtonVariant::Submit)
-                                        .control_size(ControlSize::Small)
+                                        .control_size(ControlSize::Regular)
                                         .disabled(!has_msg || busy)
                                         .on_press(move |s: &mut UiState| {
                                             commit_changes(s, &push_asid, true, stage_all)

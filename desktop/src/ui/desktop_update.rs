@@ -258,7 +258,7 @@ pub(super) fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
             Some(
                 Button::new(tr("Update"))
                     .variant(ButtonVariant::Submit)
-                    .control_size(ControlSize::Small)
+                    .control_size(ControlSize::Regular)
                     .on_press(UiState::start_desktop_update)
                     .build(k)
                     .key("desktop-update-primary"),
@@ -342,7 +342,7 @@ pub(super) fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                 Some(
                     Button::new(tr("Restart now"))
                         .variant(ButtonVariant::Submit)
-                        .control_size(ControlSize::Small)
+                        .control_size(ControlSize::Regular)
                         .disabled(!safe || s.restart_checkpoint_pending)
                         .on_press(UiState::restart_updated_desktop)
                         .build(k)
@@ -363,7 +363,7 @@ pub(super) fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
             Some(
                 Button::new(tr("Retry"))
                     .variant(ButtonVariant::Submit)
-                    .control_size(ControlSize::Small)
+                    .control_size(ControlSize::Regular)
                     .on_press(UiState::start_desktop_update)
                     .build(k)
                     .key("desktop-update-primary"),
@@ -423,7 +423,7 @@ pub(super) fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         actions = actions.child(
             Button::new(tr("Details"))
                 .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Small)
+                .control_size(ControlSize::Regular)
                 .on_press(|s: &mut UiState| {
                     s.go(Mode::Settings);
                     super::settings::open(s, SettingsTab::About);
@@ -435,7 +435,7 @@ pub(super) fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
     actions = actions.child(el().grow(1.0)).child(
         Button::new(secondary_label)
             .variant(ButtonVariant::Ghost)
-            .control_size(ControlSize::Small)
+            .control_size(ControlSize::Regular)
             .on_press(UiState::hide_desktop_update)
             .build(k)
             .key("desktop-update-hide"),
