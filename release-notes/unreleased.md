@@ -8,6 +8,9 @@ On a fresh computer with Muqun Desktop, Gateway can pair before Desktop opens an
 
 ## Agents, messages and history
 
+- **Remote `@` file search fallback & local Gateway Control API**:
+  - `GET /api/agent-sessions/{asid}/files` now falls back to Gateway's workspace file walker (`composer::search_files`) whenever an agent adapter reports `AgentError::Unsupported` (ACP/Claude/Antigravity/T3/Pi), fixing remote `@` file autocompletion across computers.
+  - Added the `gateway_control` library module (`src/platform/gateway_control.rs`) so Desktop can read and validate local Gateway `config.json` settings, service autostart status, and terminal backends cleanly.
 - **Unified tool normalization, media/file cards, and workspace read hydration across all 11 agents**:
   - Canonicalized provider-specific tool names (`read_file` → `read`, `edit_file` → `edit`, `write_file` → `write`, `run_command` → `bash`, search tools), PascalCase inputs (`Path` → `path`, `CommandLine` → `command`), unified `metadata.files` diffs, shell `metadata.exit` status, and bare empty `{}`/`[]` outputs across ACP (Antigravity, Claude, Cursor, Copilot, Qoder, Fx), Pi, Codex, OpenCode, DeepSeek, and T3.
   - Unified image/file tool media normalization with explicit image-view byte sniffing (`AccountImageView`), rich document cards (PDF/Office/media), and bounded workspace-fenced line-numbered text excerpt hydration (`StartLine`/`EndLine`/`offset`/`limit`, capped at 200 lines / 16 KiB) for completed `read` calls whose adapters omit file bodies, while keeping source-code reads compact and never showing raw `/api/.../original` URLs as filenames.
