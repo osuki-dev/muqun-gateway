@@ -70,8 +70,8 @@ pub fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
                 SurfaceFit::Fill,
             )
             .size(38.0, 38.0)
-            .radius(k.radius.lg)
-            .clip_rounded(k.radius.lg),
+            .radius(8.5)
+            .clip_rounded(8.5),
         );
     }
     let badge = look.glow(badge, k.c.bg_accent, 0.7);

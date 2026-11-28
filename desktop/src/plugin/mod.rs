@@ -1477,7 +1477,7 @@ impl DesktopPlugin for ActivityPlugin {
     }
 
     fn icon(&self) -> &'static Icon {
-        &rune_kit::shell::INSPECTOR
+        &crate::ui::icons::catalog::STACK
     }
 
     fn description(&self, lang: Language) -> Option<String> {

@@ -1311,9 +1311,13 @@ fn mention_popup(s: &UiState, slot: Slot) -> PopupState {
     let mut peers: Vec<_> = all_comps
         .into_iter()
         .filter(|p| {
-            p.name.to_lowercase().starts_with(&term)
-                || p.server_id.to_lowercase().starts_with(&term)
-                || term.is_empty()
+            // Skip stale unnamed computer profiles whose fallback label is a raw UUID.
+            let is_stale_uuid = uuid::Uuid::parse_str(&p.name).is_ok()
+                && !s.peers.iter().any(|peer| peer.server_id == p.server_id);
+            !is_stale_uuid
+                && (p.name.to_lowercase().starts_with(&term)
+                    || p.server_id.to_lowercase().starts_with(&term)
+                    || term.is_empty())
         })
         .collect();
     peers.sort_by_key(|p| {
@@ -1690,8 +1694,8 @@ fn mount_popup(
         .role("listbox")
         .label(label)
         .w_full()
-        .h((rows.len() as f32 * 30.0).min(300.0))
-        .min_h(30.0)
+        .h((rows.len() as f32 * 34.0 + 4.0).min(320.0))
+        .min_h(34.0)
         .scroll(rune::ScrollSpec {
             stick_bottom: false,
         })

@@ -570,18 +570,19 @@ fn home_brand(s: &UiState, k: &Kit, look: &Look, lights: f32) -> El {
     // Keep a fixed cross-size: the titlebar row stretches children to its full
     // height, and a stretched text run top-aligns while the mark stays centred.
     const MARK: f32 = 20.0;
+    const MARK_RADIUS: f32 = 4.5;
     let mark = match s.images.as_ref() {
         Some(images) => art::picture(images, Arc::<[u8]>::from(APP_MARK_PNG), SurfaceFit::Fill)
             .key("home-mark")
             .w(MARK)
             .h(MARK)
-            .radius(k.radius.sm)
-            .clip_rounded(k.radius.sm),
+            .radius(MARK_RADIUS)
+            .clip_rounded(MARK_RADIUS),
         None => el()
             .key("home-mark")
             .w(MARK)
             .h(MARK)
-            .radius(k.radius.sm)
+            .radius(MARK_RADIUS)
             .fill(k.c.bg_accent),
     };
     let mark = look.glow(mark, k.c.bg_accent, 0.35);
@@ -841,16 +842,19 @@ fn toolbar(s: &UiState, k: &Kit, look: &Look, layer: &mut Vec<El>) -> Toolbar {
                     let active =
                         s.active_tile_inline_panel() == Some(super::TileInlinePanel::Activity);
                     bar = bar.trailing(
-                        super::icons::header_button(&INSPECTOR, tr_ref(language, "Activity"))
-                            .variant(if active {
-                                IconButtonVariant::Contrast
-                            } else {
-                                IconButtonVariant::GhostMuted
-                            })
-                            .help(tr_ref(language, "Activity"))
-                            .on_press(|s: &mut UiState| s.toggle_activity_panel())
-                            .build(k)
-                            .key("session-activity"),
+                        super::icons::header_button(
+                            &super::icons::catalog::STACK,
+                            tr_ref(language, "Activity"),
+                        )
+                        .variant(if active {
+                            IconButtonVariant::Contrast
+                        } else {
+                            IconButtonVariant::GhostMuted
+                        })
+                        .help(tr_ref(language, "Activity"))
+                        .on_press(|s: &mut UiState| s.toggle_activity_panel())
+                        .build(k)
+                        .key("session-activity"),
                     );
                 }
                 bar = bar.trailing(session_more(s, k, layer, &asid, busy));

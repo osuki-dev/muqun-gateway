@@ -174,9 +174,9 @@ fn scope(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         .interactive(
             rune::row()
                 .key("sidebar-scope")
-                .h(26.0)
+                .h(28.0)
                 .px(7.0)
-                .gap(5.0)
+                .gap(6.0)
                 .center_y()
                 .radius(k.radius.md)
                 .fill(if open {
@@ -193,9 +193,17 @@ fn scope(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                         .truncate(),
                 )
                 .child(
-                    rune::text(count.to_string())
-                        .font(k.ty.caption())
-                        .color(k.c.text_faint),
+                    rune::row()
+                        .h(16.0)
+                        .px(5.5)
+                        .center()
+                        .radius(8.0)
+                        .fill(k.c.text_base.alpha(0.08))
+                        .child(
+                            rune::text(count.to_string())
+                                .font(k.ty.caption())
+                                .color(k.c.text_faint),
+                        ),
                 )
                 .child(super::art::directional_arrow(
                     s,
@@ -742,7 +750,7 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         );
     } else {
         trigger = trigger
-            .border(1.0, k.c.border_muted.alpha(0.65))
+            .border(1.0, k.c.border_weak)
             .fill(k.c.layer_01.alpha(0.38));
     }
 
@@ -1012,10 +1020,10 @@ fn search(s: &UiState, k: &Kit) -> El {
             .interactive(
                 rune::row()
                     .key("search")
-                    .h(26.0)
+                    .h(28.0)
                     .center()
                     .radius(k.radius.md)
-                    .border(1.0, k.c.border_muted.alpha(0.55))
+                    .border(1.0, k.c.border_weak)
                     .fill(k.c.layer_01.alpha(0.28))
                     .role("button")
                     .label(super::copy::tr_ref(language, "Search sessions"))

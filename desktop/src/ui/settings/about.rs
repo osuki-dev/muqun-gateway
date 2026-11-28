@@ -68,18 +68,19 @@ fn hero(s: &UiState, k: &Kit) -> El {
     let language = s.cfg.general.language;
     let look = s.look();
     const MARK: f32 = 56.0;
+    const MARK_RADIUS: f32 = 12.0;
     let mark = match s.images.as_ref() {
         Some(images) => {
             crate::ui::art::picture(images, Arc::<[u8]>::from(APP_MARK_PNG), SurfaceFit::Fill)
                 .key("about-mark")
                 .size(MARK, MARK)
-                .radius(k.radius.xl)
-                .clip_rounded(k.radius.xl)
+                .radius(MARK_RADIUS)
+                .clip_rounded(MARK_RADIUS)
         }
         None => el()
             .key("about-mark")
             .size(MARK, MARK)
-            .radius(k.radius.xl)
+            .radius(MARK_RADIUS)
             .fill(k.c.bg_accent),
     };
     let build = option_env!("MUQUN_BUILD").unwrap_or(if cfg!(debug_assertions) {

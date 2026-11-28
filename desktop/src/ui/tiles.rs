@@ -763,7 +763,7 @@ fn header(s: &UiState, k: &Kit, look: &Look, i: usize, place: Place, layer: &mut
         if crate::plugin::is_enabled("activity", &s.cfg.plugins_disabled) {
             head = head.child(
                 super::icons::header_button(
-                    &rune_kit::shell::INSPECTOR,
+                    &super::icons::catalog::STACK,
                     tr_ref(language, "Activity"),
                 )
                 .variant(if active_inline == Some(super::TileInlinePanel::Activity) {

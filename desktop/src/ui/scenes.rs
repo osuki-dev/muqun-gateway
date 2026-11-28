@@ -911,6 +911,33 @@ fn base_scenes() -> &'static [Scene] {
                 unreachable: true,
             });
         }),
+        ("session-inline-git", |s| {
+            session_scene(s);
+            s.right_open = false;
+            s.right.set_open(false);
+            s.open_git_panel();
+        }),
+        ("desktop-update-toast", |s| {
+            session_scene(s);
+            s.right_open = false;
+            s.right.set_open(false);
+            s.desktop_update =
+                crate::platform::update::Status::Available("0.1.1-preview.44".into());
+            s.desktop_update_panel = true;
+        }),
+        ("desktop-update-downloading", |s| {
+            session_scene(s);
+            s.right_open = false;
+            s.right.set_open(false);
+            s.desktop_update = crate::platform::update::Status::Installing {
+                version: "0.1.1-preview.44".into(),
+                phase: Some(crate::platform::installer::Phase::Downloading {
+                    received: 19_400_000,
+                    total: 35_900_000,
+                }),
+            };
+            s.desktop_update_panel = true;
+        }),
         ("tool-media-cards", |s| {
             use muqun_gateway::agents::{ToolCall, ToolCallStatus};
             session_scene(s);

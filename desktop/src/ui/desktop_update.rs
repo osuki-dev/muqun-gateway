@@ -193,25 +193,26 @@ fn slim_meter(
     track.child(beam)
 }
 
-fn mark_badge(s: &UiState, k: &Kit, tone: Color, ready: bool, active: bool) -> El {
+fn mark_badge(s: &UiState, tone: Color, ready: bool, active: bool) -> El {
     let look = s.look();
+    const R: f32 = 7.0;
     let inner = if ready {
         el().size(32.0, 32.0)
             .center()
-            .radius(k.radius.md)
+            .radius(R)
             .fill(tone.alpha(0.16))
             .border(1.0, tone.alpha(0.35))
             .child(icon(&glyphs::DONE, 16.0).color(tone))
     } else if let Some(images) = s.images.as_ref() {
         super::art::picture(images, Arc::<[u8]>::from(APP_MARK_PNG), SurfaceFit::Fill)
             .size(32.0, 32.0)
-            .radius(k.radius.md)
-            .clip_rounded(k.radius.md)
+            .radius(R)
+            .clip_rounded(R)
             .border(1.0, tone.alpha(0.32))
     } else {
         el().size(32.0, 32.0)
             .center()
-            .radius(k.radius.md)
+            .radius(R)
             .fill(tone.alpha(0.16))
             .border(1.0, tone.alpha(0.32))
             .child(icon(&glyphs::COMPUTER, 16.0).color(tone))
@@ -383,7 +384,7 @@ pub(super) fn mount(s: &UiState, k: &Kit, layer: &mut Vec<El>) {
         .w_full()
         .items_start()
         .gap(10.0)
-        .child(mark_badge(s, k, tone, ready, active_anim))
+        .child(mark_badge(s, tone, ready, active_anim))
         .child(
             col()
                 .grow(1.0)
