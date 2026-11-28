@@ -1263,6 +1263,15 @@ impl UiState {
                 });
             }
         }
+        let is_curr_local = matches!(curr, "local" | "self");
+        for p in &mut list {
+            let is_local = matches!(p.server_id.as_str(), "local" | "self");
+            p.current = if is_local {
+                is_curr_local
+            } else {
+                curr == p.server_id
+            };
+        }
         list
     }
 
@@ -5339,10 +5348,15 @@ pub fn spawn_inbox_pump(inbox: Arc<Inbox>, handle: rune::AppHandle<UiState>) {
                 };
                 let before = questions(s);
                 let previous = s.gateway_setup.clone();
+                let prev_update_panel = s.desktop_update_panel;
+                let prev_update_status = s.desktop_update.clone();
                 s.apply_updates(batch);
                 if !s.cfg.appearance.reduced_motion
                     && !s.system_reduced_motion.get()
-                    && (before != questions(s) || previous != s.gateway_setup)
+                    && (before != questions(s)
+                        || previous != s.gateway_setup
+                        || prev_update_panel != s.desktop_update_panel
+                        || prev_update_status != s.desktop_update)
                 {
                     tx.animated();
                 }

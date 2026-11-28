@@ -1133,6 +1133,8 @@ pub(crate) struct FakeAgent {
     pub reply_form_gone: bool,
     /// Optional canned `account_limits` response for orchestration failover tests.
     pub account_limits: Option<agents::domain::account_limits::AccountLimits>,
+    /// When true, `find_files` returns `AgentError::Unsupported` (like ACP/T3/Pi).
+    pub unsupported_find_files: bool,
 }
 
 /// A fake agent service's MCP registration.
@@ -1169,6 +1171,7 @@ impl FakeAgent {
             reply_permission_gone: false,
             reply_form_gone: false,
             account_limits: None,
+            unsupported_find_files: false,
         }
     }
 
@@ -1477,6 +1480,9 @@ impl agents::ports::agent::AgentPort for FakeAgent {
     ) -> agents::ports::agent::AgentFuture<'a, Vec<serde_json::Value>> {
         Box::pin(async move {
             self.record(&format!("find_files:{}", directory.unwrap_or("")));
+            if self.unsupported_find_files {
+                return Err(agents::ports::AgentError::Unsupported("find_files".into()));
+            }
             Ok(Vec::new())
         })
     }

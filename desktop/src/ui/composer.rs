@@ -1330,17 +1330,24 @@ fn mention_popup(s: &UiState, slot: Slot) -> PopupState {
                 || term.is_empty()
         })
         .collect();
-    peers.sort_by_key(|p| match (p.current, p.reachable) {
-        (true, _) => 0,
-        (false, true) => 1,
-        (false, false) => 2,
+    peers.sort_by_key(|p| {
+        let is_local = matches!(p.server_id.as_str(), "local" | "self");
+        match (p.current, is_local, p.reachable) {
+            (true, _, _) => 0,
+            (false, true, _) => 1,
+            (false, false, true) => 2,
+            (false, false, false) => 3,
+        }
     });
     let mut rows: Vec<PopupRow> = Vec::new();
     if !peers.is_empty() {
         rows.push(section_header("hdr:computers", tr_ref(language, "Computers")).row);
         rows.extend(peers.into_iter().map(|p| {
-            let detail = if p.current {
+            let is_local = matches!(p.server_id.as_str(), "local" | "self");
+            let detail = if is_local {
                 tr_ref(language, "This computer")
+            } else if p.current {
+                tr_ref(language, "Online")
             } else if p.reachable {
                 ""
             } else {

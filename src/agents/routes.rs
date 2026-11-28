@@ -1643,28 +1643,47 @@ async fn do_find_agent_files(
     let directory = directory.as_deref();
     require_directory(directory)?;
 
-    let files = manager
-        .agent()
-        .find_files(query, limit, directory)
-        .await
-        .map_err(agent_error)?;
+    let agent_files = match manager.agent().find_files(query, limit, directory).await {
+        Ok(files) => Some(files),
+        Err(crate::agents::ports::AgentError::Unsupported(_)) => None,
+        Err(err) => return Err(agent_error(err)),
+    };
 
-    let hits: Vec<Value> = files
-        .iter()
-        .filter_map(|f| {
-            let path = f.get("path").and_then(Value::as_str)?;
-            let name = std::path::Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(path);
-            let kind = f.get("type").and_then(Value::as_str).unwrap_or("file");
-            Some(json!({
-                "path": path,
-                "name": name,
-                "kind": kind,
-            }))
-        })
-        .collect();
+    let hits: Vec<Value> = if let Some(files) = agent_files {
+        files
+            .iter()
+            .filter_map(|f| {
+                let path = f.get("path").and_then(Value::as_str)?;
+                let name = std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(path);
+                let kind = f.get("type").and_then(Value::as_str).unwrap_or("file");
+                Some(json!({
+                    "path": path,
+                    "name": name,
+                    "kind": kind,
+                }))
+            })
+            .collect()
+    } else if let Some(dir) = directory {
+        let root = std::path::PathBuf::from(dir);
+        let needle = query.to_string();
+        tokio::task::spawn_blocking(move || crate::composer::search_files(&root, &needle, limit))
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|hit| {
+                json!({
+                    "path": hit.path,
+                    "name": hit.name,
+                    "kind": hit.kind,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     Ok(Json(content_envelope(json!(hits))))
 }
@@ -6585,6 +6604,33 @@ mod tests {
         )
         .await
         .expect("home is a workspace the agent can search");
+    }
+
+    #[tokio::test]
+    async fn find_files_falls_back_to_workspace_scan_when_agent_unsupported() {
+        let directory = crate::test_support::asset_test_dir("agent-file-fallback");
+        std::fs::write(directory.join("hello_remote.rs"), "fn main() {}\n").unwrap();
+        let mut agent = FakeAgent::new("claude");
+        agent.unsupported_find_files = true;
+        let state = state_with(vec![agent]).await;
+        let Json(body) = do_find_agent_files(
+            &state,
+            FileSearchScope::Agent(Some("claude")),
+            "",
+            20,
+            Some(directory.as_path().to_str().unwrap()),
+            &device_headers(),
+        )
+        .await
+        .expect("workspace fallback should return project files");
+        let files = body["data"].as_array().expect("data array of file hits");
+        assert!(
+            files
+                .iter()
+                .any(|f| f.get("path").and_then(Value::as_str) == Some("hello_remote.rs")),
+            "expected workspace fallback to return hello_remote.rs, got {files:?}"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

@@ -9,8 +9,7 @@ use rune::{el, TextEdit, Tx};
 use rune_kit::glyphs::{FOLDER, FOLDER_OPEN, SEARCH};
 use rune_kit::shell::{Sidebar, SidebarRow};
 use rune_kit::{
-    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem,
-    TextInput,
+    ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem, TextInput,
 };
 
 use super::icons::{INBOX, SETTINGS, TASK};
@@ -163,29 +162,60 @@ fn scope(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     } else {
         "Recent sessions"
     });
-    let trigger = Button::new(title)
-        .variant(ButtonVariant::Ghost)
-        .control_size(ControlSize::Large)
+    let count = if s.sidebar_all_sessions {
+        s.sessions
+            .iter()
+            .filter(|info| !is_hidden_sidebar_session(s, info))
+            .count()
+    } else {
+        recent_sessions(s, now_ms()).len()
+    };
+    let trigger = k
+        .interactive(
+            rune::row()
+                .key("sidebar-scope")
+                .h(26.0)
+                .px(7.0)
+                .gap(5.0)
+                .center_y()
+                .radius(k.radius.md)
+                .fill(if open {
+                    k.c.layer_01.alpha(0.55)
+                } else {
+                    k.c.bg_base.alpha(0.0)
+                })
+                .role("button")
+                .label(title.clone())
+                .child(
+                    rune::text(title)
+                        .font(k.ty.small)
+                        .color(if open { k.c.text_base } else { k.c.text_muted })
+                        .truncate(),
+                )
+                .child(
+                    rune::text(count.to_string())
+                        .font(k.ty.caption())
+                        .color(k.c.text_faint),
+                )
+                .child(super::art::directional_arrow(
+                    s,
+                    k,
+                    10.0,
+                    if open {
+                        -std::f32::consts::FRAC_PI_2
+                    } else {
+                        std::f32::consts::FRAC_PI_2
+                    },
+                    k.c.text_faint,
+                )),
+        )
         .on_press(move |s: &mut UiState| {
             s.menu = (!open).then_some(OpenMenu::SidebarScope);
-        })
-        .build(k)
-        .key("sidebar-scope")
-        .child(super::art::directional_arrow(
-            s,
-            k,
-            12.0,
-            if open {
-                -std::f32::consts::FRAC_PI_2
-            } else {
-                std::f32::consts::FRAC_PI_2
-            },
-            k.c.text_faint,
-        ));
+        });
     let mut menu = Menu::new("sidebar-scope-menu")
         .trigger(trigger)
         .open(open)
-        .min_width(220.0)
+        .min_width(210.0)
         .placement(rune_kit::Placement::BottomStart)
         .on_close(|s: &mut UiState| s.menu = None);
     for (all, word) in [(false, "Recent sessions"), (true, "All sessions")] {
@@ -667,16 +697,15 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let mut trigger = rune::row()
         .key("computer-switcher-trigger")
         .w_full()
-        .h(36.0)
+        .h(32.0)
         .px(10.0)
-        .gap(8.0)
+        .gap(7.0)
         .center_y()
-        .radius(k.radius.md)
-        .border(0.0, c0.alpha(0.0))
+        .radius(k.radius.lg)
         .cursor(rune::Cursor::Pointer)
         .role("button")
         .label(super::copy::tr_ref(language, "Switch computer"))
-        .child(rune::icon(glyph, 16.0).color(status_color))
+        .child(rune::icon(glyph, 15.0).color(status_color))
         .child(
             rune::text(s.computer_name(curr))
                 .font(k.ty.ui_medium)
@@ -686,15 +715,15 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .min_w(0.0),
         )
         .child(
-            el().size(5.0, 5.0)
-                .radius(2.5)
+            el().size(6.0, 6.0)
+                .radius(3.0)
                 .fill(status_color)
                 .help(super::copy::tr_ref(language, status)),
         )
         .child(super::art::directional_arrow(
             s,
             k,
-            12.0,
+            10.0,
             if open {
                 -std::f32::consts::FRAC_PI_2
             } else {
@@ -707,12 +736,14 @@ fn computer_switcher(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             s.menu = (!open).then_some(OpenMenu::ComputerPicker);
         });
     if open {
-        trigger = trigger.linear_gradient(
+        trigger = trigger.border(1.0, c0.alpha(0.45)).linear_gradient(
             std::f32::consts::FRAC_PI_2,
             [(0.0, c0.alpha(0.18)), (1.0, c1.alpha(0.12))],
         );
     } else {
-        trigger = trigger.fill(k.c.layer_01.alpha(0.35));
+        trigger = trigger
+            .border(1.0, k.c.border_muted.alpha(0.65))
+            .fill(k.c.layer_01.alpha(0.38));
     }
 
     let mut menu = Menu::new("computer-switcher-menu")
@@ -805,29 +836,36 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
     let header_box = rune::col()
         .key("sidebar-header-box")
         .w_full()
-        .gap(12.0)
-        .pb(10.0)
+        .gap(8.0)
+        .pb(6.0)
         .child(
             rune::row()
                 .w_full()
-                .gap(8.0)
+                .gap(6.0)
                 .center_y()
                 .child(computer_switcher(s, k, layer).grow(1.0).min_w(0.0))
                 .child(
                     IconButton::new(&super::icons::PLUS)
-                        .control_size(ControlSize::ExtraLarge)
+                        .control_size(ControlSize::Regular)
                         .variant(IconButtonVariant::Ghost)
                         .label(super::copy::tr_ref(language, "New session"))
                         .help(super::copy::tr_ref(language, "New session"))
                         .on_press(|s: &mut UiState| s.go(Mode::Home))
                         .build(k)
                         .key("sidebar-new-session")
-                        .size(36.0, 36.0)
+                        .size(32.0, 32.0)
                         .radius(k.radius.lg)
-                        .fill(k.c.bg_accent.alpha(0.12)),
+                        .border(1.0, k.c.bg_accent.alpha(0.28))
+                        .fill(k.c.bg_accent.alpha(0.14)),
                 ),
         )
-        .child(search_toolbar(s, k, layer));
+        .child(search_toolbar(s, k, layer))
+        .child(
+            el().w_full()
+                .h(1.0)
+                .fill(k.c.border_muted.alpha(0.5))
+                .a11y_hidden(),
+        );
 
     let mut sidebar = Sidebar::new()
         .label(super::copy::tr_ref(language, "Sessions"))
@@ -958,8 +996,8 @@ fn search_toolbar(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
         )
         .child(
             search(s, k)
-                .w(36.0)
-                .min_w(36.0)
+                .w(28.0)
+                .min_w(28.0)
                 .grow(if expanded { 1.0 } else { 0.0 })
                 .motion(motion),
         )
@@ -974,13 +1012,14 @@ fn search(s: &UiState, k: &Kit) -> El {
             .interactive(
                 rune::row()
                     .key("search")
-                    .h(28.0)
+                    .h(26.0)
                     .center()
                     .radius(k.radius.md)
-                    .fill(k.c.text_base.alpha(0.06))
+                    .border(1.0, k.c.border_muted.alpha(0.55))
+                    .fill(k.c.layer_01.alpha(0.28))
                     .role("button")
                     .label(super::copy::tr_ref(language, "Search sessions"))
-                    .child(rune::icon(&SEARCH, 14.0).color(k.c.text_muted)),
+                    .child(rune::icon(&SEARCH, 13.0).color(k.c.text_muted)),
             )
             .on_press(|s: &mut UiState| {
                 s.menu = None;
@@ -1353,6 +1392,20 @@ mod tests {
         assert_eq!(s.current_computer(), "m2");
         assert!(s.peers[1].current);
         assert!(!s.peers[0].current);
+
+        // Even if a remote hub reports `self` with `current: true` while viewing a remote peer,
+        // `all_computers()` normalizes `current` so at most one computer is marked active.
+        s.peers[0].current = true;
+        let normalized = s.all_computers();
+        assert_eq!(
+            normalized.iter().filter(|p| p.current).count(),
+            1,
+            "at most one computer may be current: {normalized:?}"
+        );
+        assert!(normalized.iter().any(|p| p.server_id == "m2" && p.current));
+        assert!(normalized
+            .iter()
+            .any(|p| p.server_id == "self" && !p.current));
     }
 
     #[test]

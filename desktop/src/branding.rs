@@ -1,6 +1,6 @@
 //! The product's name and mark.
 //!
-//! The transparent mark is based on the App's Mint icon.
+//! The mark is the App's default icon (`app/assets/icons/mint/icon.png`).
 //! Rune sets no window icon of its own; Wayland compositors and macOS take
 //! the `.desktop` entry's or the bundle's.
 

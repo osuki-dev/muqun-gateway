@@ -1167,7 +1167,7 @@ impl SessionHub for RemoteHub {
                 return Ok(Vec::new());
             }
             let limit_str = limit.to_string();
-            let found: Result<Vec<Value>, HubError> = self
+            let mut found: Result<Vec<Value>, HubError> = self
                 .data(
                     Method::GET,
                     &["api", "agent-files"],
@@ -1180,6 +1180,20 @@ impl SessionHub for RemoteHub {
                     None,
                 )
                 .await;
+            if matches!(found, Err(HubError::Agent(AgentError::Unsupported(_)))) {
+                found = self
+                    .data(
+                        Method::GET,
+                        &["api", "agent-files"],
+                        &[
+                            ("directory", trimmed),
+                            ("query", query),
+                            ("limit", &limit_str),
+                        ],
+                        None,
+                    )
+                    .await;
+            }
             match found {
                 // The route names the kind `kind`; the trait's hits say `type`.
                 Ok(hits) if !hits.is_empty() => Ok(hits
@@ -2252,7 +2266,7 @@ impl SessionHub for RemoteHub {
                 server_id: "self".into(),
                 name: super::local::computer_name(),
                 reachable: true,
-                current: true,
+                current: self.targets_local_machine(),
                 url: Some(self.base.to_string()),
             }];
             if let Ok(json) = self.call(Method::GET, &["api", "peers"], &[], None).await {
