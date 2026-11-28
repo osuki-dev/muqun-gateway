@@ -89,6 +89,7 @@ pub(crate) async fn resolve_caller_scope(
         } => {
             let filter = TaskFilter {
                 pane: Some((session_id.clone(), pane_id.clone())),
+                states: Some(crate::tasks::service::OPEN_STATES.to_vec()),
                 limit: 16,
                 ..Default::default()
             };
@@ -126,17 +127,22 @@ pub(crate) async fn resolve_caller_scope(
                     };
                 }
             }
-            // Fail closed on shared daemons while any remote peer-originated task is open on this agent.
+            // Fail closed on shared daemons while any remote peer or local delegated task is open
+            // on this agent. Only query open states so historical tasks cannot evict active ones.
+            const OPEN_SCOPE_LIMIT: usize = 256;
             let open = state
                 .tasks
                 .open_tasks(TaskFilter {
-                    limit: 64,
+                    states: Some(crate::tasks::service::OPEN_STATES.to_vec()),
+                    limit: OPEN_SCOPE_LIMIT,
                     ..Default::default()
                 })
                 .await;
             match open {
                 Ok(tasks) => {
-                    let has_peer_task_on_agent = tasks.iter().any(|t| {
+                    let mut has_peer_task_on_agent = false;
+                    let mut has_local_task_on_agent = false;
+                    for t in &tasks {
                         let matches_agent = match &t.binding {
                             crate::tasks::domain::TaskBinding::AgentSession {
                                 agent_id: a, ..
@@ -146,11 +152,19 @@ pub(crate) async fn resolve_caller_scope(
                             } => a == agent_id,
                             _ => false,
                         };
-                        (t.origin == TaskOrigin::Peer || t.requester_server_id.is_some())
-                            && matches_agent
-                    });
-                    if has_peer_task_on_agent {
+                        if !matches_agent {
+                            continue;
+                        }
+                        if t.origin == TaskOrigin::Peer || t.requester_server_id.is_some() {
+                            has_peer_task_on_agent = true;
+                        } else {
+                            has_local_task_on_agent = true;
+                        }
+                    }
+                    if has_peer_task_on_agent || tasks.len() >= OPEN_SCOPE_LIMIT {
                         CallerScope::RemoteOrRestricted
+                    } else if has_local_task_on_agent {
+                        CallerScope::LocalTask
                     } else {
                         CallerScope::LocalOwner
                     }
@@ -207,6 +221,7 @@ struct UpstreamWorker {
 /// Gateway's Unified MCP Hub manager.
 pub(crate) struct McpHub {
     config_path: Option<PathBuf>,
+    self_ports: Vec<u16>,
     upstreams: RwLock<Vec<UpstreamMcpConfig>>,
     runtime: RwLock<HashMap<String, UpstreamRuntimeState>>,
     workers: RwLock<HashMap<String, Arc<UpstreamWorker>>>,
@@ -328,22 +343,84 @@ pub(crate) enum HubCallError {
     UpstreamFailed(String),
 }
 
+/// Custom DNS resolver for outbound HTTP MCP upstreams: blocks cloud metadata,
+/// link-local, and unspecified addresses at connect time to defeat DNS rebinding.
+struct SafeUpstreamResolver;
+
+impl reqwest::dns::Resolve for SafeUpstreamResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            if is_blocked_metadata_host(&host) {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "upstream host is blocked",
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .collect();
+            for addr in &addrs {
+                if is_blocked_ip(addr.ip()) {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "upstream resolved to a blocked metadata or link-local address",
+                    ))
+                        as Box<dyn std::error::Error + Send + Sync>);
+                }
+            }
+            let iter: reqwest::dns::Addrs = Box::new(addrs.into_iter());
+            Ok(iter)
+        })
+    }
+}
+
 impl McpHub {
+    #[cfg(test)]
     pub(crate) fn new(upstreams: Vec<UpstreamMcpConfig>, config_path: Option<PathBuf>) -> Self {
+        Self::with_self_ports(upstreams, config_path, Vec::new())
+    }
+
+    pub(crate) fn with_self_ports(
+        upstreams: Vec<UpstreamMcpConfig>,
+        config_path: Option<PathBuf>,
+        mut self_ports: Vec<u16>,
+    ) -> Self {
+        self_ports.sort_unstable();
+        self_ports.dedup();
         let http = reqwest::Client::builder()
             .user_agent(format!("muqun-gateway/{}", env!("CARGO_PKG_VERSION")))
             // Never follow HTTP redirects automatically: prevents leaking Authorization headers
             // or bouncing requests onto loopback/cloud-metadata endpoints.
             .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(Arc::new(SafeUpstreamResolver))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             config_path,
+            self_ports,
             upstreams: RwLock::new(upstreams),
             runtime: RwLock::new(HashMap::new()),
             workers: RwLock::new(HashMap::new()),
             http,
         }
+    }
+
+    fn check_outbound_url(&self, url: &str) -> Result<(), String> {
+        let parsed = reqwest::Url::parse(url.trim())
+            .map_err(|_| "HTTP upstream url is not a valid URL".to_owned())?;
+        let Some(host) = parsed.host_str() else {
+            return Err("HTTP upstream url must include a host".into());
+        };
+        if is_blocked_metadata_host(host) {
+            return Err("HTTP upstream host is blocked".into());
+        }
+        if is_self_loop_url(&parsed, &self.self_ports) {
+            return Err("cannot connect to this Gateway's own listener as an upstream".into());
+        }
+        Ok(())
     }
 
     pub(crate) fn list_views(&self) -> Vec<UpstreamView> {
@@ -571,6 +648,7 @@ impl McpHub {
                             .get("inputSchema")
                             .cloned()
                             .unwrap_or_else(|| json!({ "type": "object" }));
+                        redact_json_strings(&mut input_schema);
                         if input_schema.to_string().len() > MAX_TOOL_SCHEMA_BYTES {
                             input_schema = json!({
                                 "type": "object",
@@ -1117,6 +1195,7 @@ impl McpHub {
         mcp_name: Option<&str>,
         timeout: Duration,
     ) -> Result<(Value, Option<String>), HttpRpcErr> {
+        self.check_outbound_url(url).map_err(HttpRpcErr::Other)?;
         let mut req = self
             .http
             .post(url)
@@ -1500,6 +1579,88 @@ fn http_origin(raw: &str) -> Option<String> {
     Some(format!("{scheme}://{host}:{port}"))
 }
 
+fn http_origin_and_path(raw: &str) -> Option<(String, String)> {
+    let parsed = reqwest::Url::parse(raw.trim()).ok()?;
+    let origin = http_origin(raw)?;
+    let path = parsed.path().trim_end_matches('/').to_owned();
+    Some((origin, path))
+}
+
+fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_link_local()
+                || v4.is_unspecified()
+                // Alibaba Cloud / Tencent metadata endpoint
+                || v4 == std::net::Ipv4Addr::new(100, 100, 100, 200)
+                // 0.0.0.0/8 ("this network")
+                || v4.octets()[0] == 0
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_blocked_ip(std::net::IpAddr::V4(mapped));
+            }
+            let segs = v6.segments();
+            v6.is_unspecified()
+                // fe80::/10 link-local
+                || (segs[0] & 0xffc0) == 0xfe80
+                // AWS IMDSv2 IPv6 endpoint fd00:ec2::254
+                || v6 == std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)
+        }
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let h = host
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if h == "localhost" || h.ends_with(".localhost") {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => v4.is_loopback(),
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+            }
+        };
+    }
+    false
+}
+
+fn is_self_loop_url(parsed: &reqwest::Url, self_ports: &[u16]) -> bool {
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let Some(port) = parsed.port_or_known_default() else {
+        return false;
+    };
+    is_loopback_host(host) && self_ports.contains(&port)
+}
+
+fn redact_json_strings(val: &mut Value) {
+    match val {
+        Value::String(s) => {
+            let (clean, changed) = redact_secrets(s);
+            if changed {
+                *s = clean;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_json_strings(item);
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values_mut() {
+                redact_json_strings(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn is_forbidden_header(name: &str) -> bool {
     matches!(
         name.trim().to_ascii_lowercase().as_str(),
@@ -1518,14 +1679,24 @@ fn is_forbidden_header(name: &str) -> bool {
 }
 
 fn is_blocked_metadata_host(host: &str) -> bool {
-    let h = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    let h = host
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        if is_blocked_ip(ip) {
+            return true;
+        }
+    }
     matches!(
         h.as_str(),
         "169.254.169.254"
             | "169.254.170.2"
+            | "100.100.100.200"
             | "fd00:ec2::254"
             | "metadata.google.internal"
             | "metadata.goog"
+            | "metadata"
     )
 }
 
@@ -1625,9 +1796,15 @@ fn is_sensitive_key(key: &str) -> bool {
         "session",
         "signature",
         "private",
+        "dsn",
+        "database_url",
+        "connection_string",
+        "_pat",
+        "pat_",
     ]
     .iter()
     .any(|needle| lc.contains(needle))
+        || lc == "pat"
 }
 
 fn mask_transport(transport: UpstreamTransport) -> UpstreamTransport {
@@ -1640,21 +1817,23 @@ fn mask_transport(transport: UpstreamTransport) -> UpstreamTransport {
                     if is_sensitive_key(&k) && !v.is_empty() {
                         (k, MASKED_SECRET.to_owned())
                     } else {
-                        (k, v)
+                        let (clean, _) = redact_secrets(&v);
+                        (k, clean)
                     }
                 })
                 .collect(),
         },
         UpstreamTransport::Stdio { command, args, env } => UpstreamTransport::Stdio {
             command,
-            args,
+            args: args.into_iter().map(|arg| redact_secrets(&arg).0).collect(),
             env: env
                 .into_iter()
                 .map(|(k, v)| {
                     if is_sensitive_key(&k) && !v.is_empty() {
                         (k, MASKED_SECRET.to_owned())
                     } else {
-                        (k, v)
+                        let (clean, _) = redact_secrets(&v);
+                        (k, clean)
                     }
                 })
                 .collect(),
@@ -1662,8 +1841,9 @@ fn mask_transport(transport: UpstreamTransport) -> UpstreamTransport {
     }
 }
 
-/// Only restore masked secret placeholders when the destination origin (HTTP) or
-/// executable (Stdio) is unchanged, preventing credential replay onto a new host/command.
+/// Only restore masked secret placeholders when the destination origin+path (HTTP)
+/// or command+args (Stdio) are unchanged, preventing credential replay onto a new
+/// host, path, or script/command invocation.
 fn preserve_masked_secrets(
     prev: Option<&UpstreamTransport>,
     next: &mut UpstreamTransport,
@@ -1684,9 +1864,11 @@ fn preserve_masked_secrets(
             else {
                 return Err("masked secret placeholder has no existing HTTP upstream".into());
             };
-            if http_origin(prev_url).is_none() || http_origin(prev_url) != http_origin(next_url) {
+            if http_origin_and_path(prev_url).is_none()
+                || http_origin_and_path(prev_url) != http_origin_and_path(next_url)
+            {
                 return Err(
-                    "re-enter secret headers when changing the HTTP endpoint origin".into(),
+                    "re-enter secret headers when changing the HTTP endpoint origin or path".into(),
                 );
             }
             for (k, v) in next_headers.iter_mut() {
@@ -1703,8 +1885,8 @@ fn preserve_masked_secrets(
         }
         UpstreamTransport::Stdio {
             command: next_cmd,
+            args: next_args,
             env: next_env,
-            ..
         } => {
             let has_masked = next_env.values().any(|v| v == MASKED_SECRET);
             if !has_masked {
@@ -1712,14 +1894,17 @@ fn preserve_masked_secrets(
             }
             let Some(UpstreamTransport::Stdio {
                 command: prev_cmd,
+                args: prev_args,
                 env: prev_env,
-                ..
             }) = prev
             else {
                 return Err("masked secret placeholder has no existing stdio upstream".into());
             };
-            if prev_cmd.trim() != next_cmd.trim() {
-                return Err("re-enter secret env values when changing the stdio command".into());
+            if prev_cmd.trim() != next_cmd.trim() || prev_args != next_args {
+                return Err(
+                    "re-enter secret env values when changing the stdio command or arguments"
+                        .into(),
+                );
             }
             for (k, v) in next_env.iter_mut() {
                 if v == MASKED_SECRET {
@@ -1952,17 +2137,24 @@ async fn upsert_upstream(
         ));
     }
     if let UpstreamTransport::Http { url, .. } = &payload.transport {
+        let mut self_ports = state.mcp_hub.self_ports.clone();
         let self_url = crate::mcp::local_url(&state.config.listen);
-        if http_origin(url).is_some()
-            && http_origin(url) == http_origin(&self_url)
-            && reqwest::Url::parse(url.trim())
-                .ok()
-                .is_some_and(|u| u.path().trim_end_matches('/') == crate::mcp::MCP_PATH)
+        if let Some(p) = reqwest::Url::parse(&self_url)
+            .ok()
+            .and_then(|u| u.port_or_known_default())
+        {
+            if !self_ports.contains(&p) {
+                self_ports.push(p);
+            }
+        }
+        if reqwest::Url::parse(url.trim())
+            .ok()
+            .is_some_and(|u| is_self_loop_url(&u, &self_ports))
         {
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
                 "self_loop_upstream",
-                "cannot register this Gateway's own /mcp endpoint as an upstream",
+                "cannot register this Gateway's own listener as an upstream",
             ));
         }
     }
@@ -3087,5 +3279,111 @@ done
             .unwrap();
         let resp = app.oneshot(disabled_call_req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn preserve_masked_secrets_rejects_stdio_args_change_and_http_path_change() {
+        let prev_stdio = UpstreamTransport::Stdio {
+            command: "node".into(),
+            args: vec!["server.js".into()],
+            env: BTreeMap::from([("API_KEY".into(), "real-secret-value".into())]),
+        };
+        let mut swapped_args = UpstreamTransport::Stdio {
+            command: "node".into(),
+            args: vec!["-e".into(), "console.log(process.env.API_KEY)".into()],
+            env: BTreeMap::from([("API_KEY".into(), MASKED_SECRET.into())]),
+        };
+        assert!(preserve_masked_secrets(Some(&prev_stdio), &mut swapped_args).is_err());
+
+        let mut same_args = UpstreamTransport::Stdio {
+            command: "node".into(),
+            args: vec!["server.js".into()],
+            env: BTreeMap::from([("API_KEY".into(), MASKED_SECRET.into())]),
+        };
+        assert!(preserve_masked_secrets(Some(&prev_stdio), &mut same_args).is_ok());
+
+        let prev_http = UpstreamTransport::Http {
+            url: "https://example.com/mcp/v1".into(),
+            headers: BTreeMap::from([("Authorization".into(), "Bearer tok".into())]),
+        };
+        let mut swapped_path = UpstreamTransport::Http {
+            url: "https://example.com/other/endpoint".into(),
+            headers: BTreeMap::from([("Authorization".into(), MASKED_SECRET.into())]),
+        };
+        assert!(preserve_masked_secrets(Some(&prev_http), &mut swapped_path).is_err());
+    }
+
+    #[test]
+    fn ssrf_and_self_loop_guards_block_mapped_metadata_and_loopback_aliases() {
+        for blocked in [
+            "169.254.169.254",
+            "169.254.0.1",
+            "100.100.100.200",
+            "[::ffff:169.254.169.254]",
+            "[::ffff:a9fe:a9fe]",
+            "[fe80::1]",
+            "[fd00:ec2::254]",
+            "0.0.0.0",
+            "metadata.google.internal.",
+        ] {
+            assert!(
+                is_blocked_metadata_host(blocked),
+                "{blocked} should be blocked"
+            );
+        }
+
+        let ports = [23847u16];
+        for self_url in [
+            "http://127.0.0.1:23847/mcp",
+            "http://localhost:23847/mcp",
+            "http://[::1]:23847/api/health",
+            "http://127.0.0.2:23847/mcp",
+            "http://[::ffff:127.0.0.1]:23847/mcp",
+        ] {
+            let parsed = reqwest::Url::parse(self_url).unwrap();
+            assert!(
+                is_self_loop_url(&parsed, &ports),
+                "{self_url} should be flagged as self-loop"
+            );
+        }
+        let other_local = reqwest::Url::parse("http://127.0.0.1:9999/mcp").unwrap();
+        assert!(!is_self_loop_url(&other_local, &ports));
+    }
+
+    #[test]
+    fn mask_transport_and_schema_redaction_scrub_inline_secrets() {
+        let masked = mask_transport(UpstreamTransport::Stdio {
+            command: "npx".into(),
+            args: vec![
+                "--token".into(),
+                "ghp_1234567890abcdef1234567890abcdef1234".into(),
+            ],
+            env: BTreeMap::from([
+                ("DATABASE_URL".into(), "postgres://user:pass@host/db".into()),
+                (
+                    "NOTE".into(),
+                    "Bearer sk-proj-secret12345678901234567890".into(),
+                ),
+            ]),
+        });
+        let UpstreamTransport::Stdio { args, env, .. } = masked else {
+            panic!("expected stdio");
+        };
+        assert!(!args[1].contains("ghp_1234567890"));
+        assert_eq!(
+            env.get("DATABASE_URL").map(String::as_str),
+            Some(MASKED_SECRET)
+        );
+        assert!(!env["NOTE"].contains("sk-proj-secret"));
+
+        let mut schema = json!({
+            "type": "object",
+            "description": "uses ghp_1234567890abcdef1234567890abcdef1234"
+        });
+        redact_json_strings(&mut schema);
+        assert!(!schema["description"]
+            .as_str()
+            .unwrap()
+            .contains("ghp_1234567890"));
     }
 }

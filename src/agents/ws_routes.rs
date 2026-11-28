@@ -665,6 +665,9 @@ async fn open_event_socket(
     headers: HeaderMap,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
+    if let Err(refusal) = crate::platform::http::validate_ws_origin(&headers) {
+        return refusal.into_response();
+    }
     let caller = match require_device_or_peer(&state, &headers) {
         Ok(caller) => caller,
         Err(error) => return error.into_response(),

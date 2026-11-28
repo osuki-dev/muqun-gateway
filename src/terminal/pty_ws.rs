@@ -211,6 +211,9 @@ async fn upgrade(
         )
         .into_response();
     }
+    if let Err(refusal) = crate::platform::http::validate_ws_origin(&headers) {
+        return refusal.into_response();
+    }
     let device_id = match require_device(&state, &headers) {
         Ok(id) => id,
         Err(refusal) => return refusal.into_response(),
@@ -296,9 +299,11 @@ async fn run_pty_connection(
         return;
     }
 
-    // Wait for the initial `open` frame (with a 15 s handshake timeout).
+    // Wait for the initial `open` frame within a single absolute 15 s deadline
+    // so repeated `ping` frames cannot hold a PTY slot open indefinitely.
+    let handshake_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let (cwd, initial_size) = loop {
-        let next = match tokio::time::timeout(Duration::from_secs(15), socket.recv()).await {
+        let next = match tokio::time::timeout_at(handshake_deadline, socket.recv()).await {
             Ok(Some(Ok(msg))) => msg,
             _ => return,
         };
@@ -405,6 +410,17 @@ async fn run_unix_pty(
     cwd: PathBuf,
     initial_size: WinSize,
 ) {
+    if !still_paired(&state, device_id) {
+        let _ = send_frame(
+            socket,
+            codec,
+            &json!({"t": "error", "code": "device_revoked", "message": "device is no longer paired"})
+                .to_string(),
+        )
+        .await;
+        close_socket(socket).await;
+        return;
+    }
     let (exit_tx, mut exit_rx) = mpsc::channel::<PtyExit>(1);
     let (pty, _child) = match unix::spawn_shell(
         &cwd,

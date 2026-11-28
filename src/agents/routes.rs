@@ -1668,8 +1668,16 @@ async fn do_find_agent_files(
             .collect()
     } else if let Some(dir) = directory {
         let root = std::path::PathBuf::from(dir);
-        let needle = query.to_string();
-        tokio::task::spawn_blocking(move || crate::composer::search_files(&root, &needle, limit))
+        let canonical = std::fs::canonicalize(&root).ok();
+        let scannable = canonical
+            .as_deref()
+            .is_some_and(crate::platform::assets::is_scannable_root);
+        if scannable {
+            let root = canonical.unwrap_or(root);
+            let needle = query.to_string();
+            tokio::task::spawn_blocking(move || {
+                crate::composer::search_files(&root, &needle, limit)
+            })
             .await
             .unwrap_or_default()
             .into_iter()
@@ -1681,6 +1689,9 @@ async fn do_find_agent_files(
                 })
             })
             .collect()
+        } else {
+            Vec::new()
+        }
     } else {
         Vec::new()
     };
@@ -6630,6 +6641,18 @@ mod tests {
                 .any(|f| f.get("path").and_then(Value::as_str) == Some("hello_remote.rs")),
             "expected workspace fallback to return hello_remote.rs, got {files:?}"
         );
+        // Non-scannable roots like `/` must never fall back to walking the host filesystem.
+        let Json(root_body) = do_find_agent_files(
+            &state,
+            FileSearchScope::Agent(Some("claude")),
+            "",
+            20,
+            Some("/"),
+            &device_headers(),
+        )
+        .await
+        .expect("non-scannable root should return empty list");
+        assert_eq!(root_body["data"].as_array().unwrap().len(), 0);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

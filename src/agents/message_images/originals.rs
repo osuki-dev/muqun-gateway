@@ -72,6 +72,28 @@ pub(super) fn original_store() -> Result<PathBuf, &'static str> {
     std::fs::canonicalize(root).map_err(|_| "original_storage_unavailable")
 }
 
+const MAX_INLINE_ORIGINAL_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_INLINE_STORE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_INLINE_STORE_FILES: usize = 4096;
+
+fn inline_store_has_capacity(root: &Path, additional: u64) -> Result<(), &'static str> {
+    let mut total = additional;
+    let mut count = 1usize;
+    for entry in std::fs::read_dir(root).map_err(|_| "original_storage_unavailable")? {
+        let metadata =
+            std::fs::symlink_metadata(entry.map_err(|_| "original_storage_unavailable")?.path())
+                .map_err(|_| "original_storage_unavailable")?;
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+            count = count.saturating_add(1);
+        }
+        if total > MAX_INLINE_STORE_BYTES || count > MAX_INLINE_STORE_FILES {
+            return Err("original_storage_full");
+        }
+    }
+    Ok(())
+}
+
 fn inline_original_in(
     source: &str,
     budget: &mut usize,
@@ -83,7 +105,13 @@ fn inline_original_in(
     if !header.starts_with("data:") || !header.ends_with(";base64") {
         return Err("unsupported_inline_source");
     }
+    // Reject obviously oversized base64 payloads before creating staging files.
+    let estimated_bytes = (encoded.len() as u64 / 4).saturating_mul(3);
+    if estimated_bytes > MAX_INLINE_ORIGINAL_BYTES {
+        return Err("inline_source_too_large");
+    }
     private_dir(root).map_err(|_| "original_storage_unavailable")?;
+    inline_store_has_capacity(root, estimated_bytes)?;
     let staging = root.join(format!("{}.pending", uuid::Uuid::new_v4()));
     let result = (|| {
         let mut options = std::fs::OpenOptions::new();
@@ -107,7 +135,10 @@ fn inline_original_in(
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(chunk)
                 .map_err(|_| "invalid_inline_encoding")?;
-            size += decoded.len() as u64;
+            size = size.saturating_add(decoded.len() as u64);
+            if size > MAX_INLINE_ORIGINAL_BYTES {
+                return Err("inline_source_too_large");
+            }
             if head.len() < crate::ASSET_SNIFF_BYTES {
                 head.extend_from_slice(
                     &decoded[..decoded.len().min(crate::ASSET_SNIFF_BYTES - head.len())],
@@ -879,6 +910,7 @@ async fn original_response(
         .header("etag", &etag)
         .header("accept-ranges", "bytes")
         .header("cache-control", "private, no-store")
+        .header("content-security-policy", "sandbox")
         .header(
             "content-disposition",
             format!(

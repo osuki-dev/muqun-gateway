@@ -471,6 +471,12 @@ async fn create(
             })
             .collect();
     }
+    if caller.kind == DeviceKind::Gateway && !body.mentions.is_empty() {
+        return Err(refused(
+            "invalid_mentions",
+            "Forwarded tasks cannot add computer references",
+        ));
+    }
     let request = body.request(previous_cwd.as_deref(), &state.peers.names())?;
     // A delivery the device named needs an agent that can do it: a session
     // adapter attached for `session`, a known terminal agent for `pane`

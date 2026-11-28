@@ -29,6 +29,91 @@ async fn present_route(
     present(&state, body.path).await.map(Json)
 }
 
+/// Documented policy for `files.present`: regular file inside `$HOME`,
+/// no hidden path components, no symlinks, maximum 25 MiB, and never inside
+/// Gateway's private config/state directories.
+const MAX_PRESENT_FILE_BYTES: u64 = crate::MAX_UPLOAD_BYTES as u64;
+
+fn file_unavailable() -> (axum::http::StatusCode, Json<Value>) {
+    crate::api_error(
+        axum::http::StatusCode::NOT_FOUND,
+        "file_not_found",
+        "File not found",
+    )
+}
+
+fn validate_present_path(raw: &str, home: &std::path::Path) -> ApiResult<std::path::PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Err(file_unavailable());
+    }
+    let expanded = if let Some(rest) = trimmed.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        std::path::PathBuf::from(trimmed)
+    };
+    if !expanded.is_absolute() {
+        return Err(file_unavailable());
+    }
+    let mut root_candidates: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    for raw_root in [
+        Some(home.to_path_buf()),
+        Some(std::env::temp_dir()),
+        Some(std::path::PathBuf::from("/tmp")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(canon) = std::fs::canonicalize(&raw_root) {
+            if let Ok(rel) = expanded.strip_prefix(&canon) {
+                root_candidates.push((canon.clone(), rel.to_path_buf()));
+            } else if let Ok(rel) = expanded.strip_prefix(&raw_root) {
+                root_candidates.push((canon, rel.to_path_buf()));
+            }
+        }
+    }
+    let Some((root, relative)) = root_candidates
+        .into_iter()
+        .max_by_key(|(root, _)| root.as_os_str().len())
+    else {
+        return Err(file_unavailable());
+    };
+    if relative.as_os_str().is_empty() {
+        return Err(file_unavailable());
+    }
+    let mut cursor = root.clone();
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(file_unavailable());
+        };
+        if part.to_string_lossy().starts_with('.') {
+            return Err(file_unavailable());
+        }
+        cursor.push(part);
+        let meta = std::fs::symlink_metadata(&cursor).map_err(|_| file_unavailable())?;
+        if meta.file_type().is_symlink() {
+            return Err(file_unavailable());
+        }
+    }
+    let meta = std::fs::symlink_metadata(&cursor).map_err(|_| file_unavailable())?;
+    if !meta.is_file() {
+        return Err(file_unavailable());
+    }
+    if meta.len() > MAX_PRESENT_FILE_BYTES {
+        return Err(crate::api_error(
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "file_too_large",
+            "File exceeds the 25 MiB limit",
+        ));
+    }
+    let canonical = std::fs::canonicalize(&cursor).map_err(|_| file_unavailable())?;
+    if !canonical.starts_with(&root) || crate::platform::assets::is_gateway_private_path(&canonical)
+    {
+        return Err(file_unavailable());
+    }
+    Ok(canonical)
+}
+
 pub(crate) async fn present(state: &AppState, path: String) -> ApiResult<Value> {
     let root = dirs::home_dir().ok_or_else(|| {
         crate::api_error(
@@ -37,7 +122,14 @@ pub(crate) async fn present(state: &AppState, path: String) -> ApiResult<Value> 
             "Home directory unavailable",
         )
     })?;
-    let asset = crate::agents::message_images::explicit_asset(state, path, root, None).await?;
+    let validated = validate_present_path(&path, &root)?;
+    let asset = crate::agents::message_images::explicit_asset(
+        state,
+        validated.to_string_lossy().into_owned(),
+        root,
+        None,
+    )
+    .await?;
     Ok(
         json!({"state":"done", "server_id":state.config.server_id, "machine":state.config.label, "files":[asset]}),
     )
@@ -351,6 +443,34 @@ mod output_tests {
             file["path"],
             path.canonicalize().unwrap().to_string_lossy().as_ref()
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn present_refuses_hidden_paths_and_symlinks() {
+        let dir = crate::test_support::asset_test_dir("mcp-present-hardening");
+        let hidden = dir.join(".secret");
+        std::fs::write(&hidden, b"top-secret").unwrap();
+        let target = dir.join("real.txt");
+        std::fs::write(&target, b"hello").unwrap();
+        let link = dir.join("alias.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let state = crate::test_state("admin", vec![]);
+        let hidden_err = present(&state, hidden.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+        assert_eq!(hidden_err.0, axum::http::StatusCode::NOT_FOUND);
+
+        #[cfg(unix)]
+        {
+            let link_err = present(&state, link.to_string_lossy().into_owned())
+                .await
+                .unwrap_err();
+            assert_eq!(link_err.0, axum::http::StatusCode::NOT_FOUND);
+        }
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

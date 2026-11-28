@@ -1134,6 +1134,9 @@ fn hosted_roots(session_root: &Path) -> Vec<PathBuf> {
 fn resolve_in_fences(src: &str, fences: Vec<PathBuf>) -> Option<(PathBuf, PathBuf)> {
     fences.into_iter().find_map(|fence| {
         let path = resolve_image_path(src, &fence)?;
+        if crate::platform::assets::is_gateway_private_path(&path) {
+            return None;
+        }
         Some((path, fence))
     })
 }

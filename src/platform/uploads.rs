@@ -306,6 +306,7 @@ pub(crate) async fn upload_content(
         // on top of the blanket `no-store` the security headers apply, so it
         // cannot land in a shared cache on the way back either.
         .header("cache-control", "private, no-store, max-age=0")
+        .header("content-security-policy", "sandbox")
         .body(body)
         .map_err(|err| {
             tracing::warn!("failed to build upload response: {err}");
@@ -734,10 +735,7 @@ pub(crate) fn sniff_document_upload_kind(bytes: &[u8], client_name: &str) -> Opt
             extension: "toml",
             mime: "application/toml",
         },
-        Some("xml") => UploadKind {
-            extension: "xml",
-            mime: "application/xml",
-        },
+        Some("xml") => text_upload_kind("xml"),
         Some("rtf") => UploadKind {
             extension: "rtf",
             mime: "application/rtf",

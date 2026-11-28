@@ -1208,6 +1208,11 @@ pub(crate) fn read_workspace_excerpt(
         return None;
     }
     let start = start_line.max(1);
+    const MAX_SKIP_START_LINE: usize = 100_000;
+    const MAX_SKIP_BYTES: usize = 4 * 1024 * 1024;
+    if start > MAX_SKIP_START_LINE {
+        return None;
+    }
     let requested_end = end_line.map(|e| e.max(start));
     let max_end = requested_end
         .map(|e| e.min(start.saturating_add(MAX_HYDRATED_READ_LINES - 1)))
@@ -1215,6 +1220,7 @@ pub(crate) fn read_workspace_excerpt(
 
     let mut out = String::new();
     let mut line_no = 0usize;
+    let mut skipped_bytes = 0usize;
     let mut truncated = false;
     let mut buf = Vec::new();
     loop {
@@ -1229,12 +1235,20 @@ pub(crate) fn read_workspace_excerpt(
         }
         line_no += 1;
         if line_no < start {
+            skipped_bytes = skipped_bytes.saturating_add(n);
+            if skipped_bytes > MAX_SKIP_BYTES {
+                return None;
+            }
             // Skip any remaining tail of an oversized skipped line.
             while buf.last() != Some(&b'\n') {
                 buf.clear();
                 let more = (&mut reader).take(8192).read_until(b'\n', &mut buf).ok()?;
                 if more == 0 {
                     break;
+                }
+                skipped_bytes = skipped_bytes.saturating_add(more);
+                if skipped_bytes > MAX_SKIP_BYTES {
+                    return None;
                 }
             }
             continue;

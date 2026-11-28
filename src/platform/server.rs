@@ -172,9 +172,16 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         Some(config_file.clone()),
         presence,
     ));
-    let mcp_hub = Arc::new(crate::mcp::hub::McpHub::new(
+    let mut self_ports = vec![addr.port()];
+    if let Some(port) = local_port {
+        if !self_ports.contains(&port) {
+            self_ports.push(port);
+        }
+    }
+    let mcp_hub = Arc::new(crate::mcp::hub::McpHub::with_self_ports(
         config.mcp.upstreams.clone(),
         Some(config_file),
+        self_ports,
     ));
     peers.load_names().await;
     let history =
@@ -287,8 +294,13 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         state.clone(),
         encrypted_transport,
     ))
-    // Outside the encrypted transport: the local token is plaintext, from
-    // loopback only.
+    // Outside the encrypted transport: the local client token and the admin
+    // token in `pairing.json` are plaintext credentials accepted from loopback
+    // only (without proxy headers).
+    .layer(middleware::from_fn_with_state(
+        state.clone(),
+        admin_loopback_gate,
+    ))
     .layer(middleware::from_fn(super::local_client::gate))
     .layer(middleware::from_fn_with_state(
         known_hosts(&state.config),
@@ -1172,7 +1184,7 @@ pub(crate) async fn decrypt_transport_request(
             "invalid request",
         )
     })?;
-    if hash_token(&payload.token) != token_hash {
+    if !crate::authority::authenticates_admin(&token_hash, &payload.token) {
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "invalid_token",
@@ -1469,17 +1481,50 @@ pub(crate) async fn encrypt_transport_response(
 /// or of the listen address. A refusal says so in the log, because a name the
 /// owner reaches their own gateway by and this gateway has never been told
 /// about should be a line to read, not a mystery.
+/// The static admin token in `pairing.json` is for local loopback CLI/TUI
+/// management only. Reject it before any route runs if presented from a
+/// non-loopback peer or through reverse-proxy headers.
+pub(crate) async fn admin_loopback_gate(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if let Ok(token) = crate::platform::http::bearer_token(request.headers()) {
+        if crate::authority::authenticates_admin(&state.config.token_hash, token) {
+            let peer = request
+                .extensions()
+                .get::<axum::extract::ConnectInfo<SocketAddr>>()
+                .map(|info| info.0);
+            if !crate::mcp::auth::is_loopback(peer)
+                || crate::mcp::auth::refuse_for_proxy(request.headers())
+            {
+                return api_error(StatusCode::FORBIDDEN, "invalid_token", "invalid token")
+                    .into_response();
+            }
+        }
+    }
+    next.run(request).await
+}
+
 pub(crate) async fn known_host(
     State(known): State<Vec<String>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let host = request
-        .headers()
-        .get(axum::http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-        .or_else(|| request.uri().host().map(str::to_owned));
+    let host = match request.headers().get(axum::http::header::HOST) {
+        Some(raw) => match raw.to_str() {
+            Ok(value) => Some(value.to_owned()),
+            Err(_) => {
+                return api_error(
+                    StatusCode::FORBIDDEN,
+                    "unknown_host",
+                    "this gateway does not answer to that host name",
+                )
+                .into_response();
+            }
+        },
+        None => request.uri().host().map(str::to_owned),
+    };
     if let Some(host) = host.as_deref() {
         if !host_is_known(host, &known) {
             tracing::warn!(
@@ -1517,7 +1562,7 @@ pub(crate) fn known_hosts(config: &Config) -> Vec<String> {
 pub(crate) fn host_is_known(host: &str, known: &[String]) -> bool {
     let name = host_name(host);
     if name.is_empty() {
-        return true;
+        return false;
     }
     // Rebinding needs a name. An address is not one, and a page served from an
     // address literal is same-origin with this gateway and nothing else.
@@ -3054,5 +3099,107 @@ mod transport_v2_tests {
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(downgrade.into_body(), 8192).await.unwrap()).unwrap();
         assert_eq!(body["error"]["code"], "transport_version_required");
+    }
+
+    #[tokio::test]
+    async fn admin_loopback_gate_refuses_remote_and_proxied_admin_tokens() {
+        use axum::extract::ConnectInfo;
+        use axum::routing::get;
+        use tower::ServiceExt as _;
+
+        let state = crate::test_state("secret-admin", vec![]);
+        let app = Router::new()
+            .route("/ok", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                admin_loopback_gate,
+            ))
+            .with_state(state);
+
+        // 1. Direct loopback with admin token succeeds.
+        let mut ok_req = Request::builder()
+            .uri("/ok")
+            .header("authorization", "Bearer secret-admin")
+            .body(Body::empty())
+            .unwrap();
+        ok_req.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:41234".parse::<SocketAddr>().unwrap(),
+        ));
+        assert_eq!(
+            app.clone().oneshot(ok_req).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // 2. Non-loopback peer with admin token is rejected with 403.
+        let mut remote_req = Request::builder()
+            .uri("/ok")
+            .header("authorization", "Bearer secret-admin")
+            .body(Body::empty())
+            .unwrap();
+        remote_req.extensions_mut().insert(ConnectInfo(
+            "100.64.0.9:41234".parse::<SocketAddr>().unwrap(),
+        ));
+        assert_eq!(
+            app.clone().oneshot(remote_req).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // 3. Loopback peer carrying proxy header with admin token is rejected with 403.
+        let mut proxied_req = Request::builder()
+            .uri("/ok")
+            .header("authorization", "Bearer secret-admin")
+            .header("x-forwarded-for", "100.64.0.9")
+            .body(Body::empty())
+            .unwrap();
+        proxied_req.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:41234".parse::<SocketAddr>().unwrap(),
+        ));
+        assert_eq!(
+            app.clone().oneshot(proxied_req).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // 4. Malformed / empty Host headers fail closed.
+        let known = known_hosts(&crate::test_config("secret"));
+        for bad in ["", ".", ":23847", "[]"] {
+            assert!(!host_is_known(bad, &known), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn validate_ws_origin_allows_native_and_same_origin_and_refuses_cross_origin() {
+        use axum::http::HeaderMap;
+
+        // No Origin header (native clients) -> allowed.
+        let native = HeaderMap::new();
+        assert!(crate::platform::http::validate_ws_origin(&native).is_ok());
+
+        // Same-origin Origin matching Host -> allowed.
+        let mut same = HeaderMap::new();
+        same.insert("host", "127.0.0.1:23847".parse().unwrap());
+        same.insert("origin", "http://127.0.0.1:23847".parse().unwrap());
+        assert!(crate::platform::http::validate_ws_origin(&same).is_ok());
+
+        // Cross-origin webpage -> refused.
+        let mut evil = HeaderMap::new();
+        evil.insert("host", "127.0.0.1:23847".parse().unwrap());
+        evil.insert("origin", "https://evil.example".parse().unwrap());
+        assert_eq!(
+            crate::platform::http::validate_ws_origin(&evil)
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+
+        // Null / mismatched port Origin -> refused.
+        let mut bad_port = HeaderMap::new();
+        bad_port.insert("host", "127.0.0.1:23847".parse().unwrap());
+        bad_port.insert("origin", "http://127.0.0.1:9999".parse().unwrap());
+        assert_eq!(
+            crate::platform::http::validate_ws_origin(&bad_port)
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
     }
 }

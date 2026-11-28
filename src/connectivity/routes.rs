@@ -157,7 +157,10 @@ pub(crate) async fn pair_request(
     })?;
     if let Some(pending) = pending_pairing.as_ref() {
         if holds_the_slot(pending, now) {
-            if pending.request_id == body.request_id {
+            if crate::connectivity::authority::constant_time_eq(
+                pending.request_id.as_bytes(),
+                body.request_id.as_bytes(),
+            ) {
                 return pairing_response(
                     pair_request_response(&state.config, &body.request_id),
                     b"POST /api/pair/request",

@@ -163,8 +163,15 @@ async fn create(
 
     let upload_id = uuid::Uuid::new_v4().to_string();
     let now = Instant::now();
-    with_registry(|uploads| {
-        uploads.retain(|_, upload| now.duration_since(upload.touched) < CHUNKED_IDLE_TTL);
+    let expired_ids: Vec<String> = with_registry(|uploads| {
+        let mut expired = Vec::new();
+        uploads.retain(|id, upload| {
+            let keep = now.duration_since(upload.touched) < CHUNKED_IDLE_TTL;
+            if !keep {
+                expired.push(id.clone());
+            }
+            keep
+        });
         let mine: Vec<(String, Instant)> = uploads
             .iter()
             .filter(|(_, upload)| upload.device_id == device_id && upload.done.is_none())
@@ -184,38 +191,53 @@ async fn create(
             };
             let stale = stale.clone();
             uploads.remove(&stale);
-            remove_partial(&stale);
+            expired.push(stale);
         }
-        Ok(())
-    })?;
-
-    let dir = ensure_uploads_dir().map_err(|err| {
-        tracing::warn!("failed to prepare the upload directory: {err:#}");
-        failed()
-    })?;
-    let partial_dir = dir.join(PARTIAL_DIR);
-    std::fs::create_dir_all(&partial_dir)
-        .map_err(anyhow::Error::from)
-        .and_then(|()| write_upload_file(&partial_dir.join(&upload_id), &[]))
-        .map_err(|err| {
-            tracing::warn!("failed to open a chunked upload: {err:#}");
-            failed()
-        })?;
-    with_registry(|uploads| {
+        // Reserve the slot atomically under the same lock so concurrent
+        // `create` calls cannot bypass `MAX_CHUNKED_PER_DEVICE`.
         uploads.insert(
             upload_id.clone(),
             Chunked {
-                device_id,
-                name: request.name,
+                device_id: device_id.clone(),
+                name: request.name.clone(),
                 size: request.size,
                 received: 0,
                 next_index: 0,
                 last: None,
-                in_flight: false,
+                in_flight: true,
                 touched: now,
                 done: None,
             },
         );
+        Ok(expired)
+    })?;
+    for id in expired_ids {
+        remove_partial(&id);
+    }
+
+    let dir = match ensure_uploads_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            with_registry(|uploads| uploads.remove(&upload_id));
+            tracing::warn!("failed to prepare the upload directory: {err:#}");
+            return Err(failed());
+        }
+    };
+    let partial_dir = dir.join(PARTIAL_DIR);
+    if let Err(err) = std::fs::create_dir_all(&partial_dir)
+        .map_err(anyhow::Error::from)
+        .and_then(|()| write_upload_file(&partial_dir.join(&upload_id), &[]))
+    {
+        with_registry(|uploads| uploads.remove(&upload_id));
+        remove_partial(&upload_id);
+        tracing::warn!("failed to open a chunked upload: {err:#}");
+        return Err(failed());
+    }
+    with_registry(|uploads| {
+        if let Some(upload) = uploads.get_mut(&upload_id) {
+            upload.in_flight = false;
+            upload.touched = Instant::now();
+        }
     });
     Ok(Json(
         json!({ "uploadId": upload_id, "chunkBytes": CHUNK_BYTES }),
@@ -458,6 +480,17 @@ async fn complete(
         Step::Repeat(done) => return Ok(Json(done)),
         Step::Finish { name, size } => (name, size),
     };
+    struct CompleteGuard(String);
+    impl Drop for CompleteGuard {
+        fn drop(&mut self) {
+            with_registry(|uploads| {
+                if let Some(upload) = uploads.get_mut(&self.0) {
+                    upload.in_flight = false;
+                }
+            });
+        }
+    }
+    let _guard = CompleteGuard(upload_id.clone());
 
     let partial = partial_path(&upload_id).map_err(|_| failed())?;
     let outcome = {
