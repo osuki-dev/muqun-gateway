@@ -32,35 +32,15 @@ impl WindowKind {
 /// Panel placement glyphs share an outline; the divider identifies the actual layout.
 impl WindowKind {
     pub(super) fn glyph(self) -> &'static rune::Icon {
-        static DOCK: rune::Icon = rune::Icon {
-            name: "window-dock-right",
-            view: 24.0,
-            body: r#"<path d="M3 5h18v14H3zM15 5v14" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>"#,
-        };
-        static TILE: rune::Icon = rune::Icon {
-            name: "window-tile",
-            view: 24.0,
-            body: r#"<path d="M3 5h18v14H3zM12 5v14" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>"#,
-        };
-        static PAGE: rune::Icon = rune::Icon {
-            name: "window-page",
-            view: 24.0,
-            body: r#"<path d="M4 9V4h5m6 0h5v5M4 15v5h5m6 0h5v-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-        };
         match self {
-            Self::Tile => &TILE,
-            Self::Page => &PAGE,
-            Self::Dock => &DOCK,
+            Self::Tile => &crate::ui::icons::catalog::WINDOW_TILE,
+            Self::Page => &crate::ui::icons::catalog::WINDOW_PAGE,
+            Self::Dock => &crate::ui::icons::catalog::WINDOW_DOCK_RIGHT,
         }
     }
 
     pub(super) fn float_glyph() -> &'static rune::Icon {
-        static FLOAT: rune::Icon = rune::Icon {
-            name: "window-float",
-            view: 24.0,
-            body: r#"<path d="M5 7h14v11H5zM5 10h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>"#,
-        };
-        &FLOAT
+        &crate::ui::icons::catalog::WINDOW_FLOAT
     }
 }
 

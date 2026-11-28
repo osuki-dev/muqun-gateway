@@ -19,36 +19,11 @@ use crate::config::Language;
 use crate::model::commands::Command;
 use crate::model::compose::{BranchInfo, ComposeCommand};
 
-// ---- glyphs (App set: trusted, locked, processor, more, approval-always) ----
+// ---- glyphs (from `desktop/assets/glyphs`) ----
 
-static SHIELD: Icon = Icon {
-    name: "cmp-shield",
-    view: 24.0,
-    body: r#"<path d="m12 3 8 3v7c0 4-8 8-8 8s-8-4-8-8V6l8-3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-
-static SHIELD_CHECK: Icon = Icon {
-    name: "cmp-trusted",
-    view: 24.0,
-    body: r#"<path d="m12 3 8 3v7c0 4-8 8-8 8s-8-4-8-8V6l8-3Zm-4 9 3 3 5-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-
-static LOCK: Icon = Icon {
-    name: "cmp-locked",
-    view: 24.0,
-    body: r#"<rect x="5" y="10" width="14" height="11" rx="2.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-
-static MODEL: Icon = Icon {
-    name: "cmp-processor",
-    view: 24.0,
-    body: r#"<rect x="6" y="6" width="12" height="12" rx="3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M9 3v3m6-3v3M9 18v3m6-3v3M3 9h3m-3 6h3m12-6h3m-3 6h3M10 10h4v4h-4v-4Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-
-static AUTO_APPROVE: Icon = Icon {
-    name: "cmp-approval-always",
-    view: 24.0,
-    body: r#"<path d="M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6l-8-3Zm-4 9 3 3 5-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+use super::icons::catalog::{
+    COMPOSER_APPROVAL_ALWAYS as AUTO_APPROVE, LOCKED as LOCK, PROCESSOR as MODEL, SHIELD,
+    TRUSTED as SHIELD_CHECK,
 };
 
 /// A permission mode's glyph, and whether it is the risky one (bypass:

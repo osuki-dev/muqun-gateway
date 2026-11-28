@@ -26,16 +26,7 @@ impl ActivityMark {
             Self::Inline => 16.0,
             Self::Standalone => 20.0,
         };
-        static LEFT: rune::Icon = rune::Icon {
-            name: "muqun-ribbon-left",
-            view: 32.0,
-            body: r#"<path fill="currentColor" d="M1 4Q1 2.5 2.3 3.4L22.3 18.6Q23.1 19.3 22.3 20.1L19.2 22.7Q18.6 23.2 17.8 22.6L6.2 13.2V24.7Q6.2 25.3 5.7 25.7L2.2 28.7Q1 29.5 1 28Z"/>"#,
-        };
-        static RIGHT: rune::Icon = rune::Icon {
-            name: "muqun-ribbon-right",
-            view: 32.0,
-            body: r#"<path fill="currentColor" d="M19.7 11.6L29.7 3.5Q31 2.5 31 4.2V28Q31 29.4 29.8 28.5L26 25.4Q25.6 25.1 25.6 24.5V13.2L20.4 17.2L19.7 16.7Z"/>"#,
-        };
+        use super::icons::catalog::{MUQUN_RIBBON_LEFT as LEFT, MUQUN_RIBBON_RIGHT as RIGHT};
         let second = if k.c.icon_accent == k.c.info.icon {
             k.c.text_base
         } else {

@@ -30,22 +30,8 @@ pub(crate) fn fresh(text: impl Into<String>) -> TextEdit {
     edit
 }
 
-pub static SEND: rune::Icon = rune::Icon {
-    name: "composer-send",
-    view: 24.0,
-    body: r#"<path d="M6 18 18 6M6 6h12v12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-
-pub static PHOTO: rune::Icon = rune::Icon {
-    name: "composer-photo",
-    view: 24.0,
-    body: r#"<rect width="18" height="18" x="3" y="3" rx="2" ry="2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="8.5" cy="8.5" r="1.5" fill="none" stroke="currentColor" stroke-width="2"/><polyline points="21 15 16 10 5 21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-
-pub static DROP_ICON: rune::Icon = rune::Icon {
-    name: "composer-drop-icon",
-    view: 24.0,
-    body: r#"<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>"#,
+pub use super::icons::catalog::{
+    COMPOSER_DROP as DROP_ICON, COMPOSER_PHOTO as PHOTO, COMPOSER_SEND as SEND,
 };
 
 pub fn insert_image_pill(draft: &mut TextEdit, token: u64) -> usize {

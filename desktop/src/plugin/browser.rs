@@ -10,21 +10,8 @@ use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant
 use std::process::Command;
 
 pub(crate) const ID: &str = "browser";
-pub(super) const GLOBE: Icon = Icon {
-    name: "browser-globe",
-    view: 24.0,
-    body: r#"<g fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18"/></g>"#,
-};
-const BACK: Icon = Icon {
-    name: "browser-back",
-    view: 24.0,
-    body: r#"<path d="m13 5-7 7 7 7M6 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-const FORWARD: Icon = Icon {
-    name: "browser-forward",
-    view: 24.0,
-    body: r#"<path d="m11 5 7 7-7 7M18 12H4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
+pub(super) use crate::ui::icons::catalog::BROWSER_GLOBE as GLOBE;
+use crate::ui::icons::catalog::{BROWSER_BACK as BACK, BROWSER_FORWARD as FORWARD};
 
 #[derive(Default)]
 pub(crate) struct Browser {

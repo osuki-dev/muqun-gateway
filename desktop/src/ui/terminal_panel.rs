@@ -34,14 +34,7 @@ use crate::term::input::{self, Mods, Route};
 use crate::term::session::{Ended, Msg, Session};
 use crate::theme::color_scheme::ColorScheme;
 
-pub static TERMINAL_WINDOW: rune::Icon = rune::Icon {
-    name: "terminal-window",
-    view: 24.0,
-    body: concat!(
-        r#"<rect x="3" y="4" width="18" height="16" rx="2.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-        r#"<path d="m7 9 3 3-3 3m6 0h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-    ),
-};
+pub use super::icons::catalog::TERMINAL_WINDOW;
 
 /// One tab within the terminal panel.
 #[derive(Debug, Clone)]

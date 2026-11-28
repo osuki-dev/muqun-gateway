@@ -1670,7 +1670,8 @@ pub fn resolve_icon(name: Option<&str>) -> &'static Icon {
         Some("grid") | Some("dashboard") | Some("table") => &icons::GRID,
         Some("fork") => &icons::FORK,
         Some("inbox") => &icons::INBOX,
-        _ => &icons::GRID,
+        Some(other) => icons::by_name(other).unwrap_or(&icons::GRID),
+        None => &icons::GRID,
     }
 }
 

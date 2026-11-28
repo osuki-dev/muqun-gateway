@@ -64,51 +64,9 @@ pub enum Body {
     Failed(String),
 }
 
-// App glyphs (`assets/glyphs`), strokes copied onto each element.
-static FILE: rune::Icon = rune::Icon {
-    name: "viewer-file",
-    view: 24.0,
-    body: r#"<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Zm0 0v5h5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-static SOURCE_FILE: rune::Icon = rune::Icon {
-    name: "viewer-source-file",
-    view: 24.0,
-    body: r#"<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Zm0 0v5h5m-9 5-2 2 2 2m4-4 2 2-2 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-static DOCUMENT: rune::Icon = rune::Icon {
-    name: "viewer-document",
-    view: 24.0,
-    body: r#"<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Zm0 0v5h5M9 13h6m-6 4h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-static PHOTO_FILE: rune::Icon = rune::Icon {
-    name: "viewer-photo-file",
-    view: 24.0,
-    body: r#"<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Zm0 0v5h5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="m8 18 3-4 3 3 2-2m-7-4h.01" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-static VIDEO: rune::Icon = rune::Icon {
-    name: "viewer-video",
-    view: 24.0,
-    body: r#"<rect x="3" y="4" width="18" height="16" rx="3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="m10 8 6 4-6 4V8ZM3 8h3m-3 8h3m12-8h3m-3 8h3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-static AUDIO: rune::Icon = rune::Icon {
-    name: "viewer-audio",
-    view: 24.0,
-    body: r#"<path d="M4 12V9a8 8 0 0 1 16 0v3M4 12H3v7h4v-7H4Zm16 0h1v7h-4v-7h3ZM17 19a4 4 0 0 1-4 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-static OPEN_EXTERNAL: rune::Icon = rune::Icon {
-    name: "viewer-open-external",
-    view: 24.0,
-    body: r#"<path d="M13 3h8v8m0-8L10 14M8 5H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-static OPEN_FOLDER: rune::Icon = rune::Icon {
-    name: "viewer-open-folder",
-    view: 24.0,
-    body: r#"<path d="M3 9V6a2 2 0 0 1 2-2h5l2 3h6a2 2 0 0 1 2 2M5 20a2 2 0 0 1-2-2v-6h19l-3 8H5Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-};
-static DOWNLOAD: rune::Icon = rune::Icon {
-    name: "viewer-download",
-    view: 24.0,
-    body: r#"<path d="M12 3v12m-5-5 5 5 5-5M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+// App glyphs from `desktop/assets/glyphs`.
+use super::icons::catalog::{
+    AUDIO, DOCUMENT, DOWNLOAD, FILE, OPEN_EXTERNAL, OPEN_FOLDER, PHOTO_FILE, SOURCE_FILE, VIDEO,
 };
 
 const ZOOM_STEPS: [f32; 9] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 8.0];

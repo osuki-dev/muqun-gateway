@@ -24,14 +24,7 @@ use crate::model::voice::{Meter, VoiceControl, VoiceEvent, VoiceFailure, KEY_NAM
 use crate::platform::secrets::Store;
 
 /// The App's microphone glyph (`assets/glyphs/microphone.svg`).
-pub static MIC: rune::Icon = rune::Icon {
-    name: "microphone",
-    view: 24.0,
-    body: concat!(
-        r#"<rect x="9" y="3" width="6" height="11" rx="3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-        r#"<path d="M5 11a7 7 0 0 0 14 0M12 18v3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>"#,
-    ),
-};
+pub use super::icons::catalog::MICROPHONE as MIC;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
