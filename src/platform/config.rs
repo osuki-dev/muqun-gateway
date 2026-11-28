@@ -159,6 +159,9 @@ pub(crate) struct Config {
     /// Local Qoder CLI ACP support; private children start only on explicit session operations.
     #[serde(default, skip_serializing_if = "is_default_qoder")]
     pub(crate) qoder: agents::runtime::QoderConfig,
+    /// Opt-in GitHub Copilot CLI ACP support; never installs or signs in.
+    #[serde(default, skip_serializing_if = "is_default_copilot")]
+    pub(crate) copilot: agents::runtime::CopilotConfig,
     /// Claude Code native sessions through its official ACP adapter; on when
     /// `claude`, Node.js 22+ and the adapter or npx are found.
     #[serde(default, skip_serializing_if = "is_default_claude")]
@@ -203,6 +206,72 @@ impl AgentRuntimeConfig {
     }
 }
 
+/// Who may invoke an upstream MCP server configured in Muqun's MCP Hub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UpstreamScope {
+    /// Only local interactive owner sessions (never delegated sub-tasks or remote peer tasks).
+    #[default]
+    LocalOnly,
+    /// Local owner sessions and local delegated sub-tasks (never remote peer-originated tasks).
+    Tasks,
+    /// Any authenticated `/mcp` caller (still loopback-only).
+    All,
+}
+
+/// Process / connection lifecycle for an upstream MCP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UpstreamIsolation {
+    /// One shared upstream connection/process reused across calls (serialized for stdio).
+    #[default]
+    Shared,
+    /// Fresh connection/process per call (useful for stateful servers like browsers).
+    PerSession,
+}
+
+/// Transport configuration for an upstream MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum UpstreamTransport {
+    Http {
+        url: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        headers: BTreeMap<String, String>,
+    },
+    Stdio {
+        command: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        env: BTreeMap<String, String>,
+    },
+}
+
+/// One upstream MCP server registered in Muqun Gateway's unified MCP Hub.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpstreamMcpConfig {
+    pub(crate) id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) label: Option<String>,
+    #[serde(default = "default_true")]
+    pub(crate) enabled: bool,
+    #[serde(default)]
+    pub(crate) scope: UpstreamScope,
+    #[serde(default)]
+    pub(crate) isolation: UpstreamIsolation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) timeout_s: Option<u64>,
+    /// Optional allowlist of tool name patterns (exact or `*` wildcards). Empty allows all non-denied tools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) allowed_tools: Vec<String>,
+    /// Optional denylist of tool name patterns (exact or `*` wildcards). Always overrides `allowed_tools`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) denied_tools: Vec<String>,
+    pub(crate) transport: UpstreamTransport,
+}
+
 /// `{"mcp": {"enabled": false}}` removes `/mcp` and `/api/mcp/tokens*`, stops
 /// the token sweeper and gives OpenCode no `MUQUN_MCP_*` environment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +285,9 @@ pub(crate) struct McpConfig {
     /// from a written Gateway config while on.
     #[serde(default = "mcp_enabled_default", skip_serializing_if = "is_true")]
     pub(crate) inject_into_agents: bool,
+    /// Upstream MCP servers proxied through Muqun's unified MCP Hub.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) upstreams: Vec<UpstreamMcpConfig>,
 }
 
 fn mcp_enabled_default() -> bool {
@@ -227,6 +299,7 @@ impl Default for McpConfig {
         Self {
             enabled: true,
             inject_into_agents: true,
+            upstreams: Vec::new(),
         }
     }
 }
@@ -377,6 +450,10 @@ pub(crate) fn is_default_qoder(config: &agents::runtime::QoderConfig) -> bool {
     *config == agents::runtime::QoderConfig::default()
 }
 
+pub(crate) fn is_default_copilot(config: &agents::runtime::CopilotConfig) -> bool {
+    *config == agents::runtime::CopilotConfig::default()
+}
+
 pub(crate) fn is_required_transport(mode: &TransportEncryptionMode) -> bool {
     *mode == TransportEncryptionMode::Required
 }
@@ -458,6 +535,26 @@ pub(crate) struct SessionConfig {
     /// Omitted for every existing config, where Herdr remains the default.
     #[serde(default, skip_serializing_if = "BackendKind::is_herdr")]
     pub(crate) backend: BackendKind,
+}
+
+impl SessionConfig {
+    pub(crate) const DESKTOP_ID: &'static str = "desktop-terminal";
+
+    // Keep the existing Herdr-compatible wire representation, with a distinct
+    // identity for the native adapter even when its socket has a custom name.
+    pub(crate) fn is_desktop_terminal(&self) -> bool {
+        self.backend == BackendKind::Herdr
+            && self.id == Self::DESKTOP_ID
+            && self.label == crate::backend::muqun_term::MUQUN_WORKSPACE_LABEL
+    }
+
+    pub(crate) fn backend_display_name(&self) -> &'static str {
+        if self.is_desktop_terminal() {
+            "muqun-terminal"
+        } else {
+            self.backend.as_str()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

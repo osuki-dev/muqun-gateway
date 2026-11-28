@@ -1,0 +1,1250 @@
+//! `SessionHub`: the one backend abstraction the desktop UI knows
+//! (architecture §3).
+//!
+//! Every argument and result is the gateway's own `agents::domain` type --
+//! there is no second session model. [`LocalHub`] runs the gateway's agents
+//! plane in this process; a `RemoteHub` over the App's HTTP contract can
+//! implement the same trait later without the UI changing.
+
+mod dynamic;
+mod local;
+mod remote;
+
+use std::future::Future;
+use std::path::Path;
+use std::pin::Pin;
+
+use muqun_gateway::agents::directories::Completion;
+use muqun_gateway::agents::ports::{AgentError, AgentSessionSnapshot, FileDiffItem};
+use muqun_gateway::agents::{
+    AgentCatalog, AgentDomainEvent, AgentProject, AgentSessionId, AgentSessionInfo, ModelRef,
+    PermissionDecision, SessionQuery, TimelineItem,
+};
+use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
+use muqun_gateway::platform::StoredUpload;
+use tokio::sync::broadcast;
+
+pub use dynamic::{
+    connection_origin, is_local_connection, spawn_connected, ConnectionContext, DynamicHub,
+};
+pub use local::LocalHub;
+pub(crate) use remote::{
+    build_ws_request, local_gateway_credential, WsClientCodec, WsUpgradeRequest,
+};
+pub use remote::{discover_local_gateway, LocalGateway, RemoteHub};
+
+/// One file read over a remote Gateway (`/api/agent-sessions/{asid}/file-asset`
+/// + `/api/assets/{id}/content`).
+#[derive(Debug, Clone)]
+pub struct RemoteFile {
+    pub name: String,
+    pub mime: Option<String>,
+    pub size: Option<u64>,
+    pub bytes: Vec<u8>,
+}
+
+/// Transport definition for one upstream MCP server in Muqun's unified MCP Hub.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpUpstreamTransport {
+    Http {
+        url: String,
+        #[serde(default)]
+        headers: std::collections::BTreeMap<String, String>,
+    },
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: std::collections::BTreeMap<String, String>,
+    },
+}
+
+/// Preview of one tool discovered from an upstream MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpUpstreamToolPreview {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub input_schema: Option<serde_json::Value>,
+}
+
+/// Result returned by `POST /api/mcp/upstreams/{id}/call`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpToolCallResult {
+    pub upstream: String,
+    pub tool: String,
+    pub result: serde_json::Value,
+    #[serde(default)]
+    pub redacted: bool,
+    #[serde(default)]
+    pub duration_ms: u64,
+}
+
+/// Preview of one skill served by Muqun's built-in MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpBuiltinSkillPreview {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub namespace: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Muqun Gateway's own built-in `/mcp` server status as returned by
+/// `GET /api/mcp/upstreams`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpBuiltinView {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default = "default_true_desktop")]
+    pub enabled: bool,
+    #[serde(default = "default_true_desktop")]
+    pub serves_agents: bool,
+    #[serde(default = "default_true_desktop")]
+    pub inject_into_agents: bool,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub protocol: String,
+    #[serde(default)]
+    pub active_tokens: usize,
+    #[serde(default)]
+    pub tool_count: usize,
+    #[serde(default)]
+    pub skill_count: usize,
+    #[serde(default)]
+    pub tools: Vec<McpUpstreamToolPreview>,
+    #[serde(default)]
+    pub skills: Vec<McpBuiltinSkillPreview>,
+}
+
+/// Snapshot returned by `GET /api/mcp/upstreams`: Muqun's own built-in MCP
+/// server alongside any configured external upstream MCP servers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpHubSnapshot {
+    #[serde(default)]
+    pub builtin: Option<McpBuiltinView>,
+    #[serde(default)]
+    pub upstreams: Vec<McpUpstreamView>,
+}
+
+/// One upstream MCP server as returned by `GET /api/mcp/upstreams`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpUpstreamView {
+    pub id: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default = "default_true_desktop")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub isolation: String,
+    #[serde(default)]
+    pub timeout_s: u64,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub denied_tools: Vec<String>,
+    pub transport: McpUpstreamTransport,
+    #[serde(default)]
+    pub healthy: bool,
+    #[serde(default)]
+    pub tool_count: usize,
+    #[serde(default)]
+    pub skill_count: usize,
+    #[serde(default)]
+    pub tools: Vec<McpUpstreamToolPreview>,
+    #[serde(default)]
+    pub last_probed_ms: Option<u64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+fn default_true_desktop() -> bool {
+    true
+}
+
+/// Payload for `PUT /api/mcp/upstreams/{id}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpUpstreamUpsert {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub enabled: bool,
+    pub scope: String,
+    pub isolation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_tools: Vec<String>,
+    pub transport: McpUpstreamTransport,
+}
+
+/// Why loading MCP Hub upstreams failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpHubError {
+    Unsupported(String),
+    Failed(String),
+}
+
+/// The agent a fresh install suggests first.
+pub const OPENCODE: &str = "opencode";
+
+/// Every agent id the gateway knows, in its order of preference
+/// (`AgentRuntime`'s `AGENT_PREFERENCE`).
+pub use muqun_gateway::agents::runtime::AGENT_PREFERENCE;
+
+pub type HubFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, HubError>> + Send + 'a>>;
+
+#[derive(Debug, Clone)]
+pub enum OrchestrationRequest {
+    List,
+    Read(String),
+    Start(serde_json::Value),
+    AskAdvisor {
+        run: String,
+        question: Option<String>,
+        agent: Option<String>,
+    },
+    Approve(String),
+    Rework {
+        run: String,
+        feedback: Option<String>,
+        selected_findings: Option<Vec<usize>>,
+    },
+    Cancel(String),
+    CancelTask {
+        run: String,
+        task: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct OrchestrationError {
+    pub message: String,
+    pub uncertain: bool,
+}
+
+/// What the composer offers for one agent in one folder: the gateway's
+/// catalogue (models, modes, slash commands, skills).
+#[derive(Debug, Clone, Default)]
+pub struct CatalogView {
+    pub catalog: AgentCatalog,
+}
+
+/// One computer the `@` popup may name (App `MentionComputer`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerMention {
+    pub server_id: String,
+    pub name: String,
+    pub reachable: bool,
+    /// The computer this composer already talks to.
+    pub current: bool,
+    pub url: Option<String>,
+}
+
+/// One delegated task, as `GET /api/tasks` lists it (the gateway's `TaskView`,
+/// the fields the desktop shows).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct TaskRow {
+    #[serde(rename = "task_id", alias = "id", default)]
+    pub id: String,
+    /// `queued`, `dispatching`, `working`, `waiting`, `idle_unconfirmed`,
+    /// `done`, `failed` or `cancelled`.
+    #[serde(default)]
+    pub state: String,
+    /// `delegation` or `command`.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub goal: String,
+    /// What to call the task (never empty from the gateway).
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub progress: Option<String>,
+    /// `device`, `agent`, `mcp` or `peer`.
+    #[serde(default)]
+    pub origin: String,
+    #[serde(default)]
+    pub parent_task_id: Option<String>,
+    #[serde(default)]
+    pub updated_ms: u64,
+    /// The agent the task runs on, from its binding.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// The agent session the task is bound to, when it is one.
+    #[serde(default)]
+    pub asid: Option<String>,
+    /// Persistent terminal session / pane ID bound to this task (e.g. `task-1`).
+    #[serde(default)]
+    pub pane_id: Option<String>,
+    /// Isolated git worktree branch created for this task, if any.
+    #[serde(default)]
+    pub worktree_branch: Option<String>,
+    /// The folder, when the gateway names one (a task view does not today).
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub children: TaskChildren,
+    /// A command task's exit status, once it has one.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    /// When it started working: its last reopening, else its creation.
+    #[serde(default)]
+    pub started_ms: u64,
+    /// The computer a mirrored delegation runs on (`binding.peer_name`).
+    #[serde(default)]
+    pub machine: Option<String>,
+    /// Whether the user may confirm it is finished (`POST …/complete`):
+    /// a device-opened task that is paused.
+    #[serde(default)]
+    pub completable: bool,
+}
+
+impl TaskRow {
+    /// Read one `TaskView` JSON object (a list entry or a create answer).
+    pub fn from_json(value: &serde_json::Value) -> Result<Self, serde_json::Error> {
+        let mut row: Self = serde_json::from_value(value.clone())?;
+        let binding = value.get("binding");
+        let text = |key: &str| {
+            binding
+                .and_then(|b| b.get(key))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        row.agent_id = text("agent_id").or(row.agent_id);
+        row.asid = text("asid").or_else(|| {
+            value
+                .get("asid")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+        row.pane_id = text("pane_id").or_else(|| {
+            value
+                .get("pane_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+        row.cwd = row.cwd.or_else(|| text("cwd"));
+        let ms = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+        row.started_ms = ms("reopened_ms")
+            .or_else(|| ms("created_ms"))
+            .unwrap_or(row.started_ms);
+        if binding
+            .and_then(|b| b.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("peer")
+        {
+            row.machine = text("peer_name").filter(|n| !n.is_empty());
+        }
+        row.completable =
+            row.origin == "device" && matches!(row.state.as_str(), "idle_unconfirmed" | "waiting");
+        Ok(row)
+    }
+
+    /// No further transition: cancel and complete do not apply.
+    pub fn is_ended(&self) -> bool {
+        matches!(self.state.as_str(), "done" | "failed" | "cancelled")
+    }
+}
+
+/// One "always allow" decision remembered for a session's project
+/// (`PermissionSaved.Info` in snake_case).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct SavedPermission {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub resource: String,
+}
+
+/// One background shell (`GET /api/agent-shells`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct ShellRow {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+}
+
+/// One entry from `GET /api/agent-worktrees` (`Worktree.Directory`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct WorktreeRow {
+    #[serde(default)]
+    pub directory: String,
+    /// Absent on the project's own root (not removable).
+    #[serde(default)]
+    pub strategy: Option<String>,
+}
+
+impl WorktreeRow {
+    pub fn is_root(&self) -> bool {
+        self.strategy.as_deref().is_none_or(|s| s.is_empty())
+    }
+}
+
+/// A task's direct children by state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct TaskChildren {
+    #[serde(default)]
+    pub total: u32,
+    #[serde(default)]
+    pub active: u32,
+    #[serde(default)]
+    pub waiting: u32,
+    #[serde(default)]
+    pub failed: u32,
+}
+
+/// One state change in a task's history.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct TaskStep {
+    #[serde(default)]
+    pub at_ms: u64,
+    /// The state it moved to.
+    #[serde(default)]
+    pub to: String,
+    /// Why, when the ledger recorded a reason (a summary, an error).
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// `GET /api/tasks/defaults`: what a task opened without a folder runs in.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct TaskDefaults {
+    #[serde(default)]
+    pub default_cwd: Option<String>,
+}
+
+/// A change to the delegated task list, from a hub that is told of them
+/// (the gateway's `task.updated` / `task.deleted` frames on `/api/ws`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskHubEvent {
+    Updated(Box<TaskRow>),
+    Deleted {
+        task_id: String,
+    },
+    /// Task events were missed (reconnect, or the gateway dropped some):
+    /// read the list again.
+    Resync,
+}
+
+/// One `GET /api/search` request (`docs/session-search.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SearchQuery {
+    pub q: String,
+    pub limit: usize,
+    /// The previous page's `next_cursor`.
+    pub cursor: Option<String>,
+}
+
+/// One matching row of a session: the gateway's `SearchItem`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct SearchHit {
+    pub asid: String,
+    pub agent_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub directory: Option<String>,
+    #[serde(default)]
+    pub parent_asid: Option<String>,
+    /// The timeline row, as the session's own timeline names it.
+    #[serde(default)]
+    pub item_id: String,
+    #[serde(default)]
+    pub message_id: String,
+    /// `user` or `assistant`.
+    #[serde(default)]
+    pub role: String,
+    /// `text` (a prompt or reply) or `tool` (a tool call's headline).
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub time_ms: u64,
+    #[serde(default)]
+    pub snippet: String,
+    /// `[start, end)` into `snippet`, in UTF-16 code units.
+    #[serde(default)]
+    pub highlights: Vec<[usize; 2]>,
+    /// The session's matching rows, of which at most three are listed.
+    #[serde(default)]
+    pub session_hits: usize,
+}
+
+/// Sessions whose index is current, out of those known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct SearchIndexing {
+    pub done: usize,
+    pub total: usize,
+}
+
+/// One page of search results.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct SearchPage {
+    #[serde(default)]
+    pub items: Vec<SearchHit>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub indexing: SearchIndexing,
+}
+
+/// Where a hub's sessions run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HubMode {
+    /// The gateway service on this computer, over loopback.
+    LocalGateway,
+    /// The agents plane inside this process; no gateway service.
+    #[default]
+    Standalone,
+}
+
+impl std::fmt::Display for HubMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::LocalGateway => "local gateway",
+            Self::Standalone => "standalone",
+        })
+    }
+}
+
+/// Timeline rows newer than a sequence the caller holds. `resync` means the
+/// mirror no longer covers that sequence: re-read the snapshot instead.
+#[derive(Debug, Clone, Default)]
+pub struct TimelineCatchUp {
+    pub items: Vec<TimelineItem>,
+    pub latest_seq: u64,
+    pub resync: bool,
+}
+
+pub trait SessionHub: Send + Sync {
+    fn orchestration(&self, _request: OrchestrationRequest) -> HubFuture<'_, serde_json::Value> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "Connect to a Gateway with intelligent orchestration support".into(),
+            )))
+        })
+    }
+    /// Which kind of backend this hub is.
+    fn mode(&self) -> HubMode;
+    /// The connected Gateway's version from `GET /api/meta`, or `None` for
+    /// standalone in-process hubs.
+    fn gateway_version(&self) -> HubFuture<'_, Option<String>> {
+        Box::pin(async { Ok(None) })
+    }
+    /// Every agent this hub knows, with the gateway's availability words.
+    /// Never waits on a probe: the answer is what is known now (attached
+    /// agents, the last probe), and asking again later picks up the result
+    /// of the probe this started.
+    fn agents(&self) -> HubFuture<'_, Vec<AgentDiscoveryInfo>>;
+    /// The ids of the agents attached right now, most preferred first.
+    fn attached(&self) -> HubFuture<'_, Vec<String>>;
+    /// Retained request metadata for reconnect reconciliation; None on older Gateways.
+    fn pending_attention(
+        &self,
+    ) -> HubFuture<'_, Option<Vec<muqun_gateway::agents::ports::AgentPendingSnapshot>>> {
+        Box::pin(async { Ok(None) })
+    }
+    /// One agent's sessions, as its adapter lists them.
+    fn sessions<'a>(
+        &'a self,
+        agent: &'a str,
+        query: SessionQuery,
+    ) -> HubFuture<'a, Vec<AgentSessionInfo>>;
+    /// The folders an agent already knows as projects.
+    fn projects<'a>(&'a self, agent: &'a str) -> HubFuture<'a, Vec<AgentProject>>;
+    /// Folders under a typed prefix, on the host the sessions run on.
+    fn directories<'a>(&'a self, prefix: &'a str) -> HubFuture<'a, Completion>;
+    fn create<'a>(&'a self, agent: &'a str, cwd: &'a Path) -> HubFuture<'a, AgentSessionInfo>;
+    /// Best-effort pre-warm of an agent runtime for `cwd` while the user composes a prompt.
+    fn warm_agent<'a>(
+        &'a self,
+        _agent: &'a str,
+        _cwd: Option<&'a str>,
+        _auto_approve: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    /// Create a session and apply initial model, mode, and auto-approve in one
+    /// round-trip where the backend supports it.
+    fn create_with_options<'a>(
+        &'a self,
+        agent: &'a str,
+        cwd: &'a Path,
+        model: Option<&'a ModelRef>,
+        mode: Option<&'a str>,
+        auto_approve: bool,
+    ) -> HubFuture<'a, AgentSessionInfo> {
+        Box::pin(async move {
+            let mut info = self.create(agent, cwd).await?;
+            if let Some(m) = model {
+                if self.switch_model(&info.asid, m).await.is_ok() {
+                    info.model = Some(m.clone());
+                }
+            }
+            if let Some(m) = mode {
+                if self.switch_mode(&info.asid, m).await.is_ok() {
+                    info.mode = Some(m.to_string());
+                }
+            }
+            if auto_approve {
+                let _ = self.set_auto_approve(&info.asid, true).await;
+            }
+            Ok(info)
+        })
+    }
+    /// The session's newest history and what it still has pending, after
+    /// preparing it as the App's `/prepare` does (which may restore a dormant
+    /// runtime or start following a terminal). For an explicit selection.
+    fn open<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, AgentSessionSnapshot>;
+    /// Prepare the session as `open` does, without reading its history back
+    /// (the warm path already painted it from `peek`).
+    fn wake<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move { self.open(asid).await.map(|_| ()) })
+    }
+    /// Retained history only — never wakes an agent. `None` means a cold open.
+    fn peek<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Option<AgentSessionSnapshot>>;
+    /// The same snapshot, read without preparing anything where the hub can
+    /// (the gateway's mirror): for re-reading a session that is already open.
+    fn snapshot<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, AgentSessionSnapshot>;
+    /// The agent's provider-account rate windows (`GET /api/agents/{id}/account-limits`),
+    /// as the gateway words them. Unsupported by default.
+    fn account_limits<'a>(
+        &'a self,
+        _agent: &'a str,
+        _refresh: bool,
+    ) -> HubFuture<'a, serde_json::Value> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "account limits".into(),
+            )))
+        })
+    }
+    /// The bytes of a picture the gateway serves (`/api/agent-images/…`,
+    /// `/api/assets/…`): a pasted image only the gateway holds. Unsupported
+    /// where the hub is in-process and resolves those itself.
+    fn media<'a>(&'a self, _path: &'a str) -> HubFuture<'a, Vec<u8>> {
+        Box::pin(async { Err(HubError::Agent(AgentError::Unsupported("media".into()))) })
+    }
+    /// The next older page of the session's history, kept in the mirror;
+    /// empty when there is nothing older.
+    fn earlier<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<TimelineItem>>;
+    fn prompt<'a>(&'a self, asid: &'a AgentSessionId, text: &'a str) -> HubFuture<'a, ()>;
+    fn interrupt<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()>;
+    fn reply_permission<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        request_id: &'a str,
+        decision: PermissionDecision,
+    ) -> HubFuture<'a, ()>;
+    fn reply_form<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        form_id: &'a str,
+        answers: serde_json::Value,
+    ) -> HubFuture<'a, ()>;
+    /// The prompt with files the hub already stored ([`SessionHub::store_attachment`])
+    /// and the delivery the owner asked for (`steer` / `queue`; `None` is the
+    /// agent's own default). One call for both, as the App's send.
+    fn send<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        text: &'a str,
+        attachments: &'a [String],
+        delivery: Option<&'a str>,
+    ) -> HubFuture<'a, ()>;
+    /// Files under `directory` matching `query`, as the agent finds them
+    /// (`@` mentions). Each hit is the gateway's `{path, type}` object.
+    fn find_files<'a>(
+        &'a self,
+        agent: &'a str,
+        directory: &'a str,
+        query: &'a str,
+        limit: usize,
+    ) -> HubFuture<'a, Vec<serde_json::Value>>;
+    /// Models, modes, skills and slash commands for the agent in `directory`
+    /// (or for the exact session when one is given).
+    fn catalog<'a>(
+        &'a self,
+        agent: &'a str,
+        asid: Option<&'a AgentSessionId>,
+        directory: Option<&'a str>,
+    ) -> HubFuture<'a, CatalogView>;
+    /// Run a host slash command in the session (never sent as typed text).
+    fn run_command<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        name: &'a str,
+        arguments: &'a str,
+        delivery: Option<&'a str>,
+    ) -> HubFuture<'a, serde_json::Value>;
+    /// Activate a catalogue skill in the session.
+    fn activate_skill<'a>(&'a self, asid: &'a AgentSessionId, skill: &'a str) -> HubFuture<'a, ()>;
+    fn switch_model<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        model: &'a ModelRef,
+    ) -> HubFuture<'a, ()>;
+    fn switch_mode<'a>(&'a self, asid: &'a AgentSessionId, mode: &'a str) -> HubFuture<'a, ()>;
+    /// Whether the session runs in the agent's own bypass mode ("YOLO": the
+    /// agent stops asking). `false` for an agent without such a control.
+    fn auto_approve<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, bool>;
+    /// Switch that bypass mode for this session; the answer is what the
+    /// agent reports afterwards. The gateway may refuse
+    /// (`allow_remote_auto_approve` off), which is an error here.
+    fn set_auto_approve<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        enabled: bool,
+    ) -> HubFuture<'a, bool>;
+    /// Rename the session in the agent that owns it.
+    fn rename<'a>(&'a self, asid: &'a AgentSessionId, title: &'a str) -> HubFuture<'a, ()>;
+    /// Delete the session and drop it from the mirror.
+    fn delete<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()>;
+    /// Fork into a new session (adapter may refuse). `message_id` is optional.
+    fn fork<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        message_id: Option<&'a str>,
+    ) -> HubFuture<'a, AgentSessionInfo>;
+    /// A queued or steered prompt: take it back, or move it between the two
+    /// deliveries (`steer` runs at the next step boundary).
+    fn inbox_cancel<'a>(&'a self, asid: &'a AgentSessionId, item: &'a str) -> HubFuture<'a, ()>;
+    fn inbox_delivery<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        item: &'a str,
+        delivery: &'a str,
+    ) -> HubFuture<'a, ()>;
+    /// Store a file the owner attached, under the gateway's own upload rules
+    /// (type sniffed from the bytes, 25 MiB / 64 MiB for video, no
+    /// executables). The result's path is what [`SessionHub::send`] takes.
+    fn store_attachment<'a>(&'a self, name: &'a str, bytes: Vec<u8>)
+        -> HubFuture<'a, StoredUpload>;
+    /// The working-tree changes in the session's folder, as the agent's
+    /// `get_vcs_diff` reports them (`working` mode).
+    fn vcs_diff<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<FileDiffItem>>;
+    /// Repository overview (branch, ahead/behind, branches, remote, universal worktrees).
+    fn vcs_overview<'a>(&'a self, _asid: &'a AgentSessionId) -> HubFuture<'a, GitRepoOverview> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "vcs_git_ops_v1".into(),
+            )))
+        })
+    }
+    /// Agent-independent changed file list (`working` or `branch` mode).
+    fn vcs_files<'a>(
+        &'a self,
+        _asid: &'a AgentSessionId,
+        _mode: &'a str,
+    ) -> HubFuture<'a, GitChangedFiles> {
+        Box::pin(async { Err(HubError::Agent(AgentError::Unsupported("vcs_files".into()))) })
+    }
+    /// Stage specific paths or all working-tree changes.
+    fn vcs_stage<'a>(
+        &'a self,
+        _asid: &'a AgentSessionId,
+        _paths: &'a [String],
+        _all: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "vcs_git_ops_v1".into(),
+            )))
+        })
+    }
+    /// Unstage specific paths or all staged changes.
+    fn vcs_unstage<'a>(
+        &'a self,
+        _asid: &'a AgentSessionId,
+        _paths: &'a [String],
+        _all: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "vcs_git_ops_v1".into(),
+            )))
+        })
+    }
+    /// Discard one changed or untracked file via Gateway.
+    fn vcs_discard<'a>(&'a self, _asid: &'a AgentSessionId, _path: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "vcs_discard".into(),
+            )))
+        })
+    }
+    /// Switch to a local branch or check out a Pull Request branch.
+    fn vcs_checkout<'a>(
+        &'a self,
+        _asid: &'a AgentSessionId,
+        _branch: Option<&'a str>,
+        _pr_number: Option<u64>,
+    ) -> HubFuture<'a, String> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "vcs_git_ops_v1".into(),
+            )))
+        })
+    }
+    /// Commit staged changes (or stage all then commit).
+    fn vcs_commit<'a>(
+        &'a self,
+        _asid: &'a AgentSessionId,
+        _message: &'a str,
+        _stage_all: bool,
+    ) -> HubFuture<'a, String> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "vcs_git_ops_v1".into(),
+            )))
+        })
+    }
+    /// Sync with remote (`fetch`, `pull`, `push`).
+    fn vcs_sync<'a>(
+        &'a self,
+        _asid: &'a AgentSessionId,
+        _action: &'a str,
+    ) -> HubFuture<'a, String> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "vcs_git_ops_v1".into(),
+            )))
+        })
+    }
+    /// Paginated recent commits.
+    fn vcs_commits<'a>(
+        &'a self,
+        _asid: &'a AgentSessionId,
+        _offset: usize,
+        _limit: usize,
+    ) -> HubFuture<'a, GitCommitsPage> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "vcs_git_ops_v1".into(),
+            )))
+        })
+    }
+    /// Paginated Pull Requests (`open` / `closed` / `all`, `me` / `all`).
+    fn vcs_prs<'a>(
+        &'a self,
+        _asid: &'a AgentSessionId,
+        _state: &'a str,
+        _author: &'a str,
+        _page: u32,
+        _limit: u32,
+        _refresh: bool,
+    ) -> HubFuture<'a, GitPrsPage> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "vcs_prs_v1".into(),
+            )))
+        })
+    }
+    /// Mark the session read as of now (the App's `POST …/view`).
+    fn view<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()>;
+    /// Stage a rollback to `message_id` without applying it; `files` also
+    /// reverts the working tree on commit.
+    fn stage_revert<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        message_id: &'a str,
+        files: bool,
+    ) -> HubFuture<'a, ()>;
+    /// Apply the staged rollback.
+    fn commit_revert<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()>;
+    /// Drop the staged rollback.
+    fn clear_revert<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()>;
+    /// Compact the session into a summary (`steer` / `queue`; `None` is the
+    /// agent's default).
+    fn compact<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        delivery: Option<&'a str>,
+    ) -> HubFuture<'a, ()>;
+    /// Every session below `asid`, at any depth (sub-agents and theirs),
+    /// newest update first. Empty for a session with no children.
+    fn descendants<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<AgentSessionInfo>>;
+    /// Decisions this session's project remembered as "always allow"
+    /// (`GET …/permissions/saved`). Empty when the agent has none or no such
+    /// list.
+    fn list_saved_permissions<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+    ) -> HubFuture<'a, Vec<SavedPermission>>;
+    /// Forget one remembered decision (`DELETE …/permissions/saved/{id}`).
+    fn forget_saved_permission<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        id: &'a str,
+    ) -> HubFuture<'a, ()>;
+    /// Background shells for `agent` in `directory` (`GET /api/agent-shells`).
+    /// Empty when the agent has none.
+    fn list_shells<'a>(
+        &'a self,
+        agent: &'a str,
+        directory: Option<&'a str>,
+    ) -> HubFuture<'a, Vec<ShellRow>>;
+    /// Stop one background shell (`DELETE /api/agent-shells/{id}`).
+    fn kill_shell<'a>(&'a self, agent: &'a str, id: &'a str) -> HubFuture<'a, ()>;
+    /// Park the session's current turn in the background
+    /// (`POST …/background`).
+    fn background_session<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()>;
+    /// Worktrees under the project folder (`GET /api/agent-worktrees`).
+    fn list_worktrees<'a>(
+        &'a self,
+        agent: &'a str,
+        directory: &'a str,
+    ) -> HubFuture<'a, Vec<WorktreeRow>>;
+    /// Forget one linked worktree (`DELETE /api/agent-worktrees`).
+    fn remove_worktree<'a>(
+        &'a self,
+        agent: &'a str,
+        project: &'a str,
+        worktree: &'a str,
+        force: bool,
+    ) -> HubFuture<'a, ()>;
+    /// Rediscover worktrees (`POST /api/agent-worktrees/refresh`).
+    fn refresh_worktrees<'a>(&'a self, agent: &'a str, directory: &'a str) -> HubFuture<'a, ()>;
+    /// Timeline rows with a sequence above `after`, from the mirror.
+    fn timeline_after<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        after: u64,
+    ) -> HubFuture<'a, TimelineCatchUp>;
+    /// Delegated tasks (`GET /api/tasks`), newest update first. `root` lists
+    /// that task and everything below it; `state` is a comma list of states.
+    fn list_tasks<'a>(
+        &'a self,
+        root: Option<&'a str>,
+        state: Option<&'a str>,
+    ) -> HubFuture<'a, Vec<TaskRow>>;
+    /// Delegate `goal` (`POST /api/tasks`). `cwd` and `agent_id` default on
+    /// the gateway; `peer_server_id` names another computer to give the
+    /// agent context about (`computer_ids`).
+    fn create_task<'a>(
+        &'a self,
+        goal: &'a str,
+        agent_id: Option<&'a str>,
+        cwd: Option<&'a str>,
+        peer_server_id: Option<&'a str>,
+    ) -> HubFuture<'a, TaskRow>;
+    /// Cancel a task (`POST /api/tasks/{id}/cancel`); idempotent.
+    fn cancel_task<'a>(&'a self, id: &'a str) -> HubFuture<'a, ()>;
+    /// The user confirms a paused delegation is finished
+    /// (`POST /api/tasks/{id}/complete`).
+    fn complete_task<'a>(&'a self, id: &'a str) -> HubFuture<'a, ()>;
+    /// Merge a task's worktree branch into current base checkout.
+    fn merge_task_worktree<'a>(
+        &'a self,
+        _task_id: &'a str,
+        _base_dir: &'a str,
+        _branch: &'a str,
+        _worktree_dir: Option<&'a str>,
+    ) -> HubFuture<'a, String> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "task worktree merge".into(),
+            )))
+        })
+    }
+    /// Clean up a task's worktree.
+    fn clean_task_worktree<'a>(
+        &'a self,
+        _task_id: &'a str,
+        _base_dir: &'a str,
+        _worktree_dir: Option<&'a str>,
+        _branch: Option<&'a str>,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "task worktree cleanup".into(),
+            )))
+        })
+    }
+    /// What a task opened without a folder would run in.
+    fn task_defaults(&self) -> HubFuture<'_, TaskDefaults>;
+    /// A task's state changes, oldest first (`GET /api/tasks/{id}`
+    /// `events`); empty where there is no task ledger.
+    fn task_history<'a>(&'a self, _id: &'a str) -> HubFuture<'a, Vec<TaskStep>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    /// Computers `@` may name: this machine first, then linked fleet peers
+    /// when the hub has them (App `GET /api/peers`).
+    fn list_peers(&self) -> HubFuture<'_, Vec<PeerMention>>;
+    /// Full-text search over every session's content (`GET /api/search`).
+    /// `Unsupported` where there is no index: the in-process hub (the index
+    /// lives in the gateway service) and a gateway without
+    /// `session_search_v1`.
+    fn search<'a>(&'a self, _query: &'a SearchQuery) -> HubFuture<'a, SearchPage> {
+        Box::pin(async { Err(HubError::Agent(AgentError::Unsupported("search".into()))) })
+    }
+    /// Read one file owned by a remote session through its Gateway
+    /// (`GET /api/agent-sessions/{asid}/file-asset` + asset content).
+    fn read_file<'a>(
+        &'a self,
+        _asid: &'a AgentSessionId,
+        _path: &'a str,
+    ) -> HubFuture<'a, RemoteFile> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "remote file read".into(),
+            )))
+        })
+    }
+    /// List Muqun's built-in MCP server and external upstream MCP servers
+    /// configured in Gateway's unified MCP Hub.
+    fn list_mcp_upstreams(&self) -> HubFuture<'_, McpHubSnapshot> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "Connect to a Gateway service with mcp_hub_v1 to manage unified MCP servers."
+                    .into(),
+            )))
+        })
+    }
+    /// Create or update one upstream MCP server in Gateway's unified MCP Hub.
+    fn upsert_mcp_upstream<'a>(
+        &'a self,
+        _id: &'a str,
+        _body: McpUpstreamUpsert,
+    ) -> HubFuture<'a, McpUpstreamView> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "Connect to a Gateway service with mcp_hub_v1 to manage unified MCP servers."
+                    .into(),
+            )))
+        })
+    }
+    /// Delete one upstream MCP server from Gateway's unified MCP Hub.
+    fn delete_mcp_upstream<'a>(&'a self, _id: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "Connect to a Gateway service with mcp_hub_v1 to manage unified MCP servers."
+                    .into(),
+            )))
+        })
+    }
+    /// Probe one upstream MCP server live and return updated health/tools.
+    fn probe_mcp_upstream<'a>(&'a self, _id: &'a str) -> HubFuture<'a, McpUpstreamView> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "Connect to a Gateway service with mcp_hub_v1 to manage unified MCP servers."
+                    .into(),
+            )))
+        })
+    }
+    /// Call one tool on an enabled upstream MCP server in Gateway's unified MCP Hub.
+    fn call_mcp_upstream_tool<'a>(
+        &'a self,
+        _id: &'a str,
+        _tool: &'a str,
+        _arguments: serde_json::Value,
+    ) -> HubFuture<'a, McpToolCallResult> {
+        Box::pin(async {
+            Err(HubError::Agent(AgentError::Unsupported(
+                "Connect to a Gateway service with mcp_hub_v1 to manage unified MCP servers."
+                    .into(),
+            )))
+        })
+    }
+    /// Every session event of every agent, in the order the runtime saw them.
+    fn events(&self) -> broadcast::Receiver<AgentDomainEvent>;
+    /// Whether the hub's link to its gateway is up: `None` while it is, else
+    /// why not. `None` (no receiver) for a hub with no link to lose.
+    fn link(&self) -> Option<tokio::sync::watch::Receiver<Option<String>>> {
+        None
+    }
+    /// Task changes as they happen, for a hub that is told of them; `None`
+    /// when the hub has no task ledger to follow.
+    fn task_events(&self) -> Option<broadcast::Receiver<TaskHubEvent>> {
+        None
+    }
+}
+
+/// Full repository overview for a session's checkout (local or remote).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct GitRepoOverview {
+    #[serde(default)]
+    pub is_repo: bool,
+    #[serde(default)]
+    pub toplevel: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub upstream: Option<String>,
+    #[serde(default)]
+    pub ahead: i64,
+    #[serde(default)]
+    pub behind: i64,
+    #[serde(default)]
+    pub detached: bool,
+    #[serde(default)]
+    pub head: Option<String>,
+    #[serde(default)]
+    pub changed_files: usize,
+    #[serde(default)]
+    pub local_branches: Vec<String>,
+    #[serde(default)]
+    pub remote_url: Option<String>,
+    #[serde(default)]
+    pub remote_host: Option<String>,
+    #[serde(default)]
+    pub worktrees: Vec<WorktreeRow>,
+}
+
+/// One changed file in `working` or `branch` diff mode.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct GitChangedFile {
+    pub path: String,
+    #[serde(default)]
+    pub old_path: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub staged: bool,
+    #[serde(default)]
+    pub unstaged: bool,
+    #[serde(default)]
+    pub binary: bool,
+    #[serde(default, alias = "additions")]
+    pub added: Option<u64>,
+    #[serde(default, alias = "deletions")]
+    pub removed: Option<u64>,
+}
+
+/// Changed file list returned by `GET /api/agent-sessions/{asid}/vcs/files`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitChangedFiles {
+    pub mode: String,
+    pub is_repo: bool,
+    pub truncated: bool,
+    pub files: Vec<GitChangedFile>,
+}
+
+/// One commit row from paginated `GET /api/agent-sessions/{asid}/vcs/commits`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct GitCommitRow {
+    pub hash: String,
+    pub short_hash: String,
+    pub subject: String,
+    pub author: String,
+    #[serde(default)]
+    pub timestamp_ms: i64,
+}
+
+/// One page of recent commits.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct GitCommitsPage {
+    #[serde(default)]
+    pub items: Vec<GitCommitRow>,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default)]
+    pub next_offset: Option<usize>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+/// One Pull Request row from paginated `GET /api/agent-sessions/{asid}/vcs/prs`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct GitPrRow {
+    pub number: u64,
+    pub title: String,
+    pub state: String,
+    #[serde(default)]
+    pub draft: bool,
+    pub url: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub head_branch: String,
+    #[serde(default)]
+    pub base_branch: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub checks_status: Option<String>,
+}
+
+/// One page of Pull Requests.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct GitPrsPage {
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub supported: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub repo_url: Option<String>,
+    #[serde(default)]
+    pub items: Vec<GitPrRow>,
+    #[serde(default)]
+    pub page: u32,
+    #[serde(default)]
+    pub next_page: Option<u32>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+/// Why a hub call did not happen.
+#[derive(Debug, Clone)]
+pub enum HubError {
+    /// The agent is not attached: not installed, not running, disabled.
+    /// `reason` is the gateway's own explanation when discovery has one.
+    AgentUnavailable {
+        agent: String,
+        reason: Option<String>,
+    },
+    /// No attached agent owns the session.
+    SessionNotFound(String),
+    /// The agent refused or failed; the gateway's error, for display.
+    Agent(AgentError),
+    /// A file was not accepted as an attachment (the gateway's own words).
+    Upload(muqun_gateway::platform::UploadRefusal),
+}
+
+impl From<AgentError> for HubError {
+    fn from(err: AgentError) -> Self {
+        Self::Agent(err)
+    }
+}
+
+impl std::fmt::Display for HubError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AgentUnavailable { agent, reason } => {
+                write!(f, "{agent} is not reachable")?;
+                match reason {
+                    Some(reason) => write!(f, ": {reason}"),
+                    None => Ok(()),
+                }
+            }
+            Self::SessionNotFound(asid) => write!(f, "Agent session not found: {asid}"),
+            Self::Agent(err) => err.fmt(f),
+            Self::Upload(refusal) => f.write_str(&refusal.message()),
+        }
+    }
+}
+
+impl std::error::Error for HubError {}

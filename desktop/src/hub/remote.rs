@@ -1,0 +1,3594 @@
+//! [`RemoteHub`]: the gateway service on this computer, over loopback.
+//!
+//! The same HTTP + `/api/ws` contract the phone App uses, with the local
+//! client token the gateway publishes in `local-client.json`. The gateway owns
+//! the one `AgentRuntime`; this hub holds no agent process and no session
+//! state beyond the history cursors of the sessions it has read.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use base64::Engine as _;
+use futures::{SinkExt as _, StreamExt as _};
+use muqun_gateway::agents::directories::{Completion, DirectoryEntry};
+use muqun_gateway::agents::ports::{AgentError, AgentSessionSnapshot, FileDiffItem};
+use muqun_gateway::agents::{
+    AgentCatalog, AgentDomainEvent, AgentProject, AgentSessionId, AgentSessionInfo, ModelRef,
+    PermissionDecision, SessionQuery, TimelineItem,
+};
+use muqun_gateway::platform::discovery::{AgentAvailability, AgentDiscoveryInfo};
+use muqun_gateway::platform::StoredUpload;
+use reqwest::Method;
+use serde::de::DeserializeOwned;
+use serde_json::{json, Value};
+use tokio::sync::broadcast;
+
+use super::local::enrich_local_media;
+use super::{
+    CatalogView, HubError, HubFuture, HubMode, PeerMention, SavedPermission, SearchPage,
+    SearchQuery, SessionHub, ShellRow, TaskDefaults, TaskHubEvent, TaskRow, TaskStep,
+    TimelineCatchUp, WorktreeRow,
+};
+
+const EVENT_CAPACITY: usize = 4096;
+const BACKOFF_START: Duration = Duration::from_millis(500);
+const BACKOFF_MAX: Duration = Duration::from_secs(15);
+/// Gateway pings every 25 s; after 35 s of total silence we probe with an
+/// application-level `{"t":"ping"}` and reconnect if still silent after grace.
+const WS_PING_AFTER: Duration = Duration::from_secs(35);
+const WS_PONG_GRACE: Duration = Duration::from_secs(15);
+const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long an answer about the gateway's capabilities holds: a gateway
+/// upgraded under a running desktop is noticed within this.
+const CAPABILITIES_FRESH: Duration = Duration::from_secs(60);
+/// The capability `GET /api/search` comes with.
+const SEARCH_CAPABILITY: &str = "session_search_v1";
+/// The capability `/api/mcp/upstreams*` comes with.
+const MCP_HUB_CAPABILITY: &str = "mcp_hub_v1";
+/// The capability `/api/agent-sessions/{asid}/vcs/{overview,stage,unstage,checkout,commit,sync,commits}` comes with.
+const VCS_GIT_OPS_CAPABILITY: &str = "vcs_git_ops_v1";
+/// The capability `/api/agent-sessions/{asid}/vcs/prs` comes with.
+const VCS_PRS_CAPABILITY: &str = "vcs_prs_v1";
+
+fn now_unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EncryptedRequestPayload {
+    token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_type: Option<String>,
+    body: String,
+}
+
+#[derive(serde::Deserialize)]
+struct EncryptedResponsePayload {
+    status: u16,
+    #[serde(default)]
+    #[allow(dead_code)]
+    headers: HashMap<String, String>,
+    body: String,
+    #[serde(default)]
+    content_encoding: Option<String>,
+}
+
+/// What `local-client.json` holds.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct LocalGateway {
+    pub url: String,
+    pub token: String,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub transport_key: Option<String>,
+}
+
+/// The local gateway's credential, when its file names one that answers
+/// `GET /api/meta`. `MUQUN_LOCAL_GATEWAY` overrides the file's path; the
+/// default is the gateway service's own state directory.
+pub async fn discover_local_gateway() -> Option<LocalGateway> {
+    let path = local_gateway_file()?;
+    let found = read_credential(&path)?;
+    match probe(&found).await {
+        Ok(()) => Some(found),
+        Err(why) => {
+            tracing::info!(file = %path.display(), "local gateway not usable: {why}");
+            None
+        }
+    }
+}
+
+/// Read the endpoint and credential without contacting the advertised host.
+pub(crate) fn local_gateway_credential() -> Option<LocalGateway> {
+    read_credential(&local_gateway_file()?)
+}
+
+fn local_gateway_file() -> Option<PathBuf> {
+    muqun_gateway::local_gateway_client_file().ok()
+}
+
+fn read_credential(path: &Path) -> Option<LocalGateway> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn is_loopback_url(url: &reqwest::Url) -> bool {
+    let Some(raw) = url.host_str() else {
+        return false;
+    };
+    let host = raw.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    let h = host.trim_end_matches('.');
+    h.eq_ignore_ascii_case("localhost") || h.ends_with(".localhost")
+}
+
+/// Bypass ambient HTTP/HTTPS proxy settings for loopback, private LAN, and
+/// Tailscale (`100.64.0.0/10`, `.ts.net`, `.local`) Gateways so remote traffic
+/// never detours through a local proxy daemon.
+fn should_bypass_proxy(url: &reqwest::Url) -> bool {
+    let Some(raw) = url.host_str() else {
+        return false;
+    };
+    let host = raw.trim_start_matches('[').trim_end_matches(']');
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            let o = ip.octets();
+            let is_cgnat = o[0] == 100 && (o[1] & 0b1100_0000) == 64; // 100.64.0.0/10 (Tailscale)
+            ip.is_loopback() || ip.is_private() || ip.is_link_local() || is_cgnat
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            let seg = ip.segments()[0];
+            let is_ula = (seg & 0xfe00) == 0xfc00;
+            let is_link_local = (seg & 0xffc0) == 0xfe80;
+            ip.is_loopback() || is_ula || is_link_local
+        }
+        Err(_) => {
+            let h = host.trim_end_matches('.').to_ascii_lowercase();
+            h == "localhost"
+                || h.ends_with(".localhost")
+                || h.ends_with(".local")
+                || h.ends_with(".ts.net")
+                || !h.contains('.')
+        }
+    }
+}
+
+async fn probe(gateway: &LocalGateway) -> Result<(), String> {
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(3));
+    if reqwest::Url::parse(&gateway.url)
+        .ok()
+        .is_some_and(|u| should_bypass_proxy(&u))
+    {
+        builder = builder.no_proxy();
+    }
+    let client = builder.build().map_err(|e| e.to_string())?;
+    let answer = client
+        .get(format!("{}/api/meta", gateway.url.trim_end_matches('/')))
+        .bearer_auth(&gateway.token)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if answer.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("/api/meta answered {}", answer.status()))
+    }
+}
+
+pub struct RemoteHub {
+    http: reqwest::Client,
+    base: reqwest::Url,
+    token: String,
+    device_id: Option<String>,
+    material: Option<Vec<u8>>,
+    transport_version: u8,
+    events: broadcast::Sender<AgentDomainEvent>,
+    /// `task.*` frames, which are not the session plane's events.
+    task_events: broadcast::Sender<TaskHubEvent>,
+    /// Per session, the cursor of the next older history page.
+    cursors: Mutex<HashMap<String, String>>,
+    /// `capabilities` of `GET /api/meta`, and when they were read.
+    capabilities: tokio::sync::Mutex<Option<(std::time::Instant, Vec<String>)>>,
+    /// Why the event socket is down (`None` while it is connected).
+    link: tokio::sync::watch::Sender<Option<String>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+}
+
+impl Drop for RemoteHub {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+    }
+}
+
+impl RemoteHub {
+    /// Connect to `gateway` and start the event socket (which reconnects).
+    pub fn start(gateway: LocalGateway) -> anyhow::Result<Arc<Self>> {
+        let hub = Self::client(gateway, reqwest::redirect::Policy::default())?;
+        tokio::spawn(event_socket(Arc::downgrade(&hub), hub.shutdown.subscribe()));
+        Ok(hub)
+    }
+
+    fn client(
+        gateway: LocalGateway,
+        redirects: reqwest::redirect::Policy,
+    ) -> anyhow::Result<Arc<Self>> {
+        let material = gateway
+            .transport_key
+            .as_deref()
+            .and_then(|k| muqun_gateway::connectivity::transport::decode_key(k).ok());
+        let base = reqwest::Url::parse(gateway.url.trim_end_matches('/'))?;
+        let mut builder = reqwest::Client::builder()
+            .redirect(redirects)
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(120));
+        // Bypass ambient HTTP/HTTPS proxies (Clash/Surge/http_proxy) for direct
+        // loopback, LAN, and Tailscale (100.64.0.0/10, .ts.net) Gateways so
+        // remote computer switching and streaming never detour through a proxy.
+        if should_bypass_proxy(&base) {
+            builder = builder.no_proxy();
+        }
+        let http = builder.build()?;
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let hub = Arc::new(Self {
+            http,
+            base,
+            token: gateway.token,
+            device_id: gateway.device_id,
+            material,
+            transport_version: muqun_gateway::connectivity::transport::VERSION_V2,
+            events: broadcast::channel(EVENT_CAPACITY).0,
+            task_events: broadcast::channel(EVENT_CAPACITY).0,
+            cursors: Mutex::new(HashMap::new()),
+            capabilities: tokio::sync::Mutex::new(None),
+            link: tokio::sync::watch::channel(None).0,
+            shutdown: shutdown_tx,
+        });
+        Ok(hub)
+    }
+
+    fn is_loopback(&self) -> bool {
+        is_loopback_url(&self.base)
+    }
+
+    /// Revoke only the device authenticated by this saved login. Older profiles
+    /// may lack a device ID, so the Gateway's own current marker is authoritative.
+    pub async fn revoke_own_login(gateway: LocalGateway) -> anyhow::Result<()> {
+        if let Some(key) = &gateway.transport_key {
+            anyhow::ensure!(
+                gateway.device_id.is_some()
+                    && muqun_gateway::connectivity::transport::decode_key(key)?.len() == 32,
+                "Invalid saved pairing credentials"
+            );
+        }
+        let client = Self::client(gateway, reqwest::redirect::Policy::none())?;
+        let list = client
+            .call(Method::GET, &["api", "pairings"], &[], None)
+            .await?;
+        let mut current = list["devices"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Missing paired-device list"))?
+            .iter()
+            .filter(|d| d["current"].as_bool() == Some(true));
+        let id = current
+            .next()
+            .and_then(|d| d["id"].as_str())
+            .filter(|id| !matches!(*id, "" | "." | ".."))
+            .ok_or_else(|| anyhow::anyhow!("Gateway did not identify this device"))?;
+        anyhow::ensure!(
+            current.next().is_none()
+                && client
+                    .device_id
+                    .as_deref()
+                    .is_none_or(|expected| expected == id),
+            "Gateway returned a different device identity"
+        );
+        let answer = client
+            .call(Method::DELETE, &["api", "pairings", id], &[], None)
+            .await?;
+        anyhow::ensure!(
+            answer["ok"] == true && answer["revoked"] == id,
+            "Gateway did not confirm device revocation"
+        );
+        Ok(())
+    }
+
+    fn url(&self, segments: &[&str], query: &[(&str, &str)]) -> reqwest::Url {
+        let mut url = self.base.clone();
+        if let Ok(mut path) = url.path_segments_mut() {
+            path.clear().extend(segments);
+        }
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        url
+    }
+
+    async fn call_bytes(
+        &self,
+        method: Method,
+        segments: &[&str],
+        query: &[(&str, &str)],
+        content_type: Option<&str>,
+        body: Option<Vec<u8>>,
+    ) -> Result<(u16, Vec<u8>), HubError> {
+        let url = self.url(segments, query);
+        if let (Some(material), Some(device_id)) = (&self.material, &self.device_id) {
+            let path_and_query = match url.query() {
+                Some(q) if !q.is_empty() => format!("{}?{}", url.path(), q),
+                _ => url.path().to_string(),
+            };
+            let aad = format!("{method} {path_and_query}");
+            let payload = EncryptedRequestPayload {
+                token: self.token.clone(),
+                content_type: content_type.map(str::to_owned),
+                body: body
+                    .as_deref()
+                    .map(|b| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b))
+                    .unwrap_or_default(),
+            };
+            let envelope = muqun_gateway::connectivity::transport::seal_version(
+                self.transport_version,
+                material,
+                muqun_gateway::connectivity::transport::Direction::Request,
+                aad.as_bytes(),
+                &serde_json::to_vec(&payload).map_err(|e| {
+                    HubError::Agent(AgentError::Network(format!("serialization failed: {e}")))
+                })?,
+                now_unix_ms(),
+            )
+            .map_err(|e| HubError::Agent(AgentError::Network(format!("encryption failed: {e}"))))?;
+
+            let mut request = self
+                .http
+                .request(method.clone(), url)
+                .header("x-muqun-transport", "1")
+                .header("x-muqun-device", device_id)
+                .header("x-muqun-envelope-accept", "gzip");
+
+            if method == Method::GET {
+                let envelope_json = serde_json::to_vec(&envelope).map_err(|e| {
+                    HubError::Agent(AgentError::Network(format!(
+                        "envelope serialization failed: {e}"
+                    )))
+                })?;
+                request = request.header(
+                    "x-muqun-envelope",
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(envelope_json),
+                );
+            } else {
+                request = request.json(&envelope);
+            }
+
+            let answer = request.send().await.map_err(|err| {
+                HubError::Agent(AgentError::Network(format!(
+                    "the remote gateway did not answer: {err}"
+                )))
+            })?;
+            let outer_status = answer.status().as_u16();
+            let outer_bytes = answer.bytes().await.unwrap_or_default().to_vec();
+
+            if let Ok(sealed) = serde_json::from_slice::<
+                muqun_gateway::connectivity::transport::Envelope,
+            >(&outer_bytes)
+            {
+                let response_aad = format!("{aad}\n{}", envelope.nonce);
+                let plaintext = muqun_gateway::connectivity::transport::open(
+                    material,
+                    muqun_gateway::connectivity::transport::Direction::Response,
+                    response_aad.as_bytes(),
+                    &sealed,
+                    now_unix_ms(),
+                )
+                .map_err(|e| {
+                    HubError::Agent(AgentError::Network(format!(
+                        "failed to decrypt remote response: {e:?}"
+                    )))
+                })?;
+                let resp_payload: EncryptedResponsePayload = serde_json::from_slice(&plaintext)
+                    .map_err(|e| {
+                        HubError::Agent(AgentError::Network(format!(
+                            "invalid decrypted response payload: {e}"
+                        )))
+                    })?;
+                let raw_body = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(&resp_payload.body)
+                    .or_else(|_| {
+                        base64::engine::general_purpose::STANDARD.decode(&resp_payload.body)
+                    })
+                    .unwrap_or_default();
+                let inner_body =
+                    decode_envelope_body(raw_body, resp_payload.content_encoding.as_deref())?;
+                Ok((resp_payload.status, inner_body))
+            } else {
+                Ok((outer_status, outer_bytes))
+            }
+        } else {
+            let mut request = self.http.request(method, url).bearer_auth(&self.token);
+            if let Some(ct) = content_type {
+                request = request.header("content-type", ct);
+            }
+            if let Some(body) = body {
+                request = request.body(body);
+            }
+            let answer = request.send().await.map_err(|err| {
+                HubError::Agent(AgentError::Network(format!(
+                    "the local gateway did not answer: {err}"
+                )))
+            })?;
+            let status = answer.status().as_u16();
+            let bytes = answer.bytes().await.unwrap_or_default().to_vec();
+            Ok((status, bytes))
+        }
+    }
+
+    /// True when this gateway URL points to the local loopback interface.
+    fn is_loopback_base(&self) -> bool {
+        matches!(
+            self.base.host_str(),
+            Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+        )
+    }
+
+    /// True when this hub targets the local machine's filesystem.
+    fn targets_local_machine(&self) -> bool {
+        super::is_local_connection() && self.is_loopback_base()
+    }
+
+    /// The whole JSON answer of one call.
+    async fn call(
+        &self,
+        method: Method,
+        segments: &[&str],
+        query: &[(&str, &str)],
+        body: Option<Value>,
+    ) -> Result<Value, HubError> {
+        let (body_bytes, ct) = if let Some(body) = body {
+            (
+                Some(serde_json::to_vec(&body).unwrap_or_default()),
+                Some("application/json"),
+            )
+        } else {
+            (None, None)
+        };
+        let (status, bytes) = self
+            .call_bytes(method, segments, query, ct, body_bytes)
+            .await?;
+        let text = String::from_utf8(bytes).unwrap_or_default();
+        let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        if (200..300).contains(&status) {
+            return Ok(json);
+        }
+        let asid = match segments {
+            ["api", "agent-sessions", asid, ..] => asid.to_string(),
+            _ => String::new(),
+        };
+        Err(map_error(status, &json, &asid, &text))
+    }
+
+    /// `data` of the envelope, as `T`.
+    async fn data<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        segments: &[&str],
+        query: &[(&str, &str)],
+        body: Option<Value>,
+    ) -> Result<T, HubError> {
+        let json = self.call(method, segments, query, body).await?;
+        decode(json.get("data").cloned().unwrap_or(Value::Null))
+    }
+
+    async fn session_call(
+        &self,
+        method: Method,
+        asid: &AgentSessionId,
+        tail: &[&str],
+        query: &[(&str, &str)],
+        body: Option<Value>,
+    ) -> Result<Value, HubError> {
+        let mut segments = vec!["api", "agent-sessions", asid.0.as_str()];
+        segments.extend_from_slice(tail);
+        self.call(method, &segments, query, body).await
+    }
+
+    async fn read_snapshot(&self, asid: &AgentSessionId) -> Result<AgentSessionSnapshot, HubError> {
+        self.read_window(asid, &[]).await
+    }
+
+    /// The newest history window; `retained=true` in `query` asks the gateway
+    /// to answer from what it already holds, without preparing the session.
+    async fn read_window(
+        &self,
+        asid: &AgentSessionId,
+        query: &[(&str, &str)],
+    ) -> Result<AgentSessionSnapshot, HubError> {
+        let mut json = self
+            .session_call(Method::GET, asid, &["timeline", "window"], query, None)
+            .await?;
+        // Taken, not cloned: a long session's window is tens of megabytes.
+        let data = json.get_mut("data").map(Value::take).unwrap_or(Value::Null);
+        {
+            let mut cursors = self.cursors.lock().unwrap();
+            match data.get("history_cursor").and_then(Value::as_str) {
+                Some(cursor) => cursors.insert(asid.0.clone(), cursor.to_string()),
+                None => cursors.remove(&asid.0),
+            };
+        }
+        let mut snapshot: AgentSessionSnapshot = decode(data)?;
+        if self.targets_local_machine() {
+            enrich_local_media(&mut snapshot);
+        }
+        Ok(snapshot)
+    }
+
+    /// Whether the gateway declares `capability` (`GET /api/meta`), read
+    /// at most once per [`CAPABILITIES_FRESH`].
+    async fn has_capability(&self, capability: &str) -> Result<bool, HubError> {
+        let mut known = self.capabilities.lock().await;
+        if known
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() > CAPABILITIES_FRESH)
+        {
+            let json = self.call(Method::GET, &["api", "meta"], &[], None).await?;
+            let list = json
+                .get("capabilities")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            *known = Some((std::time::Instant::now(), list));
+        }
+        Ok(known
+            .as_ref()
+            .is_some_and(|(_, list)| list.iter().any(|c| c == capability)))
+    }
+
+    fn unit(result: Result<Value, HubError>) -> Result<(), HubError> {
+        result.map(|_| ())
+    }
+}
+
+/// `data.enabled` of an auto-approve answer; `null` (no session control) is off.
+fn enabled_of(json: &Value) -> bool {
+    json.pointer("/data/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn decode<T: DeserializeOwned>(value: Value) -> Result<T, HubError> {
+    serde_json::from_value(value).map_err(|err| {
+        HubError::Agent(AgentError::Protocol(format!(
+            "unexpected answer from the local gateway: {err}"
+        )))
+    })
+}
+
+/// `{"tasks": [TaskView]}` as rows.
+fn task_rows(json: &Value) -> Result<Vec<TaskRow>, HubError> {
+    json.get("tasks")
+        .and_then(Value::as_array)
+        .map(|tasks| tasks.iter().map(task_row).collect())
+        .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+/// One `TaskView` (a list entry, or the answer of `POST /api/tasks`).
+fn task_row(json: &Value) -> Result<TaskRow, HubError> {
+    TaskRow::from_json(json).map_err(|err| {
+        HubError::Agent(AgentError::Protocol(format!(
+            "unexpected task from the local gateway: {err}"
+        )))
+    })
+}
+
+/// The `POST /api/tasks` body: only what was given, so the gateway's own
+/// defaults (primary agent, the device's last folder) apply to the rest.
+fn create_task_body(
+    goal: &str,
+    agent_id: Option<&str>,
+    cwd: Option<&str>,
+    peer_server_id: Option<&str>,
+) -> Value {
+    let mut body = json!({ "goal": goal });
+    if let Some(agent) = agent_id.filter(|a| !a.is_empty()) {
+        body["agent_id"] = json!(agent);
+    }
+    if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
+        body["cwd"] = json!(cwd);
+    }
+    if let Some(peer) = peer_server_id.filter(|p| !p.is_empty()) {
+        body["computer_ids"] = json!([peer]);
+    }
+    body
+}
+
+/// The gateway's `{"error": {"code", "message"}}` as the hub's own errors.
+fn map_error(status: u16, body: &Value, asid: &str, raw: &str) -> HubError {
+    let code = body.pointer("/error/code").and_then(Value::as_str);
+    let message = body
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "HTTP {status}: {}",
+                raw.chars().take(200).collect::<String>()
+            )
+        });
+    match (status, code) {
+        (_, Some("coordinator_unavailable")) => HubError::Agent(AgentError::NotAvailable(message)),
+        (_, Some("session_not_found")) => HubError::SessionNotFound(asid.to_string()),
+        (503, Some("agent_unavailable")) => HubError::AgentUnavailable {
+            agent: message.split('\'').nth(1).unwrap_or_default().to_string(),
+            reason: Some(message),
+        },
+        (_, Some("workspace_missing")) => HubError::Agent(AgentError::WorkspaceMissing(
+            body.pointer("/error/directory")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        )),
+        (_, Some("history_cursor_lost")) => HubError::Agent(AgentError::HistoryCursorLost),
+        // A retained-only read of a session the gateway holds nothing for.
+        (404, Some("not_retained")) => {
+            HubError::Agent(AgentError::SessionNotFound(asid.to_string()))
+        }
+        (_, Some("inbox_item_not_found")) => {
+            HubError::Agent(AgentError::InboxItemNotFound(message))
+        }
+        (_, Some("session_open_required")) => HubError::Agent(AgentError::OpenRequired(message)),
+        (501, _) => HubError::Agent(AgentError::Unsupported(message)),
+        (400, _) => HubError::Agent(AgentError::InvalidRequest(message)),
+        _ => HubError::Agent(AgentError::RequestFailed(
+            crate::model::inbox::clean_error_message(&message),
+        )),
+    }
+}
+
+impl SessionHub for RemoteHub {
+    fn orchestration(&self, request: super::OrchestrationRequest) -> HubFuture<'_, Value> {
+        Box::pin(async move {
+            if !self
+                .has_capability("agent_orchestration_preview_v1")
+                .await?
+            {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "This Gateway needs the intelligent orchestration preview update".into(),
+                )));
+            }
+            match request {
+                super::OrchestrationRequest::List => {
+                    self.call(Method::GET, &["api", "orchestrations"], &[], None)
+                        .await
+                }
+                super::OrchestrationRequest::Read(id) => {
+                    self.call(Method::GET, &["api", "orchestrations", &id], &[], None)
+                        .await
+                }
+                super::OrchestrationRequest::Start(mut body) => {
+                    // Older Gateways running `agent_orchestration_preview_v1` use
+                    // `deny_unknown_fields` and reject newer fields unless they
+                    // advertise the corresponding capability.
+                    if !self
+                        .has_capability("agent_orchestration_pool_v1")
+                        .await
+                        .unwrap_or(false)
+                    {
+                        if let Some(obj) = body.as_object_mut() {
+                            obj.remove("agent_pool");
+                            obj.remove("auto_failover");
+                        }
+                    }
+                    if !self
+                        .has_capability("agent_orchestration_model_led_v1")
+                        .await
+                        .unwrap_or(false)
+                    {
+                        if let Some(obj) = body.as_object_mut() {
+                            obj.remove("auto_review");
+                        }
+                    }
+                    self.call(Method::POST, &["api", "orchestrations"], &[], Some(body))
+                        .await
+                }
+                super::OrchestrationRequest::AskAdvisor {
+                    run,
+                    question,
+                    agent,
+                } => {
+                    if !self.has_capability("agent_orchestration_router_v1").await? {
+                        return Err(HubError::Agent(AgentError::Unsupported(
+                            "This Gateway needs the intelligent orchestration router update".into(),
+                        )));
+                    }
+                    let mut map = serde_json::Map::new();
+                    if let Some(q) = question.filter(|q| !q.trim().is_empty()) {
+                        map.insert("question".into(), json!(q));
+                    }
+                    if let Some(a) = agent.filter(|a| !a.trim().is_empty()) {
+                        map.insert("agent".into(), json!(a));
+                    }
+                    self.call(
+                        Method::POST,
+                        &["api", "orchestrations", &run, "advisor"],
+                        &[],
+                        Some(Value::Object(map)),
+                    )
+                    .await
+                }
+                super::OrchestrationRequest::Approve(id) => {
+                    self.call(
+                        Method::POST,
+                        &["api", "orchestrations", &id, "approve"],
+                        &[],
+                        None,
+                    )
+                    .await
+                }
+                super::OrchestrationRequest::Rework {
+                    run,
+                    feedback,
+                    selected_findings,
+                } => {
+                    let body = if feedback.is_some() || selected_findings.is_some() {
+                        let mut map = serde_json::Map::new();
+                        if let Some(f) = feedback {
+                            map.insert("feedback".into(), json!(f));
+                        }
+                        if let Some(indices) = selected_findings {
+                            map.insert("selected_findings".into(), json!(indices));
+                        }
+                        Some(Value::Object(map))
+                    } else {
+                        None
+                    };
+                    self.call(
+                        Method::POST,
+                        &["api", "orchestrations", &run, "rework"],
+                        &[],
+                        body,
+                    )
+                    .await
+                }
+                super::OrchestrationRequest::Cancel(id) => {
+                    self.call(
+                        Method::POST,
+                        &["api", "orchestrations", &id, "cancel"],
+                        &[],
+                        None,
+                    )
+                    .await
+                }
+                super::OrchestrationRequest::CancelTask { run, task } => {
+                    self.cancel_task(&task).await?;
+                    self.call(Method::GET, &["api", "orchestrations", &run], &[], None)
+                        .await
+                }
+            }
+        })
+    }
+    fn pending_attention(
+        &self,
+    ) -> HubFuture<'_, Option<Vec<muqun_gateway::agents::ports::AgentPendingSnapshot>>> {
+        Box::pin(async {
+            if !self.has_capability("agent_attention_v1").await? {
+                return Ok(None);
+            }
+            self.data(Method::GET, &["api", "agent-attention"], &[], None)
+                .await
+                .map(Some)
+        })
+    }
+    fn mode(&self) -> HubMode {
+        HubMode::LocalGateway
+    }
+
+    fn gateway_version(&self) -> HubFuture<'_, Option<String>> {
+        Box::pin(async move {
+            let json = self.call(Method::GET, &["api", "meta"], &[], None).await?;
+            let version = json
+                .get("version")
+                .and_then(Value::as_str)
+                .or_else(|| json.pointer("/data/version").and_then(Value::as_str))
+                .map(|v| v.trim().trim_start_matches('v'))
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned);
+            Ok(version)
+        })
+    }
+
+    fn agents(&self) -> HubFuture<'_, Vec<AgentDiscoveryInfo>> {
+        Box::pin(async move {
+            let json = self
+                .call(Method::GET, &["api", "discovery"], &[], None)
+                .await?;
+            let agents = json
+                .pointer("/planes/agents/agents")
+                .cloned()
+                .unwrap_or(Value::Array(Vec::new()));
+            decode(agents)
+        })
+    }
+
+    fn attached(&self) -> HubFuture<'_, Vec<String>> {
+        Box::pin(async move {
+            let agents = self.agents().await?;
+            let ready = |a: &&AgentDiscoveryInfo| {
+                a.enabled
+                    && matches!(
+                        a.status,
+                        AgentAvailability::Connected | AgentAvailability::Reachable
+                    )
+            };
+            Ok(super::AGENT_PREFERENCE
+                .iter()
+                .filter(|id| agents.iter().filter(ready).any(|a| a.id == **id))
+                .map(|id| id.to_string())
+                .collect())
+        })
+    }
+
+    fn sessions<'a>(
+        &'a self,
+        agent: &'a str,
+        query: SessionQuery,
+    ) -> HubFuture<'a, Vec<AgentSessionInfo>> {
+        Box::pin(async move {
+            let limit = query.limit.map(|l| l.to_string());
+            let mut pairs = vec![("agent_id", agent)];
+            for (key, value) in [
+                ("directory", query.directory.as_deref()),
+                ("parent_id", query.parent_id.as_deref()),
+                ("limit", limit.as_deref()),
+                ("order", query.order.as_deref()),
+                ("search", query.search.as_deref()),
+                ("cursor", query.cursor.as_deref()),
+            ] {
+                if let Some(value) = value {
+                    pairs.push((key, value));
+                }
+            }
+            self.data(Method::GET, &["api", "agent-sessions"], &pairs, None)
+                .await
+        })
+    }
+
+    fn projects<'a>(&'a self, agent: &'a str) -> HubFuture<'a, Vec<AgentProject>> {
+        Box::pin(async move {
+            self.data(
+                Method::GET,
+                &["api", "agent-projects"],
+                &[("agent_id", agent)],
+                None,
+            )
+            .await
+        })
+    }
+
+    fn directories<'a>(&'a self, prefix: &'a str) -> HubFuture<'a, Completion> {
+        Box::pin(async move {
+            let json = self
+                .call(
+                    Method::GET,
+                    &["api", "agent-directories"],
+                    &[("prefix", prefix)],
+                    None,
+                )
+                .await?;
+            let directories = json
+                .get("data")
+                .and_then(Value::as_array)
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|row| {
+                            Some(DirectoryEntry {
+                                name: row.get("name")?.as_str()?.to_string(),
+                                path: row.get("path")?.as_str()?.to_string(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(Completion {
+                directories,
+                truncated: json
+                    .get("truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })
+    }
+
+    fn warm_agent<'a>(
+        &'a self,
+        agent: &'a str,
+        cwd: Option<&'a str>,
+        auto_approve: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let mut body = json!({});
+            if let Some(dir) = cwd {
+                body["directory"] = json!(dir);
+            }
+            if auto_approve {
+                body["auto_approve"] = json!(true);
+            }
+            let _ = self
+                .call(
+                    Method::POST,
+                    &["api", "agents", agent, "warm"],
+                    &[],
+                    Some(body),
+                )
+                .await;
+            Ok(())
+        })
+    }
+
+    fn create<'a>(&'a self, agent: &'a str, cwd: &'a Path) -> HubFuture<'a, AgentSessionInfo> {
+        self.create_with_options(agent, cwd, None, None, false)
+    }
+
+    fn create_with_options<'a>(
+        &'a self,
+        agent: &'a str,
+        cwd: &'a Path,
+        model: Option<&'a ModelRef>,
+        mode: Option<&'a str>,
+        auto_approve: bool,
+    ) -> HubFuture<'a, AgentSessionInfo> {
+        Box::pin(async move {
+            let mut body = json!({
+                "agent_id": agent,
+                "directory": cwd.to_string_lossy(),
+            });
+            if let Some(model) = model {
+                body["model"] = json!(model);
+            }
+            if let Some(mode) = mode {
+                body["mode"] = json!(mode);
+            }
+            if auto_approve {
+                body["auto_approve"] = json!(true);
+            }
+            self.data(Method::POST, &["api", "agent-sessions"], &[], Some(body))
+                .await
+        })
+    }
+
+    fn open<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, AgentSessionSnapshot> {
+        Box::pin(async move {
+            if let Err(err) = self
+                .session_call(Method::POST, asid, &["prepare"], &[], None)
+                .await
+            {
+                tracing::debug!(asid = %asid.0, %err, "session preparation failed; reading history anyway");
+            }
+            self.read_snapshot(asid).await
+        })
+    }
+
+    fn wake<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            self.session_call(Method::POST, asid, &["prepare"], &[], None)
+                .await
+                .map(|_| ())
+        })
+    }
+
+    /// What the gateway already retains, read without preparing the session
+    /// (`retained=true`). `None` when it holds nothing: the open is cold.
+    fn peek<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Option<AgentSessionSnapshot>> {
+        Box::pin(async move {
+            match self.read_window(asid, &[("retained", "true")]).await {
+                Ok(snapshot) => Ok(Some(snapshot)),
+                Err(HubError::Agent(AgentError::SessionNotFound(_))) => Ok(None),
+                Err(err) => Err(err),
+            }
+        })
+    }
+
+    fn snapshot<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, AgentSessionSnapshot> {
+        Box::pin(async move { self.read_snapshot(asid).await })
+    }
+
+    fn account_limits<'a>(&'a self, agent: &'a str, refresh: bool) -> HubFuture<'a, Value> {
+        Box::pin(async move {
+            let query: &[(&str, &str)] = if refresh { &[("refresh", "1")] } else { &[] };
+            self.call(
+                Method::GET,
+                &["api", "agents", agent, "account-limits"],
+                query,
+                None,
+            )
+            .await
+        })
+    }
+
+    fn link(&self) -> Option<tokio::sync::watch::Receiver<Option<String>>> {
+        Some(self.link.subscribe())
+    }
+
+    fn search<'a>(&'a self, query: &'a SearchQuery) -> HubFuture<'a, SearchPage> {
+        Box::pin(async move {
+            if !self.has_capability(SEARCH_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported("search".into())));
+            }
+            let limit = query.limit.clamp(1, 50).to_string();
+            let mut params = vec![("q", query.q.as_str()), ("limit", limit.as_str())];
+            if let Some(cursor) = query.cursor.as_deref() {
+                params.push(("cursor", cursor));
+            }
+            self.data(Method::GET, &["api", "search"], &params, None)
+                .await
+        })
+    }
+
+    fn earlier<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<TimelineItem>> {
+        Box::pin(async move {
+            let cursor = self.cursors.lock().unwrap().get(&asid.0).cloned();
+            let (json, paged) = match cursor {
+                Some(cursor) => (
+                    self.session_call(
+                        Method::POST,
+                        asid,
+                        &["timeline", "page"],
+                        &[],
+                        Some(json!({"cursor": cursor})),
+                    )
+                    .await?,
+                    true,
+                ),
+                None => (
+                    self.session_call(Method::POST, asid, &["timeline", "earlier"], &[], None)
+                        .await?,
+                    false,
+                ),
+            };
+            let mut json = json;
+            let mut data = json.get_mut("data").map(Value::take).unwrap_or(Value::Null);
+            if paged {
+                let mut cursors = self.cursors.lock().unwrap();
+                match data.get("history_cursor").and_then(Value::as_str) {
+                    Some(next) => cursors.insert(asid.0.clone(), next.to_string()),
+                    None => cursors.remove(&asid.0),
+                };
+            }
+            let mut items: Vec<TimelineItem> = decode(
+                data.get_mut("items")
+                    .map(Value::take)
+                    .unwrap_or(Value::Null),
+            )?;
+            if self.is_loopback() {
+                let directory = self.snapshot_directory(asid).await;
+                muqun_gateway::agents::message_images::enrich_timeline(
+                    &asid.0,
+                    directory.as_deref(),
+                    &mut items,
+                );
+            }
+            Ok(items)
+        })
+    }
+
+    fn prompt<'a>(&'a self, asid: &'a AgentSessionId, text: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move { self.send(asid, text, &[], None).await })
+    }
+
+    fn interrupt<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(Method::POST, asid, &["interrupt"], &[], None)
+                    .await,
+            )
+        })
+    }
+
+    fn reply_permission<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        request_id: &'a str,
+        decision: PermissionDecision,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(
+                    Method::POST,
+                    asid,
+                    &["permissions", request_id, "reply"],
+                    &[],
+                    Some(json!({"decision": decision.as_str()})),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn reply_form<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        form_id: &'a str,
+        answers: Value,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(
+                    Method::POST,
+                    asid,
+                    &["forms", form_id, "reply"],
+                    &[],
+                    Some(json!({"answers": answers})),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn send<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        text: &'a str,
+        attachments: &'a [String],
+        delivery: Option<&'a str>,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let mut body = json!({"text": text});
+            if !attachments.is_empty() {
+                body["attachments"] = json!(attachments);
+            }
+            if let Some(delivery) = delivery {
+                body["delivery"] = json!(delivery);
+            }
+            Self::unit(
+                self.session_call(Method::POST, asid, &["prompt"], &[], Some(body))
+                    .await,
+            )
+        })
+    }
+
+    fn find_files<'a>(
+        &'a self,
+        agent: &'a str,
+        directory: &'a str,
+        query: &'a str,
+        limit: usize,
+    ) -> HubFuture<'a, Vec<Value>> {
+        Box::pin(async move {
+            let trimmed = directory.trim();
+            if trimmed.is_empty() || !is_remote_or_local_absolute(trimmed) {
+                return Ok(Vec::new());
+            }
+            let limit_str = limit.to_string();
+            let mut found: Result<Vec<Value>, HubError> = self
+                .data(
+                    Method::GET,
+                    &["api", "agent-files"],
+                    &[
+                        ("agent_id", agent),
+                        ("directory", trimmed),
+                        ("query", query),
+                        ("limit", &limit_str),
+                    ],
+                    None,
+                )
+                .await;
+            if matches!(found, Err(HubError::Agent(AgentError::Unsupported(_)))) {
+                found = self
+                    .data(
+                        Method::GET,
+                        &["api", "agent-files"],
+                        &[
+                            ("directory", trimmed),
+                            ("query", query),
+                            ("limit", &limit_str),
+                        ],
+                        None,
+                    )
+                    .await;
+            }
+            match found {
+                // The route names the kind `kind`; the trait's hits say `type`.
+                Ok(hits) if !hits.is_empty() => Ok(hits
+                    .into_iter()
+                    .map(|mut hit| {
+                        if let Some(kind) = hit.get("kind").cloned() {
+                            hit["type"] = kind;
+                        }
+                        hit
+                    })
+                    .collect()),
+                Ok(_) => {
+                    if self.targets_local_machine() && Path::new(trimmed).is_dir() {
+                        Ok(crate::platform::filesearch::find_files(trimmed, query, limit).await)
+                    } else {
+                        Ok(Vec::new())
+                    }
+                }
+                Err(err) => {
+                    if self.targets_local_machine() && Path::new(trimmed).is_dir() {
+                        tracing::debug!(agent, %err, "gateway find_files; local fallback");
+                        Ok(crate::platform::filesearch::find_files(trimmed, query, limit).await)
+                    } else {
+                        tracing::debug!(agent, %err, "remote gateway find_files failed");
+                        Ok(Vec::new())
+                    }
+                }
+            }
+        })
+    }
+
+    fn catalog<'a>(
+        &'a self,
+        agent: &'a str,
+        asid: Option<&'a AgentSessionId>,
+        directory: Option<&'a str>,
+    ) -> HubFuture<'a, CatalogView> {
+        Box::pin(async move {
+            let mut pairs = vec![("agent_id", agent)];
+            if let Some(asid) = asid {
+                pairs.push(("asid", asid.0.as_str()));
+            }
+            if let Some(directory) = directory {
+                pairs.push(("directory", directory));
+            }
+            let catalog: AgentCatalog = self
+                .data(Method::GET, &["api", "agent-catalog"], &pairs, None)
+                .await?;
+            Ok(CatalogView { catalog })
+        })
+    }
+
+    fn run_command<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        name: &'a str,
+        arguments: &'a str,
+        delivery: Option<&'a str>,
+    ) -> HubFuture<'a, Value> {
+        Box::pin(async move {
+            let mut body = json!({"name": name, "arguments": arguments});
+            if let Some(delivery) = delivery {
+                body["delivery"] = json!(delivery);
+            }
+            let json = self
+                .session_call(Method::POST, asid, &["command"], &[], Some(body))
+                .await?;
+            Ok(json.get("data").cloned().unwrap_or(Value::Null))
+        })
+    }
+
+    fn activate_skill<'a>(&'a self, asid: &'a AgentSessionId, skill: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(
+                    Method::POST,
+                    asid,
+                    &["skill"],
+                    &[],
+                    Some(json!({"skill": skill})),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn switch_model<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        model: &'a ModelRef,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(
+                    Method::POST,
+                    asid,
+                    &["model"],
+                    &[],
+                    Some(json!({"model": model})),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn switch_mode<'a>(&'a self, asid: &'a AgentSessionId, mode: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(
+                    Method::POST,
+                    asid,
+                    &["mode"],
+                    &[],
+                    Some(json!({"mode": mode})),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn auto_approve<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, bool> {
+        Box::pin(async move {
+            let json = self
+                .session_call(Method::GET, asid, &["auto-approve"], &[], None)
+                .await?;
+            Ok(enabled_of(&json))
+        })
+    }
+
+    fn set_auto_approve<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        enabled: bool,
+    ) -> HubFuture<'a, bool> {
+        Box::pin(async move {
+            let json = self
+                .session_call(
+                    Method::POST,
+                    asid,
+                    &["auto-approve"],
+                    &[],
+                    Some(json!({"enabled": enabled})),
+                )
+                .await?;
+            Ok(enabled_of(&json))
+        })
+    }
+
+    fn rename<'a>(&'a self, asid: &'a AgentSessionId, title: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(
+                    Method::POST,
+                    asid,
+                    &["rename"],
+                    &[],
+                    Some(json!({"title": title})),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn delete<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            self.cursors.lock().unwrap().remove(&asid.0);
+            Self::unit(
+                self.session_call(Method::DELETE, asid, &[], &[], None)
+                    .await,
+            )
+        })
+    }
+
+    fn fork<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        message_id: Option<&'a str>,
+    ) -> HubFuture<'a, AgentSessionInfo> {
+        Box::pin(async move {
+            let body = match message_id {
+                Some(id) => json!({"message_id": id}),
+                None => json!({}),
+            };
+            let json = self
+                .session_call(Method::POST, asid, &["fork"], &[], Some(body))
+                .await?;
+            decode(json.get("data").cloned().unwrap_or(Value::Null))
+        })
+    }
+
+    fn inbox_cancel<'a>(&'a self, asid: &'a AgentSessionId, item: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(Method::DELETE, asid, &["inbox", item], &[], None)
+                    .await,
+            )
+        })
+    }
+
+    fn inbox_delivery<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        item: &'a str,
+        delivery: &'a str,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            if !matches!(delivery, "steer" | "queue") {
+                return Err(HubError::Agent(AgentError::InvalidRequest(format!(
+                    "unknown delivery {delivery}"
+                ))));
+            }
+            Self::unit(
+                self.session_call(Method::POST, asid, &["inbox", item, delivery], &[], None)
+                    .await,
+            )
+        })
+    }
+
+    fn media<'a>(&'a self, path: &'a str) -> HubFuture<'a, Vec<u8>> {
+        Box::pin(async move {
+            // Only the gateway's own media routes: never a URL a row names.
+            let path = path.split('?').next().unwrap_or(path);
+            let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+            if !matches!(segments.as_slice(), ["api", "agent-images" | "assets", ..]) {
+                return Err(HubError::Agent(AgentError::Unsupported("media".into())));
+            }
+            let (status, bytes) = self
+                .call_bytes(Method::GET, &segments, &[], None, None)
+                .await?;
+            if (200..300).contains(&status) {
+                Ok(bytes)
+            } else {
+                Err(HubError::Agent(AgentError::Network(format!(
+                    "media answered {status}"
+                ))))
+            }
+        })
+    }
+
+    fn store_attachment<'a>(
+        &'a self,
+        name: &'a str,
+        bytes: Vec<u8>,
+    ) -> HubFuture<'a, StoredUpload> {
+        Box::pin(async move {
+            let boundary = format!("muqun{}", rand_suffix());
+            let safe_name: String = name
+                .chars()
+                .map(|c| if c == '"' || c.is_control() { '_' } else { c })
+                .collect();
+            let mut body = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{safe_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .into_bytes();
+            body.extend_from_slice(&bytes);
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            let content_type = format!("multipart/form-data; boundary={boundary}");
+            let (status, resp_bytes) = self
+                .call_bytes(
+                    Method::POST,
+                    &["api", "uploads"],
+                    &[],
+                    Some(&content_type),
+                    Some(body),
+                )
+                .await?;
+            let text = String::from_utf8(resp_bytes).unwrap_or_default();
+            let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            if !(200..300).contains(&status) {
+                return Err(map_error(status, &json, "", &text));
+            }
+            let field = |key: &str| json.get(key).and_then(Value::as_str).unwrap_or_default();
+            let stored_name = field("url")
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if field("mime").starts_with("image/") {
+                if let Some(target) = super::connection_origin().and_then(|(computer, _)| {
+                    crate::model::media::upload_target(&computer, field("path"))
+                }) {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::model::media::write(&target, &bytes)
+                    })
+                    .await;
+                }
+            }
+            Ok(StoredUpload {
+                path: PathBuf::from(field("path")),
+                stored_name,
+                name: field("name").to_string(),
+                size: json.get("size").and_then(Value::as_u64).unwrap_or(0) as usize,
+                mime: intern(field("mime")),
+            })
+        })
+    }
+
+    fn vcs_diff<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<FileDiffItem>> {
+        Box::pin(async move {
+            let json = self
+                .session_call(
+                    Method::GET,
+                    asid,
+                    &["vcs", "diff"],
+                    &[("mode", "working")],
+                    None,
+                )
+                .await?;
+            decode(
+                json.pointer("/data/files")
+                    .cloned()
+                    .unwrap_or(Value::Array(Vec::new())),
+            )
+        })
+    }
+
+    fn vcs_overview<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+    ) -> HubFuture<'a, super::GitRepoOverview> {
+        Box::pin(async move {
+            if !self.has_capability(VCS_GIT_OPS_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Upgrade Gateway for remote Git workbench operations (vcs_git_ops_v1).".into(),
+                )));
+            }
+            let json = self
+                .session_call(Method::GET, asid, &["vcs", "overview"], &[], None)
+                .await?;
+            let data = json.get("data").unwrap_or(&json);
+            let is_repo = data
+                .get("is_repo")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let repo = data.get("repo").and_then(Value::as_object);
+            let local_branches = data
+                .get("local_branches")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let worktrees = data
+                .get("worktrees")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| {
+                            let directory = v
+                                .get("path")
+                                .or_else(|| v.get("directory"))
+                                .and_then(Value::as_str)?
+                                .to_string();
+                            let is_main = v
+                                .get("is_main")
+                                .or_else(|| v.get("isMain"))
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                            let branch =
+                                v.get("branch").and_then(Value::as_str).map(str::to_string);
+                            let strategy = if is_main {
+                                Some("root".to_string())
+                            } else {
+                                branch.or_else(|| Some("worktree".to_string()))
+                            };
+                            Some(WorktreeRow {
+                                directory,
+                                strategy,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(super::GitRepoOverview {
+                is_repo,
+                toplevel: repo
+                    .and_then(|r| r.get("toplevel"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                branch: repo
+                    .and_then(|r| r.get("branch"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                upstream: repo
+                    .and_then(|r| r.get("upstream"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                ahead: repo
+                    .and_then(|r| r.get("ahead"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                behind: repo
+                    .and_then(|r| r.get("behind"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                detached: repo
+                    .and_then(|r| r.get("detached"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                head: repo
+                    .and_then(|r| r.get("head"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                changed_files: repo
+                    .and_then(|r| r.get("changed_files"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize,
+                local_branches,
+                remote_url: data
+                    .get("remote_url")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                remote_host: data
+                    .get("remote_host")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                worktrees,
+            })
+        })
+    }
+
+    fn vcs_files<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        mode: &'a str,
+    ) -> HubFuture<'a, super::GitChangedFiles> {
+        Box::pin(async move {
+            let json = self
+                .session_call(
+                    Method::GET,
+                    asid,
+                    &["vcs", "files"],
+                    &[("mode", mode)],
+                    None,
+                )
+                .await?;
+            let data = json.get("data").unwrap_or(&json);
+            let is_repo = data.get("reason").and_then(Value::as_str) != Some("not_a_repository");
+            let truncated = data
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let files: Vec<super::GitChangedFile> = decode(
+                data.get("files")
+                    .cloned()
+                    .unwrap_or(Value::Array(Vec::new())),
+            )?;
+            Ok(super::GitChangedFiles {
+                mode: mode.to_string(),
+                is_repo,
+                truncated,
+                files,
+            })
+        })
+    }
+
+    fn vcs_stage<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        paths: &'a [String],
+        all: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            if !self.has_capability(VCS_GIT_OPS_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Upgrade Gateway for git stage/unstage (vcs_git_ops_v1).".into(),
+                )));
+            }
+            Self::unit(
+                self.session_call(
+                    Method::POST,
+                    asid,
+                    &["vcs", "stage"],
+                    &[],
+                    Some(json!({ "paths": paths, "all": all })),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn vcs_unstage<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        paths: &'a [String],
+        all: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            if !self.has_capability(VCS_GIT_OPS_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Upgrade Gateway for git stage/unstage (vcs_git_ops_v1).".into(),
+                )));
+            }
+            Self::unit(
+                self.session_call(
+                    Method::POST,
+                    asid,
+                    &["vcs", "unstage"],
+                    &[],
+                    Some(json!({ "paths": paths, "all": all })),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn vcs_discard<'a>(&'a self, asid: &'a AgentSessionId, path: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(
+                    Method::POST,
+                    asid,
+                    &["vcs", "discard"],
+                    &[],
+                    Some(json!({ "path": path })),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn vcs_checkout<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        branch: Option<&'a str>,
+        pr_number: Option<u64>,
+    ) -> HubFuture<'a, String> {
+        Box::pin(async move {
+            if !self.has_capability(VCS_GIT_OPS_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Upgrade Gateway for remote branch checkout (vcs_git_ops_v1).".into(),
+                )));
+            }
+            let json = self
+                .session_call(
+                    Method::POST,
+                    asid,
+                    &["vcs", "checkout"],
+                    &[],
+                    Some(json!({ "branch": branch, "pr_number": pr_number })),
+                )
+                .await?;
+            let data = json.get("data").unwrap_or(&json);
+            Ok(data
+                .get("summary")
+                .or_else(|| data.get("branch"))
+                .and_then(Value::as_str)
+                .unwrap_or("Switched branch")
+                .to_string())
+        })
+    }
+
+    fn vcs_commit<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        message: &'a str,
+        stage_all: bool,
+    ) -> HubFuture<'a, String> {
+        Box::pin(async move {
+            if !self.has_capability(VCS_GIT_OPS_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Upgrade Gateway for remote git commit (vcs_git_ops_v1).".into(),
+                )));
+            }
+            let json = self
+                .session_call(
+                    Method::POST,
+                    asid,
+                    &["vcs", "commit"],
+                    &[],
+                    Some(json!({ "message": message, "stage_all": stage_all })),
+                )
+                .await?;
+            let data = json.get("data").unwrap_or(&json);
+            Ok(data
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("Committed changes")
+                .to_string())
+        })
+    }
+
+    fn vcs_sync<'a>(&'a self, asid: &'a AgentSessionId, action: &'a str) -> HubFuture<'a, String> {
+        Box::pin(async move {
+            if !self.has_capability(VCS_GIT_OPS_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Upgrade Gateway for remote git sync (vcs_git_ops_v1).".into(),
+                )));
+            }
+            let json = self
+                .session_call(
+                    Method::POST,
+                    asid,
+                    &["vcs", "sync"],
+                    &[],
+                    Some(json!({ "action": action })),
+                )
+                .await?;
+            let data = json.get("data").unwrap_or(&json);
+            Ok(data
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("Synced")
+                .to_string())
+        })
+    }
+
+    fn vcs_commits<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        offset: usize,
+        limit: usize,
+    ) -> HubFuture<'a, super::GitCommitsPage> {
+        Box::pin(async move {
+            if !self.has_capability(VCS_GIT_OPS_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Upgrade Gateway for commit history (vcs_git_ops_v1).".into(),
+                )));
+            }
+            let offset_s = offset.to_string();
+            let limit_s = limit.to_string();
+            let json = self
+                .session_call(
+                    Method::GET,
+                    asid,
+                    &["vcs", "commits"],
+                    &[("offset", &offset_s), ("limit", &limit_s)],
+                    None,
+                )
+                .await?;
+            let data = json.get("data").cloned().unwrap_or(json);
+            decode(data)
+        })
+    }
+
+    fn vcs_prs<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        state: &'a str,
+        author: &'a str,
+        page: u32,
+        limit: u32,
+        refresh: bool,
+    ) -> HubFuture<'a, super::GitPrsPage> {
+        Box::pin(async move {
+            if !self.has_capability(VCS_PRS_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Upgrade Gateway for Pull Requests (vcs_prs_v1).".into(),
+                )));
+            }
+            let page_s = page.to_string();
+            let limit_s = limit.to_string();
+            let refresh_s = if refresh { "true" } else { "false" };
+            let json = self
+                .session_call(
+                    Method::GET,
+                    asid,
+                    &["vcs", "prs"],
+                    &[
+                        ("state", state),
+                        ("author", author),
+                        ("page", &page_s),
+                        ("limit", &limit_s),
+                        ("refresh", refresh_s),
+                    ],
+                    None,
+                )
+                .await?;
+            let data = json.get("data").cloned().unwrap_or(json);
+            decode(data)
+        })
+    }
+
+    fn view<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            // The route defaults `idle` to now.
+            Self::unit(
+                self.session_call(Method::POST, asid, &["view"], &[], Some(json!({})))
+                    .await,
+            )
+        })
+    }
+
+    fn stage_revert<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        message_id: &'a str,
+        files: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(
+                    Method::POST,
+                    asid,
+                    &["revert", "stage"],
+                    &[],
+                    Some(json!({"message_id": message_id, "files": files})),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn commit_revert<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(Method::POST, asid, &["revert", "commit"], &[], None)
+                    .await,
+            )
+        })
+    }
+
+    fn clear_revert<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(Method::POST, asid, &["revert", "clear"], &[], None)
+                    .await,
+            )
+        })
+    }
+
+    fn compact<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        delivery: Option<&'a str>,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            let body = match delivery {
+                Some(delivery) => json!({"delivery": delivery}),
+                None => json!({}),
+            };
+            Self::unit(
+                self.session_call(Method::POST, asid, &["compact"], &[], Some(body))
+                    .await,
+            )
+        })
+    }
+
+    fn descendants<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, Vec<AgentSessionInfo>> {
+        Box::pin(async move {
+            let json = self
+                .session_call(Method::GET, asid, &["descendants"], &[], None)
+                .await?;
+            decode(
+                json.pointer("/data/data")
+                    .cloned()
+                    .unwrap_or(Value::Array(Vec::new())),
+            )
+        })
+    }
+
+    fn list_saved_permissions<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+    ) -> HubFuture<'a, Vec<SavedPermission>> {
+        Box::pin(async move {
+            let json = self
+                .session_call(Method::GET, asid, &["permissions", "saved"], &[], None)
+                .await?;
+            let items = json
+                .pointer("/data/items")
+                .cloned()
+                .unwrap_or(Value::Array(Vec::new()));
+            decode(items)
+        })
+    }
+
+    fn forget_saved_permission<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        id: &'a str,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(
+                    Method::DELETE,
+                    asid,
+                    &["permissions", "saved", id],
+                    &[],
+                    None,
+                )
+                .await,
+            )
+        })
+    }
+
+    fn list_shells<'a>(
+        &'a self,
+        _agent: &'a str,
+        directory: Option<&'a str>,
+    ) -> HubFuture<'a, Vec<ShellRow>> {
+        Box::pin(async move {
+            let mut pairs = Vec::new();
+            if let Some(directory) = directory {
+                pairs.push(("directory", directory));
+            }
+            let json = self
+                .call(Method::GET, &["api", "agent-shells"], &pairs, None)
+                .await?;
+            let data = json
+                .get("data")
+                .cloned()
+                .unwrap_or(Value::Array(Vec::new()));
+            decode(data)
+        })
+    }
+
+    fn kill_shell<'a>(&'a self, _agent: &'a str, id: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.call(Method::DELETE, &["api", "agent-shells", id], &[], None)
+                    .await,
+            )
+        })
+    }
+
+    fn background_session<'a>(&'a self, asid: &'a AgentSessionId) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.session_call(Method::POST, asid, &["background"], &[], None)
+                    .await,
+            )
+        })
+    }
+
+    fn list_worktrees<'a>(
+        &'a self,
+        _agent: &'a str,
+        directory: &'a str,
+    ) -> HubFuture<'a, Vec<WorktreeRow>> {
+        Box::pin(async move {
+            let json = self
+                .call(
+                    Method::GET,
+                    &["api", "agent-worktrees"],
+                    &[("directory", directory)],
+                    None,
+                )
+                .await?;
+            let items = json
+                .pointer("/data/items")
+                .cloned()
+                .unwrap_or(Value::Array(Vec::new()));
+            decode(items)
+        })
+    }
+
+    fn remove_worktree<'a>(
+        &'a self,
+        _agent: &'a str,
+        project: &'a str,
+        worktree: &'a str,
+        force: bool,
+    ) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.call(
+                    Method::DELETE,
+                    &["api", "agent-worktrees"],
+                    &[],
+                    Some(json!({
+                        "directory": project,
+                        "worktree": worktree,
+                        "force": force,
+                    })),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn refresh_worktrees<'a>(&'a self, _agent: &'a str, directory: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.call(
+                    Method::POST,
+                    &["api", "agent-worktrees", "refresh"],
+                    &[],
+                    Some(json!({ "directory": directory })),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn timeline_after<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        after: u64,
+    ) -> HubFuture<'a, TimelineCatchUp> {
+        Box::pin(async move {
+            let after = after.to_string();
+            let json = self
+                .session_call(Method::GET, asid, &["timeline"], &[("after", &after)], None)
+                .await?;
+            let data = json.get("data").cloned().unwrap_or(Value::Null);
+            let mut items: Vec<TimelineItem> = decode(
+                data.get("items")
+                    .cloned()
+                    .unwrap_or(Value::Array(Vec::new())),
+            )?;
+            if self.is_loopback() {
+                let directory = self.snapshot_directory(asid).await;
+                muqun_gateway::agents::message_images::enrich_timeline(
+                    &asid.0,
+                    directory.as_deref(),
+                    &mut items,
+                );
+            }
+            Ok(TimelineCatchUp {
+                items,
+                latest_seq: data.get("latest_seq").and_then(Value::as_u64).unwrap_or(0),
+                resync: data.get("resync").and_then(Value::as_bool).unwrap_or(false),
+            })
+        })
+    }
+
+    fn list_tasks<'a>(
+        &'a self,
+        root: Option<&'a str>,
+        state: Option<&'a str>,
+    ) -> HubFuture<'a, Vec<TaskRow>> {
+        Box::pin(async move {
+            let mut pairs = Vec::new();
+            if let Some(root) = root {
+                pairs.push(("root", root));
+            }
+            if let Some(state) = state {
+                pairs.push(("state", state));
+            }
+            let json = self
+                .call(Method::GET, &["api", "tasks"], &pairs, None)
+                .await?;
+            task_rows(&json)
+        })
+    }
+
+    fn create_task<'a>(
+        &'a self,
+        goal: &'a str,
+        agent_id: Option<&'a str>,
+        cwd: Option<&'a str>,
+        peer_server_id: Option<&'a str>,
+    ) -> HubFuture<'a, TaskRow> {
+        Box::pin(async move {
+            let json = self
+                .call(
+                    Method::POST,
+                    &["api", "tasks"],
+                    &[],
+                    Some(create_task_body(goal, agent_id, cwd, peer_server_id)),
+                )
+                .await?;
+            task_row(&json)
+        })
+    }
+
+    fn cancel_task<'a>(&'a self, id: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            Self::unit(
+                self.call(Method::POST, &["api", "tasks", id, "cancel"], &[], None)
+                    .await,
+            )
+        })
+    }
+
+    fn complete_task<'a>(&'a self, id: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            // The body is optional; an empty object keeps the task's own hint.
+            Self::unit(
+                self.call(
+                    Method::POST,
+                    &["api", "tasks", id, "complete"],
+                    &[],
+                    Some(json!({})),
+                )
+                .await,
+            )
+        })
+    }
+
+    fn merge_task_worktree<'a>(
+        &'a self,
+        _task_id: &'a str,
+        base_dir: &'a str,
+        branch: &'a str,
+        worktree_dir: Option<&'a str>,
+    ) -> HubFuture<'a, String> {
+        let base_dir = base_dir.to_string();
+        let branch = branch.to_string();
+        let worktree_dir = worktree_dir.map(String::from);
+        let allow_local = self.targets_local_machine();
+        Box::pin(async move {
+            if !allow_local {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Task worktree merge is only available on this computer".into(),
+                )));
+            }
+            let res = tokio::task::spawn_blocking(move || {
+                let base = PathBuf::from(&base_dir);
+                let wt = worktree_dir.as_deref().map(Path::new);
+                crate::model::git_ops::git_merge_branch(&base, wt, &branch)
+            })
+            .await
+            .map_err(|e| HubError::Agent(AgentError::RequestFailed(e.to_string())))?;
+            res.map_err(|why| HubError::Agent(AgentError::RequestFailed(why)))
+        })
+    }
+
+    fn clean_task_worktree<'a>(
+        &'a self,
+        _task_id: &'a str,
+        base_dir: &'a str,
+        worktree_dir: Option<&'a str>,
+        branch: Option<&'a str>,
+    ) -> HubFuture<'a, ()> {
+        let base_dir = base_dir.to_string();
+        let worktree_dir = worktree_dir.map(String::from);
+        let branch = branch.map(String::from);
+        let allow_local = self.targets_local_machine();
+        Box::pin(async move {
+            if !allow_local {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "Task worktree cleanup is only available on this computer".into(),
+                )));
+            }
+            let res = tokio::task::spawn_blocking(move || {
+                let base = PathBuf::from(&base_dir);
+                let wt = worktree_dir.as_deref().map(Path::new);
+                crate::model::git_ops::git_clean_worktree(&base, wt, branch.as_deref())
+            })
+            .await
+            .map_err(|e| HubError::Agent(AgentError::RequestFailed(e.to_string())))?;
+            res.map_err(|why| HubError::Agent(AgentError::RequestFailed(why)))
+        })
+    }
+
+    fn task_history<'a>(&'a self, id: &'a str) -> HubFuture<'a, Vec<TaskStep>> {
+        Box::pin(async move {
+            let json = self
+                .call(Method::GET, &["api", "tasks", id], &[], None)
+                .await?;
+            Ok(json
+                .get("events")
+                .and_then(Value::as_array)
+                .map(|events| {
+                    events
+                        .iter()
+                        .filter_map(|e| serde_json::from_value(e.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default())
+        })
+    }
+
+    fn task_defaults(&self) -> HubFuture<'_, TaskDefaults> {
+        Box::pin(async move {
+            let json = self
+                .call(Method::GET, &["api", "tasks", "defaults"], &[], None)
+                .await?;
+            decode(json)
+        })
+    }
+
+    fn list_peers(&self) -> HubFuture<'_, Vec<PeerMention>> {
+        Box::pin(async move {
+            let mut peers = vec![PeerMention {
+                server_id: "self".into(),
+                name: super::local::computer_name(),
+                reachable: true,
+                current: self.targets_local_machine(),
+                url: Some(self.base.to_string()),
+            }];
+            if let Ok(json) = self.call(Method::GET, &["api", "peers"], &[], None).await {
+                for peer in json
+                    .get("peers")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let text = |key: &str| peer.get(key).and_then(Value::as_str);
+                    if let (Some(server_id), Some(name)) = (text("server_id"), text("name")) {
+                        peers.push(PeerMention {
+                            server_id: server_id.to_string(),
+                            name: name.to_string(),
+                            reachable: peer
+                                .get("reachable")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            current: false,
+                            url: text("url").map(|u| u.to_string()),
+                        });
+                    }
+                }
+            }
+            Ok(peers)
+        })
+    }
+
+    fn events(&self) -> broadcast::Receiver<AgentDomainEvent> {
+        self.events.subscribe()
+    }
+
+    fn read_file<'a>(
+        &'a self,
+        asid: &'a AgentSessionId,
+        path: &'a str,
+    ) -> HubFuture<'a, super::RemoteFile> {
+        Box::pin(async move {
+            let json = self
+                .session_call(Method::GET, asid, &["file-asset"], &[("uri", path)], None)
+                .await?;
+            let asset = json.pointer("/data/asset").ok_or_else(|| {
+                HubError::Agent(AgentError::Protocol("missing asset metadata".into()))
+            })?;
+            let id = asset
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| HubError::Agent(AgentError::Protocol("missing asset id".into())))?;
+            let name = asset
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    Path::new(path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.to_owned())
+                });
+            let mime = asset
+                .get("mime")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let size = asset.get("size").and_then(Value::as_u64);
+            let (status, bytes) = self
+                .call_bytes(
+                    Method::GET,
+                    &["api", "assets", id, "content"],
+                    &[],
+                    None,
+                    None,
+                )
+                .await?;
+            if !(200..300).contains(&status) {
+                let raw = String::from_utf8_lossy(&bytes);
+                let body_json: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+                return Err(map_error(status, &body_json, &asid.0, &raw));
+            }
+            Ok(super::RemoteFile {
+                name,
+                mime,
+                size,
+                bytes,
+            })
+        })
+    }
+
+    fn list_mcp_upstreams(&self) -> HubFuture<'_, super::McpHubSnapshot> {
+        Box::pin(async move {
+            if !self.has_capability(MCP_HUB_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "This Gateway needs the MCP Hub update (mcp_hub_v1).".into(),
+                )));
+            }
+            let json = self
+                .call(Method::GET, &["api", "mcp", "upstreams"], &[], None)
+                .await?;
+            decode(json)
+        })
+    }
+
+    fn upsert_mcp_upstream<'a>(
+        &'a self,
+        id: &'a str,
+        body: super::McpUpstreamUpsert,
+    ) -> HubFuture<'a, super::McpUpstreamView> {
+        Box::pin(async move {
+            if !self.has_capability(MCP_HUB_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "This Gateway needs the MCP Hub update (mcp_hub_v1).".into(),
+                )));
+            }
+            let payload = serde_json::to_value(&body).map_err(|e| {
+                HubError::Agent(AgentError::InvalidRequest(format!(
+                    "invalid upstream payload: {e}"
+                )))
+            })?;
+            let json = self
+                .call(
+                    Method::PUT,
+                    &["api", "mcp", "upstreams", id],
+                    &[],
+                    Some(payload),
+                )
+                .await?;
+            decode(json.get("upstream").cloned().unwrap_or(Value::Null))
+        })
+    }
+
+    fn delete_mcp_upstream<'a>(&'a self, id: &'a str) -> HubFuture<'a, ()> {
+        Box::pin(async move {
+            if !self.has_capability(MCP_HUB_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "This Gateway needs the MCP Hub update (mcp_hub_v1).".into(),
+                )));
+            }
+            Self::unit(
+                self.call(Method::DELETE, &["api", "mcp", "upstreams", id], &[], None)
+                    .await,
+            )
+        })
+    }
+
+    fn probe_mcp_upstream<'a>(&'a self, id: &'a str) -> HubFuture<'a, super::McpUpstreamView> {
+        Box::pin(async move {
+            if !self.has_capability(MCP_HUB_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "This Gateway needs the MCP Hub update (mcp_hub_v1).".into(),
+                )));
+            }
+            let json = self
+                .call(
+                    Method::POST,
+                    &["api", "mcp", "upstreams", id, "probe"],
+                    &[],
+                    None,
+                )
+                .await?;
+            decode(json.get("upstream").cloned().unwrap_or(Value::Null))
+        })
+    }
+
+    fn call_mcp_upstream_tool<'a>(
+        &'a self,
+        id: &'a str,
+        tool: &'a str,
+        arguments: Value,
+    ) -> HubFuture<'a, super::McpToolCallResult> {
+        Box::pin(async move {
+            if !self.has_capability(MCP_HUB_CAPABILITY).await? {
+                return Err(HubError::Agent(AgentError::Unsupported(
+                    "This Gateway needs the MCP Hub update (mcp_hub_v1).".into(),
+                )));
+            }
+            let body = json!({
+                "tool": tool,
+                "arguments": arguments,
+            });
+            let json = self
+                .call(
+                    Method::POST,
+                    &["api", "mcp", "upstreams", id, "call"],
+                    &[],
+                    Some(body),
+                )
+                .await?;
+            decode(json.get("data").cloned().unwrap_or(Value::Null))
+        })
+    }
+
+    fn task_events(&self) -> Option<broadcast::Receiver<TaskHubEvent>> {
+        Some(self.task_events.subscribe())
+    }
+}
+
+impl RemoteHub {
+    async fn snapshot_directory(&self, asid: &AgentSessionId) -> Option<String> {
+        self.data::<AgentSessionInfo>(Method::GET, &["api", "agent-sessions", &asid.0], &[], None)
+            .await
+            .ok()
+            .and_then(|info| info.directory)
+    }
+}
+
+fn rand_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("{nanos:x}")
+}
+
+/// `StoredUpload::mime` is a `&'static str`; the set of types is small.
+fn intern(mime: &str) -> &'static str {
+    static KNOWN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap();
+    if let Some(found) = known.iter().find(|m| **m == mime) {
+        return found;
+    }
+    let leaked: &'static str = Box::leak(mime.to_string().into_boxed_str());
+    known.push(leaked);
+    leaked
+}
+
+pub(crate) struct WsClientCodec {
+    server_key: [u8; 32],
+    client_key: [u8; 32],
+    connection_id: String,
+    request_aad: String,
+    recv_seq: u64,
+    send_seq: u64,
+}
+
+impl WsClientCodec {
+    pub(crate) fn open_first(
+        first: &Value,
+        material: &[u8],
+        request_aad: &str,
+        request_nonce: &str,
+    ) -> anyhow::Result<(Self, String)> {
+        let connection_id = first["cid"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no connection id"))?
+            .to_owned();
+        let mut codec = Self {
+            server_key: muqun_gateway::connectivity::transport::derive_ws_server_key(
+                material,
+                &connection_id,
+                request_nonce,
+            )?,
+            client_key: muqun_gateway::connectivity::transport::derive_ws_client_key(
+                material,
+                &connection_id,
+                request_nonce,
+            )?,
+            connection_id,
+            request_aad: request_aad.to_owned(),
+            recv_seq: 0,
+            send_seq: 0,
+        };
+        let hello = codec.open(first)?;
+        Ok((codec, hello))
+    }
+
+    fn aad(&self, seq: u64) -> String {
+        format!("{}\n{}\n{seq}", self.request_aad, self.connection_id)
+    }
+
+    pub(crate) fn open(&mut self, frame: &Value) -> anyhow::Result<String> {
+        let seq = frame["seq"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("no seq in frame"))?;
+        anyhow::ensure!(
+            seq == self.recv_seq,
+            "frame out of order: expected {}, got {}",
+            self.recv_seq,
+            seq
+        );
+        let ciphertext = frame["c"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no ciphertext in frame"))?;
+        let plaintext = muqun_gateway::connectivity::transport::open_stream_event(
+            &self.server_key,
+            seq,
+            self.aad(seq).as_bytes(),
+            ciphertext,
+        )?;
+        self.recv_seq += 1;
+        Ok(String::from_utf8(plaintext)?)
+    }
+
+    pub(crate) fn seal(&mut self, plaintext: &str) -> anyhow::Result<String> {
+        let seq = self.send_seq;
+        let c = muqun_gateway::connectivity::transport::seal_stream_event(
+            &self.client_key,
+            seq,
+            self.aad(seq).as_bytes(),
+            plaintext.as_bytes(),
+        )?;
+        self.send_seq += 1;
+        Ok(format!(r#"{{"seq":{seq},"c":"{c}"}}"#))
+    }
+}
+
+pub(crate) struct WsUpgradeRequest {
+    pub(crate) request: tokio_tungstenite::tungstenite::http::Request<()>,
+    pub(crate) material: Option<Vec<u8>>,
+    pub(crate) nonce: Option<String>,
+}
+
+/// Build an authenticated (and optionally E2EE v2 sealed) WebSocket upgrade
+/// request for `gateway` at `segments`.
+pub(crate) fn build_ws_request(
+    gateway: &LocalGateway,
+    segments: &[&str],
+    request_aad: &str,
+) -> Result<WsUpgradeRequest, String> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    let mut ws_url = reqwest::Url::parse(gateway.url.trim_end_matches('/'))
+        .map_err(|e| format!("bad gateway url: {e}"))?;
+    if let Ok(mut path) = ws_url.path_segments_mut() {
+        path.clear().extend(segments);
+    }
+    ws_url
+        .set_scheme(if ws_url.scheme() == "https" {
+            "wss"
+        } else {
+            "ws"
+        })
+        .map_err(|_| "bad gateway url".to_string())?;
+    let mut request = ws_url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| e.to_string())?;
+
+    let material = gateway
+        .transport_key
+        .as_deref()
+        .and_then(|k| muqun_gateway::connectivity::transport::decode_key(k).ok());
+    let mut nonce = None;
+    if let (Some(material_bytes), Some(device_id)) = (&material, &gateway.device_id) {
+        let payload = EncryptedRequestPayload {
+            token: gateway.token.clone(),
+            content_type: None,
+            body: String::new(),
+        };
+        let envelope = muqun_gateway::connectivity::transport::seal_version(
+            muqun_gateway::connectivity::transport::VERSION_V2,
+            material_bytes,
+            muqun_gateway::connectivity::transport::Direction::Request,
+            request_aad.as_bytes(),
+            &serde_json::to_vec(&payload).map_err(|e| e.to_string())?,
+            now_unix_ms(),
+        )
+        .map_err(|e| format!("seal ws: {e}"))?;
+        let sealed = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&envelope).map_err(|e| e.to_string())?);
+
+        let headers = request.headers_mut();
+        headers.insert(
+            "x-muqun-transport",
+            "1".parse()
+                .map_err(|e: reqwest::header::InvalidHeaderValue| e.to_string())?,
+        );
+        headers.insert(
+            "x-muqun-device",
+            device_id
+                .parse()
+                .map_err(|e: reqwest::header::InvalidHeaderValue| e.to_string())?,
+        );
+        headers.insert(
+            "x-muqun-envelope",
+            sealed
+                .parse()
+                .map_err(|e: reqwest::header::InvalidHeaderValue| e.to_string())?,
+        );
+        nonce = Some(envelope.nonce);
+    } else {
+        request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {}", gateway.token)
+                .parse()
+                .map_err(|_| "bad token".to_string())?,
+        );
+    }
+    Ok(WsUpgradeRequest {
+        request,
+        material,
+        nonce,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Event socket
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+struct SocketTimings {
+    ping_after: Duration,
+    pong_grace: Duration,
+    write_timeout: Duration,
+}
+
+impl Default for SocketTimings {
+    fn default() -> Self {
+        Self {
+            ping_after: WS_PING_AFTER,
+            pong_grace: WS_PONG_GRACE,
+            write_timeout: WS_WRITE_TIMEOUT,
+        }
+    }
+}
+
+/// One `/api/ws` connection after another, for the life of the process. After
+/// every reconnect the projection is told to read again (an unnamed
+/// `agent.resync`): the open session's snapshot and every list, which covers
+/// whatever the socket missed.
+async fn event_socket(
+    weak: std::sync::Weak<RemoteHub>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    event_socket_with_timings(weak, shutdown, SocketTimings::default(), BACKOFF_START).await;
+}
+
+async fn event_socket_with_timings(
+    weak: std::sync::Weak<RemoteHub>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    timings: SocketTimings,
+    backoff_start: Duration,
+) {
+    let mut backoff = backoff_start;
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        let Some(hub) = weak.upgrade() else {
+            return;
+        };
+        let started = tokio::time::Instant::now();
+        let why = match run_socket(hub, &mut shutdown, timings).await {
+            Ok(()) => {
+                tracing::info!("event socket closed");
+                "the gateway closed the connection".to_string()
+            }
+            Err(why) => {
+                tracing::warn!("event socket: {why}");
+                why
+            }
+        };
+        if *shutdown.borrow() {
+            return;
+        }
+        if let Some(hub) = weak.upgrade() {
+            hub.link.send_replace(Some(why));
+        } else {
+            return;
+        }
+
+        if started.elapsed() > Duration::from_secs(30) {
+            backoff = backoff_start;
+        }
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(BACKOFF_MAX);
+    }
+}
+
+async fn run_socket(
+    hub: Arc<RemoteHub>,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    timings: SocketTimings,
+) -> Result<(), String> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let mut ws_url = hub.url(&["api", "ws"], &[]);
+    ws_url
+        .set_scheme(if hub.base.scheme() == "https" {
+            "wss"
+        } else {
+            "ws"
+        })
+        .map_err(|_| "bad gateway url".to_string())?;
+    let mut request = ws_url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| e.to_string())?;
+
+    let mut nonce = None;
+    if let (Some(material), Some(device_id)) = (&hub.material, &hub.device_id) {
+        let payload = EncryptedRequestPayload {
+            token: hub.token.clone(),
+            content_type: None,
+            body: String::new(),
+        };
+        let envelope = muqun_gateway::connectivity::transport::seal_version(
+            hub.transport_version,
+            material,
+            muqun_gateway::connectivity::transport::Direction::Request,
+            b"GET /api/ws",
+            &serde_json::to_vec(&payload).map_err(|e| e.to_string())?,
+            now_unix_ms(),
+        )
+        .map_err(|e| format!("seal ws: {e}"))?;
+        let sealed = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&envelope).map_err(|e| e.to_string())?);
+
+        let headers = request.headers_mut();
+        headers.insert(
+            "x-muqun-transport",
+            "1".parse()
+                .map_err(|e: reqwest::header::InvalidHeaderValue| e.to_string())?,
+        );
+        headers.insert(
+            "x-muqun-device",
+            device_id
+                .parse()
+                .map_err(|e: reqwest::header::InvalidHeaderValue| e.to_string())?,
+        );
+        headers.insert(
+            "x-muqun-envelope",
+            sealed
+                .parse()
+                .map_err(|e: reqwest::header::InvalidHeaderValue| e.to_string())?,
+        );
+        nonce = Some(envelope.nonce);
+    } else {
+        request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {}", hub.token)
+                .parse()
+                .map_err(|_| "bad token".to_string())?,
+        );
+    }
+
+    let (mut socket, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    .map_err(|_| "event socket handshake timed out".to_string())?
+    .map_err(|e| e.to_string())?;
+
+    let mut codec: Option<WsClientCodec> = None;
+    if let (Some(material), Some(request_nonce)) = (&hub.material, nonce) {
+        let first_msg = tokio::select! {
+            _ = shutdown.changed() => return Ok(()),
+            res = tokio::time::timeout(Duration::from_secs(10), socket.next()) => res
+                .map_err(|_| "event socket hello timed out".to_string())?
+                .ok_or_else(|| "socket closed before hello".to_string())?
+                .map_err(|e| e.to_string())?,
+        };
+        let first_text = match first_msg {
+            Message::Text(t) => t.to_string(),
+            _ => return Err("unexpected non-text frame before hello".into()),
+        };
+        let first_val: Value =
+            serde_json::from_str(&first_text).map_err(|e| format!("invalid hello json: {e}"))?;
+        let (mut client_codec, _hello) =
+            WsClientCodec::open_first(&first_val, material, "GET /api/ws", &request_nonce)
+                .map_err(|e| format!("hello open failed: {e}"))?;
+        let sub = client_codec
+            .seal(r#"{"t":"subscribe_all"}"#)
+            .map_err(|e| format!("seal subscribe: {e}"))?;
+        tokio::time::timeout(timings.write_timeout, socket.send(Message::text(sub)))
+            .await
+            .map_err(|_| "event socket subscribe timed out".to_string())?
+            .map_err(|e| e.to_string())?;
+        codec = Some(client_codec);
+    } else {
+        tokio::time::timeout(
+            timings.write_timeout,
+            socket.send(Message::text(r#"{"t":"subscribe_all"}"#)),
+        )
+        .await
+        .map_err(|_| "event socket subscribe timed out".to_string())?
+        .map_err(|e| e.to_string())?;
+    }
+
+    tracing::info!("event socket connected");
+    // A Gateway upgrade may add optional APIs while Desktop stays open.
+    *hub.capabilities.lock().await = None;
+    hub.link.send_replace(None);
+    // Also catch up the first connection: initial HTTP reads may have finished
+    // before the event subscription, or failed while the gateway was offline.
+    let _ = hub.events.send(AgentDomainEvent::Resync {
+        asid: AgentSessionId(String::new()),
+        reason: "connected".into(),
+    });
+    let _ = hub.task_events.send(TaskHubEvent::Resync);
+    // A connected socket must not keep an abandoned computer alive forever.
+    // Dropping the last owner closes shutdown and releases this socket.
+    let weak = Arc::downgrade(&hub);
+    drop(hub);
+
+    let mut last_rx = tokio::time::Instant::now();
+    let mut pinged = false;
+
+    loop {
+        let deadline = last_rx
+            + if pinged {
+                timings.pong_grace
+            } else {
+                timings.ping_after
+            };
+        tokio::select! {
+            _ = shutdown.changed() => {
+                let _ = tokio::time::timeout(Duration::from_secs(2), socket.close(None)).await;
+                return Ok(());
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                if pinged {
+                    return Err("event socket timed out".to_string());
+                }
+                let ping_wire = if let Some(c) = codec.as_mut() {
+                    c.seal(r#"{"t":"ping"}"#)
+                        .map_err(|e| format!("seal ping: {e}"))?
+                } else {
+                    r#"{"t":"ping"}"#.to_string()
+                };
+                tokio::time::timeout(timings.write_timeout, socket.send(Message::text(ping_wire)))
+                    .await
+                    .map_err(|_| "event socket ping timed out".to_string())?
+                    .map_err(|e| format!("event socket ping failed: {e}"))?;
+                last_rx = tokio::time::Instant::now();
+                pinged = true;
+            }
+            item = socket.next() => {
+                let Some(message) = item else {
+                    return Ok(());
+                };
+                let msg = message.map_err(|e| e.to_string())?;
+                last_rx = tokio::time::Instant::now();
+                pinged = false;
+                let text = match msg {
+                    Message::Text(text) => {
+                        if let Some(c) = codec.as_mut() {
+                            let frame_val: Value =
+                                serde_json::from_str(&text).map_err(|e| e.to_string())?;
+                            c.open(&frame_val).map_err(|e| e.to_string())?
+                        } else {
+                            text.to_string()
+                        }
+                    }
+                    Message::Close(_) => return Ok(()),
+                    Message::Ping(payload) => {
+                        tokio::time::timeout(timings.write_timeout, socket.send(Message::Pong(payload)))
+                            .await
+                            .map_err(|_| "event socket pong timed out".to_string())?
+                            .map_err(|e| format!("event socket pong failed: {e}"))?;
+                        continue;
+                    }
+                    Message::Pong(_) => continue,
+                    _ => continue,
+                };
+                match parse_frame(text.as_str()) {
+                    Some(Frame::Agent(event)) => {
+                        if let Some(hub) = weak.upgrade() {
+                            let _ = hub.events.send(*event);
+                        }
+                    }
+                    Some(Frame::Task(event)) => {
+                        if let Some(hub) = weak.upgrade() {
+                            let _ = hub.task_events.send(event);
+                        }
+                    }
+                    Some(Frame::Error(code)) => {
+                        return Err(format!("gateway socket error: {code}"));
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+}
+
+/// What one server frame carries: a session event, a task change, or a fatal error.
+#[derive(Debug, PartialEq)]
+enum Frame {
+    Agent(Box<AgentDomainEvent>),
+    Task(TaskHubEvent),
+    Error(String),
+}
+
+/// One server frame. `event` frames carry the event's own JSON in `data`: a
+/// session event, or -- named `task.updated` / `task.deleted` -- the task as
+/// `GET /api/tasks` shows it. `resync` asks for a re-read, of the tasks when
+/// it says `tasks: true`. `error` ends the connection so it reconnects cleanly.
+/// Everything else (hello, subscribed, pong) is neither's.
+fn parse_frame(text: &str) -> Option<Frame> {
+    let frame: Value = serde_json::from_str(text).ok()?;
+    match frame.get("t")?.as_str()? {
+        "event" if frame_event_name(&frame).is_some_and(|n| n.starts_with("task.")) => {
+            parse_task_frame(&frame).map(Frame::Task)
+        }
+        "event" => match serde_json::from_value(frame.get("data")?.clone()) {
+            Ok(event) => Some(Frame::Agent(Box::new(event))),
+            Err(err) => {
+                tracing::debug!(%err, "event frame not understood");
+                None
+            }
+        },
+        "resync" if frame.get("tasks").and_then(Value::as_bool) == Some(true) => {
+            Some(Frame::Task(TaskHubEvent::Resync))
+        }
+        "resync" => Some(Frame::Agent(Box::new(AgentDomainEvent::Resync {
+            asid: AgentSessionId(frame.get("asid")?.as_str()?.to_string()),
+            reason: "gateway".into(),
+        }))),
+        "error" => Some(Frame::Error(
+            frame
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+        )),
+        _ => None,
+    }
+}
+
+fn frame_event_name(frame: &Value) -> Option<&str> {
+    frame.get("event")?.as_str()
+}
+
+fn parse_task_frame(frame: &Value) -> Option<TaskHubEvent> {
+    let data = frame.get("data")?;
+    match frame_event_name(frame)? {
+        "task.updated" => match TaskRow::from_json(data) {
+            Ok(row) => Some(TaskHubEvent::Updated(Box::new(row))),
+            Err(err) => {
+                tracing::debug!(%err, "task frame not understood");
+                None
+            }
+        },
+        "task.deleted" => Some(TaskHubEvent::Deleted {
+            task_id: data.get("task_id")?.as_str()?.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+const MAX_DECOMPRESSED_ENVELOPE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn decode_envelope_body(
+    raw_body: Vec<u8>,
+    content_encoding: Option<&str>,
+) -> Result<Vec<u8>, HubError> {
+    if !content_encoding.is_some_and(|enc| enc.eq_ignore_ascii_case("gzip")) {
+        return Ok(raw_body);
+    }
+    use std::io::Read as _;
+    let mut decoder = flate2::read::GzDecoder::new(raw_body.as_slice());
+    let mut out = Vec::new();
+    let mut limited = (&mut decoder).take(MAX_DECOMPRESSED_ENVELOPE_BYTES + 1);
+    limited.read_to_end(&mut out).map_err(|err| {
+        HubError::Agent(AgentError::Network(format!(
+            "failed to decompress remote response: {err}"
+        )))
+    })?;
+    if out.len() as u64 > MAX_DECOMPRESSED_ENVELOPE_BYTES {
+        return Err(HubError::Agent(AgentError::Network(
+            "decompressed remote response exceeded 64 MiB limit".into(),
+        )));
+    }
+    Ok(out)
+}
+
+/// True when `path` looks like an absolute path on Unix, macOS, or Windows, or
+/// starts with `~` for remote gateway expansion. Used instead of `Path::is_dir`
+/// so remote sessions can search directories that do not exist on this machine.
+fn is_remote_or_local_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || path.starts_with('~')
+        || path.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn accept_subscription(
+        listener: &tokio::net::TcpListener,
+    ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let sub = socket.next().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(sub.to_text().unwrap()).unwrap(),
+            json!({"t":"subscribe_all"})
+        );
+        socket
+    }
+
+    fn connect_fixture(listener: &tokio::net::TcpListener) -> Arc<RemoteHub> {
+        RemoteHub::start(LocalGateway {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token: "isolated-test".into(),
+            device_id: None,
+            transport_key: None,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn saved_remote_computer_reopens_its_connection_before_reading_sessions() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = crate::config::DesktopConfig {
+                current_computer: "qa-remote".into(),
+                ..Default::default()
+            };
+            config.computers.insert("qa-remote".into(), crate::config::ComputerProfile {
+                url: Some(format!("http://{}", listener.local_addr().unwrap())),
+                token: Some("isolated-test".into()),
+                ..Default::default()
+            });
+            let hub = crate::configured_remote_hub(&config).unwrap().expect("saved remote selected");
+            let mut events = hub.events();
+            let mut socket = accept_subscription(&listener).await;
+            assert!(matches!(events.recv().await.unwrap(), AgentDomainEvent::Resync { .. }));
+            socket.send(tokio_tungstenite::tungstenite::Message::text(
+                json!({"t":"event","event":"agent.permission.resolved","data":{
+                    "type":"agent.permission.resolved","asid":"remote-session","request_id":"remote-request","seq":1
+                }}).to_string()
+            )).await.unwrap();
+            assert!(matches!(events.recv().await.unwrap(), AgentDomainEvent::PermissionResolved { asid, .. } if asid.0 == "remote-session"));
+        }).await.expect("saved remote delivers events without a local gateway");
+    }
+
+    #[tokio::test]
+    async fn socket_reconnect_resyncs_then_delivers_and_releases_abandoned_hub() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let hub = connect_fixture(&listener);
+            let mut events = hub.events();
+            let mut tasks = hub.task_events().unwrap();
+            let mut link = hub.link().unwrap();
+            let socket = accept_subscription(&listener).await;
+            assert!(matches!(events.recv().await.unwrap(), AgentDomainEvent::Resync { asid, .. } if asid.0.is_empty()));
+            assert_eq!(tasks.recv().await.unwrap(), TaskHubEvent::Resync);
+            link.borrow_and_update();
+            drop(socket);
+            loop {
+                link.changed().await.unwrap();
+                if link.borrow_and_update().is_some() { break; }
+            }
+            let mut socket = accept_subscription(&listener).await;
+            assert!(matches!(events.recv().await.unwrap(), AgentDomainEvent::Resync { .. }));
+            assert_eq!(tasks.recv().await.unwrap(), TaskHubEvent::Resync);
+            assert!(link.borrow().is_none());
+            socket.send(tokio_tungstenite::tungstenite::Message::text(
+                json!({"t":"event","event":"agent.permission.resolved","data":{
+                    "type":"agent.permission.resolved","asid":"isolated-session","request_id":"r1","seq":2
+                }}).to_string()
+            )).await.unwrap();
+            assert!(matches!(events.recv().await.unwrap(), AgentDomainEvent::PermissionResolved { asid, .. } if asid.0 == "isolated-session"));
+            let weak = Arc::downgrade(&hub);
+            drop(hub);
+            assert!(weak.upgrade().is_none(), "an idle socket must not own its hub");
+            // The peer observes a close rather than a leaked connection.
+            assert!(matches!(socket.next().await, Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None));
+        }).await.expect("reconnect and cleanup complete within the budget");
+    }
+
+    #[tokio::test]
+    async fn switching_computers_moves_existing_link_subscription() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let first = connect_fixture(&a);
+            let first_weak = Arc::downgrade(&first);
+            let hub = super::super::DynamicHub::new(first);
+            let mut link = hub.link().unwrap();
+            let _socket_a = accept_subscription(&a).await;
+            let second = connect_fixture(&b);
+            let socket_b = accept_subscription(&b).await;
+            hub.switch(second);
+            link.borrow_and_update();
+            drop(socket_b);
+            loop {
+                link.changed().await.unwrap();
+                if link.borrow_and_update().is_some() {
+                    break;
+                }
+            }
+            assert!(first_weak.upgrade().is_none());
+            let _socket_b = accept_subscription(&b).await;
+            loop {
+                link.changed().await.unwrap();
+                if link.borrow_and_update().is_none() {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the original subscription follows the new computer");
+    }
+
+    #[test]
+    fn auto_approve_answers_read_as_on_or_off() {
+        for (body, want) in [
+            (
+                r#"{"data":{"enabled":true,"native":"bypassPermissions"}}"#,
+                true,
+            ),
+            (
+                r#"{"data":{"enabled":false,"native":"bypassPermissions"}}"#,
+                false,
+            ),
+            // An agent without a session control answers null: off.
+            (r#"{"data":{"enabled":null,"native":null}}"#, false),
+            (r#"{}"#, false),
+        ] {
+            assert_eq!(
+                enabled_of(&serde_json::from_str(body).unwrap()),
+                want,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_lists_and_creates_read_as_rows() {
+        let json = json!({"tasks": [{
+            "task_id": "t_1", "state": "working", "kind": "delegation", "goal": "fix it",
+            "title": "fix it", "summary": null, "origin": "device", "updated_ms": 5,
+            "binding": {"kind": "agent_session", "agent_id": "opencode", "asid": "ses_1"},
+            "children": {"total": 2, "active": 1, "waiting": 0, "failed": 1},
+            "future_field": true
+        }, {
+            "task_id": "t_2", "state": "idle_unconfirmed", "goal": "g", "origin": "device",
+            "binding": {"kind": "pane", "pane_id": "w1:p9", "agent_id": "codex"}
+        }, {
+            "task_id": "t_4", "state": "working", "goal": "g", "origin": "agent",
+            "created_ms": 100, "reopened_ms": 400,
+            "binding": {"kind": "peer", "peer_id": "p1", "remote_task_id": "r", "peer_name": "studio"}
+        }]});
+        let rows = task_rows(&json).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].id, "t_1");
+        assert_eq!(rows[0].agent_id.as_deref(), Some("opencode"));
+        assert_eq!(rows[0].asid.as_deref(), Some("ses_1"));
+        assert_eq!(rows[0].children.failed, 1);
+        assert!(!rows[0].completable && !rows[0].is_ended());
+        assert!(rows[1].completable, "a paused device task can be confirmed");
+        assert_eq!(rows[1].agent_id.as_deref(), Some("codex"));
+        assert_eq!(rows[1].machine, None);
+        // A mirror names the computer it runs on and counts from its reopening.
+        assert_eq!(rows[2].machine.as_deref(), Some("studio"));
+        assert_eq!(rows[2].started_ms, 400);
+        assert!(task_rows(&json!({})).unwrap().is_empty());
+        let created = task_row(&json!({"task_id": "t_3", "state": "working", "asid": "ses_3"}));
+        assert_eq!(created.unwrap().asid.as_deref(), Some("ses_3"));
+    }
+
+    #[test]
+    fn a_new_task_sends_only_what_was_given() {
+        assert_eq!(
+            create_task_body("g", None, None, None),
+            json!({"goal": "g"})
+        );
+        assert_eq!(
+            create_task_body("g", Some("codex"), Some("~/w"), Some("srv")),
+            json!({"goal": "g", "agent_id": "codex", "cwd": "~/w", "computer_ids": ["srv"]})
+        );
+        assert_eq!(
+            create_task_body("g", Some(""), Some(""), None),
+            json!({"goal": "g"})
+        );
+    }
+
+    #[test]
+    fn frames_become_events() {
+        for (frame, want) in [
+            (
+                r#"{"t":"event","asid":"a","seq":3,"event":"agent.permission.resolved","data":{"type":"agent.permission.resolved","asid":"a","request_id":"r","seq":3}}"#,
+                Some("agent.permission.resolved"),
+            ),
+            (r#"{"t":"resync","asid":"a"}"#, Some("agent.resync")),
+            (r#"{"t":"resync","asid":"","tasks":true}"#, None),
+            (r#"{"t":"hello","connection_id":"c"}"#, None),
+            (r#"{"t":"event","data":{"type":"nonsense"}}"#, None),
+            (
+                r#"{"t":"event","asid":null,"seq":1,"event":"task.updated","data":{"task_id":"t"}}"#,
+                None,
+            ),
+        ] {
+            let got = match parse_frame(frame) {
+                Some(Frame::Agent(event)) => Some(event.event_name()),
+                _ => None,
+            };
+            assert_eq!(got, want, "{frame}");
+        }
+    }
+
+    #[test]
+    fn task_frames_become_task_events() {
+        let updated = r#"{"t":"event","asid":null,"seq":3,"event":"task.updated","data":{"task_id":"t_1","state":"working","goal":"g","title":"g","origin":"device","binding":{"kind":"agent_session","agent_id":"codex","asid":"ses_1"}}}"#;
+        let Some(Frame::Task(TaskHubEvent::Updated(row))) = parse_frame(updated) else {
+            panic!("a task.updated frame is a task update");
+        };
+        assert_eq!((row.id.as_str(), row.state.as_str()), ("t_1", "working"));
+        assert_eq!(row.asid.as_deref(), Some("ses_1"));
+        assert_eq!(
+            parse_frame(
+                r#"{"t":"event","asid":null,"seq":4,"event":"task.deleted","data":{"task_id":"t_1"}}"#
+            ),
+            Some(Frame::Task(TaskHubEvent::Deleted {
+                task_id: "t_1".into()
+            }))
+        );
+        assert_eq!(
+            parse_frame(r#"{"t":"resync","asid":"","tasks":true}"#),
+            Some(Frame::Task(TaskHubEvent::Resync))
+        );
+        for bad in [
+            r#"{"t":"event","event":"task.deleted","data":{}}"#,
+            r#"{"t":"event","event":"task.unknown","data":{}}"#,
+        ] {
+            assert_eq!(parse_frame(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn gateway_errors_map_to_hub_errors() {
+        let body = |code: &str| json!({"error": {"code": code, "message": "m"}});
+        assert!(matches!(
+            map_error(404, &body("session_not_found"), "x", ""),
+            HubError::SessionNotFound(a) if a == "x"
+        ));
+        assert!(matches!(
+            map_error(404, &body("not_retained"), "x", ""),
+            HubError::Agent(AgentError::SessionNotFound(a)) if a == "x"
+        ));
+        assert!(matches!(
+            map_error(409, &body("history_cursor_lost"), "x", ""),
+            HubError::Agent(AgentError::HistoryCursorLost)
+        ));
+        assert!(matches!(
+            map_error(501, &body("feature_unsupported"), "x", ""),
+            HubError::Agent(AgentError::Unsupported(_))
+        ));
+        assert!(matches!(
+            map_error(503, &json!({"error": {"code": "agent_unavailable", "message": "Agent 'opencode' is not available"}}), "", ""),
+            HubError::AgentUnavailable { agent, .. } if agent == "opencode"
+        ));
+    }
+
+    #[test]
+    fn client_codec_round_trip() {
+        let material = b"test-material-32-bytes-long!!!!!";
+        let request_nonce = "test-request-nonce";
+        let connection_id = "test-connection-id";
+
+        // Server derives server key
+        let server_key = muqun_gateway::connectivity::transport::derive_ws_server_key(
+            material,
+            connection_id,
+            request_nonce,
+        )
+        .unwrap();
+
+        // Server seals hello at seq 0
+        let hello_aad = format!("GET /api/ws\n{connection_id}\n0");
+        let hello_c = muqun_gateway::connectivity::transport::seal_stream_event(
+            &server_key,
+            0,
+            hello_aad.as_bytes(),
+            br#"{"t":"hello"}"#,
+        )
+        .unwrap();
+        let first_frame = json!({
+            "seq": 0,
+            "cid": connection_id,
+            "c": hello_c,
+        });
+
+        // Client opens first frame
+        let (mut client_codec, hello_plain) =
+            WsClientCodec::open_first(&first_frame, material, "GET /api/ws", request_nonce)
+                .unwrap();
+        assert_eq!(hello_plain, r#"{"t":"hello"}"#);
+
+        // Client seals subscribe frame at send_seq 0
+        let sub_frame_wire = client_codec.seal(r#"{"t":"subscribe_all"}"#).unwrap();
+        let sub_val: Value = serde_json::from_str(&sub_frame_wire).unwrap();
+        assert_eq!(sub_val["seq"], 0);
+
+        // Server decrypts client frame using client key
+        let client_key = muqun_gateway::connectivity::transport::derive_ws_client_key(
+            material,
+            connection_id,
+            request_nonce,
+        )
+        .unwrap();
+        let client_aad = format!("GET /api/ws\n{connection_id}\n0");
+        let client_plain = muqun_gateway::connectivity::transport::open_stream_event(
+            &client_key,
+            0,
+            client_aad.as_bytes(),
+            sub_val["c"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(client_plain).unwrap(),
+            r#"{"t":"subscribe_all"}"#
+        );
+
+        // Server seals event at seq 1
+        let event_aad = format!("GET /api/ws\n{connection_id}\n1");
+        let event_c = muqun_gateway::connectivity::transport::seal_stream_event(
+            &server_key,
+            1,
+            event_aad.as_bytes(),
+            br#"{"t":"event"}"#,
+        )
+        .unwrap();
+        let event_frame = json!({
+            "seq": 1,
+            "c": event_c,
+        });
+        let event_plain = client_codec.open(&event_frame).unwrap();
+        assert_eq!(event_plain, r#"{"t":"event"}"#);
+    }
+
+    #[tokio::test]
+    async fn silent_socket_pings_times_out_and_reconnects_to_resume_events() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let hub = RemoteHub::client(
+                LocalGateway {
+                    url: format!("http://{}", listener.local_addr().unwrap()),
+                    token: "isolated-test".into(),
+                    device_id: None,
+                    transport_key: None,
+                },
+                reqwest::redirect::Policy::default(),
+            )
+            .unwrap();
+            let timings = SocketTimings {
+                ping_after: Duration::from_millis(80),
+                pong_grace: Duration::from_millis(80),
+                write_timeout: Duration::from_secs(1),
+            };
+            tokio::spawn(event_socket_with_timings(
+                Arc::downgrade(&hub),
+                hub.shutdown.subscribe(),
+                timings,
+                Duration::from_millis(20),
+            ));
+            let mut events = hub.events();
+            let mut stalled_socket = accept_subscription(&listener).await;
+            assert!(matches!(
+                events.recv().await.unwrap(),
+                AgentDomainEvent::Resync { .. }
+            ));
+
+            // Keep the first socket open without replying: the client must send
+            // `{"t":"ping"}` and then drop and reconnect after pong_grace.
+            let ping = stalled_socket.next().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(ping.to_text().unwrap()).unwrap(),
+                json!({"t":"ping"})
+            );
+
+            // Second connection succeeds, resyncs, and delivers live events again.
+            let mut healthy_socket = accept_subscription(&listener).await;
+            assert!(matches!(
+                events.recv().await.unwrap(),
+                AgentDomainEvent::Resync { .. }
+            ));
+            healthy_socket
+                .send(tokio_tungstenite::tungstenite::Message::text(
+                    json!({"t":"event","event":"agent.permission.resolved","data":{
+                        "type":"agent.permission.resolved","asid":"remote-live","request_id":"r9","seq":7
+                    }})
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                events.recv().await.unwrap(),
+                AgentDomainEvent::PermissionResolved { asid, .. } if asid.0 == "remote-live"
+            ));
+            drop(stalled_socket);
+        })
+        .await
+        .expect("silent half-open socket recovers via ping timeout and reconnect");
+    }
+
+    #[tokio::test]
+    async fn find_files_queries_remote_gateway_without_local_directory_check() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            assert!(
+                req.contains("GET /api/agent-files?")
+                    && req.contains("directory=%2FUsers%2Fremote-mac%2Fnonexistent-project"),
+                "unexpected request: {req}"
+            );
+            let body = json!({
+                "ok": true,
+                "data": [{
+                    "path": "src/main.rs",
+                    "kind": "file"
+                }]
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let hub = RemoteHub::client(
+            LocalGateway {
+                url: format!("http://{addr}"),
+                token: "test-token".into(),
+                device_id: None,
+                transport_key: None,
+            },
+            reqwest::redirect::Policy::default(),
+        )
+        .unwrap();
+        let ctx = crate::hub::ConnectionContext {
+            computer: "mini".into(),
+            generation: 1,
+            hub: hub.clone(),
+        };
+        let hits = ctx
+            .scope(hub.find_files("codex", "/Users/remote-mac/nonexistent-project", "main", 20))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["path"], "src/main.rs");
+        assert_eq!(hits[0]["type"], "file");
+    }
+
+    #[tokio::test]
+    async fn remote_task_worktree_operations_return_unsupported() {
+        let hub = RemoteHub::client(
+            LocalGateway {
+                url: "http://100.64.0.9:43210".into(),
+                token: "test-token".into(),
+                device_id: None,
+                transport_key: None,
+            },
+            reqwest::redirect::Policy::default(),
+        )
+        .unwrap();
+        let ctx = crate::hub::ConnectionContext {
+            computer: "mini".into(),
+            generation: 1,
+            hub: hub.clone(),
+        };
+        let merge_err = ctx
+            .clone()
+            .scope(hub.merge_task_worktree("t1", "/Users/mini/repo", "feat", None))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            merge_err,
+            HubError::Agent(AgentError::Unsupported(_))
+        ));
+        let clean_err = ctx
+            .scope(hub.clean_task_worktree("t1", "/Users/mini/repo", None, Some("feat")))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            clean_err,
+            HubError::Agent(AgentError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn decode_envelope_body_decompresses_gzip_and_passes_plain_bytes() {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write as _;
+
+        let plain = br#"{"ok":true,"data":{"timeline":[1,2,3]}}"#.to_vec();
+        assert_eq!(decode_envelope_body(plain.clone(), None).unwrap(), plain);
+
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&plain).unwrap();
+        let gz = enc.finish().unwrap();
+        assert_eq!(decode_envelope_body(gz, Some("gzip")).unwrap(), plain);
+
+        assert!(decode_envelope_body(b"not-gzip".to_vec(), Some("gzip")).is_err());
+    }
+
+    #[test]
+    fn direct_local_lan_and_tailscale_gateways_bypass_system_proxy() {
+        let u = |s: &str| reqwest::Url::parse(s).unwrap();
+        assert!(should_bypass_proxy(&u("http://127.0.0.1:23847")));
+        assert!(should_bypass_proxy(&u("http://localhost:23847")));
+        assert!(should_bypass_proxy(&u("http://100.83.99.56:23847")));
+        assert!(should_bypass_proxy(&u("http://100.126.182.72:23847")));
+        assert!(should_bypass_proxy(&u("http://192.168.1.50:23847")));
+        assert!(should_bypass_proxy(&u("http://10.0.0.2:23847")));
+        assert!(should_bypass_proxy(&u("https://mini.tail123.ts.net")));
+        assert!(!should_bypass_proxy(&u("https://gateway.example.com")));
+        assert!(!should_bypass_proxy(&u("http://100.128.0.1:23847")));
+
+        assert!(is_loopback_url(&u("http://127.0.0.1:23847")));
+        assert!(is_loopback_url(&u("http://localhost:23847")));
+        assert!(!is_loopback_url(&u("http://100.83.99.56:23847")));
+    }
+}

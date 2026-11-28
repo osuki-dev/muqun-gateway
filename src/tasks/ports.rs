@@ -4,8 +4,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use super::domain::{
-    ChildCounts, NoticeTarget, Task, TaskChange, TaskEvent, TaskFilter, TaskId, TaskPrincipal,
-    TaskState,
+    ChildCounts, NoticeTarget, PendingNotice, Task, TaskChange, TaskEvent, TaskFilter, TaskId,
+    TaskPrincipal, TaskState,
 };
 
 pub(crate) type TaskFuture<'a, T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send + 'a>>;
@@ -42,6 +42,16 @@ pub(crate) trait TaskStore: Send + Sync {
     fn set_notice<'a>(&'a self, _id: &'a TaskId, _target: &'a NoticeTarget) -> TaskFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
+    /// Tell `target` how task `id` ends, optionally coalescing completion
+    /// notices with sibling tasks sharing `barrier_group`.
+    fn set_notice_with_barrier<'a>(
+        &'a self,
+        id: &'a TaskId,
+        target: &'a NoticeTarget,
+        _barrier_group: Option<&'a str>,
+    ) -> TaskFuture<'a, ()> {
+        self.set_notice(id, target)
+    }
     /// Tasks with a notice target, updated since `since_ms`, in a reported
     /// state that has not been told yet: newest change first, at most `limit`.
     fn pending_notices<'a>(
@@ -49,6 +59,35 @@ pub(crate) trait TaskStore: Send + Sync {
         _since_ms: u64,
         _limit: usize,
     ) -> TaskFuture<'a, Vec<(Task, NoticeTarget)>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    /// Like [`Self::pending_notices`], including any optional `barrier_group`.
+    fn pending_notices_with_barrier<'a>(
+        &'a self,
+        since_ms: u64,
+        limit: usize,
+    ) -> TaskFuture<'a, Vec<PendingNotice>> {
+        Box::pin(async move {
+            Ok(self
+                .pending_notices(since_ms, limit)
+                .await?
+                .into_iter()
+                .map(|(task, target)| PendingNotice {
+                    task,
+                    target,
+                    barrier_group: None,
+                })
+                .collect())
+        })
+    }
+    /// All tasks assigned to `(target, barrier_group)` updated since `since_ms`,
+    /// regardless of whether they have settled yet.
+    fn barrier_group_tasks<'a>(
+        &'a self,
+        _target: &'a NoticeTarget,
+        _barrier_group: &'a str,
+        _since_ms: u64,
+    ) -> TaskFuture<'a, Vec<Task>> {
         Box::pin(async { Ok(Vec::new()) })
     }
     /// `task` as it is now (its state, at its `seq`) has been told: a later

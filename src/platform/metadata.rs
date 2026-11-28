@@ -38,6 +38,10 @@ pub(crate) const GATEWAY_API_MAJOR: u64 = 1;
 /// A feature whose availability depends on the terminal on the other side does
 /// not belong in this list -- see [`AGENT_COLLABORATION_CAPABILITY`].
 pub(crate) const API_CAPABILITIES: &[&str] = &[
+    crate::orchestration::CAPABILITY,
+    crate::orchestration::POOL_CAPABILITY,
+    crate::orchestration::ROUTER_CAPABILITY,
+    crate::orchestration::MODEL_LED_CAPABILITY,
     "agent_catalog",
     // `visibility`/`picker` on discovery agents and
     // `PUT /api/agents/{kind}/visibility`.
@@ -53,6 +57,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "agent_events",
     "multi_agent",
     "agent_forms",
+    "agent_attention_v1",
     "agent_compaction_references_v1",
     "agent_lifecycle_notifications",
     // Pushes about a native agent session carry `asid` and `agent_id` (never
@@ -63,6 +68,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "native_agent_push",
     "agent_mcp",
     crate::mcp::files::CAPABILITY,
+    crate::mcp::hub::CAPABILITY,
     "agent_models",
     "agent_permissions",
     "agent_sessions",
@@ -87,6 +93,7 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     "home_overview_sections_v1",
     "agent_history_ws_v1",
     "agent_history_window_v1",
+    "agent_history_window_options_v1",
     "agent_computer_context_v1",
     "agent_discovery",
     "agent_spawn",
@@ -97,6 +104,11 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // `vcs/files`, `vcs/file` and `vcs/discard` on an agent session: git in
     // the session's directory, for every agent.
     "agent_vcs_files",
+    // Developer Git Workbench operations (`vcs/overview`, `stage`, `unstage`,
+    // `checkout`, `commit`, `sync`, `commits`) on an agent session.
+    "vcs_git_ops_v1",
+    // Paginated pull requests (`vcs/prs`) and PR checkout on an agent session.
+    "vcs_prs_v1",
     "assets",
     "agent_audio_assets",
     "agent_file_assets",
@@ -215,6 +227,10 @@ pub(crate) const API_CAPABILITIES: &[&str] = &[
     // and tasks another computer opened (`origin: "peer"`,
     // `requested_by.kind == "gateway"`).
     "fleet_peers",
+    // `GET /api/pty/ws`: interactive remote PTY WebSocket for paired
+    // Desktop/App devices (Unix hosts only).
+    #[cfg(unix)]
+    "remote_pty_v1",
 ];
 
 /// Handing a task to an agent the app did not start, and following it home.

@@ -65,6 +65,42 @@ pub(crate) fn choose_runner(lookup: impl Fn(&str) -> Option<PathBuf>) -> Option<
         .or_else(|| lookup("npx").map(Runner::Npx))
 }
 
+/// Reuse a previously downloaded `@agentclientprotocol/claude-agent-acp`
+/// executable from npm's `_npx` cache when `claude-agent-acp` is not on PATH,
+/// avoiding a 1.5–2.5s `npm exec` wrapper process on every Claude session open.
+fn find_cached_npx_adapter() -> Option<PathBuf> {
+    let cache = std::env::var_os("NPM_CONFIG_CACHE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".npm")))?;
+    find_cached_npx_adapter_in(&cache)
+}
+
+fn find_cached_npx_adapter_in(cache_dir: &std::path::Path) -> Option<PathBuf> {
+    let npx_dir = cache_dir.join("_npx");
+    let entries = std::fs::read_dir(npx_dir).ok()?;
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let root = entry.path();
+        let pkg = root
+            .join("node_modules")
+            .join("@agentclientprotocol")
+            .join("claude-agent-acp")
+            .join("package.json");
+        let bin = root.join("node_modules").join(".bin").join(ADAPTER);
+        if !pkg.is_file() || !super::is_executable(&bin) {
+            continue;
+        }
+        let mtime = std::fs::metadata(&pkg)
+            .and_then(|meta| meta.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(prev, _)| mtime > *prev) {
+            best = Some((mtime, bin));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
 /// The runner and `claude` once every prerequisite is present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Prerequisites {
@@ -181,7 +217,17 @@ impl ClaudeConfig {
             Some(node) => super::binary_version(node).await,
             None => None,
         };
-        self.prerequisites(crate::agents::tasks::find_on_path, version.as_deref())
+        let use_npx_cache = self.acp_package.is_none();
+        self.prerequisites(
+            |name| {
+                crate::agents::tasks::find_on_path(name).or_else(|| {
+                    (name == ADAPTER && use_npx_cache)
+                        .then(find_cached_npx_adapter)
+                        .flatten()
+                })
+            },
+            version.as_deref(),
+        )
     }
 
     /// The program and launch for the adapter; never written anywhere.
@@ -377,29 +423,7 @@ impl AgentRuntime {
     /// token could not be minted. Earlier such tokens belonged to children of
     /// a previous Gateway run and are revoked.
     async fn claude_mcp_servers(&self) -> Option<serde_json::Value> {
-        let wiring = self.mcp.get()?;
-        match super::issue_agent_env_for(
-            wiring.tokens.as_ref(),
-            &wiring.url,
-            "claude",
-            "claude (native sessions)",
-        )
-        .await
-        {
-            Ok((env, previous)) => {
-                super::settle_agent_tokens(wiring.tokens.as_ref(), &env, &previous, true).await;
-                Some(serde_json::json!([{
-                    "type": "http",
-                    "name": crate::mcp::hosts::SERVER_NAME,
-                    "url": env.url,
-                    "headers": [{ "name": "Authorization", "value": format!("Bearer {}", env.token) }],
-                }]))
-            }
-            Err(error) => {
-                tracing::warn!("could not mint Claude Code's MCP token: {error}");
-                None
-            }
-        }
+        self.acp_muqun_mcp_servers("claude", "Claude Code").await
     }
 }
 
@@ -715,6 +739,37 @@ mod tests {
             "CLAUDE_CODE_EXECUTABLE".into(),
             "/synthetic/bin/claude".into()
         )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_npx_adapter_prefers_newest_executable_matching_package() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root =
+            std::env::temp_dir().join(format!("muqun-claude-npx-cache-{}", uuid::Uuid::new_v4()));
+        let make_entry = |hash: &str, with_pkg: bool, executable: bool| {
+            let base = root.join("_npx").join(hash).join("node_modules");
+            if with_pkg {
+                let pkg_dir = base.join("@agentclientprotocol").join("claude-agent-acp");
+                std::fs::create_dir_all(&pkg_dir).unwrap();
+                std::fs::write(pkg_dir.join("package.json"), "{}").unwrap();
+            }
+            let bin_dir = base.join(".bin");
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            let bin = bin_dir.join(ADAPTER);
+            std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+            let mode = if executable { 0o755 } else { 0o644 };
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(mode)).unwrap();
+            bin
+        };
+
+        let _missing_pkg = make_entry("no-pkg", false, true);
+        let _not_exec = make_entry("not-exec", true, false);
+        let valid = make_entry("valid-entry", true, true);
+
+        assert_eq!(find_cached_npx_adapter_in(&root), Some(valid));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

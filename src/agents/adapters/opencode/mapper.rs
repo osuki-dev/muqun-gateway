@@ -88,6 +88,41 @@ fn map_tokens(val: &Value) -> TokensUsage {
     }
 }
 
+/// Project OpenCode's `GET /api/session/{id}/context` message list into the
+/// neutral `SessionContextUsage` carried on `AgentSessionInfo`.
+pub fn map_context_usage(
+    messages: &[Value],
+    session_limit: Option<&Value>,
+) -> Option<crate::agents::domain::SessionContextUsage> {
+    let raw_tokens = messages
+        .iter()
+        .rev()
+        .find_map(|m| m.get("tokens").filter(|t| !t.is_null()))?;
+    let tokens = map_tokens(raw_tokens);
+    let total_tokens = tokens
+        .input
+        .saturating_add(tokens.output)
+        .saturating_add(tokens.reasoning.unwrap_or(0))
+        .saturating_add(tokens.cache_read.unwrap_or(0))
+        .saturating_add(tokens.cache_write.unwrap_or(0));
+    if total_tokens == 0 {
+        return None;
+    }
+    let mut limit_obj = session_limit
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if !messages.is_empty() {
+        limit_obj.insert("messages".to_string(), serde_json::json!(messages.len()));
+    }
+    let limit = (!limit_obj.is_empty()).then_some(Value::Object(limit_obj));
+    Some(crate::agents::domain::SessionContextUsage {
+        tokens: Some(tokens),
+        total_tokens,
+        limit,
+    })
+}
+
 /// `Session.Revert {messageID, partID?, snapshot?, files?}`, as it appears on
 /// `Session.Info.revert`, on a `POST …/revert/stage` reply and inside a
 /// `session.revert.staged` event -- one shape in all three places.
@@ -430,6 +465,7 @@ fn map_message_with_budget(
                 attachments: $attachments,
                 image_assets: attachment_assets.take(),
                 generation: None,
+                origin: None,
             })
         };
     }
@@ -741,13 +777,18 @@ fn normalize_tool_output(output: Option<Value>) -> Option<Value> {
 pub fn tool_title(name: &str, input: &Value) -> Option<String> {
     let s = |key: &str| input.get(key).and_then(Value::as_str);
     let title = match name {
-        "read" | "write" | "edit" | "patch" => s("path").map(|p| {
-            std::path::Path::new(p)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(p)
-                .to_string()
-        })?,
+        "read" | "read_file" | "view_file" | "write" | "edit" | "patch" => {
+            crate::agents::message_images::tool_media::INPUT_PATH_KEYS
+                .iter()
+                .find_map(|key| s(key))
+                .map(|p| {
+                    std::path::Path::new(p)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(p)
+                        .to_string()
+                })?
+        }
         "shell" | "bash" => s("command")?.lines().next().unwrap_or("").to_string(),
         "glob" => s("pattern")?.to_string(),
         "grep" | "search" => s("pattern").or_else(|| s("query"))?.to_string(),
@@ -872,6 +913,7 @@ pub fn map_tool_call(val: &Value) -> ToolCall {
         time,
     };
     apply_tool_metadata(&mut call);
+    crate::agents::message_images::tool_media::normalize_tool_call(&mut call);
     call
 }
 
@@ -1598,6 +1640,32 @@ mod tests {
         // ... and never an older message's, when the newest did not fail.
         let newer = json!({ "id": "msg_3", "type": "assistant", "content": [] });
         assert_eq!(last_failure(&[failed, newer]), None);
+    }
+
+    #[test]
+    fn test_map_context_usage_extracts_last_tokens_and_message_count() {
+        let messages = vec![
+            json!({ "id": "m1", "type": "user", "text": "hello" }),
+            json!({
+                "id": "m2",
+                "type": "assistant",
+                "tokens": { "input": 1000, "output": 200, "reasoning": 50, "cache": { "read": 5000, "write": 100 } }
+            }),
+        ];
+        let session_limit = json!({ "context": 200_000 });
+        let usage = map_context_usage(&messages, Some(&session_limit)).expect("context usage");
+        assert_eq!(usage.total_tokens, 6350);
+        let tokens = usage.tokens.expect("tokens");
+        assert_eq!(tokens.input, 1000);
+        assert_eq!(tokens.output, 200);
+        assert_eq!(tokens.reasoning, Some(50));
+        assert_eq!(tokens.cache_read, Some(5000));
+        assert_eq!(tokens.cache_write, Some(100));
+        assert_eq!(
+            usage.limit,
+            Some(json!({ "context": 200_000, "messages": 2 }))
+        );
+        assert!(map_context_usage(&[json!({ "id": "m1", "type": "user" })], None).is_none());
     }
 
     #[test]

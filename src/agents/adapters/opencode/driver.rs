@@ -168,6 +168,12 @@ pub struct OpencodeDriver {
     catalog_cache: Mutex<HashMap<String, CachedCatalog>>,
     /// Where `load_earlier_timeline` stands per session.
     earlier: Mutex<HashMap<String, EarlierCursor>>,
+    /// Remembered session directories so `get_vcs_diff` avoids an extra
+    /// `GET /api/session/{id}` roundtrip when the session was already loaded.
+    session_dirs: Mutex<HashMap<String, String>>,
+    /// Latest context usage observed from `get_timeline` messages so opening a
+    /// session populates `info.context_usage` without an extra `/context` read.
+    context_usage: Mutex<HashMap<String, crate::agents::domain::SessionContextUsage>>,
 }
 
 /// The newest messages of a session delivered so far. OpenCode's message
@@ -201,7 +207,35 @@ impl OpencodeDriver {
             primed: Mutex::new(HashSet::new()),
             catalog_cache: Mutex::new(HashMap::new()),
             earlier: Mutex::new(HashMap::new()),
+            session_dirs: Mutex::new(HashMap::new()),
+            context_usage: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn remember_context_usage(
+        &self,
+        session_id: &str,
+        usage: Option<crate::agents::domain::SessionContextUsage>,
+    ) {
+        let Some(usage) = usage else {
+            return;
+        };
+        let mut map = self.context_usage.lock().unwrap_or_else(|p| p.into_inner());
+        if map.len() >= 256 && !map.contains_key(session_id) {
+            map.clear();
+        }
+        map.insert(session_id.to_string(), usage);
+    }
+
+    fn remember_session_dir(&self, session_id: &str, directory: Option<&str>) {
+        let Some(dir) = directory.filter(|d| !d.is_empty()) else {
+            return;
+        };
+        let mut dirs = self.session_dirs.lock().unwrap_or_else(|p| p.into_inner());
+        if dirs.len() > 2048 && !dirs.contains_key(session_id) {
+            dirs.clear();
+        }
+        dirs.insert(session_id.to_owned(), dir.to_owned());
     }
 
     /// Remember the newest `messages` as delivered for `session_id`. A
@@ -385,12 +419,14 @@ impl OpencodeDriver {
         F: Fn(Option<&'a str>) -> Fut,
         Fut: std::future::Future<Output = Vec<Value>>,
     {
-        let floor = self.once_present(&fetch, None).await;
         if directory.is_none() {
-            return floor;
+            return self.once_present(&fetch, None).await;
         }
 
-        let mut scoped = self.once_present(&fetch, directory).await;
+        let (floor, mut scoped) = tokio::join!(
+            self.once_present(&fetch, None),
+            self.once_present(&fetch, directory),
+        );
         for wait in AGENT_SETTLE_BACKOFF {
             if missing_ids(&scoped, &floor).is_empty() {
                 return scoped;
@@ -513,10 +549,7 @@ impl AgentPort for OpencodeDriver {
     }
 
     fn probe(&self) -> AgentFuture<'_, bool> {
-        Box::pin(async move {
-            let req_client = reqwest::Client::new();
-            Ok(self.client.endpoint.probe_healthy(&req_client).await)
-        })
+        Box::pin(async move { Ok(self.client.endpoint.probe_healthy(self.client.http()).await) })
     }
 
     fn list_projects(&self) -> AgentFuture<'_, Vec<AgentProject>> {
@@ -546,6 +579,13 @@ impl AgentPort for OpencodeDriver {
         query: &'a SessionQuery,
     ) -> AgentFuture<'a, Vec<AgentSessionInfo>> {
         Box::pin(async move {
+            // OpenCode v2 validates `parentID` as an OpenCode session id (`ses_...`)
+            // and answers HTTP 400 for foreign agent ids (UUIDs from Codex/Claude/etc.).
+            if let Some(parent) = query.parent_id.as_deref() {
+                if parent != "null" && !parent.starts_with("ses_") {
+                    return Ok(Vec::new());
+                }
+            }
             let filter = SessionListFilter {
                 parent_id: query.parent_id.as_deref(),
                 limit: query.limit,
@@ -557,12 +597,27 @@ impl AgentPort for OpencodeDriver {
                 .client
                 .list_sessions(query.directory.as_deref(), &filter)
                 .await?;
-            map_session_list(&raw_sessions)
+            let sessions = map_session_list(&raw_sessions)?;
+            for info in &sessions {
+                self.remember_session_dir(&info.asid.0, info.directory.as_deref());
+            }
+            Ok(sessions)
         })
     }
 
     fn list_sessions_page<'a>(&'a self, query: &'a SessionQuery) -> AgentFuture<'a, SessionPage> {
         Box::pin(async move {
+            if let Some(parent) = query.parent_id.as_deref() {
+                if parent != "null" && !parent.starts_with("ses_") {
+                    return Ok(SessionPage {
+                        data: Vec::new(),
+                        cursor: crate::agents::domain::SessionCursor {
+                            next: None,
+                            previous: None,
+                        },
+                    });
+                }
+            }
             let filter = SessionListFilter {
                 parent_id: query.parent_id.as_deref(),
                 limit: query.limit,
@@ -612,6 +667,15 @@ impl AgentPort for OpencodeDriver {
                     info.error = mapper::last_failure(&messages);
                 }
             }
+            if info.context_usage.is_none() {
+                if let Some(mut observed) = self.observed_context_usage(&info.asid.0) {
+                    if observed.limit.is_none() {
+                        observed.limit = info.limit.clone();
+                    }
+                    info.context_usage = Some(observed);
+                }
+            }
+            self.remember_session_dir(&info.asid.0, info.directory.as_deref());
             Ok(info)
         })
     }
@@ -624,16 +688,42 @@ impl AgentPort for OpencodeDriver {
         delivery: Option<&'a str>,
     ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
+            self.send_prompt_with_receipt(session_id, text, text, attachments, delivery)
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn send_prompt_with_receipt<'a>(
+        &'a self,
+        session_id: &'a str,
+        text: &'a str,
+        _display_text: &'a str,
+        attachments: &'a [String],
+        delivery: Option<&'a str>,
+    ) -> AgentFuture<'a, Option<String>> {
+        Box::pin(async move {
             // An attachment is a path into the gateway's upload directory,
             // which sits outside the session's own -- so the allowance goes on
             // before the prompt that will make the agent open it, never after.
             if !attachments.is_empty() {
                 self.prime_uploads_permission(session_id).await;
             }
-            self.client
+            let response = self
+                .client
                 .send_prompt(session_id, text, attachments, delivery)
                 .await?;
-            Ok(())
+            // OpenCode 2 responds with Session.Inbox.User. Older versions
+            // may acknowledge with no body. Both are successful submissions.
+            Ok(response
+                .get("data")
+                .filter(|receipt| {
+                    receipt.get("sessionID").and_then(Value::as_str) == Some(session_id)
+                        && receipt.get("type").and_then(Value::as_str) == Some("user")
+                })
+                .and_then(|receipt| receipt.get("id")?.as_str())
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned))
         })
     }
 
@@ -886,12 +976,25 @@ impl AgentPort for OpencodeDriver {
         Box::pin(async move {
             // The diff is scoped to the session's own directory; a global diff
             // is not what the caller asked for.
-            let directory = match self.client.get_session(session_id).await {
-                Ok(raw) => mapper::map_session(&raw).and_then(|s| s.directory),
-                Err(err) => {
-                    tracing::debug!(session_id, %err, "vcs diff: session lookup failed, using server cwd");
-                    None
-                }
+            let cached_dir = self
+                .session_dirs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(session_id)
+                .cloned();
+            let directory = match cached_dir {
+                Some(dir) => Some(dir),
+                None => match self.client.get_session(session_id).await {
+                    Ok(raw) => {
+                        let dir = mapper::map_session(&raw).and_then(|s| s.directory);
+                        self.remember_session_dir(session_id, dir.as_deref());
+                        dir
+                    }
+                    Err(err) => {
+                        tracing::debug!(session_id, %err, "vcs diff: session lookup failed, using server cwd");
+                        None
+                    }
+                },
             };
             let raw_diff = self
                 .client
@@ -959,6 +1062,17 @@ impl AgentPort for OpencodeDriver {
         })
     }
 
+    fn observed_context_usage(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::agents::domain::SessionContextUsage> {
+        self.context_usage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session_id)
+            .cloned()
+    }
+
     fn get_timeline<'a>(
         &'a self,
         session_id: &'a str,
@@ -966,6 +1080,7 @@ impl AgentPort for OpencodeDriver {
     ) -> AgentFuture<'a, Vec<crate::agents::domain::TimelineItem>> {
         Box::pin(async move {
             let messages = self.client.get_messages(session_id, limit).await?;
+            self.remember_context_usage(session_id, mapper::map_context_usage(&messages, None));
             self.hold_newest(session_id, &messages, limit);
             let asid = crate::agents::domain::AgentSessionId(session_id.to_string());
             Ok(mapper::map_messages_to_timeline(&messages, &asid))

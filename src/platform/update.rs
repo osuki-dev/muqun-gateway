@@ -11,7 +11,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::lifecycle::{Action, Controller};
 
-const REPO: &str = "osuki-dev/muqun-gateway";
+const RELEASE_API: &str = "https://muqun.dev/api/releases/gateway";
 const TARGETS: [&str; 4] = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -22,7 +22,7 @@ const MAX_BINARY: u64 = 256 * 1024 * 1024;
 const BACKUP: &str = ".muqun-gateway.update-backup";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Version([u64; 3], Stability);
+pub struct Version([u64; 3], Stability);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Stability {
@@ -38,7 +38,11 @@ pub(crate) enum Channel {
 }
 
 impl Version {
-    fn parse(value: &str) -> Result<Self> {
+    pub fn is_preview(self) -> bool {
+        matches!(self.1, Stability::Preview(_))
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
         let (base, stability) = match value.split_once("-preview.") {
             Some((base, number)) => {
                 anyhow::ensure!(
@@ -74,21 +78,34 @@ impl Version {
 }
 
 #[derive(Deserialize)]
-#[cfg_attr(test, derive(serde::Serialize))]
-struct Release {
-    tag_name: String,
-    draft: bool,
-    prerelease: bool,
+struct ChannelPointer {
+    channel: String,
+    version: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Manifest {
+    channel: String,
+    version: String,
+    tag: String,
     assets: Vec<Asset>,
 }
 
 #[derive(Clone, Deserialize)]
-#[cfg_attr(test, derive(serde::Serialize))]
 struct Asset {
     name: String,
-    browser_download_url: String,
+    platform: String,
     size: u64,
-    state: String,
+    sha256: String,
+}
+
+impl Channel {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Preview => "preview",
+        }
+    }
 }
 
 pub(crate) struct Plan {
@@ -128,110 +145,63 @@ fn target() -> Result<&'static str> {
     }
 }
 
-fn release_url(tag: &str, name: &str) -> String {
-    format!("https://github.com/{REPO}/releases/download/{tag}/{name}")
-}
-
-fn plan(release: Release, current: &str, target: &str) -> Result<Plan> {
-    plan_channel(release, current, target, Channel::Stable)
-}
-
-fn plan_channel(release: Release, current: &str, target: &str, channel: Channel) -> Result<Plan> {
-    let installed = Version::parse(current)?;
+fn plan_manifest(
+    manifest: Manifest,
+    pointer_version: &str,
+    channel: Channel,
+    current: &str,
+    target: &str,
+) -> Result<Plan> {
+    let tag = format!("v{pointer_version}");
     anyhow::ensure!(
-        !release.draft && release.prerelease == (channel == Channel::Preview),
-        "release does not match the requested channel; no update attempted"
+        manifest.version == pointer_version
+            && manifest.tag == tag
+            && manifest.channel == channel.name(),
+        "release manifest does not match the channel pointer"
     );
-    let latest = Version::parse(
-        release
-            .tag_name
-            .strip_prefix('v')
-            .context("release tag must be vX.Y.Z")?,
-    )?;
     anyhow::ensure!(
-        matches!(
-            (channel, latest.1),
-            (Channel::Stable, Stability::Stable) | (Channel::Preview, Stability::Preview(_))
-        ),
-        "release version does not match the requested channel"
+        manifest.assets.len() == TARGETS.len() * 2,
+        "incomplete release manifest"
     );
     let mut result = Plan {
         current: current.into(),
-        tag: release.tag_name,
+        tag,
         binary: None,
         checksum: None,
     };
-    if latest <= installed && channel == Channel::Stable {
-        return Ok(result);
-    }
-    anyhow::ensure!(TARGETS.contains(&target), "unsupported release target");
-    // Matrix uploads can finish at different times. Require the entire release,
-    // not just whichever asset happened to be present when this host checked.
     for platform in TARGETS {
-        let name = format!("muqun-gateway-{platform}");
-        for (name, max) in [(name.clone(), MAX_BINARY), (format!("{name}.sha256"), 1024)] {
-            let assets: Vec<_> = release
+        let binary_name = format!("muqun-gateway-{platform}");
+        for (name, limit) in [
+            (binary_name.clone(), MAX_BINARY),
+            (format!("{binary_name}.sha256"), 1024),
+        ] {
+            let asset = manifest
                 .assets
                 .iter()
-                .filter(|asset| asset.name == name)
-                .collect();
-            anyhow::ensure!(assets.len() == 1,
-                "release {} is incomplete or has no SHA256 checksums; wait for a newer checksum-equipped complete release (no unsafe binary installed)", result.tag);
-            let asset = assets[0];
+                .find(|asset| asset.name == name)
+                .context("release manifest is missing a required asset")?;
             anyhow::ensure!(
-                asset.state == "uploaded" && asset.size > 0 && asset.size <= max,
-                "release asset is incomplete or exceeds its size limit; no update attempted"
+                asset.platform == platform
+                    && asset.size > 0
+                    && asset.size <= limit
+                    && asset.sha256.len() == 64
+                    && asset
+                        .sha256
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                "invalid platform, size or SHA256 in release manifest"
             );
-            anyhow::ensure!(
-                asset.browser_download_url == release_url(&result.tag, &name),
-                "release asset is not at the official version-locked URL; no update attempted"
-            );
-            if platform == target {
-                if name.ends_with(".sha256") {
-                    result.checksum = Some(asset.clone());
-                } else {
+            if target == platform {
+                if name == binary_name {
                     result.binary = Some(asset.clone());
+                } else {
+                    result.checksum = Some(asset.clone());
                 }
             }
         }
     }
-    if latest <= installed {
-        result.binary = None;
-        result.checksum = None;
-    }
+    anyhow::ensure!(result.available(), "unsupported release target");
     Ok(result)
-}
-
-fn select_preview(releases: Vec<Release>, current: &str, target: &str) -> Result<Plan> {
-    let mut candidates: Vec<_> = releases
-        .into_iter()
-        .filter_map(|release| {
-            let version = Version::parse(release.tag_name.strip_prefix('v')?).ok()?;
-            let plan = plan_channel(release, current, target, Channel::Preview).ok()?;
-            Some((version, plan))
-        })
-        .collect();
-    candidates.sort_by_key(|(version, _)| *version);
-    candidates
-        .pop()
-        .map(|(_, plan)| plan)
-        .context("no complete official preview release found; nothing changed")
-}
-
-fn trusted_url(url: &reqwest::Url) -> bool {
-    url.scheme() == "https"
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.port_or_known_default() == Some(443)
-        && matches!(
-            url.host_str(),
-            Some(
-                "github.com"
-                    | "api.github.com"
-                    | "release-assets.githubusercontent.com"
-                    | "objects.githubusercontent.com"
-            )
-        )
 }
 
 fn client() -> Result<reqwest::Client> {
@@ -240,19 +210,12 @@ fn client() -> Result<reqwest::Client> {
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(300))
         .user_agent(concat!("muqun-gateway/", env!("CARGO_PKG_VERSION")))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 || !trusted_url(attempt.url()) {
-                attempt.error("update redirect refused")
-            } else {
-                attempt.follow()
-            }
-        }))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| anyhow::anyhow!("cannot initialize secure update HTTP client"))
 }
 
 async fn response(client: &reqwest::Client, url: &str, max: u64) -> Result<reqwest::Response> {
-    // Do not propagate reqwest's URL-bearing error: CDN queries are signed.
     let response = client.get(url).send().await.map_err(|_| {
         anyhow::anyhow!(
             "update request failed (network, TLS, redirect or timeout); no automatic retry"
@@ -299,65 +262,45 @@ pub(crate) async fn check_channel(channel: Channel) -> Result<Plan> {
     } else {
         env!("CARGO_PKG_VERSION").into()
     };
-    if channel == Channel::Preview {
-        return check_preview(&client()?, &current).await;
+    check_at(&client()?, RELEASE_API, &current, channel).await
+}
+
+async fn check_at(
+    client: &reqwest::Client,
+    base: &str,
+    current: &str,
+    channel: Channel,
+) -> Result<Plan> {
+    let url = format!("{base}/{}", channel.name());
+    let pointer: ChannelPointer =
+        serde_json::from_slice(&bounded_body(response(client, &url, 4096).await?, 4096).await?)
+            .context("invalid Gateway release channel pointer")?;
+    anyhow::ensure!(
+        pointer.channel == channel.name(),
+        "incorrect release channel"
+    );
+    let version = pointer
+        .version
+        .context("no published Gateway release on this channel")?;
+    let latest = Version::parse(&version)?;
+    anyhow::ensure!(
+        latest.is_preview() == (channel == Channel::Preview),
+        "release version does not match the requested channel"
+    );
+    if latest <= Version::parse(current)? {
+        return Ok(Plan {
+            current: current.into(),
+            tag: format!("v{version}"),
+            binary: None,
+            checksum: None,
+        });
     }
-    check_at(
-        &client()?,
-        &format!("https://api.github.com/repos/{REPO}/releases/latest"),
-        &current,
+    let url = format!("{base}/v{version}/manifest.json");
+    let manifest = serde_json::from_slice(
+        &bounded_body(response(client, &url, 64 * 1024).await?, 64 * 1024).await?,
     )
-    .await
-}
-
-async fn check_preview(client: &reqwest::Client, current: &str) -> Result<Plan> {
-    check_preview_at(
-        client,
-        &format!("https://api.github.com/repos/{REPO}/releases"),
-        current,
-    )
-    .await
-}
-
-/// Preview listing bounds. GitHub release bodies and asset lists are large (measured
-/// about 24 KiB per release, 69 KiB at most, in November 2026), so a 100-release page
-/// outgrew a 1 MiB cap. Small pages keep each body bounded; the cap leaves roughly
-/// 3x headroom over today's worst case of a full page (20 x 69 KiB) so growth in
-/// release notes does not break the check again. 50 pages x 20 = 1000 releases.
-const PREVIEW_PAGE_SIZE: usize = 20;
-const PREVIEW_MAX_PAGES: usize = 50;
-const PREVIEW_PAGE_BODY_LIMIT: u64 = 4 * 1024 * 1024;
-
-async fn check_preview_at(client: &reqwest::Client, endpoint: &str, current: &str) -> Result<Plan> {
-    let mut releases = Vec::new();
-    // Exhaust a bounded listing: never trust ordering or use a partial search.
-    for page in 1..=PREVIEW_MAX_PAGES {
-        let url = format!("{endpoint}?per_page={PREVIEW_PAGE_SIZE}&page={page}");
-        let body = bounded_body(
-            response(client, &url, PREVIEW_PAGE_BODY_LIMIT).await?,
-            PREVIEW_PAGE_BODY_LIMIT,
-        )
-        .await?;
-        let batch: Vec<Release> =
-            serde_json::from_slice(&body).context("invalid preview release metadata")?;
-        anyhow::ensure!(
-            batch.len() <= PREVIEW_PAGE_SIZE,
-            "unexpected preview page size"
-        );
-        let complete = batch.len() < PREVIEW_PAGE_SIZE;
-        releases.extend(batch);
-        if complete {
-            return select_preview(releases, current, target()?);
-        }
-    }
-    anyhow::bail!("preview listing exceeds the 1000-release search bound; nothing changed")
-}
-
-async fn check_at(client: &reqwest::Client, url: &str, current: &str) -> Result<Plan> {
-    let body = bounded_body(response(client, url, 1024 * 1024).await?, 1024 * 1024).await?;
-    let release: Release = serde_json::from_slice(&body)
-        .map_err(|_| anyhow::anyhow!("invalid release metadata; no update attempted"))?;
-    plan(release, current, target()?)
+    .context("invalid Gateway release manifest")?;
+    plan_manifest(manifest, &version, channel, current, target()?)
 }
 
 /// Run async update I/O from the synchronous raw-mode manager without nesting a
@@ -483,11 +426,12 @@ fn checksum(body: &[u8], name: &str) -> Result<[u8; 32]> {
 
 async fn download(
     client: &reqwest::Client,
+    url: &str,
     asset: &Asset,
     hash: [u8; 32],
     file: &mut File,
 ) -> Result<()> {
-    let mut response = response(client, &asset.browser_download_url, MAX_BINARY).await?;
+    let mut response = response(client, url, MAX_BINARY).await?;
     let mut size = 0_u64;
     let mut digest = Sha256::new();
     while let Some(chunk) = response
@@ -629,7 +573,7 @@ pub(crate) async fn bootstrap_preview() -> Result<String> {
         "bootstrap must run from a verified preview release image"
     );
     let current = executable_version(&exe).await?;
-    let plan = check_preview(&client()?, &current).await?;
+    let plan = check_at(&client()?, RELEASE_API, &current, Channel::Preview).await?;
     validate_bootstrap_plan(&plan, env!("CARGO_PKG_VERSION"))?;
     apply_install(plan, true).await
 }
@@ -679,6 +623,7 @@ async fn apply_install(plan: Plan, bootstrap: bool) -> Result<String> {
         .context("release has no SHA256 checksum; wait for a newer checksum-equipped release")?;
     let temporary = prepare(
         &client,
+        &format!("{RELEASE_API}/{}", plan.tag),
         &binary,
         &checksum_asset,
         &install_dir,
@@ -702,7 +647,7 @@ async fn apply_install(plan: Plan, bootstrap: bool) -> Result<String> {
             "installed binary changed during download; check again");
         ensure_running_executable(&exe)?;
         install(&exe, &temporary.0, &backup, controller.was_running, |action| controller.control(action))?;
-        Ok(format!("Updated to {}. {} Pairing/config and terminal tasks unchanged. Reopen manage to load the new UI.", plan.tag,
+        Ok(format!("Updated to {}. SHA-256 verified: {}. {} Pairing/config and terminal tasks unchanged. Reopen manage to load the new UI.", plan.tag, binary.sha256,
             if controller.was_running { "Gateway restarted through its previous owner." } else { "Gateway remains stopped." }))
     }).await.context("update transaction worker failed")?
 }
@@ -710,6 +655,7 @@ async fn apply_install(plan: Plan, bootstrap: bool) -> Result<String> {
 #[cfg(unix)]
 async fn prepare(
     client: &reqwest::Client,
+    release_base: &str,
     binary: &Asset,
     checksum_asset: &Asset,
     parent: &Path,
@@ -718,7 +664,12 @@ async fn prepare(
 ) -> Result<Temporary> {
     use std::os::unix::fs::PermissionsExt as _;
     let body = bounded_body(
-        response(client, &checksum_asset.browser_download_url, 1024).await?,
+        response(
+            client,
+            &format!("{release_base}/{}", checksum_asset.name),
+            1024,
+        )
+        .await?,
         1024,
     )
     .await?;
@@ -726,11 +677,27 @@ async fn prepare(
         body.len() as u64 == checksum_asset.size,
         "checksum size differs from release metadata"
     );
+    anyhow::ensure!(
+        hex::encode(Sha256::digest(&body)) == checksum_asset.sha256,
+        "checksum file differs from manifest SHA256"
+    );
     let hash = checksum(&body, &binary.name)?;
+    anyhow::ensure!(
+        hex::encode(hash) == binary.sha256,
+        "companion SHA256 differs from manifest"
+    );
+
     let temporary =
         Temporary(parent.join(format!(".muqun-gateway.update-{}", uuid::Uuid::new_v4())));
     let mut file = private_file(&temporary.0)?;
-    download(client, binary, hash, &mut file).await?;
+    download(
+        client,
+        &format!("{release_base}/{}", binary.name),
+        binary,
+        hash,
+        &mut file,
+    )
+    .await?;
     drop(file); // A writable descriptor prevents executing the image on Linux.
     verify_platform(&temporary.0)?;
     fs::set_permissions(&temporary.0, fs::Permissions::from_mode(mode))?;
@@ -873,40 +840,49 @@ mod tests {
         }
     }
 
-    fn complete_release(tag: &str) -> Release {
-        Release {
-            tag_name: tag.into(),
-            draft: false,
-            prerelease: false,
-            assets: TARGETS
+    fn manifest(version: &str, channel: Channel) -> serde_json::Value {
+        let assets: Vec<_> =
+            TARGETS
                 .into_iter()
-                .flat_map(|target| {
-                    let name = format!("muqun-gateway-{target}");
-                    [name.clone(), format!("{name}.sha256")].map(|name| Asset {
-                        browser_download_url: release_url(tag, &name),
-                        name,
-                        size: 100,
-                        state: "uploaded".into(),
-                    })
+                .flat_map(|platform| {
+                    let name = format!("muqun-gateway-{platform}");
+                    [name.clone(), format!("{name}.sha256")].map(|name| serde_json::json!({
+                "platform": platform, "name": name, "sha256": "0".repeat(64), "size": 100
+            }))
                 })
-                .collect(),
-        }
+                .collect();
+        serde_json::json!({"channel": channel.name(), "version": version, "tag": format!("v{version}"), "assets": assets})
     }
 
-    #[test]
-    fn bootstrap_plan_requires_matching_preview_and_forward_upgrade() {
-        let make = |installed| {
-            let mut release = complete_release("v0.14.1-preview.2");
-            release.prerelease = true;
-            plan_channel(release, installed, target().unwrap(), Channel::Preview).unwrap()
-        };
-        let plan = make("0.14.0");
-        assert!(validate_bootstrap_plan(&plan, "0.14.1-preview.2").is_ok());
+    #[tokio::test]
+    async fn bootstrap_plan_requires_matching_preview_and_forward_upgrade() {
+        let server = Server::new().await;
+        let version = "0.14.1-preview.2";
+        let channel = Channel::Preview;
+        server.set(
+            "/preview",
+            StatusCode::OK,
+            serde_json::to_vec(&serde_json::json!({"channel":"preview","version":version}))
+                .unwrap(),
+        );
+        server.set(
+            "/v0.14.1-preview.2/manifest.json",
+            StatusCode::OK,
+            serde_json::to_vec(&manifest(version, channel)).unwrap(),
+        );
+        let client = test_client();
+        let plan = check_at(&client, &server.url, "0.14.0", channel)
+            .await
+            .unwrap();
+        assert!(validate_bootstrap_plan(&plan, version).is_ok());
         for wrong in ["0.14.0", "0.14.1-preview.1", "0.14.1-preview.3"] {
             assert!(validate_bootstrap_plan(&plan, wrong).is_err());
         }
         for installed in ["0.14.1-preview.2", "0.14.1-preview.3", "0.14.1", "0.15.0"] {
-            assert!(validate_bootstrap_plan(&make(installed), "0.14.1-preview.2").is_err());
+            let plan = check_at(&client, &server.url, installed, channel)
+                .await
+                .unwrap();
+            assert!(validate_bootstrap_plan(&plan, version).is_err());
         }
     }
 
@@ -992,128 +968,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn preview_selection_orders_numbers_and_requires_complete_official_releases() {
-        let preview = |tag| {
-            let mut release = complete_release(tag);
-            release.prerelease = true;
-            release
-        };
-        let mut incomplete = preview("v0.15.0-preview.11");
-        incomplete.assets.pop();
-        let mut draft = preview("v0.15.0-preview.12");
-        draft.draft = true;
-        let mut foreign = preview("v0.15.0-preview.13");
-        foreign.assets[0].browser_download_url = "https://evil.test/payload".into();
-        let selected = select_preview(
-            vec![
-                preview("v0.15.0-preview.10"),
-                preview("v0.15.0-preview.9"),
-                incomplete,
-                draft,
-                foreign,
-                complete_release("v0.16.0"),
-            ],
-            "0.14.0",
-            target().unwrap(),
-        )
-        .unwrap();
-        assert_eq!(selected.tag, "v0.15.0-preview.10");
-        assert!(selected.available());
-        assert!(plan(preview("v0.15.0-preview.10"), "0.14.0", target().unwrap()).is_err());
-        assert!(select_preview(
-            vec![complete_release("v0.16.0")],
-            "0.14.0",
-            target().unwrap()
-        )
-        .is_err());
-        for installed in ["0.15.0-preview.10", "0.15.0-preview.11", "0.15.0"] {
-            assert!(!select_preview(
-                vec![preview("v0.15.0-preview.10")],
-                installed,
-                target().unwrap()
-            )
-            .unwrap()
-            .available());
-        }
-        assert!(plan(
-            complete_release("v0.15.0"),
-            "0.15.0-preview.10",
-            target().unwrap()
-        )
-        .unwrap()
-        .available());
-        assert!(!plan(
-            complete_release("v0.14.0"),
-            "0.15.0-preview.10",
-            target().unwrap()
-        )
-        .unwrap()
-        .available());
-        for bad in [
-            "1.2.3-preview.01",
-            "1.2.3-preview.-1",
-            "1.2.3-preview.",
-            "1.2.3-preview.18446744073709551616",
-            "1.2.3-preview.1+build",
-        ] {
-            assert!(Version::parse(bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn stable_semver_and_matrix_fail_closed() {
-        for bad in [
-            "1",
-            "1.2",
-            "1.2.3.4",
-            "01.2.3",
-            "1.02.3",
-            "1.2.3-beta",
-            "1.2.3+build",
-            "v1.2.3",
-            "1.2.-3",
-            "1.2.18446744073709551616",
-        ] {
-            assert!(Version::parse(bad).is_err(), "{bad}");
-        }
-        assert!(Version::parse("0.14.0").unwrap() > Version::parse("0.9.99").unwrap());
-        for installed in ["0.14.0", "0.15.0"] {
-            assert!(
-                !plan(complete_release("v0.14.0"), installed, target().unwrap())
-                    .unwrap()
-                    .available()
-            );
-        }
-        let good = plan(complete_release("v0.14.0"), "0.13.0", target().unwrap()).unwrap();
-        assert!(good.available());
-        for missing in 0..8 {
-            let mut release = complete_release("v0.14.0");
-            release.assets.remove(missing);
-            assert!(plan(release, "0.13.0", target().unwrap())
-                .unwrap_err_string()
-                .contains("checksum-equipped"));
-        }
-        let mut release = complete_release("v0.14.0");
-        release.assets.push(release.assets[0].clone());
-        assert!(plan(release, "0.13.0", target().unwrap()).is_err());
-        let mut release = complete_release("v0.14.0");
-        release.assets[0].browser_download_url = "https://evil.test/payload".into();
-        assert!(plan(release, "0.13.0", target().unwrap()).is_err());
-        let mut release = complete_release("v0.14.0");
-        release.assets[0].size = MAX_BINARY + 1;
-        assert!(plan(release, "0.13.0", target().unwrap()).is_err());
-        let mut release = complete_release("v0.14.0");
-        release.prerelease = true;
-        assert!(plan(release, "0.13.0", target().unwrap()).is_err());
-        assert!(plan(
-            complete_release("v0.14.0"),
-            "0.13.0-beta",
-            target().unwrap()
-        )
-        .is_err());
-    }
-
     trait ErrorString {
         fn unwrap_err_string(self) -> String;
     }
@@ -1127,22 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn redirects_and_checksum_formats_are_strict() {
-        for url in [
-            "http://github.com/a",
-            "https://evil.test/a",
-            "https://github.com.evil.test/a",
-            "https://github.com:444/a",
-            "https://user:secret@github.com/a",
-        ] {
-            assert!(!trusted_url(&reqwest::Url::parse(url).unwrap()));
-        }
-        for url in [
-            "https://github.com/a",
-            "https://release-assets.githubusercontent.com/a?signature=secret",
-        ] {
-            assert!(trusted_url(&reqwest::Url::parse(url).unwrap()));
-        }
+    fn checksum_formats_are_strict() {
         let hash = "0".repeat(64);
         assert_eq!(
             checksum(format!("{hash}  binary\n").as_bytes(), "binary").unwrap(),
@@ -1294,81 +1133,6 @@ mod tests {
     }
 
     type Replies = Arc<Mutex<HashMap<String, (StatusCode, Vec<u8>)>>>;
-    #[tokio::test]
-    async fn preview_metadata_requires_complete_bounded_pagination() {
-        let server = Server::new().await;
-        let full_page = serde_json::to_vec(&vec![
-            serde_json::json!({
-                "tag_name": "v0.14.0", "draft": false, "prerelease": false, "assets": []
-            });
-            20
-        ])
-        .unwrap();
-        server.set(
-            "/releases?per_page=20&page=1",
-            StatusCode::OK,
-            full_page.clone(),
-        );
-        let endpoint = format!("{}/releases", server.url);
-        assert!(check_preview_at(&test_client(), &endpoint, "0.14.0")
-            .await
-            .is_err());
-        let mut preview = complete_release("v0.15.0-preview.10");
-        preview.prerelease = true;
-        server.set(
-            "/releases?per_page=20&page=2",
-            StatusCode::OK,
-            serde_json::to_vec(&vec![preview]).unwrap(),
-        );
-        let plan = check_preview_at(&test_client(), &endpoint, "0.14.0")
-            .await
-            .unwrap();
-        assert_eq!(plan.tag, "v0.15.0-preview.10");
-        for page in 2..=50 {
-            server.set(
-                &format!("/releases?per_page=20&page={page}"),
-                StatusCode::OK,
-                full_page.clone(),
-            );
-        }
-        assert!(check_preview_at(&test_client(), &endpoint, "0.14.0")
-            .await
-            .unwrap_err_string()
-            .contains("search bound"));
-    }
-
-    #[tokio::test]
-    async fn preview_page_larger_than_old_cap_is_accepted_but_oversize_page_fails() {
-        let server = Server::new().await;
-        let endpoint = format!("{}/releases", server.url);
-        let page = |note_bytes: usize| {
-            // One short of a full page, so it is also the last page.
-            serde_json::to_vec(&vec![
-                serde_json::json!({
-                    "tag_name": "v0.14.0", "draft": false, "prerelease": false,
-                    "assets": [], "body": "x".repeat(note_bytes)
-                });
-                PREVIEW_PAGE_SIZE - 1
-            ])
-            .unwrap()
-        };
-        // Over the former 1 MiB cap, under the current one: the final short page ends the listing.
-        let big = page(100 * 1024);
-        assert!(big.len() > 1024 * 1024 && (big.len() as u64) < PREVIEW_PAGE_BODY_LIMIT);
-        server.set("/releases?per_page=20&page=1", StatusCode::OK, big);
-        assert!(check_preview_at(&test_client(), &endpoint, "0.14.0")
-            .await
-            .unwrap_err_string()
-            .contains("no complete official preview release"));
-        let huge = page(250 * 1024);
-        assert!(huge.len() as u64 > PREVIEW_PAGE_BODY_LIMIT);
-        server.set("/releases?per_page=20&page=1", StatusCode::OK, huge);
-        assert!(check_preview_at(&test_client(), &endpoint, "0.14.0")
-            .await
-            .unwrap_err_string()
-            .contains("size limit"));
-    }
-
     struct Server {
         url: String,
         replies: Replies,
@@ -1420,12 +1184,13 @@ mod tests {
         }
         fn asset(&self, path: &str, body: Vec<u8>) -> Asset {
             let size = body.len() as u64;
+            let sha256 = hex::encode(Sha256::digest(&body));
             self.set(path, StatusCode::OK, body);
             Asset {
                 name: path.trim_start_matches('/').into(),
-                browser_download_url: format!("{}{path}", self.url),
+                platform: target().unwrap().into(),
+                sha256,
                 size,
-                state: "uploaded".into(),
             }
         }
     }
@@ -1450,11 +1215,11 @@ mod tests {
     async fn check_without_update_fetches_only_metadata_and_never_restarts() {
         let server = Server::new().await;
         server.set(
-            "/latest",
+            "/stable",
             StatusCode::OK,
-            br#"{"tag_name":"v0.13.0","draft":false,"prerelease":false,"assets":[]}"#.to_vec(),
+            br#"{"channel":"stable","version":"0.13.0"}"#.to_vec(),
         );
-        let result = check_at(&test_client(), &format!("{}/latest", server.url), "0.13.0")
+        let result = check_at(&test_client(), &server.url, "0.13.0", Channel::Stable)
             .await
             .unwrap();
         assert!(!result.available());
@@ -1462,7 +1227,87 @@ mod tests {
             .await
             .unwrap()
             .contains("No download or restart"));
-        assert_eq!(*server.requests.lock().unwrap(), ["/latest"]);
+        assert_eq!(*server.requests.lock().unwrap(), ["/stable"]);
+    }
+
+    #[tokio::test]
+    async fn both_channels_pin_the_exact_manifest_and_reject_crossed_or_incomplete_assets() {
+        let server = Server::new().await;
+        for (channel, version) in [
+            (Channel::Stable, "0.14.0"),
+            (Channel::Preview, "0.14.1-preview.2"),
+        ] {
+            let pointer = format!("/{}", channel.name());
+            let path = format!("/v{version}/manifest.json");
+            server.set(
+                &pointer,
+                StatusCode::OK,
+                serde_json::to_vec(
+                    &serde_json::json!({"channel":channel.name(),"version":version}),
+                )
+                .unwrap(),
+            );
+            let mut data = manifest(version, channel);
+            server.set(&path, StatusCode::OK, serde_json::to_vec(&data).unwrap());
+            let plan = check_at(&test_client(), &server.url, "0.13.0", channel)
+                .await
+                .unwrap();
+            assert_eq!(plan.tag, format!("v{version}"));
+            assert_eq!(
+                plan.binary.unwrap().name,
+                format!("muqun-gateway-{}", target().unwrap())
+            );
+            data["assets"].as_array_mut().unwrap().pop();
+            server.set(&path, StatusCode::OK, serde_json::to_vec(&data).unwrap());
+            assert!(check_at(&test_client(), &server.url, "0.13.0", channel)
+                .await
+                .is_err());
+            let other = if channel == Channel::Stable {
+                Channel::Preview
+            } else {
+                Channel::Stable
+            };
+            server.set(
+                &format!("/{}", other.name()),
+                StatusCode::OK,
+                serde_json::to_vec(&serde_json::json!({"channel":other.name(),"version":version}))
+                    .unwrap(),
+            );
+            assert!(check_at(&test_client(), &server.url, "0.13.0", other)
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_versions_never_become_download_paths() {
+        let server = Server::new().await;
+        for version in [
+            "../preview",
+            "v1.2.3",
+            "01.2.3",
+            "1.2.3-preview.01",
+            "1.2.3+local",
+            "18446744073709551616.0.0",
+        ] {
+            server.set(
+                "/preview",
+                StatusCode::OK,
+                serde_json::to_vec(&serde_json::json!({"channel":"preview","version":version}))
+                    .unwrap(),
+            );
+            assert!(
+                check_at(&test_client(), &server.url, "0.13.0", Channel::Preview)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|path| path == "/preview"));
     }
 
     #[tokio::test]
@@ -1472,23 +1317,41 @@ mod tests {
         let client = test_client();
         let asset = server.asset("/binary", b"payload".to_vec());
         let mut file = private_file(&fixture.0.join("download")).unwrap();
-        assert!(download(&client, &asset, [0; 32], &mut file)
-            .await
-            .unwrap_err_string()
-            .contains("SHA256 mismatch"));
+        assert!(download(
+            &client,
+            &format!("{}/binary", server.url),
+            &asset,
+            [0; 32],
+            &mut file
+        )
+        .await
+        .unwrap_err_string()
+        .contains("SHA256 mismatch"));
         let mut truncated = asset.clone();
         truncated.size += 1;
-        assert!(download(&client, &truncated, [0; 32], &mut file)
-            .await
-            .unwrap_err_string()
-            .contains("truncated"));
+        assert!(download(
+            &client,
+            &format!("{}/binary", server.url),
+            &truncated,
+            [0; 32],
+            &mut file
+        )
+        .await
+        .unwrap_err_string()
+        .contains("truncated"));
         let mut too_small = asset.clone();
         too_small.size -= 1;
-        assert!(download(&client, &too_small, [0; 32], &mut file)
-            .await
-            .unwrap_err_string()
-            .contains("declared size"));
-        assert!(response(&client, &asset.browser_download_url, 1)
+        assert!(download(
+            &client,
+            &format!("{}/binary", server.url),
+            &too_small,
+            [0; 32],
+            &mut file
+        )
+        .await
+        .unwrap_err_string()
+        .contains("declared size"));
+        assert!(response(&client, &format!("{}/binary", server.url), 1)
             .await
             .unwrap_err_string()
             .contains("size limit"));
@@ -1497,9 +1360,15 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             b"secret backend body".to_vec(),
         );
-        let error = download(&client, &asset, [0; 32], &mut file)
-            .await
-            .unwrap_err_string();
+        let error = download(
+            &client,
+            &format!("{}/binary", server.url),
+            &asset,
+            [0; 32],
+            &mut file,
+        )
+        .await
+        .unwrap_err_string();
         assert!(error.contains("503"));
         assert!(!error.contains("secret"));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1536,8 +1405,29 @@ mod tests {
             .collect();
         let checksum_asset =
             server.asset("/binary.sha256", format!("{digest}  binary\n").into_bytes());
+        let mut tampered = binary.clone();
+        tampered.sha256 = "0".repeat(64);
+        assert!(prepare(
+            &client,
+            &server.url,
+            &tampered,
+            &checksum_asset,
+            &fixture.0,
+            0o700,
+            "0.14.0"
+        )
+        .await
+        .unwrap_err_string()
+        .contains("differs from manifest"));
+        assert!(!server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|req| req == "/binary"));
         let temporary = prepare(
             &client,
+            &server.url,
             &binary,
             &checksum_asset,
             &fixture.0,
@@ -1552,6 +1442,7 @@ mod tests {
         assert!(!staged.exists());
         assert!(prepare(
             &client,
+            &server.url,
             &binary,
             &checksum_asset,
             &fixture.0,
@@ -1570,10 +1461,18 @@ mod tests {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         let sum = server.asset("/binary.sha256", format!("{digest}  binary\n").into_bytes());
-        assert!(prepare(&client, &wrong, &sum, &fixture.0, 0o700, "0.14.0")
-            .await
-            .unwrap_err_string()
-            .contains("platform"));
+        assert!(prepare(
+            &client,
+            &server.url,
+            &wrong,
+            &sum,
+            &fixture.0,
+            0o700,
+            "0.14.0"
+        )
+        .await
+        .unwrap_err_string()
+        .contains("platform"));
         assert!(!fs::read_dir(&fixture.0).unwrap().any(|entry| entry
             .unwrap()
             .file_name()
@@ -1726,9 +1625,17 @@ mod tests {
             .collect();
         let binary = server.asset("/binary", payload);
         let sum = server.asset("/binary.sha256", format!("{hash}  binary\n").into_bytes());
-        let temporary = prepare(&test_client(), &binary, &sum, &parent, 0o700, "0.14.0")
-            .await
-            .unwrap();
+        let temporary = prepare(
+            &test_client(),
+            &server.url,
+            &binary,
+            &sum,
+            &parent,
+            0o700,
+            "0.14.0",
+        )
+        .await
+        .unwrap();
         let mut calls = Vec::new();
         let error = install(&exe, &temporary.0, &parent.join(BACKUP), true, |action| {
             calls.push(action);

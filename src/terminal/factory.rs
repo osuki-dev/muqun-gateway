@@ -66,6 +66,9 @@ pub(crate) fn warn_about_missing_backend_programs(config: &Config) {
 /// remember. herdr sessions are returned unwrapped: herdr's own ids already
 /// work today and must not change.
 pub(crate) fn terminal_backend(session: &SessionConfig) -> Box<dyn TerminalBackend> {
+    if session.is_desktop_terminal() {
+        return Box::new(crate::backend::MuqunTermBackend::new(&session.socket_path));
+    }
     let backend = backend_registry().connect(session.backend, &session.socket_path);
     match session.backend {
         BackendKind::Tmux => Box::new(TmuxWireIds::new(backend)),

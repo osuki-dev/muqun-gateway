@@ -76,6 +76,15 @@ impl AcpProvider for AntigravityProvider {
     fn transcript_modified(_directory: &str, id: &str) -> Option<std::time::SystemTime> {
         super::store::store_modified(id)
     }
+    const PREVIEW_TIMELINE: bool = true;
+    fn preview_timeline<'a>(
+        _directory: &'a str,
+        id: &'a str,
+        limit: usize,
+        stop: &'a CancellationToken,
+    ) -> AgentFuture<'a, Vec<crate::agents::domain::TimelineItem>> {
+        Box::pin(super::store::tail_timeline(id, limit, stop))
+    }
     fn offline_sessions<'a>(
         directory: Option<&'a str>,
         _owned: std::collections::HashSet<String>,

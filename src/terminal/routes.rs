@@ -47,7 +47,7 @@ type GatewayEventStream =
 
 /// Terminal plane routes: sessions, workspaces, tabs, panes, and their views.
 pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
-    router
+    super::pty_ws::mount(router)
         .route("/api/sessions", get(sessions))
         .route("/api/sessions/{session_id}/events", get(events))
         .route("/api/sessions/{session_id}/snapshot", get(snapshot))
@@ -3181,6 +3181,9 @@ pub(crate) fn git_error(err: git::GitError) -> (StatusCode, Json<Value>) {
             "git_missing",
             "git is not installed on this host",
         ),
+        git::GitError::InvalidInput(message) => {
+            api_error(StatusCode::BAD_REQUEST, "invalid_request", &message)
+        }
         git::GitError::Failed(_) => api_error(StatusCode::BAD_GATEWAY, "git_failed", "git failed"),
     }
 }

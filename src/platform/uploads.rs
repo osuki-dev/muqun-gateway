@@ -16,6 +16,11 @@ use crate::{
     api_error, looks_textual, read_asset_head, require_device, state_dir, ApiResult, AppState,
 };
 
+#[path = "office_uploads.rs"]
+mod office_uploads;
+#[cfg(test)]
+pub(crate) use office_uploads::fixture as legacy_office_fixture;
+
 /// The one route allowed a body bigger than [`MAX_REQUEST_BODY_BYTES`]. Named
 /// so the router and the encrypted transport cannot disagree about which route
 /// that is.
@@ -101,34 +106,104 @@ pub(crate) async fn upload_file(
             "the file field must carry a filename",
         ));
     };
-    if bytes.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "empty_file",
-            "the file field is empty",
-        ));
+    let stored = store_upload(&client_name, &bytes)
+        .map_err(|refusal| api_error(refusal.status(), refusal.code(), &refusal.message()))?;
+
+    Ok(Json(json!({
+        // `path` is for the agent, which reads the file off this host.
+        "path": stored.path.to_string_lossy(),
+        // `url` is for the app, which cannot. Same file, the two ways of
+        // reaching it, so the transcript can draw what was sent.
+        "url": upload_url(&stored.stored_name),
+        "name": stored.name,
+        "size": stored.size,
+        "mime": stored.mime
+    })))
+}
+
+/// One accepted upload, as stored under the upload directory.
+#[derive(Debug, Clone)]
+pub struct StoredUpload {
+    /// Where the agent reads it (absolute, inside the upload directory).
+    pub path: PathBuf,
+    /// The generated on-disk name (UUID plus the extension the content earned).
+    pub stored_name: String,
+    /// The client's name, reduced to something safe to show.
+    pub name: String,
+    pub size: usize,
+    pub mime: &'static str,
+}
+
+/// Why a file was not stored. The same decisions `POST /api/uploads` makes;
+/// a client that is not HTTP (the desktop) asks through [`store_upload`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadRefusal {
+    Empty,
+    Executable,
+    Unsupported,
+    /// Over the ceiling for what the content turned out to be.
+    TooLarge {
+        max_mib: usize,
+    },
+    Storage,
+}
+
+impl UploadRefusal {
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
+            Self::Empty => StatusCode::BAD_REQUEST,
+            Self::Executable | Self::Unsupported => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Self::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::Storage => StatusCode::INTERNAL_SERVER_ERROR,
+        }
     }
 
-    // Executables are checked separately from the content allow-list so the
-    // refusal says what it means, and so adding a document format cannot
-    // accidentally make an executable acceptable.
-    if looks_executable(&bytes) {
-        return Err(api_error(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "executable_rejected",
-            "executables and scripts are not accepted",
-        ));
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::Empty => "empty_file",
+            Self::Executable => "executable_rejected",
+            Self::Unsupported => "unsupported_file_type",
+            Self::TooLarge { .. } => "upload_too_large",
+            Self::Storage => "upload_failed",
+        }
     }
-    let Some(kind) = sniff_upload_kind(&bytes)
-        .or_else(|| sniff_video_upload_kind(&bytes))
-        .or_else(|| sniff_office_upload_kind(&bytes))
-        .or_else(|| sniff_document_upload_kind(&bytes, &client_name))
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::Empty => "the file field is empty".into(),
+            Self::Executable => "executables and scripts are not accepted".into(),
+            Self::Unsupported => {
+                "only supported images, videos, office documents, PDF, and UTF-8 text are accepted"
+                    .into()
+            }
+            Self::TooLarge { max_mib } => format!("this file may be at most {max_mib} MiB"),
+            Self::Storage => "failed to store the upload".into(),
+        }
+    }
+}
+
+/// Check `bytes` as the upload route does and park them in the upload
+/// directory. Executables are checked separately from the content allow-list
+/// so the refusal says what it means, and so adding a document format cannot
+/// accidentally make an executable acceptable.
+pub fn store_upload(client_name: &str, bytes: &[u8]) -> Result<StoredUpload, UploadRefusal> {
+    if bytes.is_empty() {
+        return Err(UploadRefusal::Empty);
+    }
+    if looks_executable(bytes) {
+        return Err(UploadRefusal::Executable);
+    }
+    if office_container(bytes) && bytes.len() > MAX_UPLOAD_BYTES {
+        return Err(UploadRefusal::TooLarge {
+            max_mib: MAX_UPLOAD_BYTES / (1024 * 1024),
+        });
+    }
+    let Some(kind) = sniff_upload_kind(bytes)
+        .or_else(|| sniff_video_upload_kind(bytes))
+        .or_else(|| sniff_office_upload_kind(bytes))
+        .or_else(|| sniff_document_upload_kind(bytes, client_name))
     else {
-        return Err(api_error(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_file_type",
-            "only supported images, videos, office documents, PDF, and UTF-8 text are accepted",
-        ));
+        return Err(UploadRefusal::Unsupported);
     };
     // The route's body limit is the video ceiling; everything else keeps the
     // smaller one, decided by what the content turned out to be.
@@ -138,42 +213,27 @@ pub(crate) async fn upload_file(
         MAX_UPLOAD_BYTES
     };
     if bytes.len() > maximum {
-        return Err(api_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "upload_too_large",
-            &format!("this file may be at most {} MiB", maximum / (1024 * 1024)),
-        ));
+        return Err(UploadRefusal::TooLarge {
+            max_mib: maximum / (1024 * 1024),
+        });
     }
-
     let dir = ensure_uploads_dir().map_err(|err| {
         tracing::warn!("failed to prepare the upload directory: {err:#}");
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "upload_failed",
-            "failed to store the upload",
-        )
+        UploadRefusal::Storage
     })?;
     let stored_name = stored_upload_name(kind);
     let path = dir.join(&stored_name);
-    write_upload_file(&path, &bytes).map_err(|err| {
+    write_upload_file(&path, bytes).map_err(|err| {
         tracing::warn!("failed to write upload {}: {err:#}", path.display());
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "upload_failed",
-            "failed to store the upload",
-        )
+        UploadRefusal::Storage
     })?;
-
-    Ok(Json(json!({
-        // `path` is for the agent, which reads the file off this host.
-        "path": path.to_string_lossy(),
-        // `url` is for the app, which cannot. Same file, the two ways of
-        // reaching it, so the transcript can draw what was sent.
-        "url": upload_url(&stored_name),
-        "name": sanitize_upload_name(&client_name),
-        "size": bytes.len(),
-        "mime": kind.mime
-    })))
+    Ok(StoredUpload {
+        path,
+        stored_name,
+        name: sanitize_upload_name(client_name),
+        size: bytes.len(),
+        mime: kind.mime,
+    })
 }
 
 /// Where a stored upload is readable over the API. The stored name is
@@ -246,6 +306,7 @@ pub(crate) async fn upload_content(
         // on top of the blanket `no-store` the security headers apply, so it
         // cannot land in a shared cache on the way back either.
         .header("cache-control", "private, no-store, max-age=0")
+        .header("content-security-policy", "sandbox")
         .body(body)
         .map_err(|err| {
             tracing::warn!("failed to build upload response: {err}");
@@ -295,7 +356,7 @@ pub(crate) fn safe_upload_component(raw: &str) -> Option<String> {
 
 /// Decide a stored upload's type from its bytes, the same order `upload_file`
 /// used to accept it: magic numbers first, the office container probe for a
-/// zip, and only then the text probe, where the stored extension -- which the
+/// ZIP/CFB, and only then the text probe, where the stored extension -- which the
 /// gateway earned from the content at upload time, never took from the client
 /// -- picks the flavour.
 pub(crate) fn sniff_stored_upload(path: &FsPath, stored_name: &str) -> Option<UploadKind> {
@@ -319,10 +380,19 @@ pub(crate) fn sniff_upload_file(path: &FsPath, name: &str) -> Option<UploadKind>
     if let Some(kind) = sniff_video_upload_kind(&head) {
         return Some(kind);
     }
-    // A zip's central directory sits at the tail, so the office probe is the
-    // one that needs the whole file -- and only when the head says zip.
-    if head.starts_with(b"PK\x03\x04") {
-        let whole = std::fs::read(path).ok()?;
+    // Office containers need bounded metadata beyond the head (ZIP directory
+    // or CFB sectors). Bound the read itself, including files changing on disk.
+    if office_container(&head) {
+        use std::io::Read as _;
+        let mut whole = Vec::new();
+        std::fs::File::open(path)
+            .ok()?
+            .take((MAX_UPLOAD_BYTES + 1) as u64)
+            .read_to_end(&mut whole)
+            .ok()?;
+        if whole.len() > MAX_UPLOAD_BYTES {
+            return None;
+        }
         if let Some(kind) = sniff_office_upload_kind(&whole) {
             return Some(kind);
         }
@@ -422,12 +492,19 @@ pub(crate) fn sniff_video_upload_kind(bytes: &[u8]) -> Option<UploadKind> {
     })
 }
 
-/// Recognise modern Office/OpenDocument containers without extracting them.
-/// The central directory carries entry names in plain bytes even when the
-/// entries themselves are compressed, which is enough to distinguish a Word,
-/// Excel or PowerPoint package from an arbitrary zip. ODF additionally puts an
-/// uncompressed `mimetype` entry first by specification.
+/// Container signatures whose upload probe needs more than the file head.
+pub(crate) fn office_container(bytes: &[u8]) -> bool {
+    bytes.starts_with(ZIP_LOCAL_HEADER) || bytes.starts_with(office_uploads::CFB_MAGIC)
+}
+
+/// Recognise Office containers without extracting their document contents.
+/// Legacy CFB uses validated stream headers. For modern Office, ZIP directory
+/// names distinguish Word, Excel and PowerPoint packages from arbitrary ZIPs.
+/// ODF additionally puts an uncompressed `mimetype` entry first by specification.
 pub(crate) fn sniff_office_upload_kind(bytes: &[u8]) -> Option<UploadKind> {
+    if bytes.starts_with(office_uploads::CFB_MAGIC) {
+        return office_uploads::sniff(bytes);
+    }
     let names = zip_entry_names(bytes)?;
     let has = |needle: &str| names.contains(&needle);
     let ooxml_root = has("[Content_Types].xml") && has("_rels/.rels");
@@ -588,8 +665,8 @@ pub(crate) fn stored_first_zip_entry(bytes: &[u8]) -> Option<(&str, &[u8])> {
     ))
 }
 
-/// Documents stay deliberately narrow: PDF has an unambiguous signature and
-/// everything else must first pass the same UTF-8 text probe used by the asset
+/// PDF and RTF have content signatures. Other document text must first pass
+/// the same UTF-8 text probe used by the asset
 /// browser. The filename may then preserve a useful source/document extension,
 /// but can never turn binary bytes into an accepted upload.
 pub(crate) fn sniff_document_upload_kind(bytes: &[u8], client_name: &str) -> Option<UploadKind> {
@@ -599,8 +676,35 @@ pub(crate) fn sniff_document_upload_kind(bytes: &[u8], client_name: &str) -> Opt
             mime: "application/pdf",
         });
     }
+    // RTF is an ASCII control-word format; legacy code pages may occur in
+    // its text, so it need not pass the UTF-8 probe. Never execute/render it.
+    if bytes.starts_with(b"{\\rtf1")
+        && bytes
+            .get(6)
+            .is_some_and(|c| *c == b'\\' || c.is_ascii_whitespace())
+    {
+        return Some(UploadKind {
+            extension: "rtf",
+            mime: "application/rtf",
+        });
+    }
     if !looks_textual(bytes) {
         return None;
+    }
+    // Word/Excel can save HTML under .doc/.xls. Preserve the actual textual
+    // format (served as plain text), rather than pretending it is binary Office.
+    let head = bytes
+        .strip_prefix(b"\xef\xbb\xbf")
+        .unwrap_or(bytes)
+        .trim_ascii_start();
+    if head
+        .get(..14)
+        .is_some_and(|s| s.eq_ignore_ascii_case(b"<!doctype html"))
+        || head
+            .get(..5)
+            .is_some_and(|s| s.eq_ignore_ascii_case(b"<html"))
+    {
+        return Some(text_upload_kind("html"));
     }
 
     let extension = client_name
@@ -631,10 +735,7 @@ pub(crate) fn sniff_document_upload_kind(bytes: &[u8], client_name: &str) -> Opt
             extension: "toml",
             mime: "application/toml",
         },
-        Some("xml") => UploadKind {
-            extension: "xml",
-            mime: "application/xml",
-        },
+        Some("xml") => text_upload_kind("xml"),
         Some("rtf") => UploadKind {
             extension: "rtf",
             mime: "application/rtf",
@@ -820,6 +921,7 @@ pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
+    use super::office_uploads;
     use crate::*;
 
     #[test]
@@ -1219,6 +1321,166 @@ mod tests {
         assert_eq!(unknown.extension, "txt");
     }
 
+    #[tokio::test]
+    async fn legacy_office_round_trips_through_multipart_and_chunked_http() {
+        use tower::ServiceExt as _;
+        let token = "office-upload-device";
+        let app = super::mount(Router::new())
+            .with_state(test_state("admin", vec![test_device(token, token)]));
+        let request = |method: &str, uri: &str, content_type: &str, bytes: Vec<u8>| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", content_type)
+                .body(Body::from(bytes))
+                .unwrap()
+        };
+        for extension in ["doc", "xls", "ppt"] {
+            let bytes = office_uploads::fixture(extension);
+            for chunked in [false, true] {
+                let response = if chunked {
+                    let opened = app
+                        .clone()
+                        .oneshot(request(
+                            "POST",
+                            "/api/uploads/chunked",
+                            "application/json",
+                            json!({"name": "office.bin", "size": bytes.len()})
+                                .to_string()
+                                .into_bytes(),
+                        ))
+                        .await
+                        .unwrap();
+                    assert_eq!(opened.status(), StatusCode::OK);
+                    let value: Value = serde_json::from_slice(
+                        &axum::body::to_bytes(opened.into_body(), 65536)
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let uri = format!(
+                        "/api/uploads/chunked/{}",
+                        value["uploadId"].as_str().unwrap()
+                    );
+                    let put = app
+                        .clone()
+                        .oneshot(request(
+                            "PUT",
+                            &format!("{uri}/0"),
+                            "application/octet-stream",
+                            bytes.clone(),
+                        ))
+                        .await
+                        .unwrap();
+                    assert_eq!(put.status(), StatusCode::OK);
+                    app.clone()
+                        .oneshot(request(
+                            "POST",
+                            &format!("{uri}/complete"),
+                            "application/json",
+                            vec![],
+                        ))
+                        .await
+                        .unwrap()
+                } else {
+                    let mut body = b"--office\r\nContent-Disposition: form-data; name=\"file\"; filename=\"office.bin\"\r\n\r\n".to_vec();
+                    body.extend_from_slice(&bytes);
+                    body.extend_from_slice(b"\r\n--office--\r\n");
+                    app.clone()
+                        .oneshot(request(
+                            "POST",
+                            UPLOADS_PATH,
+                            "multipart/form-data; boundary=office",
+                            body,
+                        ))
+                        .await
+                        .unwrap()
+                };
+                assert_eq!(response.status(), StatusCode::OK);
+                let stored: Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), 65536)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                let url = stored["url"].as_str().unwrap();
+                assert!(url.ends_with(&format!(".{extension}")));
+                let response = app
+                    .clone()
+                    .oneshot(request("GET", url, "", vec![]))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response.headers()["content-type"],
+                    stored["mime"].as_str().unwrap()
+                );
+                assert_eq!(
+                    axum::body::to_bytes(response.into_body(), 65536)
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    bytes
+                );
+                std::fs::remove_file(stored["path"].as_str().unwrap()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_office_uploads_have_the_same_type_in_desktop_chunked_and_readback_paths() {
+        for extension in ["doc", "xls", "ppt"] {
+            let bytes = office_uploads::fixture(extension);
+            // An intentionally wrong client extension cannot dictate the type.
+            let stored = store_upload("document.bin", &bytes).unwrap();
+            assert!(stored.stored_name.ends_with(&format!(".{extension}")));
+            assert_eq!(
+                sniff_upload_file(&stored.path, "document.bin")
+                    .unwrap()
+                    .mime,
+                stored.mime
+            );
+            assert_eq!(
+                sniff_stored_upload(&stored.path, &stored.stored_name)
+                    .unwrap()
+                    .mime,
+                stored.mime
+            );
+            assert_eq!(std::fs::read(&stored.path).unwrap(), bytes);
+            std::fs::remove_file(&stored.path).unwrap();
+        }
+        assert_eq!(
+            store_upload("document.doc", b"MZnot an office file").unwrap_err(),
+            UploadRefusal::Executable
+        );
+        assert_eq!(
+            store_upload("document.doc", office_uploads::CFB_MAGIC).unwrap_err(),
+            UploadRefusal::Unsupported
+        );
+    }
+
+    #[test]
+    fn office_text_exports_keep_their_actual_format_despite_doc_extension() {
+        for (bytes, extension) in [
+            (b"{\\rtf1\\ansi legacy \xe9}".as_slice(), "rtf"),
+            (
+                b"<!DOCTYPE html><html><body>Document</body></html>".as_slice(),
+                "html",
+            ),
+        ] {
+            let stored = store_upload("document.doc", bytes).unwrap();
+            assert!(stored.stored_name.ends_with(&format!(".{extension}")));
+            assert_eq!(
+                sniff_upload_file(&stored.path, &stored.stored_name)
+                    .unwrap()
+                    .mime,
+                stored.mime
+            );
+            std::fs::remove_file(&stored.path).unwrap();
+        }
+    }
+
     #[test]
     fn modern_office_packages_are_recognised_from_their_zip_structure() {
         let docx = test_zip(&[
@@ -1245,12 +1507,21 @@ mod tests {
 
     #[test]
     fn open_document_packages_require_the_stored_mimetype_first() {
-        let odt = test_zip(&[
-            ("mimetype", b"application/vnd.oasis.opendocument.text"),
-            ("content.xml", b"content"),
-            ("META-INF/manifest.xml", b"manifest"),
-        ]);
-        assert_eq!(sniff_office_upload_kind(&odt).unwrap().extension, "odt");
+        for (extension, mime) in [
+            ("odt", "application/vnd.oasis.opendocument.text"),
+            ("ods", "application/vnd.oasis.opendocument.spreadsheet"),
+            ("odp", "application/vnd.oasis.opendocument.presentation"),
+        ] {
+            let package = test_zip(&[
+                ("mimetype", mime.as_bytes()),
+                ("content.xml", b"content"),
+                ("META-INF/manifest.xml", b"manifest"),
+            ]);
+            assert_eq!(
+                sniff_office_upload_kind(&package).unwrap().extension,
+                extension
+            );
+        }
 
         let mimetype_late = test_zip(&[
             ("content.xml", b"content"),

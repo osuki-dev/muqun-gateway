@@ -950,9 +950,37 @@ pub(crate) fn preview_lookup_roots(
     roots
 }
 
+/// Gateway's own configuration and internal state directories hold pairing
+/// tokens, transport keys, SQLCipher keys, and upstream secrets. File preview
+/// and explicit asset endpoints must never serve them (while still allowing
+/// user-facing uploads and cached message images under `state_dir`).
+pub(crate) fn is_gateway_private_path(canonical: &FsPath) -> bool {
+    if let Ok(cfg) = crate::platform::store::config_dir() {
+        let cfg = std::fs::canonicalize(&cfg).unwrap_or(cfg);
+        if canonical == cfg || canonical.starts_with(&cfg) {
+            return true;
+        }
+    }
+    if let Ok(state) = crate::platform::store::state_dir() {
+        let state = std::fs::canonicalize(&state).unwrap_or(state);
+        if canonical == state || canonical.starts_with(&state) {
+            let uploads = state.join("uploads");
+            let uploads_canon = std::fs::canonicalize(&uploads).unwrap_or(uploads);
+            let msg_images = state.join("message-images");
+            let msg_images_canon = std::fs::canonicalize(&msg_images).unwrap_or(msg_images);
+            let allowed =
+                canonical.starts_with(&uploads_canon) || canonical.starts_with(&msg_images_canon);
+            if !allowed {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub(crate) fn asset_entry_for_path(raw: &str, roots: &[AssetRoot]) -> Option<AssetEntry> {
     let path = std::fs::canonicalize(raw).ok()?;
-    if !path.is_file() {
+    if !path.is_file() || is_gateway_private_path(&path) {
         return None;
     }
     // Workspace roots nest, so the deepest containing root owns the file.
@@ -1546,6 +1574,7 @@ async fn stream_asset(
                 header_safe_name(&entry.name)
             ),
         )
+        .header("content-security-policy", "sandbox")
         .header("x-asset-kind", asset_type.kind.as_str())
         .header("x-content-schema-version", CONTENT_SCHEMA_VERSION)
         .body(body)

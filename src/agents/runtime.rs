@@ -27,6 +27,8 @@ pub(crate) mod claude;
 pub use claude::ClaudeConfig;
 pub(crate) mod codex;
 pub use codex::CodexConfig;
+pub(crate) mod copilot;
+pub use copilot::CopilotConfig;
 pub(crate) mod deepseek;
 pub(crate) mod fx;
 pub use fx::FxConfig;
@@ -73,7 +75,7 @@ const VERSION_OUTPUT_LIMIT: u64 = 4096;
 
 /// Preference among attached providers. Explicit provider/session selections
 /// retain their route; discovery additionally puts usable providers first.
-pub const AGENT_PREFERENCE: [&str; 10] = [
+pub const AGENT_PREFERENCE: [&str; 11] = [
     "codex",
     "opencode",
     "deepseek",
@@ -84,6 +86,7 @@ pub const AGENT_PREFERENCE: [&str; 10] = [
     "claude",
     "antigravity",
     "cursor",
+    "copilot",
 ];
 /// An agent kind as a person names it -- in pushes, task summaries and the
 /// agent list alike. A brand, so the same in every language.
@@ -99,6 +102,7 @@ pub fn agent_display_name(kind: &str) -> Option<&'static str> {
         "claude" => "Claude Code",
         "antigravity" => "Antigravity",
         "cursor" => "Cursor",
+        "copilot" => "GitHub Copilot CLI",
         _ => return None,
     })
 }
@@ -318,8 +322,9 @@ pub struct AgentStatus {
 }
 
 /// Configurations for the local service adapters, named to keep construction clear.
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct LocalAgentConfigs {
+    pub copilot: CopilotConfig,
     pub codex: CodexConfig,
     pub fx: FxConfig,
     pub qoder: QoderConfig,
@@ -330,6 +335,7 @@ pub struct LocalAgentConfigs {
 }
 
 struct LocalAgentStates {
+    copilot: copilot::CopilotState,
     codex: codex::CodexState,
     fx: fx::FxState,
     qoder: qoder::QoderState,
@@ -340,6 +346,7 @@ struct LocalAgentStates {
 }
 
 pub struct AgentRuntime {
+    copilot: copilot::CopilotState,
     manager: RwLock<Option<Arc<AgentManager>>>,
     managers: RwLock<BTreeMap<String, Arc<AgentManager>>>,
     session_routes: RwLock<SessionRoutes>,
@@ -439,6 +446,34 @@ impl McpEnv {
 }
 
 impl AgentRuntime {
+    /// Unified ACP `mcpServers` entry pointing at this gateway's `/mcp` with a
+    /// runtime-scoped token for `agent_id`. Shared across all native ACP drivers
+    /// (Claude Code, Cursor, Antigravity, Copilot, Qoder, FX) so every agent uses
+    /// the single gateway MCP endpoint and its unified Hub/Skills surface.
+    pub(super) async fn acp_muqun_mcp_servers(
+        &self,
+        agent_id: &str,
+        display_name: &str,
+    ) -> Option<serde_json::Value> {
+        let wiring = self.mcp.get()?;
+        let label = format!("{agent_id} (native sessions)");
+        match issue_agent_env_for(wiring.tokens.as_ref(), &wiring.url, agent_id, &label).await {
+            Ok((env, previous)) => {
+                settle_agent_tokens(wiring.tokens.as_ref(), &env, &previous, true).await;
+                Some(serde_json::json!([{
+                    "type": "http",
+                    "name": crate::mcp::hosts::SERVER_NAME,
+                    "url": env.url,
+                    "headers": [{ "name": "Authorization", "value": format!("Bearer {}", env.token) }],
+                }]))
+            }
+            Err(error) => {
+                tracing::warn!("could not mint {display_name}'s MCP token: {error}");
+                None
+            }
+        }
+    }
+
     pub fn new(config: OpencodeConfig) -> Arc<Self> {
         Self::with_configs(config, DeepseekConfig::default(), T3Config::default(), None)
     }
@@ -456,6 +491,7 @@ impl AgentRuntime {
             deepseek_config,
             t3_config,
             LocalAgentConfigs {
+                copilot: CopilotConfig::default(),
                 pi: PiConfig::disabled(),
                 claude: ClaudeConfig::disabled(),
                 antigravity: AntigravityConfig::disabled(),
@@ -479,6 +515,7 @@ impl AgentRuntime {
             deepseek_config,
             t3_config,
             LocalAgentConfigs {
+                copilot: CopilotConfig::default(),
                 codex: codex_config,
                 pi: PiConfig::disabled(),
                 antigravity: AntigravityConfig::disabled(),
@@ -502,6 +539,7 @@ impl AgentRuntime {
             deepseek_config,
             T3State::new(t3_config, state_dir.clone()),
             LocalAgentStates {
+                copilot: copilot::CopilotState::new(local.copilot),
                 codex: codex::CodexState::new(local.codex),
                 fx: fx::FxState::new(local.fx),
                 qoder: qoder::QoderState::new(local.qoder),
@@ -526,6 +564,7 @@ impl AgentRuntime {
             deepseek_config,
             t3_config,
             LocalAgentConfigs {
+                copilot: CopilotConfig::default(),
                 codex: codex_config,
                 fx: fx_config,
                 qoder: QoderConfig::default(),
@@ -552,6 +591,7 @@ impl AgentRuntime {
             deepseek_config,
             t3_config,
             LocalAgentConfigs {
+                copilot: CopilotConfig::default(),
                 codex: codex_config,
                 fx: fx_config,
                 qoder: qoder_config,
@@ -579,6 +619,7 @@ impl AgentRuntime {
             deepseek_config,
             t3_config,
             LocalAgentConfigs {
+                copilot: CopilotConfig::default(),
                 codex: codex_config,
                 fx: fx_config,
                 qoder: QoderConfig {
@@ -605,6 +646,7 @@ impl AgentRuntime {
             deepseek_config,
             t3,
             LocalAgentStates {
+                copilot: copilot::CopilotState::new(CopilotConfig::default()),
                 codex: codex::CodexState::new(CodexConfig::default()),
                 fx: fx::FxState::new(FxConfig::default()),
                 qoder: qoder::QoderState::new(QoderConfig::default()),
@@ -624,6 +666,7 @@ impl AgentRuntime {
     ) -> Arc<Self> {
         let (events_tx, _) = broadcast::channel(1024);
         Arc::new(Self {
+            copilot: local.copilot,
             manager: RwLock::new(None),
             managers: RwLock::new(BTreeMap::new()),
             session_routes: RwLock::new(SessionRoutes::default()),
@@ -683,6 +726,10 @@ impl AgentRuntime {
             Err(error) => tracing::warn!("session routes could not be loaded: {error:#}"),
         }
         let _ = self.route_store.set(db);
+    }
+
+    pub(super) fn store(&self) -> Option<Arc<crate::platform::store::sqlite::SqliteStore>> {
+        self.route_store.get().cloned()
     }
 
     async fn store_route(&self, asid: &str, agent_id: Option<&str>) {
@@ -823,6 +870,7 @@ impl AgentRuntime {
             DeepseekConfig::default(),
             T3Config::default(),
             LocalAgentConfigs {
+                copilot: CopilotConfig::default(),
                 codex: CodexConfig {
                     enabled: false,
                     binary: None,
@@ -984,6 +1032,21 @@ impl AgentRuntime {
         out
     }
 
+    /// Resolve only from local routing and initialized mirrors. A cache probe
+    /// must never discover ownership by contacting providers.
+    pub(crate) async fn retained_manager(&self, asid: &str) -> Option<Arc<AgentManager>> {
+        if let Some(owner) = self.session_routes.read().await.map.get(asid).cloned() {
+            return self.manager_for_agent(&owner).await;
+        }
+        let id = super::domain::AgentSessionId(asid.to_owned());
+        for (_, manager) in self.attached_in_order().await {
+            if manager.mirror().history_initialized(&id).await {
+                return Some(manager);
+            }
+        }
+        None
+    }
+
     /// The manager that owns a session: the recorded route, else whichever
     /// attached agent says it has the session (and that is then recorded).
     /// `None` when nothing owns it.
@@ -1068,7 +1131,7 @@ impl AgentRuntime {
             origin: if manager.as_ref().is_some_and(|manager| {
                 matches!(
                     manager.agent().kind(),
-                    "fx" | "qoder" | "claude" | "antigravity" | "cursor"
+                    "fx" | "qoder" | "claude" | "antigravity" | "cursor" | "copilot"
                 ) && manager.stream_connected()
             }) {
                 AgentOrigin::Spawned
@@ -1089,7 +1152,7 @@ impl AgentRuntime {
             } else if manager.as_ref().is_some_and(|m| {
                 matches!(
                     m.agent().kind(),
-                    "fx" | "qoder" | "claude" | "antigravity" | "cursor"
+                    "fx" | "qoder" | "claude" | "antigravity" | "cursor" | "copilot"
                 )
             }) {
                 false
@@ -1116,7 +1179,7 @@ impl AgentRuntime {
             installation: AgentInstallation::Installed,
             origin: if matches!(
                 kind.as_str(),
-                "fx" | "qoder" | "claude" | "antigravity" | "cursor"
+                "fx" | "qoder" | "claude" | "antigravity" | "cursor" | "copilot"
             ) {
                 if manager.stream_connected() {
                     AgentOrigin::Spawned
@@ -1292,6 +1355,11 @@ impl AgentRuntime {
                         antigravity::features(),
                     ),
                     "cursor" => (self.cursor.config.enabled, "Cursor", cursor::features()),
+                    "copilot" => (
+                        self.copilot.config.enabled,
+                        "GitHub Copilot CLI",
+                        copilot::features(),
+                    ),
                     _ => (
                         self.deepseek_config.enabled || self.deepseek_config.endpoint.is_some(),
                         "DeepSeek",
@@ -1323,7 +1391,7 @@ impl AgentRuntime {
                         (true, Some(_))
                             if matches!(
                                 *id,
-                                "fx" | "qoder" | "claude" | "antigravity" | "cursor"
+                                "fx" | "qoder" | "claude" | "antigravity" | "cursor" | "copilot"
                             ) =>
                         {
                             AgentAvailability::Reachable
@@ -1633,6 +1701,7 @@ impl AgentRuntime {
         agents.push(self.claude.discovery(self).await);
         agents.push(self.antigravity.discovery(self).await);
         agents.push(self.cursor.discovery(self).await);
+        agents.push(self.copilot.discovery(self).await);
         crate::agents::auto_approve::annotate(&mut agents);
         crate::discovery::order_agents(&mut agents);
 
@@ -1713,7 +1782,7 @@ impl AgentRuntime {
             .map(|m| {
                 !matches!(
                     m.agent().kind(),
-                    "fx" | "qoder" | "claude" | "antigravity" | "cursor"
+                    "fx" | "qoder" | "claude" | "antigravity" | "cursor" | "copilot"
                 ) && !m.stream_connected()
             })
             .unwrap_or(false)
@@ -1747,6 +1816,7 @@ impl AgentRuntime {
         let qoder_ok = self.qoder.supervise(self).await;
         let antigravity_ok = self.antigravity.supervise(self).await;
         let cursor_ok = self.cursor.supervise(self).await;
+        let copilot_ok = self.copilot.supervise(self).await;
         let pi_ok = self.supervise_pi().await;
         let claude_ok = self.claude.supervise(self).await;
 
@@ -1760,6 +1830,7 @@ impl AgentRuntime {
             || claude_ok
             || antigravity_ok
             || cursor_ok
+            || copilot_ok
         {
             *start_backoff = Duration::from_secs(2);
             let primary = pick_primary(&*self.managers.read().await).cloned();
@@ -2577,10 +2648,15 @@ fn is_executable(path: &std::path::Path) -> bool {
 /// Prefer the first nonempty stdout line, then stderr. Unlike the old probe,
 /// leading blank lines do not hide a version that follows them.
 pub(crate) async fn binary_version(path: &std::path::Path) -> Option<String> {
+    let mut command = tokio::process::Command::new(path);
+    command.arg("--version");
+    binary_version_command(command).await
+}
+
+pub(crate) async fn binary_version_command(mut command: tokio::process::Command) -> Option<String> {
     use tokio::io::AsyncReadExt as _;
 
-    let mut child = tokio::process::Command::new(path)
-        .arg("--version")
+    let mut child = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -2639,6 +2715,7 @@ fn running_binary_path(_pid: u32) -> Option<std::path::PathBuf> {
 
 fn probe_client() -> reqwest::Client {
     reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(60))
         .build()
@@ -4189,6 +4266,7 @@ mod tests {
             DeepseekConfig::default(),
             T3Config::default(),
             LocalAgentConfigs {
+                copilot: CopilotConfig::default(),
                 pi: PiConfig::disabled(),
                 antigravity: AntigravityConfig::disabled(),
                 cursor: CursorConfig::disabled(),
@@ -4796,7 +4874,8 @@ mod tests {
                 "pi",
                 "claude",
                 "antigravity",
-                "cursor"
+                "cursor",
+                "copilot"
             ]
         );
         assert_eq!(runtime.manager().await.unwrap().agent().kind(), "codex");
@@ -4834,6 +4913,7 @@ mod tests {
                 "claude",
                 "antigravity",
                 "cursor",
+                "copilot",
                 "codex"
             ]
         );

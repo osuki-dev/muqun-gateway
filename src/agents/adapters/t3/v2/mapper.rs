@@ -429,7 +429,7 @@ pub fn timeline(thread_id: &str, projection: &Value, seq: u64) -> Vec<TimelineIt
                     Some("idle" | "pending") => ToolCallStatus::Pending,
                     _ => ToolCallStatus::Running,
                 };
-                AgentPart::Tool(ToolCall {
+                let mut call = ToolCall {
                     id: string(item, "id").unwrap_or("").to_string(),
                     name: match kind {
                         "command_execution" => "shell",
@@ -476,7 +476,9 @@ pub fn timeline(thread_id: &str, projection: &Value, seq: u64) -> Vec<TimelineIt
                         ran: string(item, "startedAt").and_then(ms_from_iso),
                         completed: string(item, "completedAt").and_then(ms_from_iso),
                     },
-                })
+                };
+                crate::agents::message_images::tool_media::normalize_tool_call(&mut call);
+                AgentPart::Tool(call)
             }
             // The request is a control acknowledgement, not confirmation that
             // execution stopped. Render the result once it actually arrives.
@@ -534,6 +536,7 @@ pub fn timeline(thread_id: &str, projection: &Value, seq: u64) -> Vec<TimelineIt
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         });
     }
     result

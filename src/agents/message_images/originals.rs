@@ -26,6 +26,12 @@ pub(super) fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// Identity used by the Gateway when it serves an original upload. Clients that
+/// staged the upload can match its host path to the later session-scoped URL.
+pub fn original_asset_id(asid: &str, host_path: &str) -> String {
+    format!("ai_{}", digest(format!("{asid}\n{host_path}").as_bytes()))
+}
+
 /// Create only gateway-owned directories; reject a symlink before changing
 /// permissions. Files below are written create-new, never replacing originals.
 pub(super) fn private_dir(path: &Path) -> std::io::Result<()> {
@@ -66,6 +72,28 @@ pub(super) fn original_store() -> Result<PathBuf, &'static str> {
     std::fs::canonicalize(root).map_err(|_| "original_storage_unavailable")
 }
 
+const MAX_INLINE_ORIGINAL_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_INLINE_STORE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_INLINE_STORE_FILES: usize = 4096;
+
+fn inline_store_has_capacity(root: &Path, additional: u64) -> Result<(), &'static str> {
+    let mut total = additional;
+    let mut count = 1usize;
+    for entry in std::fs::read_dir(root).map_err(|_| "original_storage_unavailable")? {
+        let metadata =
+            std::fs::symlink_metadata(entry.map_err(|_| "original_storage_unavailable")?.path())
+                .map_err(|_| "original_storage_unavailable")?;
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+            count = count.saturating_add(1);
+        }
+        if total > MAX_INLINE_STORE_BYTES || count > MAX_INLINE_STORE_FILES {
+            return Err("original_storage_full");
+        }
+    }
+    Ok(())
+}
+
 fn inline_original_in(
     source: &str,
     budget: &mut usize,
@@ -77,7 +105,13 @@ fn inline_original_in(
     if !header.starts_with("data:") || !header.ends_with(";base64") {
         return Err("unsupported_inline_source");
     }
+    // Reject obviously oversized base64 payloads before creating staging files.
+    let estimated_bytes = (encoded.len() as u64 / 4).saturating_mul(3);
+    if estimated_bytes > MAX_INLINE_ORIGINAL_BYTES {
+        return Err("inline_source_too_large");
+    }
     private_dir(root).map_err(|_| "original_storage_unavailable")?;
+    inline_store_has_capacity(root, estimated_bytes)?;
     let staging = root.join(format!("{}.pending", uuid::Uuid::new_v4()));
     let result = (|| {
         let mut options = std::fs::OpenOptions::new();
@@ -101,7 +135,10 @@ fn inline_original_in(
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(chunk)
                 .map_err(|_| "invalid_inline_encoding")?;
-            size += decoded.len() as u64;
+            size = size.saturating_add(decoded.len() as u64);
+            if size > MAX_INLINE_ORIGINAL_BYTES {
+                return Err("inline_source_too_large");
+            }
             if head.len() < crate::ASSET_SNIFF_BYTES {
                 head.extend_from_slice(
                     &decoded[..decoded.len().min(crate::ASSET_SNIFF_BYTES - head.len())],
@@ -313,10 +350,7 @@ fn normalize(
     head.truncate(read);
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let kind = crate::sniff_asset_type(&head, &name);
-    let id = format!(
-        "ai_{}",
-        digest(format!("{asid}\n{}", path.display()).as_bytes())
-    );
+    let id = original_asset_id(asid, &path.to_string_lossy());
     let url = format!("/api/agent-images/{id}/original");
     let (width, height) = image_dimensions(&head).unzip();
     let image = kind.kind == AssetKind::Image;
@@ -366,6 +400,7 @@ async fn attach_with_originals_dir(
 ) {
     let mut inputs = Vec::new();
     let mut mirrored_outputs = Vec::new();
+    let mut read_hydrations = Vec::new();
     for (index, item) in items.iter_mut().enumerate() {
         if let Some(sources) = item.attachments.take() {
             let sources = sources
@@ -395,20 +430,54 @@ async fn attach_with_originals_dir(
             ));
         }
         if let AgentPart::Tool(call) = &mut item.part {
-            // Only the native structured imageView's exact file gets the same
-            // explicit account-artifact roots as a paired device file open.
-            // Arbitrary output text and other tool files retain their session fence.
-            let viewed_uri = (call.name == "image_view"
-                && call
-                    .metadata
+            super::tool_media::normalize_tool_call(call);
+            // Completed read-file calls on rich binary/document files (PDF,
+            // Office, audio/video) inside the session workspace that carry no
+            // inline text output get a typed session-fenced file entry. Normal
+            // source code / text reads stay compact foldable `Read` rows.
+            if super::tool_media::is_read_file_tool(&call.name)
+                && call.state == crate::agents::domain::ToolCallStatus::Completed
+                && !super::tool_media::has_text_output(call)
+                && !call
+                    .content
                     .as_ref()
-                    .is_some_and(|m| m["type"] == "imageView" && m["path"] == call.input["path"]))
-            .then(|| {
-                call.input["path"]
-                    .as_str()
-                    .and_then(|p| reqwest::Url::from_file_path(p).ok())
-            })
-            .flatten();
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| {
+                        parts
+                            .iter()
+                            .any(|part| part["type"] == "file" && part["uri"].is_string())
+                    })
+            {
+                if let (Some(session_root), Some(path)) =
+                    (root.as_deref(), super::tool_media::input_path(&call.input))
+                {
+                    if super::tool_media::has_rich_document_extension(path)
+                        && hosted_file(path, session_root).is_some()
+                    {
+                        if let Some(uri) = super::tool_media::path_to_uri(path) {
+                            let block = serde_json::json!({ "type": "file", "uri": uri });
+                            match &mut call.content {
+                                Some(Value::Array(existing)) => existing.push(block),
+                                _ => call.content = Some(Value::Array(vec![block])),
+                            }
+                        }
+                    }
+                }
+            }
+            if root.is_some()
+                && read_hydrations.len() < super::tool_media::MAX_HYDRATED_READS_PER_BATCH
+            {
+                if let Some((path, start_line, end_line)) =
+                    super::tool_media::empty_text_read_request(call)
+                {
+                    read_hydrations.push((index, path, start_line, end_line));
+                }
+            }
+            // Only canonical image-view / read-image calls' exact file gets the
+            // same explicit account-artifact roots as a paired device file open
+            // (with strict image-byte sniffing). Unrelated tools and arbitrary
+            // output text retain their session fence.
+            let viewed_uri = super::tool_media::viewed_image_uri(call);
             if let Some(Value::Array(content)) = &call.content {
                 let raw = call.output.as_ref() == call.content.as_ref();
                 let has_file = content
@@ -427,7 +496,7 @@ async fn attach_with_originals_dir(
                             .and_then(|uri| uri.as_str().map(str::to_owned))
                         {
                             part["uri"] = Value::Null;
-                            let scope = if viewed_uri.as_ref().is_some_and(|v| v.as_str() == uri) {
+                            let scope = if viewed_uri.as_deref() == Some(uri.as_str()) {
                                 FileScope::AccountImageView
                             } else {
                                 FileScope::Session
@@ -439,17 +508,17 @@ async fn attach_with_originals_dir(
             }
         }
     }
-    if inputs.is_empty() {
+    if inputs.is_empty() && read_hydrations.is_empty() {
         return;
     }
     let Ok(permit) = ADMISSION.clone().acquire_owned().await else {
         return;
     };
     let asid = asid.to_owned();
-    let Ok(outputs) = tokio::task::spawn_blocking(move || {
+    let Ok((outputs, hydrated_reads)) = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let mut budget = RESPONSE_WORK_BYTES;
-        inputs
+        let outputs = inputs
             .into_iter()
             .map(|(index, position, sources, scope)| {
                 let sources = sources
@@ -475,7 +544,21 @@ async fn attach_with_originals_dir(
                     .collect::<Vec<_>>();
                 (index, position, sources)
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        let hydrated_reads = match root.as_deref() {
+            Some(session_root) => read_hydrations
+                .into_iter()
+                .filter_map(|(index, path, start_line, end_line)| {
+                    let (hosted, fence) = hosted_file(&path, session_root)?;
+                    let (text, truncated) = super::tool_media::read_workspace_excerpt(
+                        &hosted, &fence, start_line, end_line,
+                    )?;
+                    Some((index, text, truncated))
+                })
+                .collect::<Vec<_>>(),
+            None => Vec::new(),
+        };
+        (outputs, hydrated_reads)
     })
     .await
     else {
@@ -536,6 +619,16 @@ async fn attach_with_originals_dir(
                             .join("\n"),
                     ))
                 };
+            }
+        }
+    }
+    for (index, text, truncated) in hydrated_reads {
+        if let AgentPart::Tool(call) = &mut items[index].part {
+            if !super::tool_media::has_text_output(call) {
+                call.output = Some(Value::String(text));
+                if truncated {
+                    call.truncated = true;
+                }
             }
         }
     }
@@ -817,6 +910,7 @@ async fn original_response(
         .header("etag", &etag)
         .header("accept-ranges", "bytes")
         .header("cache-control", "private, no-store")
+        .header("content-security-policy", "sandbox")
         .header(
             "content-disposition",
             format!(
@@ -916,6 +1010,7 @@ mod tests {
             attachments: Some(sources),
             image_assets: None,
             generation: None,
+            origin: None,
         }
     }
     async fn read(state: &AppState, id: &str, variant: &str, headers: HeaderMap) -> Response {
@@ -1862,6 +1957,300 @@ mod tests {
             .unwrap_err()
             .0,
             StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+    }
+
+    #[tokio::test]
+    async fn unified_tool_media_covers_acp_antigravity_pi_claude_opencode_deepseek_and_t3() {
+        let (_scratch, root) = workspace();
+        let (_outside_scratch, outside) = workspace();
+        let outside_png = outside.join("mao_dev_light_v2.png");
+        std::fs::write(&outside_png, png(320, 200, 42)).unwrap();
+        let fake_png = outside.join("secret.png");
+        std::fs::write(&fake_png, b"not-an-image-credential").unwrap();
+        let workspace_pdf = root.join("design.pdf");
+        std::fs::write(&workspace_pdf, b"%PDF-1.7\nUnified card").unwrap();
+        let workspace_rs = root.join("lib.rs");
+        std::fs::write(&workspace_rs, b"fn one() {}\nfn two() {}\nfn three() {}\n").unwrap();
+        let outside_txt = outside.join("private.txt");
+        std::fs::write(&outside_txt, b"private outside text").unwrap();
+
+        let state = crate::test_state("admin", vec![crate::test_device("phone", "token")]);
+
+        // 1. Antigravity ACP `read_file` with PascalCase `Path` pointing outside workspace.
+        let mut projection = crate::agents::adapters::acp::mapper::Projection::new(false);
+        projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "ag-img",
+                "name": "read_file",
+                "title": "File ../../../.gemini/scratch/mao_dev_light_v2.png",
+                "status": "completed",
+                "rawInput": { "Path": outside_png },
+            }))
+            .unwrap();
+        // 2. Antigravity ACP `read_file` on a fake `.png` outside workspace -> must be refused.
+        projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "ag-fake",
+                "name": "read_file",
+                "status": "completed",
+                "rawInput": { "Path": fake_png },
+            }))
+            .unwrap();
+        // 3. Antigravity ACP `read_file` on a workspace `.pdf` with empty output -> workspace file card.
+        projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "ag-pdf",
+                "name": "read_file",
+                "status": "completed",
+                "rawInput": { "Path": workspace_pdf },
+            }))
+            .unwrap();
+        // 3b. Antigravity ACP `read_file` on a workspace `.rs` code file -> stays a compact Read row with hydrated lines.
+        projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "ag-rs",
+                "name": "read_file",
+                "status": "completed",
+                "rawInput": { "Path": workspace_rs, "StartLine": 2, "EndLine": 3 },
+            }))
+            .unwrap();
+        // 4. Antigravity ACP `read_file` on an outside non-image file -> must NOT synthesize file asset.
+        projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "ag-outside-txt",
+                "name": "read_file",
+                "status": "completed",
+                "rawInput": { "Path": outside_txt },
+            }))
+            .unwrap();
+        // 5. Claude ACP `Read` returning nested ACP inline image content block.
+        let encoded = base64::engine::general_purpose::STANDARD.encode(png(160, 120, 7));
+        projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "claude-img",
+                "name": "Read",
+                "status": "completed",
+                "rawInput": { "file_path": "/tmp/claude.png" },
+                "content": [{
+                    "type": "content",
+                    "content": { "type": "image", "data": encoded, "mimeType": "image/png" }
+                }],
+            }))
+            .unwrap();
+        // 6. Antigravity ACP `edit_file` -> canonical `edit` with unified `metadata.files` diff & no `{}` output.
+        projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "ag-edit",
+                "name": "edit_file",
+                "title": "File src/lib.rs",
+                "status": "completed",
+                "rawInput": { "Path": "/w/src/lib.rs", "Target": "let a = 1;\n", "Replacement": "let a = 2;\n" },
+                "rawOutput": {},
+            }))
+            .unwrap();
+        // 7. Antigravity ACP `update_steps` -> native Todo checklist part.
+        let todo_row = projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "ag-steps",
+                "name": "update_steps",
+                "status": "completed",
+                "rawInput": { "steps": [{ "title": "Audit adapters", "status": "done" }, { "title": "Verify UI", "status": "in_progress" }] },
+            }))
+            .unwrap()
+            .expect("update_steps produces Todo row");
+        assert!(matches!(
+            &todo_row.part,
+            AgentPart::Todo { items } if items.len() == 2 && items[0].done && !items[1].done
+        ));
+
+        let mut items = projection.timeline();
+        super::super::attach_to_items(&state, "acp-unified", root.to_str(), &mut items).await;
+
+        let by_id = |call_id: &str| {
+            items
+                .iter()
+                .find(|row| matches!(&row.part, AgentPart::Tool(c) if c.id == call_id))
+                .expect(call_id)
+        };
+
+        // Antigravity image read: normalized `path`, served preview + download.
+        let ag_img = by_id("ag-img");
+        let AgentPart::Tool(call) = &ag_img.part else {
+            panic!()
+        };
+        assert_eq!(
+            call.input.get("path").and_then(Value::as_str),
+            outside_png.to_str()
+        );
+        assert!(call.input.get("Path").is_none());
+        let asset = &ag_img.image_assets.as_ref().unwrap()[0];
+        assert!(asset.unavailable_reason.is_none());
+        assert_eq!(asset.mime, "image/png");
+        assert!(asset.preview_url.is_some());
+        assert_eq!(call.content.as_ref().unwrap()[0]["uri"], asset.url);
+
+        // Fake `.png` outside workspace: strictly refused with no download URL.
+        let ag_fake = by_id("ag-fake");
+        let fake_asset = &ag_fake.image_assets.as_ref().unwrap()[0];
+        assert_eq!(
+            fake_asset.unavailable_reason.as_deref(),
+            Some("image_content_unavailable")
+        );
+        assert!(fake_asset.download_url.is_none());
+
+        // Workspace `.pdf` empty-output read: session-fenced file card asset.
+        let ag_pdf = by_id("ag-pdf");
+        let pdf_asset = &ag_pdf.image_assets.as_ref().unwrap()[0];
+        assert!(pdf_asset.unavailable_reason.is_none());
+        assert_eq!(pdf_asset.mime, "application/pdf");
+        assert!(pdf_asset.download_url.is_some());
+
+        // Workspace `.rs` source-code read: compact Read row (no file card) with hydrated line-numbered excerpt.
+        let ag_rs = by_id("ag-rs");
+        assert!(ag_rs.image_assets.is_none());
+        let AgentPart::Tool(rs_call) = &ag_rs.part else {
+            panic!()
+        };
+        assert_eq!(
+            rs_call.output.as_ref().and_then(Value::as_str),
+            Some("2: fn two() {}\n3: fn three() {}")
+        );
+
+        // Outside non-image text file: zero assets attached and NEVER hydrated.
+        let ag_outside = by_id("ag-outside-txt");
+        assert!(ag_outside.image_assets.is_none());
+        let AgentPart::Tool(out_call) = &ag_outside.part else {
+            panic!()
+        };
+        assert!(out_call.output.is_none());
+
+        // Claude ACP nested inline image: base64 stripped, authenticated asset minted.
+        let claude_img = by_id("claude-img");
+        assert!(!serde_json::to_string(claude_img)
+            .unwrap()
+            .contains("base64"));
+        let c_asset = &claude_img.image_assets.as_ref().unwrap()[0];
+        assert!(c_asset.unavailable_reason.is_none());
+        assert_eq!(c_asset.mime, "image/png");
+
+        // Antigravity `edit_file`: canonical `edit`, unified diff in `metadata.files`, empty `{}` cleared.
+        let ag_edit = by_id("ag-edit");
+        let AgentPart::Tool(edit_call) = &ag_edit.part else {
+            panic!()
+        };
+        assert_eq!(edit_call.name, "edit");
+        assert!(edit_call.output.is_none());
+        assert!(edit_call.title.is_none());
+        assert_eq!(
+            edit_call.metadata.as_ref().unwrap()["files"][0]["additions"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            edit_call.metadata.as_ref().unwrap()["files"][0]["deletions"],
+            serde_json::json!(1)
+        );
+
+        // 6. Pi `read` toolResult with `{type:"image", data, mimeType}`.
+        let pi_entries = vec![
+            serde_json::json!({
+                "type": "message",
+                "id": "m1",
+                "timestamp": "2026-11-27T00:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "type": "toolCall", "id": "pi-read", "name": "read", "arguments": { "path": "shot.png" } }]
+                }
+            }),
+            serde_json::json!({
+                "type": "message",
+                "id": "m2",
+                "timestamp": "2026-11-27T00:00:01Z",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": "pi-read",
+                    "isError": false,
+                    "content": [
+                        { "type": "text", "text": "Read image file [image/png]" },
+                        { "type": "image", "data": encoded, "mimeType": "image/png" }
+                    ]
+                }
+            }),
+        ];
+        let mut pi_items = crate::agents::adapters::pi::mapper::timeline_from_entries(&pi_entries);
+        super::super::attach_to_items(&state, "pi-unified", root.to_str(), &mut pi_items).await;
+        assert!(!serde_json::to_string(&pi_items).unwrap().contains("base64"));
+        let pi_asset = &pi_items[0].image_assets.as_ref().unwrap()[0];
+        assert!(pi_asset.unavailable_reason.is_none());
+        assert_eq!(pi_asset.mime, "image/png");
+
+        // 7. Single standalone read tool event (like a live SSE TimelineUpsert
+        //    with `content: None`) must NOT be short-circuited by `attach_rows`.
+        let mut sse_projection = crate::agents::adapters::acp::mapper::Projection::new(false);
+        sse_projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "sse-rs",
+                "name": "read_file",
+                "status": "completed",
+                "rawInput": { "Path": workspace_rs, "StartLine": 2, "EndLine": 3 },
+                "rawOutput": {},
+            }))
+            .unwrap();
+        let mut sse_items = sse_projection.timeline();
+        super::super::attach_to_items(&state, "sse-unified", root.to_str(), &mut sse_items).await;
+        let AgentPart::Tool(sse_call) = &sse_items[0].part else {
+            panic!()
+        };
+        assert_eq!(sse_call.name, "read");
+        assert_eq!(
+            sse_call.output.as_ref().and_then(Value::as_str),
+            Some("2: fn two() {}\n3: fn three() {}")
+        );
+
+        // 8. In-process Desktop `enrich_timeline` gets the same unified assets
+        //    and hydrated workspace read excerpts.
+        let mut desktop_projection = crate::agents::adapters::acp::mapper::Projection::new(false);
+        desktop_projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "desk-img",
+                "name": "read_file",
+                "status": "completed",
+                "rawInput": { "Path": outside_png },
+            }))
+            .unwrap();
+        desktop_projection
+            .update(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "desk-rs",
+                "name": "read_file",
+                "status": "completed",
+                "rawInput": { "Path": workspace_rs, "StartLine": 1, "EndLine": 2 },
+                "rawOutput": {},
+            }))
+            .unwrap();
+        let mut desktop_items = desktop_projection.timeline();
+        super::super::enrich_timeline("desk-unified", root.to_str(), &mut desktop_items);
+        let d_asset = &desktop_items[0].image_assets.as_ref().unwrap()[0];
+        assert_eq!(d_asset.mime, "image/png");
+        assert_eq!(d_asset.width, Some(320));
+        assert_eq!(d_asset.height, Some(200));
+        let AgentPart::Tool(desk_rs_call) = &desktop_items[1].part else {
+            panic!()
+        };
+        assert_eq!(desk_rs_call.name, "read");
+        assert_eq!(
+            desk_rs_call.output.as_ref().and_then(Value::as_str),
+            Some("1: fn one() {}\n2: fn two() {}")
         );
     }
 }

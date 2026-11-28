@@ -21,8 +21,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Match the validated Desktop compiler; async-stream 0.3.6 is not yet
+      # compatible with Rust 1.100 never-type inference.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.1
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
@@ -31,6 +34,9 @@ jobs:
       # same way it does on a developer machine.
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
+
+      - name: Verify release mirroring offline
+        run: python3 -m unittest discover -s scripts/tests -p test_mirror_release.py
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -51,8 +57,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Match the validated Desktop compiler; async-stream 0.3.6 is not yet
+      # compatible with Rust 1.100 never-type inference.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.1
           components: clippy
 
       - uses: Swatinem/rust-cache@v2

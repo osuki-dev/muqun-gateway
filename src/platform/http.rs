@@ -273,6 +273,13 @@ pub(crate) fn still_paired(state: &AppState, device_id: &str) -> bool {
 /// the pending code plus its request id is exactly what an attacker on the
 /// same network needs to claim a pairing before the user does.
 pub(crate) fn require_admin(config: &Config, headers: &HeaderMap) -> ApiResult<()> {
+    if crate::mcp::auth::refuse_for_proxy(headers) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "invalid_token",
+            "invalid token",
+        ));
+    }
     let token = bearer_token(headers)?;
     if !authority::authenticates_admin(&config.token_hash, token) {
         return Err(api_error(
@@ -280,6 +287,57 @@ pub(crate) fn require_admin(config: &Config, headers: &HeaderMap) -> ApiResult<(
             "invalid_token",
             "invalid token",
         ));
+    }
+    Ok(())
+}
+
+/// Reject cross-site WebSocket upgrades initiated by browsers. Native Muqun
+/// clients omit `Origin` (or send a same-origin value matching `Host`).
+pub(crate) fn validate_ws_origin(headers: &HeaderMap) -> ApiResult<()> {
+    let Some(raw_origin) = headers.get(axum::http::header::ORIGIN) else {
+        return Ok(());
+    };
+    let refuse = || {
+        api_error(
+            StatusCode::FORBIDDEN,
+            "forbidden_origin",
+            "cross-origin WebSocket upgrades are not allowed",
+        )
+    };
+    let Ok(origin_str) = raw_origin.to_str() else {
+        return Err(refuse());
+    };
+    let Ok(origin_url) = reqwest::Url::parse(origin_str.trim()) else {
+        return Err(refuse());
+    };
+    if !matches!(origin_url.scheme(), "http" | "https") {
+        return Err(refuse());
+    }
+    let Some(origin_host) = origin_url.host_str() else {
+        return Err(refuse());
+    };
+    let Some(host_str) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Err(refuse());
+    };
+    let expected_host = super::server::host_name(host_str);
+    let actual_host = super::server::host_name(origin_host);
+    if expected_host.is_empty() || actual_host != expected_host {
+        return Err(refuse());
+    }
+    let host_port = host_str.trim().rsplit_once(':').and_then(|(h, p)| {
+        if h.contains(']') || !h.contains(':') {
+            p.parse::<u16>().ok()
+        } else {
+            None
+        }
+    });
+    if let Some(expected_port) = host_port {
+        if origin_url.port_or_known_default() != Some(expected_port) {
+            return Err(refuse());
+        }
     }
     Ok(())
 }

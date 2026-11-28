@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Muqun
+GenericName=Coding Agents
+GenericName[zh_CN]=编程智能体
+Comment=Every coding agent on this computer in one window
+Comment[zh_CN]=这台电脑上的编程智能体，汇于一个窗口
+Exec=muqun-desktop %f
+TryExec=muqun-desktop
+Icon=muqun-desktop
+Terminal=false
+Categories=Development;IDE;
+Keywords=agent;coding;ai;codex;claude;opencode;muqun;
+StartupNotify=true
+StartupWMClass=muqun-desktop
+SingleMainWindow=true

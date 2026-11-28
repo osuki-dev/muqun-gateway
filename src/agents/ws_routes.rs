@@ -152,6 +152,10 @@ pub(crate) struct HistoryRequest {
     pub request_id: String,
     pub asid: String,
     pub operation: String,
+    pub limit: Option<usize>,
+    pub if_seq: Option<u64>,
+    #[serde(default)]
+    pub retained: bool,
     #[serde(default)]
     pub refresh: bool,
     #[serde(default)]
@@ -661,6 +665,9 @@ async fn open_event_socket(
     headers: HeaderMap,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
+    if let Err(refusal) = crate::platform::http::validate_ws_origin(&headers) {
+        return refusal.into_response();
+    }
     let caller = match require_device_or_peer(&state, &headers) {
         Ok(caller) => caller,
         Err(error) => return error.into_response(),
@@ -946,13 +953,26 @@ impl Connection {
                         let request = request.clone();
                         let state = state.clone();
                         history_workers.spawn(async move {
-                            let result = tokio::time::timeout(Duration::from_secs(30), super::routes::socket_history(&state, &request.asid, &request.operation, request.refresh, request.after, request.cursor.as_deref())).await;
+                            let result = tokio::time::timeout(Duration::from_secs(30), super::routes::socket_history(&state, &request)).await;
                             let (mut status, mut body) = match result {
                                 Ok(Ok(axum::Json(body))) => (200, body),
                                 Ok(Err((status, axum::Json(body)))) => (status.as_u16(), body),
                                 Err(_) => (504, serde_json::json!({"error":{"code":"history_timeout","message":"History request timed out; refresh before retrying"}})),
                             };
-                            if body.to_string().len() > 16 * 1024 * 1024 {
+                            // Uncompressed WS frames expand ~1.33x after AES-GCM + Base64.
+                            // Route large idempotent `snapshot`/`window` replies to gzipped
+                            // sealed HTTP (4x-6x smaller on mobile/cellular) via the existing
+                            // 413 fallback, while keeping the full 16 MiB budget for paged
+                            // `earlier`/`page`/`delta` replies that do not repeat over HTTP.
+                            let budget = if matches!(
+                                request.operation.as_str(),
+                                "snapshot" | "window"
+                            ) {
+                                128 * 1024
+                            } else {
+                                16 * 1024 * 1024
+                            };
+                            if body.to_string().len() > budget {
                                 status = 413;
                                 body = serde_json::json!({"error":{"code":"history_response_too_large","message":"History response exceeds the socket budget"}});
                             }

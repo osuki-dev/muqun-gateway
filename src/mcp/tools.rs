@@ -3,12 +3,20 @@
 //! long work returns a handle that `tasks.wait` polls.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
+use rmcp::model::{
+    CallToolResult, CancelTaskParams, ContentBlock, DetailedTask, GetSkillRequestParams,
+    GetSkillResult, GetTaskParams, GetTaskResult, Implementation, JsonObject, ListResourcesResult,
+    ListSkillsResult, PaginatedRequestParams, ReadResourceDirectoryRequestParams,
+    ReadResourceDirectoryResult, ReadResourceRequestParams, ReadResourceResponse,
+    ServerCapabilities, ServerConfig, Task as McpTask, TaskPayload, TaskStatus,
+};
 use rmcp::schemars::{self, JsonSchema};
+use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -284,7 +292,7 @@ fn reply<T: Serialize>(result: Result<T, TaskError>) -> Result<CallToolResult, E
     })
 }
 
-/// What `exec.run` answers: the handle, the output so far, and the pane.
+/// What `exec.run` answers: the handle, redacted/reduced output, and the pane.
 fn command_result(handle: RunHandle) -> Value {
     let pane = match &handle.task.binding {
         TaskBinding::Pane {
@@ -294,14 +302,48 @@ fn command_result(handle: RunHandle) -> Value {
         } => json!({ "session_id": session_id, "pane_id": pane_id }),
         _ => Value::Null,
     };
-    json!({
+    let reduced =
+        super::reducer::reduce_command_output(&handle.stdout_tail, handle.exit_code, 10 * 1024);
+    let mut out = json!({
         "task_id": handle.task.id.0,
         "state": handle.task.state,
         "exit_code": handle.exit_code,
-        "stdout_tail": handle.stdout_tail,
+        "stdout_tail": reduced.stdout_tail,
         "duration_ms": handle.duration_ms,
         "pane": pane,
-    })
+    });
+    if !reduced.key_errors.is_empty() {
+        out["key_errors"] = json!(reduced.key_errors);
+    }
+    if reduced.omitted_lines > 0 {
+        out["omitted_lines"] = json!(reduced.omitted_lines);
+        out["original_bytes"] = json!(reduced.original_bytes);
+    }
+    if reduced.redacted {
+        out["redacted"] = json!(true);
+    }
+    out
+}
+
+fn sanitize_waited(waited: &mut crate::tasks::service::Waited) -> Vec<String> {
+    let mut key_errors = Vec::new();
+    if let Some(ref mut tail) = waited.stdout_tail {
+        let reduced = super::reducer::reduce_command_output(tail, waited.task.exit_code, 8 * 1024);
+        *tail = reduced.stdout_tail;
+        key_errors.extend(reduced.key_errors);
+    }
+    if let Some(ref mut answer) = waited.answer {
+        let (clean, _) = super::reducer::redact_secrets(answer);
+        if key_errors.is_empty() {
+            key_errors.extend(super::reducer::extract_key_errors(&clean, 6));
+        }
+        *answer = clean;
+    }
+    if let Some(ref mut summary) = waited.task.summary {
+        let (clean, _) = super::reducer::redact_secrets(summary);
+        *summary = clean;
+    }
+    key_errors
 }
 
 /// An absolute, existing directory, canonicalized.
@@ -377,6 +419,19 @@ pub(crate) struct DelegateArgs {
     /// For a terminal agent: the terminal session to start it in, by its id on that computer (e.g. "default" for tmux, or a Herdr session's id). Default: the first that answers.
     #[serde(default)]
     pub terminal: Option<String>,
+    /// Optional task_id of a previous completed/idle sub-task you created: sends this goal as a follow-up in that same warm agent session instead of cold-starting a new session.
+    #[serde(default)]
+    pub reuse_task_id: Option<String>,
+    /// Optional parallel barrier group key (<=128 chars): when delegating multiple async sub-tasks, Muqun holds individual notices until every task in the group settles and wakes you once with a combined summary.
+    #[serde(default)]
+    pub barrier_group: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct SkillReadArgs {
+    /// Skill name, slug, or URI (`skill://muqun/<slug>/SKILL.md`). Omit to list available Muqun playbooks.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 impl DelegateArgs {
@@ -429,11 +484,26 @@ impl DelegateArgs {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WaitFor {
+    #[default]
+    All,
+    Any,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct WaitArgs {
-    /// A task_id from tasks.delegate or exec.run.
-    pub task_id: String,
-    /// Seconds to wait (1..=45, default 30). Call again while it is working.
+    /// A single task_id from tasks.delegate or exec.run.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Batch parallel wait: up to 16 task_ids to wait on concurrently in one call (avoids multi-turn polling loops).
+    #[serde(default)]
+    pub task_ids: Option<Vec<String>>,
+    /// With task_ids: "all" (default) waits until every task settles or timeout; "any" returns as soon as the first task settles.
+    #[serde(default)]
+    pub wait_for: Option<WaitFor>,
+    /// Seconds to wait (1..=45, default 30). Call again while work is still running.
     #[serde(default)]
     pub timeout_s: Option<u64>,
 }
@@ -495,6 +565,33 @@ pub(crate) struct CompleteArgs {
     pub outcome: Outcome,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct HubSearchToolsArgs {
+    /// Optional keywords to search across upstream MCP tool names, servers, and descriptions. Omit to list available servers and top tools.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Optional upstream server id to restrict search to.
+    #[serde(default)]
+    pub server: Option<String>,
+    /// "summary" (default, compact name + description) or "schema" (includes inputSchema for calling).
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Maximum tools to return (1..=50, default 20).
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct HubCallToolArgs {
+    /// Registered upstream MCP server id (from hub.search_tools).
+    pub server: String,
+    /// Upstream tool name (from hub.search_tools).
+    pub tool: String,
+    /// JSON object of arguments for the upstream tool.
+    #[serde(default)]
+    pub arguments: Option<Value>,
+}
+
 #[derive(Clone)]
 pub(crate) struct MuqunMcp {
     state: AppState,
@@ -506,18 +603,121 @@ pub(crate) struct MuqunMcp {
     /// The computers the task's agent may hand work to ([`fleet_line`]),
     /// told in its instructions.
     fleet: Option<String>,
+    /// Whether `tools/list`, `get_tool`, and instructions expose underscore
+    /// tool names (`exec_run`, `fleet_list`, …) for strict hosts like
+    /// Antigravity whose tool-name validator forbids dots. `tools/call`
+    /// always accepts both dotted and underscore spellings.
+    underscore_tool_names: bool,
     tool_router: ToolRouter<Self>,
+}
+
+/// Canonical dotted built-in tool names paired with their underscore aliases
+/// (`^[a-zA-Z0-9_-]{1,64}$`, even with host prefixes like `mcp_muqun_`).
+const BUILTIN_TOOL_ALIASES: &[(&str, &str)] = &[
+    ("exec.run", "exec_run"),
+    ("files.present", "files_present"),
+    ("fleet.describe", "fleet_describe"),
+    ("fleet.list", "fleet_list"),
+    ("hub.call_tool", "hub_call_tool"),
+    ("hub.search_tools", "hub_search_tools"),
+    ("skills.read", "skills_read"),
+    ("tasks.cancel", "tasks_cancel"),
+    ("tasks.complete", "tasks_complete"),
+    ("tasks.delegate", "tasks_delegate"),
+    ("tasks.read", "tasks_read"),
+    ("tasks.wait", "tasks_wait"),
+];
+
+pub(crate) fn canonical_tool_name(name: &str) -> Option<&'static str> {
+    BUILTIN_TOOL_ALIASES
+        .iter()
+        .find(|&&(dotted, underscored)| name == dotted || name == underscored)
+        .map(|&(dotted, _)| dotted)
+}
+
+fn underscore_tool_name(name: &str) -> Option<&'static str> {
+    BUILTIN_TOOL_ALIASES
+        .iter()
+        .find(|&&(dotted, underscored)| name == dotted || name == underscored)
+        .map(|&(_, underscored)| underscored)
+}
+
+fn rewrite_tool_names_to_underscore(text: &str) -> String {
+    let mut out = text.to_owned();
+    for &(dotted, underscored) in BUILTIN_TOOL_ALIASES {
+        out = out.replace(dotted, underscored);
+    }
+    out
+}
+
+pub(crate) fn agent_uses_underscore_tool_names(agent_id: &str) -> bool {
+    agent_id == "antigravity"
+}
+
+fn session_uses_underscore_tool_names(session: &AssistantSession) -> bool {
+    match &session.binding {
+        crate::mcp::tokens::TokenBinding::Runtime { agent_id }
+        | crate::mcp::tokens::TokenBinding::Agent { agent_id } => {
+            agent_uses_underscore_tool_names(agent_id)
+        }
+        crate::mcp::tokens::TokenBinding::Pane { .. }
+        | crate::mcp::tokens::TokenBinding::Task { .. } => false,
+    }
+}
+
+pub(crate) async fn uses_underscore_tool_names(
+    state: &AppState,
+    session: &AssistantSession,
+) -> bool {
+    if session_uses_underscore_tool_names(session) {
+        return true;
+    }
+    let Some(task) = task_of(state, session).await else {
+        return false;
+    };
+    match &task.binding {
+        TaskBinding::AgentSession { agent_id, .. } => agent_uses_underscore_tool_names(agent_id),
+        TaskBinding::Pane {
+            agent_id: Some(agent_id),
+            ..
+        } => agent_uses_underscore_tool_names(agent_id),
+        _ => false,
+    }
+}
+
+static CACHED_TOOL_ROUTER: OnceLock<ToolRouter<MuqunMcp>> = OnceLock::new();
+
+/// Preview metadata for every built-in tool served on `/mcp`, derived directly
+/// from the cached `ToolRouter` so the management UI stays in sync.
+pub(crate) fn builtin_tool_previews() -> Vec<super::hub::UpstreamToolPreview> {
+    let mut tools: Vec<super::hub::UpstreamToolPreview> = CACHED_TOOL_ROUTER
+        .get_or_init(MuqunMcp::tool_router)
+        .list_all()
+        .into_iter()
+        .map(|tool| super::hub::UpstreamToolPreview {
+            name: tool.name.to_string(),
+            description: tool.description.map(|d| d.to_string()).unwrap_or_default(),
+            input_schema: super::hub::preview_input_schema(Value::Object(
+                (*tool.input_schema).clone(),
+            )),
+        })
+        .collect();
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    tools
 }
 
 #[tool_router(router = tool_router)]
 impl MuqunMcp {
     pub(crate) fn new(state: AppState, session: AssistantSession) -> Self {
+        let tool_router = CACHED_TOOL_ROUTER.get_or_init(Self::tool_router).clone();
+        let underscore_tool_names = session_uses_underscore_tool_names(&session);
         Self {
             state,
             session,
             in_task: false,
             fleet: None,
-            tool_router: Self::tool_router(),
+            underscore_tool_names,
+            tool_router,
         }
     }
 
@@ -533,13 +733,34 @@ impl MuqunMcp {
         self
     }
 
+    /// Expose underscore tool names (`exec_run`, `fleet_list`, …) to strict
+    /// hosts whose MCP tool-name validator rejects dots.
+    pub(crate) fn underscore_tool_names(mut self, enabled: bool) -> Self {
+        self.underscore_tool_names = enabled;
+        self
+    }
+
+    fn format_tool(&self, mut tool: rmcp::model::Tool) -> rmcp::model::Tool {
+        if self.underscore_tool_names {
+            if let Some(underscored) = underscore_tool_name(tool.name.as_ref()) {
+                tool.name = std::borrow::Cow::Borrowed(underscored);
+            }
+            if let Some(desc) = tool.description {
+                tool.description = Some(std::borrow::Cow::Owned(rewrite_tool_names_to_underscore(
+                    desc.as_ref(),
+                )));
+            }
+        }
+        tool
+    }
+
     fn by(&self) -> TaskPrincipal {
         self.session.principal()
     }
 
     #[tool(
         name = "fleet.list",
-        description = "List the computers this gateway can hand work to: this one and every linked one, with OS, what each is suitable for, whether it is reachable and how busy it is."
+        description = "List this computer and linked computers with OS, reachability, and load."
     )]
     async fn fleet_list(&self) -> Result<CallToolResult, ErrorData> {
         let machines = self.state.fleet.list(&self.state).await;
@@ -548,7 +769,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "fleet.describe",
-        description = "What a computer offers: its agents (status, version, modes, model count), terminal backends, toolchains with versions, task counts and what it is suitable for. Without machine, this computer plus a short entry per linked computer (peers)."
+        description = "Inspect a computer's agents, models, live quota health, toolchains, and peers (omit machine for self + peer summaries)."
     )]
     async fn fleet_describe(
         &self,
@@ -586,7 +807,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "files.present",
-        description = "Share a file from this computer or a linked computer with machine. Uses the same file permissions and preview/download handling as opening a local session file. Any file type can be downloaded; supported types can also be previewed. The App must be paired with the source computer. No public URL or credentials are returned."
+        description = "Present a file on this computer or a linked machine for preview/download in Muqun Desktop/App."
     )]
     async fn present_file(
         &self,
@@ -635,7 +856,7 @@ impl MuqunMcp {
 
     #[tool(
         name = "exec.run",
-        description = "Run a shell command in a visible terminal pane on this computer, or (machine) on a linked computer, and return its exit code and output tail. Blocks up to timeout_s (max 45); if still running, returns a task_id for tasks.wait. For a command or a short script on another computer use this first, before your own SSH and not tasks.delegate: it is visible, recorded, interruptible and approved there, and no agent is started."
+        description = "Run a shell command in a visible pane on this computer or a linked machine (blocks <=45s, else returns task_id). Prefer this over SSH or tasks.delegate for commands/scripts."
     )]
     async fn exec_run(
         &self,
@@ -724,17 +945,34 @@ impl MuqunMcp {
             TaskBinding::Peer { peer_server_id, .. } => peer_server_id.as_str(),
             _ => "",
         };
+        let reduced = run
+            .stdout_tail
+            .as_deref()
+            .map(|raw| super::reducer::reduce_command_output(raw, run.exit_code, 10 * 1024));
+        let stdout_tail = reduced.as_ref().map(|r| r.stdout_tail.as_str());
         let mut result = json!({
             "task_id": run.task.task_id, "state":run.task.state,
-            "exit_code":run.exit_code, "stdout_tail":run.stdout_tail, "machine":machine,
+            "exit_code":run.exit_code, "stdout_tail":stdout_tail, "machine":machine,
         });
+        if let Some(ref reduced) = reduced {
+            if !reduced.key_errors.is_empty() {
+                result["key_errors"] = json!(reduced.key_errors);
+            }
+            if reduced.omitted_lines > 0 {
+                result["omitted_lines"] = json!(reduced.omitted_lines);
+                result["original_bytes"] = json!(reduced.original_bytes);
+            }
+            if reduced.redacted {
+                result["redacted"] = json!(true);
+            }
+        }
         super::files::attach_output(&mut result, server_id, &machine, false);
         Ok(ok(result))
     }
 
     #[tool(
         name = "tasks.delegate",
-        description = "Start a sub-task on an agent, on this computer or (machine) on a linked one: a new native agent session in cwd with your goal as the first prompt (an agent with no native adapter here starts in a new terminal pane). Returns task_id. If the work will take long, end your turn after delegating; you will be told when it finishes. Use tasks.wait only for short jobs. One hop only: a task another computer handed here cannot hand work to a linked computer (delegation_loop)."
+        description = "Delegate a goal to a coding agent on this computer or a linked machine (supports reuse_task_id for warm local sessions and barrier_group for single-wakeup parallel fan-out). Returns task_id; end your turn for long jobs."
     )]
     async fn tasks_delegate(
         &self,
@@ -742,9 +980,27 @@ impl MuqunMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let goal = args.goal.clone();
         let machine = args.machine.clone();
+        let reuse_task_id = args
+            .reuse_task_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let barrier_group = match args.barrier_group.as_deref() {
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if !crate::tasks::domain::valid_barrier_group(trimmed) {
+                    return Ok(invalid(
+                        "barrier_group must be non-empty, at most 128 bytes, and contain no control characters",
+                    ));
+                }
+                Some(trimmed.to_owned())
+            }
+            None => None,
+        };
         let config = &self.state.config;
         let peers = self.state.peers.selectors();
-        let request = match args.request(&config.server_id, &config.label, &peers) {
+        let mut request = match args.request(&config.server_id, &config.label, &peers) {
             Ok(request) => request,
             Err(refused) => return Ok(refused),
         };
@@ -765,13 +1021,45 @@ impl MuqunMcp {
             lineage::requested(&self.state, &self.session, &call).await
         };
         let caller = lineage::caller_session(&self.state, &self.session, &call).await;
-        let view = match self.state.tasks.delegate(&self.state, by, request).await {
-            Ok(view) => view,
-            Err(error) => return Ok(task_error(error)),
+        let view = if let Some(reuse_id) = reuse_task_id {
+            if remote {
+                return Ok(invalid(
+                    "reuse_task_id is only supported for sub-tasks on this computer",
+                ));
+            }
+            let prev = match self.state.tasks.owned(&self.by(), &TaskId(reuse_id)).await {
+                Ok(task) => task,
+                Err(error) => return Ok(task_error(error)),
+            };
+            let TaskBinding::AgentSession { agent_id, asid } = prev.binding else {
+                return Ok(invalid(
+                    "reuse_task_id must refer to an agent session sub-task",
+                ));
+            };
+            if request.agent_id.is_none() {
+                request.agent_id = Some(agent_id);
+            }
+            match self
+                .state
+                .tasks
+                .delegate_in_session(&self.state, by, request, Some(&asid), None, false, None)
+                .await
+            {
+                Ok(view) => view,
+                Err(error) => return Ok(task_error(error)),
+            }
+        } else {
+            match self.state.tasks.delegate(&self.state, by, request).await {
+                Ok(view) => view,
+                Err(error) => return Ok(task_error(error)),
+            }
         };
         let id = TaskId(view.task_id.clone());
         if let Some(caller) = caller {
-            self.state.tasks.notify(&id, &caller).await;
+            self.state
+                .tasks
+                .notify_with_barrier(&id, &caller, barrier_group.as_deref())
+                .await;
         }
         if let (Some(parent), Ok(Some(child))) = (
             view.parent_task_id.as_ref(),
@@ -781,6 +1069,9 @@ impl MuqunMcp {
             self.state.tasks.waits_on(&parent, &child).await;
         }
         let mut body = json!(view);
+        if let Some(group) = barrier_group {
+            body["barrier_group"] = json!(group);
+        }
         // The create went out and got no answer: whether it started is unknown.
         if let TaskBinding::Peer {
             remote_task_id,
@@ -801,13 +1092,148 @@ impl MuqunMcp {
 
     #[tool(
         name = "tasks.wait",
-        description = "Wait up to timeout_s (max 45) for a task to reach done/failed/waiting, or idle_unconfirmed (its agent stopped without completing: read its answer and decide; do not call again while it says idle_unconfirmed). Returns the current state and summary. If the work will take long, end your turn after delegating; you will be told when it finishes. Use tasks.wait only for short jobs."
+        description = "Wait <=45s for one task_id or parallel task_ids (up to 16, wait_for: \"all\"|\"any\") to settle; returns compact redacted summary and key_errors. For long jobs, end your turn instead of polling."
     )]
     async fn tasks_wait(
         &self,
         Parameters(args): Parameters<WaitArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (id, slice) = (TaskId(args.task_id), wait_slice(args.timeout_s));
+        let slice = wait_slice(args.timeout_s);
+        let batch_ids: Vec<String> = args
+            .task_ids
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+            .fold(Vec::new(), |mut acc, id| {
+                if !acc.contains(&id) {
+                    acc.push(id);
+                }
+                acc
+            });
+
+        if !batch_ids.is_empty() {
+            if batch_ids.len() > 16 {
+                return Ok(invalid("task_ids accepts at most 16 tasks per call"));
+            }
+            let wait_for = args.wait_for.unwrap_or_default();
+            let by = self.by();
+            let tasks = &self.state.tasks;
+            let results: Vec<(String, Result<crate::tasks::service::Waited, TaskError>)> =
+                match wait_for {
+                    WaitFor::All => {
+                        let futs = batch_ids.iter().map(|raw_id| {
+                            let id = TaskId(raw_id.clone());
+                            let raw = raw_id.clone();
+                            let by = by.clone();
+                            async move {
+                                let res = tasks.wait(&self.state, &by, &id, slice).await;
+                                (raw, res)
+                            }
+                        });
+                        futures::future::join_all(futs).await
+                    }
+                    WaitFor::Any => {
+                        let mut futs: Vec<_> = batch_ids
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, raw_id)| {
+                                let id = TaskId(raw_id.clone());
+                                let raw = raw_id.clone();
+                                let by = by.clone();
+                                Box::pin(async move {
+                                    let res = tasks.wait(&self.state, &by, &id, slice).await;
+                                    (idx, raw, res)
+                                })
+                            })
+                            .collect();
+                        let ((winner_idx, winner_id, winner_res), _, _rest) =
+                            futures::future::select_all(futs.drain(..)).await;
+                        // Snapshot the other tasks immediately without waiting further.
+                        let mut ordered: Vec<
+                            Option<(String, Result<crate::tasks::service::Waited, TaskError>)>,
+                        > = (0..batch_ids.len()).map(|_| None).collect();
+                        ordered[winner_idx] = Some((winner_id, winner_res));
+                        for (idx, raw_id) in batch_ids.iter().enumerate() {
+                            if ordered[idx].is_some() {
+                                continue;
+                            }
+                            let id = TaskId(raw_id.clone());
+                            let snap = tasks
+                                .wait(&self.state, &by, &id, Duration::from_millis(1))
+                                .await;
+                            ordered[idx] = Some((raw_id.clone(), snap));
+                        }
+                        ordered.into_iter().flatten().collect()
+                    }
+                };
+
+            let mut entries = Vec::with_capacity(results.len());
+            let mut settled_count = 0usize;
+            for (raw_id, res) in results {
+                match res {
+                    Ok(mut waited) => {
+                        let id = TaskId(raw_id.clone());
+                        tasks.told(&id, waited.task.state).await;
+                        let key_errors = sanitize_waited(&mut waited);
+                        let settled = waited.task.state.is_terminal()
+                            || matches!(
+                                waited.task.state,
+                                crate::tasks::domain::TaskState::Waiting
+                                    | crate::tasks::domain::TaskState::IdleUnconfirmed
+                            );
+                        if settled {
+                            settled_count += 1;
+                        }
+                        let mut entry = json!({
+                            "task_id": waited.task.task_id,
+                            "state": waited.task.state,
+                            "summary": waited.task.summary,
+                        });
+                        if let Some(code) = waited.task.exit_code {
+                            entry["exit_code"] = json!(code);
+                        }
+                        if let Some(answer) = waited.answer {
+                            entry["answer"] = json!(answer);
+                        }
+                        if let Some(tail) = waited.stdout_tail {
+                            entry["stdout_tail"] = json!(tail);
+                        }
+                        if !key_errors.is_empty() {
+                            entry["key_errors"] = json!(key_errors);
+                        }
+                        entries.push(entry);
+                    }
+                    Err(err) => {
+                        entries.push(json!({
+                            "task_id": raw_id,
+                            "error": err.to_string(),
+                        }));
+                    }
+                }
+            }
+            let total = entries.len();
+            return Ok(ok(json!({
+                "wait_for": match wait_for {
+                    WaitFor::All => "all",
+                    WaitFor::Any => "any",
+                },
+                "all_settled": settled_count == total,
+                "settled_count": settled_count,
+                "total": total,
+                "tasks": entries,
+            })));
+        }
+
+        let Some(raw_id) = args
+            .task_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(invalid("either task_id or task_ids must be provided"));
+        };
+        let id = TaskId(raw_id.to_owned());
         let tasks = &self.state.tasks;
         let waited = tasks.wait(&self.state, &self.by(), &id, slice).await;
         // What a wait answers is not told again into the caller's session.
@@ -815,14 +1241,21 @@ impl MuqunMcp {
             tasks.told(&id, waited.task.state).await;
         }
         Ok(match waited {
-            Ok(waited) => ok(with_reminder(&self.state, json!(waited), &id).await),
+            Ok(mut waited) => {
+                let key_errors = sanitize_waited(&mut waited);
+                let mut payload = json!(waited);
+                if !key_errors.is_empty() {
+                    payload["key_errors"] = json!(key_errors);
+                }
+                ok(with_reminder(&self.state, payload, &id).await)
+            }
             Err(error) => task_error(error),
         })
     }
 
     #[tool(
         name = "tasks.read",
-        description = "Read a task you created: its summary or recent timeline. Without task_id: whether this session itself is working on a Muqun task, and that task, whose summary lists the computers the user named for it (mentions)."
+        description = "Read a delegated task's summary or timeline. Omit task_id to check your own active Muqun task and user-named machines (mentions)."
     )]
     async fn tasks_read(
         &self,
@@ -854,7 +1287,10 @@ impl MuqunMcp {
             .await
         {
             Err(TaskError::NotYours) => {}
-            Ok(read) => return Ok(ok(with_reminder(state, read, &id).await)),
+            Ok(mut read) => {
+                redact_json_strings(&mut read);
+                return Ok(ok(with_reminder(state, read, &id).await));
+            }
             read => return reply(read),
         }
         // Not one it created: the task this session works on, if it is that.
@@ -867,14 +1303,20 @@ impl MuqunMcp {
             args: vec![("what", what_text), ("task_id", &id.0)],
         };
         match lineage::own_task(state, &self.session, &call, Some(&id)).await {
-            Some(own) => reply(state.tasks.read_own(state, &own, what, args.cursor).await),
+            Some(own) => match state.tasks.read_own(state, &own, what, args.cursor).await {
+                Ok(mut val) => {
+                    redact_json_strings(&mut val);
+                    Ok(ok(val))
+                }
+                Err(error) => Ok(task_error(error)),
+            },
             None => Ok(task_error(TaskError::NotFound)),
         }
     }
 
     #[tool(
         name = "tasks.complete",
-        description = "Call this when the task you were given is finished, with a one-line summary (outcome done, the default) -- or when you stop because you need the user, with outcome blocked and the reason (a missing file, an unclear request, a permission you cannot get). Only the session (or terminal pane) working on the task can complete it; stopping or going idle does not, and a blocked task stays open until you call this again with done. If it answers task_not_found, you are not working on a Muqun task: do not call it again."
+        description = "Report your active Muqun task finished (outcome \"done\") or blocked on the user (\"blocked\") with a one-line summary. Ignore if it returns task_not_found."
     )]
     async fn tasks_complete(
         &self,
@@ -930,44 +1372,434 @@ impl MuqunMcp {
         }
         reply(cancelled)
     }
+
+    #[tool(
+        name = "skills.read",
+        description = "List or read Muqun orchestration playbooks on demand (fallback for clients without MCP Skills/Resources)."
+    )]
+    async fn skills_read(
+        &self,
+        Parameters(args): Parameters<SkillReadArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Some(name) = args
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            let mut catalog = super::skills::skills_catalog_json();
+            let caller = super::hub::resolve_caller_scope(&self.state, &self.session, None).await;
+            let hub_skills = self.state.mcp_hub.cached_skills(caller);
+            if !hub_skills.is_empty() {
+                catalog["upstream_skills"] = json!(hub_skills);
+            }
+            return Ok(ok(catalog));
+        };
+        if let Some(skill) = super::skills::find_skill(name) {
+            return Ok(ok(json!({
+                "uri": skill.uri(),
+                "name": skill.name,
+                "namespace": skill.namespace,
+                "title": skill.title,
+                "content": skill.skill_md_text(),
+            })));
+        }
+        if let Some((server, skill_name)) = super::hub::parse_hub_skill_ref(name) {
+            let caller = super::hub::resolve_caller_scope(&self.state, &self.session, None).await;
+            return Ok(
+                match self
+                    .state
+                    .mcp_hub
+                    .read_upstream_skill(caller, server, skill_name)
+                    .await
+                {
+                    Ok(body) => ok(body),
+                    Err(super::hub::HubCallError::ScopeDenied { server, scope }) => fail(
+                        "scope_denied",
+                        &format!("Upstream MCP server '{server}' is restricted ({scope:?})."),
+                    ),
+                    Err(super::hub::HubCallError::Disabled(id)) => fail(
+                        "upstream_disabled",
+                        &format!("Upstream MCP server '{id}' is disabled."),
+                    ),
+                    Err(super::hub::HubCallError::UpstreamFailed(msg)) => {
+                        fail("upstream_failed", &msg)
+                    }
+                    Err(_) => fail(
+                        "skill_not_found",
+                        &format!("Unknown skill '{name}'. Call skills.read without arguments to list available playbooks."),
+                    ),
+                },
+            );
+        }
+        Ok(fail(
+            "skill_not_found",
+            &format!("Unknown skill '{name}'. Call skills.read without arguments to list available playbooks."),
+        ))
+    }
+
+    #[tool(
+        name = "hub.search_tools",
+        description = "Search external MCP tools registered in Muqun's unified MCP Hub. Returns compact summaries by default; pass detail=\"schema\" to inspect inputSchema before calling hub.call_tool."
+    )]
+    async fn hub_search_tools(
+        &self,
+        Parameters(args): Parameters<HubSearchToolsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let caller = super::hub::resolve_caller_scope(&self.state, &self.session, None).await;
+        let include_schema = args
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.trim().eq_ignore_ascii_case("schema"));
+        let limit = args.limit.unwrap_or(20).clamp(1, 50) as usize;
+        let result = self
+            .state
+            .mcp_hub
+            .search_tools(
+                caller,
+                args.query.as_deref(),
+                args.server.as_deref(),
+                include_schema,
+                limit,
+            )
+            .await;
+        Ok(ok(result))
+    }
+
+    #[tool(
+        name = "hub.call_tool",
+        description = "Call a tool on an external MCP server registered in Muqun's unified MCP Hub (discover server/tool names via hub.search_tools first). Subject to scope isolation and secret redaction."
+    )]
+    async fn hub_call_tool(
+        &self,
+        Parameters(args): Parameters<HubCallToolArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let server = args.server.trim();
+        let tool = args.tool.trim();
+        if server.is_empty() || tool.is_empty() {
+            return Ok(invalid("server and tool must be non-empty"));
+        }
+        let call = lineage::Call {
+            tool: "hub.call_tool",
+            args: vec![("server", server), ("tool", tool)],
+        };
+        let caller =
+            super::hub::resolve_caller_scope(&self.state, &self.session, Some(&call)).await;
+        match self
+            .state
+            .mcp_hub
+            .call_tool(caller, server, tool, args.arguments.unwrap_or_else(|| json!({})))
+            .await
+        {
+            Ok(result) => Ok(ok(result)),
+            Err(super::hub::HubCallError::NotFound(id)) => Ok(fail(
+                "upstream_not_found",
+                &format!("No upstream MCP server '{id}' is registered. Call hub.search_tools to list available servers."),
+            )),
+            Err(super::hub::HubCallError::Disabled(id)) => Ok(fail(
+                "upstream_disabled",
+                &format!("Upstream MCP server '{id}' is currently disabled."),
+            )),
+            Err(super::hub::HubCallError::ScopeDenied { server, scope }) => Ok(fail(
+                "scope_denied",
+                &format!("Upstream MCP server '{server}' is restricted ({scope:?}) and cannot be called from this session."),
+            )),
+            Err(super::hub::HubCallError::ToolDenied { server, tool }) => Ok(fail(
+                "tool_denied",
+                &format!("Tool '{tool}' on upstream MCP server '{server}' is blocked by tool ACL policy."),
+            )),
+            Err(super::hub::HubCallError::UpstreamFailed(msg)) => {
+                Ok(fail("upstream_failed", &msg))
+            }
+        }
+    }
+}
+
+fn redact_json_strings(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            let (clean, redacted) = super::reducer::redact_secrets(text);
+            if redacted {
+                *text = clean;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_json_strings(item);
+            }
+        }
+        Value::Object(map) => {
+            for (_, v) in map.iter_mut() {
+                redact_json_strings(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn iso8601_utc(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    let millis = ms % 1000;
+    let days = (total_secs / 86_400) as i64;
+    let secs_of_day = total_secs % 86_400;
+    let hour = secs_of_day / 3600;
+    let min = (secs_of_day % 3600) / 60;
+    let sec = secs_of_day % 60;
+    // Howard Hinnant's civil_from_days algorithm (Unix epoch 1970-01-01).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
+}
+
+fn task_to_mcp_detailed(task: &crate::tasks::domain::Task) -> DetailedTask {
+    use crate::tasks::domain::TaskState;
+    let (summary, _) = super::reducer::redact_secrets(task.summary.as_deref().unwrap_or(""));
+    let summary_opt = (!summary.is_empty()).then_some(summary.clone());
+    let mut base = McpTask::new(
+        task.id.0.clone(),
+        TaskStatus::Working,
+        iso8601_utc(task.created_ms),
+        iso8601_utc(task.updated_ms),
+    )
+    .with_poll_interval_ms(2000);
+    if let Some(msg) = summary_opt.clone() {
+        base = base.with_status_message(msg);
+    }
+    let payload = match task.state {
+        TaskState::Queued | TaskState::Dispatching | TaskState::Working => TaskPayload::Working,
+        TaskState::Waiting => {
+            // Surface waiting status cleanly without fabricating unrequested Elicitation IDs.
+            base = base.with_status_message(
+                summary_opt.unwrap_or_else(|| "Task is waiting for user input".into()),
+            );
+            TaskPayload::Working
+        }
+        TaskState::Done | TaskState::IdleUnconfirmed => {
+            let mut obj = JsonObject::new();
+            obj.insert("task_id".into(), json!(task.id.0));
+            obj.insert("state".into(), json!(task.state));
+            if let Some(s) = summary_opt {
+                obj.insert("summary".into(), json!(s));
+            }
+            if let Some(code) = task.exit_code {
+                obj.insert("exit_code".into(), json!(code));
+            }
+            TaskPayload::Completed { result: obj }
+        }
+        TaskState::Failed => {
+            let mut err = JsonObject::new();
+            err.insert("code".into(), json!(-32000));
+            err.insert(
+                "message".into(),
+                json!(summary_opt.unwrap_or_else(|| "Task failed".into())),
+            );
+            TaskPayload::Failed { error: err }
+        }
+        TaskState::Cancelled => TaskPayload::Cancelled,
+    };
+    DetailedTask::new(base, payload)
 }
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MuqunMcp {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        let capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .enable_skills_with_directory_read()
+            .enable_tasks()
+            .build();
+        ServerConfig::new(capabilities)
             .with_server_info(Implementation::new(
                 "muqun-gateway",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions(instructions(self.in_task, self.fleet.as_deref()))
+            .with_instructions(instructions_for(
+                self.in_task,
+                self.fleet.as_deref(),
+                self.underscore_tool_names,
+            ))
+    }
+
+    async fn call_tool(
+        &self,
+        mut request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        if !self.tool_router.map.contains_key(request.name.as_ref()) {
+            if let Some(canonical) = canonical_tool_name(request.name.as_ref()) {
+                request.name = std::borrow::Cow::Borrowed(canonical);
+            }
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        let tools = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| self.format_tool(tool))
+            .collect();
+        Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Private),
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        let lookup = canonical_tool_name(name).unwrap_or(name);
+        self.tool_router
+            .get(lookup)
+            .cloned()
+            .map(|tool| self.format_tool(tool))
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        Ok(super::skills::list_resources())
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        if let Some((server, skill_name)) = super::hub::parse_hub_skill_ref(&request.uri) {
+            let caller = super::hub::resolve_caller_scope(&self.state, &self.session, None).await;
+            let body = self
+                .state
+                .mcp_hub
+                .read_upstream_skill(caller, server, skill_name)
+                .await
+                .map_err(|err| match err {
+                    super::hub::HubCallError::ScopeDenied { .. } => {
+                        ErrorData::invalid_params("upstream skill access denied by scope", None)
+                    }
+                    super::hub::HubCallError::NotFound(_)
+                    | super::hub::HubCallError::Disabled(_) => ErrorData::resource_not_found(
+                        format!("resource not found: {}", request.uri),
+                        None,
+                    ),
+                    _ => ErrorData::internal_error("failed to read upstream skill", None),
+                })?;
+            let text = body["content"].as_str().unwrap_or_default().to_owned();
+            return Ok(ReadResourceResponse::Complete(
+                rmcp::model::ReadResourceResult::new(vec![
+                    rmcp::model::ResourceContents::TextResourceContents {
+                        uri: request.uri,
+                        mime_type: Some("text/markdown".into()),
+                        text,
+                        meta: None,
+                    },
+                ]),
+            ));
+        }
+        super::skills::read_resource(&request.uri)
+    }
+
+    async fn read_resource_directory(
+        &self,
+        request: ReadResourceDirectoryRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceDirectoryResult, ErrorData> {
+        super::skills::read_resource_directory(&request.uri)
+    }
+
+    async fn list_skills(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListSkillsResult, ErrorData> {
+        Ok(super::skills::list_skills())
+    }
+
+    async fn get_skill(
+        &self,
+        request: GetSkillRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetSkillResult, ErrorData> {
+        super::skills::get_skill(&request.uri)
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, ErrorData> {
+        let id = TaskId(request.task_id);
+        let task = self.state.tasks.owned(&self.by(), &id).await.map_err(|_| {
+            ErrorData::resource_not_found(format!("task not found: {}", id.0), None)
+        })?;
+        Ok(GetTaskResult::new(task_to_mcp_detailed(&task)))
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        let id = TaskId(request.task_id);
+        self.state
+            .tasks
+            .cancel(&self.state, &self.by(), &id)
+            .await
+            .map_err(|err| match err {
+                TaskError::NotFound | TaskError::NotYours => {
+                    ErrorData::resource_not_found(format!("task not found: {}", id.0), None)
+                }
+                _ => ErrorData::internal_error("cannot cancel task", None),
+            })?;
+        Ok(())
     }
 }
 
 /// What the server tells a caller about itself and about finishing a task:
 /// plainly to one started for a task (`in_task`), conditionally to anyone
 /// else, who may never have been given one.
-pub(crate) fn instructions(in_task: bool, fleet: Option<&str>) -> String {
-    let about = "Muqun Gateway on this computer. fleet.describe says what it has and which \
-                 other computers are linked to it, exec.run runs short commands, \
-                 tasks.delegate hands work to a coding agent -- if the work will take long, \
-                 end your turn after delegating; you will be told when it finishes. Use \
-                 tasks.wait (at most 45 s) only for short jobs; tasks.delegate(machine) \
-                 sends work to a linked computer, and your task's summary (tasks.read without \
-                 a task_id) lists the ones the user named (mentions). For a command or a \
-                 short script on another computer, call exec.run with machine first: it runs \
-                 in a visible pane there, is recorded, can be interrupted and goes through \
-                 approvals. Fall back to your own SSH only when that computer is not linked \
-                 or exec.run cannot do it (an interactive session, a directory outside its \
-                 home), and say so. Delegate a goal only when the other computer needs an \
-                 agent of its own. Do not restate the completion protocol in a delegated \
-                 goal: the agent there already knows it.";
-    let finish = "call tasks.complete with a one-line summary; when you stop because you \
-                  need the user, call it with outcome \"blocked\" and the reason; if you \
-                  cannot call it, end with the line MUQUN_TASK_DONE: <summary> (or \
-                  MUQUN_TASK_BLOCKED: <reason>). If tasks.complete answers task_not_found, \
-                  this session is not a Muqun task: do not call it again and print no marker.";
-    if in_task {
+pub(crate) fn instructions_for(
+    in_task: bool,
+    fleet: Option<&str>,
+    underscore_tool_names: bool,
+) -> String {
+    let about = "Muqun Gateway on this computer. Use fleet.describe for capabilities/peers, \
+                 exec.run for commands/scripts (prefer over SSH), and tasks.delegate for \
+                 sub-tasks (use barrier_group for single-wakeup parallel fan-out; end your \
+                 turn for long jobs). Use hub.search_tools and hub.call_tool to discover \
+                 and invoke external MCP servers configured in Muqun's unified MCP Hub. \
+                 Detailed playbooks are published as Skills over MCP (skill://muqun/... \
+                 or skills.read). Do not restate the completion protocol in a delegated goal.";
+    let finish = "call tasks.complete with a one-line summary; when blocked on the user, \
+                  call it with outcome \"blocked\" and the reason; fallback if unavailable: \
+                  end with MUQUN_TASK_DONE: <summary> or MUQUN_TASK_BLOCKED: <reason>. \
+                  If tasks.complete answers task_not_found, ignore the task protocol and \
+                  print no marker.";
+    let text = if in_task {
         // First and imperative: a host may show this beside many other
         // instructions, and an agent that just stops leaves its task paused.
         let fleet = fleet.map(|fleet| format!(" {fleet}")).unwrap_or_default();
@@ -983,6 +1815,11 @@ pub(crate) fn instructions(in_task: bool, fleet: Option<&str>) -> String {
              task_id tells you -- then when the whole task is finished, {finish} If \
              tasks.read says this session has no task, ignore the task protocol."
         )
+    };
+    if underscore_tool_names {
+        rewrite_tool_names_to_underscore(&text)
+    } else {
+        text
     }
 }
 
@@ -1105,6 +1942,8 @@ pub(crate) mod tests_support {
             variant: None,
             machine: Some(machine.into()),
             terminal: None,
+            reuse_task_id: None,
+            barrier_group: None,
         };
         let result = MuqunMcp::new(state.clone(), session)
             .tasks_delegate(Parameters(args))
@@ -1163,6 +2002,7 @@ mod tests {
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         }
     }
 
@@ -1182,6 +2022,8 @@ mod tests {
             variant: None,
             machine: None,
             terminal: None,
+            reuse_task_id: None,
+            barrier_group: None,
         };
         let (error, _, body) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(!error, "{body}");
@@ -1230,6 +2072,8 @@ mod tests {
             variant: None,
             machine: None,
             terminal: None,
+            reuse_task_id: None,
+            barrier_group: None,
         };
         let (error, _, task) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(!error, "{task}");
@@ -1274,6 +2118,8 @@ mod tests {
             variant: None,
             machine: None,
             terminal: Some("nope".into()),
+            reuse_task_id: None,
+            barrier_group: None,
         };
         let (error, text, _) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(error, "{text}");
@@ -1390,6 +2236,8 @@ mod tests {
             variant: None,
             machine: None,
             terminal: None,
+            reuse_task_id: None,
+            barrier_group: None,
         }
         .request("srv-coding", "coding", &[])
         .unwrap();
@@ -1405,6 +2253,8 @@ mod tests {
             variant: None,
             machine: None,
             terminal: None,
+            reuse_task_id: None,
+            barrier_group: None,
         };
         let (error, _, body) = answer(mcp.tasks_delegate(Parameters(args)).await);
         assert!(error, "{body}");
@@ -1720,7 +2570,9 @@ mod tests {
             .unwrap();
         assert_eq!(opencode["modelCount"], 3000, "{opencode}");
         assert_eq!(opencode["modes"], json!(["build", "plan"]));
-        assert!(opencode.get("models").is_none());
+        let listed_models = opencode["models"].as_array().expect("top models summary");
+        assert_eq!(listed_models.len(), 10, "{opencode}");
+        assert_eq!(listed_models[0], "p/model-0");
     }
 
     #[test]
@@ -1802,6 +2654,9 @@ mod tests {
                 "files.present",
                 "fleet.describe",
                 "fleet.list",
+                "hub.call_tool",
+                "hub.search_tools",
+                "skills.read",
                 "tasks.cancel",
                 "tasks.complete",
                 "tasks.delegate",
@@ -1809,6 +2664,19 @@ mod tests {
                 "tasks.wait"
             ]
         );
+        for name in &names {
+            let alias = underscore_tool_name(name)
+                .unwrap_or_else(|| panic!("missing underscore alias for {name}"));
+            assert_eq!(canonical_tool_name(alias), Some(name.as_str()));
+            let prefixed = format!("mcp_muqun_{alias}");
+            assert!(
+                prefixed.len() <= 64
+                    && prefixed
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                "invalid strict host tool name: {prefixed}"
+            );
+        }
     }
 
     /// Another session under the same agent token cancelling a child is not
@@ -1869,6 +2737,7 @@ mod tests {
                 attachments: None,
                 image_assets: None,
                 generation: None,
+                origin: None,
             }],
         );
         state.agent_runtime.attach_for_test(agent.manager()).await;
@@ -2046,5 +2915,123 @@ for line in sys.stdin:
             }
             driver.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn tasks_wait_batch_all_and_any_returns_compact_redacted_summary() {
+        use crate::tasks::domain::{
+            now_ms, PrincipalKind, Task, TaskBinding, TaskId, TaskKind, TaskOrigin, TaskPrincipal,
+            TaskState,
+        };
+        let state = test_state("admin", Vec::new());
+        let sess = session("%1");
+        let owner = sess.binding.owner_key();
+        let now = now_ms();
+        let make_task = |goal: &str, state_val: TaskState, summary: Option<&str>| Task {
+            id: TaskId::new(),
+            kind: TaskKind::Delegation,
+            goal: goal.into(),
+            cwd: None,
+            binding: TaskBinding::None,
+            state: state_val,
+            summary: summary.map(str::to_owned),
+            exit_code: None,
+            created_by: TaskPrincipal {
+                kind: PrincipalKind::Assistant,
+                id: owner.clone(),
+            },
+            created_ms: now,
+            updated_ms: now,
+            seq: 0,
+            parent: None,
+            origin: TaskOrigin::Agent,
+            label: None,
+            requester_name: None,
+            session_title: None,
+            mentions: Vec::new(),
+            client_ref: None,
+            requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
+        };
+        let done_id = state
+            .tasks
+            .insert_for_test(&make_task(
+                "task one",
+                TaskState::Done,
+                Some("Finished with token ghp_1234567890abcdefghijklmnop1234567890"),
+            ))
+            .await;
+        let working_id = state
+            .tasks
+            .insert_for_test(&make_task("task two", TaskState::Working, None))
+            .await;
+        let mcp = MuqunMcp::new(state, sess);
+
+        // wait_for = "any" returns immediately as soon as the done task settles.
+        let (error, _, body) = answer(
+            mcp.tasks_wait(Parameters(WaitArgs {
+                task_id: None,
+                task_ids: Some(vec![working_id.0.clone(), done_id.0.clone()]),
+                wait_for: Some(WaitFor::Any),
+                timeout_s: Some(5),
+            }))
+            .await,
+        );
+        assert!(!error, "{body}");
+        assert_eq!(body["wait_for"], "any");
+        assert_eq!(body["total"], 2);
+        assert_eq!(body["settled_count"], 1);
+        assert_eq!(body["all_settled"], false);
+        let done_entry = body["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["task_id"] == done_id.0)
+            .unwrap();
+        let summary_str = done_entry["summary"].as_str().unwrap();
+        assert!(!summary_str.contains("ghp_1234567890"), "{summary_str}");
+        assert!(summary_str.contains("[REDACTED]"), "{summary_str}");
+
+        // wait_for = "all" with two already-settled tasks returns all_settled = true.
+        let (error, _, body_all) = answer(
+            mcp.tasks_wait(Parameters(WaitArgs {
+                task_id: None,
+                task_ids: Some(vec![done_id.0.clone(), done_id.0.clone()]),
+                wait_for: Some(WaitFor::All),
+                timeout_s: Some(1),
+            }))
+            .await,
+        );
+        assert!(!error, "{body_all}");
+        assert_eq!(body_all["wait_for"], "all");
+        assert_eq!(body_all["total"], 1, "duplicate task_ids are deduplicated");
+        assert_eq!(body_all["all_settled"], true);
+    }
+
+    #[tokio::test]
+    async fn tasks_delegate_reuse_task_id_continues_warm_session() {
+        let mcp = MuqunMcp::new(test_state("admin", Vec::new()), session("%1"));
+        let first_id = delegated(FakeAgent::new("opencode"), &mcp).await;
+
+        let (error, _, second) = answer(
+            mcp.tasks_delegate(Parameters(DelegateArgs {
+                goal: "apply the follow-up fix".into(),
+                cwd: None,
+                agent_id: None,
+                mode: None,
+                model: None,
+                variant: None,
+                machine: None,
+                terminal: None,
+                reuse_task_id: Some(first_id.clone()),
+                barrier_group: None,
+            }))
+            .await,
+        );
+        assert!(!error, "{second}");
+        assert_ne!(second["task_id"].as_str().unwrap(), first_id);
+        assert_eq!(second["binding"]["kind"], "agent_session");
+        assert_eq!(second["binding"]["asid"], ASID);
     }
 }

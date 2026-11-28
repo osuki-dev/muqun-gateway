@@ -1,0 +1,6 @@
+s2tw-chars.txt is data derived from OpenCC (Open Chinese Convert),
+https://github.com/BYVoid/OpenCC, Copyright (c) Carbo Kuo and contributors,
+licensed under the Apache License, Version 2.0. It lists the single
+characters OpenCC's `s2tw` configuration changes (Simplified Chinese to
+Traditional Chinese, Taiwan standard). Regenerate it with
+`desktop/scripts/gen-s2tw.py`.

@@ -450,6 +450,7 @@ pub(crate) mod codex {
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         }]
     }
 

@@ -721,22 +721,45 @@ async fn delivered_user_enters_timeline_without_blocking_assistant_or_waiting_fo
         1,
         "retain the receipt until its row exists"
     );
+    let origin = crate::agents::domain::MessageOrigin {
+        device_id: "phone-id".into(),
+        name: "Phone".into(),
+    };
+    let boundary = ctx.mirror.held_prompt_boundary(&asid, Some("steer")).await;
+    assert!(ctx
+        .mirror
+        .present_user_prompt(
+            &asid,
+            "Continue in parallel.",
+            origin.clone(),
+            Some("msg-10"),
+            boundary
+        )
+        .await
+        .is_none());
+    assert!(ctx
+        .mirror
+        .get_snapshot(&asid)
+        .await
+        .unwrap()
+        .timeline
+        .iter()
+        .all(|r| r.role != TimelineRole::User));
     release.add_permits(1);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let AgentDomainEvent::TimelineUpsert { items, .. } = out.recv().await.unwrap() {
-                if items[0].role == TimelineRole::User {
-                    assert_eq!(items[0].id, "msg-10:t0");
-                    assert_eq!(
-                        items[0].part,
-                        AgentPart::Text {
-                            text: "Continue in parallel.".into()
-                        }
-                    );
-                    break;
-                }
+        let AgentDomainEvent::TimelineUpsert { items, seq, .. } = out.recv().await.unwrap() else {
+            panic!("expected the canonical user message");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].seq, seq);
+        assert_eq!(items[0].origin.as_ref(), Some(&origin));
+        assert_eq!(items[0].id, "msg-10:t0");
+        assert_eq!(
+            items[0].part,
+            AgentPart::Text {
+                text: "Continue in parallel.".into()
             }
-        }
+        );
         let AgentDomainEvent::InboxChanged { items, .. } = out.recv().await.unwrap() else {
             panic!("the queue receipt leaves only after the canonical row is published");
         };
@@ -750,11 +773,69 @@ async fn delivered_user_enters_timeline_without_blocking_assistant_or_waiting_fo
         .upsert_timeline_items(&asid, mapper::map_message(&native, &asid))
         .await;
     let snapshot = ctx.mirror.get_snapshot(&asid).await.unwrap();
+    assert_eq!(snapshot.timeline[0].origin.as_ref(), Some(&origin));
     assert_eq!(snapshot.timeline.len(), 2);
     assert_eq!(snapshot.timeline[0].role, TimelineRole::User);
     assert_eq!(snapshot.timeline[1].role, TimelineRole::Assistant);
     ctx.cancel.cancel();
     pump.await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn opencode_receipts_track_identical_sends_even_when_native_delivery_is_reversed() {
+    use axum::{extract::Path, routing::post, Json, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let (ctx, server) = upstream_context(Router::new().route(
+        "/api/session/{sid}/prompt",
+        post(move |Path(sid): Path<String>| {
+            let index = counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Json(json!({"data":{"type":"user","sessionID":sid,"id":format!("msg-{index}")}}))
+            }
+        }),
+    ))
+    .await;
+    let asid = AgentSessionId("ses-receipts".into());
+    for device in ["phone", "desktop"] {
+        let receipt = ctx
+            .driver
+            .send_prompt_with_receipt(&asid.0, "repeat", "repeat", &[], None)
+            .await
+            .unwrap();
+        ctx.mirror
+            .present_user_prompt(
+                &asid,
+                "repeat",
+                crate::agents::domain::MessageOrigin {
+                    name: device.into(),
+                    device_id: device.into(),
+                },
+                receipt.as_deref(),
+                None,
+            )
+            .await;
+    }
+    for id in ["msg-1", "msg-0"] {
+        // A provider may echo normalized/expanded wire text much later.
+        let native = json!({"id":id, "type":"user", "text":"expanded", "time":{"created":100}});
+        let revision = ctx.mirror.delivered_input_revision(&asid).await.unwrap();
+        ctx.finish_delivered_read(asid.clone(), id, revision, Ok(native))
+            .await;
+    }
+    let rows = ctx.mirror.get_snapshot(&asid).await.unwrap().timeline;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(rows.len(), 2);
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(row.id, format!("msg-{index}:t0"));
+        assert_eq!(
+            row.origin.as_ref().unwrap().device_id,
+            ["phone", "desktop"][index]
+        );
+        assert!(matches!(&row.part, AgentPart::Text {text} if text == "expanded"));
+    }
     server.abort();
 }
 
@@ -1345,6 +1426,7 @@ async fn committing_a_rollback_takes_the_rows_after_it_off_the_timeline() {
         attachments: None,
         image_assets: None,
         generation: None,
+        origin: None,
     };
     ctx.mirror
         .upsert_timeline_items(
@@ -1668,4 +1750,211 @@ async fn a_changed_catalog_surface_clears_the_cached_catalog() {
         ctx.driver.has_cached_catalog("/repo"),
         "a turn's output is not a catalog change"
     );
+}
+
+#[tokio::test]
+async fn account_limits_cache_reuses_snapshot_until_forced_or_key_changes() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    struct LimitsStub {
+        reads: AtomicU64,
+        invalidations: AtomicU64,
+        ready: AtomicBool,
+        epoch: AtomicU64,
+    }
+
+    impl AgentPort for LimitsStub {
+        fn kind(&self) -> &'static str {
+            "fx"
+        }
+        fn account_limits(
+            &self,
+        ) -> crate::agents::ports::agent::AgentFuture<
+            '_,
+            crate::agents::domain::account_limits::AccountLimits,
+        > {
+            Box::pin(async move {
+                let n = self.reads.fetch_add(1, Ordering::AcqRel) + 1;
+                Ok(crate::agents::domain::account_limits::AccountLimits {
+                    status: "available",
+                    reason: None,
+                    observed_at_ms: n,
+                    ordinary_usage_allowed: Some(true),
+                    reset_credits: None,
+                    limits: vec![],
+                })
+            })
+        }
+        fn invalidate_account_limits(&self) {
+            self.invalidations.fetch_add(1, Ordering::AcqRel);
+        }
+        fn account_limits_cache_key(&self) -> Option<u64> {
+            self.ready
+                .load(Ordering::Acquire)
+                .then(|| self.epoch.load(Ordering::Acquire))
+        }
+        fn probe(&self) -> crate::agents::ports::agent::AgentFuture<'_, bool> {
+            Box::pin(async { Ok(true) })
+        }
+        fn list_projects(
+            &self,
+        ) -> crate::agents::ports::agent::AgentFuture<'_, Vec<crate::agents::domain::AgentProject>>
+        {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn list_sessions<'a>(
+            &'a self,
+            _query: &'a crate::agents::domain::SessionQuery,
+        ) -> crate::agents::ports::agent::AgentFuture<
+            'a,
+            Vec<crate::agents::domain::AgentSessionInfo>,
+        > {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn create_session<'a>(
+            &'a self,
+            _directory: Option<&'a str>,
+            _model: Option<&'a crate::agents::domain::ModelRef>,
+            _mode: Option<&'a str>,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, crate::agents::domain::AgentSessionInfo>
+        {
+            Box::pin(async { Err(AgentError::Unsupported("create".into())) })
+        }
+        fn get_session<'a>(
+            &'a self,
+            _session_id: &'a str,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, crate::agents::domain::AgentSessionInfo>
+        {
+            Box::pin(async { Err(AgentError::Unsupported("get".into())) })
+        }
+        fn send_prompt<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _text: &'a str,
+            _attachments: &'a [String],
+            _delivery: Option<&'a str>,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, ()> {
+            Box::pin(async { Err(AgentError::Unsupported("prompt".into())) })
+        }
+        fn interrupt<'a>(
+            &'a self,
+            _session_id: &'a str,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, ()> {
+            Box::pin(async { Err(AgentError::Unsupported("interrupt".into())) })
+        }
+        fn get_timeline<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _limit: usize,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, Vec<TimelineItem>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn get_catalog<'a>(
+            &'a self,
+            _directory: Option<&'a str>,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, crate::agents::domain::AgentCatalog>
+        {
+            Box::pin(async { Ok(Default::default()) })
+        }
+        fn get_pending_permissions<'a>(
+            &'a self,
+            _session_id: &'a str,
+        ) -> crate::agents::ports::agent::AgentFuture<
+            'a,
+            Vec<crate::agents::domain::PermissionRequest>,
+        > {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn get_pending_forms<'a>(
+            &'a self,
+            _session_id: &'a str,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, Vec<crate::agents::domain::FormRequest>>
+        {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn reply_permission<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _request_id: &'a str,
+            _decision: crate::agents::domain::PermissionDecision,
+            _message: Option<&'a str>,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, ()> {
+            Box::pin(async { Err(AgentError::Unsupported("perm".into())) })
+        }
+        fn reply_form<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _request_id: &'a str,
+            _answers: serde_json::Value,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, ()> {
+            Box::pin(async { Err(AgentError::Unsupported("form".into())) })
+        }
+        fn revert_session<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _message_id: &'a str,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, ()> {
+            Box::pin(async { Err(AgentError::Unsupported("revert".into())) })
+        }
+        fn switch_model<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _model: &'a crate::agents::domain::ModelRef,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, ()> {
+            Box::pin(async { Err(AgentError::Unsupported("model".into())) })
+        }
+        fn switch_mode<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _mode: &'a str,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, ()> {
+            Box::pin(async { Err(AgentError::Unsupported("mode".into())) })
+        }
+        fn find_files<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+            _directory: Option<&'a str>,
+        ) -> crate::agents::ports::agent::AgentFuture<'a, Vec<serde_json::Value>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn get_vcs_diff<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _mode: &'a str,
+        ) -> crate::agents::ports::agent::AgentFuture<
+            'a,
+            Vec<crate::agents::ports::agent::FileDiffItem>,
+        > {
+            Box::pin(async { Ok(vec![]) })
+        }
+    }
+
+    let stub = Arc::new(LimitsStub {
+        reads: AtomicU64::new(0),
+        invalidations: AtomicU64::new(0),
+        ready: AtomicBool::new(true),
+        epoch: AtomicU64::new(1),
+    });
+    let manager = AgentManager::for_test(stub.clone());
+
+    let first = manager.account_limits(false).await.unwrap();
+    let second = manager.account_limits(false).await.unwrap();
+    assert_eq!(first.observed_at_ms, 1);
+    assert_eq!(second.observed_at_ms, 1, "cached within TTL");
+    assert_eq!(stub.reads.load(Ordering::Acquire), 1);
+
+    let forced = manager.account_limits(true).await.unwrap();
+    assert_eq!(forced.observed_at_ms, 2);
+    assert_eq!(stub.invalidations.load(Ordering::Acquire), 1);
+
+    // Changing cache key invalidates manager cache automatically.
+    stub.epoch.store(2, Ordering::Release);
+    let after_epoch = manager.account_limits(false).await.unwrap();
+    assert_eq!(after_epoch.observed_at_ms, 3);
+
+    // Disconnected adapter (`None` cache key) never serves a cached snapshot.
+    stub.ready.store(false, Ordering::Release);
+    let disconnected = manager.account_limits(false).await.unwrap();
+    assert_eq!(disconnected.observed_at_ms, 4);
 }

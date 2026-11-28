@@ -16,9 +16,9 @@ use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::time::Instant;
 
 use super::domain::{
-    clip, now_ms, one_line, ChildCounts, NoticeTarget, PrincipalKind, Requested, Task, TaskBinding,
-    TaskChange, TaskEvent, TaskFilter, TaskId, TaskKind, TaskOrigin, TaskPrincipal, TaskState,
-    REPORTED_STATES,
+    clip, now_ms, one_line, ChildCounts, NoticeTarget, PendingNotice, PrincipalKind, Requested,
+    Task, TaskBinding, TaskChange, TaskEvent, TaskFilter, TaskId, TaskKind, TaskOrigin,
+    TaskPrincipal, TaskState, REPORTED_STATES,
 };
 use super::events::TaskDomainEvent;
 use super::pane_agent;
@@ -1011,7 +1011,20 @@ impl TaskService {
 
     /// Tell `target` how task `id` ends (`tasks::notices`).
     pub(crate) async fn notify(&self, id: &TaskId, target: &NoticeTarget) {
-        if let Err(error) = self.store.set_notice(id, target).await {
+        self.notify_with_barrier(id, target, None).await;
+    }
+
+    pub(crate) async fn notify_with_barrier(
+        &self,
+        id: &TaskId,
+        target: &NoticeTarget,
+        barrier_group: Option<&str>,
+    ) {
+        if let Err(error) = self
+            .store
+            .set_notice_with_barrier(id, target, barrier_group)
+            .await
+        {
             tracing::warn!(task = %id.0, %error, "the parent will not be told how this task ends");
         }
     }
@@ -1022,12 +1035,36 @@ impl TaskService {
     }
 
     /// Untold reported states of tasks with a notice target (`tasks::notices`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn pending_notices(
         &self,
         since_ms: u64,
         limit: usize,
     ) -> anyhow::Result<Vec<(Task, NoticeTarget)>> {
         self.store.pending_notices(since_ms, limit).await
+    }
+
+    /// Like [`Self::pending_notices`], including optional `barrier_group`.
+    pub(crate) async fn pending_notices_with_barrier(
+        &self,
+        since_ms: u64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<PendingNotice>> {
+        self.store
+            .pending_notices_with_barrier(since_ms, limit)
+            .await
+    }
+
+    /// All tasks registered under `(target, barrier_group)` updated since `since_ms`.
+    pub(crate) async fn barrier_group_tasks(
+        &self,
+        target: &NoticeTarget,
+        barrier_group: &str,
+        since_ms: u64,
+    ) -> anyhow::Result<Vec<Task>> {
+        self.store
+            .barrier_group_tasks(target, barrier_group, since_ms)
+            .await
     }
 
     /// Task `id`'s `state` has reached its parent: delivered, or answered by
@@ -1338,6 +1375,21 @@ impl TaskService {
         by: Requested,
         request: DelegateRequest,
     ) -> Result<TaskView, TaskError> {
+        self.delegate_in_session(state, by, request, None, None, false, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn delegate_in_session(
+        &self,
+        state: &AppState,
+        by: Requested,
+        request: DelegateRequest,
+        existing: Option<&str>,
+        display_goal: Option<&str>,
+        auto_approve: bool,
+        extra_instruction: Option<&str>,
+    ) -> Result<TaskView, TaskError> {
         if !is_self(
             request.machine.as_deref(),
             &self.machine_id,
@@ -1398,6 +1450,18 @@ impl TaskService {
         }
         let manager = agent_for(state, request.agent_id.as_deref()).await?;
         let agent_id = manager.agent().kind();
+        let existing_session = if let Some(asid) = existing {
+            let info = manager.sessions().get_session(asid).await?;
+            if info.status != AgentSessionStatus::Idle {
+                return Err(AgentError::InvalidRequest(
+                    "Wait for this session to become idle before enabling orchestration".into(),
+                )
+                .into());
+            }
+            Some(info)
+        } else {
+            None
+        };
         // No supported session adapter currently supplies a credential bound
         // to this new task. Refuse before registration, task or session creation.
         if self
@@ -1505,16 +1569,21 @@ impl TaskService {
                 tracing::debug!("Codex computer tools unavailable; continuing ordinary task");
             }
         }
-        let created = manager
-            .sessions()
-            .create_session(
-                request.cwd.as_deref(),
-                model.as_ref(),
-                request.mode.as_deref(),
-            )
-            .await;
-        let asid = match created {
-            Ok(session) => session.asid,
+        let created = if let Some(session) = existing_session {
+            Ok(session)
+        } else {
+            manager
+                .sessions()
+                .create_session_with_auto_approve(
+                    request.cwd.as_deref(),
+                    model.as_ref(),
+                    request.mode.as_deref(),
+                    auto_approve,
+                )
+                .await
+        };
+        let (asid, initial_title) = match created {
+            Ok(session) => (session.asid, session.title),
             Err(error) => {
                 let error = TaskError::from(error);
                 self.record_failure(&task, noted(TaskState::Failed, error.to_string()))
@@ -1522,23 +1591,41 @@ impl TaskService {
                 return Err(error);
             }
         };
+        let initial_session_title = {
+            let trimmed = initial_title.trim();
+            (!trimmed.is_empty() && !untitled_placeholder(&asid.0, trimmed))
+                .then(|| trimmed.to_owned())
+        };
         state
             .agent_runtime
             .record_session_route(&asid.0, agent_id)
             .await;
-        crate::agents::session_defaults::after_create(
-            &state.db,
-            &manager,
-            &asid.0,
-            request.cwd.as_deref(),
-            model.as_ref(),
-            request.mode.as_deref(),
-        )
-        .await;
+        if existing.is_none() {
+            crate::agents::session_defaults::after_create(
+                &state.db,
+                &manager,
+                &asid.0,
+                request.cwd.as_deref(),
+                model.as_ref(),
+                request.mode.as_deref(),
+            )
+            .await;
+        }
+        if auto_approve && existing.is_some() {
+            if let Err(error) = manager.agent().set_auto_approve(&asid.0, true).await {
+                tracing::debug!(
+                    %error,
+                    agent_id,
+                    asid = %asid.0,
+                    "auto-approve not applied for orchestration session"
+                );
+            }
+        }
         let binding = TaskBinding::AgentSession {
             agent_id: agent_id.to_owned(),
             asid: asid.0.clone(),
         };
+        let extra_clean = extra_instruction.map(str::trim).filter(|s| !s.is_empty());
         // The task's sentence for this session only, outside its
         // conversation, where the agent takes one; removed when the task
         // ends (`driver::spawn_instruction_cleanup`).
@@ -1548,7 +1635,12 @@ impl TaskService {
         if crate::mcp::inject::enabled(&state.config) && manager.agent().task_sentence_in_prompt() {
             self.mark_task_session(&asid.0);
             let fleet = fleet_line(state, &task).await;
-            prompt_sentence = Some(crate::mcp::inject::task_sentence(fleet.as_deref()));
+            let mut sentence = crate::mcp::inject::task_sentence(fleet.as_deref());
+            if let Some(extra) = extra_clean {
+                sentence.push_str("\n\n");
+                sentence.push_str(extra);
+            }
+            prompt_sentence = Some(sentence);
         } else if crate::mcp::inject::enabled(&state.config)
             && manager.agent().takes_session_instructions()
         {
@@ -1556,17 +1648,25 @@ impl TaskService {
             // instruction may leave at once is stripped like the rest.
             self.mark_task_session(&asid.0);
             let fleet = fleet_line(state, &task).await;
+            let mut instruction = crate::mcp::inject::task_sentence(fleet.as_deref());
+            if let Some(extra) = extra_clean {
+                instruction.push_str("\n\n");
+                instruction.push_str(extra);
+            }
             match manager
                 .agent()
                 .set_session_instruction(
                     &asid.0,
                     crate::mcp::inject::SESSION_INSTRUCTION_KEY,
-                    &crate::mcp::inject::task_sentence(fleet.as_deref()),
+                    &instruction,
                 )
                 .await
             {
                 Ok(true) => {}
                 Ok(false) => {
+                    if let Some(extra) = extra_clean {
+                        prompt_sentence = Some(extra.to_string());
+                    }
                     unannounced = Some(
                         "the agent took no per-session instruction for this session; it is \
                          not told to report the task's end"
@@ -1575,20 +1675,29 @@ impl TaskService {
                 }
                 Err(error) => {
                     tracing::warn!(%error, "the task's session instruction was not set");
+                    if let Some(extra) = extra_clean {
+                        prompt_sentence = Some(extra.to_string());
+                    }
                     unannounced = Some(
                         "the task's session instruction was not set; it may end paused".to_owned(),
                     )
                 }
             }
+        } else if let Some(extra) = extra_clean {
+            prompt_sentence = Some(extra.to_string());
         }
         let dispatched = async {
             let dispatching = TaskChange {
                 binding: Some(binding.clone()),
                 note: unannounced.clone(),
+                session_title: initial_session_title.clone(),
                 ..change(TaskState::Dispatching)
             };
             self.store().transition(&task.id, dispatching).await?;
             self.bind_session(&asid.0, &task.id);
+            if let Some(title) = initial_session_title.as_deref() {
+                self.session_named(&asid.0, title).await;
+            }
             // The goal alone: how to say it ended is the MCP server's, which
             // the agent's service is given now if it does not have it.
             let context = crate::agents::computer_context::context(state, &request.computer_ids)
@@ -1612,7 +1721,13 @@ impl TaskService {
             };
             manager
                 .prompts()
-                .send_prompt_with_display(&asid, &goal, &request.goal, &request.attachments, None)
+                .send_prompt_with_display(
+                    &asid,
+                    &goal,
+                    display_goal.unwrap_or(&request.goal),
+                    &request.attachments,
+                    None,
+                )
                 .await?;
             let task = self
                 .store()
@@ -1636,11 +1751,13 @@ impl TaskService {
                 Err(error)
             }
             Err(error) => {
-                if let Err(interrupt) = manager.prompts().interrupt(&asid).await {
-                    tracing::warn!(
-                        "task {}: could not stop the session: {interrupt}",
-                        task.id.0
-                    );
+                if existing.is_none() {
+                    if let Err(interrupt) = manager.prompts().interrupt(&asid).await {
+                        tracing::warn!(
+                            "task {}: could not stop the session: {interrupt}",
+                            task.id.0
+                        );
+                    }
                 }
                 let failed = TaskChange {
                     binding: Some(binding),
@@ -2638,6 +2755,7 @@ impl TaskService {
             ),
             _ => (None, None),
         };
+        let label = effective_label(task);
         TaskView {
             task_id: task.id.0.clone(),
             state: task.state,
@@ -2652,8 +2770,8 @@ impl TaskService {
             reopen_count: task.reopen_count,
             parent_task_id: task.parent.as_ref().map(|id| id.0.clone()),
             origin: task.origin,
-            label: task.label.clone(),
-            title: pane_agent::title(task.label.as_deref(), None, &task.goal),
+            label: label.map(str::to_owned),
+            title: pane_agent::title(label, None, &task.goal),
             requested_by,
             children,
             progress: None,
@@ -2677,12 +2795,14 @@ impl TaskService {
             TaskBinding::Peer { .. } => "",
             _ => return None,
         };
-        if task.label.is_some() {
+        if effective_label(task).is_some() {
             return None;
         }
         let name = match task.state.is_terminal() {
             true => task.session_title.clone()?,
-            false => self.live_title(&task.id)?,
+            false => self
+                .live_title(&task.id)
+                .or_else(|| task.session_title.clone())?,
         };
         let name = one_line(&name, usize::MAX);
         let short = name.trim_end_matches(['…', '.']).trim_end();
@@ -3243,10 +3363,25 @@ const TASK_SESSION_CACHE: usize = 4096;
 /// Whether `title` is what an adapter shows for a session that has not been
 /// named (its id, T3's "New thread", DeepSeek's placeholder): never a
 /// task's title.
-fn untitled_placeholder(asid: &str, title: &str) -> bool {
+pub fn untitled_placeholder(asid: &str, title: &str) -> bool {
     title == asid
         || title == crate::agents::adapters::t3::driver::NEW_THREAD_TITLE
         || title == crate::agents::adapters::deepseek::mapper::UNTITLED
+}
+
+/// Generic `"Orchestration"` labels written by earlier builds on top-level
+/// orchestration tasks should not hide the bound session's real title.
+fn effective_label(task: &Task) -> Option<&str> {
+    let label = task.label.as_deref()?;
+    if label == "Orchestration"
+        && task
+            .client_ref
+            .as_deref()
+            .is_some_and(|client_ref| client_ref.starts_with("orchestration:"))
+    {
+        return None;
+    }
+    Some(label)
 }
 
 /// A parent's progress while a child works: `Waiting for mini · 3 min`.
@@ -3328,7 +3463,7 @@ async fn form_waiting(manager: &AgentManager, task: &Task, title: &str) -> TaskC
 /// `dir` named from the home directory: `~` itself, `~/<rest>` below it,
 /// else as it is. Both are canonicalized first, so a home reached through a
 /// symlink still reads `~`.
-fn home_relative(dir: &str, home: Option<&Path>) -> String {
+pub fn home_relative(dir: &str, home: Option<&Path>) -> String {
     let Some(home) = home else {
         return dir.to_owned();
     };
@@ -3920,6 +4055,7 @@ mod tests {
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         }
     }
 
@@ -5809,6 +5945,121 @@ mod tests {
         assert_eq!(ended.session_title.as_deref(), Some("Fix the CI build"));
         assert_eq!(state.tasks.live_title(&id), None);
         assert_eq!(title().await, "Fix the CI build");
+    }
+
+    #[tokio::test]
+    async fn legacy_orchestration_label_yields_to_session_title() {
+        const ASID: &str = "orch-titled-1";
+        let state = crate::test_state("admin", vec![]);
+        let now = now_ms();
+        let id = TaskId::new();
+        state
+            .tasks
+            .store()
+            .insert(&Task {
+                id: id.clone(),
+                kind: TaskKind::Delegation,
+                goal: "Implement and verify the user goal carefully.".into(),
+                cwd: None,
+                binding: TaskBinding::AgentSession {
+                    agent_id: "antigravity".into(),
+                    asid: ASID.into(),
+                },
+                state: TaskState::Working,
+                summary: None,
+                exit_code: None,
+                created_by: TaskPrincipal {
+                    kind: PrincipalKind::Device,
+                    id: "d1".into(),
+                },
+                created_ms: now,
+                updated_ms: now,
+                seq: 0,
+                parent: None,
+                origin: TaskOrigin::Device,
+                label: Some("Orchestration".into()),
+                requester_name: None,
+                session_title: Some("Casual Greeting".into()),
+                mentions: vec![],
+                client_ref: Some("orchestration:o_legacy".into()),
+                requester_server_id: None,
+                reopened_ms: None,
+                reopen_count: 0,
+            })
+            .await
+            .unwrap();
+
+        let view = state
+            .tasks
+            .present(&state.tasks.get_for_test(&id).await)
+            .await;
+        assert_eq!(view.label, None);
+        assert_eq!(view.title, "Casual Greeting");
+
+        state.tasks.session_named(ASID, "Venue api & mini").await;
+        let view = state
+            .tasks
+            .present(&state.tasks.get_for_test(&id).await)
+            .await;
+        assert_eq!(view.label, None);
+        assert_eq!(view.title, "Venue api & mini");
+
+        state
+            .tasks
+            .move_to(&id, change(TaskState::Done))
+            .await
+            .unwrap();
+        let ended = state
+            .tasks
+            .present(&state.tasks.get_for_test(&id).await)
+            .await;
+        assert_eq!(ended.label, None);
+        assert_eq!(ended.title, "Venue api & mini");
+
+        // Even when a legacy orchestration task ended with no persisted session_title,
+        // `view.title` must fall back to the goal instead of showing "Orchestration".
+        let untitled = TaskId::new();
+        state
+            .tasks
+            .store()
+            .insert(&Task {
+                id: untitled.clone(),
+                kind: TaskKind::Delegation,
+                goal: "Check legacy fallback title".into(),
+                cwd: None,
+                binding: TaskBinding::AgentSession {
+                    agent_id: "claude".into(),
+                    asid: "orch-untitled-1".into(),
+                },
+                state: TaskState::Failed,
+                summary: None,
+                exit_code: None,
+                created_by: TaskPrincipal {
+                    kind: PrincipalKind::Device,
+                    id: "d1".into(),
+                },
+                created_ms: now,
+                updated_ms: now,
+                seq: 0,
+                parent: None,
+                origin: TaskOrigin::Device,
+                label: Some("Orchestration".into()),
+                requester_name: None,
+                session_title: None,
+                mentions: vec![],
+                client_ref: Some("orchestration:o_legacy_untitled".into()),
+                requester_server_id: None,
+                reopened_ms: None,
+                reopen_count: 0,
+            })
+            .await
+            .unwrap();
+        let untitled_view = state
+            .tasks
+            .present(&state.tasks.get_for_test(&untitled).await)
+            .await;
+        assert_eq!(untitled_view.label, None);
+        assert_eq!(untitled_view.title, "Check legacy fallback title");
     }
 
     #[test]

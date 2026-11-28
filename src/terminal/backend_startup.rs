@@ -46,6 +46,10 @@ fn herdr_roots() -> Vec<PathBuf> {
 }
 
 pub(crate) fn validate(session: &SessionConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !session.is_desktop_terminal(),
+        "Muqun Desktop manages its built-in terminal daemon"
+    );
     if session.backend == BackendKind::Herdr {
         herdr_session(Path::new(&session.socket_path), &herdr_roots())?;
     }
@@ -70,7 +74,7 @@ pub(crate) fn spawn(config: &Config) {
     }
 }
 
-fn command(program: &str) -> Command {
+fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut cmd = Command::new(program);
     #[cfg(unix)]
     cmd.process_group(0);
@@ -204,7 +208,12 @@ async fn start(session: &SessionConfig) -> anyhow::Result<()> {
             {
                 return Ok(());
             }
-            let mut cmd = command("herdr");
+            let herdr_program = crate::platform::runtimes::resolve_binary(
+                crate::platform::runtimes::RuntimeKind::Herdr,
+                None,
+            )
+            .unwrap_or_else(|| PathBuf::from("herdr"));
+            let mut cmd = command(&herdr_program);
             if let Some(name) = herdr_session(Path::new(&session.socket_path), &herdr_roots())? {
                 cmd.env("HERDR_SESSION", name);
             }

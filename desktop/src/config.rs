@@ -1,0 +1,1870 @@
+//! `<config>/config.json`: what the owner chose, in one file.
+//!
+//! Every struct is `#[serde(default)]`, so a file written by an older build --
+//! or one the owner trimmed by hand -- still loads, with the missing keys at
+//! their defaults. The OpenCode block is the gateway's own
+//! [`OpencodeConfig`], serialized exactly as the gateway's `config.json`
+//! names it, so the two files read the same.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+
+use muqun_gateway::agents::compose::RuntimeSettings;
+use muqun_gateway::agents::runtime::LocalAgentConfigs;
+use muqun_gateway::agents::{
+    AntigravityConfig, ClaudeConfig, CodexConfig, CopilotConfig, CursorConfig, DeepseekConfig,
+    FxConfig, OpencodeConfig, PiConfig, QoderConfig, T3Config,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::model::projects::ProjectPrefs;
+
+pub const CONFIG_FILE: &str = "config.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DesktopConfig {
+    pub agents: AgentConfigs,
+    pub general: General,
+    pub appearance: Appearance,
+    pub ui: UiPrefs,
+    pub window: WindowGeometry,
+    pub notifications: Notifications,
+    /// Dictation's speech service (the API key lives in the keyring).
+    pub voice: VoiceConfig,
+    /// User-configurable shortcuts and global leader key.
+    pub keymap: KeymapConfig,
+    /// Per-computer profiles (theme, accent, agent configs) by computer id / server_id.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub computers: HashMap<String, ComputerProfile>,
+    /// Currently active computer id ("local" or peer server_id / name).
+    #[serde(default = "default_computer")]
+    pub current_computer: String,
+    /// Plugin ids the owner turned off in Settings → Plugins.
+    /// Core always-on plugins (`terminal`, `settings`) are ignored here.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub plugins_disabled: BTreeSet<String>,
+}
+
+/// User-customized keyboard shortcuts and global leader key (`Settings → Shortcuts`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeymapConfig {
+    /// Global leader chord (e.g. `"ctrl+space"`, `"ctrl+;"`, `"alt+space"`, `"ctrl+a"`, `"ctrl+g"`).
+    pub leader: String,
+    /// Per-action shortcut overrides keyed by `Action::id()` (e.g. `"palette" -> "mod+k"`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bindings: BTreeMap<String, String>,
+}
+
+impl KeymapConfig {
+    pub const DEFAULT_LEADER: &'static str = "ctrl+space";
+
+    pub fn is_default(&self) -> bool {
+        self.leader == Self::DEFAULT_LEADER && self.bindings.is_empty()
+    }
+}
+
+impl Default for KeymapConfig {
+    fn default() -> Self {
+        Self {
+            leader: Self::DEFAULT_LEADER.to_string(),
+            bindings: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_computer() -> String {
+    "local".to_string()
+}
+
+/// A computer's custom profile: distinct theme, accent color, and agent configs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ComputerProfile {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agents: Option<AgentConfigs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_key: Option<String>,
+}
+
+impl Default for DesktopConfig {
+    fn default() -> Self {
+        Self {
+            agents: AgentConfigs::default(),
+            general: General::default(),
+            appearance: Appearance::default(),
+            ui: UiPrefs::default(),
+            window: WindowGeometry::default(),
+            notifications: Notifications::default(),
+            voice: VoiceConfig::default(),
+            keymap: KeymapConfig::default(),
+            computers: HashMap::new(),
+            current_computer: default_computer(),
+            plugins_disabled: BTreeSet::new(),
+        }
+    }
+}
+
+impl DesktopConfig {
+    /// Return the agent configs for `computer`.
+    pub fn agents_for(&self, computer: &str) -> &AgentConfigs {
+        if computer == "local" || computer == "self" || computer.is_empty() {
+            &self.agents
+        } else if let Some(p) = self.computers.get(computer) {
+            p.agents.as_ref().unwrap_or(&self.agents)
+        } else {
+            &self.agents
+        }
+    }
+
+    /// Return the mutable agent configs for `computer`, creating the profile if needed.
+    pub fn agents_for_mut(&mut self, computer: &str) -> &mut AgentConfigs {
+        if computer == "local" || computer == "self" || computer.is_empty() {
+            &mut self.agents
+        } else {
+            let profile = self.computers.entry(computer.to_string()).or_default();
+            if profile.agents.is_none() {
+                profile.agents = Some(self.agents.clone());
+            }
+            profile.agents.as_mut().unwrap()
+        }
+    }
+
+    /// Return the theme chosen for `computer`, falling back to global appearance.
+    pub fn theme_for(&self, computer: &str) -> &str {
+        if let Some(p) = self.computers.get(computer) {
+            if let Some(t) = &p.theme_id {
+                return t.as_str();
+            }
+        }
+        &self.appearance.theme_id
+    }
+
+    /// Return the accent hue chosen for `computer`, if any.
+    #[allow(dead_code)]
+    pub fn accent_for(&self, computer: &str) -> Option<&str> {
+        self.computers
+            .get(computer)
+            .and_then(|p| p.accent.as_deref())
+    }
+}
+
+/// How dictation transcribes (the App's Settings → Voice).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VoiceMode {
+    /// The whole recording to an OpenAI-compatible `/v1/audio/transcriptions`.
+    #[default]
+    File,
+    /// Streamed to an OpenAI-Realtime-compatible WebSocket, words as you speak.
+    Realtime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiceConfig {
+    pub mode: VoiceMode,
+    /// The service's endpoint: `https://…` after recording, `wss://…` realtime.
+    pub url: String,
+    /// Empty: the service's own default.
+    pub model: String,
+    /// `auto`, or a language tag (`en`, `zh-CN`, …).
+    pub language: String,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            mode: VoiceMode::File,
+            url: String::new(),
+            model: String::new(),
+            language: "auto".into(),
+        }
+    }
+}
+
+impl VoiceConfig {
+    /// The App's presets, shown as placeholders and followed when the mode
+    /// changes while the URL is still the preset.
+    pub fn preset(mode: VoiceMode) -> (&'static str, &'static str) {
+        match mode {
+            VoiceMode::File => (
+                "https://api.openai.com/v1/audio/transcriptions",
+                "gpt-4o-mini-transcribe",
+            ),
+            VoiceMode::Realtime => (
+                "wss://api.openai.com/v1/realtime?intent=transcription",
+                "gpt-live-transcribe",
+            ),
+        }
+    }
+
+    /// The URL is one this mode can use (`https` / `wss`, no credentials).
+    pub fn usable(&self) -> bool {
+        let url = self.url.trim();
+        let scheme = match self.mode {
+            VoiceMode::File => "https://",
+            VoiceMode::Realtime => "wss://",
+        };
+        url.starts_with(scheme) && url.len() > scheme.len() && !url[scheme.len()..].contains('@')
+    }
+}
+
+/// System notifications for sessions that are not on screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Notifications {
+    /// An approval, a question or a finished turn raises a system
+    /// notification (the App's "Gateway notifications"). On by default.
+    pub enabled: bool,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Every agent the gateway drives, under the names its `config.json` uses.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentConfigs {
+    pub codex: CodexConfig,
+    pub opencode: OpencodeConfig,
+    pub deepseek: DeepseekConfig,
+    pub t3: T3Config,
+    pub fx: FxConfig,
+    pub qoder: QoderConfig,
+    pub copilot: CopilotConfig,
+    pub pi: PiConfig,
+    pub claude: ClaudeConfig,
+    pub antigravity: AntigravityConfig,
+    pub cursor: CursorConfig,
+}
+
+impl AgentConfigs {
+    /// The runtime's settings, as configured.
+    pub fn runtime_settings(&self) -> RuntimeSettings {
+        RuntimeSettings {
+            opencode: self.opencode.clone(),
+            deepseek: self.deepseek.clone(),
+            t3: self.t3.clone(),
+            local: LocalAgentConfigs {
+                copilot: self.copilot.clone(),
+                codex: self.codex.clone(),
+                fx: self.fx.clone(),
+                qoder: self.qoder.clone(),
+                pi: self.pi.clone(),
+                claude: self.claude.clone(),
+                antigravity: self.antigravity.clone(),
+                cursor: self.cursor.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct General {
+    /// Where "New session" starts when nothing was remembered for the agent.
+    /// Absent: the home directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_cwd: Option<PathBuf>,
+    /// The folder each agent last started a session in, by agent id.
+    pub last_cwd: HashMap<String, PathBuf>,
+    /// The agent the last session was started with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_agent: Option<String>,
+    /// The model last chosen for an agent in a folder, by [`choice_key`]
+    /// (the composer preselects it next time).
+    pub last_model: HashMap<String, String>,
+    /// Recently chosen models per agent id (`"provider_id/model_id"`, newest first, up to 5).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub recent_models: HashMap<String, Vec<String>>,
+    /// The mode last chosen, likewise.
+    pub last_mode: HashMap<String, String>,
+    /// Unsent composer text: the start page under [`START_DRAFT`], each
+    /// session under its id. Survives switching sessions and restarts.
+    pub drafts: HashMap<String, String>,
+    /// Pinned sessions (ids), newest pin first: the start page's recent
+    /// list shows them first.
+    pub pinned: Vec<String>,
+    pub language: Language,
+    /// The command "open in editor" will run, for later (`code`, `zed`, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor_command: Option<String>,
+    /// The top bar's "Open in …": the editor used last.
+    pub editor: crate::platform::editors::Editor,
+    /// Open text/code directly in the configured editor instead of previewing.
+    pub files_in_editor: bool,
+    /// Closing the window keeps Muqun running behind its status icon
+    /// (where there is one); off quits.
+    pub close_to_tray: bool,
+    /// The first-run welcome was seen (or skipped).
+    pub welcomed: bool,
+    /// Use Desktop without automatically provisioning a local Gateway.
+    pub gateway_local_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub announced_desktop_update: Option<String>,
+}
+
+/// The draft key of the start page.
+pub const START_DRAFT: &str = "start";
+/// The most drafts kept; the oldest-written are not tracked, so past this the
+/// session drafts of a few arbitrary sessions go (the start page's never).
+pub(crate) const MAX_DRAFTS: usize = 64;
+
+/// Maximum recently used models remembered per agent.
+pub(crate) const MAX_RECENT_MODELS: usize = 5;
+
+/// What "an agent in a folder" is called in [`General::last_model`] and
+/// [`General::last_mode`].
+pub fn choice_key(agent: &str, cwd: &str) -> String {
+    format!("{agent}\u{1f}{cwd}")
+}
+
+impl General {
+    /// Recently used `"provider_id/model_id"` entries for `agent`, newest first.
+    pub fn recent_models_for(&self, agent: &str) -> &[String] {
+        self.recent_models
+            .get(agent)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn record_recent_model(&mut self, agent: &str, model: &str) {
+        if agent.is_empty() || model.is_empty() {
+            return;
+        }
+        let list = self.recent_models.entry(agent.to_owned()).or_default();
+        list.retain(|existing| existing != model);
+        list.insert(0, model.to_owned());
+        list.truncate(MAX_RECENT_MODELS);
+    }
+
+    /// The folder to preselect for `agent`: the one it last used, else the
+    /// configured default, else `~`.
+    pub fn initial_cwd(&self, agent: &str) -> PathBuf {
+        self.last_cwd
+            .get(agent)
+            .or(self.default_cwd.as_ref())
+            .cloned()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("/"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Language {
+    #[serde(rename = "en")]
+    En,
+    #[serde(rename = "zh-TW")]
+    ZhTw,
+    #[serde(rename = "zh-CN")]
+    ZhCn,
+    #[serde(rename = "ja")]
+    Ja,
+    #[serde(rename = "ko")]
+    Ko,
+    #[serde(rename = "de")]
+    De,
+    #[serde(rename = "fr")]
+    Fr,
+    #[serde(rename = "es")]
+    Es,
+    #[serde(rename = "pt")]
+    Pt,
+    #[serde(rename = "ru")]
+    Ru,
+    #[serde(rename = "vi")]
+    Vi,
+    #[serde(rename = "th")]
+    Th,
+}
+
+impl Default for Language {
+    fn default() -> Self {
+        Self::from_environment()
+    }
+}
+
+impl Language {
+    /// Every language, matching the App picker and website order.
+    pub const ALL: &'static [Language] = &[
+        Language::En,
+        Language::ZhTw,
+        Language::ZhCn,
+        Language::Ja,
+        Language::Ko,
+        Language::De,
+        Language::Fr,
+        Language::Es,
+        Language::Pt,
+        Language::Ru,
+        Language::Vi,
+        Language::Th,
+    ];
+
+    /// Native names for each language, matching App's `LOCALE_LABELS`.
+    pub const LABELS: &'static [&'static str] = &[
+        "English",
+        "\u{7e41}\u{9ad4}\u{4e2d}\u{6587}",
+        "\u{7b80}\u{4f53}\u{4e2d}\u{6587}",
+        "\u{65e5}\u{672c}\u{8a9e}",
+        "한국어",
+        "Deutsch",
+        "Français",
+        "Español",
+        "Português",
+        "Русский",
+        "Tiếng Việt",
+        "ไทย",
+    ];
+
+    /// Wire code matching App and Gateway (`en`, `zh-TW`, `zh-CN`, `ja`, ...).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::ZhTw => "zh-TW",
+            Self::ZhCn => "zh-CN",
+            Self::Ja => "ja",
+            Self::Ko => "ko",
+            Self::De => "de",
+            Self::Fr => "fr",
+            Self::Es => "es",
+            Self::Pt => "pt",
+            Self::Ru => "ru",
+            Self::Vi => "vi",
+            Self::Th => "th",
+        }
+    }
+
+    /// Language name written in its own language.
+    #[allow(dead_code)]
+    pub fn native_label(self) -> &'static str {
+        match self {
+            Self::En => "English",
+            Self::ZhTw => "\u{7e41}\u{9ad4}\u{4e2d}\u{6587}",
+            Self::ZhCn => "\u{7b80}\u{4f53}\u{4e2d}\u{6587}",
+            Self::Ja => "\u{65e5}\u{672c}\u{8a9e}",
+            Self::Ko => "한국어",
+            Self::De => "Deutsch",
+            Self::Fr => "Français",
+            Self::Es => "Español",
+            Self::Pt => "Português",
+            Self::Ru => "Русский",
+            Self::Vi => "Tiếng Việt",
+            Self::Th => "ไทย",
+        }
+    }
+
+    /// Chinese is Chinese: `zh` and the rest of the UI copy.
+    pub fn is_zh(self) -> bool {
+        matches!(self, Self::ZhCn | Self::ZhTw)
+    }
+
+    /// Chinese when the session's locale says Chinese (Traditional for
+    /// Taiwan, Hong Kong, Macau and `Hant`), else English.
+    pub fn from_environment() -> Self {
+        let lang = ["LC_ALL", "LC_MESSAGES", "LANG"]
+            .iter()
+            .find_map(|key| std::env::var(key).ok().filter(|v| !v.is_empty()))
+            .unwrap_or_default();
+        Self::from_locale_tag(&lang)
+    }
+
+    pub fn from_locale_tag(tag: &str) -> Self {
+        let tag = tag.to_ascii_lowercase().replace('_', "-");
+        if tag.starts_with("zh") {
+            let traditional = ["zh-tw", "zh-hk", "zh-mo", "zh-hant"]
+                .iter()
+                .any(|t| tag.starts_with(t));
+            if traditional {
+                Self::ZhTw
+            } else {
+                Self::ZhCn
+            }
+        } else if tag.starts_with("ja") {
+            Self::Ja
+        } else if tag.starts_with("ko") {
+            Self::Ko
+        } else if tag.starts_with("de") {
+            Self::De
+        } else if tag.starts_with("fr") {
+            Self::Fr
+        } else if tag.starts_with("es") {
+            Self::Es
+        } else if tag.starts_with("pt") {
+            Self::Pt
+        } else if tag.starts_with("ru") {
+            Self::Ru
+        } else if tag.starts_with("vi") {
+            Self::Vi
+        } else if tag.starts_with("th") {
+            Self::Th
+        } else {
+            Self::En
+        }
+    }
+
+    /// The gateway's i18n locale for the same language.
+    #[allow(dead_code)]
+    pub fn locale(self) -> muqun_gateway::platform::i18n::Locale {
+        muqun_gateway::platform::i18n::Locale::from_code(self.as_str()).unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Appearance {
+    pub scheme: Scheme,
+    pub theme_id: String,
+    /// "Reduce motion" (architecture §6.1 red line 6): the middle and large
+    /// motion tiers become short fades.
+    pub reduced_motion: bool,
+    /// "Reduce transparency" (§6.1d): glass surfaces fall back to solid.
+    pub reduced_transparency: bool,
+    pub density: Density,
+    /// Text size, 0.85..=1.3 of the kit's own sizes (1 is the kit's).
+    pub text_scale: f32,
+    /// Corner profile of panels, cards and controls.
+    pub shape: Shape,
+    /// Custom global opacity across the entire desktop (`0.35..=1.0`).
+    /// `None` uses the theme / platform default translucency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_opacity: Option<f32>,
+}
+
+/// How rounded the surfaces are.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Shape {
+    Sharp,
+    #[default]
+    Soft,
+    Round,
+}
+
+impl Shape {
+    /// What the kit's radii are multiplied by.
+    pub fn factor(self) -> f32 {
+        match self {
+            Shape::Sharp => 0.5,
+            Shape::Soft => 1.0,
+            Shape::Round => 1.5,
+        }
+    }
+}
+
+impl Appearance {
+    pub const TEXT_SCALES: [f32; 4] = [0.9, 1.0, 1.1, 1.2];
+    pub const MIN_OPACITY: f32 = 0.35;
+    pub const DEFAULT_OPACITY: f32 = 0.86;
+
+    /// The stored text scale, forced into range (a hand-edited value never
+    /// yields unreadable text).
+    pub fn text_scale(&self) -> f32 {
+        if self.text_scale.is_finite() {
+            self.text_scale.clamp(0.85, 1.3)
+        } else {
+            1.0
+        }
+    }
+
+    /// The user's custom global desktop opacity, clamped to a readable range.
+    pub fn custom_opacity(&self) -> Option<f32> {
+        self.window_opacity
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(Self::MIN_OPACITY, 1.0))
+    }
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            scheme: Scheme::System,
+            theme_id: crate::theme::DEFAULT_THEME_ID.to_string(),
+            reduced_motion: false,
+            reduced_transparency: false,
+            density: Density::Comfortable,
+            text_scale: 1.0,
+            shape: Shape::Soft,
+            window_opacity: None,
+        }
+    }
+}
+
+/// Row heights and spacing, scaled together (§6.1d).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Density {
+    #[default]
+    Comfortable,
+    Compact,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scheme {
+    Light,
+    Dark,
+    #[default]
+    System,
+}
+
+/// Minimal lineage evidence for a session visited from its parent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentContext {
+    pub computer: String,
+    pub agent: String,
+    pub asid: String,
+    /// An observed ancestor, not a guessed parent reconstructed from a title or id.
+    pub ancestor: Option<String>,
+}
+
+/// One MAO (Multi-Agent Orchestration) role binding: agent id + optional model/effort.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MaoRoleConfig {
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<muqun_gateway::agents::ModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+}
+
+/// Per-session MAO configuration override. Absent fields inherit from global `MaoPrefs`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MaoSessionOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<MaoRoleConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_failover: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_review: Option<bool>,
+}
+
+impl MaoSessionOverride {
+    pub fn is_empty(&self) -> bool {
+        self.reviewer.is_none()
+            && self.max_rounds.is_none()
+            && self.auto_failover.is_none()
+            && self.auto_review.is_none()
+    }
+}
+
+/// Persisted MAO preferences for the composer's orchestration flow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MaoPrefs {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<MaoRoleConfig>,
+    #[serde(default = "MaoPrefs::default_max_rounds")]
+    pub max_rounds: u8,
+    /// Automatically switch to the next configured Agent/Model in `agent_pool`
+    /// when quota, credits, or rate limits are exhausted.
+    #[serde(default = "MaoPrefs::default_auto_failover")]
+    pub auto_failover: bool,
+    /// Automatically run an independent Reviewer after every turn with code edits.
+    /// Defaults to `false` (Model-led orchestration: the Lead Model decides whether
+    /// to delegate or review, and the user can invoke Ask Advisor anytime).
+    #[serde(default)]
+    pub auto_review: bool,
+    /// Ordered pool of user-approved Agents & Models available for dynamic
+    /// orchestrator allocation and automatic quota failover.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_pool: Vec<MaoRoleConfig>,
+    /// Explicit per-session MAO on/off choices keyed by `asid`, persisted so
+    /// disabling MAO on a session stays disabled across reopens and Gateway syncs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub session_overrides: BTreeMap<String, bool>,
+    /// Per-session MAO configuration overrides (reviewer, max_rounds, auto_failover)
+    /// keyed by `asid`. Absent fields inherit from global defaults without affecting
+    /// other sessions.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub session_configs: BTreeMap<String, MaoSessionOverride>,
+}
+
+impl MaoPrefs {
+    pub const fn default_max_rounds() -> u8 {
+        2
+    }
+
+    pub const fn default_auto_failover() -> bool {
+        true
+    }
+}
+
+impl Default for MaoPrefs {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reviewer: None,
+            max_rounds: Self::default_max_rounds(),
+            auto_failover: Self::default_auto_failover(),
+            auto_review: false,
+            agent_pool: Vec::new(),
+            session_overrides: BTreeMap::new(),
+            session_configs: BTreeMap::new(),
+        }
+    }
+}
+
+/// Window furniture the owner arranged and expects back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiPrefs {
+    /// The sidebar's width in logical pixels.
+    pub sidebar_width: f32,
+    /// The right panel's preferred width (Queue / Git tabs). Clamped further
+    /// at layout time so the left column and main stay usable.
+    #[serde(default = "UiPrefs::right_default")]
+    pub right_width: f32,
+    /// The terminal panel's width (`ui/terminal_panel.rs`).
+    #[serde(default = "UiPrefs::terminal_default")]
+    pub terminal_width: f32,
+    /// Initial placement for ordinary terminal entry points.
+    pub terminal_open_mode: TerminalOpenMode,
+    /// Pins, hidden projects and names given to projects, by project root
+    /// (`model/projects.rs`). Only projects with a choice are kept.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub projects: BTreeMap<String, ProjectPrefs>,
+    /// The command palette's recent commands, newest first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recent_commands: Vec<String>,
+    /// Bounded lineage evidence for sessions opened through a parent. This keeps
+    /// incomplete metadata after reconnect from promoting a child to a root row.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subagent_contexts: Vec<SubagentContext>,
+    /// Sessions open side by side when the window closed, in tile order
+    /// (`ui/tiles.rs`); empty when one session filled the pane.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tiles: Vec<String>,
+    /// How those panes tile (`ui/dwindle.rs`), its leaves indexing `tiles`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile_layout: Option<TileNode>,
+    /// Active workspace layout mode (`Dwindle`, `Scrolling`, or `Floating`).
+    #[serde(default)]
+    pub tile_mode: TileLayoutMode,
+    /// The sidebar's Running list is open (`ui/running.rs`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub running_open: bool,
+    /// Multi-Agent Orchestration (`ui/orchestration.rs`) reviewer & round preferences.
+    #[serde(default)]
+    pub mao: MaoPrefs,
+}
+
+/// Default placement only; opening an existing terminal never relocates it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalOpenMode {
+    #[default]
+    Docked,
+    Split,
+    Floating,
+}
+
+/// Omarchy 4.5 / Hyprland workspace layout modes for split tiles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TileLayoutMode {
+    /// Binary tree spiral tiling (`dwindle.rs`).
+    #[default]
+    Dwindle,
+    /// Horizontal scrolling columns side by side.
+    Scrolling,
+    /// Free-floating, draggable, resizable window cards.
+    Floating,
+}
+
+impl TileLayoutMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Dwindle => Self::Scrolling,
+            Self::Scrolling => Self::Floating,
+            Self::Floating => Self::Dwindle,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Dwindle => Self::Floating,
+            Self::Scrolling => Self::Dwindle,
+            Self::Floating => Self::Scrolling,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dwindle => "Tiling (Dwindle)",
+            Self::Scrolling => "Scrolling",
+            Self::Floating => "Floating",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Dwindle => "Dwindle",
+            Self::Scrolling => "Scrolling",
+            Self::Floating => "Floating",
+        }
+    }
+}
+
+/// A split view's tiling, as Hyprland's dwindle layout keeps it: a leaf is
+/// a pane (an index into the tile list), a split two subtrees side by side
+/// (`across`) or stacked, the first taking `ratio` of the room.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TileNode {
+    Leaf(usize),
+    Split {
+        across: bool,
+        ratio: f32,
+        a: Box<TileNode>,
+        b: Box<TileNode>,
+    },
+}
+
+impl UiPrefs {
+    pub const SIDEBAR_DEFAULT: f32 = 260.0;
+    pub const SIDEBAR_MIN: f32 = 220.0;
+    pub const SIDEBAR_MAX: f32 = 360.0;
+    pub const RIGHT_DEFAULT: f32 = 320.0;
+    pub const RIGHT_MIN: f32 = 240.0;
+    /// Right-hand panes have no fixed ceiling: the window sets it at
+    /// layout time (`ui/panes.rs`). This only stops nonsense values.
+    pub const RIGHT_MAX: f32 = 4096.0;
+    /// Main column must keep at least this much (timeline + composer).
+    #[allow(dead_code)]
+    pub const MAIN_MIN: f32 = 420.0;
+
+    fn right_default() -> f32 {
+        Self::RIGHT_DEFAULT
+    }
+
+    pub const TERMINAL_DEFAULT: f32 = 560.0;
+
+    fn terminal_default() -> f32 {
+        Self::TERMINAL_DEFAULT
+    }
+
+    /// The stored terminal width, forced into the panel's range (the
+    /// window narrows it further at layout time).
+    pub fn terminal(&self) -> f32 {
+        if self.terminal_width.is_finite() {
+            self.terminal_width.clamp(360.0, Self::RIGHT_MAX)
+        } else {
+            Self::TERMINAL_DEFAULT
+        }
+    }
+
+    /// The stored width, forced into the range the layout allows (a hand
+    /// edited or NaN value never yields a broken window).
+    pub fn sidebar(&self) -> f32 {
+        if self.sidebar_width.is_finite() {
+            self.sidebar_width
+                .clamp(Self::SIDEBAR_MIN, Self::SIDEBAR_MAX)
+        } else {
+            Self::SIDEBAR_DEFAULT
+        }
+    }
+
+    /// Preferred right-panel width before the live window clamp.
+    pub fn right(&self) -> f32 {
+        if self.right_width.is_finite() {
+            self.right_width.clamp(Self::RIGHT_MIN, Self::RIGHT_MAX)
+        } else {
+            Self::RIGHT_DEFAULT
+        }
+    }
+}
+
+impl Default for UiPrefs {
+    fn default() -> Self {
+        Self {
+            sidebar_width: Self::SIDEBAR_DEFAULT,
+            right_width: Self::RIGHT_DEFAULT,
+            terminal_width: Self::TERMINAL_DEFAULT,
+            terminal_open_mode: TerminalOpenMode::default(),
+            projects: BTreeMap::new(),
+            recent_commands: Vec::new(),
+            subagent_contexts: Vec::new(),
+            tiles: Vec::new(),
+            tile_layout: None,
+            tile_mode: TileLayoutMode::Dwindle,
+            running_open: false,
+            mao: MaoPrefs::default(),
+        }
+    }
+}
+
+/// One change the owner made, applied by the core thread in the order the
+/// UI sent them (see `model/projection.rs`). Pure data, so applying it is a
+/// plain function ([`DesktopConfig::apply`]) with tests.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigEdit {
+    #[allow(dead_code)]
+    Window(WindowGeometry),
+    SidebarWidth(f32),
+    RightWidth(f32),
+    TerminalWidth(f32),
+    TerminalOpenMode(TerminalOpenMode),
+    /// The sessions open side by side and how they tile.
+    Tiles {
+        asids: Vec<String>,
+        layout: Option<TileNode>,
+    },
+    /// Active tile layout mode (`Dwindle`, `Scrolling`, `Floating`).
+    TileMode(TileLayoutMode),
+    /// What the owner chose for one project (pin, hide, name), by root.
+    Project {
+        root: String,
+        prefs: ProjectPrefs,
+    },
+    /// The editor "Open in …" uses.
+    Editor(crate::platform::editors::Editor),
+    Scheme(Scheme),
+    Language(Language),
+    Density(Density),
+    TextScale(f32),
+    Shape(Shape),
+    /// The first-run welcome was dismissed.
+    Welcomed,
+    GatewayLocalOnly(bool),
+    AnnouncedDesktopUpdate(String),
+    ReducedMotion(bool),
+    ReducedTransparency(bool),
+    WindowOpacity(Option<f32>),
+    Notifications(bool),
+    CloseToTray(bool),
+    /// The command palette's recent commands, newest first.
+    RecentCommands(Vec<String>),
+    RememberSubagent(SubagentContext),
+    Voice(VoiceConfig),
+    EditorCommand(Option<String>),
+    FilesInEditor(bool),
+    /// Where "New session" starts for an agent with no remembered folder.
+    DefaultCwd(Option<PathBuf>),
+    AgentEnabled {
+        agent: String,
+        on: bool,
+    },
+    /// What the composer chose for an agent in a folder. `None` clears.
+    Remember {
+        agent: String,
+        cwd: String,
+        model: Option<String>,
+        mode: Option<String>,
+    },
+    RememberRecentModel {
+        agent: String,
+        model: String,
+    },
+    /// Pin the session, or unpin it when it is pinned.
+    TogglePin(String),
+    /// Open or close the sidebar's Running list.
+    RunningOpen(bool),
+    /// The unsent text under a draft key; empty removes it.
+    Draft {
+        key: String,
+        text: String,
+    },
+    /// One field of one agent's block, as the owner typed it. An invalid
+    /// value changes nothing (the settings page has already said why).
+    AgentValue {
+        agent: String,
+        field: crate::agent_fields::Field,
+        value: String,
+    },
+    /// Switch active computer target.
+    CurrentComputer(String),
+    /// Set a per-computer theme.
+    ComputerTheme {
+        computer: String,
+        theme_id: String,
+    },
+    /// Set a per-computer accent hue.
+    #[allow(dead_code)]
+    ComputerAccent {
+        computer: String,
+        accent: String,
+    },
+    /// Remove this login, keeping the owner's computer preferences.
+    ForgetComputer(String),
+    /// Configure a computer's URL and token.
+    ComputerToken {
+        computer: String,
+        label: String,
+        url: String,
+        token: String,
+        device_id: Option<String>,
+        transport_key: Option<String>,
+    },
+    /// Set the global leader key chord (falls back to `"ctrl+space"` if empty).
+    SetLeader(String),
+    /// Set or clear a custom shortcut override for an action (`Action::id()`).
+    SetKeybind {
+        action: String,
+        spec: Option<String>,
+    },
+    /// Reset all custom keybindings and the leader key to defaults.
+    ResetKeymap,
+    /// Enable or disable a desktop plugin by id (`Settings → Plugins`).
+    PluginEnabled {
+        plugin: String,
+        on: bool,
+    },
+    /// Update Multi-Agent Orchestration (`MAO`) preferences.
+    Mao(MaoPrefs),
+}
+
+impl DesktopConfig {
+    /// Fold one edit in.
+    pub fn apply(&mut self, edit: ConfigEdit) {
+        match edit {
+            ConfigEdit::Window(geometry) => self.window = geometry,
+            ConfigEdit::SidebarWidth(width) => self.ui.sidebar_width = width,
+            ConfigEdit::RightWidth(width) => self.ui.right_width = width,
+            ConfigEdit::TerminalWidth(width) => self.ui.terminal_width = width,
+            ConfigEdit::TerminalOpenMode(mode) => self.ui.terminal_open_mode = mode,
+            ConfigEdit::Tiles { asids, layout } => {
+                self.ui.tiles = asids;
+                self.ui.tile_layout = layout;
+            }
+            ConfigEdit::TileMode(mode) => self.ui.tile_mode = mode,
+            ConfigEdit::Project { root, prefs } => {
+                if prefs.is_default() {
+                    self.ui.projects.remove(&root);
+                } else {
+                    self.ui.projects.insert(root, prefs);
+                }
+            }
+            ConfigEdit::Editor(editor) => self.general.editor = editor,
+            ConfigEdit::FilesInEditor(on) => self.general.files_in_editor = on,
+            ConfigEdit::Scheme(scheme) => self.appearance.scheme = scheme,
+            ConfigEdit::Language(language) => self.general.language = language,
+            ConfigEdit::Density(density) => self.appearance.density = density,
+            ConfigEdit::TextScale(scale) => self.appearance.text_scale = scale,
+            ConfigEdit::Shape(shape) => self.appearance.shape = shape,
+            ConfigEdit::AnnouncedDesktopUpdate(version) => {
+                self.general.announced_desktop_update = Some(version);
+            }
+            ConfigEdit::Welcomed => self.general.welcomed = true,
+            ConfigEdit::GatewayLocalOnly(on) => self.general.gateway_local_only = on,
+            ConfigEdit::ReducedMotion(on) => self.appearance.reduced_motion = on,
+            ConfigEdit::ReducedTransparency(on) => self.appearance.reduced_transparency = on,
+            ConfigEdit::WindowOpacity(opacity) => {
+                self.appearance.window_opacity = opacity
+                    .filter(|v| v.is_finite())
+                    .map(|v| v.clamp(Appearance::MIN_OPACITY, 1.0));
+            }
+            ConfigEdit::Notifications(on) => self.notifications.enabled = on,
+            ConfigEdit::CloseToTray(on) => self.general.close_to_tray = on,
+            ConfigEdit::RecentCommands(list) => self.ui.recent_commands = list,
+            ConfigEdit::RememberSubagent(context) => {
+                if context.asid.trim().is_empty()
+                    || context.ancestor.as_deref() == Some(context.asid.as_str())
+                {
+                    return;
+                }
+                if let Some(ancestor) = context.ancestor.as_deref() {
+                    if subagent_ancestor_reaches(
+                        &self.ui.subagent_contexts,
+                        &context.computer,
+                        ancestor,
+                        &context.asid,
+                    ) {
+                        return;
+                    }
+                }
+                self.ui
+                    .subagent_contexts
+                    .retain(|old| old.computer != context.computer || old.asid != context.asid);
+                self.ui.subagent_contexts.push(context);
+                let excess = self.ui.subagent_contexts.len().saturating_sub(1024);
+                self.ui.subagent_contexts.drain(..excess);
+            }
+            ConfigEdit::Voice(voice) => self.voice = voice,
+            ConfigEdit::EditorCommand(command) => {
+                self.general.editor_command = command.filter(|c| !c.trim().is_empty());
+            }
+            ConfigEdit::DefaultCwd(cwd) => self.general.default_cwd = cwd,
+            ConfigEdit::Remember {
+                agent,
+                cwd,
+                model,
+                mode,
+            } => {
+                let key = choice_key(&agent, &cwd);
+                let g = &mut self.general;
+                match model {
+                    Some(m) => {
+                        g.record_recent_model(&agent, &m);
+                        g.last_model.insert(key.clone(), m);
+                    }
+                    None => {
+                        g.last_model.remove(&key);
+                    }
+                }
+                match mode {
+                    Some(m) => g.last_mode.insert(key, m),
+                    None => g.last_mode.remove(&key),
+                };
+            }
+            ConfigEdit::RememberRecentModel { agent, model } => {
+                self.general.record_recent_model(&agent, &model);
+            }
+            ConfigEdit::RunningOpen(open) => self.ui.running_open = open,
+            ConfigEdit::TogglePin(asid) => {
+                let pinned = &mut self.general.pinned;
+                match pinned.iter().position(|p| *p == asid) {
+                    Some(at) => {
+                        pinned.remove(at);
+                    }
+                    None => pinned.insert(0, asid),
+                }
+            }
+            ConfigEdit::Draft { key, text } => {
+                let drafts = &mut self.general.drafts;
+                if text.trim().is_empty() {
+                    drafts.remove(&key);
+                } else {
+                    drafts.insert(key, text);
+                    while drafts.len() > MAX_DRAFTS {
+                        let Some(victim) = drafts.keys().find(|k| *k != START_DRAFT).cloned()
+                        else {
+                            break;
+                        };
+                        drafts.remove(&victim);
+                    }
+                }
+            }
+            ConfigEdit::CurrentComputer(id) => {
+                self.current_computer = id;
+            }
+            ConfigEdit::ComputerTheme { computer, theme_id } => {
+                if computer == "local" || computer == "self" {
+                    self.appearance.theme_id = theme_id;
+                } else {
+                    let p = self.computers.entry(computer).or_default();
+                    p.theme_id = Some(theme_id);
+                }
+            }
+            ConfigEdit::ComputerAccent { computer, accent } => {
+                let p = self.computers.entry(computer).or_default();
+                p.accent = Some(accent);
+            }
+            ConfigEdit::ForgetComputer(computer) => {
+                if let Some(p) = self.computers.get_mut(&computer) {
+                    p.url = None;
+                    p.token = None;
+                    p.device_id = None;
+                    p.transport_key = None;
+                }
+            }
+            ConfigEdit::ComputerToken {
+                computer,
+                label,
+                url,
+                token,
+                device_id,
+                transport_key,
+            } => {
+                let p = self.computers.entry(computer).or_default();
+                if p.name.is_empty() {
+                    p.name = label;
+                }
+                p.url = Some(url);
+                p.token = Some(token);
+                p.device_id = device_id;
+                p.transport_key = transport_key;
+            }
+            ConfigEdit::AgentEnabled { agent, on } => {
+                let target = self.current_computer.clone();
+                self.agents_for_mut(&target).set_enabled(&agent, on);
+            }
+            ConfigEdit::AgentValue {
+                agent,
+                field,
+                value,
+            } => {
+                let target = self.current_computer.clone();
+                if let Err(err) = self
+                    .agents_for_mut(&target)
+                    .set_value(&agent, field, &value)
+                {
+                    tracing::debug!(agent, ?field, %err, "an invalid value was not applied");
+                }
+            }
+            ConfigEdit::SetLeader(leader) => {
+                let trimmed = leader.trim();
+                self.keymap.leader = if trimmed.is_empty() {
+                    KeymapConfig::DEFAULT_LEADER.to_string()
+                } else {
+                    trimmed.to_string()
+                };
+            }
+            ConfigEdit::SetKeybind { action, spec } => {
+                match spec.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                    Some(s) => {
+                        self.keymap.bindings.insert(action, s);
+                    }
+                    None => {
+                        self.keymap.bindings.remove(&action);
+                    }
+                }
+            }
+            ConfigEdit::ResetKeymap => {
+                self.keymap.bindings.clear();
+                self.keymap.leader = KeymapConfig::DEFAULT_LEADER.to_string();
+            }
+            ConfigEdit::PluginEnabled { plugin, on } => {
+                if on || crate::plugin::is_always_on(&plugin) {
+                    self.plugins_disabled.remove(&plugin);
+                } else {
+                    self.plugins_disabled.insert(plugin);
+                }
+            }
+            ConfigEdit::Mao(mao) => self.ui.mao = mao,
+        }
+    }
+}
+
+/// Logical pixels. `x`/`y` are absent until a position is known: Wayland
+/// never tells a client where its window is.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WindowGeometry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub y: Option<i32>,
+    pub w: u32,
+    pub h: u32,
+    pub maximized: bool,
+}
+
+impl Default for WindowGeometry {
+    fn default() -> Self {
+        Self {
+            x: None,
+            y: None,
+            w: 1200,
+            h: 800,
+            maximized: false,
+        }
+    }
+}
+
+impl WindowGeometry {
+    /// The smallest window the layout is designed for.
+    pub const MIN: (u32, u32) = (720, 480);
+
+    /// This geometry with a size no smaller than [`Self::MIN`].
+    pub fn clamped(mut self) -> Self {
+        self.w = self.w.max(Self::MIN.0);
+        self.h = self.h.max(Self::MIN.1);
+        self
+    }
+}
+
+fn subagent_ancestor_reaches(
+    contexts: &[SubagentContext],
+    computer: &str,
+    start: &str,
+    target: &str,
+) -> bool {
+    let mut current = start;
+    let mut visited = std::collections::HashSet::new();
+    while visited.insert(current) {
+        if current == target {
+            return true;
+        }
+        let Some(next) = contexts
+            .iter()
+            .rev()
+            .find(|c| c.computer == computer && c.asid == current)
+            .and_then(|c| c.ancestor.as_deref())
+        else {
+            return false;
+        };
+        current = next;
+    }
+    false
+}
+
+/// Remove self-loops and break parent↔child cycles (which can happen if a
+/// subagent's collab tool referenced its own parent thread), keeping the true
+/// root visible in the sidebar while retaining all real subagent entries.
+pub(crate) fn sanitize_subagent_contexts(contexts: &mut Vec<SubagentContext>) {
+    contexts
+        .retain(|c| !c.asid.trim().is_empty() && c.ancestor.as_deref() != Some(c.asid.as_str()));
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped = Vec::with_capacity(contexts.len());
+    for entry in contexts.iter().rev() {
+        if seen.insert((entry.computer.clone(), entry.asid.clone())) {
+            deduped.push(entry.clone());
+        }
+    }
+    deduped.reverse();
+    *contexts = deduped;
+
+    loop {
+        let mut cycle_to_break: Option<(String, String)> = None;
+        for entry in contexts.iter() {
+            let mut path: Vec<String> = Vec::new();
+            let mut cur = entry.asid.as_str();
+            while let Some(next) = contexts
+                .iter()
+                .rev()
+                .find(|c| c.computer == entry.computer && c.asid == cur)
+                .and_then(|c| c.ancestor.as_deref())
+            {
+                if let Some(pos) = path.iter().position(|id| id == cur) {
+                    let cycle = &path[pos..];
+                    let root = cycle
+                        .iter()
+                        .max_by(|a, b| {
+                            let ca = contexts
+                                .iter()
+                                .filter(|c| {
+                                    c.computer == entry.computer
+                                        && c.ancestor.as_deref() == Some(a.as_str())
+                                })
+                                .count();
+                            let cb = contexts
+                                .iter()
+                                .filter(|c| {
+                                    c.computer == entry.computer
+                                        && c.ancestor.as_deref() == Some(b.as_str())
+                                })
+                                .count();
+                            ca.cmp(&cb).then_with(|| b.cmp(a))
+                        })
+                        .cloned();
+                    if let Some(root) = root {
+                        cycle_to_break = Some((entry.computer.clone(), root));
+                    }
+                    break;
+                }
+                path.push(cur.to_owned());
+                cur = next;
+            }
+            if cycle_to_break.is_some() {
+                break;
+            }
+        }
+        let Some((computer, root_asid)) = cycle_to_break else {
+            break;
+        };
+        contexts.retain(|c| !(c.computer == computer && c.asid == root_asid));
+    }
+}
+
+impl DesktopConfig {
+    /// Read `path`. A missing file is the defaults; a file that does not
+    /// parse is an error, so a typo is reported instead of silently reset.
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let mut cfg: Self = serde_json::from_slice(&bytes)
+                    .map_err(|err| anyhow::anyhow!("{} is not valid: {err}", path.display()))?;
+                sanitize_subagent_contexts(&mut cfg.ui.subagent_contexts);
+                Ok(cfg)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(err) => Err(anyhow::anyhow!("cannot read {}: {err}", path.display())),
+        }
+    }
+
+    /// Write `path` atomically: a sibling temporary file, flushed, then
+    /// renamed over the old one, so a crash mid-write leaves the previous
+    /// file and never half of a new one.
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        let dir = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
+        std::fs::create_dir_all(dir)?;
+        let mut json = serde_json::to_vec_pretty(self)?;
+        json.push(b'\n');
+        let result = (|| -> std::io::Result<()> {
+            // Profiles include bearer tokens and device transport keys. A fresh
+            // NamedTempFile is owner-only on Unix, including after the rename.
+            let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+            tmp.write_all(&json)?;
+            tmp.as_file().sync_all()?;
+            tmp.persist(path)?;
+            Ok(())
+        })();
+        result.map_err(|err| anyhow::anyhow!("cannot write {}: {err}", path.display()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "muqun-desktop-config-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_empty_object_loads_as_the_defaults() {
+        let config: DesktopConfig = serde_json::from_str("{}").unwrap();
+        assert!(config.agents.opencode.enabled && config.agents.opencode.autostart);
+        assert!(config.agents.codex.enabled);
+        assert!(!config.agents.deepseek.enabled, "the gateway's default");
+        assert_eq!(config.appearance.scheme, Scheme::System);
+        assert_eq!(config.appearance.theme_id, "cover-courier");
+        assert!(!config.appearance.reduced_motion && !config.appearance.reduced_transparency);
+        assert_eq!(config.appearance.density, Density::Comfortable);
+        assert_eq!(config.window, WindowGeometry::default());
+        assert!(
+            config.notifications.enabled,
+            "notifications are on until turned off"
+        );
+    }
+
+    #[test]
+    fn partial_blocks_keep_their_other_defaults() {
+        let config: DesktopConfig = serde_json::from_str(
+            r#"{"agents":{"opencode":{"autostart":false}},"general":{"language":"zh-CN"},"window":{"w":900}}"#,
+        )
+        .unwrap();
+        assert!(config.agents.opencode.enabled);
+        assert!(!config.agents.opencode.autostart);
+        assert!(
+            config.agents.claude.enabled,
+            "an absent agent keeps its default"
+        );
+        assert_eq!(config.general.language, Language::ZhCn);
+        assert_eq!(config.window.w, 900);
+        assert_eq!(config.window.h, 800);
+    }
+
+    #[test]
+    fn choices_and_drafts_are_remembered_and_cleared() {
+        let mut config = DesktopConfig::default();
+        config.apply(ConfigEdit::Remember {
+            agent: "codex".into(),
+            cwd: "/work/a".into(),
+            model: Some("gpt".into()),
+            mode: None,
+        });
+        let key = choice_key("codex", "/work/a");
+        assert_eq!(
+            config.general.last_model.get(&key).map(String::as_str),
+            Some("gpt")
+        );
+        assert!(!config.general.last_mode.contains_key(&key));
+        config.apply(ConfigEdit::Draft {
+            key: START_DRAFT.into(),
+            text: "hello".into(),
+        });
+        assert_eq!(config.general.drafts[START_DRAFT], "hello");
+        config.apply(ConfigEdit::Draft {
+            key: START_DRAFT.into(),
+            text: "  ".into(),
+        });
+        assert!(
+            config.general.drafts.is_empty(),
+            "an empty draft is removed"
+        );
+        for n in 0..(MAX_DRAFTS + 10) {
+            config.apply(ConfigEdit::Draft {
+                key: format!("s{n}"),
+                text: "x".into(),
+            });
+        }
+        config.apply(ConfigEdit::Draft {
+            key: START_DRAFT.into(),
+            text: "keep".into(),
+        });
+        assert!(config.general.drafts.len() <= MAX_DRAFTS);
+        assert!(config.general.drafts.contains_key(START_DRAFT));
+    }
+
+    #[test]
+    fn pinning_toggles() {
+        let mut config = DesktopConfig::default();
+        config.apply(ConfigEdit::TogglePin("a".into()));
+        config.apply(ConfigEdit::TogglePin("b".into()));
+        assert_eq!(config.general.pinned, ["b", "a"]);
+        config.apply(ConfigEdit::TogglePin("b".into()));
+        assert_eq!(config.general.pinned, ["a"]);
+    }
+
+    #[test]
+    fn save_then_load_round_trips_and_leaves_no_temporary_file() {
+        let dir = scratch();
+        let path = dir.join(CONFIG_FILE);
+        let mut config = DesktopConfig::default();
+        config
+            .general
+            .last_cwd
+            .insert("opencode".into(), PathBuf::from("/tmp/x"));
+        config.appearance.scheme = Scheme::Dark;
+        config.save(&path).unwrap();
+        config.window.w = 1000;
+        config.save(&path).unwrap();
+        let loaded = DesktopConfig::load(&path).unwrap();
+        assert_eq!(loaded.window.w, 1000);
+        assert_eq!(loaded.appearance.scheme, Scheme::Dark);
+        assert_eq!(
+            loaded.general.last_cwd.get("opencode"),
+            Some(&PathBuf::from("/tmp/x"))
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name() != CONFIG_FILE)
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_file_is_the_defaults_and_a_broken_one_is_an_error() {
+        let dir = scratch();
+        let path = dir.join(CONFIG_FILE);
+        assert!(DesktopConfig::load(&path).is_ok());
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(DesktopConfig::load(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_initial_folder_prefers_the_remembered_one() {
+        let mut general = General {
+            default_cwd: Some(PathBuf::from("/srv")),
+            ..General::default()
+        };
+        assert_eq!(general.initial_cwd("opencode"), PathBuf::from("/srv"));
+        general
+            .last_cwd
+            .insert("opencode".into(), PathBuf::from("/work"));
+        assert_eq!(general.initial_cwd("opencode"), PathBuf::from("/work"));
+        general.default_cwd = None;
+        assert_eq!(general.initial_cwd("codex"), dirs::home_dir().unwrap());
+    }
+
+    #[test]
+    fn locale_tag_negotiation() {
+        assert_eq!(Language::from_locale_tag("zh_CN.UTF-8"), Language::ZhCn);
+        assert_eq!(Language::from_locale_tag("en_US.UTF-8"), Language::En);
+        assert_eq!(Language::from_locale_tag("zh_TW.UTF-8"), Language::ZhTw);
+        assert_eq!(Language::from_locale_tag("zh-Hant-HK"), Language::ZhTw);
+        assert_eq!(Language::from_locale_tag("ja_JP.UTF-8"), Language::Ja);
+        assert_eq!(Language::from_locale_tag("ko_KR.UTF-8"), Language::Ko);
+        assert_eq!(Language::from_locale_tag("de_DE.UTF-8"), Language::De);
+        assert_eq!(Language::from_locale_tag("fr_FR.UTF-8"), Language::Fr);
+        assert_eq!(Language::from_locale_tag("es_ES.UTF-8"), Language::Es);
+        assert_eq!(Language::from_locale_tag("pt_BR.UTF-8"), Language::Pt);
+        assert_eq!(Language::from_locale_tag("ru_RU.UTF-8"), Language::Ru);
+        assert_eq!(Language::from_locale_tag("vi_VN.UTF-8"), Language::Vi);
+        assert_eq!(Language::from_locale_tag("th_TH.UTF-8"), Language::Th);
+        assert_eq!(Language::from_locale_tag(""), Language::En);
+    }
+
+    #[test]
+    fn edits_change_only_what_they_name() {
+        use crate::agent_fields::Field;
+        let mut config = DesktopConfig::default();
+        config.apply(ConfigEdit::SidebarWidth(333.0));
+        config.apply(ConfigEdit::Project {
+            root: "/w/x".into(),
+            prefs: ProjectPrefs {
+                pinned: true,
+                ..ProjectPrefs::default()
+            },
+        });
+        config.apply(ConfigEdit::Project {
+            root: "/w/y".into(),
+            prefs: ProjectPrefs::default(),
+        });
+        config.apply(ConfigEdit::Editor(crate::platform::editors::Editor::Zed));
+        config.apply(ConfigEdit::Language(Language::ZhCn));
+        config.apply(ConfigEdit::Scheme(Scheme::Dark));
+        config.apply(ConfigEdit::Density(Density::Compact));
+        config.apply(ConfigEdit::ReducedMotion(true));
+        config.apply(ConfigEdit::ReducedTransparency(true));
+        config.apply(ConfigEdit::DefaultCwd(Some(PathBuf::from("/srv"))));
+        config.apply(ConfigEdit::EditorCommand(Some("  ".into())));
+        config.apply(ConfigEdit::AgentEnabled {
+            agent: "fx".into(),
+            on: false,
+        });
+        config.apply(ConfigEdit::AgentValue {
+            agent: "claude".into(),
+            field: Field::IdleTimeout,
+            value: "90".into(),
+        });
+        // An invalid value is dropped, not stored.
+        config.apply(ConfigEdit::AgentValue {
+            agent: "codex".into(),
+            field: Field::Binary,
+            value: "codex".into(),
+        });
+        assert_eq!(config.ui.sidebar_width, 333.0);
+        assert!(config.ui.projects["/w/x"].pinned);
+        assert!(
+            !config.ui.projects.contains_key("/w/y"),
+            "a project with nothing chosen is not kept"
+        );
+        assert_eq!(config.general.editor, crate::platform::editors::Editor::Zed);
+        assert_eq!(config.general.language, Language::ZhCn);
+        assert_eq!(config.appearance.scheme, Scheme::Dark);
+        assert_eq!(config.appearance.density, Density::Compact);
+        assert!(config.appearance.reduced_motion);
+        assert!(config.appearance.reduced_transparency);
+        assert_eq!(config.general.default_cwd, Some(PathBuf::from("/srv")));
+        assert_eq!(config.general.editor_command, None, "blank is unset");
+        assert!(!config.agents.fx.enabled);
+        assert_eq!(config.agents.claude.idle_timeout_secs, 90);
+        assert!(config.agents.codex.binary.is_none());
+        assert!(
+            config.agents.opencode.enabled,
+            "untouched agents keep their defaults"
+        );
+    }
+
+    #[test]
+    fn the_sidebar_width_is_kept_inside_what_the_layout_allows() {
+        let width = |w: f32| {
+            UiPrefs {
+                sidebar_width: w,
+                ..UiPrefs::default()
+            }
+            .sidebar()
+        };
+        assert_eq!(width(10.0), UiPrefs::SIDEBAR_MIN);
+        assert_eq!(width(9000.0), UiPrefs::SIDEBAR_MAX);
+        assert_eq!(width(f32::NAN), UiPrefs::SIDEBAR_DEFAULT);
+        assert_eq!(width(320.0), 320.0);
+    }
+
+    #[test]
+    fn an_old_file_without_the_new_blocks_still_loads() {
+        // `grouping` and `agent_filter` were the v1 sidebar's; they are
+        // ignored now, not an error.
+        let config: DesktopConfig = serde_json::from_str(
+            r#"{"general":{"language":"en"},"ui":{"grouping":"agent","agent_filter":"codex"}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.ui.sidebar_width, UiPrefs::SIDEBAR_DEFAULT);
+        assert_eq!(config.ui.right_width, UiPrefs::RIGHT_DEFAULT);
+        assert!(config.ui.projects.is_empty());
+        assert!(!config.general.close_to_tray);
+        assert_eq!(
+            config.general.editor,
+            crate::platform::editors::Editor::VsCode
+        );
+        let config: DesktopConfig = serde_json::from_str(
+            r#"{"ui":{"projects":{"/w/x":{"pinned":true,"name":"X"}}},"general":{"editor":"zed"}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.ui.projects["/w/x"].name.as_deref(), Some("X"));
+        assert_eq!(config.general.editor, crate::platform::editors::Editor::Zed);
+        let config: DesktopConfig =
+            serde_json::from_str(r#"{"general":{"editor":"neovim"}}"#).unwrap();
+        assert_eq!(
+            config.general.editor,
+            crate::platform::editors::Editor::Neovim
+        );
+    }
+
+    #[test]
+    fn computer_profiles_isolate_agent_configs_and_theme() {
+        let mut config = DesktopConfig::default();
+        assert_eq!(config.current_computer, "local");
+        assert_eq!(config.theme_for("local"), "cover-courier");
+
+        // Set theme and agent for remote "mini"
+        config.apply(ConfigEdit::CurrentComputer("mini".into()));
+        assert_eq!(config.current_computer, "mini");
+
+        config.apply(ConfigEdit::ComputerTheme {
+            computer: "mini".into(),
+            theme_id: "jade-tempest".into(),
+        });
+        assert_eq!(config.theme_for("mini"), "jade-tempest");
+        assert_eq!(config.theme_for("local"), "cover-courier"); // local is unchanged!
+
+        // Modify agent setting on "mini"
+        config.apply(ConfigEdit::AgentEnabled {
+            agent: "claude".into(),
+            on: false,
+        });
+
+        assert!(!config.agents_for("mini").claude.enabled);
+        assert!(
+            config.agents_for("local").claude.enabled,
+            "local claude remains enabled!"
+        );
+
+        config.apply(ConfigEdit::ComputerAccent {
+            computer: "mini".into(),
+            accent: "emerald".into(),
+        });
+        assert_eq!(config.accent_for("mini"), Some("emerald"));
+
+        // Switch back to local
+        config.apply(ConfigEdit::CurrentComputer("local".into()));
+        assert_eq!(config.current_computer, "local");
+        assert!(config.agents_for(&config.current_computer).claude.enabled);
+    }
+
+    #[test]
+    fn keymap_config_serializes_and_applies_edits() {
+        let mut config = DesktopConfig::default();
+        assert!(config.keymap.is_default());
+        assert_eq!(config.keymap.leader, "ctrl+space");
+        assert!(config.keymap.bindings.is_empty());
+
+        config.apply(ConfigEdit::SetLeader("ctrl+a".into()));
+        assert_eq!(config.keymap.leader, "ctrl+a");
+        assert!(!config.keymap.is_default());
+
+        // Empty leader falls back to ctrl+space
+        config.apply(ConfigEdit::SetLeader("   ".into()));
+        assert_eq!(config.keymap.leader, "ctrl+space");
+
+        config.apply(ConfigEdit::SetLeader("alt+space".into()));
+        config.apply(ConfigEdit::SetKeybind {
+            action: "palette".into(),
+            spec: Some("ctrl+shift+k".into()),
+        });
+        assert_eq!(
+            config.keymap.bindings.get("palette").map(String::as_str),
+            Some("ctrl+shift+k")
+        );
+
+        // Round-trip through JSON
+        let json = serde_json::to_string(&config).unwrap();
+        let loaded: DesktopConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.keymap.leader, "alt+space");
+        assert_eq!(
+            loaded.keymap.bindings.get("palette").map(String::as_str),
+            Some("ctrl+shift+k")
+        );
+
+        // Clear single keybind
+        config.apply(ConfigEdit::SetKeybind {
+            action: "palette".into(),
+            spec: None,
+        });
+        assert!(!config.keymap.bindings.contains_key("palette"));
+
+        // Reset all keymap settings
+        config.apply(ConfigEdit::SetKeybind {
+            action: "toggle_sidebar".into(),
+            spec: Some("alt+b".into()),
+        });
+        config.apply(ConfigEdit::ResetKeymap);
+        assert!(config.keymap.is_default());
+        assert_eq!(config.keymap.leader, "ctrl+space");
+        assert!(config.keymap.bindings.is_empty());
+    }
+
+    #[test]
+    fn plugin_enablement_uses_disabled_set() {
+        let mut config = DesktopConfig::default();
+        assert!(config.plugins_disabled.is_empty());
+
+        config.apply(ConfigEdit::PluginEnabled {
+            plugin: "quicknotes".into(),
+            on: false,
+        });
+        assert!(config.plugins_disabled.contains("quicknotes"));
+
+        config.apply(ConfigEdit::PluginEnabled {
+            plugin: "terminal".into(),
+            on: false,
+        });
+        assert!(
+            !config.plugins_disabled.contains("terminal"),
+            "always-on plugins stay enabled"
+        );
+
+        config.apply(ConfigEdit::PluginEnabled {
+            plugin: "quicknotes".into(),
+            on: true,
+        });
+        assert!(!config.plugins_disabled.contains("quicknotes"));
+    }
+
+    #[test]
+    fn sanitize_subagent_contexts_breaks_parent_child_cycle_preserving_root() {
+        let mut contexts = vec![
+            SubagentContext {
+                computer: "local".into(),
+                agent: "codex".into(),
+                asid: "01a2088d-child1".into(),
+                ancestor: Some("01a207c1-root".into()),
+            },
+            SubagentContext {
+                computer: "local".into(),
+                agent: "codex".into(),
+                asid: "01a20897-child2".into(),
+                ancestor: Some("01a207c1-root".into()),
+            },
+            // Poisoned reverse edge demoting the root under its own child:
+            SubagentContext {
+                computer: "local".into(),
+                agent: "codex".into(),
+                asid: "01a207c1-root".into(),
+                ancestor: Some("01a20897-child2".into()),
+            },
+        ];
+        sanitize_subagent_contexts(&mut contexts);
+        assert!(
+            !contexts.iter().any(|c| c.asid == "01a207c1-root"),
+            "root must not remain marked as a subagent"
+        );
+        assert_eq!(contexts.len(), 2);
+        assert!(contexts
+            .iter()
+            .all(|c| c.ancestor.as_deref() == Some("01a207c1-root")));
+
+        // RememberSubagent also refuses to introduce a cycle at runtime.
+        let mut cfg = DesktopConfig::default();
+        cfg.ui.subagent_contexts = contexts;
+        cfg.apply(ConfigEdit::RememberSubagent(SubagentContext {
+            computer: "local".into(),
+            agent: "codex".into(),
+            asid: "01a207c1-root".into(),
+            ancestor: Some("01a20897-child2".into()),
+        }));
+        assert!(!cfg
+            .ui
+            .subagent_contexts
+            .iter()
+            .any(|c| c.asid == "01a207c1-root"));
+    }
+}

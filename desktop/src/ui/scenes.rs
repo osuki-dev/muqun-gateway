@@ -1,0 +1,2397 @@
+//! Named states for `AppSpec::scenes`: demo data so screenshots need no live gateway.
+
+use muqun_gateway::agents::{
+    AgentPart, AgentSessionInfo, FormRequest, PermissionRequest, TimelineItem, TimelineRole,
+};
+use muqun_gateway::platform::discovery::AgentDiscoveryInfo;
+use rune::TextEdit;
+use rune_kit::diff::{parse, DiffState};
+use serde_json::json;
+
+use super::{Mode, SessionSlot, SettingsTab, Tile, UiState};
+use crate::hub::TaskRow;
+use crate::model::compose::InboxItem;
+use crate::model::types::{DiffFile, DiffStat};
+
+const PATCH: &str = "diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,6 +1,8 @@
+ pub fn greet(name: &str) -> String {
+-    format!(\"hi {name}\")
++    let name = name.trim();
++    format!(\"Hello, {name}!\")
+ }
+ 
+ pub fn main() {
+     println!(\"{}\", greet(\"world\"));
++    println!(\"{}\", greet(\"  rune \"));
+ }
+";
+
+fn session(
+    asid: &str,
+    title: &str,
+    agent: &str,
+    status: &str,
+    dir: &str,
+    age: u64,
+) -> AgentSessionInfo {
+    serde_json::from_value(json!({
+        "asid": asid, "agent_id": agent, "title": title, "status": status,
+        "directory": std::env::var("MUQUN_SCENE_WORKSPACE").unwrap_or_else(|_| dir.to_string()), "updated_ms": 1_800_000_000_000u64 - age,
+        "model": { "provider_id": "anthropic", "model_id": "sonnet" },
+    }))
+    .expect("demo session")
+}
+
+fn agent(id: &str, name: &str, enabled: bool) -> AgentDiscoveryInfo {
+    let features: serde_json::Value = [
+        "streaming",
+        "reasoningEffort",
+        "modelSelection",
+        "toolApprovals",
+        "worktrees",
+        "revert",
+        "stagedRevert",
+        "inbox",
+        "modes",
+        "skills",
+        "slashCommands",
+        "compaction",
+        "backgroundShells",
+        "attachments",
+        "attachmentsByPath",
+    ]
+    .iter()
+    .map(|k| (k.to_string(), json!(false)))
+    .collect::<serde_json::Map<_, _>>()
+    .into();
+    serde_json::from_value(json!({
+        "id": id, "name": name, "kind": id, "status": if enabled { "connected" } else { "disabled" },
+        "enabled": enabled, "models": [], "modes": [], "features": features,
+    }))
+    .expect("demo agent")
+}
+
+fn item(id: &str, role: TimelineRole, part: AgentPart) -> TimelineItem {
+    TimelineItem {
+        id: id.into(),
+        message_id: format!("m-{id}"),
+        role,
+        part,
+        seq: 0,
+        updated_ms: 0,
+        ordinal: 0,
+        attachments: None,
+        image_assets: None,
+        generation: None,
+        origin: None,
+    }
+}
+
+/// Make a built-in theme pack current, so a scene renders in it.
+fn with_pack(s: &mut UiState, id: &str) {
+    let Some(pack) = crate::theme::store::builtin(id) else {
+        return;
+    };
+    activate(s, &crate::theme::store::Loaded::Builtin(pack));
+}
+
+fn activate(s: &mut UiState, loaded: &crate::theme::store::Loaded) {
+    let applied = crate::theme::service::applied_from(
+        loaded,
+        crate::config::Scheme::System,
+        std::time::Instant::now(),
+    );
+    match applied.and_then(crate::theme::apply::activate) {
+        Ok(_) => s.cfg.appearance.theme_id = loaded.manifest().id.clone(),
+        Err(err) => tracing::error!("scene theme: {err:#}"),
+    }
+}
+
+/// `MUQUN_SCENE_THEME` renders any scene in another pack: a built-in id, a
+/// `.muqun-theme` package, or a directory holding `theme.json` (a source in
+/// the themes repository) or `manifest.json` (an installed theme) beside
+/// `assets/`. Pair it with Rune's `--theme light|dark`.
+fn scene_pack(s: &mut UiState) {
+    let Ok(spec) = std::env::var("MUQUN_SCENE_THEME") else {
+        return;
+    };
+    let path = std::path::Path::new(&spec);
+    let loaded = if let Some(pack) = crate::theme::store::builtin(&spec) {
+        Ok(crate::theme::store::Loaded::Builtin(pack))
+    } else if path.is_dir() {
+        ["theme.json", "manifest.json"]
+            .iter()
+            .map(|name| path.join(name))
+            .find(|p| p.is_file())
+            .ok_or_else(|| anyhow::anyhow!("{spec}: no theme.json or manifest.json"))
+            .and_then(|p| Ok(std::fs::read(p)?))
+            .and_then(|bytes| crate::theme::pack::parse_manifest(&bytes))
+            .map(|manifest| crate::theme::store::Loaded::Installed {
+                manifest: std::sync::Arc::new(manifest),
+                dir: path.to_path_buf(),
+            })
+    } else {
+        std::fs::read(path)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| crate::theme::pack::unpack(&bytes))
+            .map(|pack| crate::theme::store::Loaded::Builtin(std::sync::Arc::new(pack)))
+    };
+    match loaded {
+        Ok(loaded) => activate(s, &loaded),
+        Err(err) => tracing::error!("MUQUN_SCENE_THEME: {err:#}"),
+    }
+}
+
+/// The launch splash, caught mid-hold.
+fn splash_scene(s: &mut UiState) {
+    base(s);
+    s.mode = Mode::Home;
+    s.selected = None;
+    let splash = super::splash::Splash::start(super::splash::SplashKind::Boot);
+    s.hub_label.clear();
+    s.splash = Some(splash);
+    s.demo = true;
+}
+
+fn base(s: &mut UiState) {
+    scene_pack(s);
+    s.hub_label = "standalone".into();
+    s.agents_seen = true;
+    s.splash = None;
+    s.cfg.general.welcomed = true;
+    s.status = "Demo".into();
+    s.agents = vec![
+        agent("codex", "Codex", true),
+        agent("opencode", "OpenCode", true),
+        agent("pi", "Pi", false),
+    ];
+    s.start_agent = "codex".into();
+    s.start_cwd = TextEdit::new("/home/demo/gateway");
+    s.sessions = vec![
+        session(
+            "s1",
+            "Fix the greeting",
+            "codex",
+            "busy",
+            "/home/demo/gateway",
+            1_000,
+        ),
+        session(
+            "s2",
+            "Review the release notes",
+            "opencode",
+            "idle",
+            "/home/demo/gateway",
+            60_000,
+        ),
+        session(
+            "s3",
+            "Port the settings page",
+            "codex",
+            "idle",
+            "/home/demo/rune",
+            3_600_000,
+        ),
+    ];
+    s.selected = Some("s1".into());
+}
+
+fn permission() -> PermissionRequest {
+    serde_json::from_value(json!({
+        "id": "perm-1", "asid": "s1", "action": "bash", "resources": ["cargo test --locked"],
+        "prompt": "Run the test suite?", "options": [],
+    }))
+    .expect("demo permission")
+}
+
+fn form() -> FormRequest {
+    serde_json::from_value(json!({
+        "id": "form-1", "asid": "s1", "title": "Pick a target",
+        "fields": [
+            { "type": "string", "key": "branch", "title": "Branch", "placeholder": "main" },
+            { "type": "boolean", "key": "push", "title": "Push when done", "default": false },
+        ],
+    }))
+    .expect("demo form")
+}
+
+fn timeline(s: &mut UiState) {
+    use TimelineRole::{Assistant, User};
+    let call: muqun_gateway::agents::ToolCall = serde_json::from_value(json!({
+        "id": "t1", "name": "edit", "title": "Edit src/lib.rs", "input": { "file_path": "src/lib.rs" },
+        "output": "Applied 1 edit.", "metadata": { "files": [{ "file": "src/lib.rs", "patch": PATCH }] },
+        "state": "completed", "status": "completed",
+    }))
+    .expect("demo tool");
+    let items = vec![
+        item("u1", User, AgentPart::Text { text: "Make `greet` trim its argument and add a trailing `!`.".into() }),
+        item("r1", Assistant, AgentPart::Reasoning { text: "The function formats directly; trim first.".into(), duration_ms: Some(2300) }),
+        item("a1", Assistant, AgentPart::Text { text: "I'll update **`greet`** and run the tests.\n\n- trim the input\n- add punctuation".into() }),
+        item("t1", Assistant, AgentPart::Tool(call)),
+        item("d1", Assistant, AgentPart::Todo { items: vec![
+            muqun_gateway::agents::TodoItem { text: "Edit greet".into(), done: true },
+            muqun_gateway::agents::TodoItem { text: "Run cargo test".into(), done: false },
+        ] }),
+        item("p1", Assistant, AgentPart::Approval { request: permission() }),
+        item("f1", Assistant, AgentPart::Form { request: form() }),
+        item("st1", Assistant, AgentPart::Status { text: "Waiting for approval".into() }),
+    ];
+    s.open_session_current(&s.sessions[0].asid.0.clone());
+    s.apply_updates(vec![crate::model::inbox::Update::Snapshot(Box::new(
+        muqun_gateway::agents::ports::AgentSessionSnapshot {
+            info: s.sessions[0].clone(),
+            timeline: items,
+            permissions: vec![permission()],
+            forms: vec![form()],
+            inbox: vec![],
+            seq: 1,
+        },
+    ))]);
+    if let Some(tl) = s.timelines.get_mut("s1") {
+        tl.flip("r1");
+    }
+    s.mode = Mode::Session;
+}
+
+fn diff_stat(s: &mut UiState) {
+    s.diff_stat = DiffStat {
+        asid: "s1".into(),
+        files: 1,
+        added: 3,
+        removed: 1,
+        paths: vec![DiffFile {
+            path: "src/lib.rs".into(),
+            added: 3,
+            removed: 1,
+            patch: PATCH.into(),
+        }],
+    };
+    s.diff = Some(DiffState::new(parse(PATCH)));
+}
+
+fn home(s: &mut UiState) {
+    base(s);
+    s.selected = None;
+    s.mode = Mode::Home;
+    s.start_draft = TextEdit::new("Add a settings page that edits the agent list.");
+    s.start_catalog = Some(composer_catalog());
+    s.demo = true;
+}
+
+/// Home while agents work: one approval waiting, one session running, a task.
+fn home_busy(s: &mut UiState) {
+    base(s);
+    s.sessions.push(session(
+        "s4",
+        "Migrate the config loader",
+        "opencode",
+        "busy",
+        "/home/demo/rune",
+        5_000,
+    ));
+    s.waiting_perms.insert("s1".into(), vec![permission()]);
+    s.tasks = vec![TaskRow {
+        id: "k1".into(),
+        state: "working".into(),
+        title: "Audit the release workflow".into(),
+        progress: Some("3 of 5 steps".into()),
+        agent_id: Some("codex".into()),
+        asid: Some("s1".into()),
+        ..TaskRow::default()
+    }];
+    s.selected = None;
+    s.mode = Mode::Home;
+    s.demo = true;
+}
+
+/// Home on a well-used install: ten agents, a full recent grid, and the
+/// sidebar's Running list open on sessions and tasks, one on another computer.
+fn home_crowd(s: &mut UiState) {
+    home_busy(s);
+    s.agents = [
+        ("claude", "Claude Code"),
+        ("codex", "Codex"),
+        ("opencode", "OpenCode"),
+        ("cursor", "Cursor"),
+        ("deepseek", "DeepSeek"),
+        ("qoder", "Qoder"),
+        ("pi", "Pi"),
+        ("t3", "T3 Code"),
+        ("antigravity", "Antigravity"),
+        ("fx", "FX"),
+    ]
+    .iter()
+    .map(|(id, name)| agent(id, name, true))
+    .collect();
+    for (asid, title, agent_id, status, dir, age) in [
+        (
+            "s5",
+            "Rework the theme loader",
+            "claude",
+            "busy",
+            "/home/demo/gateway",
+            9_000,
+        ),
+        (
+            "s6",
+            "Tidy the release notes",
+            "claude",
+            "idle",
+            "/home/demo/rune",
+            7_200_000,
+        ),
+        (
+            "s7",
+            "Explain the sync protocol",
+            "deepseek",
+            "idle",
+            "/home/demo/gateway",
+            86_400_000,
+        ),
+        (
+            "s8",
+            "Speed up the session list",
+            "cursor",
+            "idle",
+            "/home/demo/rune",
+            90_000_000,
+        ),
+        (
+            "s9",
+            "Draft the install guide",
+            "claude",
+            "idle",
+            "/home/demo/site",
+            200_000_000,
+        ),
+    ] {
+        s.sessions
+            .push(session(asid, title, agent_id, status, dir, age));
+    }
+    let now = super::now_ms();
+    s.busy_since.insert("s4".into(), now - 4 * 60_000);
+    s.busy_since.insert("s5".into(), now - 38 * 60_000);
+    s.tasks = vec![
+        TaskRow {
+            id: "k1".into(),
+            state: "working".into(),
+            title: "Audit the release workflow".into(),
+            progress: Some("Reading .github/workflows/release.yml".into()),
+            agent_id: Some("codex".into()),
+            asid: Some("s1".into()),
+            started_ms: now - 12 * 60_000,
+            ..TaskRow::default()
+        },
+        TaskRow {
+            id: "k2".into(),
+            state: "working".into(),
+            title: "Run the device test matrix".into(),
+            progress: Some("iOS 3 of 8".into()),
+            agent_id: Some("claude".into()),
+            machine: Some("studio".into()),
+            started_ms: now - 71 * 60_000,
+            ..TaskRow::default()
+        },
+        TaskRow {
+            id: "k3".into(),
+            state: "working".into(),
+            kind: "command".into(),
+            title: "cargo build --release".into(),
+            started_ms: now - 2 * 60_000,
+            ..TaskRow::default()
+        },
+    ];
+    s.cfg.ui.running_open = true;
+}
+
+/// Home before the first session: the welcome.
+fn home_first(s: &mut UiState) {
+    base(s);
+    s.sessions.clear();
+    s.cfg.general.last_agent = None;
+    s.cfg.general.last_cwd.clear();
+    s.selected = None;
+    s.mode = Mode::Home;
+    s.demo = true;
+}
+
+fn session_scene(s: &mut UiState) {
+    base(s);
+    timeline(s);
+    diff_stat(s);
+    s.queue = vec![InboxItem {
+        id: "q1".into(),
+        text: "Then update the changelog".into(),
+        steer: false,
+        files: Vec::new(),
+    }];
+    s.right_open = true;
+    s.right.set_open(true);
+    s.draft = TextEdit::new("");
+    s.demo = true;
+}
+
+fn diff(s: &mut UiState) {
+    base(s);
+    timeline(s);
+    diff_stat(s);
+    s.show_diff = true;
+    s.open_git_panel();
+    s.git_commit_msg = rune::TextEdit::new("feat: update greeting copy");
+    s.demo = true;
+}
+
+/// A parked tile's own short timeline.
+fn parked_items(prefix: &str, ask: &str, reply: &str) -> Vec<TimelineItem> {
+    use TimelineRole::{Assistant, User};
+    vec![
+        item(
+            &format!("{prefix}-u1"),
+            User,
+            AgentPart::Text { text: ask.into() },
+        ),
+        item(
+            &format!("{prefix}-a1"),
+            Assistant,
+            AgentPart::Text { text: reply.into() },
+        ),
+    ]
+}
+
+/// Two sessions side by side: the greeting fix (focused) and the release
+/// notes review streaming beside it.
+fn split2(s: &mut UiState) {
+    base(s);
+    timeline(s);
+    diff_stat(s);
+    s.tiles = vec![
+        Tile::session("s1"),
+        Tile {
+            slot: SessionSlot {
+                draft: TextEdit::new("Also check the Chinese copy"),
+                ..SessionSlot::default()
+            },
+            ..Tile::session("s2")
+        },
+    ];
+    s.timelines.insert(
+        "s2".into(),
+        {
+            let mut tl = super::timeline::SessionTimeline::default();
+            tl.replace(parked_items(
+                "s2",
+                    "Review the release notes for 3.1.0 and tighten the wording.",
+                    "Reading `release-notes/unreleased.md`…\n\n- The **Pad layout** entry needs the keyboard shortcut.\n- Two entries repeat the PR number.",
+            ));
+            tl.earlier_exhausted = true;
+            tl
+        },
+    );
+    s.focus = 0;
+    s.draft = TextEdit::new("");
+    s.demo = true;
+}
+
+/// Four tiles: two working, one waiting on an approval, one empty picker.
+fn split4(s: &mut UiState) {
+    base(s);
+    s.sessions.push(session(
+        "s4",
+        "Migrate the config loader",
+        "opencode",
+        "busy",
+        "/home/demo/rune",
+        5_000,
+    ));
+    timeline(s);
+    s.tiles = vec![
+        Tile::session("s1"),
+        Tile::session("s2"),
+        Tile::session("s4"),
+        Tile::empty(),
+    ];
+    s.timelines.insert("s2".into(), {
+        let mut tl = super::timeline::SessionTimeline::default();
+        tl.replace(parked_items(
+            "s2",
+            "Review the release notes for 3.1.0.",
+            "Two entries repeat the PR number; fixing.",
+        ));
+        tl.earlier_exhausted = true;
+        tl
+    });
+    s.timelines.insert("s4".into(), {
+        let mut tl = super::timeline::SessionTimeline::default();
+        tl.replace(parked_items(
+            "s4",
+            "Move the config loader onto serde defaults.",
+            "Working through `config.rs`: 3 of 7 structs done.",
+        ));
+        tl.earlier_exhausted = true;
+        tl
+    });
+    s.focus = 1;
+    // Tile 1 is focused: its state lives in the top-level fields.
+    s.tiles[1].slot = SessionSlot::default();
+    s.selected = Some("s2".into());
+    s.draft = TextEdit::new("");
+    s.demo = true;
+}
+
+fn settings(s: &mut UiState) {
+    base(s);
+    s.mode = Mode::Settings;
+    s.settings_tab = SettingsTab::Agents;
+    s.storage = Some(crate::model::storage::StorageReport {
+        previews: 9_500_000,
+        gallery: 88_000,
+        uploads: 20_000_000,
+        other: 1_200_000,
+        state_dir: Some("/home/demo/.local/share/muqun-desktop".into()),
+    });
+    settings_themes(s);
+    s.demo = true;
+}
+
+/// The built-in packs as the library (with thumbnails made from their
+/// previews, as the theme service makes them) and again as the gallery.
+fn settings_themes(s: &mut UiState) {
+    use crate::theme::store::{builtin, Loaded, Origin, ThemeEntry, BUILTIN};
+    let dir = std::env::temp_dir().join("muqun-scene-thumbs");
+    let _ = std::fs::create_dir_all(&dir);
+    let mut library = Vec::new();
+    let mut gallery = Vec::new();
+    for b in BUILTIN {
+        let Some(pack) = builtin(b.id) else { continue };
+        let loaded = Loaded::Builtin(pack.clone());
+        let mut entry = ThemeEntry::from_manifest(&pack.manifest, Origin::Builtin);
+        let path = dir.join(format!("{}.jpg", b.id));
+        if !path.exists() {
+            if let Some(jpeg) = loaded
+                .preview()
+                .and_then(|p| crate::theme::gallery::thumbnail(&p).ok())
+            {
+                let _ = std::fs::write(&path, jpeg);
+            }
+        }
+        if path.exists() {
+            entry.thumbnail = Some(path.clone());
+            s.theme_previews.insert(b.id.to_string(), path);
+        }
+        gallery.push(crate::theme::gallery::IndexEntry {
+            id: entry.id.clone(),
+            name: entry.name.clone(),
+            version: entry.version.clone(),
+            author: entry.author.clone(),
+            license: entry.license.clone(),
+            description: entry.description.clone(),
+            tags: entry.tags.clone(),
+            package: format!("dist/{}.muqun-theme", b.id),
+            bytes: b.bytes.len() as u64,
+            sha256: None,
+            assets: None,
+            preview: None,
+        });
+        library.push(entry);
+    }
+    // The gallery also lists themes not installed here.
+    library.truncate(4);
+    s.theme_library = std::sync::Arc::new(library);
+    s.theme_gallery = std::sync::Arc::new(crate::theme::service::GalleryView {
+        entries: gallery,
+        ..Default::default()
+    });
+}
+
+fn tasks(s: &mut UiState) {
+    base(s);
+    s.mode = Mode::Tasks;
+    s.task_cwd = Some("/home/demo/gateway".into());
+    s.tasks = vec![
+        TaskRow {
+            id: "k1".into(),
+            state: "working".into(),
+            title: "Audit the release workflow".into(),
+            progress: Some("3 of 5 steps".into()),
+            agent_id: Some("codex".into()),
+            asid: Some("s1".into()),
+            cwd: Some("/home/demo/gateway/.git/muqun-worktrees/k1".into()),
+            worktree_branch: Some("muqun/k1".into()),
+            ..TaskRow::default()
+        },
+        TaskRow {
+            id: "k2".into(),
+            state: "waiting".into(),
+            title: "Draft the migration notes".into(),
+            origin: "device".into(),
+            completable: true,
+            ..TaskRow::default()
+        },
+        TaskRow {
+            id: "k3".into(),
+            state: "done".into(),
+            title: "Bump dependencies".into(),
+            ..TaskRow::default()
+        },
+    ];
+    s.demo = true;
+}
+
+fn inbox(s: &mut UiState) {
+    base(s);
+    s.waiting_perms.insert("s1".into(), vec![permission()]);
+    s.waiting_forms.insert("s1".into(), vec![form()]);
+    s.mode = Mode::Inbox;
+    s.demo = true;
+}
+
+include!("scenes_timeline.rs");
+include!("scenes_terminal.rs");
+include!("scenes_search.rs");
+include!("scenes_composer.rs");
+include!("scenes_lists.rs");
+const VIEWER_CODE: &str = r#"//! Retry a flaky request with capped exponential backoff.
+
+use std::time::Duration;
+
+/// How long to wait before attempt `n` (0-based): 200 ms, doubling, at most 5 s.
+pub fn backoff(n: u32) -> Duration {
+    let ms = 200u64.saturating_mul(1 << n.min(16));
+    Duration::from_millis(ms.min(5_000))
+}
+
+pub async fn with_retry<T, E, F, Fut>(mut attempt: F, tries: u32) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut n = 0;
+    loop {
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(err) if n + 1 >= tries => return Err(err),
+            Err(_) => {
+                tokio::time::sleep(backoff(n)).await;
+                n += 1;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn backoff_is_capped() {
+        assert_eq!(super::backoff(0).as_millis(), 200);
+        assert_eq!(super::backoff(10).as_millis(), 5_000);
+    }
+}
+"#;
+
+const VIEWER_MARKDOWN: &str = "# Release checklist
+
+Before tagging **v0.4.0**, walk this list top to bottom.
+
+## Build
+
+- [x] `cargo build --release` on Linux, macOS and Windows
+- [x] Installer smoke test in a clean container
+- [ ] Notarize the macOS bundle
+
+## Notes
+
+| Area | Owner | State |
+|---|---|---|
+| Desktop | platform | ready |
+| Gateway | core | review |
+
+```sh
+desktop/scripts/install-local.sh
+```
+
+> Ship nothing that has not run on a real machine.
+";
+
+fn viewer_with(s: &mut UiState, name: &str, kind: crate::model::viewer::FileKind, body: &str) {
+    use super::viewer::{text_body, Viewer};
+    session_scene(s);
+    s.viewer = Some(Viewer {
+        path: Some(format!("/home/demo/gateway/{name}").into()),
+        name: name.rsplit('/').next().unwrap_or(name).to_string(),
+        kind,
+        meta: crate::model::viewer::Meta {
+            size: Some(body.len() as u64),
+            modified: Some(std::time::SystemTime::now() - std::time::Duration::from_secs(720)),
+        },
+        body: text_body(body.into(), false),
+        remote_path: None,
+        remote_computer: None,
+        zoom: None,
+        image_viewport: [0.0; 2],
+        image_pan_start: None,
+        source: false,
+    });
+    s.show_file_window();
+}
+
+fn viewer_code(s: &mut UiState) {
+    use crate::model::viewer::FileKind;
+    viewer_with(s, "src/retry.rs", FileKind::Text(Some("rust")), VIEWER_CODE);
+}
+
+fn viewer_markdown(s: &mut UiState) {
+    use crate::model::viewer::FileKind;
+    viewer_with(s, "docs/RELEASE.md", FileKind::Markdown, VIEWER_MARKDOWN);
+}
+
+fn viewer_image(s: &mut UiState) {
+    session_scene(s);
+    s.open_file(std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/icons/app-icon.png"
+    )));
+}
+
+fn viewer_video(s: &mut UiState) {
+    use crate::model::viewer::FileKind;
+    viewer_with(s, "recordings/demo-run.mp4", FileKind::Video, "");
+    if let Some(v) = s.viewer.as_mut() {
+        v.body = super::viewer::Body::External;
+        v.meta.size = Some(48_734_112);
+    }
+}
+
+fn voice_meter() -> std::sync::Arc<crate::model::voice::Meter> {
+    use crate::model::voice::Meter;
+    let started = std::time::Instant::now() - std::time::Duration::from_secs_f64(6.3);
+    let meter = Meter::since(started);
+    // A speech-like envelope: syllables riding on phrases, a pause mid-way.
+    let mut t = 0.0f64;
+    while t < 6.3 {
+        let phrase =
+            ((t * 0.9).sin() * 0.5 + 0.5) * if (2.6..3.2).contains(&t) { 0.1 } else { 1.0 };
+        let syllable = ((t * 11.0).sin() * 0.5 + 0.5).powf(0.7);
+        meter.push(t, (0.12 + 0.78 * phrase * syllable) as f32);
+        t += 0.02;
+    }
+    std::sync::Arc::new(meter)
+}
+
+fn voice_scene(s: &mut UiState) {
+    use crate::config::VoiceMode;
+    session_scene(s);
+    s.cfg.voice.mode = VoiceMode::File;
+    s.voice = Some(super::voice::Dictation::preview(
+        VoiceMode::File,
+        voice_meter(),
+        "",
+    ));
+}
+
+fn voice_realtime_scene(s: &mut UiState) {
+    use crate::config::VoiceMode;
+    session_scene(s);
+    s.cfg.voice.mode = VoiceMode::Realtime;
+    s.voice = Some(super::voice::Dictation::preview(
+        VoiceMode::Realtime,
+        voice_meter(),
+        "Rename the greet helper and also update the tests, then run the checks",
+    ));
+}
+
+fn voice_settings_scene(s: &mut UiState) {
+    use crate::config::VoiceMode;
+    settings(s);
+    s.settings_tab = SettingsTab::Voice;
+    s.cfg.voice.mode = VoiceMode::Realtime;
+    s.cfg.voice.url = "wss://speech.example.com/v1/realtime?intent=transcription&model=live".into();
+    s.voice_form = super::voice::VoiceForm::new(&s.cfg.voice);
+    s.voice_form.key_saved = Some(crate::platform::secrets::Store::Keyring);
+}
+
+fn palette_scene(s: &mut UiState) {
+    session_scene(s);
+    s.cfg.ui.recent_commands = vec!["go:Tasks".into(), "session:s2".into()];
+    s.palette = Some(super::palette::Palette::new(false));
+}
+
+fn palette_search_scene(s: &mut UiState) {
+    session_scene(s);
+    let mut palette = super::palette::Palette::new(false);
+    palette.query = TextEdit::new("new cod");
+    palette.query.focused = true;
+    palette.selected = 1;
+    s.cfg.general.last_cwd.clear();
+    s.cfg
+        .general
+        .last_cwd
+        .insert("codex".into(), "/home/demo/gateway".into());
+    s.cfg
+        .general
+        .last_cwd
+        .insert("opencode".into(), "/home/demo/rune".into());
+    s.palette = Some(palette);
+}
+
+fn shortcuts_scene(s: &mut UiState) {
+    session_scene(s);
+    s.toggle_keys_sheet();
+}
+
+fn latest_scene(s: &mut UiState) {
+    session_scene(s);
+    s.right_open = false;
+    s.right.set_open(false);
+}
+
+/// A scene name and the state it applies.
+fn scene_plugin() -> Option<crate::plugin::ExternalPlugin> {
+    let dir = std::env::var_os("MUQUN_SCENE_PLUGIN_DIR")?;
+    crate::plugin::ExternalPlugin::from_dir(&std::path::PathBuf::from(dir)).ok()
+}
+
+fn image_plugin(s: &mut UiState) -> Option<String> {
+    let plugin = scene_plugin()?;
+    let id = plugin.manifest().id.clone();
+    s.plugins.register(std::sync::Arc::new(plugin));
+    Some(id)
+}
+
+fn plugin_update_scene(s: &mut UiState, failed: bool) {
+    use crate::plugin::packages::{Operation, PackageStage};
+    settings(s);
+    s.settings_tab = SettingsTab::Plugins;
+    s.runtime_statuses = muqun_gateway::platform::runtimes::probe_all();
+    let op = if let Some(plugin) = scene_plugin() {
+        let manifest = plugin.manifest();
+        let id = manifest.id.clone();
+        s.plugin_query = TextEdit::new(&id);
+        s.plugins
+            .managed_versions
+            .insert(id.clone(), manifest.version.clone());
+        s.plugins.register(std::sync::Arc::new(plugin));
+        Operation::Update(id)
+    } else {
+        s.plugin_source = TextEdit::new("@example/plugin");
+        Operation::Install(s.plugin_source.text.clone())
+    };
+    let request = s.plugin_packages.start(op).unwrap();
+    s.plugin_packages.advance(request, PackageStage::Resolving);
+    if failed {
+        s.plugin_packages.finish(
+            request,
+            &Err("Could not reach the package registry.".into()),
+        );
+    }
+}
+
+pub type Scene = (&'static str, fn(&mut UiState));
+
+pub fn scenes() -> &'static [Scene] {
+    static ALL: std::sync::OnceLock<Vec<Scene>> = std::sync::OnceLock::new();
+    ALL.get_or_init(|| {
+        let mut all = base_scenes().to_vec();
+        all.extend(search_scenes());
+        all.extend(composer_scenes());
+        all.extend(list_scenes());
+        all
+    })
+}
+
+fn base_scenes() -> &'static [Scene] {
+    &[
+        ("session-error-notice", |s| {
+            session_scene(s);
+            s.error = Some(crate::model::inbox::UiError {
+                message: "Agent not available: ACP session is disconnected. Reopen the session to continue.".into(),
+                detail: None,
+                unreachable: true,
+            });
+        }),
+        ("session-inline-git", |s| {
+            session_scene(s);
+            s.right_open = false;
+            s.right.set_open(false);
+            s.open_git_panel();
+        }),
+        ("settings-computers-gateway", |s| {
+            base(s);
+            s.mode = Mode::Settings;
+            s.settings_tab = SettingsTab::Computers;
+            s.local_pairings = crate::platform::paired_devices::List::Ready(vec![
+                crate::platform::paired_devices::Client {
+                    id: "dev-iphone".into(),
+                    name: "iPhone 16 Pro".into(),
+                    kind: Some("app".into()),
+                    last_seen_unix_ms: Some(super::now_ms().saturating_sub(120_000)),
+                },
+                crate::platform::paired_devices::Client {
+                    id: "dev-mini".into(),
+                    name: "Mac mini".into(),
+                    kind: Some("gateway".into()),
+                    last_seen_unix_ms: Some(super::now_ms().saturating_sub(600_000)),
+                },
+            ]);
+            s.receive_local_gateway_control(Ok(
+                muqun_gateway::gateway_control::GatewayControlSnapshot {
+                    configured: true,
+                    running: true,
+                    pid: Some(42180),
+                    service_state: muqun_gateway::gateway_control::ServiceState::Installed,
+                    config_changed_since_start: false,
+                    cli_available: true,
+                    server_id: "srv-demo".into(),
+                    label: "workstation".into(),
+                    public_url: "http://100.64.0.12:23847".into(),
+                    listen: "0.0.0.0:23847".into(),
+                    port: 23847,
+                    transport_encryption: true,
+                    allow_remote_auto_approve: true,
+                    agent_trust_folders: true,
+                    rich_agent_pushes: false,
+                    backends: vec![
+                        muqun_gateway::gateway_control::GatewayBackendInfo {
+                            id: "tmux".into(),
+                            label: "tmux".into(),
+                            kind: "tmux".into(),
+                            endpoint: "default".into(),
+                            is_default: true,
+                            autostart: true,
+                        },
+                        muqun_gateway::gateway_control::GatewayBackendInfo {
+                            id: "desktop-terminal".into(),
+                            label: "Muqun Terminal".into(),
+                            kind: "desktop-terminal".into(),
+                            endpoint: "~/.local/state/muqun-desktop/term.sock".into(),
+                            is_default: false,
+                            autostart: false,
+                        },
+                    ],
+                    config_path: "~/.config/muqun-gateway/config.json".into(),
+                },
+            ));
+            s.demo = true;
+        }),
+        ("split-pick", |s| {
+            session_scene(s);
+            s.right_open = false;
+            s.right.set_open(false);
+            s.split();
+        }),
+        ("question-answered", |s| {
+            base(s);
+            let answered_q = tool_item(
+                "qa1",
+                "question",
+                "completed",
+                json!({
+                    "input": {
+                        "questions": [
+                            {
+                                "header": "Target branch",
+                                "question": "Where should the fix go?",
+                                "options": [
+                                    { "label": "main", "description": "Ship it today" },
+                                    { "label": "release/0.14", "description": "Backport only" }
+                                ]
+                            },
+                            {
+                                "header": "Release action",
+                                "question": "Should we push after committing?",
+                                "options": [
+                                    { "label": "Push & open PR" },
+                                    { "label": "Push only" }
+                                ]
+                            }
+                        ]
+                    },
+                    "metadata": {
+                        "answers": [["main"], ["Keep local commit only"]]
+                    }
+                }),
+            );
+            let resolved_form: FormRequest = serde_json::from_value(json!({
+                "id": "f-done",
+                "asid": "s1",
+                "title": "Confirm release branch",
+                "fields": [{
+                    "type": "string",
+                    "key": "branch",
+                    "title": "Branch",
+                    "options": [
+                        { "value": "main", "label": "main" },
+                        { "value": "release/0.14", "label": "release/0.14" }
+                    ]
+                }]
+            }))
+            .expect("resolved form");
+            let pending_form: FormRequest = serde_json::from_value(json!({
+                "id": "f-live",
+                "asid": "s1",
+                "title": "Choose verification target",
+                "fields": [{
+                    "type": "string",
+                    "key": "env",
+                    "title": "Environment",
+                    "required": true,
+                    "custom": true,
+                    "options": [
+                        { "value": "staging", "label": "Staging", "description": "Run against staging cluster" },
+                        { "value": "local", "label": "Local only", "description": "Verify on this computer" }
+                    ]
+                }]
+            }))
+            .expect("pending form");
+            s.form_inputs
+                .insert("f-done/branch".into(), TextEdit::new("main"));
+            s.form_inputs
+                .insert("f-live/env".into(), TextEdit::new("local"));
+            let items = vec![
+                answered_q,
+                item(
+                    "qf1",
+                    TimelineRole::Assistant,
+                    AgentPart::Form {
+                        request: resolved_form,
+                    },
+                ),
+                item(
+                    "qf2",
+                    TimelineRole::Assistant,
+                    AgentPart::Form {
+                        request: pending_form.clone(),
+                    },
+                ),
+            ];
+            s.open_session_current("s1");
+            s.apply_updates(vec![crate::model::inbox::Update::Snapshot(Box::new(
+                muqun_gateway::agents::ports::AgentSessionSnapshot {
+                    info: s.sessions[0].clone(),
+                    timeline: items,
+                    permissions: vec![],
+                    forms: vec![pending_form],
+                    inbox: vec![],
+                    seq: 1,
+                },
+            ))]);
+            if let Some(tl) = s.timelines.get_mut("s1") {
+                tl.flip("qa1");
+                tl.earlier_exhausted = true;
+            }
+            s.mode = Mode::Session;
+            s.right_open = false;
+            s.right.set_open(false);
+            s.demo = true;
+        }),
+        ("desktop-update-toast", |s| {
+            session_scene(s);
+            s.right_open = false;
+            s.right.set_open(false);
+            s.desktop_update =
+                crate::platform::update::Status::Available("0.1.1-preview.44".into());
+            s.desktop_update_panel = true;
+        }),
+        ("desktop-update-downloading", |s| {
+            session_scene(s);
+            s.right_open = false;
+            s.right.set_open(false);
+            s.desktop_update = crate::platform::update::Status::Installing {
+                version: "0.1.1-preview.44".into(),
+                phase: Some(crate::platform::installer::Phase::Downloading {
+                    received: 19_400_000,
+                    total: 35_900_000,
+                }),
+            };
+            s.desktop_update_panel = true;
+        }),
+        ("tool-media-cards", |s| {
+            use muqun_gateway::agents::{ToolCall, ToolCallStatus};
+            session_scene(s);
+            let dir = std::env::temp_dir().join("muqun-tool-media-scene");
+            let _ = std::fs::create_dir_all(&dir);
+            let shot_path = dir.join("mao_dev_light_v2.png");
+            let mut img = image::RgbImage::new(640, 360);
+            for (x, y, px) in img.enumerate_pixels_mut() {
+                let r = ((x * 220) / 640 + 24) as u8;
+                let g = ((y * 180) / 360 + 50) as u8;
+                let b = 210u8;
+                *px = image::Rgb([r, g, b]);
+            }
+            let _ = img.save(&shot_path);
+            let doc_path = dir.join("architecture-spec.pdf");
+            let _ = std::fs::write(&doc_path, b"%PDF-1.7\nUnified tool file cards.");
+
+            let asid = s.selected.clone().unwrap_or_else(|| "s-main".into());
+            if let Some(info) = s.sessions.iter_mut().find(|i| i.asid.0 == asid) {
+                info.directory = Some(dir.to_string_lossy().into_owned());
+            }
+            let mut items = vec![
+                item(
+                    "u1",
+                    TimelineRole::User,
+                    AgentPart::Text {
+                        text: "检查一下 Antigravity read_file、Codex image_view 和文件卡片的统一渲染效果。".into(),
+                    },
+                ),
+                item(
+                    "t-ag-img",
+                    TimelineRole::Assistant,
+                    AgentPart::Tool(ToolCall {
+                        id: "ag-read-img".into(),
+                        name: "read_file".into(),
+                        title: Some("File mao_dev_light_v2.png".into()),
+                        input: serde_json::json!({ "Path": shot_path }),
+                        output: None,
+                        content: None,
+                        metadata: None,
+                        state: ToolCallStatus::Completed,
+                        status: ToolCallStatus::Completed,
+                        error: None,
+                        child_session_id: None,
+                        background: false,
+                        input_partial: None,
+                        truncated: false,
+                        time: Default::default(),
+                    }),
+                ),
+                item(
+                    "t-codex-img",
+                    TimelineRole::Assistant,
+                    AgentPart::Tool(ToolCall {
+                        id: "codex-img-view".into(),
+                        name: "image_view".into(),
+                        title: None,
+                        input: serde_json::json!({ "path": shot_path }),
+                        output: None,
+                        content: None,
+                        metadata: Some(serde_json::json!({ "type": "imageView", "path": shot_path })),
+                        state: ToolCallStatus::Completed,
+                        status: ToolCallStatus::Completed,
+                        error: None,
+                        child_session_id: None,
+                        background: false,
+                        input_partial: None,
+                        truncated: false,
+                        time: Default::default(),
+                    }),
+                ),
+                item(
+                    "t-ag-edit",
+                    TimelineRole::Assistant,
+                    AgentPart::Tool(ToolCall {
+                        id: "ag-edit-1".into(),
+                        name: "edit_file".into(),
+                        title: Some("File src/agents/message_images/tool_media.rs".into()),
+                        input: serde_json::json!({
+                            "Path": "/home/ryu/Work/muqun/gateway-desktop/src/agents/message_images/tool_media.rs",
+                            "Target": "    let (inner, wrapped) = if outer_type == \"content\" {\n        match obj.get(\"content\").filter(|v| v.is_object()) {\n            Some(inner) => (inner, true),\n            None => return None,\n        }\n    } else {",
+                            "Replacement": "    let (inner, wrapped) = if outer_type == \"content\" {\n        (obj.get(\"content\").filter(|v| v.is_object())?, true)\n    } else {"
+                        }),
+                        output: Some(serde_json::json!({})),
+                        content: None,
+                        metadata: None,
+                        state: ToolCallStatus::Completed,
+                        status: ToolCallStatus::Completed,
+                        error: None,
+                        child_session_id: None,
+                        background: false,
+                        input_partial: None,
+                        truncated: false,
+                        time: Default::default(),
+                    }),
+                ),
+                item(
+                    "t-ag-shell",
+                    TimelineRole::Assistant,
+                    AgentPart::Tool(ToolCall {
+                        id: "ag-shell-1".into(),
+                        name: "run_command".into(),
+                        title: None,
+                        input: serde_json::json!({
+                            "CommandLine": "cargo test --workspace --locked",
+                            "Cwd": "/home/ryu/Work/muqun/gateway-desktop"
+                        }),
+                        output: Some(serde_json::json!({ "exit_code": 0, "output": "test result: ok. 2366 passed; 0 failed" })),
+                        content: None,
+                        metadata: None,
+                        state: ToolCallStatus::Completed,
+                        status: ToolCallStatus::Completed,
+                        error: None,
+                        child_session_id: None,
+                        background: false,
+                        input_partial: None,
+                        truncated: false,
+                        time: Default::default(),
+                    }),
+                ),
+                item(
+                    "t-ag-doc",
+                    TimelineRole::Assistant,
+                    AgentPart::Tool(ToolCall {
+                        id: "ag-read-doc".into(),
+                        name: "read_file".into(),
+                        title: Some("File architecture-spec.pdf".into()),
+                        input: serde_json::json!({ "Path": doc_path }),
+                        output: None,
+                        content: None,
+                        metadata: None,
+                        state: ToolCallStatus::Completed,
+                        status: ToolCallStatus::Completed,
+                        error: None,
+                        child_session_id: None,
+                        background: false,
+                        input_partial: None,
+                        truncated: false,
+                        time: Default::default(),
+                    }),
+                ),
+                item(
+                    "a1",
+                    TimelineRole::Assistant,
+                    AgentPart::Text {
+                        text: "所有 Agent 读取图片与文件现在统一走卡片渲染，不再展示原始 JSON 字段。".into(),
+                    },
+                ),
+            ];
+            muqun_gateway::agents::message_images::enrich_timeline(&asid, dir.to_str(), &mut items);
+            s.timelines.entry(asid).or_default().replace(items);
+        }),
+        ("plugin-image-settings", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Plugins;
+            image_plugin(s);
+        }),
+        ("settings-plugin-updating", |s| {
+            plugin_update_scene(s, false)
+        }),
+        ("settings-plugin-update-failed", |s| {
+            plugin_update_scene(s, true)
+        }),
+        ("settings-plugins-catalog", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Plugins;
+            s.runtime_statuses = muqun_gateway::platform::runtimes::probe_all();
+            if let Some(id) = image_plugin(s) {
+                s.plugins.managed_versions.insert(id, "1.2.3".into());
+            }
+        }),
+        ("plugin-image-tile", |s| {
+            home(s);
+            s.tiles = vec![Tile::empty(), Tile::empty()];
+            s.tile_tree = crate::config::TileNode::Split {
+                across: true,
+                ratio: 0.5,
+                a: Box::new(crate::config::TileNode::Leaf(0)),
+                b: Box::new(crate::config::TileNode::Leaf(1)),
+            };
+            if let Some(id) = image_plugin(s) {
+                s.open_plugin_tile(&id);
+            }
+        }),
+        ("plugin-image-picker", |s| {
+            home(s);
+            image_plugin(s);
+            s.mode = Mode::Session;
+            s.selected = None;
+            s.tiles = vec![Tile::empty(), Tile::empty()];
+            s.focus = 0;
+            s.tile_tree = crate::config::TileNode::Split {
+                across: true,
+                ratio: 0.5,
+                a: Box::new(crate::config::TileNode::Leaf(0)),
+                b: Box::new(crate::config::TileNode::Leaf(1)),
+            };
+        }),
+        ("home", home),
+        ("home-busy", home_busy),
+        ("home-crowd", home_crowd),
+        ("home-folders", |s| {
+            home_crowd(s);
+            for (dir, branch) in [
+                ("/home/demo/gateway", "main"),
+                ("/home/demo/rune", "desktop-polish"),
+            ] {
+                s.directories.insert(
+                    dir.into(),
+                    crate::model::projects::DirInfo {
+                        root: dir.into(),
+                        kind: crate::model::projects::ProjectKind::Git,
+                        branch: Some(branch.into()),
+                        exists: true,
+                    },
+                );
+            }
+            s.menu = Some(super::OpenMenu::StartFolder);
+        }),
+        ("home-crowd-zh", |s| {
+            home_crowd(s);
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("home-first", home_first),
+        ("splash", splash_scene),
+        ("home-plain", |s| {
+            home_busy(s);
+            s.cfg.appearance.reduced_motion = true;
+            s.cfg.appearance.reduced_transparency = true;
+        }),
+        ("home-zh", |s| {
+            home_busy(s);
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        // Split view with the focused composer's field in focus.
+        ("split2-typing", |s| {
+            split2(s);
+            s.draft = TextEdit::new("Run the tests again");
+            s.draft.focused = true;
+        }),
+        // Four panes (one tall, one above two) on an opaque window.
+        ("split4-plain", |s| {
+            split4(s);
+            s.cfg.appearance.reduced_motion = true;
+            s.cfg.appearance.reduced_transparency = true;
+        }),
+        // Split view on an opaque window without motion, sidebar closed.
+        ("split2-plain", |s| {
+            split2(s);
+            s.cfg.appearance.reduced_motion = true;
+            s.cfg.appearance.reduced_transparency = true;
+            s.sidebar.set_open(false);
+        }),
+        ("split2-zh", |s| {
+            split2(s);
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("home-noagent", |s| {
+            home_first(s);
+            for a in &mut s.agents {
+                a.enabled = false;
+            }
+        }),
+        ("gateway-install-consent", |s| {
+            home_first(s);
+            s.show_gateway_setup(crate::platform::gateway_bootstrap::Status::NeedsConsent);
+        }),
+        ("gateway-install-download", |s| {
+            home_first(s);
+            s.show_gateway_setup(crate::platform::gateway_bootstrap::Status::Downloading {
+                received: 18_700_000,
+                total: 32_000_000,
+            });
+        }),
+        ("welcome", |s| {
+            home_first(s);
+            s.cfg.general.welcomed = false;
+        }),
+        ("settings-appearance", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Appearance;
+        }),
+        ("settings-general", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::General;
+        }),
+        ("settings-shortcuts", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Shortcuts;
+        }),
+        ("settings-diagnostics", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Diagnostics;
+            crate::diagnostics::Attempt::new(
+                crate::diagnostics::EventKind::PluginInstall,
+                "Example",
+                Some("1.0.0"),
+            )
+            .finish(crate::diagnostics::Outcome::SdkIncompatible);
+        }),
+        ("settings-plugins", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Plugins;
+            s.runtime_statuses = muqun_gateway::platform::runtimes::probe_all();
+        }),
+        ("settings-about", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::About;
+        }),
+        ("settings-themes", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Themes;
+            s.theme_tab = super::settings::ThemeTab::Installed;
+        }),
+        ("settings-themes-gallery", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Themes;
+            s.theme_tab = super::settings::ThemeTab::Gallery;
+        }),
+        ("settings-themes-search", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Themes;
+            s.theme_query = TextEdit::new("jade");
+        }),
+        ("settings-storage", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Storage;
+        }),
+        ("settings-open-in", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::General;
+            s.menu = Some(super::OpenMenu::Setting("open-in".into()));
+        }),
+        ("settings-language", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::General;
+            s.menu = Some(super::OpenMenu::Setting("language".into()));
+        }),
+        ("settings-agents-zh", |s| {
+            settings(s);
+            s.cfg.general.language = crate::config::Language::ZhCn;
+            if let Some(agent) = s.agents.iter_mut().find(|a| a.id == "codex") {
+                agent.version = Some("0.172.0".into());
+                agent
+                    .features
+                    .extra
+                    .insert("accountLimits".into(), json!(true));
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            s.account_limits.insert(
+                "codex".into(),
+                Some(json!({
+                    "status": "available",
+                    "reason": null,
+                    "observed_at_ms": now,
+                    "ordinary_usage_allowed": true,
+                    "reset_credits": { "available_count": 0, "credits": [] },
+                    "limits": [{
+                        "id": "codex",
+                        "name": null,
+                        "plan_type": "pro",
+                        "credits": { "has_credits": true, "unlimited": false, "balance": "13905.2351075000" },
+                        "windows": [
+                            {
+                                "id": "primary",
+                                "label": null,
+                                "unit": "percent",
+                                "used": 33.0,
+                                "limit": 100.0,
+                                "remaining": 67.0,
+                                "window_duration_minutes": 10080,
+                                "resets_at_ms": now + 6 * 86_400_000 + 7 * 3_600_000
+                            }
+                        ]
+                    }]
+                })),
+            );
+        }),
+        ("settings-appearance-zh", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Appearance;
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("settings-general-zh", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::General;
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("settings-themes-zh", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Themes;
+            s.theme_tab = super::settings::ThemeTab::Installed;
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("settings-themes-gallery-zh", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Themes;
+            s.theme_tab = super::settings::ThemeTab::Gallery;
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("settings-shortcuts-zh", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Shortcuts;
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("settings-storage-zh", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::Storage;
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("settings-about-zh", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::About;
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("voice-settings-zh", |s| {
+            voice_settings_scene(s);
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("home-big", |s| {
+            home_busy(s);
+            s.cfg.appearance.text_scale = 1.2;
+            s.cfg.appearance.shape = crate::config::Shape::Round;
+        }),
+        ("home-tw", |s| {
+            home_busy(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("session-tw", |s| {
+            session_scene(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("settings-tw", |s| {
+            settings(s);
+            s.settings_tab = SettingsTab::General;
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("home-akiba", |s| {
+            with_pack(s, "akiba-overdrive");
+            home_busy(s);
+        }),
+        ("home-jade", |s| {
+            with_pack(s, "jade-tempest");
+            home_busy(s);
+        }),
+        ("home-voyager", |s| {
+            with_pack(s, "scene-voyager");
+            home(s);
+        }),
+        ("home-eclipse", |s| {
+            with_pack(s, "eclipse-archivist");
+            home(s);
+        }),
+        ("home-vanguard", |s| {
+            with_pack(s, "vanguard-drifter");
+            home_busy(s);
+        }),
+        ("split2-akiba", |s| {
+            with_pack(s, "akiba-overdrive");
+            split2(s);
+        }),
+        ("settings-themes-akiba", |s| {
+            with_pack(s, "akiba-overdrive");
+            settings(s);
+            s.settings_tab = SettingsTab::Themes;
+        }),
+        ("splash-jade", |s| {
+            with_pack(s, "jade-tempest");
+            splash_scene(s);
+        }),
+        ("session", session_scene),
+        ("split2", split2),
+        ("split4", split4),
+        // Three panes: one on the left beside two stacked.
+        ("split3", |s| {
+            split4(s);
+            s.tiles.pop();
+        }),
+        // Two panes with the terminal open on the right.
+        ("split2-terminal", |s| {
+            split2(s);
+            s.term.fixture = Some(shell_fixture);
+            s.term.open = true;
+            s.term.pane.set_open(true);
+        }),
+        // Two independent terminal tiles side by side, each with its own tab.
+        ("split-terminals", |s| {
+            base(s);
+            s.term.fixture = Some(shell_fixture);
+            let is_light = std::env::args().any(|a| a == "light");
+            let scheme = if is_light {
+                crate::theme::color_scheme::ColorScheme::Light
+            } else {
+                crate::theme::color_scheme::ColorScheme::Dark
+            };
+            let colors =
+                crate::ui::terminal_panel::colors(&rune_kit::Kit::neutral(!is_light), scheme);
+            s.term.want.set(Some(colors));
+            let size = crate::term::engine::Size {
+                cols: 80,
+                rows: 24,
+                cell_w: 8,
+                cell_h: 17,
+            };
+            let frame_0 = crate::term::engine::render_fixture(&shell_fixture(80, 24), size, colors);
+            let frame_1 = crate::term::engine::render_fixture(&vim_fixture(80, 24), size, colors);
+            s.term.frame = frame_0.clone();
+            s.term.tabs.push(super::terminal_panel::TermTab {
+                id: 0,
+                session: None,
+                frame: frame_0,
+                cwd: std::path::PathBuf::from("/home/demo/app"),
+                title: Some("shell".into()),
+                pending_command: None,
+            });
+            s.term.tabs.push(super::terminal_panel::TermTab {
+                id: 1,
+                session: None,
+                frame: frame_1,
+                cwd: std::path::PathBuf::from("/home/demo/api"),
+                title: Some("editor".into()),
+                pending_command: None,
+            });
+            s.term.next_tab_id = 2;
+            s.term.active_tab = 0;
+            let mut a = super::Tile::terminal();
+            a.term_tab = Some(0);
+            let mut b = super::Tile::terminal();
+            b.term_tab = Some(1);
+            s.tiles = vec![a, b];
+            s.focus = 0;
+            s.mode = super::Mode::Session;
+            s.term.sink.focused = true;
+        }),
+        ("split-terminals-light", |s| {
+            base(s);
+            s.dark = false;
+            s.cfg.appearance.scheme = crate::config::Scheme::Light;
+            s.term.fixture = Some(shell_fixture);
+            let scheme = crate::theme::color_scheme::ColorScheme::Light;
+            let colors = crate::ui::terminal_panel::colors(&rune_kit::Kit::neutral(false), scheme);
+            s.term.want.set(Some(colors));
+            let size = crate::term::engine::Size {
+                cols: 80,
+                rows: 24,
+                cell_w: 8,
+                cell_h: 17,
+            };
+            let frame_0 = crate::term::engine::render_fixture(&shell_fixture(80, 24), size, colors);
+            let frame_1 = crate::term::engine::render_fixture(&vim_fixture(80, 24), size, colors);
+            s.term.frame = frame_0.clone();
+            s.term.tabs.push(super::terminal_panel::TermTab {
+                id: 0,
+                session: None,
+                frame: frame_0,
+                cwd: std::path::PathBuf::from("/home/demo/app"),
+                title: Some("shell".into()),
+                pending_command: None,
+            });
+            s.term.tabs.push(super::terminal_panel::TermTab {
+                id: 1,
+                session: None,
+                frame: frame_1,
+                cwd: std::path::PathBuf::from("/home/demo/api"),
+                title: Some("editor".into()),
+                pending_command: None,
+            });
+            s.term.next_tab_id = 2;
+            s.term.active_tab = 0;
+            let mut a = super::Tile::terminal();
+            a.term_tab = Some(0);
+            let mut b = super::Tile::terminal();
+            b.term_tab = Some(1);
+            s.tiles = vec![a, b];
+            s.focus = 0;
+            s.mode = super::Mode::Session;
+            s.term.sink.focused = true;
+        }),
+        ("split-terminals-drag", |s| {
+            base(s);
+            s.term.fixture = Some(shell_fixture);
+            let is_light = std::env::args().any(|a| a == "light");
+            let scheme = if is_light {
+                crate::theme::color_scheme::ColorScheme::Light
+            } else {
+                crate::theme::color_scheme::ColorScheme::Dark
+            };
+            let colors =
+                crate::ui::terminal_panel::colors(&rune_kit::Kit::neutral(!is_light), scheme);
+            s.term.want.set(Some(colors));
+            let size = crate::term::engine::Size {
+                cols: 80,
+                rows: 24,
+                cell_w: 8,
+                cell_h: 17,
+            };
+            let frame_0 = crate::term::engine::render_fixture(&shell_fixture(80, 24), size, colors);
+            let frame_1 = crate::term::engine::render_fixture(&vim_fixture(80, 24), size, colors);
+            s.term.frame = frame_0.clone();
+            s.term.tabs.push(super::terminal_panel::TermTab {
+                id: 0,
+                session: None,
+                frame: frame_0,
+                cwd: std::path::PathBuf::from("/home/demo/app"),
+                title: Some("shell".into()),
+                pending_command: None,
+            });
+            s.term.tabs.push(super::terminal_panel::TermTab {
+                id: 1,
+                session: None,
+                frame: frame_1,
+                cwd: std::path::PathBuf::from("/home/demo/api"),
+                title: Some("editor".into()),
+                pending_command: None,
+            });
+            s.term.next_tab_id = 2;
+            s.term.active_tab = 0;
+            let mut a = super::Tile::terminal();
+            a.term_tab = Some(0);
+            let mut b = super::Tile::terminal();
+            b.term_tab = Some(1);
+            s.tiles = vec![a, b];
+            s.focus = 0;
+            s.mode = super::Mode::Session;
+            s.term.sink.focused = true;
+            s.tile_drag = Some(vec![]);
+        }),
+        ("settings", settings),
+        ("tasks", tasks),
+        ("inbox", inbox),
+        ("diff", diff),
+        ("diff-card", |s| {
+            session_scene(s);
+            s.inspect = Some(super::Inspect {
+                asid: "s1".into(),
+                id: "t1".into(),
+            });
+            s.inspect_pane.set_open(true);
+            s.inspect_pane.set_width(550.0);
+        }),
+        ("timeline-cards", timeline_cards),
+        ("timeline-tool-output", |s| {
+            base(s);
+            timeline(s);
+            s.sidebar.set_open(false);
+            s.right_open = false;
+            s.right.set_open(false);
+            s.waiting_perms.clear();
+            s.waiting_forms.clear();
+            if let Some(tl) = s.timelines.get_mut("s1") {
+                let mut items = std::mem::take(&mut tl.items);
+                items.retain(|it| matches!(it.id.as_str(), "r1" | "a1" | "t1" | "d1"));
+                tl.replace(items);
+                tl.flip("r1");
+                tl.flip("t1");
+                tl.earlier_exhausted = true;
+            }
+            s.demo = true;
+        }),
+        ("timeline-narrow", timeline_narrow),
+        ("timeline-long", timeline_long),
+        ("timeline-zh", timeline_zh),
+        ("timeline-grouped", timeline_grouped),
+        ("timeline-expanded", timeline_expanded),
+        ("timeline-running", timeline_running),
+        ("timeline-detail", timeline_detail),
+        // A message's hover actions: hover it with `--script`, a
+        // `{"type": "move", "key": "item-a1"}` step (the owner's message is
+        // `"key": "user"`, on screen at `--size 1440x1600`).
+        ("message-actions", |s| {
+            session_scene(s);
+            s.right_open = false;
+            s.right.set_open(false);
+        }),
+        ("session-narrow", |s| {
+            // A wide right-hand pane squeezes the session column to ~360 pt
+            // at 1440 (and ~240 pt at 1320).
+            timeline_detail(s);
+            s.sessions[0].status = muqun_gateway::agents::AgentSessionStatus::Busy;
+            s.inspect_pane.set_width(700.0);
+            s.diff_stat.files = 3;
+            s.diff_stat.added = 3;
+            s.diff_stat.removed = 1;
+        }),
+        ("popup-home-mention", popup_home_mention),
+        ("popup-home-slash", popup_home_slash),
+        ("popup-session-slash", popup_session_slash),
+        ("popup-session-skill", popup_session_skill),
+        ("timeline-detail-zh", |s| {
+            timeline_detail(s);
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("terminal", |s| terminal_scene(s, shell_fixture)),
+        ("terminal-tabs", |s| {
+            terminal_scene(s, shell_fixture);
+            s.term.tabs = vec![
+                super::terminal_panel::TermTab {
+                    id: 1,
+                    session: None,
+                    frame: None,
+                    cwd: std::path::PathBuf::from("/home/ryu/Work/muqun/gateway-desktop"),
+                    title: Some("muqun/gateway-desktop".into()),
+                    pending_command: None,
+                },
+                super::terminal_panel::TermTab {
+                    id: 2,
+                    session: None,
+                    frame: None,
+                    cwd: std::path::PathBuf::from("/home/ryu/Work/muqun/server"),
+                    title: Some("nvim src/main.rs".into()),
+                    pending_command: None,
+                },
+            ];
+            s.term.active_tab = 0;
+        }),
+        ("plugin-dock-tabs", |s| {
+            terminal_scene(s, vim_fixture);
+            let id = image_plugin(s).unwrap_or_else(|| "quicknotes".into());
+            s.open_plugin_drawer(&id);
+        }),
+        ("terminal-vim", |s| terminal_scene(s, vim_fixture)),
+        ("terminal-webview-live", terminal_webview_live),
+        ("terminal-ended", |s| {
+            terminal_scene(s, shell_fixture);
+            s.term.fixture_ended = Some(crate::term::session::Ended::Shell(
+                crate::platform::pty::Exit::Code(3),
+            ));
+        }),
+        ("terminal-plain", |s| {
+            terminal_scene(s, shell_fixture);
+            s.cfg.appearance.reduced_transparency = true;
+        }),
+        ("timeline-detail-plain", |s| {
+            timeline_detail(s);
+            s.cfg.appearance.reduced_transparency = true;
+        }),
+        ("terminal-menu", |s| {
+            terminal_scene(s, shell_fixture);
+            s.term.menu_at = Some(rune::PointerPress {
+                x: 1180.0,
+                y: 300.0,
+            });
+        }),
+        ("row-menu", |s| {
+            timeline_expanded(s);
+            s.row_menu = Some(crate::ui::RowMenu {
+                asid: "s1".into(),
+                id: "sh2".into(),
+                point: rune::PointerPress { x: 500.0, y: 300.0 },
+                selection: None,
+            });
+        }),
+        ("terminal-search", |s| {
+            terminal_scene(s, shell_fixture);
+            let is_light = std::env::args().any(|a| a == "light");
+            let scheme = if is_light {
+                crate::theme::color_scheme::ColorScheme::Light
+            } else {
+                crate::theme::color_scheme::ColorScheme::Dark
+            };
+            let colors =
+                crate::ui::terminal_panel::colors(&rune_kit::Kit::neutral(!is_light), scheme);
+            s.term.want.set(Some(colors));
+            let size = crate::term::engine::Size {
+                cols: 80,
+                rows: 24,
+                cell_w: 8,
+                cell_h: 17,
+            };
+            let frame_0 = crate::term::engine::render_fixture(&shell_fixture(80, 24), size, colors);
+            s.term.frame = frame_0;
+            s.term.search.open = true;
+            s.term.search.query = rune::TextEdit::new("Cargo");
+            s.term.search.matches = vec![
+                super::terminal_panel::TermSearchMatch {
+                    row: 1,
+                    col: 0,
+                    len: 5,
+                },
+                super::terminal_panel::TermSearchMatch {
+                    row: 1,
+                    col: 14,
+                    len: 5,
+                },
+            ];
+            s.term.search.active_idx = 0;
+            s.term.hover_link = Some(super::terminal_panel::TermHoverLink {
+                link: crate::term::link::TerminalLink::FilePath {
+                    path: std::path::PathBuf::from("Cargo.toml"),
+                    line: None,
+                    col: None,
+                },
+                row: 1,
+                col_start: 14,
+                col_end: 24,
+            });
+        }),
+        ("terminal-ime", |s| {
+            terminal_scene(s, shell_fixture);
+            s.term.sink.ime(&rune::Ime::Preedit(
+                "ni hao".into(),
+                Some((6, 6)),
+                Vec::new(),
+            ));
+        }),
+        ("terminal-jade", |s| {
+            with_pack(s, "jade-tempest");
+            terminal_scene(s, shell_fixture);
+        }),
+        ("voice-settings-tw", |s| {
+            voice_settings_scene(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("voice-tw", |s| {
+            voice_scene(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("palette-tw", |s| {
+            palette_scene(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("viewer-tw", |s| {
+            viewer_code(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("viewer-video-tw", |s| {
+            viewer_video(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+        }),
+        ("voice", voice_scene),
+        ("voice-realtime", voice_realtime_scene),
+        ("voice-settings", voice_settings_scene),
+        ("timeline-subagent", timeline_subagent),
+        ("sessions-root-only", sessions_root_only),
+        ("timeline-subagent-waiting", |s| {
+            timeline_subagent(s);
+            s.cfg.general.language = crate::config::Language::ZhTw;
+            let agent = s
+                .sessions
+                .iter_mut()
+                .find(|session| session.asid.0 == "s2")
+                .unwrap();
+            agent.title = "Subagent".into();
+            agent.agent_name = Some("Pascal".into());
+            agent.status = muqun_gateway::agents::AgentSessionStatus::Busy;
+            s.timelines.insert("s2".into(), Default::default());
+        }),
+        ("timeline-context", timeline_context),
+        ("palette", palette_scene),
+        ("quick-open", |s| {
+            session_scene(s);
+            s.palette = Some(super::palette::Palette::new(true));
+        }),
+        // The shortcuts sheet (Ctrl+/).
+        ("shortcuts", shortcuts_scene),
+        ("shortcuts-zh", |s| {
+            shortcuts_scene(s);
+            s.cfg.general.language = crate::config::Language::ZhCn;
+        }),
+        ("shortcuts-search", |s| {
+            shortcuts_scene(s);
+            if let Some(sheet) = s.keys_sheet.as_mut() {
+                sheet.query = TextEdit::new("split");
+                sheet.query.focused = true;
+            }
+        }),
+        // The "Latest" pill shows once the reader scrolls up: run with
+        // `--script` and a `{"type": "wheel", "key": "feed-s1", "dy": 400}`
+        // step. `latest-new` has three messages waiting below.
+        ("latest", latest_scene),
+        ("latest-new", |s| {
+            latest_scene(s);
+            if let Some(tl) = s.timelines.get_mut("s1") {
+                tl.unseen = 3;
+            }
+        }),
+        ("palette-search", palette_search_scene),
+        ("viewer", viewer_code),
+        ("viewer-markdown", viewer_markdown),
+        ("viewer-image", viewer_image),
+        ("viewer-video", viewer_video),
+        ("mao", mao_session_scene),
+        ("mao-page", mao_page_scene),
+        ("mao-page-zh", mao_page_zh_scene),
+        ("mao-general-zh", mao_general_zh_scene),
+    ]
+}
+
+fn mao_sample_runs(now: u64) -> Vec<super::orchestration::MaoRun> {
+    use super::orchestration::{
+        MaoDeliverableFile, MaoFinding, MaoPhase, MaoRole, MaoRun, MaoStep, MaoStepKind,
+    };
+    use muqun_gateway::agents::ModelRef;
+
+    vec![
+        MaoRun {
+            id: "mao-2".into(),
+            computer: "local".into(),
+            goal: "Refactor session search indexer batch flush into background worker".into(),
+            cwd: "/home/demo/gateway".into(),
+            coder: MaoRole {
+                agent: "opencode".into(),
+                model: None,
+                machine: None,
+            },
+            reviewer: MaoRole {
+                agent: "claude".into(),
+                model: None,
+                machine: None,
+            },
+            coder_asid: "s3".into(),
+            reviewer_asid: Some("s3".into()),
+            pending_reviewer_token: None,
+            pending_review_diff: false,
+            pre_review_msg_id: None,
+            base_commit: Some("a1b2c3d".into()),
+            base_commits: Default::default(),
+            last_diff_fingerprint: None,
+            snapshot_retries: 0,
+            round: 1,
+            max_rounds: 2,
+            phase: MaoPhase::Approved {
+                round: 1,
+                summary: "Batch channel cleanup and backpressure tests verified clean.".into(),
+            },
+            files: vec![
+                MaoDeliverableFile {
+                    path: "src/search/indexer.rs".into(),
+                    additions: 64,
+                    deletions: 28,
+                },
+                MaoDeliverableFile {
+                    path: "src/search/tests.rs".into(),
+                    additions: 41,
+                    deletions: 2,
+                },
+            ],
+            coder_summary: "Moved batch index flush to bounded worker task; cargo test search::tests passed (18/18).".into(),
+            review_summary: "Reviewed indexer shutdown path and bounded mpsc backpressure behavior. All 18 unit tests pass.".into(),
+            findings: Vec::new(),
+            steps: vec![
+                MaoStep {
+                    kind: MaoStepKind::Coding,
+                    round: 1,
+                    title: "Coding #1 · OpenCode".into(),
+                    detail: "Moved batch flush to bounded mpsc worker".into(),
+                    status: "completed",
+                    asid: Some("s3".into()),
+                    time_ms: now.saturating_sub(620_000),
+                },
+                MaoStep {
+                    kind: MaoStepKind::Verdict,
+                    round: 1,
+                    title: "Review approved #1".into(),
+                    detail: "Batch channel cleanup and backpressure tests verified clean.".into(),
+                    status: "completed",
+                    asid: Some("s3".into()),
+                    time_ms: now.saturating_sub(580_000),
+                },
+            ],
+            expanded: false,
+            created_ms: now.saturating_sub(680_000),
+            updated_ms: now.saturating_sub(580_000),
+            ..Default::default()
+        },
+        MaoRun {
+            id: "mao-1".into(),
+            computer: "local".into(),
+            goal: "Add rate limiting middleware to /api/search and verify existing unit tests".into(),
+            cwd: "/home/demo/gateway".into(),
+            coder: MaoRole {
+                agent: "claude".into(),
+                model: Some(ModelRef {
+                    provider_id: "anthropic".into(),
+                    model_id: "claude-haiku-4-5".into(),
+                    variant: Some("low".into()),
+                }),
+                machine: None,
+            },
+            reviewer: MaoRole {
+                agent: "codex".into(),
+                model: Some(ModelRef {
+                    provider_id: "openai".into(),
+                    model_id: "gpt-5.1-codex-mini".into(),
+                    variant: Some("low".into()),
+                }),
+                machine: None,
+            },
+            coder_asid: "s1".into(),
+            reviewer_asid: Some("s2".into()),
+            pending_reviewer_token: None,
+            pending_review_diff: false,
+            pre_review_msg_id: None,
+            base_commit: Some("e4f5g6h".into()),
+            base_commits: Default::default(),
+            last_diff_fingerprint: None,
+            snapshot_retries: 0,
+            round: 2,
+            max_rounds: 2,
+            phase: MaoPhase::Reviewing { round: 2 },
+            files: vec![
+                MaoDeliverableFile {
+                    path: "src/platform/server.rs".into(),
+                    additions: 84,
+                    deletions: 6,
+                },
+                MaoDeliverableFile {
+                    path: "src/orchestration/routes.rs".into(),
+                    additions: 58,
+                    deletions: 12,
+                },
+                MaoDeliverableFile {
+                    path: "src/orchestration/tests.rs".into(),
+                    additions: 45,
+                    deletions: 0,
+                },
+            ],
+            coder_summary: "Implemented per-IP token bucket limiter on /api/search with X-Forwarded-For loopback validation and added 6 integration tests.".into(),
+            review_summary: "Round 1 caught missing X-Forwarded-For fallback check; Coder updated trusted proxy parsing. Verifying Round 2 diff now…".into(),
+            findings: vec![
+                MaoFinding {
+                    severity: "medium".into(),
+                    location: "src/orchestration/routes.rs:142".into(),
+                    message: "Verify X-Forwarded-For uses right-most untrusted hop behind loopback proxy".into(),
+                },
+            ],
+            steps: vec![
+                MaoStep {
+                    kind: MaoStepKind::Coding,
+                    round: 1,
+                    title: "Coding #1 · Claude".into(),
+                    detail: "Added token bucket middleware and route guard".into(),
+                    status: "completed",
+                    asid: Some("s1".into()),
+                    time_ms: now.saturating_sub(180_000),
+                },
+                MaoStep {
+                    kind: MaoStepKind::Review,
+                    round: 1,
+                    title: "Code review #1 · Codex".into(),
+                    detail: "Changes requested: handle X-Forwarded-For fallback when behind loopback proxy".into(),
+                    status: "warning",
+                    asid: Some("s2".into()),
+                    time_ms: now.saturating_sub(110_000),
+                },
+                MaoStep {
+                    kind: MaoStepKind::Rework,
+                    round: 2,
+                    title: "Rework #2 · Claude".into(),
+                    detail: "Added trusted proxy header parsing and unit test coverage".into(),
+                    status: "completed",
+                    asid: Some("s1".into()),
+                    time_ms: now.saturating_sub(50_000),
+                },
+                MaoStep {
+                    kind: MaoStepKind::Review,
+                    round: 2,
+                    title: "Code review #2 · Codex".into(),
+                    detail: "Inspecting updated middleware diff and loopback test cases…".into(),
+                    status: "running",
+                    asid: Some("s2".into()),
+                    time_ms: now.saturating_sub(15_000),
+                },
+            ],
+            expanded: false,
+            created_ms: now.saturating_sub(200_000),
+            updated_ms: now.saturating_sub(15_000),
+            ..Default::default()
+        },
+    ]
+}
+
+fn mao_session_scene(s: &mut UiState) {
+    base(s);
+    timeline(s);
+    diff_stat(s);
+    s.draft = TextEdit::new("");
+    s.cfg.ui.mao = crate::config::MaoPrefs {
+        enabled: true,
+        reviewer: Some(crate::config::MaoRoleConfig {
+            agent: "codex".into(),
+            model: Some(muqun_gateway::agents::ModelRef {
+                provider_id: "openai".into(),
+                model_id: "gpt-5.1-codex-mini".into(),
+                variant: Some("low".into()),
+            }),
+            machine: None,
+        }),
+        max_rounds: 2,
+        ..Default::default()
+    };
+    let now = super::now_ms();
+    s.orchestration.runs = mao_sample_runs(now);
+    s.orchestration.selected_run = Some("mao-1".into());
+    s.demo = true;
+}
+
+fn mao_page_scene(s: &mut UiState) {
+    mao_session_scene(s);
+    s.go(Mode::Mao);
+}
+
+fn mao_page_zh_scene(s: &mut UiState) {
+    use super::orchestration::{
+        MaoDeliverableFile, MaoFinding, MaoPhase, MaoRole, MaoRun, MaoStep, MaoStepKind,
+    };
+    use muqun_gateway::agents::ModelRef;
+
+    mao_session_scene(s);
+    s.cfg.general.language = crate::config::Language::ZhCn;
+    let now = super::now_ms();
+    let mut locale_files: Vec<MaoDeliverableFile> = [
+        "de", "en", "es", "fr", "ja", "ko", "pt", "ru", "th", "vi", "zh-CN", "zh-TW",
+    ]
+    .into_iter()
+    .map(|l| MaoDeliverableFile {
+        path: format!("desktop/locales/desktop/{l}.json"),
+        additions: 15,
+        deletions: 1,
+    })
+    .collect();
+    locale_files.push(MaoDeliverableFile {
+        path: "src/orchestration/routes.rs".into(),
+        additions: 184,
+        deletions: 28,
+    });
+    locale_files.push(MaoDeliverableFile {
+        path: "desktop/src/ui/orchestration.rs".into(),
+        additions: 312,
+        deletions: 86,
+    });
+
+    let dev_run = MaoRun {
+        id: "o_dev_zh".into(),
+        computer: "local".into(),
+        goal: "不应该让我手动指定架构或前后端，应该由编排器根据任务自动从我配置的 Agent 池里分配模型，额度用完自动切换备用 Agent。".into(),
+        cwd: "/home/ryu/Work/muqun/gateway-desktop".into(),
+        coder: MaoRole {
+            agent: "antigravity".into(),
+            model: Some(ModelRef {
+                provider_id: "antigravity".into(),
+                model_id: "gemini-4-neon".into(),
+                variant: Some("high".into()),
+            }),
+            machine: None,
+        },
+        reviewer: MaoRole {
+            agent: "claude".into(),
+            model: Some(ModelRef {
+                provider_id: "anthropic".into(),
+                model_id: "claude-sonnet-5-5".into(),
+                variant: Some("high".into()),
+            }),
+            machine: None,
+        },
+        coder_asid: "s1".into(),
+        reviewer_asid: Some("s2".into()),
+        base_commit: Some("25b0902".into()),
+        round: 3,
+        max_rounds: 3,
+        phase: MaoPhase::Failed {
+            error: "Reviewer dispatch failed: no terminal session '0facb893-322a-41a5-8419-b65bcc398e2d'".into(),
+        },
+        files: locale_files,
+        coder_summary: "已实现基于 Agent 池的自动路由与额度耗尽切换，更新了 Gateway 编排逻辑和 12 语言文案。".into(),
+        review_summary: "前两轮审查共发现 4 项问题（2 项高危、2 项中危），第 3 轮复核因会话断开中断。".into(),
+        findings: vec![
+            MaoFinding {
+                severity: "high".into(),
+                location: "src/orchestration/routes.rs:1783".into(),
+                message: "启动期即时故障切换创建了 parent: None 的任务且只更新了内存中的 run.task_id，重启后可能丢失任务关联。".into(),
+            },
+            MaoFinding {
+                severity: "high".into(),
+                location: "src/orchestration/mod.rs:251".into(),
+                message: "当订阅账号 has_credits=false 但包含配额窗口仍有余量时，不应直接判定为额度耗尽。".into(),
+            },
+            MaoFinding {
+                severity: "medium".into(),
+                location: "src/orchestration/routes.rs:261".into(),
+                message: "运行时故障切换产生的子任务应排除在用户可见子任务计数之外，避免重复统计。".into(),
+            },
+            MaoFinding {
+                severity: "medium".into(),
+                location: "desktop/src/ui/orchestration.rs:5689".into(),
+                message: "向不支持 pool 能力的旧版 Gateway 发送请求前应先检查能力标志。".into(),
+            },
+        ],
+        steps: vec![
+            MaoStep {
+                kind: MaoStepKind::Coding,
+                round: 1,
+                title: "执行 #1 · Antigravity".into(),
+                detail: "完成 Agent 池路由与自动切换实现".into(),
+                status: "completed",
+                asid: Some("s1".into()),
+                time_ms: now.saturating_sub(240_000),
+            },
+            MaoStep {
+                kind: MaoStepKind::Review,
+                round: 3,
+                title: "复核 #3 · Claude".into(),
+                detail: "Reviewer dispatch failed: no terminal session '0facb893-322a-41a5-8419-b65bcc398e2d'".into(),
+                status: "failed",
+                asid: None,
+                time_ms: now.saturating_sub(30_000),
+            },
+        ],
+        created_ms: now.saturating_sub(300_000),
+        updated_ms: now.saturating_sub(30_000),
+        ..Default::default()
+    };
+
+    let general_run = MaoRun {
+        id: "o_general_zh".into(),
+        computer: "local".into(),
+        goal: "帮我起草一份 Q3 产品发布与订阅定价方案，包含面向个人用户和团队版的权益对比、上线节奏与风险清单。".into(),
+        cwd: "/home/ryu/Documents".into(),
+        coder: MaoRole {
+            agent: "claude".into(),
+            model: None,
+            machine: None,
+        },
+        reviewer: MaoRole {
+            agent: "codex".into(),
+            model: None,
+            machine: None,
+        },
+        coder_asid: "s3".into(),
+        reviewer_asid: None,
+        round: 1,
+        max_rounds: 2,
+        phase: MaoPhase::ChangesRequested {
+            round: 1,
+            feedback: "整体结构清晰，建议补充年付折扣测算和老用户平滑迁移说明后再定稿。".into(),
+        },
+        files: Vec::new(),
+        coder_summary: "已完成 Q3 发布计划与三档订阅定价方案，涵盖个人版、专业版与团队版权益矩阵、3 周上线里程碑及宣发清单。".into(),
+        review_summary: "方案逻辑完整，有 2 项内容建议在对外发布前补齐：年付折扣利润测算和现有老用户的价格保护策略。".into(),
+        findings: vec![
+            MaoFinding {
+                severity: "high".into(),
+                location: "定价与权益 · 老用户迁移".into(),
+                message: "缺少对现有订阅用户的价格保护与过渡期说明，直接切换新定价容易引发客诉。".into(),
+            },
+            MaoFinding {
+                severity: "medium".into(),
+                location: "上线节奏 · 风险预案".into(),
+                message: "建议为灰度发布阶段补充回滚触发条件与客服 FAQ 准备时间。".into(),
+            },
+        ],
+        steps: Vec::new(),
+        created_ms: now.saturating_sub(900_000),
+        updated_ms: now.saturating_sub(120_000),
+        ..Default::default()
+    };
+
+    let mut runs = mao_sample_runs(now);
+    runs.push(general_run);
+    runs.push(dev_run);
+    s.orchestration.runs = runs;
+    s.orchestration.selected_run = Some("o_dev_zh".into());
+    s.go(Mode::Mao);
+}
+
+fn mao_general_zh_scene(s: &mut UiState) {
+    mao_page_zh_scene(s);
+    s.orchestration.selected_run = Some("o_general_zh".into());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::commands;
+
+    #[test]
+    fn every_scene_builds_its_state() {
+        for (name, scene) in scenes() {
+            let (tx, _rx) = commands::channel();
+            let mut state = UiState::new(tx);
+            scene(&mut state);
+            assert!(!state.agents.is_empty(), "{name}");
+        }
+    }
+}

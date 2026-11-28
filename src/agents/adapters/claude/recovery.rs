@@ -350,20 +350,42 @@ fn replay_updates(chain: &[Chained]) -> Vec<Value> {
             })),
             (Some("user"), _) => {
                 for part in parts.iter().filter(|p| p["type"] == "tool_result") {
-                    let output = match &part["content"] {
-                        Value::String(text) => text.clone(),
-                        Value::Array(items) => items
-                            .iter()
-                            .filter_map(|item| item["text"].as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                        _ => String::new(),
-                    };
+                    let mut content_blocks = Vec::new();
+                    match &part["content"] {
+                        Value::String(text) => {
+                            content_blocks.push(
+                                json!({"type": "content", "content": {"type": "text", "text": text}}),
+                            );
+                        }
+                        Value::Array(items) => {
+                            let mut texts = Vec::new();
+                            for item in items {
+                                if let Some(text) = item["text"].as_str() {
+                                    texts.push(text);
+                                } else if let Some(file_block) =
+                                    crate::agents::message_images::tool_media::normalize_content_block(item)
+                                {
+                                    content_blocks.push(file_block);
+                                }
+                            }
+                            if !texts.is_empty() || content_blocks.is_empty() {
+                                content_blocks.insert(
+                                    0,
+                                    json!({"type": "content", "content": {"type": "text", "text": texts.join("\n")}}),
+                                );
+                            }
+                        }
+                        _ => {
+                            content_blocks.push(
+                                json!({"type": "content", "content": {"type": "text", "text": ""}}),
+                            );
+                        }
+                    }
                     updates.push(json!({
                         "sessionUpdate": "tool_call_update",
                         "toolCallId": part["tool_use_id"],
                         "status": if part["is_error"] == true { "failed" } else { "completed" },
-                        "content": [{"type": "content", "content": {"type": "text", "text": output}}],
+                        "content": content_blocks,
                     }));
                 }
             }
@@ -404,6 +426,145 @@ fn replay_updates(chain: &[Chained]) -> Vec<Value> {
         }
     }
     updates
+}
+
+/// Maximum bytes read from the tail of a Claude Code transcript for instant
+/// cold-open preview before ACP `session/load` finishes in the background.
+const PREVIEW_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Fast, bounded tail preview of a Claude Code transcript without starting an
+/// ACP child process. Even on multi-hundred-MB transcripts this reads at most
+/// [`PREVIEW_TAIL_BYTES`] from the end and stops walking `parentUuid` cleanly
+/// at the start of the window.
+fn tail_chain_from(
+    path: &Path,
+    id: &str,
+    tail_bytes: u64,
+    stop: &CancellationToken,
+) -> Result<Vec<Chained>, AgentError> {
+    use std::io::{Seek, SeekFrom};
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).map_err(|_| unavailable())?;
+    let meta = file.metadata().map_err(|_| unavailable())?;
+    if !meta.is_file() {
+        return Err(unavailable());
+    }
+    let len = meta.len();
+    let skip_first = len > tail_bytes;
+    if skip_first {
+        file.seek(SeekFrom::Start(len - tail_bytes))
+            .map_err(|_| unavailable())?;
+    }
+    let mut reader = std::io::BufReader::with_capacity(256 * 1024, &file);
+    let mut buffer = Vec::new();
+    let mut total = 0u64;
+    if skip_first {
+        let _ = next_line(&mut reader, &mut buffer, &mut total);
+    }
+    let mut nodes: HashMap<String, (Option<String>, Chained)> = HashMap::new();
+    let mut leaf = None;
+    let mut records = 0usize;
+    loop {
+        if stop.is_cancelled() || total > tail_bytes.saturating_add(MAX_LINE as u64) {
+            break;
+        }
+        let line = match next_line(&mut reader, &mut buffer, &mut total) {
+            Ok(Some(line)) => line,
+            Ok(None) | Err(_) => break,
+        };
+        if buffer.is_empty() || metadata_type(&buffer).is_some() || matches!(line, Line::Oversized)
+        {
+            continue;
+        }
+        records += 1;
+        if records > MAX_RECORDS {
+            break;
+        }
+        let Ok(record) = serde_json::from_slice::<Record>(&buffer) else {
+            continue;
+        };
+        if record
+            .session_id
+            .as_deref()
+            .is_some_and(|native| native != id)
+        {
+            continue;
+        }
+        let Some(uuid) = record.uuid.clone() else {
+            continue;
+        };
+        if record.is_sidechain {
+            continue;
+        }
+        let node = node(&record);
+        let chained = Chained {
+            uuid: uuid.clone(),
+            node,
+            kind: record.kind.clone(),
+            message_id: record.message.as_ref().and_then(|m| m.id.clone()),
+            content: record.message.and_then(|m| m.content),
+        };
+        nodes.insert(uuid.clone(), (record.parent_uuid, chained));
+        leaf = Some(uuid);
+    }
+    let Some(mut next) = leaf else {
+        return Ok(Vec::new());
+    };
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
+    while seen.insert(next.clone()) {
+        let Some((parent, chained)) = nodes.remove(&next) else {
+            break;
+        };
+        chain.push(chained);
+        match parent {
+            Some(parent) => next = parent,
+            None => break,
+        }
+    }
+    chain.reverse();
+    Ok(chain)
+}
+
+/// Recent timeline items read directly from the tail of Claude Code's native
+/// `.jsonl` file, used to paint cold sessions immediately while ACP wakes.
+pub(crate) async fn tail_timeline(
+    directory: &str,
+    id: &str,
+    limit: usize,
+    stop: &CancellationToken,
+) -> Result<Vec<crate::agents::domain::TimelineItem>, AgentError> {
+    if !valid_session_id(id) || !Path::new(directory).is_absolute() {
+        return Ok(Vec::new());
+    }
+    let Some(root) = projects_root() else {
+        return Ok(Vec::new());
+    };
+    let (directory, id, stop) = (directory.to_owned(), id.to_owned(), stop.clone());
+    tokio::task::spawn_blocking(move || {
+        let Ok(path) = find_exact(&root, &directory, &id) else {
+            return Ok(Vec::new());
+        };
+        let chain = tail_chain_from(&path, &id, PREVIEW_TAIL_BYTES, &stop)?;
+        let mut projection = crate::agents::adapters::acp::mapper::Projection::new(false);
+        for update in replay_updates(&chain) {
+            let _ = projection.update(&update);
+        }
+        let mut items = projection.timeline();
+        if limit > 0 && items.len() > limit {
+            items.drain(..items.len() - limit);
+        }
+        Ok(items)
+    })
+    .await
+    .map_err(|_| unavailable())?
 }
 
 /// The timeline of a transcript another process is still writing, read-only.
@@ -543,36 +704,81 @@ struct UsageScan {
     file: Option<(u64, u64)>,
     offset: u64,
     messages: HashMap<String, MessageUsage>,
+    observed: Option<(u64, std::time::SystemTime)>,
+    cached_total: Option<TokensUsage>,
 }
 
 impl UsageScan {
-    fn read(&mut self, reader: &mut impl BufRead) -> std::io::Result<()> {
+    const USAGE_BUFFER: u64 = 2 * 1024 * 1024;
+
+    /// Keep the small common case in a reusable buffer. Claude also writes
+    /// request blobs and tool results of arbitrary size. Skip metadata in
+    /// place and stream JSON for exceptional chat records.
+    fn read(&mut self, reader: &mut (impl BufRead + std::io::Seek)) -> std::io::Result<()> {
+        use std::io::{Read, SeekFrom};
         let mut line = Vec::new();
+        let mut start = reader.stream_position()?;
         loop {
             line.clear();
-            let read = reader.read_until(b'\n', &mut line)?;
-            if read == 0 || line.last() != Some(&b'\n') {
-                // A record still being appended is read next time.
-                return Ok(());
+            let prefix = reader
+                .take(Self::USAGE_BUFFER)
+                .read_until(b'\n', &mut line)? as u64;
+            if prefix == 0 {
+                break;
             }
-            self.offset += read as u64;
-            if metadata_type(&line).is_some() {
-                continue;
-            }
-            let Ok(spent) = serde_json::from_slice::<Spent>(&line) else {
-                continue;
+            let kind = metadata_type(&line);
+            let chat = kind.is_none() || kind == Some("assistant");
+            let (spent, consumed) = if line.last() == Some(&b'\n') {
+                (
+                    chat.then(|| serde_json::from_slice::<Spent>(&line).ok())
+                        .flatten(),
+                    prefix,
+                )
+            } else {
+                if prefix < Self::USAGE_BUFFER {
+                    break;
+                }
+                let mut consumed = prefix;
+                loop {
+                    let bytes = reader.fill_buf()?;
+                    if bytes.is_empty() {
+                        return Ok(());
+                    }
+                    let newline = bytes.iter().position(|&b| b == b'\n');
+                    let n = newline.map_or(bytes.len(), |at| at + 1);
+                    reader.consume(n);
+                    consumed += n as u64;
+                    if newline.is_some() {
+                        break;
+                    }
+                }
+                let spent = if chat {
+                    reader.seek(SeekFrom::Start(start))?;
+                    let spent = serde_json::from_reader::<_, Spent>(reader.take(consumed)).ok();
+                    reader.seek(SeekFrom::Start(start + consumed))?;
+                    spent
+                } else {
+                    None
+                };
+                (spent, consumed)
             };
-            if spent.kind.as_deref() != Some("assistant") {
-                continue;
-            }
-            if let Some(SpentMessage {
-                id: Some(id),
-                usage: Some(usage),
-            }) = spent.message
+            self.offset += consumed;
+            start += consumed;
+            if let Some(Spent {
+                kind: Some(kind),
+                message:
+                    Some(SpentMessage {
+                        id: Some(id),
+                        usage: Some(usage),
+                    }),
+            }) = spent
             {
-                self.messages.insert(id, usage);
+                if kind == "assistant" {
+                    self.messages.insert(id, usage);
+                }
             }
         }
+        Ok(())
     }
 
     /// Disjoint counters, as the neutral shape has them: thinking is
@@ -602,7 +808,7 @@ impl UsageScan {
     }
 }
 
-type UsageCache = std::sync::Mutex<HashMap<PathBuf, UsageScan>>;
+type UsageCache = std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<UsageScan>>>>;
 const MAX_USAGE_SCANS: usize = 64;
 
 /// The session's cumulative token usage from its transcript. A transcript
@@ -621,15 +827,32 @@ pub(super) async fn transcript_usage(
     };
     let (directory, id) = (directory.to_owned(), id.to_owned());
     Ok(tokio::task::spawn_blocking(move || {
-        use std::io::{Seek, SeekFrom};
         let path = find_exact(&root, &directory, &id).ok()?;
-        let mut file = std::fs::File::open(&path).ok()?;
-        let stat = file.metadata().ok()?;
-        if stat.len() > MAX_BYTES {
-            return None;
-        }
         let cache = CACHE.get_or_init(Default::default);
-        let mut scan = cache.lock().unwrap().remove(&path).unwrap_or_default();
+        let entry = {
+            let mut entries = cache.lock().ok()?;
+            if !entries.contains_key(&path) && entries.len() >= MAX_USAGE_SCANS {
+                let evict = entries
+                    .iter()
+                    .find(|(_, entry)| std::sync::Arc::strong_count(entry) == 1)
+                    .map(|(key, _)| key.clone())?;
+                entries.remove(&evict);
+            }
+            entries.entry(path.clone()).or_default().clone()
+        };
+        let mut scan = entry.lock().ok()?;
+        scan.read_file(&path).ok()?
+    })
+    .await
+    .ok()
+    .flatten())
+}
+
+impl UsageScan {
+    fn read_file(&mut self, path: &Path) -> std::io::Result<Option<TokensUsage>> {
+        use std::io::{Seek, SeekFrom};
+        let mut file = std::fs::File::open(path)?;
+        let stat = file.metadata()?;
         #[cfg(unix)]
         let identity = {
             use std::os::unix::fs::MetadataExt as _;
@@ -637,25 +860,27 @@ pub(super) async fn transcript_usage(
         };
         #[cfg(not(unix))]
         let identity = None;
-        if scan.file != identity || stat.len() < scan.offset {
-            scan = UsageScan {
+        let stamp = stat.modified().ok().map(|mtime| (stat.len(), mtime));
+        if self.file == identity && stamp.is_some() && self.observed == stamp {
+            return Ok(self.cached_total.clone());
+        }
+        if self.file != identity
+            || stat.len() < self.offset
+            || self
+                .observed
+                .is_some_and(|(size, _)| size == stat.len() && stamp.is_some())
+        {
+            *self = UsageScan {
                 file: identity,
-                ..UsageScan::default()
+                ..Default::default()
             };
         }
-        file.seek(SeekFrom::Start(scan.offset)).ok()?;
-        scan.read(&mut std::io::BufReader::new(file)).ok()?;
-        let total = scan.total();
-        let mut cache = cache.lock().unwrap();
-        if cache.len() >= MAX_USAGE_SCANS {
-            cache.clear();
-        }
-        cache.insert(path, scan);
-        Some(total)
-    })
-    .await
-    .ok()
-    .flatten())
+        file.seek(SeekFrom::Start(self.offset))?;
+        self.read(&mut std::io::BufReader::with_capacity(128 * 1024, file))?;
+        self.cached_total = (!self.messages.is_empty()).then(|| self.total());
+        self.observed = stamp;
+        Ok(self.cached_total.clone())
+    }
 }
 
 /// The transcript's modification time, to notice that a terminal wrote to it.
@@ -777,6 +1002,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn usage_streams_long_records_and_discards_rotated_totals() {
+        use std::io::Write;
+        let (dir, path) = write(&[], "");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"api-request-blob","body":"x".repeat(UsageScan::USAGE_BUFFER as usize + 1)})
+        )
+        .unwrap();
+        let assistant = |n| {
+            json!({"type":"assistant", "message":{"id":"response",
+            "content":"x".repeat(UsageScan::USAGE_BUFFER as usize + 1), "usage":{"input_tokens":n,"output_tokens":2}}})
+        };
+        writeln!(file, "{}", assistant(7)).unwrap();
+        let mut scan = UsageScan::default();
+        assert_eq!(scan.read_file(&path).unwrap().unwrap().input, 7);
+        writeln!(file, "{}", assistant(9)).unwrap();
+        assert_eq!(scan.read_file(&path).unwrap().unwrap().input, 9);
+        let replacement = dir.join("new.jsonl");
+        std::fs::write(&replacement, "{}\n").unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        assert!(scan.read_file(&path).unwrap().is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// The whole-transcript read is the one operation that still has a
     /// limit; it says so instead of a generic failure.
     #[test]
@@ -835,6 +1087,40 @@ mod tests {
         // An unfinished append is not settled evidence.
         std::fs::write(&path, format!("{}\n{{\"type\":\"user\"", lines[0])).unwrap();
         assert!(inspect_file(&path, id, &CancellationToken::new()).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tail_timeline_reads_recent_turns_when_tail_window_truncates_earlier_history() {
+        let id = "00000000-0000-4000-8000-000000000003";
+        let big_pad = "x".repeat(4096);
+        let lines = [
+            json!({"type":"user","uuid":"u1","parentUuid":null,"sessionId":id,
+                   "origin":{"kind":"human"},"message":{"content":[{"type":"text","text":big_pad}]}}),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":id,
+                   "message":{"id":"m1","content":[{"type":"text","text":big_pad}]}}),
+            json!({"type":"user","uuid":"u2","parentUuid":"a1","sessionId":id,
+                   "origin":{"kind":"human"},"message":{"content":[{"type":"text","text":"Recent question"}]}}),
+            json!({"type":"assistant","uuid":"a2","parentUuid":"u2","sessionId":id,
+                   "message":{"id":"m2","content":[{"type":"text","text":"Recent answer"}]}}),
+        ];
+        let (dir, path) = write(&lines, "");
+        // Window smaller than the whole file, large enough for the final turn.
+        let chain = tail_chain_from(&path, id, 1024, &CancellationToken::new()).unwrap();
+        let mut projection = crate::agents::adapters::acp::mapper::Projection::new(false);
+        for update in replay_updates(&chain) {
+            let _ = projection.update(&update);
+        }
+        let timeline = projection.timeline();
+        assert!(timeline.len() >= 2, "{timeline:?}");
+        assert!(timeline.iter().any(|item| matches!(
+            &item.part,
+            crate::agents::domain::AgentPart::Text { text } if text.contains("Recent question")
+        )));
+        assert!(timeline.iter().any(|item| matches!(
+            &item.part,
+            crate::agents::domain::AgentPart::Text { text } if text.contains("Recent answer")
+        )));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

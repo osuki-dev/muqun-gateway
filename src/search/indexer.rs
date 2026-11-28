@@ -205,10 +205,13 @@ impl Worker {
             .store(total - pending.len(), Ordering::Relaxed);
         pending.sort_by_key(|p| std::cmp::Reverse(p.2.updated_ms));
         let count = pending.len();
-        for (source, agent, meta, stamp) in pending {
+        for (idx, (source, agent, meta, stamp)) in pending.into_iter().enumerate() {
             self.index(source, &agent, meta, Some(&stamp)).await;
             progress.done.fetch_add(1, Ordering::Relaxed);
             self.flush().await;
+            if (idx + 1) % 8 == 0 {
+                crate::platform::server::trim_allocator();
+            }
         }
         if count > 0 {
             // A transcript read is a burst of allocation; give it back.

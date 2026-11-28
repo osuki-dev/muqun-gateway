@@ -76,6 +76,15 @@ impl AcpProvider for CursorProvider {
     ) -> AgentFuture<'a, Vec<crate::agents::domain::TimelineItem>> {
         Box::pin(super::store::live_timeline(id, stop))
     }
+    const PREVIEW_TIMELINE: bool = true;
+    fn preview_timeline<'a>(
+        _directory: &'a str,
+        id: &'a str,
+        limit: usize,
+        stop: &'a CancellationToken,
+    ) -> AgentFuture<'a, Vec<crate::agents::domain::TimelineItem>> {
+        Box::pin(super::store::tail_timeline(id, limit, stop))
+    }
     fn terminal_sessions<'a>(
         ids: Vec<String>,
         stop: &'a CancellationToken,

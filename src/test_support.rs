@@ -68,6 +68,7 @@ pub(crate) fn test_config(token: &str) -> Config {
             ..Default::default()
         },
         claude: agents::runtime::ClaudeConfig::disabled(),
+        copilot: agents::runtime::CopilotConfig::default(),
         antigravity: agents::runtime::AntigravityConfig::disabled(),
         cursor: agents::runtime::CursorConfig::disabled(),
         agent_runtime: crate::platform::config::AgentRuntimeConfig { enabled: false },
@@ -202,9 +203,12 @@ pub(crate) fn test_state(admin_token: &str, devices: Vec<DeviceRecord>) -> AppSt
         session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
         agent_runtime: agents::AgentRuntime::disabled(),
         ws_connections: Arc::new(agents::ws_routes::WsRegistry::default()),
+        pty_connections: Arc::new(terminal::pty_ws::PtyRegistry::default()),
         generation: new_generation(),
         message_images: Arc::default(),
+        preview_cache: Arc::default(),
         mcp_tokens: Arc::new(crate::mcp::tokens_sqlite::SqliteTokenStore::new(db.clone())),
+        mcp_hub: Arc::new(crate::mcp::hub::McpHub::new(Vec::new(), None)),
         fleet: Arc::default(),
         peers,
         tasks,
@@ -1122,6 +1126,15 @@ pub(crate) struct FakeAgent {
     pub session_deletion: bool,
     /// An agent whose service takes MCP servers at runtime.
     pub mcp: Option<Arc<Mutex<FakeMcp>>>,
+    /// When true, `reply_permission` answers as if another client already
+    /// cleared the request (G3 R4 duplicate-reply coverage).
+    pub reply_permission_gone: bool,
+    /// Same idea for forms.
+    pub reply_form_gone: bool,
+    /// Optional canned `account_limits` response for orchestration failover tests.
+    pub account_limits: Option<agents::domain::account_limits::AccountLimits>,
+    /// When true, `find_files` returns `AgentError::Unsupported` (like ACP/T3/Pi).
+    pub unsupported_find_files: bool,
 }
 
 /// A fake agent service's MCP registration.
@@ -1155,6 +1168,10 @@ impl FakeAgent {
             http_404: Vec::new(),
             session_deletion: false,
             mcp: None,
+            reply_permission_gone: false,
+            reply_form_gone: false,
+            account_limits: None,
+            unsupported_find_files: false,
         }
     }
 
@@ -1463,25 +1480,44 @@ impl agents::ports::agent::AgentPort for FakeAgent {
     ) -> agents::ports::agent::AgentFuture<'a, Vec<serde_json::Value>> {
         Box::pin(async move {
             self.record(&format!("find_files:{}", directory.unwrap_or("")));
+            if self.unsupported_find_files {
+                return Err(agents::ports::AgentError::Unsupported("find_files".into()));
+            }
             Ok(Vec::new())
         })
     }
     fn reply_permission<'a>(
         &'a self,
-        _session_id: &'a str,
-        _request_id: &'a str,
+        session_id: &'a str,
+        request_id: &'a str,
         _decision: agents::domain::PermissionDecision,
         _message: Option<&'a str>,
     ) -> agents::ports::agent::AgentFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            self.record(&format!("reply_permission:{session_id}:{request_id}"));
+            if self.reply_permission_gone {
+                return Err(agents::ports::agent::AgentError::InvalidRequest(
+                    "permission is no longer pending".into(),
+                ));
+            }
+            Ok(())
+        })
     }
     fn reply_form<'a>(
         &'a self,
-        _session_id: &'a str,
-        _form_id: &'a str,
+        session_id: &'a str,
+        form_id: &'a str,
         _answers: serde_json::Value,
     ) -> agents::ports::agent::AgentFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            self.record(&format!("reply_form:{session_id}:{form_id}"));
+            if self.reply_form_gone {
+                return Err(agents::ports::agent::AgentError::InvalidRequest(
+                    "form is no longer pending".into(),
+                ));
+            }
+            Ok(())
+        })
     }
     fn get_catalog<'a>(
         &'a self,
@@ -1536,6 +1572,18 @@ impl agents::ports::agent::AgentPort for FakeAgent {
                 .get(session_id)
                 .unwrap_or(&self.timeline)
                 .clone())
+        })
+    }
+    fn account_limits<'a>(
+        &'a self,
+    ) -> agents::ports::agent::AgentFuture<'a, agents::domain::account_limits::AccountLimits> {
+        Box::pin(async move {
+            match &self.account_limits {
+                Some(limits) => Ok(limits.clone()),
+                None => Err(agents::ports::agent::AgentError::Unsupported(
+                    "account limits".into(),
+                )),
+            }
         })
     }
 }

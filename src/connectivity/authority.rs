@@ -224,15 +224,15 @@ pub fn valid_pairing_code(value: &str) -> bool {
             .all(|(index, byte)| index == 4 || PAIRING_CODE_ALPHABET.contains(&byte))
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
     }
     let mut diff = 0_u8;
     for (left, right) in left.iter().zip(right) {
-        diff |= left ^ right;
+        diff |= std::hint::black_box(left ^ right);
     }
-    diff == 0
+    std::hint::black_box(diff) == 0
 }
 
 #[cfg(test)]

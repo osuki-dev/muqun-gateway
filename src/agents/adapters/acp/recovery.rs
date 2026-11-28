@@ -18,6 +18,7 @@ pub struct TurnEvidence {
 pub struct NativeSnapshot {
     pub session_id: String,
     pub entries: Vec<Value>,
+    pub streamed: Option<(Checkpoint, Checkpoint)>,
     pub last_user: Option<String>,
     pub last_assistant: Option<String>,
 }
@@ -29,14 +30,47 @@ pub fn text_digest(text: &str) -> String {
 fn entries_digest(entries: &[Value]) -> String {
     let mut digest = Sha256::new();
     for entry in entries {
-        // Value's object keys are ordered without the preserve_order feature.
-        // Length framing prevents two different entry sequences colliding by
-        // concatenation before the cryptographic digest is applied.
-        let bytes = serde_json::to_vec(entry).expect("JSON Value is serializable");
-        digest.update((bytes.len() as u64).to_le_bytes());
-        digest.update(bytes);
+        digest_entry(&mut digest, entry);
     }
     hex::encode(digest.finalize())
+}
+
+fn digest_entry(digest: &mut Sha256, entry: &Value) {
+    // Value's object keys are ordered without the preserve_order feature.
+    // Length framing prevents two different entry sequences colliding by
+    // concatenation before the cryptographic digest is applied.
+    let bytes = serde_json::to_vec(entry).expect("JSON Value is serializable");
+    digest.update((bytes.len() as u64).to_le_bytes());
+    digest.update(bytes);
+}
+
+/// Only the full checkpoint and its immediately preceding prefix are needed
+/// to prove a single newly completed turn.
+#[derive(Default)]
+pub struct RecoveryEntries {
+    count: usize,
+    digest: Sha256,
+    previous: Sha256,
+}
+
+impl RecoveryEntries {
+    pub fn push(&mut self, entry: Value) {
+        self.previous = self.digest.clone();
+        digest_entry(&mut self.digest, &entry);
+        self.count += 1;
+    }
+    pub fn finish(self) -> (Checkpoint, Checkpoint) {
+        (
+            Checkpoint {
+                entries: self.count,
+                digest: hex::encode(self.digest.finalize()),
+            },
+            Checkpoint {
+                entries: self.count.saturating_sub(1),
+                digest: hex::encode(self.previous.finalize()),
+            },
+        )
+    }
 }
 
 impl NativeSnapshot {
@@ -44,12 +78,23 @@ impl NativeSnapshot {
         Self {
             session_id: session_id.into(),
             entries: Vec::new(),
+            streamed: None,
             last_user: None,
             last_assistant: None,
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        match &self.streamed {
+            Some((full, _)) => full.entries == 0,
+            None => self.entries.is_empty(),
+        }
+    }
+
     pub fn checkpoint(&self) -> Checkpoint {
+        if let Some((full, _)) = &self.streamed {
+            return full.clone();
+        }
         Checkpoint {
             entries: self.entries.len(),
             digest: entries_digest(&self.entries),
@@ -58,8 +103,15 @@ impl NativeSnapshot {
 
     pub fn proves_turn(&self, id: &str, before: &Checkpoint, expected: &TurnEvidence) -> bool {
         self.session_id == id
-            && self.entries.len() == before.entries + 1
-            && entries_digest(&self.entries[..before.entries]) == before.digest
+            && match &self.streamed {
+                Some((full, prefix)) => {
+                    full.entries.checked_sub(1) == Some(before.entries) && prefix == before
+                }
+                None => {
+                    self.entries.len().checked_sub(1) == Some(before.entries)
+                        && entries_digest(&self.entries[..before.entries]) == before.digest
+                }
+            }
             && self
                 .last_user
                 .as_deref()

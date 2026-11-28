@@ -127,12 +127,62 @@ impl DeltaCoalescer {
     }
 }
 
+const ACCOUNT_LIMITS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Single-flight, bounded-TTL cache for `AgentPort::account_limits` shared across
+/// all adapters (Codex, FX, and future providers) and paired clients.
+#[derive(Default)]
+struct AccountLimitsCache {
+    entry: Mutex<
+        Option<(
+            std::time::Instant,
+            u64,
+            super::domain::account_limits::AccountLimits,
+        )>,
+    >,
+}
+
+impl AccountLimitsCache {
+    async fn read(
+        &self,
+        agent: &dyn AgentPort,
+        force_refresh: bool,
+    ) -> Result<super::domain::account_limits::AccountLimits, AgentError> {
+        let mut guard = self.entry.lock().await;
+        if force_refresh {
+            agent.invalidate_account_limits();
+            *guard = None;
+        }
+        let key_before = agent.account_limits_cache_key();
+        if !force_refresh {
+            if let (Some(key), Some((at, cached_key, value))) = (key_before, guard.as_ref()) {
+                if *cached_key == key && at.elapsed() < ACCOUNT_LIMITS_TTL {
+                    return Ok(value.clone());
+                }
+            }
+        }
+        let snapshot = agent.account_limits().await?;
+        let key_after = agent.account_limits_cache_key();
+        if let (Some(before), Some(after)) = (key_before, key_after) {
+            if before == after {
+                *guard = Some((std::time::Instant::now(), after, snapshot.clone()));
+            } else {
+                *guard = None;
+            }
+        } else {
+            *guard = None;
+        }
+        Ok(snapshot)
+    }
+}
+
 pub struct AgentManager {
     agent: Arc<dyn AgentPort>,
     mirror: Arc<MemoryMirror>,
     session_service: Arc<SessionService>,
     prompt_service: Arc<PromptService>,
     interaction_service: Arc<InteractionService>,
+    account_limits: AccountLimitsCache,
     events_tx: broadcast::Sender<AgentDomainEvent>,
     endpoint_url: String,
     endpoint_version: Option<String>,
@@ -146,7 +196,7 @@ impl Drop for AgentManager {
         // external manager must cancel them. Adopted services stay untouched.
         if matches!(
             self.agent.kind(),
-            "codex" | "fx" | "qoder" | "pi" | "claude" | "antigravity" | "cursor"
+            "codex" | "fx" | "qoder" | "pi" | "claude" | "antigravity" | "cursor" | "copilot"
         ) {
             (self.shutdown_handle)();
         }
@@ -293,15 +343,7 @@ impl EventContext {
     }
 
     async fn emit_timeline_item(&self, asid: &AgentSessionId, item: TimelineItem) {
-        let seq = self
-            .mirror
-            .upsert_timeline_items(asid, vec![item.clone()])
-            .await;
-        self.emit(AgentDomainEvent::TimelineUpsert {
-            asid: asid.clone(),
-            items: vec![item],
-            seq,
-        });
+        self.emit(self.mirror.record_timeline_upsert(asid, vec![item]).await);
     }
 
     async fn delivered_without_message(&self, asid: &AgentSessionId, inbox_id: &str) -> bool {
@@ -372,12 +414,7 @@ impl EventContext {
             .await
         {
             Ok(items) if !items.is_empty() => {
-                let seq = self.mirror.upsert_timeline_items(asid, items.clone()).await;
-                self.emit(AgentDomainEvent::TimelineUpsert {
-                    asid: asid.clone(),
-                    items,
-                    seq,
-                });
+                self.emit(self.mirror.record_timeline_upsert(asid, items).await);
             }
             Ok(_) => {}
             Err(err) => {
@@ -455,6 +492,7 @@ impl AgentManager {
             )),
             prompt_service: Arc::new(PromptService::new(agent.clone())),
             interaction_service: Arc::new(InteractionService::new(agent.clone(), mirror.clone())),
+            account_limits: AccountLimitsCache::default(),
             agent,
             mirror,
             events_tx,
@@ -542,6 +580,34 @@ impl AgentManager {
             mirror,
             events_tx,
             "stdio://qoder-acp".into(),
+            version,
+            Arc::new(move || connected.has_live_stream()),
+            Arc::new(move || shutdown.stop()),
+        );
+        (manager, driver)
+    }
+
+    /// Assemble the lazy ACP adapter; each Copilot session owns its own child.
+    pub fn connect_copilot(
+        binary: String,
+        directory: String,
+        version: Option<String>,
+        events_tx: broadcast::Sender<AgentDomainEvent>,
+    ) -> (Self, Arc<crate::agents::adapters::copilot::CopilotDriver>) {
+        let mirror = Arc::new(MemoryMirror::for_agent("copilot"));
+        let driver = crate::agents::adapters::copilot::CopilotDriver::new(
+            binary,
+            directory,
+            mirror.clone(),
+            events_tx.clone(),
+        );
+        let connected = driver.clone();
+        let shutdown = driver.clone();
+        let manager = Self::assemble(
+            driver.clone(),
+            mirror,
+            events_tx,
+            "stdio://copilot-acp".into(),
             version,
             Arc::new(move || connected.has_live_stream()),
             Arc::new(move || shutdown.stop()),
@@ -882,6 +948,18 @@ impl AgentManager {
 
     pub fn agent(&self) -> &Arc<dyn AgentPort> {
         &self.agent
+    }
+
+    /// Read provider-account rate limits through the manager's single-flight
+    /// cache. `force_refresh` bypasses the cached snapshot and asks the adapter
+    /// to drop any internal cache before reading again.
+    pub async fn account_limits(
+        &self,
+        force_refresh: bool,
+    ) -> Result<super::domain::account_limits::AccountLimits, AgentError> {
+        self.account_limits
+            .read(self.agent.as_ref(), force_refresh)
+            .await
     }
 
     pub fn mirror(&self) -> &Arc<MemoryMirror> {
@@ -1806,6 +1884,7 @@ impl AgentManager {
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         }
     }
 

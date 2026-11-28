@@ -13,7 +13,7 @@ use clap::Subcommand;
 use crate::agents::adapters::deepseek::DeepseekEndpoint;
 use crate::agents::adapters::t3::{T3Credential, T3Endpoint};
 use crate::agents::runtime::{binary_version, resolve_binary, DEFAULT_T3_URL};
-use crate::agents::{AgentRuntime, DeepseekConfig, T3Config};
+use crate::agents::{DeepseekConfig, T3Config};
 use crate::discovery::{AgentAvailability, AgentDiscoveryInfo};
 use crate::platform::service::SERVICE_LABEL;
 use crate::{
@@ -62,6 +62,8 @@ pub(crate) enum AgentCommand {
 
 #[derive(Subcommand)]
 pub(crate) enum SetupAgent {
+    /// Explain opt-in GitHub Copilot CLI setup without starting it.
+    Copilot,
     /// Give the gateway a T3 Code credential and enable T3.
     T3 {
         /// T3 server URL; defaults to `t3.url`, then http://127.0.0.1:3773.
@@ -122,6 +124,10 @@ pub(crate) async fn run_agent_command(
         AgentCommand::Hide { agent } => set_visibility(&agent, true)?,
         AgentCommand::Show { agent } => set_visibility(&agent, false)?,
         AgentCommand::Setup { agent } => match agent {
+            SetupAgent::Copilot => {
+                println!("GitHub Copilot CLI is opt-in. Install Copilot CLI and configure its authentication yourself, then set copilot.enabled=true in config.json. Gateway reuses the existing CLI configuration and starts a private `copilot --acp --stdio --no-auto-update` child only when an explicit session operation needs it.");
+                println!("copilot.binary may name an absolute executable. Discovery checks the installed version, not model authentication. Gateway does not install, sign in, grant permissions, change Copilot settings or restart itself. Copilot's saved permissions remain in effect; Plan is not a sandbox and Autopilot requires owner authorization.");
+            }
             SetupAgent::T3 {
                 url,
                 token,
@@ -302,25 +308,16 @@ async fn running_gateway_discovery(config: &Config) -> Option<serde_json::Value>
 /// Probe the agents from this shell, the way the gateway would, with
 /// nothing attached.
 async fn local_probe(config: &Config) -> anyhow::Result<Vec<AgentDiscoveryInfo>> {
-    let runtime = if config.agent_runtime.enabled {
-        AgentRuntime::with_local_configs(
-            config.opencode.clone(),
-            config.deepseek.clone(),
-            config.t3.clone(),
-            crate::agents::runtime::LocalAgentConfigs {
-                codex: config.codex.clone(),
-                fx: config.fx.clone(),
-                qoder: config.qoder.clone(),
-                antigravity: config.antigravity.clone(),
-                cursor: config.cursor.clone(),
-                pi: config.pi.clone(),
-                claude: config.claude.clone(),
-            },
-            Some(state_dir()?),
-        )
+    let state_directory = if config.agent_runtime.enabled {
+        Some(state_dir()?)
     } else {
-        AgentRuntime::disabled()
+        None
     };
+    let runtime = crate::agents::compose::build_runtime(
+        crate::agents::compose::RuntimeSettings::from_config(config),
+        config.agent_runtime.enabled,
+        state_directory,
+    );
     // The uncached probe: `discover_agents` gives up after a few seconds
     // and would report everything offline while a catalog is still loading.
     let mut agents = runtime.probe_agents().await.agents;
@@ -565,6 +562,10 @@ pub(crate) fn next_step(id: &str, status: &AgentAvailability) -> Option<&'static
         (Unconfigured, "cursor") => "check cursor.binary in config.json",
         (Offline | Unsupported, "cursor") => "check that `agent --version` runs on this host",
         (Disabled, "qoder") => "set `qoder.enabled` to true in config.json",
+        (Disabled, "copilot") => "set `copilot.enabled` to true in config.json",
+        (NotInstalled, "copilot") => "install GitHub Copilot CLI yourself, or set copilot.binary to its existing executable",
+        (Unconfigured, "copilot") => "check copilot.binary in config.json; configure Copilot authentication on this host yourself",
+        (Offline | Unsupported, "copilot") => "check Copilot CLI ACP support; sign in on this host if needed; failed prompts are never retried automatically",
         (NotInstalled, "qoder") => "install Qoder CLI yourself, set qoder.binary, or disable qoder.enabled",
         (Unconfigured, "qoder") => "check qoder.binary and configure Qoder CLI authentication on this host yourself",
         (Offline | Unsupported, "qoder") => "check Qoder CLI ACP support; failed prompts are never automatically retried",

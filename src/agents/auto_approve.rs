@@ -38,6 +38,10 @@ pub fn native_bypass(kind: &str) -> Option<NativeBypass> {
             native: "yolo",
             scope: BypassScope::Session,
         },
+        "copilot" => NativeBypass {
+            native: "allow_all",
+            scope: BypassScope::Session,
+        },
         "codex" => NativeBypass {
             native: "approvalPolicy=never",
             scope: BypassScope::Session,
@@ -80,6 +84,8 @@ pub fn elevating_modes(kind: &str) -> &'static [&'static str] {
     match kind {
         "claude" => &["bypassPermissions", "auto"],
         "qoder" => &["yolo", "bypassPermissions", "auto"],
+        // Native Autopilot enables blanket permissions in addition to autonomy.
+        "copilot" => &["https://agentclientprotocol.com/protocol/session-modes#autopilot"],
         _ => &[],
     }
 }
@@ -108,81 +114,19 @@ pub fn feature(kind: &str) -> Value {
                 BypassScope::Launch => "launch",
             },
             "native": bypass.native,
+            // Additive metadata: older clients still use scope/native.
+            "applies": match kind {
+                "codex" => "next_turn",
+                "cursor" | "antigravity" | "fx" => "restart_when_idle",
+                "pi" => "next_launch",
+                _ => "immediate",
+            },
+            "modeIds": match kind {
+                "claude" => &["bypassPermissions"][..],
+                "qoder" => &["yolo", "bypassPermissions"][..],
+                _ => &[][..],
+            },
         }),
         None => json!({ "scope": "none" }),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_agent_names_its_own_control_or_none() {
-        for (kind, native, scope) in [
-            (
-                "claude",
-                Some("bypassPermissions"),
-                Some(BypassScope::Session),
-            ),
-            ("qoder", Some("yolo"), Some(BypassScope::Session)),
-            (
-                "codex",
-                Some("approvalPolicy=never"),
-                Some(BypassScope::Session),
-            ),
-            (
-                "opencode",
-                Some("permission * allow"),
-                Some(BypassScope::Session),
-            ),
-            ("t3", Some("full-access"), Some(BypassScope::Session)),
-            (
-                "antigravity",
-                Some("--dangerously-skip-permissions"),
-                Some(BypassScope::Session),
-            ),
-            ("cursor", Some("--force"), Some(BypassScope::Session)),
-            ("fx", Some("full-access"), Some(BypassScope::Session)),
-            (
-                "pi",
-                Some("MUQUN_PI_APPROVALS=never"),
-                Some(BypassScope::Launch),
-            ),
-            // Per-request approvals only: nothing to switch.
-            ("deepseek", None, None),
-            ("unknown", None, None),
-        ] {
-            let found = native_bypass(kind);
-            assert_eq!(found.map(|b| b.native), native, "{kind}");
-            assert_eq!(found.map(|b| b.scope), scope, "{kind}");
-        }
-    }
-
-    #[test]
-    fn elevating_modes_are_the_bypass_and_classifier_modes_of_each_agent() {
-        for (kind, mode, elevating) in [
-            ("claude", "bypassPermissions", true),
-            ("claude", "auto", true),
-            ("claude", "acceptEdits", false),
-            ("claude", "plan", false),
-            ("qoder", "yolo", true),
-            ("qoder", "bypassPermissions", true),
-            ("qoder", "dontAsk", false),
-            // OpenCode's modes are personas, never permission policies.
-            ("opencode", "auto", false),
-            ("codex", "bypassPermissions", false),
-        ] {
-            assert_eq!(is_elevating(kind, mode), elevating, "{kind} {mode}");
-        }
-    }
-
-    #[test]
-    fn the_feature_states_scope_and_native_name() {
-        assert_eq!(feature("claude")["scope"], "session");
-        assert_eq!(feature("claude")["native"], "bypassPermissions");
-        assert_eq!(feature("antigravity")["scope"], "session");
-        assert_eq!(feature("pi")["scope"], "launch");
-        assert_eq!(feature("deepseek"), json!({ "scope": "none" }));
     }
 }

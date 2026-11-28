@@ -23,12 +23,14 @@ set -eu
 REPO="osuki-dev/muqun-gateway"
 channel=stable
 bootstrap=0
-case "$#" in
-  0) ;;
-  2) [ "$1" = --channel ] || { echo 'Usage: install.sh [--channel stable|preview]' >&2; exit 1; }
-     channel="$2" ;;
-  *) echo 'Usage: install.sh [--channel stable|preview]' >&2; exit 1 ;;
-esac
+desktop_terminal=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --channel) [ "$#" -ge 2 ] || { echo 'Missing channel.' >&2; exit 1; }; channel="$2"; shift 2 ;;
+    --desktop-terminal) desktop_terminal=1; shift ;;
+    *) echo 'Usage: install.sh [--channel stable|preview] [--desktop-terminal]' >&2; exit 1 ;;
+  esac
+done
 case "$channel" in stable|preview) ;; *) echo 'Channel must be stable or preview.' >&2; exit 1 ;; esac
 MIN_HERDR_VERSION="0.7.5"
 # Where the standalone (non-Herdr) binary lands. Overridable for anyone who
@@ -119,14 +121,16 @@ command -v herdr >/dev/null 2>&1 && have_herdr=1
 have_tmux=0
 command -v tmux >/dev/null 2>&1 && have_tmux=1
 
-if [ "$have_herdr" = 0 ] && [ "$have_tmux" = 0 ]; then
+if [ "$have_herdr" = 0 ] && [ "$have_tmux" = 0 ] && [ "$desktop_terminal" = 0 ]; then
   die "Neither Herdr (https://herdr.dev) nor tmux was found. Install one of them, then retry."
 fi
 
 # All detected backends use one standalone gateway, including Herdr-only hosts.
 # A plugin-owned gateway cannot start Herdr after reboot: it depends on Herdr
 # already running. Existing plugin pairings are imported below.
-if [ "$have_tmux" = 1 ]; then
+if [ "$have_herdr" = 0 ] && [ "$have_tmux" = 0 ]; then
+  setup_backend=desktop
+elif [ "$have_tmux" = 1 ]; then
   setup_backend=tmux
 else
   setup_backend=herdr
@@ -221,6 +225,35 @@ fi
 umask 077
 staging="$(mktemp -d "$INSTALL_DIR/.muqun-gateway-install.XXXXXX")" || die "Cannot create private staging directory."
 
+# GUI bootstrap reads these fixed records from stderr; stage labels and
+# diagnostics on the normal CLI remain independent of the machine protocol.
+gui_progress() {
+  if [ "${MUQUN_INSTALL_PROGRESS:-}" = 1 ]; then
+    printf 'MUQUN_PROGRESS %s\n' "$1" >&2
+  fi
+}
+
+download_sample() {
+  received=0
+  if [ -f "$output" ]; then received=$(wc -c < "$output"); fi
+  # curl may follow redirects. Only the final successful response can name
+  # the download size. Missing/chunked lengths are reported as zero.
+  total=$(LC_ALL=C awk -v cap="$max_bytes" '
+    /^HTTP\// {ok=($2 == 200); size=0; chunked=0}
+    ok && tolower($1) == "content-length:" {
+      sub(/\r$/, "", $2)
+      if ($2 ~ /^[0-9]+$/ && $2+0 <= cap) size=$2+0
+    }
+    ok && tolower($1) == "transfer-encoding:" && tolower($0) ~ /chunked/ {chunked=1}
+    END {printf "%.0f", chunked ? 0 : size+0}
+  ' "$headers")
+  sample="download $((received + 0)) $total"
+  if [ "$sample" != "$last_sample" ]; then
+    gui_progress "$sample"
+    last_sample=$sample
+  fi
+}
+
 download() (
   # curl versions before 8.4 only enforce --max-filesize for known lengths.
   # The file-size limit also bounds chunked writes. Its unit is the shell's:
@@ -230,89 +263,62 @@ download() (
   ulimit -c 0 || exit 1
   ulimit -f "$((($3 + 511) / 512))" || exit 1
   url="$1" output="$2" max_bytes="$3"
+  report=${4:-}
   set -- -fsSL
   if [ "$color" = 1 ] && [ -t 2 ]; then
     # curl reports measured bytes/known Content-Length, never a simulated %.
     # Let curl size its own progress display to the terminal.
     set -- -fSL --progress-bar
   fi
-  curl "$@" --proto '=https' --proto-redir '=https' --connect-timeout 10 \
-    --max-time 120 --max-filesize "$max_bytes" "$url" -o "$output" || exit 1
+  set -- "$@" --proto '=https' --proto-redir '=https' --connect-timeout 10 \
+    --max-time 120 --max-filesize "$max_bytes" "$url" -o "$output"
+  if [ "$report" = binary ] && [ "${MUQUN_INSTALL_PROGRESS:-}" = 1 ]; then
+    headers="$staging/download-headers"
+    : > "$headers"
+    last_sample=
+    download_sample
+    curl --dump-header "$headers" "$@" &
+    transfer=$!
+    trap 'kill "$transfer" 2>/dev/null || :; wait "$transfer" 2>/dev/null || :; exit 1' HUP INT TERM
+    while kill -0 "$transfer" 2>/dev/null; do
+      download_sample
+      sleep 0.25
+    done
+    wait "$transfer" || exit 1
+    trap - HUP INT TERM
+    download_sample
+  else
+    curl "$@" || exit 1
+  fi
   [ "$(wc -c < "$output")" -le "$max_bytes" ]
 )
 
-# Preview JSON parsing is an explicit prerequisite only for a fresh preview install.
-if [ "$channel" = preview ]; then
-  command -v python3 >/dev/null 2>&1 || die "Python 3 is required to resolve preview releases safely; nothing installed."
-  page=1
-  while :; do
-    download "https://api.github.com/repos/$REPO/releases?per_page=100&page=$page" "$staging/releases-$page.json" 1048576 || die "Cannot fetch preview metadata; nothing installed."
-    count="$(python3 -I -c 'import json,sys; a=json.load(open(sys.argv[1])); sys.exit("Invalid preview page") if not isinstance(a,list) or len(a)>100 else print(len(a))' "$staging/releases-$page.json")" || die "Invalid preview metadata."
-    [ "$count" -eq 100 ] || break
-    [ "$page" -lt 10 ] || die "Preview listing exceeds the 1000-release search bound; nothing installed."
-    page=$((page + 1))
-  done
-  tag="$(python3 -I - "$staging" "$REPO" <<'PY'
-import glob, json, re, sys
-targets = ['aarch64-apple-darwin', 'x86_64-apple-darwin',
-           'x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl']
-pattern = re.compile(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-preview\.(0|[1-9][0-9]*)', re.ASCII)
-candidates = []
-for path in glob.glob(sys.argv[1] + '/releases-*.json'):
-    for release in json.load(open(path)):
-        if not isinstance(release, dict):
-            sys.exit('Invalid release metadata')
-        tag = release.get('tag_name', '')
-        match = pattern.fullmatch(tag) if isinstance(tag, str) else None
-        if not match or release.get('draft') is not False or release.get('prerelease') is not True:
-            continue
-        version = tuple(map(int, match.groups()))
-        if any(n > 18446744073709551615 for n in version):
-            continue
-        assets = release.get('assets', [])
-        if not isinstance(assets, list) or not all(isinstance(a, dict) for a in assets):
-            continue
-        valid = True
-        for target in targets:
-            name = 'muqun-gateway-' + target
-            for asset_name, limit in [(name, 268435456), (name + '.sha256', 1024)]:
-                found = [a for a in assets if a.get('name') == asset_name]
-                if len(found) != 1:
-                    valid = False
-                    continue
-                asset = found[0]
-                size = asset.get('size')
-                expected = 'https://github.com/' + sys.argv[2] + '/releases/download/' + tag + '/' + asset_name
-                if (type(size) is not int or not 0 < size <= limit or
-                    asset.get('state') != 'uploaded' or asset.get('browser_download_url') != expected):
-                    valid = False
-        if valid:
-            candidates.append((version, tag))
-if not candidates:
-    sys.exit('No complete official preview release found')
-print(max(candidates)[1])
-PY
-  )" || die "Cannot resolve a complete preview release; nothing installed."
-else
-# Resolve latest once by its HTTPS redirect, then pin both assets to that tag.
-# HEAD avoids downloading the release page or needing a JSON parser dependency.
-release_url="$(curl -fsSLI --proto '=https' --proto-redir '=https' \
-  --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
-  -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest")" || die "Cannot resolve the latest stable release."
-tag="${release_url#https://github.com/$REPO/releases/tag/}"
-case "$tag" in
-  *[!v0-9.]*) die "Latest release did not resolve to a stable vX.Y.Z tag." ;;
-esac
-if [ "$tag" = "$release_url" ] ||
-   ! printf '%s\n' "$tag" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
-  die "Latest release did not resolve to a stable vX.Y.Z tag."
-fi
-fi
+# Resolve once, then fetch both objects from this immutable version. The
+# text endpoint exposes the same channel pointer as the JSON update API.
+api="https://muqun.dev/api/releases/gateway"
+download "$api/$channel/version" "$staging/channel-version" 256 || die "Cannot resolve the $channel Gateway release; nothing installed."
+version="$(LC_ALL=C awk -v channel="$channel" '
+  NR == 1 {
+    version = $0
+    number = "(0|[1-9][0-9]*)"
+    pattern = "^" number "[.]" number "[.]" number
+    if (channel == "preview") pattern = pattern "-preview[.][1-9][0-9]*"
+    if ($0 !~ (pattern "$")) exit 1
+    count = split($0, parts, /[.]|-preview[.]/)
+    for (i = 1; i <= count; i++) {
+      if (length(parts[i]) > 20 ||
+          (length(parts[i]) == 20 && ("v" parts[i]) > "v18446744073709551615")) exit 1
+    }
+  }
+  END { if (NR != 1) exit 1; print version }
+' "$staging/channel-version")" || die "Invalid $channel Gateway version; nothing installed."
+tag="v$version"
 stage_ok
 stage "Download binary and checksum"
 asset="muqun-gateway-$target"
-download_url="https://github.com/$REPO/releases/download/$tag/$asset"
-download "$download_url" "$staging/$asset" 268435456 || die "Binary download failed; nothing installed."
+download_url="$api/$tag/$asset"
+download "$download_url" "$staging/$asset" 268435456 binary || die "Binary download failed; nothing installed."
+gui_progress verify
 download "$download_url.sha256" "$staging/checksum" 1024 || die "Checksum download failed; nothing installed."
 stage_ok
 stage "Verify release identity"
@@ -330,7 +336,8 @@ else
   actual_hash="$(shasum -a 256 "$staging/$asset")" || die "Cannot hash downloaded binary."
 fi
 actual_hash="${actual_hash%% *}"
-[ "$actual_hash" = "$expected_hash" ] || die "SHA256 mismatch; nothing installed."
+[ "$actual_hash" = "$expected_hash" ] || die "$tag $asset SHA-256 mismatch (expected $expected_hash, got $actual_hash); nothing installed."
+info "$tag  $asset  SHA-256 verified: $actual_hash"
 # Mirror platform/update.rs: only native 64-bit little-endian ELF/Mach-O with
 # the expected CPU may reach --version. Read exactly the bounded header, not
 # file(1)'s descriptive output or an executable shell script.
@@ -353,9 +360,10 @@ chmod 755 "$staging/$asset"
 # Only this staged native image is probed, with no input, bounded output and
 # a five-second wall deadline. Reap both the probe and its watchdog on every
 # exit; never print untrusted version output or fall back to publication.
+probe_blocks=1
 probe_staged() {
 (
-  ulimit -c 0 && ulimit -f 1 || exit 1
+  ulimit -c 0 && ulimit -f "$probe_blocks" || exit 1
   exec "$staging/$asset" "$@"
 ) </dev/null > "$staging/version" 2>/dev/null &
 probe_pid=$!
@@ -380,6 +388,12 @@ awk -v expected="muqun-gateway ${tag#v}" '
   NR != 1 || $0 != expected { bad = 1 }
   END { exit (NR != 1 || bad) }
 ' "$staging/version" || die "Staged binary version does not match $tag; nothing installed."
+if [ "$setup_backend" = desktop ] && [ "$bootstrap" = 0 ]; then
+  probe_blocks=16
+  probe_staged setup --help &&
+    grep -Eq '^[[:space:]]*--desktop-terminal([[:space:]]|$)' "$staging/version" ||
+    die "Gateway $tag predates built-in Desktop terminal support. Install a newer Gateway release; nothing installed."
+fi
 stage_ok
 if [ "$bootstrap" = 1 ]; then
   stage "Run protected preview bootstrap"
@@ -395,6 +409,7 @@ if [ "$bootstrap" = 1 ]; then
   exit 0
 fi
 stage "Publish verified binary"
+gui_progress install
 # A concurrent installer must not clobber an image published since our check.
 # Hard-link publication refuses existing files; also refuse directory/symlink
 # destinations rather than letting ln interpret them as a target directory.
@@ -465,7 +480,11 @@ fi
 info "Configuring the $setup_backend backend..."
 # POSIX positional parameters preserve exact argument boundaries. Never build a
 # shell command string: socket paths may contain spaces, quotes or glob syntax.
-set -- setup --backend "$setup_backend"
+if [ "$setup_backend" = desktop ]; then
+  set -- setup --desktop-terminal
+else
+  set -- setup --backend "$setup_backend"
+fi
 if [ -n "${MUQUN_GATEWAY_PORT:-}" ]; then
   set -- "$@" --port "$MUQUN_GATEWAY_PORT"
 fi
@@ -500,36 +519,41 @@ elif [ "$have_tmux" = 1 ]; then
   [ -n "$tmux_id" ] && "$binary" backend default "$tmux_id" >/dev/null
 fi
 
-# Backend startup is separate from registering the gateway with the OS. An
-# empty answer or a noninteractive install preserves the existing preference.
-echo
-echo "Start configured terminal backends when the gateway starts?"
-echo "  Existing tmux/Herdr sessions are reused, never replaced."
-echo "  If stopped, tmux opens a detached shell and Herdr starts headless."
-echo "  Herdr may restore its saved workspace; no agent prompts or trust"
-echo "  approvals are submitted by the gateway."
-echo "  Default: keep your current settings (new installs: off)."
-if (exec 3< /dev/tty) 2>/dev/null; then
-  printf "Enable backend startup? [y/N] "
-  backend_answer=n
-  if read -r backend_answer < /dev/tty 2>/dev/null; then :; else backend_answer=n; fi
-  case "$backend_answer" in
-    y|Y|yes|YES|Yes)
-      "$binary" backend list | cut -f1 | while IFS= read -r backend_id; do
-        if ! "$binary" backend autostart "$backend_id" on; then
-          warn "Could not enable startup for $backend_id; it will need manual startup."
-        fi
-      done
-      ;;
-    *) info "Backend startup settings unchanged." ;;
-  esac
+if [ "$setup_backend" = desktop ]; then
+  info "Muqun Desktop starts its built-in terminal daemon. Gateway pairing and agent sessions are available independently."
 else
-  info "No terminal to ask on; backend startup settings unchanged."
+  # Backend startup is separate from registering the gateway with the OS. An
+  # empty answer or a noninteractive install preserves the existing preference.
+  echo
+  echo "Start configured terminal backends when the gateway starts?"
+  echo "  Existing tmux/Herdr sessions are reused, never replaced."
+  echo "  If stopped, tmux opens a detached shell and Herdr starts headless."
+  echo "  Herdr may restore its saved workspace; no agent prompts or trust"
+  echo "  approvals are submitted by the gateway."
+  echo "  Default: keep your current settings (new installs: off)."
+  if (exec 3< /dev/tty) 2>/dev/null; then
+    printf "Enable backend startup? [y/N] "
+    backend_answer=n
+    if read -r backend_answer < /dev/tty 2>/dev/null; then :; else backend_answer=n; fi
+    case "$backend_answer" in
+      y|Y|yes|YES|Yes)
+        "$binary" backend list | cut -f1 | while IFS= read -r backend_id; do
+          if ! "$binary" backend autostart "$backend_id" on; then
+            warn "Could not enable startup for $backend_id; it will need manual startup."
+          fi
+        done
+        ;;
+      *) info "Backend startup settings unchanged." ;;
+    esac
+  else
+    info "No terminal to ask on; backend startup settings unchanged."
+  fi
+  echo "  Change later: $binary backend autostart <backend-id> on|off"
 fi
-echo "  Change later: $binary backend autostart <backend-id> on|off"
 
 stage_ok
 stage "Start Gateway and ask autostart"
+gui_progress start
 if [ "$already_installed" = 1 ]; then
   # Refresh the unit as well as the binary, including child-process lifetime
   # rules that keep persistent terminals alive across gateway restarts.
@@ -654,9 +678,13 @@ if [ "$gateway_state" = running ]; then
 else
   echo "Gateway readiness: unconfirmed; check service status."
 fi
-echo "Backends configured:"
-"$binary" backend list | awk -F'\t' '{ printf "  %s %s (%s)\n", (NR == 1 ? "*" : " "), $1, $2 }'
-echo "(* default)"
+if [ "$setup_backend" = desktop ]; then
+  echo "Terminal backend: Muqun Terminal (provided by Desktop)."
+else
+  echo "Backends configured:"
+  "$binary" backend list | awk -F'\t' '{ printf "  %s %s (%s)\n", (NR == 1 ? "*" : " "), $1, $2 }'
+  echo "(* default)"
+fi
 echo
 echo "Open the pairing QR any time with:"
 echo "  $binary manage"

@@ -425,6 +425,7 @@ pub fn apply_tool_result(call: &mut ToolCall, result: &ToolResult, completed_ms:
         call.error = result.error.clone();
     }
     call.time.completed = Some(completed_ms);
+    crate::agents::message_images::tool_media::normalize_tool_call(call);
 }
 
 fn message_role(role: &str) -> TimelineRole {
@@ -537,6 +538,7 @@ fn map_content_blocks(
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         });
     }
     items
@@ -623,6 +625,7 @@ pub fn map_record(event: &Value) -> Vec<TimelineItem> {
                 attachments: None,
                 image_assets: None,
                 generation: None,
+                origin: None,
             }]
         }
         _ => Vec::new(),

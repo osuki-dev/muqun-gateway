@@ -17,7 +17,10 @@ use super::domain::{AgentSessionId, ModelRef, PermissionDecision, SessionQuery};
 use super::message_images;
 use super::ports::mirror::SessionMirrorPort;
 use crate::platform::git;
-use crate::platform::vcs_routes::{self, VcsDiscardBody, VcsFileQuery};
+use crate::platform::vcs_routes::{
+    self, VcsCheckoutBody, VcsCommitBody, VcsCommitsQuery, VcsDiscardBody, VcsFileQuery,
+    VcsPrsQuery, VcsStageBody, VcsSyncBody,
+};
 use crate::tasks::transcript::{for_session, hide_in_event, hide_in_inbox, hide_in_items};
 use crate::terminal::routes::git_error;
 use crate::{
@@ -247,12 +250,21 @@ impl SwitchModelBody {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct WarmAgentBody {
+    pub directory: Option<String>,
+    #[serde(default)]
+    pub auto_approve: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CreateAgentSessionBody {
     pub directory: Option<String>,
     pub model: Option<ModelRef>,
     pub mode: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
+    #[serde(default)]
+    pub auto_approve: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -362,6 +374,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             "/api/agents/{agent_id}/account-limits",
             get(get_account_limits),
         )
+        .route("/api/agents/{agent_id}/warm", post(warm_agent))
         .route(
             "/api/agent-sessions/{asid}/audio-asset",
             get(message_images::audio_asset),
@@ -404,6 +417,7 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             "/api/agents/{agent_id}/sessions/{asid}/prepare",
             post(prepare_agent_session_scoped),
         )
+        .route("/api/agent-attention", get(read_agent_attention))
         .route("/api/agent-sessions/{asid}/fork", post(fork_agent_session))
         .route(
             "/api/agents/{agent_id}/sessions/{asid}/fork",
@@ -572,6 +586,32 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
             post(discard_agent_vcs_file),
         )
         .route(
+            "/api/agent-sessions/{asid}/vcs/overview",
+            get(get_agent_vcs_overview),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/vcs/stage",
+            post(stage_agent_vcs_files),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/vcs/unstage",
+            post(unstage_agent_vcs_files),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/vcs/checkout",
+            post(checkout_agent_vcs),
+        )
+        .route(
+            "/api/agent-sessions/{asid}/vcs/commit",
+            post(commit_agent_vcs),
+        )
+        .route("/api/agent-sessions/{asid}/vcs/sync", post(sync_agent_vcs))
+        .route(
+            "/api/agent-sessions/{asid}/vcs/commits",
+            get(get_agent_vcs_commits),
+        )
+        .route("/api/agent-sessions/{asid}/vcs/prs", get(get_agent_vcs_prs))
+        .route(
             "/api/agent-sessions/{asid}/abort",
             post(interrupt_agent_session_global),
         )
@@ -681,16 +721,89 @@ pub fn mount(router: Router<AppState>) -> Router<AppState> {
 // Core implementation functions (pure OpenCode, zero herdr/tmux dependency)
 // ---------------------------------------------------------------------------
 
+fn validate_session_directory(directory: Option<&str>) -> ApiResult<Option<String>> {
+    let expanded = expand_directory_param(directory);
+    match expanded.as_deref() {
+        Some(dir) if !dir.trim().is_empty() => {
+            let p = std::path::Path::new(dir.trim());
+            if !p.is_absolute() {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_directory",
+                    "Working directory must be an absolute path",
+                ));
+            }
+            let canonical = std::fs::canonicalize(p).map_err(|e| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "directory_not_found",
+                    &format!("Directory does not exist or is inaccessible: {e}"),
+                )
+            })?;
+            if !canonical.is_dir() {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "not_a_directory",
+                    "Specified path is not a directory",
+                ));
+            }
+            Ok(Some(canonical.to_string_lossy().to_string()))
+        }
+        // The App shows `~/` for a session it opens without naming a folder,
+        // so that is the folder it gets. Left as `None`, OpenCode used its own
+        // cwd and DeepSeek Harness refused the relative "." outright.
+        _ => Ok(dirs::home_dir().map(|home| home.to_string_lossy().to_string())),
+    }
+}
+
+async fn warm_agent(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<WarmAgentBody>>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let body = body.map(|Json(b)| b).unwrap_or(WarmAgentBody {
+        directory: None,
+        auto_approve: None,
+    });
+    let manager = agent_manager_or_err(&state, &agent_id).await?;
+    let auto_approve = body.auto_approve == Some(true);
+    refuse_remote_elevation(&state, &headers, auto_approve)?;
+    let dir = validate_session_directory(body.directory.as_deref())?;
+    tokio::spawn(async move {
+        let _ = manager
+            .agent()
+            .warm_session(dir.as_deref(), auto_approve)
+            .await;
+    });
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Default, Deserialize)]
+struct AccountLimitsQuery {
+    #[serde(default)]
+    refresh: Option<String>,
+}
+
+impl AccountLimitsQuery {
+    fn force_refresh(&self) -> bool {
+        self.refresh
+            .as_deref()
+            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
+    }
+}
+
 async fn get_account_limits(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
+    Query(query): Query<AccountLimitsQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     require_device(&state, &headers)?;
     let manager = agent_manager_or_err(&state, &agent_id).await?;
     let snapshot = manager
-        .agent()
-        .account_limits()
+        .account_limits(query.force_refresh())
         .await
         .map_err(agent_error)?;
     let mut response = Json(snapshot).into_response();
@@ -745,6 +858,51 @@ async fn managers_for_read(
         ));
     }
     Ok(all_managers)
+}
+
+/// Device-authenticated, retained request metadata. Never starts an agent and
+/// never sends question bodies, command arguments, or transcript content.
+async fn read_agent_attention(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let managers = managers_for_read(&state, None).await?;
+    let mut pending = Vec::new();
+    for manager in managers {
+        pending.extend(manager.sessions().pending_snapshots().await);
+    }
+    Ok(Json(content_envelope(json!(pending))))
+}
+
+fn session_directory_is_missing(info: &crate::agents::domain::AgentSessionInfo) -> bool {
+    if matches!(
+        info.status,
+        crate::agents::domain::AgentSessionStatus::Busy
+            | crate::agents::domain::AgentSessionStatus::Retry
+    ) {
+        return false;
+    }
+    let Some(dir) = info
+        .directory
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    else {
+        return false;
+    };
+    let path = std::path::Path::new(dir);
+    path.is_absolute() && !path.is_dir()
+}
+
+fn drop_missing_directory_sessions(
+    sessions: &mut Vec<crate::agents::domain::AgentSessionInfo>,
+    explicit_directory: Option<&str>,
+) {
+    if cfg!(test) || explicit_directory.is_some() {
+        return;
+    }
+    sessions.retain(|s| !session_directory_is_missing(s));
 }
 
 async fn do_list_agent_sessions(
@@ -806,6 +964,10 @@ async fn do_list_agent_sessions(
         }
     }
 
+    // Hide dead sessions whose working directory no longer exists on disk
+    // (e.g. deleted temporary worktrees or /tmp folders that cannot spawn ACP).
+    drop_missing_directory_sessions(&mut sessions, query.directory.as_deref());
+
     // Sort newest first
     sessions.sort_by_key(|b| std::cmp::Reverse(b.updated_ms));
 
@@ -836,50 +998,22 @@ async fn do_create_agent_session(
     };
     refuse_remote_elevation(
         state,
-        body.mode.as_deref().is_some_and(|mode| {
-            crate::agents::auto_approve::is_elevating(manager.agent().kind(), mode)
-        }),
+        headers,
+        body.auto_approve == Some(true)
+            || body.mode.as_deref().is_some_and(|mode| {
+                crate::agents::auto_approve::is_elevating(manager.agent().kind(), mode)
+            }),
     )?;
 
-    let directory = expand_directory_param(body.directory.as_deref());
-    let validated_dir = match directory.as_deref() {
-        Some(dir) if !dir.trim().is_empty() => {
-            let p = std::path::Path::new(dir.trim());
-            if !p.is_absolute() {
-                return Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_directory",
-                    "Working directory must be an absolute path",
-                ));
-            }
-            let canonical = std::fs::canonicalize(p).map_err(|e| {
-                api_error(
-                    StatusCode::BAD_REQUEST,
-                    "directory_not_found",
-                    &format!("Directory does not exist or is inaccessible: {e}"),
-                )
-            })?;
-            if !canonical.is_dir() {
-                return Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    "not_a_directory",
-                    "Specified path is not a directory",
-                ));
-            }
-            Some(canonical.to_string_lossy().to_string())
-        }
-        // The App shows `~/` for a session it opens without naming a folder,
-        // so that is the folder it gets. Left as `None`, OpenCode used its own
-        // cwd and DeepSeek Harness refused the relative "." outright.
-        _ => dirs::home_dir().map(|home| home.to_string_lossy().to_string()),
-    };
+    let validated_dir = validate_session_directory(body.directory.as_deref())?;
 
     let session = manager
         .sessions()
-        .create_session(
+        .create_session_with_auto_approve(
             validated_dir.as_deref(),
             body.model.as_ref(),
             body.mode.as_deref(),
+            body.auto_approve == Some(true),
         )
         .await
         .map_err(|e| api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()))?;
@@ -952,7 +1086,9 @@ async fn socket_read_agent_session(
     }
     message_images::attach_to_items(state, asid, directory.as_deref(), &mut snapshot.timeline)
         .await;
+    dedupe_redundant_tool_content(&mut snapshot.timeline);
     message_images::attach_to_inbox(state, asid, &mut snapshot.inbox).await;
+    state.preview_cache.maybe_save(&state.db, &snapshot);
 
     // A session the reader is sitting on is polled and mostly unchanged; the
     // whole snapshot is the expensive thing to send twice.
@@ -963,18 +1099,29 @@ async fn socket_read_agent_session(
 /// exact HTTP projection, including hidden internal rows and image attachment.
 pub(crate) async fn socket_history(
     state: &AppState,
-    asid: &str,
-    operation: &str,
-    refresh: bool,
-    after: u64,
-    cursor: Option<&str>,
+    request: &super::ws_routes::HistoryRequest,
 ) -> ApiResult<Json<Value>> {
-    match operation {
-        "window" => socket_history_window(state, asid, cursor, refresh).await,
+    let asid = &request.asid;
+    let cursor = request.cursor.as_deref();
+    match request.operation.as_str() {
+        "window" => {
+            read_history_window(
+                state,
+                asid,
+                HistoryWindowQuery {
+                    cursor: request.cursor.clone(),
+                    refresh: request.refresh,
+                    retained: request.retained,
+                    limit: request.limit,
+                    if_seq: request.if_seq,
+                },
+            )
+            .await
+        }
         "page" => socket_history_page(state, asid, cursor).await,
-        "snapshot" => socket_read_agent_session(state, asid, refresh).await,
+        "snapshot" => socket_read_agent_session(state, asid, request.refresh).await,
         "earlier" => socket_load_earlier_timeline(state, asid).await,
-        "delta" => socket_get_agent_session_timeline(state, asid, after).await,
+        "delta" => socket_get_agent_session_timeline(state, asid, request.after).await,
         _ => Err(api_error(
             StatusCode::BAD_REQUEST,
             "invalid_operation",
@@ -985,9 +1132,15 @@ pub(crate) async fn socket_history(
 
 #[derive(Default, Deserialize)]
 struct HistoryWindowQuery {
+    limit: Option<usize>,
+    if_seq: Option<u64>,
     cursor: Option<String>,
     #[serde(default)]
     refresh: bool,
+    /// Answer only from what the mirror already holds: never read the agent,
+    /// never start or wake it.
+    #[serde(default)]
+    retained: bool,
 }
 
 async fn history_window_global(
@@ -997,7 +1150,36 @@ async fn history_window_global(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    socket_history_window(&state, &asid, query.cursor.as_deref(), query.refresh).await
+    read_history_window(&state, &asid, query).await
+}
+
+async fn read_history_window(
+    state: &AppState,
+    asid: &str,
+    query: HistoryWindowQuery,
+) -> ApiResult<Json<Value>> {
+    use super::adapters::memory_mirror::history_window::WINDOW_ROWS;
+    let limit = query.limit.unwrap_or(WINDOW_ROWS);
+    if !(1..=WINDOW_ROWS).contains(&limit) || (query.if_seq.is_some() && query.cursor.is_none()) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_window",
+            "Use a limit from 1 to 100 and a cursor with if_seq",
+        ));
+    }
+    if query.retained {
+        return retained_history_window(state, asid, query.cursor.as_deref(), limit, query.if_seq)
+            .await;
+    }
+    socket_history_window(
+        state,
+        asid,
+        query.cursor.as_deref(),
+        query.refresh,
+        limit,
+        query.if_seq,
+    )
+    .await
 }
 
 async fn history_page_global(
@@ -1026,6 +1208,8 @@ async fn socket_history_window(
     asid: &str,
     cursor: Option<&str>,
     refresh: bool,
+    limit: usize,
+    if_seq: Option<u64>,
 ) -> ApiResult<Json<Value>> {
     validate_history_cursor(cursor)?;
     let manager = session_manager_or_err(state, asid).await?;
@@ -1034,26 +1218,108 @@ async fn socket_history_window(
         // snapshot; otherwise opening a bounded window would hide history.
         return socket_read_agent_session(state, asid, refresh).await;
     }
-    let mut window = manager
+    let window = manager
         .sessions()
-        .history_window(&AgentSessionId(asid.to_owned()), cursor, refresh)
+        .history_window(
+            &AgentSessionId(asid.to_owned()),
+            cursor,
+            refresh,
+            limit,
+            if_seq,
+        )
         .await
         .map_err(agent_error)?;
+    state.preview_cache.maybe_save(&state.db, &window.snapshot);
+    project_history_window(state, asid, window).await
+}
+
+/// A peek at what the Gateway already retains for a session. A session the
+/// mirror has no history for is `404 not_retained`; answering it must not
+/// start the agent or read its transcript.
+async fn retained_history_window(
+    state: &AppState,
+    asid: &str,
+    cursor: Option<&str>,
+    limit: usize,
+    if_seq: Option<u64>,
+) -> ApiResult<Json<Value>> {
+    validate_history_cursor(cursor)?;
+    let not_retained = || {
+        api_error(
+            StatusCode::NOT_FOUND,
+            "not_retained",
+            "The Gateway holds no history for this session",
+        )
+    };
+    let session_id = AgentSessionId(asid.to_owned());
+    let window = if let Some(manager) = state.agent_runtime.retained_manager(asid).await {
+        let pageable = manager.agent().supports_earlier_timeline();
+        let limit = if pageable { limit } else { usize::MAX };
+        match manager
+            .sessions()
+            .retained_window(&session_id, cursor, limit, if_seq)
+            .await
+            .map_err(agent_error)?
+        {
+            Some(mut window) => {
+                if !pageable {
+                    window.history_cursor = None;
+                }
+                window
+            }
+            None if cursor.is_none() => {
+                let snapshot = match state.preview_cache.load(&state.db, asid).await {
+                    Some(snapshot) => snapshot,
+                    None => manager
+                        .sessions()
+                        .preview_snapshot(&session_id)
+                        .await
+                        .ok_or_else(not_retained)?,
+                };
+                super::adapters::memory_mirror::history_window::HistoryWindow {
+                    snapshot,
+                    history_cursor: None,
+                    unchanged: false,
+                }
+            }
+            None => return Err(not_retained()),
+        }
+    } else if cursor.is_none() {
+        let snapshot = state
+            .preview_cache
+            .load(&state.db, asid)
+            .await
+            .ok_or_else(not_retained)?;
+        super::adapters::memory_mirror::history_window::HistoryWindow {
+            snapshot,
+            history_cursor: None,
+            unchanged: false,
+        }
+    } else {
+        return Err(not_retained());
+    };
+    project_history_window(state, asid, window).await
+}
+
+async fn project_history_window(
+    state: &AppState,
+    asid: &str,
+    mut window: super::adapters::memory_mirror::history_window::HistoryWindow,
+) -> ApiResult<Json<Value>> {
     let snapshot = &mut window.snapshot;
     let plumbing = for_session(state, asid).await;
     hide_in_items(&mut snapshot.timeline, plumbing);
     if plumbing.task {
         hide_in_inbox(&mut snapshot.inbox);
     }
-    message_images::attach_to_items(
-        state,
-        asid,
-        snapshot.info.directory.as_deref(),
-        &mut snapshot.timeline,
-    )
-    .await;
-    message_images::attach_to_inbox(state, asid, &mut snapshot.inbox).await;
-    Ok(Json(content_envelope(json!(window))))
+    message_images::attach_window(state, asid, snapshot).await;
+    dedupe_redundant_tool_content(&mut snapshot.timeline);
+    let mut data = json!(window);
+    if window.unchanged {
+        data.as_object_mut().unwrap().remove("timeline");
+        data["unchanged"] = json!(true);
+    }
+    Ok(Json(content_envelope(data)))
 }
 
 async fn socket_history_page(
@@ -1077,7 +1343,48 @@ async fn socket_history_page(
         .map_err(agent_error)?;
     hide_in_items(&mut page.items, for_session(state, asid).await);
     message_images::attach_to_items(state, asid, None, &mut page.items).await;
+    dedupe_redundant_tool_content(&mut page.items);
     Ok(Json(content_envelope(json!(page))))
+}
+
+/// Drop `ToolCall.content` on the wire when it is an exact pure-text duplicate
+/// of `ToolCall.output`. Any content array carrying files, images, diffs, or
+/// non-text structured blocks is preserved verbatim.
+fn dedupe_redundant_tool_content(items: &mut [super::domain::TimelineItem]) {
+    for item in items {
+        let super::domain::AgentPart::Tool(call) = &mut item.part else {
+            continue;
+        };
+        let (Some(Value::String(output)), Some(Value::Array(blocks))) =
+            (&call.output, &call.content)
+        else {
+            continue;
+        };
+        let pure_text = !blocks.is_empty()
+            && blocks.iter().all(|block| match block {
+                Value::String(_) => true,
+                Value::Object(map) => {
+                    map.get("type").and_then(Value::as_str) == Some("text")
+                        && map.get("text").and_then(Value::as_str).is_some()
+                        && map.len() <= 2
+                }
+                _ => false,
+            });
+        if !pure_text {
+            continue;
+        }
+        let flattened: Vec<&str> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                Value::String(s) => Some(s.as_str()),
+                Value::Object(map) => map.get("text").and_then(Value::as_str),
+                _ => None,
+            })
+            .collect();
+        if flattened.join("\n") == *output {
+            call.content = None;
+        }
+    }
 }
 
 async fn do_get_agent_session_events(
@@ -1199,6 +1506,7 @@ async fn do_switch_mode(
     let manager = session_manager_or_err(state, asid).await?;
     refuse_remote_elevation(
         state,
+        headers,
         crate::agents::auto_approve::is_elevating(manager.agent().kind(), mode),
     )?;
 
@@ -1212,8 +1520,8 @@ async fn do_switch_mode(
     Ok(Json(content_envelope(json!({ "ok": true }))))
 }
 
-/// `{enabled, native}`: whether the session runs in the agent's own bypass
-/// mode, and that mode's native name. A bypass is never remembered as a
+/// `{enabled, native}`: the agent's own session permission bypass setting
+/// and its native name. A bypass is never remembered as a
 /// session default (`session_defaults::ELEVATING_MODES`).
 async fn auto_approve_state(
     manager: &super::manager::AgentManager,
@@ -1249,7 +1557,7 @@ async fn do_set_auto_approve(
     headers: &HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_device(state, headers)?;
-    refuse_remote_elevation(state, enabled)?;
+    refuse_remote_elevation(state, headers, enabled)?;
     let manager = session_manager_or_err(state, asid).await?;
     manager
         .agent()
@@ -1260,12 +1568,20 @@ async fn do_set_auto_approve(
 }
 
 /// Putting an agent into a mode where it stops asking is the owner's
-/// choice, made in config.json on this computer, never from a device.
+/// choice, made in config.json on this computer or through the local desktop app
+/// authenticated via `local-client.json`, never from a remote device.
 /// Every route that can select such a mode -- the auto-approve switch, the
 /// mode route and session creation -- passes its request through here;
 /// leaving such a mode is never refused.
-fn refuse_remote_elevation(state: &AppState, elevating: bool) -> ApiResult<()> {
-    if elevating && !state.config.allow_remote_auto_approve {
+fn refuse_remote_elevation(
+    state: &AppState,
+    headers: &HeaderMap,
+    elevating: bool,
+) -> ApiResult<()> {
+    if elevating
+        && !state.config.allow_remote_auto_approve
+        && crate::platform::local_client::caller(headers).is_none()
+    {
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "auto_approve_disabled",
@@ -1327,28 +1643,58 @@ async fn do_find_agent_files(
     let directory = directory.as_deref();
     require_directory(directory)?;
 
-    let files = manager
-        .agent()
-        .find_files(query, limit, directory)
-        .await
-        .map_err(agent_error)?;
+    let agent_files = match manager.agent().find_files(query, limit, directory).await {
+        Ok(files) => Some(files),
+        Err(crate::agents::ports::AgentError::Unsupported(_)) => None,
+        Err(err) => return Err(agent_error(err)),
+    };
 
-    let hits: Vec<Value> = files
-        .iter()
-        .filter_map(|f| {
-            let path = f.get("path").and_then(Value::as_str)?;
-            let name = std::path::Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(path);
-            let kind = f.get("type").and_then(Value::as_str).unwrap_or("file");
-            Some(json!({
-                "path": path,
-                "name": name,
-                "kind": kind,
-            }))
-        })
-        .collect();
+    let hits: Vec<Value> = if let Some(files) = agent_files {
+        files
+            .iter()
+            .filter_map(|f| {
+                let path = f.get("path").and_then(Value::as_str)?;
+                let name = std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(path);
+                let kind = f.get("type").and_then(Value::as_str).unwrap_or("file");
+                Some(json!({
+                    "path": path,
+                    "name": name,
+                    "kind": kind,
+                }))
+            })
+            .collect()
+    } else if let Some(dir) = directory {
+        let root = std::path::PathBuf::from(dir);
+        let canonical = std::fs::canonicalize(&root).ok();
+        let scannable = canonical
+            .as_deref()
+            .is_some_and(crate::platform::assets::is_scannable_root);
+        if scannable {
+            let root = canonical.unwrap_or(root);
+            let needle = query.to_string();
+            tokio::task::spawn_blocking(move || {
+                crate::composer::search_files(&root, &needle, limit)
+            })
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|hit| {
+                json!({
+                    "path": hit.path,
+                    "name": hit.name,
+                    "kind": hit.kind,
+                })
+            })
+            .collect()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
 
     Ok(Json(content_envelope(json!(hits))))
 }
@@ -1359,7 +1705,12 @@ async fn do_send_agent_prompt(
     body: SendAgentPromptBody,
     headers: &HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    require_device(state, headers)?;
+    // The same gate as `require_device`, keeping the caller so the sent
+    // message can say which device it came from.
+    let caller = crate::platform::http::require_device_or_peer(state, headers)?;
+    if caller.kind == crate::DeviceKind::Gateway {
+        return Err(crate::platform::http::peer_forbidden());
+    }
 
     let manager = session_manager_or_err(state, asid).await?;
 
@@ -1402,10 +1753,15 @@ async fn do_send_agent_prompt(
         body.text.clone()
     };
     let attachments = body.attachments.as_deref().unwrap_or(&[]);
-    manager
+    let session_id = AgentSessionId(asid.to_string());
+    let held_since = manager
+        .mirror()
+        .held_prompt_boundary(&session_id, body.delivery.as_deref())
+        .await;
+    let native_message_id = manager
         .prompts()
-        .send_prompt_with_display(
-            &AgentSessionId(asid.to_string()),
+        .send_with_receipt(
+            &session_id,
             &text,
             &body.text,
             attachments,
@@ -1418,6 +1774,23 @@ async fn do_send_agent_prompt(
             | super::ports::agent::AgentError::OpenRequired(_) => agent_error(e),
             _ => api_error(StatusCode::BAD_GATEWAY, "agent_error", &e.to_string()),
         })?;
+
+    // The prompt is already with the agent: showing who sent it is best effort
+    // and never turns an accepted prompt into an error.
+    let origin = super::domain::MessageOrigin {
+        device_id: caller.device_id,
+        name: caller.name,
+    };
+    manager
+        .mirror()
+        .present_user_prompt(
+            &session_id,
+            &body.text,
+            origin,
+            native_message_id.as_deref(),
+            held_since,
+        )
+        .await;
 
     let mut accepted = json!({ "submitted": true });
     if let Some(client_ref) = body.client_ref {
@@ -1709,6 +2082,93 @@ async fn discard_agent_vcs_file(
         "discarded an agent session change"
     );
     Ok(answer)
+}
+
+async fn get_agent_vcs_overview(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    vcs_routes::overview(toplevel.as_deref()).await
+}
+
+async fn stage_agent_vcs_files(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<VcsStageBody>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    vcs_routes::stage(toplevel.as_deref(), &body).await
+}
+
+async fn unstage_agent_vcs_files(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<VcsStageBody>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    vcs_routes::unstage(toplevel.as_deref(), &body).await
+}
+
+async fn checkout_agent_vcs(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<VcsCheckoutBody>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    vcs_routes::checkout(toplevel.as_deref(), &body).await
+}
+
+async fn commit_agent_vcs(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<VcsCommitBody>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    vcs_routes::commit(toplevel.as_deref(), &body).await
+}
+
+async fn sync_agent_vcs(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<VcsSyncBody>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    vcs_routes::sync(toplevel.as_deref(), &body).await
+}
+
+async fn get_agent_vcs_commits(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    Query(query): Query<VcsCommitsQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    vcs_routes::commits(toplevel.as_deref(), &query).await
+}
+
+async fn get_agent_vcs_prs(
+    State(state): State<AppState>,
+    Path(asid): Path<String>,
+    Query(query): Query<VcsPrsQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let toplevel = agent_session_checkout(&state, &asid).await?;
+    vcs_routes::prs(toplevel.as_deref(), &query).await
 }
 
 /// Whether a catalog is one a client should be allowed to keep.
@@ -2155,11 +2615,12 @@ async fn list_agent_sessions_page(
     })?;
     let session_query = query.to_page_query()?;
     let manager = agent_manager_or_err(&state, query.agent_id.as_deref().unwrap()).await?;
-    let page = manager
+    let mut page = manager
         .sessions()
         .list_sessions_page(&session_query)
         .await
         .map_err(agent_error)?;
+    drop_missing_directory_sessions(&mut page.data, query.directory.as_deref());
     for session in &page.data {
         state
             .agent_runtime
@@ -2784,12 +3245,21 @@ async fn do_list_agent_session_descendants(
         let mut next = Vec::new();
         for parent in &frontier {
             session_query.parent_id = Some(parent.clone());
-            for manager in &all_managers {
-                let list = match manager.sessions().list_sessions(&session_query).await {
+            let q = session_query.clone();
+            let results = futures::future::join_all(all_managers.iter().map(|manager| {
+                let q = q.clone();
+                async move {
+                    let res = manager.sessions().list_sessions(&q).await;
+                    (manager.agent().kind(), res)
+                }
+            }))
+            .await;
+            for (kind, res) in results {
+                let list = match res {
                     Ok(list) => list,
                     Err(e) => {
                         tracing::warn!(
-                            agent_id = manager.agent().kind(),
+                            agent_id = kind,
                             error = %e,
                             "agent children list failed; skipping this agent"
                         );
@@ -2808,7 +3278,7 @@ async fn do_list_agent_session_descendants(
                     }
                     state
                         .agent_runtime
-                        .record_session_route(&session.asid.0, manager.agent().kind())
+                        .record_session_route(&session.asid.0, kind)
                         .await;
                     next.push(session.asid.0.clone());
                     sessions.push(session);
@@ -2962,6 +3432,7 @@ async fn do_delete_agent_session(
         .mirror()
         .remove_session(&AgentSessionId(asid.to_owned()))
         .await;
+    state.preview_cache.delete(&state.db, asid).await;
     // A deleted session can no longer be resumed, so it stops withholding the
     // agent's runtime credential (see `store_sqlite::RuntimeBlock`).
     let (kind, gone) = (manager.agent().kind().to_owned(), asid.to_owned());
@@ -3140,14 +3611,12 @@ async fn list_saved_agent_permissions(
     let manager = session_manager_or_err!(&state, &headers, &asid);
     let agent = manager.agent();
     let project_id = session_project_id(agent.as_ref(), &asid).await?;
+    // OpenCode's driver already renames into snake_case; remapping here would
+    // look for `projectID` again and blank `project_id`.
     let items = agent
         .list_saved_permissions(Some(&project_id))
         .await
         .map_err(agent_error)?;
-    let items: Vec<Value> = items
-        .iter()
-        .filter_map(super::adapters::opencode::mapper::map_saved_permission)
-        .collect();
     Ok(Json(content_envelope(json!({ "items": items }))))
 }
 
@@ -4237,6 +4706,10 @@ mod tests {
                 "device_repair_required",
             ),
         ] {
+            let attention_refusal = read_agent_attention(State(state.clone()), headers.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(attention_refusal.0, status);
             let edit_refusal = edit_agent_inbox_item(
                 State(state.clone()),
                 Path(("fixture".into(), "queued".into())),
@@ -4252,10 +4725,14 @@ mod tests {
                 crate::test_support::error_body(&edit_refusal)["error"]["code"],
                 code
             );
-            let limits_refusal =
-                get_account_limits(State(state.clone()), Path("codex".into()), headers.clone())
-                    .await
-                    .unwrap_err();
+            let limits_refusal = get_account_limits(
+                State(state.clone()),
+                Path("codex".into()),
+                Query(AccountLimitsQuery::default()),
+                headers.clone(),
+            )
+            .await
+            .unwrap_err();
             assert_eq!(limits_refusal.0, status);
             for selected in [None, Some("fx")] {
                 let refusal = do_prepare_agent_session(&state, "fixture", selected, &headers)
@@ -4310,6 +4787,43 @@ mod tests {
                 .is_err()
         );
         assert_eq!(log.lock().unwrap().len(), observed + 1);
+    }
+
+    #[tokio::test]
+    async fn attention_reads_retained_request_ids_without_preparing_or_exposing_request_content() {
+        use crate::agents::ports::SessionMirrorPort;
+        let mut agent = FakeAgent::new("opencode").with_sessions(&[("conversation", 1)]);
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        agent.preparation_log = Some(log.clone());
+        let state = state_with(vec![agent]).await;
+        let manager = state.agent_runtime.all_managers().await.remove(0);
+        let asid = AgentSessionId("conversation".into());
+        manager
+            .mirror()
+            .add_form(crate::agents::FormRequest {
+                id: "form-one".into(),
+                asid: asid.clone(),
+                title: "private prompt".into(),
+                fields: vec![],
+                nonblocking: false,
+            })
+            .await;
+        let Json(response) = read_agent_attention(State(state.clone()), device_headers())
+            .await
+            .unwrap();
+        assert_eq!(response["data"][0]["form_ids"], json!(["form-one"]));
+        assert!(response["data"][0].get("timeline").is_none());
+        assert!(response["data"][0].get("forms").is_none());
+        assert!(log.lock().unwrap().is_empty());
+        manager.mirror().resolve_form(&asid, "form-one").await;
+        let Json(resolved) = read_agent_attention(State(state), device_headers())
+            .await
+            .unwrap();
+        assert_eq!(resolved["data"][0]["form_ids"], json!([]));
+        assert!(
+            resolved["data"][0]["seq"].as_u64().unwrap()
+                > response["data"][0]["seq"].as_u64().unwrap()
+        );
     }
 
     #[tokio::test]
@@ -4454,6 +4968,7 @@ mod tests {
             model: None,
             mode: mode.map(str::to_owned),
             agent_id: Some("claude".into()),
+            auto_approve: None,
         };
         let asid = do_create_agent_session(&state, session(None), &device_headers())
             .await
@@ -4492,6 +5007,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copilot_autopilot_requires_owner_consent_for_creation_and_mode_switches() {
+        let mut state = state_with(vec![FakeAgent::new("copilot")]).await;
+        state.config.allow_remote_auto_approve = false;
+        let body = |mode: Option<&str>| CreateAgentSessionBody {
+            directory: None,
+            model: None,
+            mode: mode.map(str::to_owned),
+            agent_id: Some("copilot".into()),
+            auto_approve: None,
+        };
+        let asid = do_create_agent_session(&state, body(None), &device_headers())
+            .await
+            .unwrap()
+            .0["data"]["asid"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let autopilot = "https://agentclientprotocol.com/protocol/session-modes#autopilot";
+        assert_eq!(
+            do_set_auto_approve(&state, &asid, true, &device_headers())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_ne!(
+            do_set_auto_approve(&state, &asid, false, &device_headers())
+                .await
+                .err()
+                .map(|refusal| refusal.0),
+            Some(StatusCode::FORBIDDEN)
+        );
+        let refusal = do_switch_mode(&state, &asid, autopilot, &device_headers())
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            do_create_agent_session(&state, body(Some(autopilot)), &device_headers())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        state.config.allow_remote_auto_approve = true;
+        let _ = do_switch_mode(&state, &asid, autopilot, &device_headers())
+            .await
+            .unwrap();
+        let _ = do_create_agent_session(&state, body(Some(autopilot)), &device_headers())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn account_limits_refuses_unsupported_and_never_falls_back() {
         let state = state_with(vec![FakeAgent::new("opencode")]).await;
         for (agent, status) in [
@@ -4507,6 +5075,52 @@ mod tests {
             .await;
             assert_eq!(response.status(), status);
         }
+        assert!(AccountLimitsQuery {
+            refresh: Some("1".into())
+        }
+        .force_refresh());
+        assert!(AccountLimitsQuery {
+            refresh: Some("true".into())
+        }
+        .force_refresh());
+        assert!(!AccountLimitsQuery::default().force_refresh());
+    }
+
+    #[test]
+    fn dedupe_redundant_tool_content_drops_exact_text_copies_and_keeps_rich_blocks() {
+        let mut items: Vec<crate::agents::domain::TimelineItem> = vec![
+            serde_json::from_value(json!({
+                "id": "t1", "message_id": "m1", "role": "assistant", "seq": 1, "updated_ms": 1,
+                "part": {
+                    "type": "tool", "id": "c1", "name": "read", "input": {}, "state": "completed", "status": "completed",
+                    "output": "line 1\nline 2",
+                    "content": [{"type": "text", "text": "line 1"}, {"type": "text", "text": "line 2"}]
+                }
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "id": "t2", "message_id": "m1", "role": "assistant", "seq": 2, "updated_ms": 2,
+                "part": {
+                    "type": "tool", "id": "c2", "name": "read", "input": {}, "state": "completed", "status": "completed",
+                    "output": "img.png",
+                    "content": [{"type": "file", "uri": "file:///tmp/img.png", "mime": "image/png"}]
+                }
+            }))
+            .unwrap(),
+        ];
+        dedupe_redundant_tool_content(&mut items);
+        let crate::agents::domain::AgentPart::Tool(pure) = &items[0].part else {
+            panic!("tool");
+        };
+        assert!(pure.content.is_none(), "exact pure-text duplicate dropped");
+        assert_eq!(
+            pure.output.as_ref().and_then(Value::as_str),
+            Some("line 1\nline 2")
+        );
+        let crate::agents::domain::AgentPart::Tool(rich) = &items[1].part else {
+            panic!("tool");
+        };
+        assert!(rich.content.is_some(), "file/image block preserved");
     }
 
     /// A session whose recorded owner is not attached is retryable, never
@@ -4784,6 +5398,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retained_window_with_no_route_does_not_probe_a_blocked_provider() {
+        let mut agent = FakeAgent::new("opencode").with_sessions(&[("unknown", 1)]);
+        agent.session_gate = Some(Default::default());
+        let state = state_with(vec![agent]).await;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            retained_history_window(&state, "unknown", None, 40, None),
+        )
+        .await
+        .expect("cache lookup did not call get_session")
+        .unwrap_err();
+        assert_eq!(
+            crate::test_support::error_body(&error)["error"]["code"],
+            "not_retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_window_answers_only_from_the_mirror_and_labels_sent_prompts() {
+        let state = state_with(vec![FakeAgent::new("claude")]).await;
+        let asid = do_create_agent_session(
+            &state,
+            CreateAgentSessionBody {
+                directory: None,
+                model: None,
+                mode: None,
+                agent_id: Some("claude".into()),
+                auto_approve: None,
+            },
+            &device_headers(),
+        )
+        .await
+        .expect("a session is created")
+        .0["data"]["asid"]
+            .as_str()
+            .expect("the created session has an id")
+            .to_owned();
+        let _ = do_send_agent_prompt(
+            &state,
+            &asid,
+            SendAgentPromptBody {
+                text: "from the phone".into(),
+                client_ref: None,
+                computer_ids: Vec::new(),
+                attachments: None,
+                delivery: None,
+                model: None,
+                reasoning_effort: None,
+            },
+            &device_headers(),
+        )
+        .await
+        .expect("the prompt is accepted");
+        let Ok(manager) = state.agent_runtime.request_manager_for_session(&asid).await else {
+            panic!("the session has an owner");
+        };
+        let Json(window) = retained_history_window(&state, &asid, None, 100, None)
+            .await
+            .expect("the mirror holds the new session");
+        let rows = window["data"]["timeline"].as_array().unwrap();
+        let sent: Vec<_> = rows
+            .iter()
+            .filter(|row| row["part"]["text"] == "from the phone")
+            .collect();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["origin"]["device_id"], "phone-1");
+        assert_eq!(sent[0]["origin"]["name"], "device phone-1");
+
+        manager
+            .mirror()
+            .remove_session(&AgentSessionId(asid.clone()))
+            .await;
+        let refusal = retained_history_window(&state, &asid, None, 100, None)
+            .await
+            .expect_err("the mirror no longer holds the session");
+        assert_eq!(refusal.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            crate::test_support::error_body(&refusal)["error"]["code"],
+            "not_retained"
+        );
+    }
+
+    #[tokio::test]
     async fn timeline_earlier_route_uses_codex_owner_and_retains_bounded_rows_in_snapshot() {
         use crate::agents::adapters::codex::{
             tests::{golden, Fixture},
@@ -4860,7 +5557,55 @@ mod tests {
             .mirror()
             .mark_history_initialized(&AgentSessionId(id.clone()))
             .await;
-        let Json(window) = socket_history_window(&state, &id, None, false)
+        let request: super::super::ws_routes::HistoryRequest = serde_json::from_value(json!({
+            "request_id": "first", "asid": id, "operation": "window",
+            "retained": true, "limit": 40
+        }))
+        .unwrap();
+        let Json(socket) = socket_history(&state, &request).await.unwrap();
+        let Json(http) = history_window_global(
+            State(state.clone()),
+            Path(id.clone()),
+            Query(HistoryWindowQuery {
+                retained: true,
+                limit: Some(40),
+                ..Default::default()
+            }),
+            device_headers(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(socket["data"], http["data"]);
+        let entry = &http["data"];
+        let entry_rows = entry["timeline"].as_array().unwrap();
+        assert_eq!(entry_rows.len(), 40);
+        assert_eq!(entry_rows[0]["id"], snapshot.timeline[141].id);
+        let anchor = entry["history_cursor"].as_str().unwrap();
+        let Json(older) = socket_history_page(&state, &id, Some(anchor))
+            .await
+            .unwrap();
+        assert_eq!(older["data"]["items"][79]["id"], snapshot.timeline[140].id);
+        let seq = entry["seq"].as_u64().unwrap();
+        let Json(hit) = socket_history_window(&state, &id, Some(anchor), false, 40, Some(seq))
+            .await
+            .unwrap();
+        assert_eq!(hit["data"]["unchanged"], true);
+        assert!(hit["data"].get("timeline").is_none());
+        for field in [
+            "info",
+            "permissions",
+            "forms",
+            "inbox",
+            "seq",
+            "history_cursor",
+        ] {
+            assert_eq!(hit["data"][field], entry[field]);
+        }
+        let Json(miss) = socket_history_window(&state, &id, Some(anchor), false, 40, Some(seq - 1))
+            .await
+            .unwrap();
+        assert_eq!(miss["data"]["timeline"], entry["timeline"]);
+        let Json(window) = socket_history_window(&state, &id, None, false, 100, None)
             .await
             .unwrap();
         assert_eq!(window["data"]["timeline"].as_array().unwrap().len(), 100);
@@ -4884,7 +5629,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(end["data"]["exhausted"], true);
-        let Json(reopen) = socket_history_window(&state, &id, None, false)
+        let Json(reopen) = socket_history_window(&state, &id, None, false, 100, None)
             .await
             .unwrap();
         assert_eq!(reopen["data"]["timeline"].as_array().unwrap().len(), 100);
@@ -5637,6 +6382,7 @@ mod tests {
                 model: None,
                 mode: None,
                 agent_id: agent_id.map(str::to_string),
+                auto_approve: None,
             };
             let Json(created) = do_create_agent_session(&state, body, &headers)
                 .await
@@ -5684,6 +6430,7 @@ mod tests {
             model: None,
             mode: None,
             agent_id: None,
+            auto_approve: None,
         };
 
         // A real subdirectory of home, whatever this machine has.
@@ -5734,6 +6481,51 @@ mod tests {
                 "{typed}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn warm_agent_rejects_invalid_or_missing_explicit_directory() {
+        let state = state_with(vec![FakeAgent::new("codex")]).await;
+        let headers = device_headers();
+
+        for (typed, code) in [
+            ("~nobody", "invalid_directory"),
+            ("relative/dir", "invalid_directory"),
+            ("~/muqun-no-such-dir-for-tests", "directory_not_found"),
+        ] {
+            let refusal = warm_agent(
+                State(state.clone()),
+                Path("codex".into()),
+                headers.clone(),
+                Some(Json(WarmAgentBody {
+                    directory: Some(typed.into()),
+                    auto_approve: None,
+                })),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{typed} should be refused"));
+            assert_eq!(refusal.0, StatusCode::BAD_REQUEST, "{typed}");
+            assert_eq!(
+                crate::test_support::error_body(&refusal)["error"]["code"],
+                code,
+                "{typed}"
+            );
+        }
+
+        let home = std::fs::canonicalize(dirs::home_dir().unwrap()).unwrap();
+        let ok = warm_agent(
+            State(state),
+            Path("codex".into()),
+            headers,
+            Some(Json(WarmAgentBody {
+                directory: Some(home.to_string_lossy().into_owned()),
+                auto_approve: None,
+            })),
+        )
+        .await
+        .expect("valid directory succeeds");
+        assert_eq!(ok.0["ok"], true);
     }
 
     #[tokio::test]
@@ -5823,6 +6615,45 @@ mod tests {
         )
         .await
         .expect("home is a workspace the agent can search");
+    }
+
+    #[tokio::test]
+    async fn find_files_falls_back_to_workspace_scan_when_agent_unsupported() {
+        let directory = crate::test_support::asset_test_dir("agent-file-fallback");
+        std::fs::write(directory.join("hello_remote.rs"), "fn main() {}\n").unwrap();
+        let mut agent = FakeAgent::new("claude");
+        agent.unsupported_find_files = true;
+        let state = state_with(vec![agent]).await;
+        let Json(body) = do_find_agent_files(
+            &state,
+            FileSearchScope::Agent(Some("claude")),
+            "",
+            20,
+            Some(directory.as_path().to_str().unwrap()),
+            &device_headers(),
+        )
+        .await
+        .expect("workspace fallback should return project files");
+        let files = body["data"].as_array().expect("data array of file hits");
+        assert!(
+            files
+                .iter()
+                .any(|f| f.get("path").and_then(Value::as_str) == Some("hello_remote.rs")),
+            "expected workspace fallback to return hello_remote.rs, got {files:?}"
+        );
+        // Non-scannable roots like `/` must never fall back to walking the host filesystem.
+        let Json(root_body) = do_find_agent_files(
+            &state,
+            FileSearchScope::Agent(Some("claude")),
+            "",
+            20,
+            Some("/"),
+            &device_headers(),
+        )
+        .await
+        .expect("non-scannable root should return empty list");
+        assert_eq!(root_body["data"].as_array().unwrap().len(), 0);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -6356,6 +7187,7 @@ mod tests {
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         };
         manager
             .mirror()
@@ -6424,6 +7256,143 @@ mod tests {
             );
         }
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn vcs_workbench_routes_handle_repo_non_repo_and_capabilities() {
+        assert!(crate::API_CAPABILITIES.contains(&"vcs_git_ops_v1"));
+        assert!(crate::API_CAPABILITIES.contains(&"vcs_prs_v1"));
+
+        let (state, root, repo) = Box::pin(vcs_state("agent-vcs-workbench")).await;
+
+        // Non-repo overview returns 200 with is_repo: false (NOT 404).
+        let Json(plain_ov) = Box::pin(get_agent_vcs_overview(
+            State(state.clone()),
+            Path("ses_plain".into()),
+            device_headers(),
+        ))
+        .await
+        .expect("non-repo overview succeeds");
+        assert_eq!(plain_ov["data"]["is_repo"], false);
+        assert!(plain_ov["data"]["repo"].is_null());
+        assert_eq!(plain_ov["data"]["local_branches"], json!([]));
+        assert!(plain_ov["data"]["remote_url"].is_null());
+        assert!(plain_ov["data"]["remote_host"].is_null());
+        assert_eq!(plain_ov["data"]["worktrees"], json!([]));
+
+        // Repo overview returns branch, local_branches, worktrees.
+        let Json(repo_ov) = Box::pin(get_agent_vcs_overview(
+            State(state.clone()),
+            Path("ses_git".into()),
+            device_headers(),
+        ))
+        .await
+        .expect("repo overview succeeds");
+        assert_eq!(repo_ov["data"]["is_repo"], true);
+        assert_eq!(repo_ov["data"]["repo"]["branch"], "main");
+        assert!(repo_ov["data"]["local_branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b == "main"));
+
+        // Stage, unstage, commit, and commits pagination via route handlers.
+        let Json(staged) = Box::pin(stage_agent_vcs_files(
+            State(state.clone()),
+            Path("ses_git".into()),
+            device_headers(),
+            Json(VcsStageBody {
+                paths: vec!["notes.md".into()],
+                all: false,
+            }),
+        ))
+        .await
+        .expect("stage succeeds");
+        assert_eq!(staged["data"]["ok"], true);
+
+        let Json(unstaged) = Box::pin(unstage_agent_vcs_files(
+            State(state.clone()),
+            Path("ses_git".into()),
+            device_headers(),
+            Json(VcsStageBody {
+                paths: vec!["notes.md".into()],
+                all: false,
+            }),
+        ))
+        .await
+        .expect("unstage succeeds");
+        assert_eq!(unstaged["data"]["ok"], true);
+
+        let Json(committed) = Box::pin(commit_agent_vcs(
+            State(state.clone()),
+            Path("ses_git".into()),
+            device_headers(),
+            Json(VcsCommitBody {
+                message: "workbench commit".into(),
+                stage_all: true,
+            }),
+        ))
+        .await
+        .expect("commit succeeds");
+        assert_eq!(committed["data"]["ok"], true);
+
+        let Json(commits) = Box::pin(get_agent_vcs_commits(
+            State(state.clone()),
+            Path("ses_git".into()),
+            Query(VcsCommitsQuery {
+                offset: Some(0),
+                limit: Some(1),
+            }),
+            device_headers(),
+        ))
+        .await
+        .expect("commits succeeds");
+        assert_eq!(commits["data"]["items"][0]["subject"], "workbench commit");
+        assert_eq!(commits["data"]["has_more"], true);
+        assert_eq!(commits["data"]["next_offset"], 1);
+
+        // PRs on a repo without origin returns supported: false cleanly.
+        let Json(prs) = Box::pin(get_agent_vcs_prs(
+            State(state.clone()),
+            Path("ses_git".into()),
+            Query(VcsPrsQuery {
+                refresh: true,
+                ..VcsPrsQuery::default()
+            }),
+            device_headers(),
+        ))
+        .await
+        .expect("prs succeeds");
+        assert_eq!(prs["data"]["supported"], false);
+        assert_eq!(prs["data"]["items"], json!([]));
+
+        // Checkout with neither branch nor pr_number returns 400.
+        let bad_checkout = Box::pin(checkout_agent_vcs(
+            State(state.clone()),
+            Path("ses_git".into()),
+            device_headers(),
+            Json(VcsCheckoutBody::default()),
+        ))
+        .await
+        .expect_err("must reject empty checkout");
+        assert_eq!(bad_checkout.0, StatusCode::BAD_REQUEST);
+
+        // Mutating route outside a repo returns 404 not_a_repository.
+        let non_repo_stage = Box::pin(stage_agent_vcs_files(
+            State(state.clone()),
+            Path("ses_plain".into()),
+            device_headers(),
+            Json(VcsStageBody {
+                paths: vec![],
+                all: true,
+            }),
+        ))
+        .await
+        .expect_err("non-repo stage fails");
+        assert_eq!(non_repo_stage.0, StatusCode::NOT_FOUND);
+
+        let _ = repo;
         std::fs::remove_dir_all(&root).ok();
     }
 }

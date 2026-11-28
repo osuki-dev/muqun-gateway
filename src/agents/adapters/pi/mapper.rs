@@ -52,7 +52,15 @@ pub struct UsageTotals {
 }
 
 impl UsageTotals {
-    fn add(&mut self, usage: &Value) {
+    pub(super) fn observe(&mut self, entry: &Value) {
+        if entry.pointer("/message/role").and_then(Value::as_str) == Some("assistant") {
+            if let Some(usage) = entry.pointer("/message/usage") {
+                self.add(usage);
+            }
+        }
+    }
+
+    pub(super) fn add(&mut self, usage: &Value) {
         let count = |key| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
         self.tokens.input = self.tokens.input.saturating_add(count("input"));
         self.tokens.output = self.tokens.output.saturating_add(count("output"));
@@ -79,11 +87,7 @@ impl UsageTotals {
 pub fn usage_from_entries(entries: &[Value]) -> UsageTotals {
     let mut totals = UsageTotals::default();
     for entry in entries {
-        if entry.pointer("/message/role").and_then(Value::as_str) == Some("assistant") {
-            if let Some(usage) = entry.pointer("/message/usage") {
-                totals.add(usage);
-            }
-        }
+        totals.observe(entry);
     }
     totals
 }
@@ -347,7 +351,7 @@ fn message_id(sort_ms: u64, key: &str) -> String {
 }
 
 /// `content` as a string, or the text blocks of a content array joined.
-fn content_text(content: Option<&Value>) -> String {
+pub(super) fn content_text(content: Option<&Value>) -> String {
     match content {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(blocks)) => blocks
@@ -379,6 +383,7 @@ fn item(
         attachments: None,
         image_assets: None,
         generation: None,
+        origin: None,
     }
 }
 
@@ -438,6 +443,22 @@ impl ToolOutcome {
             call.content = content.cloned();
             call.metadata = result.get("details").filter(|d| !d.is_null()).cloned();
         }
+        crate::agents::message_images::tool_media::normalize_tool_call(call);
+    }
+}
+
+fn apply_tool_outcome(call: &mut ToolCall, message: &Value) {
+    ToolOutcome::finished(
+        message.get("isError").and_then(Value::as_bool) == Some(true),
+        message,
+    )
+    .apply(call);
+}
+
+pub(super) fn apply_history_outcome(row: &mut TimelineItem, entry: &Value) {
+    if let AgentPart::Tool(call) = &mut row.part {
+        apply_tool_outcome(call, &entry["message"]);
+        row.updated_ms = text(entry, "timestamp").and_then(ms_from_iso).unwrap_or(0);
     }
 }
 
@@ -540,7 +561,7 @@ fn block_part(block: &Value, outcomes: &HashMap<String, ToolOutcome>) -> Option<
     }
 }
 
-fn model_ref(entry: &Value) -> Option<ModelRef> {
+pub(super) fn model_ref(entry: &Value) -> Option<ModelRef> {
     Some(ModelRef {
         provider_id: text(entry, "provider")?.to_string(),
         model_id: text(entry, "modelId")?.to_string(),
@@ -569,8 +590,7 @@ pub fn timeline_from_entries(entries: &[Value]) -> Vec<TimelineItem> {
                     let row = text(message, "toolCallId").and_then(|c| tool_rows.get(c));
                     if let Some(row) = row.and_then(|&at| items.get_mut(at)) {
                         if let AgentPart::Tool(call) = &mut row.part {
-                            let is_error = message.get("isError").and_then(Value::as_bool);
-                            ToolOutcome::finished(is_error == Some(true), message).apply(call);
+                            apply_tool_outcome(call, message);
                             row.updated_ms = ms;
                         }
                     }
@@ -837,8 +857,8 @@ impl LiveFolder {
         self
     }
 
-    pub fn with_history_usage(mut self, entries: &[Value]) -> Self {
-        self.completed_usage = usage_from_entries(entries);
+    pub fn with_history_usage(mut self, usage: UsageTotals) -> Self {
+        self.completed_usage = usage;
         self
     }
 
@@ -1757,7 +1777,8 @@ mod tests {
         let usage = json!({"input":10,"output":5,"cacheRead":2,"cacheWrite":1,"totalTokens":18,"cost":{"total":0.01}});
         let history =
             vec![json!({"type":"message", "message":{"role":"assistant", "usage":usage}})];
-        let mut folder = LiveFolder::new("s1".into()).with_history_usage(&history);
+        let mut folder =
+            LiveFolder::new("s1".into()).with_history_usage(usage_from_entries(&history));
         for (timestamp, total) in [(1, 36), (2, 54)] {
             let message =
                 json!({"role":"assistant", "timestamp":timestamp, "content":[], "usage":usage});

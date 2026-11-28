@@ -6,6 +6,14 @@ use crate::agents::domain::{
 use crate::agents::ports::agent::{AgentError, AgentPort, FileDiffItem};
 use crate::agents::ports::mirror::{AgentSessionSnapshot, SessionMirrorPort};
 
+/// Newest timeline items a snapshot / refresh opens with. Older pages come
+/// from [`Self::load_earlier_timeline`] (scroll-to-top or "Load earlier").
+/// Shared by every client: the desktop shows fewer rows on open by trimming
+/// client-side, not by shrinking what the gateway reads.
+const INITIAL_TIMELINE_LIMIT: usize = 100;
+/// Items per older-history page.
+const EARLIER_TIMELINE_LIMIT: usize = 80;
+
 pub struct SessionService {
     agent: Arc<dyn AgentPort>,
     mirror: Arc<dyn SessionMirrorPort>,
@@ -16,6 +24,14 @@ pub struct SessionService {
 }
 
 impl SessionService {
+    /// Read retained request identities only. Does not prepare or wake a provider.
+    pub async fn pending_snapshots(&self) -> Vec<crate::agents::ports::AgentPendingSnapshot> {
+        match &self.memory {
+            Some(memory) => memory.pending_snapshots().await,
+            None => Vec::new(),
+        }
+    }
+
     pub fn new(agent: Arc<dyn AgentPort>, mirror: Arc<dyn SessionMirrorPort>) -> Self {
         Self {
             agent,
@@ -106,7 +122,21 @@ impl SessionService {
         model: Option<&ModelRef>,
         mode: Option<&str>,
     ) -> Result<AgentSessionInfo, AgentError> {
-        let mut info = self.agent.create_session(directory, model, mode).await?;
+        self.create_session_with_auto_approve(directory, model, mode, false)
+            .await
+    }
+
+    pub async fn create_session_with_auto_approve(
+        &self,
+        directory: Option<&str>,
+        model: Option<&ModelRef>,
+        mode: Option<&str>,
+        auto_approve: bool,
+    ) -> Result<AgentSessionInfo, AgentError> {
+        let mut info = self
+            .agent
+            .create_session_with_auto_approve(directory, model, mode, auto_approve)
+            .await?;
         self.stamp(&mut info);
         self.observe_runtime(&mut info).await;
         self.mirror.update_session(info.clone()).await;
@@ -153,6 +183,51 @@ impl SessionService {
         })?
     }
 
+    /// Read canonical history already retained by this service without waking
+    /// the agent. Session metadata and live deltas alone are not a history read;
+    /// callers must use `get_snapshot` when this returns `None`.
+    pub async fn retained_snapshot(&self, asid: &AgentSessionId) -> Option<AgentSessionSnapshot> {
+        let memory = self.memory.as_ref()?;
+        if !memory.history_initialized(asid).await {
+            return None;
+        }
+        let mut snapshot = self.mirror.get_snapshot(asid).await?;
+        self.observe_runtime(&mut snapshot.info).await;
+        Some(snapshot)
+    }
+
+    /// Fast read-only preview of recent messages from local native storage
+    /// without waking the agent or marking the mirror initialized.
+    pub async fn preview_snapshot(&self, asid: &AgentSessionId) -> Option<AgentSessionSnapshot> {
+        let timeline = self
+            .agent
+            .preview_timeline(&asid.0, 100)
+            .await
+            .ok()
+            .flatten()?;
+        if timeline.is_empty() {
+            return None;
+        }
+        let cached_info = match &self.memory {
+            Some(memory) => memory.session_info(asid).await,
+            None => None,
+        };
+        let mut info = match cached_info {
+            Some(info) => info,
+            None => self.agent.get_session(&asid.0).await.ok()?,
+        };
+        self.stamp(&mut info);
+        self.observe_runtime(&mut info).await;
+        Some(AgentSessionSnapshot {
+            info,
+            timeline,
+            permissions: Vec::new(),
+            forms: Vec::new(),
+            inbox: Vec::new(),
+            seq: 0,
+        })
+    }
+
     pub async fn get_snapshot(
         &self,
         asid: &AgentSessionId,
@@ -190,15 +265,31 @@ impl SessionService {
         // history read, as it was when these ran one after another.
         let (info, prepared, permissions, forms) = tokio::join!(
             self.agent.get_session(&asid.0),
-            self.agent.prepare_timeline(&asid.0, 100),
+            self.agent.prepare_timeline(&asid.0, INITIAL_TIMELINE_LIMIT),
             self.agent.get_pending_permissions(&asid.0),
             self.agent.get_pending_forms(&asid.0),
         );
         let mut info = info?;
+        let prepared = prepared?;
+        if info.context_usage.is_none() {
+            if let Some(mut observed) = self.agent.observed_context_usage(&asid.0) {
+                if observed.limit.is_none() {
+                    observed.limit = info.limit.clone();
+                } else if let (
+                    Some(serde_json::Value::Object(dst)),
+                    Some(serde_json::Value::Object(src)),
+                ) = (observed.limit.as_mut(), info.limit.as_ref())
+                {
+                    for (k, v) in src {
+                        dst.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
+                info.context_usage = Some(observed);
+            }
+        }
         self.stamp(&mut info);
         self.observe_runtime(&mut info).await;
         self.mirror.update_session(info.clone()).await;
-        let prepared = prepared?;
         let timeline = prepared.items;
         if let (Some(memory), Some(gate)) = (&self.memory, &history_gate) {
             if !memory
@@ -290,7 +381,10 @@ impl SessionService {
             .ok_or_else(|| AgentError::Unsupported("explicit session refresh".into()))?;
         let (expected, incarnation) = memory.snapshot_read_revision(asid).await;
         let info = self.get_session(&asid.0).await?;
-        let prepared = self.agent.prepare_timeline(&asid.0, 100).await?;
+        let prepared = self
+            .agent
+            .prepare_timeline(&asid.0, INITIAL_TIMELINE_LIMIT)
+            .await?;
         let timeline = prepared.items;
         let permissions = self.agent.get_pending_permissions(&asid.0).await?;
         let forms = self.agent.get_pending_forms(&asid.0).await?;
@@ -317,6 +411,8 @@ impl SessionService {
         asid: &AgentSessionId,
         cursor: Option<&str>,
         refresh: bool,
+        limit: usize,
+        if_seq: Option<u64>,
     ) -> Result<crate::agents::adapters::memory_mirror::history_window::HistoryWindow, AgentError>
     {
         let memory = self
@@ -330,9 +426,35 @@ impl SessionService {
         } else {
             self.agent.prepare_observed_session(&asid.0).await?;
         }
-        let mut window = memory.history_window(asid, cursor).await?;
+        let mut window = memory.history_window(asid, cursor, limit, if_seq).await?;
         self.observe_runtime(&mut window.snapshot.info).await;
         Ok(window)
+    }
+
+    /// The newest window of what the mirror already holds, or `None` when it
+    /// holds no read history for the session. Never reads or wakes the agent.
+    pub(crate) async fn retained_window(
+        &self,
+        asid: &AgentSessionId,
+        cursor: Option<&str>,
+        limit: usize,
+        if_seq: Option<u64>,
+    ) -> Result<
+        Option<crate::agents::adapters::memory_mirror::history_window::HistoryWindow>,
+        AgentError,
+    > {
+        let Some(memory) = self.memory.as_ref() else {
+            return Ok(None);
+        };
+        if !memory.history_initialized(asid).await {
+            return Ok(None);
+        }
+        match memory.history_window(asid, cursor, limit, if_seq).await {
+            Ok(window) => Ok(Some(window)),
+            // Evicted between the check and the read.
+            Err(AgentError::HistoryCursorLost) if cursor.is_none() => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) async fn history_page(
@@ -361,7 +483,10 @@ impl SessionService {
                 .history_read_revision(asid)
                 .await
                 .ok_or(AgentError::HistoryCursorLost)?;
-            let prepared = self.agent.prepare_earlier_timeline(&asid.0, 80).await?;
+            let prepared = self
+                .agent
+                .prepare_earlier_timeline(&asid.0, EARLIER_TIMELINE_LIMIT)
+                .await?;
             let exhausted = prepared.items.is_empty();
             let source_ids: std::collections::HashSet<_> =
                 prepared.items.iter().map(|row| row.id.clone()).collect();
@@ -399,12 +524,18 @@ impl SessionService {
                 .history_read_revision(asid)
                 .await
                 .ok_or(AgentError::HistoryCursorLost)?;
-            let prepared = self.agent.prepare_earlier_timeline(&asid.0, 80).await?;
+            let prepared = self
+                .agent
+                .prepare_earlier_timeline(&asid.0, EARLIER_TIMELINE_LIMIT)
+                .await?;
             return memory
                 .accept_earlier_history(asid, &gate, revision, prepared.items, prepared.commit)
                 .await;
         }
-        let prepared = self.agent.prepare_earlier_timeline(&asid.0, 80).await?;
+        let prepared = self
+            .agent
+            .prepare_earlier_timeline(&asid.0, EARLIER_TIMELINE_LIMIT)
+            .await?;
         if prepared.commit.is_some() {
             return Err(AgentError::Unsupported(
                 "stateful history requires atomic mirror acceptance".into(),
@@ -486,7 +617,7 @@ impl SessionService {
         self.agent.revert_session(&asid.0, message_id).await?;
         let timeline = self
             .agent
-            .get_timeline(&asid.0, 100)
+            .get_timeline(&asid.0, INITIAL_TIMELINE_LIMIT)
             .await
             .unwrap_or_default();
         if !timeline.is_empty() {
@@ -502,6 +633,56 @@ pub(crate) mod tests {
     use crate::agents::domain::*;
     use crate::agents::ports::agent::AgentFuture;
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn retained_snapshot_requires_canonical_history_and_preserves_known_empty() {
+        let row = TimelineItem {
+            id: "answer".into(),
+            message_id: "answer".into(),
+            role: TimelineRole::Assistant,
+            part: AgentPart::Text {
+                text: "retained answer".into(),
+            },
+            seq: 1,
+            updated_ms: 1,
+            ordinal: 0,
+            attachments: None,
+            image_assets: None,
+            generation: None,
+            origin: None,
+        };
+        for history in [vec![row], vec![]] {
+            let preparation_log = Arc::new(Mutex::new(Vec::new()));
+            let mut agent = crate::test_support::FakeAgent::new("codex")
+                .with_sessions(&[("restored", 1)])
+                .with_timeline(history.clone());
+            agent.preparation_log = Some(preparation_log.clone());
+            let mirror =
+                Arc::new(crate::agents::adapters::memory_mirror::MemoryMirror::for_agent("codex"));
+            let asid = AgentSessionId("restored".into());
+            mirror
+                .update_session(crate::test_support::fake_session("restored", 1))
+                .await;
+            let service = SessionService::with_memory_mirror(Arc::new(agent), mirror);
+
+            // Metadata exists before opening, but must not truncate history.
+            assert!(service.retained_snapshot(&asid).await.is_none());
+            assert!(preparation_log.lock().unwrap().is_empty());
+            let loaded = service.get_snapshot(&asid).await.unwrap();
+            assert_eq!(loaded.timeline.len(), history.len());
+            assert_eq!(
+                loaded.timeline.first().map(|item| &item.part),
+                history.first().map(|item| &item.part)
+            );
+            preparation_log.lock().unwrap().clear();
+
+            // A genuinely empty canonical read is retained too, without
+            // activating another follower when the desktop peeks or refreshes.
+            let retained = service.retained_snapshot(&asid).await.unwrap();
+            assert_eq!(retained.timeline, loaded.timeline);
+            assert!(preparation_log.lock().unwrap().is_empty());
+        }
+    }
 
     /// A page-capable fake kept here so route tests exercise the same service.
     pub(crate) struct PageAgent {

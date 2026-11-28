@@ -405,6 +405,7 @@ mod tests {
             attachments: Some(vec![source]),
             image_assets: None,
             generation: None,
+            origin: None,
         }
     }
     async fn register(

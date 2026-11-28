@@ -139,55 +139,25 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     // One background attempt per opted-in backend; no restart/logging loop.
     backend_startup::spawn(&config);
 
-    let agent_runtime = if config.agent_runtime.enabled {
-        agents::AgentRuntime::with_local_configs(
-            config.opencode.clone(),
-            config.deepseek.clone(),
-            config.t3.clone(),
-            crate::agents::runtime::LocalAgentConfigs {
-                codex: config.codex.clone(),
-                fx: config.fx.clone(),
-                qoder: config.qoder.clone(),
-                antigravity: config.antigravity.clone(),
-                cursor: config.cursor.clone(),
-                pi: config.pi.clone(),
-                claude: config.claude.clone(),
-            },
-            Some(state_dir()?),
-        )
-    } else {
-        agents::AgentRuntime::disabled()
-    };
+    let state_directory = state_dir()?;
+    let agent_runtime = agents::compose::build_runtime(
+        agents::compose::RuntimeSettings::from_config(&config),
+        config.agent_runtime.enabled,
+        Some(state_directory.clone()),
+    );
 
     agent_runtime.observe_terminal_sessions(&config.sessions);
 
     let scrollback = Arc::new(Mutex::new(scrollback::ScrollbackStore::new(
         config.history.capture,
     )));
-    let state_directory = state_dir()?;
+    let encryption = agents::compose::StoreEncryption::from(config.store.encryption);
+    let db = agents::compose::open_store(&state_directory, encryption)?;
+    // The search index is a separate database under the same key; `open_store`
+    // above has already created the key file when the store is encrypted.
     let key = platform::store::db_key::key_for(&config.store, &state_directory)?;
-    let search = Arc::new(crate::search::SearchService::open(
-        &state_directory,
-        key.clone(),
-    ));
-    let db = platform::store::sqlite::SqliteStore::open(
-        &platform::store::store_db_path(&state_directory),
-        key,
-        platform::store::sqlite::ALL_MIGRATIONS,
-    )
-    .map_err(|err| match config.store.encryption {
-        // One sentence that names both files, so the owner knows what to restore.
-        crate::platform::config::StoreEncryption::File => anyhow::anyhow!(
-            "{err} (key file: {})",
-            platform::store::db_key::key_file(&state_directory).display()
-        ),
-        crate::platform::config::StoreEncryption::Off => err,
-    })?;
-    if config.store.encryption == crate::platform::config::StoreEncryption::File {
-        agent_runtime.persist_t3_credentials(db.clone());
-    }
-    agent_runtime.restore_native_codex_sessions(db.clone());
-    agent_runtime.persist_session_routes(db.clone()).await;
+    let search = Arc::new(crate::search::SearchService::open(&state_directory, key));
+    agents::compose::attach_opened_store(&agent_runtime, &db, encryption).await;
     let task_events = tokio::sync::broadcast::channel(crate::tasks::events::TASK_EVENT_CAPACITY).0;
     let presence = Arc::new(crate::fleet::peers::PeerPresence::default());
     let tasks = Arc::new(crate::tasks::service::TaskService::new(
@@ -199,8 +169,19 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     let peers = Arc::new(crate::fleet::peers::PeerService::new(
         Arc::new(crate::fleet::peers_sqlite::SqlitePeerStore::new(db.clone())),
         &config.fleet,
-        Some(config_file),
+        Some(config_file.clone()),
         presence,
+    ));
+    let mut self_ports = vec![addr.port()];
+    if let Some(port) = local_port {
+        if !self_ports.contains(&port) {
+            self_ports.push(port);
+        }
+    }
+    let mcp_hub = Arc::new(crate::mcp::hub::McpHub::with_self_ports(
+        config.mcp.upstreams.clone(),
+        Some(config_file),
+        self_ports,
     ));
     peers.load_names().await;
     let history =
@@ -220,9 +201,12 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         session_liveness: Arc::new(Mutex::new(SessionLivenessCache::default())),
         agent_runtime: agent_runtime.clone(),
         ws_connections: Arc::new(agents::ws_routes::WsRegistry::default()),
+        pty_connections: Arc::new(terminal::pty_ws::PtyRegistry::default()),
         generation: crate::new_generation(),
         message_images: Arc::default(),
+        preview_cache: Arc::default(),
         mcp_tokens: Arc::new(crate::mcp::tokens_sqlite::SqliteTokenStore::new(db.clone())),
+        mcp_hub,
         fleet: Arc::default(),
         peers,
         tasks,
@@ -278,6 +262,8 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
     let app = crate::fleet::routes::mount(app);
     let app = crate::fleet::peer_routes::mount(app);
     let app = crate::tasks::routes::mount(app);
+    let app = crate::orchestration::mount(app);
+    crate::orchestration::spawn_reconciler(state.clone());
     let app = crate::search::routes::mount(app);
     let app = if state.config.mcp.enabled {
         crate::mcp::mount(app)
@@ -308,8 +294,13 @@ pub(crate) async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         state.clone(),
         encrypted_transport,
     ))
-    // Outside the encrypted transport: the local token is plaintext, from
-    // loopback only.
+    // Outside the encrypted transport: the local client token and the admin
+    // token in `pairing.json` are plaintext credentials accepted from loopback
+    // only (without proxy headers).
+    .layer(middleware::from_fn_with_state(
+        state.clone(),
+        admin_loopback_gate,
+    ))
     .layer(middleware::from_fn(super::local_client::gate))
     .layer(middleware::from_fn_with_state(
         known_hosts(&state.config),
@@ -371,6 +362,7 @@ async fn serve_until_shutdown(
     tokio::join!(
         runtime.shutdown_fx(),
         runtime.shutdown_qoder(),
+        runtime.shutdown_copilot(),
         runtime.shutdown_claude(),
         runtime.shutdown_antigravity(),
         runtime.shutdown_cursor(),
@@ -1192,7 +1184,7 @@ pub(crate) async fn decrypt_transport_request(
             "invalid request",
         )
     })?;
-    if hash_token(&payload.token) != token_hash {
+    if !crate::authority::authenticates_admin(&token_hash, &payload.token) {
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "invalid_token",
@@ -1489,17 +1481,50 @@ pub(crate) async fn encrypt_transport_response(
 /// or of the listen address. A refusal says so in the log, because a name the
 /// owner reaches their own gateway by and this gateway has never been told
 /// about should be a line to read, not a mystery.
+/// The static admin token in `pairing.json` is for local loopback CLI/TUI
+/// management only. Reject it before any route runs if presented from a
+/// non-loopback peer or through reverse-proxy headers.
+pub(crate) async fn admin_loopback_gate(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if let Ok(token) = crate::platform::http::bearer_token(request.headers()) {
+        if crate::authority::authenticates_admin(&state.config.token_hash, token) {
+            let peer = request
+                .extensions()
+                .get::<axum::extract::ConnectInfo<SocketAddr>>()
+                .map(|info| info.0);
+            if !crate::mcp::auth::is_loopback(peer)
+                || crate::mcp::auth::refuse_for_proxy(request.headers())
+            {
+                return api_error(StatusCode::FORBIDDEN, "invalid_token", "invalid token")
+                    .into_response();
+            }
+        }
+    }
+    next.run(request).await
+}
+
 pub(crate) async fn known_host(
     State(known): State<Vec<String>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let host = request
-        .headers()
-        .get(axum::http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-        .or_else(|| request.uri().host().map(str::to_owned));
+    let host = match request.headers().get(axum::http::header::HOST) {
+        Some(raw) => match raw.to_str() {
+            Ok(value) => Some(value.to_owned()),
+            Err(_) => {
+                return api_error(
+                    StatusCode::FORBIDDEN,
+                    "unknown_host",
+                    "this gateway does not answer to that host name",
+                )
+                .into_response();
+            }
+        },
+        None => request.uri().host().map(str::to_owned),
+    };
     if let Some(host) = host.as_deref() {
         if !host_is_known(host, &known) {
             tracing::warn!(
@@ -1537,7 +1562,7 @@ pub(crate) fn known_hosts(config: &Config) -> Vec<String> {
 pub(crate) fn host_is_known(host: &str, known: &[String]) -> bool {
     let name = host_name(host);
     if name.is_empty() {
-        return true;
+        return false;
     }
     // Rebinding needs a name. An address is not one, and a page served from an
     // address literal is same-origin with this gateway and nothing else.
@@ -3074,5 +3099,107 @@ mod transport_v2_tests {
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(downgrade.into_body(), 8192).await.unwrap()).unwrap();
         assert_eq!(body["error"]["code"], "transport_version_required");
+    }
+
+    #[tokio::test]
+    async fn admin_loopback_gate_refuses_remote_and_proxied_admin_tokens() {
+        use axum::extract::ConnectInfo;
+        use axum::routing::get;
+        use tower::ServiceExt as _;
+
+        let state = crate::test_state("secret-admin", vec![]);
+        let app = Router::new()
+            .route("/ok", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                admin_loopback_gate,
+            ))
+            .with_state(state);
+
+        // 1. Direct loopback with admin token succeeds.
+        let mut ok_req = Request::builder()
+            .uri("/ok")
+            .header("authorization", "Bearer secret-admin")
+            .body(Body::empty())
+            .unwrap();
+        ok_req.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:41234".parse::<SocketAddr>().unwrap(),
+        ));
+        assert_eq!(
+            app.clone().oneshot(ok_req).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // 2. Non-loopback peer with admin token is rejected with 403.
+        let mut remote_req = Request::builder()
+            .uri("/ok")
+            .header("authorization", "Bearer secret-admin")
+            .body(Body::empty())
+            .unwrap();
+        remote_req.extensions_mut().insert(ConnectInfo(
+            "100.64.0.9:41234".parse::<SocketAddr>().unwrap(),
+        ));
+        assert_eq!(
+            app.clone().oneshot(remote_req).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // 3. Loopback peer carrying proxy header with admin token is rejected with 403.
+        let mut proxied_req = Request::builder()
+            .uri("/ok")
+            .header("authorization", "Bearer secret-admin")
+            .header("x-forwarded-for", "100.64.0.9")
+            .body(Body::empty())
+            .unwrap();
+        proxied_req.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:41234".parse::<SocketAddr>().unwrap(),
+        ));
+        assert_eq!(
+            app.clone().oneshot(proxied_req).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // 4. Malformed / empty Host headers fail closed.
+        let known = known_hosts(&crate::test_config("secret"));
+        for bad in ["", ".", ":23847", "[]"] {
+            assert!(!host_is_known(bad, &known), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn validate_ws_origin_allows_native_and_same_origin_and_refuses_cross_origin() {
+        use axum::http::HeaderMap;
+
+        // No Origin header (native clients) -> allowed.
+        let native = HeaderMap::new();
+        assert!(crate::platform::http::validate_ws_origin(&native).is_ok());
+
+        // Same-origin Origin matching Host -> allowed.
+        let mut same = HeaderMap::new();
+        same.insert("host", "127.0.0.1:23847".parse().unwrap());
+        same.insert("origin", "http://127.0.0.1:23847".parse().unwrap());
+        assert!(crate::platform::http::validate_ws_origin(&same).is_ok());
+
+        // Cross-origin webpage -> refused.
+        let mut evil = HeaderMap::new();
+        evil.insert("host", "127.0.0.1:23847".parse().unwrap());
+        evil.insert("origin", "https://evil.example".parse().unwrap());
+        assert_eq!(
+            crate::platform::http::validate_ws_origin(&evil)
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+
+        // Null / mismatched port Origin -> refused.
+        let mut bad_port = HeaderMap::new();
+        bad_port.insert("host", "127.0.0.1:23847".parse().unwrap());
+        bad_port.insert("origin", "http://127.0.0.1:9999".parse().unwrap());
+        assert_eq!(
+            crate::platform::http::validate_ws_origin(&bad_port)
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
     }
 }

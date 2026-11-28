@@ -512,11 +512,31 @@ mod tests {
 /// The session a delegation was asked from, where its result is told once
 /// it ends (`tasks::notices`): an agent service's session, or the pane a
 /// terminal agent runs in.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum NoticeTarget {
     Session { agent_id: String, asid: String },
     Pane { session_id: String, pane_id: String },
+}
+
+/// An untold notice row waiting to wake a parent session or pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingNotice {
+    pub task: Task,
+    pub target: NoticeTarget,
+    pub barrier_group: Option<String>,
+}
+
+/// Maximum byte length of a `barrier_group` identifier.
+pub(crate) const MAX_BARRIER_GROUP_BYTES: usize = 128;
+
+/// Whether `group` is a valid parallel barrier group key: trimmed non-empty,
+/// at most [`MAX_BARRIER_GROUP_BYTES`] bytes, and free of control characters.
+pub(crate) fn valid_barrier_group(group: &str) -> bool {
+    let trimmed = group.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= MAX_BARRIER_GROUP_BYTES
+        && !trimmed.chars().any(char::is_control)
 }
 
 /// The states a parent is told about: the child ended, or stopped and needs

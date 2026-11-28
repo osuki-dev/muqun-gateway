@@ -4,6 +4,7 @@ pub mod idle;
 pub(crate) mod mapper;
 pub mod session;
 pub use client::{AcpClient, AcpEvent};
+pub use mapper::PermissionFields;
 
 pub(crate) mod operations;
 

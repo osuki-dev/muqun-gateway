@@ -1,0 +1,17 @@
+{
+  "name": "@muqun/desktop",
+  "version": "0.0.8-dev",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "bun test tests"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2",
+    "@types/bun": "1.4.2"
+  }
+}

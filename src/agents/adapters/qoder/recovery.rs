@@ -1,21 +1,195 @@
 //! Recoverability inspection of one exact native Qoder transcript. This does
 //! not load a session, hold its native lock, or write to the native store.
+mod index;
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::agents::adapters::acp::recovery::NativeSnapshot;
 use crate::agents::ports::agent::AgentError;
 
-const MAX_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RECORD_BYTES: u64 = 64 * 1024 * 1024;
+const PREVIEW_TAIL_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RECORDS: usize = 100_000;
 
 fn unavailable() -> AgentError {
     AgentError::NotAvailable("Qoder native recovery history is incomplete or unsupported".into())
+}
+
+/// Fast tail preview of a Qoder `.jsonl` transcript directly from disk without
+/// starting `qodercli --acp`.
+pub(super) async fn tail_timeline(
+    id: &str,
+    limit: usize,
+    stop: &CancellationToken,
+) -> Result<Vec<crate::agents::domain::TimelineItem>, AgentError> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Ok(Vec::new());
+    }
+    let Some(root) = dirs::home_dir().map(|home| home.join(".qoder/projects")) else {
+        return Ok(Vec::new());
+    };
+    let id = id.to_owned();
+    let stop = stop.clone();
+    tokio::task::spawn_blocking(move || {
+        let Ok(path) = find_exact(&root, &id, &stop) else {
+            return Ok(Vec::new());
+        };
+        Ok(tail_timeline_file(&path, &id, limit, &stop).unwrap_or_default())
+    })
+    .await
+    .map_err(|_| unavailable())?
+}
+
+fn tail_timeline_file(
+    path: &Path,
+    id: &str,
+    limit: usize,
+    stop: &CancellationToken,
+) -> Result<Vec<crate::agents::domain::TimelineItem>, AgentError> {
+    use std::io::{BufRead, Seek, SeekFrom};
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).map_err(|_| unavailable())?;
+    let meta = file.metadata().map_err(|_| unavailable())?;
+    if !meta.is_file() {
+        return Ok(Vec::new());
+    }
+    let len = meta.len();
+    let skip_first = len > PREVIEW_TAIL_BYTES;
+    if skip_first {
+        file.seek(SeekFrom::Start(len - PREVIEW_TAIL_BYTES))
+            .map_err(|_| unavailable())?;
+    }
+    let mut reader = std::io::BufReader::with_capacity(256 * 1024, &file);
+    let mut line = String::new();
+    if skip_first {
+        let _ = reader.read_line(&mut line);
+        line.clear();
+    }
+    let mut nodes: HashMap<String, (Option<String>, Value)> = HashMap::new();
+    let mut leaf = None;
+    let mut count = 0usize;
+    while count < MAX_RECORDS {
+        if stop.is_cancelled() {
+            break;
+        }
+        line.clear();
+        let Ok(read) = reader.read_line(&mut line) else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        count += 1;
+        let Ok(record) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if record["sessionId"]
+            .as_str()
+            .is_some_and(|native| native != id)
+            || record["isSidechain"].as_bool() == Some(true)
+        {
+            continue;
+        }
+        let Some(uuid) = record["uuid"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        let parent = record["parentUuid"].as_str().map(str::to_owned);
+        nodes.insert(uuid.clone(), (parent, record));
+        leaf = Some(uuid);
+    }
+    let Some(mut next) = leaf else {
+        return Ok(Vec::new());
+    };
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
+    while seen.insert(next.clone()) {
+        let Some((parent, record)) = nodes.remove(&next) else {
+            break;
+        };
+        chain.push(record);
+        match parent {
+            Some(parent) => next = parent,
+            None => break,
+        }
+    }
+    chain.reverse();
+    let mut projection = crate::agents::adapters::acp::mapper::Projection::new(false);
+    for record in chain {
+        if is_human(&record) {
+            if let Some(text) = message_text(&record).filter(|t| !t.is_empty()) {
+                let _ = projection.update(&serde_json::json!({
+                    "sessionUpdate": "user_message_chunk",
+                    "content": { "type": "text", "text": text },
+                }));
+            }
+        } else if record["type"].as_str() == Some("assistant") {
+            let msg_id = record
+                .pointer("/message/id")
+                .and_then(Value::as_str)
+                .or_else(|| record["uuid"].as_str())
+                .unwrap_or_default();
+            if let Some(parts) = record.pointer("/message/content").and_then(Value::as_array) {
+                for part in parts {
+                    match part["type"].as_str() {
+                        Some("text") => {
+                            let _ = projection.update(&serde_json::json!({
+                                "sessionUpdate": "agent_message_chunk",
+                                "messageId": msg_id,
+                                "content": { "type": "text", "text": part["text"] },
+                            }));
+                        }
+                        Some("thinking")
+                            if part["thinking"].as_str().is_some_and(|t| !t.is_empty()) =>
+                        {
+                            let _ = projection.update(&serde_json::json!({
+                                "sessionUpdate": "agent_thought_chunk",
+                                "messageId": msg_id,
+                                "content": { "type": "text", "text": part["thinking"] },
+                            }));
+                        }
+                        Some("tool_use") => {
+                            let _ = projection.update(&serde_json::json!({
+                                "sessionUpdate": "tool_call",
+                                "toolCallId": part["id"],
+                                "title": part["name"],
+                                "name": part["name"],
+                                "status": "completed",
+                                "rawInput": part["input"],
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    let mut items = projection.timeline();
+    if limit > 0 && items.len() > limit {
+        items.drain(..items.len() - limit);
+    }
+    Ok(items)
 }
 
 pub(super) async fn inspect(
@@ -34,8 +208,9 @@ pub(super) async fn inspect(
         .ok_or_else(unavailable)?
         .join(".qoder/projects");
     let id = id.to_owned();
-    let stop = stop.clone();
-    inspect_owned(move || {
+    let stop = stop.child_token();
+    let _cancel_read = stop.clone().drop_guard();
+    inspect_owned(stop.clone(), move || {
         let path = find_exact(&root, &id, &stop)?;
         inspect_file(&path, &id, &stop)
     })
@@ -43,15 +218,18 @@ pub(super) async fn inspect(
 }
 
 async fn inspect_owned<T: Send + 'static>(
+    stop: CancellationToken,
     read: impl FnOnce() -> Result<T, AgentError> + Send + 'static,
 ) -> Result<T, AgentError> {
     static READS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
-    let permit = READS
+    let reads = READS
         .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| unavailable())?;
+        .clone();
+    let permit = tokio::select! {
+        biased;
+        _ = stop.cancelled() => return Err(unavailable()),
+        permit = reads.acquire_owned() => permit.map_err(|_| unavailable())?,
+    };
     tokio::task::spawn_blocking(move || {
         // A cancelled HTTP caller cannot release the byte-budget admission
         // while its blocking scan/read/parse is still using memory.
@@ -111,19 +289,12 @@ fn inspect_file(
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let mut file = options.open(path).map_err(|_| unavailable())?;
+    let file = options.open(path).map_err(|_| unavailable())?;
     let before = file.metadata().map_err(|_| unavailable())?;
-    if !before.is_file() || before.len() > MAX_BYTES || stop.is_cancelled() {
+    if !before.is_file() || stop.is_cancelled() {
         return Err(unavailable());
     }
-    let mut bytes = Vec::with_capacity(before.len() as usize);
-    (&mut file)
-        .take(MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| unavailable())?;
-    if bytes.len() as u64 != before.len() || !bytes.ends_with(b"\n") {
-        return Err(unavailable());
-    }
+    let snapshot = inspect_reader(id, BufReader::new(&file), before.len(), stop)?;
     let after = file.metadata().map_err(|_| unavailable())?;
     let named = std::fs::symlink_metadata(path).map_err(|_| unavailable())?;
     let stable = after.len() == before.len()
@@ -133,17 +304,22 @@ fn inspect_file(
             .ok()
             .zip(after.modified().ok())
             .is_some_and(|(a, b)| a == b)
+        && before.modified().ok() == named.modified().ok()
         && !named.file_type().is_symlink()
         && named.is_file();
     #[cfg(unix)]
     let stable = {
         use std::os::unix::fs::MetadataExt;
-        stable && before.dev() == named.dev() && before.ino() == named.ino()
+        stable
+            && before.dev() == named.dev()
+            && before.ino() == named.ino()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
     };
     if !stable || stop.is_cancelled() {
         return Err(unavailable());
     }
-    parse(id, bytes)
+    Ok(snapshot)
 }
 
 fn is_human(record: &Value) -> bool {
@@ -177,19 +353,44 @@ fn message_text(record: &Value) -> Option<String> {
     Some(text)
 }
 
-fn parse(id: &str, bytes: Vec<u8>) -> Result<NativeSnapshot, AgentError> {
-    let mut records = HashMap::new();
+// Only the active ancestry counts as recoverable context. Keep locations,
+// never tool payloads, for abandoned branches and out-of-order records.
+struct Location {
+    offset: u64,
+    length: usize,
+    parent: Result<Option<String>, ()>,
+    human: bool,
+}
+
+fn active_branch(
+    id: &str,
+    mut reader: impl BufRead,
+    length: u64,
+    stop: &CancellationToken,
+) -> Result<Option<index::Branch>, AgentError> {
+    let mut records = index::Index::new();
     let mut active_leaf: Option<Option<String>> = None;
     let mut metadata_only = true;
-    for (index, line) in bytes
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .enumerate()
-    {
-        if index >= MAX_RECORDS {
+    let mut line = Vec::new();
+    let mut offset = 0;
+    while offset < length {
+        if stop.is_cancelled() {
             return Err(unavailable());
         }
-        let record: Value = serde_json::from_slice(line).map_err(|_| unavailable())?;
+        line.clear();
+        let bytes = (&mut reader)
+            .take(MAX_RECORD_BYTES + 1)
+            .read_until(b'\n', &mut line)
+            .map_err(|_| unavailable())?;
+        let start = offset;
+        offset += bytes as u64;
+        if bytes as u64 > MAX_RECORD_BYTES || offset > length || !line.ends_with(b"\n") {
+            return Err(unavailable());
+        }
+        if bytes == 1 {
+            continue;
+        }
+        let record: Value = serde_json::from_slice(&line).map_err(|_| unavailable())?;
         if record["sessionId"]
             .as_str()
             .is_some_and(|native| native != id)
@@ -250,7 +451,7 @@ fn parse(id: &str, bytes: Vec<u8>) -> Result<NativeSnapshot, AgentError> {
         {
             active_leaf = Some(match &record["leafUuid"] {
                 Value::Null => None,
-                Value::String(leaf) if !leaf.is_empty() => Some(leaf.clone()),
+                Value::String(leaf) if !leaf.is_empty() && leaf.len() <= 256 => Some(leaf.clone()),
                 _ => return Err(unavailable()),
             });
         }
@@ -261,32 +462,89 @@ fn parse(id: &str, bytes: Vec<u8>) -> Result<NativeSnapshot, AgentError> {
             metadata_only = false;
         }
         if let Some(uuid) = record["uuid"].as_str() {
-            if uuid.is_empty()
-                || uuid.len() > 256
-                || records.insert(uuid.to_owned(), record).is_some()
-            {
+            let parent = match &record["parentUuid"] {
+                Value::Null => Ok(None),
+                Value::String(parent) if !parent.is_empty() && parent.len() <= 256 => {
+                    Ok(Some(parent.clone()))
+                }
+                _ => Err(()),
+            };
+            let location = Location {
+                offset: start,
+                length: bytes,
+                parent,
+                human: is_human(&record),
+            };
+            if uuid.is_empty() || uuid.len() > 256 {
                 return Err(unavailable());
             }
+            records.insert(uuid, location, stop)?;
         }
     }
-    drop(bytes);
     let Some(leaf) = active_leaf else {
         return Err(unavailable());
     };
-    let Some(mut next) = leaf else {
+    let Some(next) = leaf else {
         return if metadata_only && records.is_empty() {
-            Ok(NativeSnapshot::empty(id))
+            Ok(None)
         } else {
             Err(unavailable())
         };
     };
-    let mut seen = HashSet::new();
-    let mut branch = Vec::new();
-    loop {
-        if !seen.insert(next.clone()) {
+    records.trace(next, stop).map(Some)
+}
+
+fn inspect_reader(
+    id: &str,
+    mut reader: impl BufRead + Seek,
+    length: u64,
+    stop: &CancellationToken,
+) -> Result<NativeSnapshot, AgentError> {
+    let Some(branch) = active_branch(id, &mut reader, length, stop)? else {
+        return Ok(NativeSnapshot::empty(id));
+    };
+    let mut line = Vec::new();
+    let current_turn = branch.current_turn;
+    let mut position = None;
+    let mut read_record = |offset, length, line: &mut Vec<u8>| -> Result<Value, AgentError> {
+        if stop.is_cancelled() {
             return Err(unavailable());
         }
-        let record = records.remove(&next).ok_or_else(unavailable)?;
+        if position != Some(offset) {
+            reader
+                .seek(SeekFrom::Start(offset))
+                .map_err(|_| unavailable())?;
+        }
+        position = Some(offset + length as u64);
+        line.resize(length, 0);
+        reader.read_exact(line).map_err(|_| unavailable())?;
+        serde_json::from_slice(line).map_err(|_| unavailable())
+    };
+    let (leaf_offset, leaf_length, _) = branch.at(branch.len - 1)?;
+    let final_message = {
+        let leaf = read_record(leaf_offset, leaf_length, &mut line)?;
+        if leaf["type"].as_str() == Some("assistant")
+            && leaf.pointer("/message/stop_reason").and_then(Value::as_str) == Some("end_turn")
+            && leaf["aborted"].as_bool() != Some(true)
+            && leaf["isApiErrorMessage"].as_bool() != Some(true)
+        {
+            Some(
+                leaf.pointer("/message/id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(unavailable)?
+                    .to_owned(),
+            )
+        } else {
+            None
+        }
+    };
+    let mut last_assistant = final_message.as_ref().map(|_| String::new());
+    let mut last_user = None;
+    let mut entries = crate::agents::adapters::acp::recovery::RecoveryEntries::default();
+    let mut turn = Sha256::new();
+    for index in 0..branch.len {
+        let (offset, size, human) = branch.at(index)?;
+        let record = read_record(offset, size, &mut line)?;
         if record["sessionId"].as_str() != Some(id)
             || record["isSidechain"].as_bool() == Some(true)
             || !record["agentId"].is_null()
@@ -307,62 +565,47 @@ fn parse(id: &str, bytes: Vec<u8>) -> Result<NativeSnapshot, AgentError> {
         {
             return Err(unavailable());
         }
-        let parent = record["parentUuid"].clone();
-        branch.push(record);
-        match parent {
-            Value::Null => break,
-            Value::String(parent) if !parent.is_empty() => next = parent,
-            _ => return Err(unavailable()),
-        }
-    }
-    branch.reverse();
-    let mut entries = Vec::new();
-    let mut current = Vec::new();
-    let mut last_user = None;
-    for record in branch {
-        if is_human(&record) {
-            if !current.is_empty() {
-                entries.push(Value::Array(std::mem::take(&mut current)));
+        if human {
+            if index != 0 {
+                entries.push(Value::String(hex::encode(turn.finalize_reset())));
             }
             let text = message_text(&record).ok_or_else(unavailable)?;
             if record.pointer("/humanInput/text").and_then(Value::as_str) != Some(text.as_str()) {
                 return Err(unavailable());
             }
-            last_user = Some(text);
-        }
-        current.push(record);
-    }
-    let last = current.last().ok_or_else(unavailable)?;
-    let completed = last["type"].as_str() == Some("assistant")
-        && last.pointer("/message/stop_reason").and_then(Value::as_str) == Some("end_turn")
-        && last["aborted"].as_bool() != Some(true)
-        && last["isApiErrorMessage"].as_bool() != Some(true);
-    let last_assistant = if completed {
-        let message_id = last
-            .pointer("/message/id")
-            .and_then(Value::as_str)
-            .ok_or_else(unavailable)?;
-        let mut text = String::new();
-        for record in &current {
-            if record["type"].as_str() == Some("assistant")
-                && record.pointer("/message/id").and_then(Value::as_str) == Some(message_id)
-            {
-                if record["aborted"].as_bool() == Some(true)
-                    || record["isApiErrorMessage"].as_bool() == Some(true)
-                {
-                    return Err(unavailable());
-                }
-                text.push_str(&message_text(record).ok_or_else(unavailable)?);
+            if index == current_turn {
+                last_user = Some(text);
             }
         }
-        Some(text)
-    } else {
-        None
-    };
-    entries.push(Value::Array(current));
+        // Fixed-width hashes frame records unambiguously. Hash the complete
+        // normalized JSON, including tool input, output and reasoning.
+        line.clear();
+        serde_json::to_writer(&mut line, &record).map_err(|_| unavailable())?;
+        turn.update(Sha256::digest(&line));
+        if index >= current_turn
+            && record["type"].as_str() == Some("assistant")
+            && final_message
+                .as_deref()
+                .is_some_and(|id| record.pointer("/message/id").and_then(Value::as_str) == Some(id))
+        {
+            if record["aborted"].as_bool() == Some(true)
+                || record["isApiErrorMessage"].as_bool() == Some(true)
+            {
+                return Err(unavailable());
+            }
+            let text = message_text(&record).ok_or_else(unavailable)?;
+            let joined = last_assistant.as_mut().ok_or_else(unavailable)?;
+            if joined.len().saturating_add(text.len()) as u64 > MAX_RECORD_BYTES {
+                return Err(unavailable());
+            }
+            joined.push_str(&text);
+        }
+    }
+    entries.push(Value::String(hex::encode(turn.finalize())));
     Ok(NativeSnapshot {
         session_id: id.into(),
-        entries,
+        entries: Vec::new(),
+        streamed: Some(entries.finish()),
         last_user,
         last_assistant,
     })
@@ -377,7 +620,7 @@ mod tests {
     async fn cancelling_the_waiter_does_not_admit_a_second_unfinished_read() {
         let (entered, started) = tokio::sync::oneshot::channel();
         let (release, blocked) = std::sync::mpsc::channel();
-        let first = tokio::spawn(inspect_owned(move || {
+        let first = tokio::spawn(inspect_owned(CancellationToken::new(), move || {
             let _ = entered.send(());
             blocked.recv().map_err(|_| unavailable())?;
             Ok(())
@@ -385,9 +628,20 @@ mod tests {
         started.await.unwrap();
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        let cancelled = inspect_owned(stopped, || -> Result<(), AgentError> {
+            panic!("cancelled reader started")
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), cancelled)
+                .await
+                .unwrap()
+                .is_err()
+        );
         let second_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let observed = second_entered.clone();
-        let second = tokio::spawn(inspect_owned(move || {
+        let second = tokio::spawn(inspect_owned(CancellationToken::new(), move || {
             observed.store(true, std::sync::atomic::Ordering::Release);
             Ok(())
         }));
@@ -402,6 +656,15 @@ mod tests {
         assert!(second_entered.load(std::sync::atomic::Ordering::Acquire));
     }
 
+    fn parse(id: &str, bytes: Vec<u8>) -> Result<NativeSnapshot, AgentError> {
+        let length = bytes.len() as u64;
+        inspect_reader(
+            id,
+            std::io::Cursor::new(bytes),
+            length,
+            &CancellationToken::new(),
+        )
+    }
     fn bytes(rows: &[Value]) -> Vec<u8> {
         rows.iter()
             .map(|row| serde_json::to_string(row).unwrap() + "\n")
@@ -430,7 +693,7 @@ mod tests {
             .is_some_and(|text| !text.is_empty()));
         println!(
             "verified native active branch: turns={}, checkpoint={}",
-            snapshot.entries.len(),
+            snapshot.checkpoint().entries,
             snapshot.checkpoint().digest
         );
     }
@@ -463,7 +726,7 @@ mod tests {
             json!({"type":"runtime-config","sessionId":"same","model":"latest"}),
         ];
         let snapshot = parse("same", bytes(&rows)).unwrap();
-        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.checkpoint().entries, 1);
         assert_eq!(snapshot.last_user.as_deref(), Some("question"));
         assert_eq!(snapshot.last_assistant.as_deref(), Some("answer"));
         let mut cancelled = rows.clone();
@@ -487,12 +750,145 @@ mod tests {
         assert!(parse("other", bytes(&rows)).is_err());
     }
     #[test]
+    fn large_active_history_proves_only_an_extension_of_the_original_turn() {
+        use crate::agents::adapters::acp::recovery::{text_digest, TurnEvidence};
+        use std::io::{BufWriter, Write};
+        let dir =
+            std::env::temp_dir().join(format!("muqun-qoder-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("same.jsonl");
+        let first = vec![
+            human("old", Value::Null),
+            assistant(
+                "old-answer",
+                "old",
+                json!("end_turn"),
+                json!([{"type":"text","text":"first"}]),
+            ),
+            json!({"type":"active-leaf","sessionId":"same","leafUuid":"old-answer"}),
+        ];
+        std::fs::write(&path, bytes(&first)).unwrap();
+        let stop = CancellationToken::new();
+        let before = inspect_file(&path, "same", &stop).unwrap().checkpoint();
+        {
+            let mut writer = BufWriter::new(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap(),
+            );
+            writeln!(writer, "{}", human("new", json!("old-answer"))).unwrap();
+            let mut parent = "new".to_string();
+            let payload = "x".repeat(1024 * 1024);
+            for i in 0..65 {
+                let uuid = format!("result-{i}");
+                writeln!(writer,r#"{{"type":"user","sessionId":"same","uuid":"{}","parentUuid":"{}","message":{{"content":[{{"type":"tool_result","content":"{}"}}]}}}}"#,uuid,parent,payload).unwrap();
+                parent = uuid;
+            }
+            writeln!(
+                writer,
+                "{}",
+                assistant(
+                    "answer",
+                    &parent,
+                    json!("end_turn"),
+                    json!([{"type":"text","text":"second"}])
+                )
+            )
+            .unwrap();
+            writeln!(
+                writer,
+                r#"{{"type":"active-leaf","sessionId":"same","leafUuid":"answer"}}"#
+            )
+            .unwrap();
+            writer.flush().unwrap();
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() > 64 * 1024 * 1024);
+        let after = inspect_file(&path, "same", &stop).unwrap();
+        let expected = TurnEvidence {
+            user_digest: text_digest("question"),
+            assistant_digest: text_digest("second"),
+        };
+        assert!(!after.is_empty());
+        assert!(after.proves_turn("same", &before, &expected));
+        let mut changed = first;
+        changed[1]["message"]["content"][0]["text"] = json!("changed");
+        let other = parse("same", bytes(&changed)).unwrap().checkpoint();
+        assert!(!after.proves_turn("same", &other, &expected));
+        assert!(!after.proves_turn("other", &before, &expected));
+        assert!(inspect_file(&path, "other", &stop).is_err());
+        stop.cancel();
+        assert!(inspect_file(&path, "same", &stop).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn very_long_active_branch_proves_the_next_turn() {
+        use crate::agents::adapters::acp::recovery::{text_digest, TurnEvidence};
+        use std::io::{BufWriter, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same.jsonl");
+        let first = [
+            human("first", Value::Null),
+            assistant(
+                "old",
+                "first",
+                json!("end_turn"),
+                json!([{"type":"text","text":"first"}]),
+            ),
+            json!({"type":"active-leaf","sessionId":"same","leafUuid":"old"}),
+        ];
+        std::fs::write(&path, bytes(&first)).unwrap();
+        let stop = CancellationToken::new();
+        let before = inspect_file(&path, "same", &stop).unwrap().checkpoint();
+        let mut out = BufWriter::new(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+        );
+        writeln!(out, "{}", human("new", json!("old"))).unwrap();
+        let mut parent = "new".to_string();
+        for i in 0..100_001 {
+            writeln!(out,r#"{{"type":"attachment","sessionId":"same","uuid":"n{i}","parentUuid":"{parent}","attachment":{{"type":"environment"}}}}"#).unwrap();
+            parent = format!("n{i}");
+        }
+        writeln!(
+            out,
+            "{}",
+            assistant(
+                "final",
+                &parent,
+                json!("end_turn"),
+                json!([{"type":"text","text":"second"}])
+            )
+        )
+        .unwrap();
+        writeln!(
+            out,
+            r#"{{"type":"active-leaf","sessionId":"same","leafUuid":"final"}}"#
+        )
+        .unwrap();
+        out.flush().unwrap();
+        let after = inspect_file(&path, "same", &stop).unwrap();
+        assert!(after.proves_turn(
+            "same",
+            &before,
+            &TurnEvidence {
+                user_digest: text_digest("question"),
+                assistant_digest: text_digest("second"),
+            }
+        ));
+    }
+
+    #[test]
     fn verified_empty_metadata_is_distinct_from_unknown_or_dangling_history() {
         let empty = vec![
             json!({"type":"active-leaf","sessionId":"same","leafUuid":null}),
             json!({"type":"runtime-config","sessionId":"same"}),
         ];
-        assert!(parse("same", bytes(&empty)).unwrap().entries.is_empty());
+        assert!(parse("same", bytes(&empty)).unwrap().is_empty());
         let mut hidden = empty;
         hidden.push(human("u", Value::Null));
         assert!(parse("same", bytes(&hidden)).is_err());

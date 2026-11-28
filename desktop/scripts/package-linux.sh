@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Assemble a local Linux candidate. This does not publish or tag a release.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+[[ "$(uname -s)" == Linux ]] || { echo 'Linux packaging requires Linux' >&2; exit 1; }
+if [[ "${1:-}" != --no-build ]]; then
+  [[ $# == 0 ]] || { echo 'usage: package-linux.sh [--no-build]' >&2; exit 1; }
+  bash "$ROOT/desktop/scripts/build-release.sh"
+fi
+[[ $# -le 1 ]] || exit 1
+BIN="${CARGO_TARGET_DIR:-$ROOT/target}/release/muqun-desktop"
+OUT="${CARGO_TARGET_DIR:-$ROOT/target}/desktop-package"
+mkdir -p "$OUT"
+STAGE="$(mktemp -d "$OUT/stage.XXXXXX")"
+trap 'rm -rf -- "$STAGE"' EXIT
+NAME="muqun-desktop-linux-$(uname -m)"
+PKG="$STAGE/$NAME"
+mkdir -p "$PKG/bin" "$PKG/desktop/scripts" "$PKG/desktop/packaging" "$PKG/desktop/assets/plugins/review-center"
+cp "$ROOT/install-desktop.sh" "$ROOT/install.sh" "$PKG/"
+cp "$BIN" "$PKG/bin/muqun-desktop"
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$PKG/bin/muqun-desktop-install" "$ROOT"/desktop/installer/*.go
+cp "$(dirname "$BIN")/muqun-wry-embedded" "$PKG/bin/"
+cp "$ROOT/desktop/scripts/install-local.sh" "$ROOT/desktop/scripts/uninstall-local.sh" "$PKG/desktop/scripts/"
+cp -R "$ROOT/desktop/packaging/linux" "$PKG/desktop/packaging/"
+cp "$ROOT/desktop/assets/plugins/review-center/plugin.json" "$ROOT/desktop/assets/plugins/review-center/review.ts" "$ROOT/desktop/assets/plugins/review-center/README.md" "$PKG/desktop/assets/plugins/review-center/"
+cp "$ROOT/desktop/README.md" "$PKG/README.md"
+cp "$ROOT/LICENSE" "$ROOT/LICENSE-MIT" "$ROOT/desktop/assets/glyphs/LICENSE-octicons" "$PKG/"
+cargo metadata --locked --no-deps --format-version 1 --manifest-path "$ROOT/desktop/Cargo.toml" |
+  python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "muqun-desktop"))' > "$PKG/VERSION"
+git -C "$ROOT" rev-parse HEAD > "$PKG/SOURCE"
+if [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then
+  printf 'dirty working tree; local candidate only\n' >> "$PKG/SOURCE"
+fi
+tar -cf - -C "$STAGE" "$NAME" | gzip -9n > "$OUT/$NAME.tar.gz"
+(cd "$OUT" && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+printf 'Created %s\nInstall after extraction: bash %s/desktop/scripts/install-local.sh --no-build\n' "$OUT/$NAME.tar.gz" "$NAME"

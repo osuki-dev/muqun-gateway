@@ -67,54 +67,209 @@ pub(crate) fn spawn(state: AppState) {
 /// One pass: tell every idle parent its child's untold state. How many were told.
 pub(crate) async fn deliver(state: &AppState) -> usize {
     let since = now_ms().saturating_sub(LOOKBACK.as_millis() as u64);
-    let pending = match state.tasks.pending_notices(since, BATCH).await {
+    let pending = match state.tasks.pending_notices_with_barrier(since, BATCH).await {
         Ok(pending) => pending,
         Err(error) => {
             tracing::debug!(%error, "notices: pending lookup failed");
             return 0;
         }
     };
-    let mut told = 0;
-    for (child, target) in pending {
-        let readiness = match parent_ended(state, &child).await {
-            Some(why) => Ready::Never(why),
-            None => ready(state, &child, &target).await,
-        };
-        match readiness {
-            Ready::NotYet => continue,
-            // The record is the Home row and the parent's own summary.
-            Ready::Never(why) => {
-                tracing::info!(task = %child.id.0, why, "notices: the parent is not told");
-                state.tasks.told_task(&child).await;
+    let mut immediate = Vec::new();
+    let mut group_index: std::collections::HashMap<(NoticeTarget, String), usize> =
+        std::collections::HashMap::new();
+    let mut barrier_groups: Vec<(NoticeTarget, String, Vec<Task>)> = Vec::new();
+    for item in pending {
+        // A child waiting for input surfaces right away so it never deadlocks a batch.
+        if item.task.state != TaskState::Waiting {
+            if let Some(group) = item.barrier_group {
+                let key = (item.target.clone(), group.clone());
+                if let Some(&idx) = group_index.get(&key) {
+                    barrier_groups[idx].2.push(item.task);
+                } else {
+                    group_index.insert(key, barrier_groups.len());
+                    barrier_groups.push((item.target, group, vec![item.task]));
+                }
                 continue;
             }
-            Ready::Now => {}
         }
-        let line = message(state, &child).await;
-        match send(state, &child, &target, &line).await {
-            Ok(Sent::Delivered) => {
-                state.tasks.told_task(&child).await;
-                told += 1;
-            }
-            // Not in front right now: tried again on a later pass, for a while.
-            Ok(Sent::Withdrawn(why)) if recent(&child) => {
-                tracing::info!(task = %child.id.0, why, "notices: the parent is told later");
-            }
-            Ok(Sent::Withdrawn(why)) => {
-                tracing::info!(task = %child.id.0, why, "notices: the parent is not told");
-                state.tasks.told_task(&child).await;
-            }
-            // A send that failed is tried again within the same hour, no longer.
-            Err(error) if recent(&child) => {
-                tracing::debug!(task = %child.id.0, %error, "notices: not told yet")
-            }
+        immediate.push((item.task, item.target));
+    }
+
+    let mut told = 0;
+    for (child, target) in immediate {
+        told += deliver_one(state, child, &target).await;
+    }
+    for (target, group, mut children) in barrier_groups {
+        children.sort_by_key(|t| (t.created_ms, t.seq));
+        let all_members = match state
+            .tasks
+            .barrier_group_tasks(&target, &group, since)
+            .await
+        {
+            Ok(members) => members,
             Err(error) => {
-                tracing::info!(task = %child.id.0, %error, "notices: the parent is not told");
-                state.tasks.told_task(&child).await;
+                tracing::debug!(%error, barrier_group = %group, "notices: barrier lookup failed");
+                continue;
             }
+        };
+        if all_members
+            .iter()
+            .any(|member| !REPORTED_STATES.contains(&member.state))
+        {
+            // At least one sibling in this barrier group is still running; hold
+            // until the whole batch settles so the parent wakes only once.
+            continue;
         }
+        told += deliver_barrier_group(state, &target, &group, all_members.len(), children).await;
     }
     told
+}
+
+async fn deliver_one(state: &AppState, child: Task, target: &NoticeTarget) -> usize {
+    let readiness = match parent_ended(state, &child).await {
+        Some(why) => Ready::Never(why),
+        None => ready(state, &child, target).await,
+    };
+    match readiness {
+        Ready::NotYet => return 0,
+        // The record is the Home row and the parent's own summary.
+        Ready::Never(why) => {
+            tracing::info!(task = %child.id.0, why, "notices: the parent is not told");
+            state.tasks.told_task(&child).await;
+            return 0;
+        }
+        Ready::Now => {}
+    }
+    let line = message(state, &child).await;
+    match send(state, &child, target, &line).await {
+        Ok(Sent::Delivered) => {
+            state.tasks.told_task(&child).await;
+            1
+        }
+        // Not in front right now: tried again on a later pass, for a while.
+        Ok(Sent::Withdrawn(why)) if recent(&child) => {
+            tracing::info!(task = %child.id.0, why, "notices: the parent is told later");
+            0
+        }
+        Ok(Sent::Withdrawn(why)) => {
+            tracing::info!(task = %child.id.0, why, "notices: the parent is not told");
+            state.tasks.told_task(&child).await;
+            0
+        }
+        // A send that failed is tried again within the same hour, no longer.
+        Err(error) if recent(&child) => {
+            tracing::debug!(task = %child.id.0, %error, "notices: not told yet");
+            0
+        }
+        Err(error) => {
+            tracing::info!(task = %child.id.0, %error, "notices: the parent is not told");
+            state.tasks.told_task(&child).await;
+            0
+        }
+    }
+}
+
+async fn deliver_barrier_group(
+    state: &AppState,
+    target: &NoticeTarget,
+    group: &str,
+    total_members: usize,
+    children: Vec<Task>,
+) -> usize {
+    if children.is_empty() {
+        return 0;
+    }
+    let mut active_children = Vec::with_capacity(children.len());
+    for child in children {
+        if let Some(why) = parent_ended(state, &child).await {
+            tracing::info!(task = %child.id.0, barrier_group = %group, why, "notices: the parent is not told");
+            state.tasks.told_task(&child).await;
+        } else {
+            active_children.push(child);
+        }
+    }
+    if active_children.is_empty() {
+        return 0;
+    }
+    let lead = &active_children[0];
+    match ready(state, lead, target).await {
+        Ready::NotYet => return 0,
+        Ready::Never(why) => {
+            for child in &active_children {
+                tracing::info!(task = %child.id.0, barrier_group = %group, why, "notices: the parent is not told");
+                state.tasks.told_task(child).await;
+            }
+            return 0;
+        }
+        Ready::Now => {}
+    }
+    let line = if active_children.len() == 1 {
+        message(state, &active_children[0]).await
+    } else {
+        batch_message(
+            state,
+            group,
+            total_members.max(active_children.len()),
+            &active_children,
+        )
+        .await
+    };
+    let any_recent = active_children.iter().any(recent);
+    match send(state, lead, target, &line).await {
+        Ok(Sent::Delivered) => {
+            let count = active_children.len();
+            for child in &active_children {
+                state.tasks.told_task(child).await;
+            }
+            count
+        }
+        Ok(Sent::Withdrawn(why)) if any_recent => {
+            tracing::info!(barrier_group = %group, why, "notices: the parent is told later");
+            0
+        }
+        Ok(Sent::Withdrawn(why)) => {
+            for child in &active_children {
+                tracing::info!(task = %child.id.0, barrier_group = %group, why, "notices: the parent is not told");
+                state.tasks.told_task(child).await;
+            }
+            0
+        }
+        Err(error) if any_recent => {
+            tracing::debug!(barrier_group = %group, %error, "notices: batch not told yet");
+            0
+        }
+        Err(error) => {
+            for child in &active_children {
+                tracing::info!(task = %child.id.0, barrier_group = %group, %error, "notices: the parent is not told");
+                state.tasks.told_task(child).await;
+            }
+            0
+        }
+    }
+}
+
+/// Consolidated single-line parent wakeup for a settled parallel `barrier_group`.
+pub(crate) async fn batch_message(
+    state: &AppState,
+    group: &str,
+    total_members: usize,
+    children: &[Task],
+) -> String {
+    let label = one_plain_line(group, 80);
+    let label = label.trim_start_matches(['/', '!', ':', ' ']);
+    let header = format!(
+        "Parallel batch \"{label}\" settled ({}/{}): ",
+        children.len(),
+        total_members
+    );
+    let per_item_budget =
+        (MAX_RESULT_CHARS.saturating_sub(header.len()) / children.len().max(1)).clamp(120, 1200);
+    let mut parts = Vec::with_capacity(children.len());
+    for (idx, child) in children.iter().enumerate() {
+        let entry = one_plain_line(&message(state, child).await, per_item_budget);
+        parts.push(format!("[{}] {}", idx + 1, entry));
+    }
+    one_plain_line(&format!("{header}{}", parts.join(" | ")), MAX_RESULT_CHARS)
 }
 
 /// How a send ended.
@@ -476,10 +631,10 @@ pub(crate) async fn message(state: &AppState, child: &Task) -> String {
         }
         _ => None,
     };
-    let result = one_plain_line(
+    let (redacted_raw, _) = crate::mcp::reducer::redact_secrets(
         &answer.or_else(|| child.summary.clone()).unwrap_or_default(),
-        MAX_RESULT_CHARS,
     );
+    let result = one_plain_line(&redacted_raw, MAX_RESULT_CHARS);
     let (how, fallback) = match child.state {
         TaskState::Done => ("finished", "it is done."),
         TaskState::Waiting => ("needs an answer", "it is waiting for you."),
@@ -906,5 +1061,99 @@ mod tests {
             ),
             "mini finished: see ＠src/main.rs and ＠.env, ask ＠alice or bob@x.org"
         );
+    }
+
+    #[tokio::test]
+    async fn barrier_group_holds_until_all_siblings_settle_then_wakes_parent_once() {
+        let app = test_state("admin", vec![test_device("d1", "token")]);
+        let agent = FakeAgent::new("opencode").with_sessions(&[("ses_parent", 1)]);
+        let prompts = agent.prompts.clone();
+        app.agent_runtime.attach_for_test(agent.manager()).await;
+        let parent = NoticeTarget::Session {
+            agent_id: "opencode".into(),
+            asid: "ses_parent".into(),
+        };
+
+        let first = app
+            .tasks
+            .insert_for_test(&child(TaskState::Done, Some("lint passed")))
+            .await;
+        let second = app
+            .tasks
+            .insert_for_test(&child(TaskState::Working, None))
+            .await;
+        app.tasks
+            .notify_with_barrier(&first, &parent, Some("verify-batch"))
+            .await;
+        app.tasks
+            .notify_with_barrier(&second, &parent, Some("verify-batch"))
+            .await;
+
+        // First task finished, second still working: parent must NOT be woken yet.
+        assert_eq!(deliver(&app).await, 0);
+        assert!(prompts.lock().unwrap().is_empty());
+
+        // Second task settles: parent wakes ONCE with both summaries consolidated.
+        app.tasks
+            .complete(
+                &second,
+                "tests passed",
+                crate::tasks::service::Outcome::Done,
+            )
+            .await
+            .unwrap();
+        assert_eq!(deliver(&app).await, 2);
+        {
+            let sent = prompts.lock().unwrap();
+            assert_eq!(
+                sent.len(),
+                1,
+                "expected single consolidated wakeup: {sent:?}"
+            );
+            let line = &sent[0];
+            assert!(
+                line.contains("Parallel batch \"verify-batch\" settled (2/2):"),
+                "{line}"
+            );
+            assert!(line.contains("lint passed"), "{line}");
+            assert!(line.contains("tests passed"), "{line}");
+        }
+
+        // Subsequent passes do not re-notify.
+        assert_eq!(deliver(&app).await, 0);
+        assert!(app.tasks.pending_notices(0, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn barrier_group_surfaces_waiting_child_immediately() {
+        let app = test_state("admin", vec![test_device("d1", "token")]);
+        let agent = FakeAgent::new("opencode").with_sessions(&[("ses_parent", 1)]);
+        let prompts = agent.prompts.clone();
+        app.agent_runtime.attach_for_test(agent.manager()).await;
+        let parent = NoticeTarget::Session {
+            agent_id: "opencode".into(),
+            asid: "ses_parent".into(),
+        };
+
+        let blocked = app
+            .tasks
+            .insert_for_test(&child(TaskState::Waiting, Some("need API key")))
+            .await;
+        let running = app
+            .tasks
+            .insert_for_test(&child(TaskState::Working, None))
+            .await;
+        app.tasks
+            .notify_with_barrier(&blocked, &parent, Some("deploy-batch"))
+            .await;
+        app.tasks
+            .notify_with_barrier(&running, &parent, Some("deploy-batch"))
+            .await;
+
+        // Waiting child surfaces right away so the batch never deadlocks on user input.
+        assert_eq!(deliver(&app).await, 1);
+        let sent = prompts.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("need API key"), "{sent:?}");
     }
 }

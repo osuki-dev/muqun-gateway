@@ -145,6 +145,17 @@ fn probe_login_shell() -> Option<LoginEnvironment> {
     Some(parse_probe(&stdout))
 }
 
+/// Cached `PATH` reported by the user's login shell, probed at most once per process.
+pub fn login_path() -> Option<String> {
+    if std::env::var("MUQUN_NO_LOGIN_ENV").is_ok() {
+        return None;
+    }
+    static LOGIN_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    LOGIN_PATH
+        .get_or_init(|| probe_login_shell().and_then(|env| env.path))
+        .clone()
+}
+
 /// The user's login shell as the probes run it: `$SHELL` when it is a
 /// POSIX shell, else `/bin/sh`.
 pub(crate) fn user_shell() -> String {

@@ -291,6 +291,17 @@ pub struct TimelineItem {
     /// Measured throughput of this settled assistant message, never session totals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<MessageGeneration>,
+    /// The paired device that sent this user message through the gateway.
+    /// Absent for prompts typed in the agent's own terminal or UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<MessageOrigin>,
+}
+
+/// The device a presented user message came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageOrigin {
+    pub device_id: String,
+    pub name: String,
 }
 
 /// Optional normalized metrics supported by `agent_message_generation_v1`.

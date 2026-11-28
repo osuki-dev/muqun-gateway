@@ -75,7 +75,7 @@ pub(crate) fn upload_parts(
     let transcript = append_attachment_paths(text, &paths);
     let mut content = vec![json!({"type":"text","text":transcript})];
     let mut files = Vec::with_capacity(paths.len());
-    let mut total = transcript.len();
+    let mut total = 0usize;
     for path in &paths {
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
@@ -90,7 +90,10 @@ pub(crate) fn upload_parts(
         let metadata = file
             .metadata()
             .map_err(|_| invalid("upload is unreadable"))?;
-        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_PROMPT_BYTES as u64 {
+        if !metadata.is_file()
+            || metadata.len() == 0
+            || metadata.len() > crate::platform::uploads::MAX_UPLOAD_BYTES as u64
+        {
             return Err(invalid(
                 "ACP uploads must be bounded nonempty regular files",
             ));
@@ -98,8 +101,8 @@ pub(crate) fn upload_parts(
         let length = metadata.len() as usize;
         // Bound cumulative reads before allocating, including unsupported inputs.
         total = total.saturating_add(length);
-        if total > MAX_PROMPT_BYTES {
-            return Err(invalid("ACP attachments exceed the prompt byte budget"));
+        if total > crate::platform::uploads::MAX_UPLOAD_BYTES {
+            return Err(invalid("ACP uploads exceed the 25 MiB attachment budget"));
         }
         let mut bytes = Vec::with_capacity(length);
         (&mut file)
@@ -108,6 +111,19 @@ pub(crate) fn upload_parts(
             .map_err(|_| invalid("upload is unreadable"))?;
         if bytes.len() != length {
             return Err(invalid("upload changed while preparing the prompt"));
+        }
+        // The local ACP process receives the checked host path in the text part.
+        // Office containers and PDFs do not need an embedded binary resource.
+        let document = crate::platform::uploads::sniff_office_upload_kind(&bytes).or_else(|| {
+            crate::platform::uploads::sniff_document_upload_kind(&bytes, path)
+                .filter(|kind| matches!(kind.mime, "application/pdf" | "application/rtf"))
+        });
+        if let Some(kind) = document {
+            files.push(crate::agents::adapters::inbox::file_entry(
+                path,
+                Some(kind.mime),
+            ));
+            continue;
         }
         if let Some(kind) = crate::platform::uploads::sniff_upload_kind(&bytes) {
             if !capabilities.images {
@@ -139,10 +155,8 @@ pub(crate) fn upload_parts(
                     "this ACP agent did not advertise embedded file content".into(),
                 ));
             }
-            if bytes.starts_with(b"%PDF-") || !crate::looks_textual(&bytes) {
-                return Err(invalid(
-                    "this ACP agent accepts images and UTF-8 text uploads, not binary documents",
-                ));
+            if !crate::looks_textual(&bytes) {
+                return Err(invalid("unrecognized binary attachment"));
             }
             let text = std::str::from_utf8(&bytes)
                 .map_err(|_| invalid("ACP text uploads must be valid UTF-8"))?;
@@ -374,15 +388,35 @@ mod tests {
             PromptCapabilities::default()
         )
         .is_err());
-        for (name, bytes) in [
-            ("data.pdf", b"%PDF-1.7\nexample".as_slice()),
-            ("data.bin", b"binary\0body".as_slice()),
+        let path = root.0.join("fake.doc");
+        std::fs::write(&path, b"binary\0body").unwrap();
+        assert!(upload_parts("", &[path.to_string_lossy().into_owned()], &root.0, caps()).is_err());
+    }
+
+    #[test]
+    fn office_and_pdf_uploads_reach_local_acp_as_checked_paths() {
+        let root = scratch();
+        for (name, bytes, mime) in [
+            (
+                "report.doc",
+                crate::platform::uploads::legacy_office_fixture("doc"),
+                "application/msword",
+            ),
+            ("report.pdf", b"%PDF-1.7".to_vec(), "application/pdf"),
         ] {
             let path = root.0.join(name);
             std::fs::write(&path, bytes).unwrap();
-            assert!(
-                upload_parts("", &[path.to_string_lossy().into_owned()], &root.0, caps()).is_err()
-            );
+            let path = path.to_string_lossy().into_owned();
+            let prompt = upload_parts(
+                "read it",
+                std::slice::from_ref(&path),
+                &root.0,
+                PromptCapabilities::default(),
+            )
+            .unwrap();
+            assert_eq!(prompt.content.len(), 1);
+            assert!(prompt.content[0]["text"].as_str().unwrap().contains(&path));
+            assert_eq!(prompt.files[0]["mime"], mime);
         }
     }
     #[test]

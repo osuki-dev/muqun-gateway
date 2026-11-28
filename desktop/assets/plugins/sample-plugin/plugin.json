@@ -1,0 +1,28 @@
+{
+  "id": "sample-plugin",
+  "name": "Sample Workspace Guide",
+  "version": "1.0.0",
+  "description": "An example desktop extension demonstrating file-based plugin configuration, custom commands, and markdown documentation tiles.",
+  "author": "Muqun Team",
+  "category": "extensions",
+  "icon": "task",
+  "commands": [
+    {
+      "id": "sample.welcome",
+      "title": "Welcome Guide",
+      "shortcut": "Ctrl+Shift+G",
+      "action": "Welcome to Muqun Desktop Plugin System!"
+    },
+    {
+      "id": "sample.docs",
+      "title": "Visit Muqun Repository",
+      "shortcut": "Ctrl+Shift+H",
+      "action": "https://github.com/osuki-dev/muqun-gateway"
+    }
+  ],
+  "tile": {
+    "kind": "markdown",
+    "title": "Workspace Guide",
+    "entry": "README.md"
+  }
+}

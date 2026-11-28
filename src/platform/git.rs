@@ -42,6 +42,12 @@ use tokio::process::Command;
 /// is a blank diff screen. Fifteen seconds, and `run` tries once more on a
 /// timeout.
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Network git operations (`fetch`, `pull`, `push`) get a slightly wider bound.
+pub const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum number of local branches returned by [`overview`].
+pub const MAX_LOCAL_BRANCHES: usize = 200;
+/// Maximum commit message size accepted by [`commit`].
+const MAX_COMMIT_MESSAGE_BYTES: usize = 64 * 1024;
 /// One file's patch is a smaller job and is read a page at a time: it keeps
 /// the shorter bound, so a paged read never holds the phone for long.
 pub const PATCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -65,6 +71,8 @@ pub enum GitError {
     /// `git` is not on the gateway's PATH.
     NotInstalled,
     Timeout,
+    /// Client supplied invalid input (bad path, branch name, commit message, or action).
+    InvalidInput(String),
     /// git exited non-zero; the text is for the gateway's log only.
     Failed(String),
 }
@@ -74,6 +82,7 @@ impl std::fmt::Display for GitError {
         match self {
             Self::NotInstalled => formatter.write_str("git is not installed"),
             Self::Timeout => formatter.write_str("git timed out"),
+            Self::InvalidInput(detail) => write!(formatter, "invalid git request: {detail}"),
             Self::Failed(detail) => write!(formatter, "git failed: {detail}"),
         }
     }
@@ -524,6 +533,8 @@ pub struct VcsFile {
     pub path: String,
     pub old_path: Option<String>,
     pub status: VcsStatus,
+    pub staged: bool,
+    pub unstaged: bool,
     /// `None` for an untracked file whose lines were not counted: too big,
     /// past the list's read budget, or not a regular file.
     pub additions: Option<u64>,
@@ -540,6 +551,8 @@ impl VcsFile {
             map.insert("old_path".into(), json!(old_path));
         }
         map.insert("status".into(), json!(self.status.as_str()));
+        map.insert("staged".into(), json!(self.staged));
+        map.insert("unstaged".into(), json!(self.unstaged));
         map.insert("additions".into(), json!(self.additions));
         map.insert("deletions".into(), json!(self.deletions));
         map.insert("binary".into(), json!(self.binary));
@@ -853,6 +866,8 @@ struct Row {
     path: String,
     old_path: Option<String>,
     status: VcsStatus,
+    staged: bool,
+    unstaged: bool,
 }
 
 struct Listing {
@@ -893,6 +908,8 @@ async fn list_rows(
                 status: VcsStatus::of_entry(&entry),
                 path: entry.path,
                 old_path: entry.old_path,
+                staged: entry.staged,
+                unstaged: entry.unstaged,
             });
         }
     }
@@ -939,6 +956,8 @@ async fn list_rows(
                 path,
                 old_path,
                 status: VcsStatus::from_change(status),
+                staged: false,
+                unstaged: false,
             },
         ));
     }
@@ -961,6 +980,8 @@ async fn list_rows(
                 path,
                 old_path: None,
                 status: VcsStatus::Untracked,
+                staged: false,
+                unstaged: true,
             }),
     );
     if let Some(path) = only {
@@ -1018,6 +1039,8 @@ fn file_of(row: Row, counts: &HashMap<String, Counts>) -> VcsFile {
         path: row.path,
         old_path: row.old_path,
         status: row.status,
+        staged: row.staged,
+        unstaged: row.unstaged,
         additions,
         deletions,
         binary,
@@ -1176,6 +1199,8 @@ pub async fn changed_file_patch(
                     path: relative_str,
                     old_path: None,
                     status: VcsStatus::Unchanged,
+                    staged: false,
+                    unstaged: false,
                     additions: Some(0),
                     deletions: 0,
                     binary: false,
@@ -1216,6 +1241,8 @@ pub async fn changed_file_patch(
                 path: row.path,
                 old_path: None,
                 status: VcsStatus::Untracked,
+                staged: false,
+                unstaged: true,
                 additions: Some(additions),
                 deletions: 0,
                 binary,
@@ -1410,6 +1437,619 @@ async fn discard_unless_home(
         DiscardAction::Deleted
     } else {
         DiscardAction::Restored
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Developer Git Workbench operations: overview, staging, checkout, commit,
+// sync, and paginated commit history.
+// ---------------------------------------------------------------------------
+
+/// Parsed `origin` remote information, normalized to a credential-free HTTPS
+/// web URL when possible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteInfo {
+    pub web_url: String,
+    pub host_name: String,
+    pub host_kind: String,
+    pub repo_path: String,
+}
+
+fn classify_remote_host(host: &str) -> &'static str {
+    let lower = host.to_ascii_lowercase();
+    if lower == "github.com" || lower.ends_with(".github.com") {
+        "github"
+    } else if lower == "gitlab.com" || lower.ends_with(".gitlab.com") || lower.contains("gitlab") {
+        "gitlab"
+    } else if lower == "gitea.com"
+        || lower.ends_with(".gitea.com")
+        || lower.contains("gitea")
+        || lower == "codeberg.org"
+    {
+        "gitea"
+    } else if lower == "bitbucket.org"
+        || lower.ends_with(".bitbucket.org")
+        || lower.contains("bitbucket")
+    {
+        "bitbucket"
+    } else {
+        "remote"
+    }
+}
+
+/// Normalize an SSH, git, or HTTP(S) remote URL into a credential-free web URL
+/// and classify its hosting platform. Returns `None` for local paths or
+/// unparseable URLs.
+pub fn parse_remote_url(raw: &str) -> Option<RemoteInfo> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some((scheme, rest)) = trimmed.split_once("://") {
+        let scheme_lower = scheme.to_ascii_lowercase();
+        let (authority, path_part) = rest.split_once('/')?;
+        let host_port = authority.rsplit('@').next().unwrap_or(authority).trim();
+        if host_port.is_empty() {
+            return None;
+        }
+        let repo_path = path_part
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .strip_suffix(".git")
+            .unwrap_or_else(|| path_part.trim_start_matches('/').trim_end_matches('/'))
+            .trim_end_matches('/');
+        if repo_path.is_empty() {
+            return None;
+        }
+        let host_only = strip_port(host_port);
+        if host_only.is_empty() {
+            return None;
+        }
+        let web_url = match scheme_lower.as_str() {
+            "https" | "http" => format!("{scheme_lower}://{host_port}/{repo_path}"),
+            "ssh" | "git" | "git+ssh" => format!("https://{host_only}/{repo_path}"),
+            _ => return None,
+        };
+        return Some(RemoteInfo {
+            web_url,
+            host_name: host_only.to_ascii_lowercase(),
+            host_kind: classify_remote_host(host_only).to_string(),
+            repo_path: repo_path.to_string(),
+        });
+    }
+
+    // SCP-style SSH URL: `[user@]host:org/repo[.git]`
+    if let Some((left, path_part)) = trimmed.split_once(':') {
+        if left.contains('/') || left.is_empty() {
+            return None;
+        }
+        let host_only = left.rsplit('@').next().unwrap_or(left).trim();
+        if host_only.is_empty() || host_only.contains(char::is_whitespace) {
+            return None;
+        }
+        let repo_path = path_part
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .strip_suffix(".git")
+            .unwrap_or_else(|| path_part.trim_start_matches('/').trim_end_matches('/'))
+            .trim_end_matches('/');
+        if repo_path.is_empty() {
+            return None;
+        }
+        return Some(RemoteInfo {
+            web_url: format!("https://{host_only}/{repo_path}"),
+            host_name: host_only.to_ascii_lowercase(),
+            host_kind: classify_remote_host(host_only).to_string(),
+            repo_path: repo_path.to_string(),
+        });
+    }
+
+    None
+}
+
+fn strip_port(host_port: &str) -> &str {
+    if let Some(bracketed) = host_port.strip_prefix('[') {
+        if let Some((ipv6, _)) = bracketed.split_once(']') {
+            return ipv6;
+        }
+        return host_port;
+    }
+    host_port.split(':').next().unwrap_or(host_port)
+}
+
+/// Inspect the `origin` remote URL of `toplevel`, normalized for web display.
+pub async fn origin_remote(toplevel: &Path) -> Result<Option<RemoteInfo>, GitError> {
+    match run(toplevel, &["remote", "get-url", "origin"], &[0]).await {
+        Ok(output) => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            Ok(parse_remote_url(text.trim()))
+        }
+        Err(GitError::Failed(_)) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Repository overview for the Developer Git Workbench.
+#[derive(Debug, Clone)]
+pub struct RepoOverview {
+    pub is_repo: bool,
+    pub repo: Option<RepoSummary>,
+    pub local_branches: Vec<String>,
+    pub remote_url: Option<String>,
+    pub remote_host: Option<String>,
+    pub worktrees: Vec<Worktree>,
+}
+
+impl RepoOverview {
+    pub fn not_a_repo() -> Self {
+        Self {
+            is_repo: false,
+            repo: None,
+            local_branches: Vec::new(),
+            remote_url: None,
+            remote_host: None,
+            worktrees: Vec::new(),
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "is_repo": self.is_repo,
+            "repo": self.repo.as_ref().map(|r| json!({
+                "toplevel": r.toplevel.to_string_lossy(),
+                "branch": r.branch,
+                "upstream": r.upstream,
+                "ahead": r.ahead.unwrap_or(0),
+                "behind": r.behind.unwrap_or(0),
+                "detached": r.detached,
+                "head": r.head,
+                "changed_files": r.changed_files,
+            })),
+            "local_branches": self.local_branches,
+            "remote_url": self.remote_url,
+            "remote_host": self.remote_host,
+            "worktrees": self.worktrees.iter().map(Worktree::to_json).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Assemble the repository overview: branch/ahead/behind summary, sorted local
+/// branches (capped at 200), normalized `origin` remote info, and worktrees.
+pub async fn overview(toplevel: &Path) -> Result<RepoOverview, GitError> {
+    let repo = Box::pin(summary(toplevel)).await?;
+
+    let branches_out = Box::pin(run(
+        toplevel,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        &[0],
+    ))
+    .await?;
+    let mut local_branches: Vec<String> = String::from_utf8_lossy(&branches_out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    local_branches.sort();
+    local_branches.dedup();
+    local_branches.truncate(MAX_LOCAL_BRANCHES);
+
+    let remote = Box::pin(origin_remote(toplevel)).await?;
+    let (remote_url, remote_host) = match remote {
+        Some(info) => (Some(info.web_url), Some(info.host_kind)),
+        None => (None, None),
+    };
+
+    let worktrees = Box::pin(worktrees(toplevel)).await?.worktrees;
+
+    Ok(RepoOverview {
+        is_repo: true,
+        repo: Some(repo),
+        local_branches,
+        remote_url,
+        remote_host,
+        worktrees,
+    })
+}
+
+async fn has_head(toplevel: &Path) -> Result<bool, GitError> {
+    match run_with(
+        toplevel,
+        &["rev-parse", "--verify", "-q", "HEAD^{commit}"],
+        &[0],
+        GIT_TIMEOUT,
+    )
+    .await
+    {
+        Ok(_) => Ok(true),
+        Err(GitError::Failed(_)) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn validate_staged_paths(toplevel: &Path, paths: &[String]) -> Result<Vec<String>, GitError> {
+    if paths.is_empty() {
+        return Err(GitError::InvalidInput(
+            "paths must not be empty when all is false".into(),
+        ));
+    }
+    if paths.len() > MAX_STATUS_FILES {
+        return Err(GitError::InvalidInput(
+            "too many paths in one request".into(),
+        ));
+    }
+    let mut validated = Vec::with_capacity(paths.len());
+    for raw in paths {
+        let relative = validate_relative_path(raw)
+            .ok_or_else(|| GitError::InvalidInput("invalid repository-relative path".into()))?;
+        if !stays_inside(toplevel, &relative) {
+            return Err(GitError::InvalidInput(
+                "path leads outside the repository".into(),
+            ));
+        }
+        validated.push(relative.to_string_lossy().into_owned());
+    }
+    Ok(validated)
+}
+
+/// Stage validated repo-relative paths, or all changes when `all` is true.
+pub async fn stage(toplevel: &Path, paths: &[String], all: bool) -> Result<(), GitError> {
+    if all {
+        run_with(toplevel, &["add", "-A"], &[0], GIT_TIMEOUT).await?;
+        return Ok(());
+    }
+    let validated = validate_staged_paths(toplevel, paths)?;
+    let mut args = Vec::with_capacity(validated.len() + 2);
+    args.push("add");
+    args.push("--");
+    args.extend(validated.iter().map(String::as_str));
+    run_with(toplevel, &args, &[0], GIT_TIMEOUT).await?;
+    Ok(())
+}
+
+/// Unstage validated repo-relative paths, or all staged changes when `all` is
+/// true. Falls back to `git rm --cached` on an unborn HEAD.
+pub async fn unstage(toplevel: &Path, paths: &[String], all: bool) -> Result<(), GitError> {
+    if all {
+        match run_with(toplevel, &["reset", "-q", "HEAD"], &[0], GIT_TIMEOUT).await {
+            Ok(_) => return Ok(()),
+            Err(GitError::Failed(detail)) => {
+                if !has_head(toplevel).await? {
+                    run_with(
+                        toplevel,
+                        &["rm", "--cached", "-r", "-q", "--ignore-unmatch", "."],
+                        &[0],
+                        GIT_TIMEOUT,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                return Err(GitError::Failed(detail));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    let validated = validate_staged_paths(toplevel, paths)?;
+    let mut reset_args = Vec::with_capacity(validated.len() + 4);
+    reset_args.extend(["reset", "-q", "HEAD", "--"]);
+    reset_args.extend(validated.iter().map(String::as_str));
+    match run_with(toplevel, &reset_args, &[0], GIT_TIMEOUT).await {
+        Ok(_) => Ok(()),
+        Err(GitError::Failed(detail)) => {
+            if !has_head(toplevel).await? {
+                let mut rm_args = Vec::with_capacity(validated.len() + 5);
+                rm_args.extend(["rm", "--cached", "-q", "--ignore-unmatch", "--"]);
+                rm_args.extend(validated.iter().map(String::as_str));
+                run_with(toplevel, &rm_args, &[0], GIT_TIMEOUT).await?;
+                return Ok(());
+            }
+            Err(GitError::Failed(detail))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Validate a branch name before passing it to git ref checks or checkout.
+pub fn validate_branch_name(branch: &str) -> bool {
+    if branch.is_empty() || branch.len() > 256 {
+        return false;
+    }
+    if branch.starts_with('-')
+        || branch.starts_with('/')
+        || branch.ends_with('/')
+        || branch.ends_with('.')
+        || branch.ends_with(".lock")
+        || branch == "@"
+    {
+        return false;
+    }
+    if branch.contains("..") || branch.contains("@{") || branch.contains("//") {
+        return false;
+    }
+    if branch.chars().any(|c| {
+        c.is_whitespace()
+            || c.is_control()
+            || matches!(c, '\0' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+    }) {
+        return false;
+    }
+    for segment in branch.split('/') {
+        if segment.is_empty() || segment.starts_with('.') || segment.ends_with(".lock") {
+            return false;
+        }
+    }
+    true
+}
+
+async fn ref_exists(toplevel: &Path, full_ref: &str) -> Result<bool, GitError> {
+    match run_with(
+        toplevel,
+        &["show-ref", "--verify", "--quiet", full_ref],
+        &[0],
+        GIT_TIMEOUT,
+    )
+    .await
+    {
+        Ok(_) => Ok(true),
+        Err(GitError::Failed(_)) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+/// Switch to an existing local branch or a remote tracking branch under
+/// `refs/remotes/origin/<branch>`.
+pub async fn checkout_branch(toplevel: &Path, branch: &str) -> Result<String, GitError> {
+    if !validate_branch_name(branch) {
+        return Err(GitError::InvalidInput("invalid branch name".into()));
+    }
+
+    let local_ref = format!("refs/heads/{branch}");
+    if ref_exists(toplevel, &local_ref).await? {
+        run_with(toplevel, &["checkout", branch], &[0], GIT_TIMEOUT).await?;
+        return Ok(branch.to_string());
+    }
+
+    let remote_ref = format!("refs/remotes/origin/{branch}");
+    if ref_exists(toplevel, &remote_ref).await? {
+        run_with(
+            toplevel,
+            &["checkout", "-b", branch, "--track", &remote_ref],
+            &[0],
+            GIT_TIMEOUT,
+        )
+        .await?;
+        return Ok(branch.to_string());
+    }
+
+    Err(GitError::InvalidInput(format!(
+        "branch '{branch}' does not exist"
+    )))
+}
+
+/// Return the currently checked-out local branch name.
+pub async fn current_branch(toplevel: &Path) -> Result<String, GitError> {
+    let output = run_with(
+        toplevel,
+        &["symbolic-ref", "--short", "HEAD"],
+        &[0],
+        GIT_TIMEOUT,
+    )
+    .await?;
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !validate_branch_name(&branch) {
+        return Err(GitError::Failed(
+            "could not determine current branch".into(),
+        ));
+    }
+    Ok(branch)
+}
+
+/// Fetch `pull/<n>/head` from `origin` into local branch `pr-<n>` and check it
+/// out.
+pub async fn checkout_pr_ref(toplevel: &Path, pr_number: u64) -> Result<String, GitError> {
+    if pr_number == 0 {
+        return Err(GitError::InvalidInput(
+            "pr_number must be greater than 0".into(),
+        ));
+    }
+    let local_branch = format!("pr-{pr_number}");
+    let refspec = format!("pull/{pr_number}/head:{local_branch}");
+    run_with(toplevel, &["fetch", "origin", &refspec], &[0], SYNC_TIMEOUT).await?;
+    run_with(toplevel, &["checkout", &local_branch], &[0], GIT_TIMEOUT).await?;
+    Ok(local_branch)
+}
+
+/// Commit staged changes (or stage all changes first when `stage_all` is true).
+/// Returns the first non-empty line of stdout, or `"Committed changes"`.
+pub async fn commit(toplevel: &Path, message: &str, stage_all: bool) -> Result<String, GitError> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return Err(GitError::InvalidInput(
+            "commit message must not be empty".into(),
+        ));
+    }
+    if trimmed.len() > MAX_COMMIT_MESSAGE_BYTES || trimmed.contains('\0') {
+        return Err(GitError::InvalidInput("invalid commit message".into()));
+    }
+    if stage_all {
+        stage(toplevel, &[], true).await?;
+    }
+    let output = run_with(toplevel, &["commit", "-m", trimmed], &[0], GIT_TIMEOUT).await?;
+    let first_line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| "Committed changes".to_string());
+    Ok(first_line)
+}
+
+/// Run a fixed remote synchronization verb: `"fetch"`, `"pull"`, or `"push"`.
+pub async fn sync(toplevel: &Path, action: &str) -> Result<String, GitError> {
+    match action {
+        "fetch" => {
+            let output = run_with(toplevel, &["fetch", "--prune"], &[0], SYNC_TIMEOUT).await?;
+            Ok(first_output_line(&output.stdout, "Fetched from remote"))
+        }
+        "pull" => {
+            let output = run_with(toplevel, &["pull", "--ff-only"], &[0], SYNC_TIMEOUT).await?;
+            Ok(first_output_line(&output.stdout, "Pulled from remote"))
+        }
+        "push" => match run_with(toplevel, &["push"], &[0], SYNC_TIMEOUT).await {
+            Ok(output) => Ok(first_output_line(&output.stdout, "Pushed to remote")),
+            Err(GitError::Failed(detail))
+                if detail.contains("has no upstream branch") || detail.contains("set-upstream") =>
+            {
+                let branch = current_branch(toplevel).await?;
+                let output = run_with(
+                    toplevel,
+                    &["push", "-u", "origin", &branch],
+                    &[0],
+                    SYNC_TIMEOUT,
+                )
+                .await?;
+                Ok(first_output_line(&output.stdout, "Pushed to remote"))
+            }
+            Err(err) => Err(err),
+        },
+        _ => Err(GitError::InvalidInput(
+            "action must be 'fetch', 'pull', or 'push'".into(),
+        )),
+    }
+}
+
+fn first_output_line(stdout: &[u8], fallback: &str) -> String {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CommitEntry {
+    pub hash: String,
+    pub short_hash: String,
+    pub subject: String,
+    pub author: String,
+    pub timestamp_ms: i64,
+}
+
+impl CommitEntry {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "hash": self.hash,
+            "short_hash": self.short_hash,
+            "subject": self.subject,
+            "author": self.author,
+            "timestamp_ms": self.timestamp_ms,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CommitsPage {
+    pub items: Vec<CommitEntry>,
+    pub offset: usize,
+    pub next_offset: Option<usize>,
+    pub has_more: bool,
+}
+
+impl CommitsPage {
+    pub fn empty(offset: usize) -> Self {
+        Self {
+            items: Vec::new(),
+            offset,
+            next_offset: None,
+            has_more: false,
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "items": self.items.iter().map(CommitEntry::to_json).collect::<Vec<_>>(),
+            "offset": self.offset,
+            "next_offset": self.next_offset,
+            "has_more": self.has_more,
+        })
+    }
+}
+
+/// Paginated recent commits on `HEAD`. `limit` is clamped to `1..=50`.
+/// Returns an empty page on an unborn repository.
+pub async fn recent_commits(
+    toplevel: &Path,
+    offset: usize,
+    limit: usize,
+) -> Result<CommitsPage, GitError> {
+    let limit = limit.clamp(1, 50);
+    let skip_arg = format!("--skip={offset}");
+    let count_arg = format!("{}", limit + 1);
+    let output = match run(
+        toplevel,
+        &[
+            "log",
+            &skip_arg,
+            "-n",
+            &count_arg,
+            "--format=%H%x1f%h%x1f%s%x1f%an%x1f%ct",
+        ],
+        &[0],
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(GitError::Failed(detail)) => {
+            if !has_head(toplevel).await? {
+                return Ok(CommitsPage::empty(offset));
+            }
+            return Err(GitError::Failed(detail));
+        }
+        Err(err) => return Err(err),
+    };
+
+    let mut entries = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(5, '\x1f');
+        let hash = parts.next().unwrap_or("").to_string();
+        let short_hash = parts.next().unwrap_or("").to_string();
+        let subject = parts.next().unwrap_or("").to_string();
+        let author = parts.next().unwrap_or("").to_string();
+        let seconds = parts
+            .next()
+            .unwrap_or("0")
+            .trim()
+            .parse::<i64>()
+            .unwrap_or(0);
+        if hash.is_empty() {
+            continue;
+        }
+        entries.push(CommitEntry {
+            hash,
+            short_hash,
+            subject,
+            author,
+            timestamp_ms: seconds.saturating_mul(1000),
+        });
+    }
+
+    let has_more = entries.len() > limit;
+    if has_more {
+        entries.truncate(limit);
+    }
+    let next_offset = has_more.then_some(offset.saturating_add(entries.len()));
+
+    Ok(CommitsPage {
+        items: entries,
+        offset,
+        next_offset,
+        has_more,
     })
 }
 
@@ -2916,7 +3556,15 @@ mod tests {
         let merge = std::process::Command::new("git")
             .arg("-C")
             .arg(&repo)
-            .args(["merge", "-q", "other"])
+            .args([
+                "-c",
+                "merge.ff=true",
+                "-c",
+                "rerere.enabled=false",
+                "merge",
+                "-q",
+                "other",
+            ])
             .output()
             .unwrap();
         assert!(!merge.status.success(), "the merge should conflict");
@@ -3766,6 +4414,220 @@ mod tests {
         assert!(unknown["data"]["cwd"].is_null());
         assert_eq!(unknown["data"]["cwd_in_fence"], false);
         assert!(unknown["data"]["git"].is_null());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn remote_url_normalization_handles_ssh_https_credentials_and_hosts() {
+        let gh = parse_remote_url("git@github.com:octocat/hello-world.git").unwrap();
+        assert_eq!(gh.web_url, "https://github.com/octocat/hello-world");
+        assert_eq!(gh.host_kind, "github");
+        assert_eq!(gh.repo_path, "octocat/hello-world");
+
+        let ssh_port =
+            parse_remote_url("ssh://git@gitea.home.t-diy.com:2222/team/app.git").unwrap();
+        assert_eq!(ssh_port.web_url, "https://gitea.home.t-diy.com/team/app");
+        assert_eq!(ssh_port.host_kind, "gitea");
+        assert_eq!(ssh_port.repo_path, "team/app");
+
+        let https_creds =
+            parse_remote_url("https://user:secret-token@gitlab.com/org/sub/repo.git").unwrap();
+        assert_eq!(https_creds.web_url, "https://gitlab.com/org/sub/repo");
+        assert_eq!(https_creds.host_kind, "gitlab");
+
+        let bb = parse_remote_url("https://bitbucket.org/team/proj").unwrap();
+        assert_eq!(bb.host_kind, "bitbucket");
+
+        let custom = parse_remote_url("ssh://git@git.example.org/me/demo.git").unwrap();
+        assert_eq!(custom.web_url, "https://git.example.org/me/demo");
+        assert_eq!(custom.host_kind, "remote");
+
+        assert!(parse_remote_url("/tmp/local-bare.git").is_none());
+        assert!(parse_remote_url("").is_none());
+    }
+
+    #[test]
+    fn branch_name_validation_rejects_flags_traversal_and_control_chars() {
+        for good in ["main", "feat/workbench", "release-1.2.3", "user_topic/v2"] {
+            assert!(validate_branch_name(good), "{good:?} should pass");
+        }
+        for bad in [
+            "",
+            "-b",
+            "--orphan",
+            "a..b",
+            "main@{1}",
+            "feat/with space",
+            "feat\nline",
+            "/leading",
+            "trailing/",
+            "bad.lock",
+            "a//b",
+            "a/.hidden",
+            "@",
+        ] {
+            assert!(!validate_branch_name(bad), "{bad:?} should fail");
+        }
+    }
+
+    #[tokio::test]
+    async fn workbench_overview_stage_unstage_commit_checkout_and_commits_pagination() {
+        let repo = temp_repo("workbench");
+        let root = repo.parent().unwrap().to_path_buf();
+        git_ok(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:muqun/gateway.git",
+            ],
+        );
+        git_ok(&repo, &["branch", "feat/demo"]);
+
+        // Overview returns branch summary, sorted local branches, normalized remote, worktrees.
+        let ov = Box::pin(overview(&repo)).await.expect("overview");
+        assert!(ov.is_repo);
+        assert_eq!(ov.repo.as_ref().unwrap().branch.as_deref(), Some("main"));
+        assert_eq!(
+            ov.local_branches,
+            vec!["feat/demo".to_string(), "main".to_string()]
+        );
+        assert_eq!(
+            ov.remote_url.as_deref(),
+            Some("https://github.com/muqun/gateway")
+        );
+        assert_eq!(ov.remote_host.as_deref(), Some("github"));
+        assert!(!ov.worktrees.is_empty());
+        let ov_json = ov.to_json();
+        assert_eq!(ov_json["is_repo"], true);
+        assert_eq!(ov_json["repo"]["ahead"], 0);
+        assert_eq!(ov_json["repo"]["behind"], 0);
+        assert_eq!(ov_json["remote_host"], "github");
+
+        // Stage rejects invalid paths.
+        assert!(matches!(
+            Box::pin(stage(&repo, &["../escape".into()], false)).await,
+            Err(GitError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            Box::pin(stage(&repo, &[], false)).await,
+            Err(GitError::InvalidInput(_))
+        ));
+
+        // Stage a specific file, then unstage it, then stage all and commit.
+        std::fs::write(repo.join("notes.txt"), "hello\n").unwrap();
+        Box::pin(stage(&repo, &["notes.txt".into()], false))
+            .await
+            .expect("stage one");
+        let st = Box::pin(status(&repo)).await.expect("status");
+        assert!(st.files.iter().any(|f| f.path == "notes.txt" && f.staged));
+
+        Box::pin(unstage(&repo, &["notes.txt".into()], false))
+            .await
+            .expect("unstage one");
+        let st = Box::pin(status(&repo)).await.expect("status");
+        assert!(st
+            .files
+            .iter()
+            .any(|f| f.path == "notes.txt" && !f.staged && f.unstaged));
+
+        // Empty commit message rejected.
+        assert!(matches!(
+            Box::pin(commit(&repo, "   \n ", true)).await,
+            Err(GitError::InvalidInput(_))
+        ));
+
+        let summary1 = Box::pin(commit(&repo, "add notes", true))
+            .await
+            .expect("commit 1");
+        assert!(!summary1.is_empty());
+        std::fs::write(repo.join("notes.txt"), "hello\nsecond\n").unwrap();
+        let _ = Box::pin(commit(&repo, "update notes", true))
+            .await
+            .expect("commit 2");
+        std::fs::write(repo.join("notes.txt"), "hello\nsecond\nthird\n").unwrap();
+        let _ = Box::pin(commit(&repo, "third update", true))
+            .await
+            .expect("commit 3");
+
+        // Paginate recent commits (4 commits total: initial + 3).
+        let page1 = Box::pin(recent_commits(&repo, 0, 2)).await.expect("page 1");
+        assert_eq!(page1.items.len(), 2);
+        assert_eq!(page1.items[0].subject, "third update");
+        assert_eq!(page1.items[1].subject, "update notes");
+        assert_eq!(page1.offset, 0);
+        assert_eq!(page1.next_offset, Some(2));
+        assert!(page1.has_more);
+        assert!(page1.items[0].timestamp_ms > 0);
+
+        let page2 = Box::pin(recent_commits(&repo, 2, 2)).await.expect("page 2");
+        assert_eq!(page2.items.len(), 2);
+        assert_eq!(page2.items[0].subject, "add notes");
+        assert_eq!(page2.next_offset, None);
+        assert!(!page2.has_more);
+
+        // Checkout branch validation and switch.
+        assert!(matches!(
+            Box::pin(checkout_branch(&repo, "-evil")).await,
+            Err(GitError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            Box::pin(checkout_branch(&repo, "does-not-exist")).await,
+            Err(GitError::InvalidInput(_))
+        ));
+        let switched = Box::pin(checkout_branch(&repo, "feat/demo"))
+            .await
+            .expect("checkout feat/demo");
+        assert_eq!(switched, "feat/demo");
+        assert_eq!(
+            Box::pin(summary(&repo)).await.unwrap().branch.as_deref(),
+            Some("feat/demo")
+        );
+
+        // Sync rejects unknown action.
+        assert!(matches!(
+            Box::pin(sync(&repo, "rebase")).await,
+            Err(GitError::InvalidInput(_))
+        ));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn unborn_repo_supports_unstage_and_empty_commits_page() {
+        let root = std::env::temp_dir().join(format!(
+            "muqun-gateway-git-unborn-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        git_ok(&root, &["init", "--initial-branch", "main"]);
+        std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+
+        let page = Box::pin(recent_commits(&root, 0, 10))
+            .await
+            .expect("unborn commits");
+        assert!(page.items.is_empty());
+        assert!(!page.has_more);
+        assert_eq!(page.next_offset, None);
+
+        Box::pin(stage(&root, &["a.txt".into()], false))
+            .await
+            .expect("stage");
+        Box::pin(unstage(&root, &["a.txt".into()], false))
+            .await
+            .expect("unstage one unborn");
+        let st = Box::pin(status(&root)).await.expect("status");
+        assert!(st.files.iter().any(|f| f.path == "a.txt" && !f.staged));
+
+        Box::pin(stage(&root, &[], true)).await.expect("stage all");
+        Box::pin(unstage(&root, &[], true))
+            .await
+            .expect("unstage all unborn");
+        let st = Box::pin(status(&root)).await.expect("status");
+        assert!(st.files.iter().any(|f| f.path == "a.txt" && !f.staged));
 
         std::fs::remove_dir_all(&root).ok();
     }

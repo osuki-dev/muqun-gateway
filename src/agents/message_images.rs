@@ -24,9 +24,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
-use crate::agents::domain::{AgentDomainEvent, AgentPart, MessageImageAsset, TimelineItem};
+use crate::agents::domain::{
+    AgentDomainEvent, AgentPart, MessageImageAsset, TimelineItem, TimelineRole,
+};
+use crate::agents::ports::agent::split_uploaded_attachment_suffix;
 use crate::{
     api_error, asset_id, asset_json, content_envelope, read_asset_head, require_device,
     sniff_asset_type, ApiResult, AppState, AssetEntry, AssetKind,
@@ -34,8 +37,10 @@ use crate::{
 
 mod originals;
 mod previews;
+pub(crate) mod tool_media;
 mod versions;
 pub(crate) use originals::content as image_content;
+pub use originals::original_asset_id;
 pub(crate) use originals::version_content as image_version_content;
 
 /// How many served images are remembered. Old entries fall off; the next read
@@ -81,7 +86,14 @@ impl MessageImages {
 
     /// Note where a session works, from anything that says so.
     pub(crate) fn remember_root(&self, asid: &str, directory: Option<&str>) -> Option<PathBuf> {
-        let root = image_root(directory?)?;
+        let directory = directory?;
+        {
+            let inner = self.inner.lock().ok()?;
+            if let Some(root) = inner.roots.get(asid) {
+                return Some(root.clone());
+            }
+        }
+        let root = image_root(directory)?;
         let mut inner = self.inner.lock().ok()?;
         if inner.roots.insert(asid.to_owned(), root.clone()).is_none() {
             inner.root_order.push_back(asid.to_owned());
@@ -132,6 +144,12 @@ impl MessageImages {
                 sources.push(src);
             }
         }
+        for src in workspace_file_paths(text, root) {
+            let file_uri = format!("file://{src}");
+            if !sources.iter().any(|have| have == &src || have == &file_uri) {
+                sources.push(src);
+            }
+        }
         for src in sources.into_iter().take(MAX_IMAGES_PER_PART) {
             let Some((path, fence)) = hosted_file(&src, root) else {
                 continue;
@@ -171,12 +189,54 @@ impl MessageImages {
     }
 }
 
-/// True when a text part could embed an image at all -- the cheap test that
-/// keeps every streamed delta of ordinary prose off the filesystem.
+/// True when a text part could embed an image or workspace file path -- the
+/// cheap test that keeps every streamed delta of ordinary prose off the filesystem.
 fn may_embed_image(item: &TimelineItem) -> bool {
     matches!(&item.part, AgentPart::Text { text }
-        if text.contains("![") || text.to_ascii_lowercase().contains("<img")
-            || text.contains("file://"))
+        if text.contains("![")
+            || text.to_ascii_lowercase().contains("<img")
+            || text.contains("file://")
+            || contains_absolute_path_hint(text))
+}
+
+/// Cheap pre-filter for bare absolute workspace paths such as
+/// `/home/user/repo/docs/guide.md`. Matches a `/` at a token boundary followed
+/// by at least two path segments (`/<seg>/<seg>`), excluding `//` and `/api/`.
+fn contains_absolute_path_hint(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while let Some(rel) = text[i..].find('/') {
+        let pos = i + rel;
+        i = pos + 1;
+        let boundary = match pos.checked_sub(1).map(|p| bytes[p]) {
+            None => true,
+            Some(b) => {
+                b.is_ascii_whitespace()
+                    || matches!(
+                        b,
+                        b'(' | b'<' | b'[' | b'"' | b'\'' | b':' | b',' | b';' | b'*'
+                    )
+                    || !b.is_ascii()
+            }
+        };
+        if !boundary {
+            continue;
+        }
+        let rest = &text[pos + 1..];
+        if rest.is_empty() || rest.starts_with('/') || rest.starts_with("api/") {
+            continue;
+        }
+        let token_end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, ')' | '>' | ']' | '"' | '\'' | '`'))
+            .unwrap_or(rest.len());
+        let token = &rest[..token_end];
+        if let Some(slash) = token.find('/') {
+            if slash > 0 && slash + 1 < token.len() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// A session's directory as an image fence: it has to exist, be a directory,
@@ -184,6 +244,300 @@ fn may_embed_image(item: &TimelineItem) -> bool {
 pub(crate) fn image_root(directory: &str) -> Option<PathBuf> {
     let root = std::fs::canonicalize(directory.trim()).ok()?;
     (root.is_dir() && root.parent().is_some()).then_some(root)
+}
+
+/// Process-local image map for in-process clients (Muqun Desktop) that never
+/// hit the HTTP attach path. Same fencing rules as the gateway routes.
+fn local_images() -> &'static MessageImages {
+    static IMAGES: OnceLock<MessageImages> = OnceLock::new();
+    IMAGES.get_or_init(Default::default)
+}
+
+/// Promote the App's ByPath "Attached files (on this host)" suffix into
+/// `attachments` and strip it from the visible text — same as the App's
+/// `parseTimelineItem` / `splitUploadedAttachmentSuffix`.
+fn promote_uploaded_attachment_suffix(items: &mut [TimelineItem]) {
+    for item in items {
+        if item.role != TimelineRole::User {
+            continue;
+        }
+        let AgentPart::Text { text } = &item.part else {
+            continue;
+        };
+        let (body, paths) = split_uploaded_attachment_suffix(text);
+        if paths.is_empty() {
+            continue;
+        }
+        let body = body.to_owned();
+        let paths: Vec<String> = paths.into_iter().map(str::to_owned).collect();
+        let attachments = item.attachments.get_or_insert_with(Vec::new);
+        for path in paths {
+            if !attachments.iter().any(|existing| existing == &path) {
+                attachments.push(path);
+            }
+        }
+        if let AgentPart::Text { text } = &mut item.part {
+            *text = body;
+        }
+    }
+}
+
+/// Attach `image_assets` the way the HTTP egress does for the App
+/// (`attach_to_items` / `originals::attach`), for an in-process desktop that
+/// never hits `/api`. Same fields the App reads on each text part and tool row.
+pub fn enrich_timeline(asid: &str, directory: Option<&str>, items: &mut [TimelineItem]) {
+    promote_uploaded_attachment_suffix(items);
+    let mut has_tool = false;
+    for item in items.iter_mut() {
+        if let AgentPart::Tool(call) = &mut item.part {
+            tool_media::normalize_tool_call(call);
+            has_tool = true;
+        }
+    }
+    let has_text_or_attach =
+        items.iter().any(may_embed_image) || items.iter().any(|item| item.attachments.is_some());
+    if !has_text_or_attach && !has_tool {
+        return;
+    }
+    let images = local_images();
+    let root = directory
+        .filter(|d| !d.is_empty())
+        .and_then(|d| images.remember_root(asid, Some(d)));
+    if has_text_or_attach {
+        if let Some(root) = root.as_ref() {
+            images.attach(root, items);
+        }
+        // Codex / Cursor put user photos in `attachments` (often absolute uploads)
+        // with `[Image #N]` in the text. The HTTP path runs `originals::attach`;
+        // Desktop gets the same `image_assets` shape here, including when the
+        // session directory is not known yet.
+        attach_local_attachments(root.as_deref(), items);
+    }
+    if has_tool {
+        attach_local_tool_files(root.as_deref(), items);
+    }
+}
+
+/// Resolve canonical tool `file` content blocks (and completed empty-output
+/// workspace file reads) into `image_assets` for in-process Desktop clients,
+/// matching the HTTP egress contract in `originals::attach`.
+fn attach_local_tool_files(root: Option<&Path>, items: &mut [TimelineItem]) {
+    let mut hydrated_reads = 0usize;
+    for item in items {
+        let AgentPart::Tool(call) = &mut item.part else {
+            continue;
+        };
+        if let Some(session_root) = root {
+            if hydrated_reads < tool_media::MAX_HYDRATED_READS_PER_BATCH {
+                if let Some((path, start, end)) = tool_media::empty_text_read_request(call) {
+                    if let Some((resolved, fence)) = hosted_file(&path, session_root) {
+                        if let Some((text, truncated)) =
+                            tool_media::read_workspace_excerpt(&resolved, &fence, start, end)
+                        {
+                            call.output = Some(serde_json::Value::String(text));
+                            if truncated {
+                                call.truncated = true;
+                            }
+                            hydrated_reads += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if tool_media::is_read_file_tool(&call.name)
+            && call.state == crate::agents::domain::ToolCallStatus::Completed
+            && !tool_media::has_text_output(call)
+            && !call
+                .content
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| part["type"] == "file" && part["uri"].is_string())
+                })
+        {
+            if let (Some(session_root), Some(path)) = (root, tool_media::input_path(&call.input)) {
+                if tool_media::has_rich_document_extension(path)
+                    && hosted_file(path, session_root).is_some()
+                {
+                    if let Some(uri) = tool_media::path_to_uri(path) {
+                        let block = serde_json::json!({ "type": "file", "uri": uri });
+                        match &mut call.content {
+                            Some(serde_json::Value::Array(existing)) => existing.push(block),
+                            _ => call.content = Some(serde_json::Value::Array(vec![block])),
+                        }
+                    }
+                }
+            }
+        }
+        let viewed_uri = tool_media::viewed_image_uri(call);
+        let Some(serde_json::Value::Array(content)) = &mut call.content else {
+            continue;
+        };
+        let mut discovered = Vec::new();
+        for part in content.iter_mut() {
+            if part["type"] != "file" {
+                continue;
+            }
+            let Some(uri) = part.get("uri").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if uri.starts_with("data:") || uri.starts_with("/api/") {
+                continue;
+            }
+            let allow_account_image = viewed_uri.as_deref() == Some(uri);
+            let resolved = if allow_account_image {
+                root.and_then(|r| account_file(uri, r).map(|(p, _)| p))
+                    .or_else(|| resolve_host_media(uri, None))
+            } else {
+                root.and_then(|r| hosted_file(uri, r).map(|(p, _)| p))
+            };
+            let Some(path) = resolved else {
+                continue;
+            };
+            let head = read_asset_head(&path);
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| uri.to_owned());
+            let kind = sniff_asset_type(&head, &name);
+            if allow_account_image && kind.kind != AssetKind::Image {
+                continue;
+            }
+            part["mime"] = serde_json::Value::String(kind.mime.to_owned());
+            let (width, height) = if kind.kind == AssetKind::Image {
+                image_dimensions(&head).unzip()
+            } else {
+                (None, None)
+            };
+            discovered.push(MessageImageAsset {
+                src: path.to_string_lossy().into_owned(),
+                asset_id: String::new(),
+                url: path.to_string_lossy().into_owned(),
+                mime: kind.mime.to_owned(),
+                width,
+                height,
+                thumbnail_url: None,
+                preview_url: None,
+                download_url: None,
+                version_url: None,
+                size: std::fs::metadata(&path).ok().map(|m| m.len()),
+                unavailable_reason: None,
+            });
+        }
+        if !discovered.is_empty() {
+            let assets = item.image_assets.get_or_insert_with(Vec::new);
+            for asset in discovered {
+                if !assets
+                    .iter()
+                    .any(|existing| existing.src == asset.src || existing.url == asset.url)
+                {
+                    assets.push(asset);
+                }
+            }
+        }
+    }
+}
+
+/// Resolve bare `attachments` paths into `image_assets` for in-process clients.
+fn attach_local_attachments(root: Option<&Path>, items: &mut [TimelineItem]) {
+    for item in items {
+        let Some(sources) = item.attachments.clone() else {
+            continue;
+        };
+        let assets = item.image_assets.get_or_insert_with(Vec::new);
+        for src in sources {
+            if assets
+                .iter()
+                .any(|a| a.src == src || a.url == src || a.src.ends_with(&src))
+            {
+                continue;
+            }
+            let Some(path) = root
+                .and_then(|root| hosted_file(&src, root).map(|(path, _)| path))
+                .or_else(|| {
+                    let raw = src.strip_prefix("file://").unwrap_or(&src);
+                    let path = Path::new(raw);
+                    path.is_absolute()
+                        .then(|| std::fs::canonicalize(path).ok())
+                        .flatten()
+                        .filter(|p| p.is_file())
+                })
+            else {
+                continue;
+            };
+            let head = read_asset_head(&path);
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| src.clone());
+            let kind = sniff_asset_type(&head, &name);
+            if kind.kind != AssetKind::Image {
+                continue;
+            }
+            let (width, height) = image_dimensions(&head).unzip();
+            // Same map the App consumes: src stays the wire source, url is what
+            // the client loads (here a host path; over HTTP it is /api/assets/…).
+            assets.push(MessageImageAsset {
+                src: src.clone(),
+                asset_id: String::new(),
+                url: path.to_string_lossy().into_owned(),
+                mime: kind.mime.to_owned(),
+                width,
+                height,
+                thumbnail_url: None,
+                preview_url: None,
+                download_url: None,
+                version_url: None,
+                size: std::fs::metadata(&path).ok().map(|m| m.len()),
+                unavailable_reason: None,
+            });
+        }
+    }
+}
+
+/// Resolve a media `src` (markdown destination, attachment path, or gateway
+/// `/api/assets|agent-images/…` URL) to a local file the desktop can draw.
+pub fn resolve_host_media(src: &str, session_directory: Option<&str>) -> Option<PathBuf> {
+    let src = src.trim();
+    if src.is_empty() {
+        return None;
+    }
+    if let Some(id) = asset_id_from_api(src) {
+        if let Some(served) = local_images().served(&id) {
+            return Some(served.path);
+        }
+    }
+    if let Some(directory) = session_directory.filter(|d| !d.is_empty()) {
+        if let Some(root) = image_root(directory) {
+            if let Some((path, _)) = hosted_file(src, &root) {
+                return Some(path);
+            }
+        }
+    }
+    // Same machine as the agent: absolute / file:// paths that still exist.
+    let raw = src.strip_prefix("file://").unwrap_or(src);
+    let raw = raw.strip_prefix("localhost").unwrap_or(raw);
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return std::fs::canonicalize(path).ok().filter(|p| p.is_file());
+    }
+    None
+}
+
+fn asset_id_from_api(src: &str) -> Option<String> {
+    let path = src.split('?').next()?;
+    for prefix in ["/api/assets/", "/api/agent-images/"] {
+        let Some(rest) = path.strip_prefix(prefix) else {
+            continue;
+        };
+        let id = rest.split('/').next()?.trim();
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    None
 }
 
 /// The directory a session's images are fenced to: remembered, else asked of
@@ -391,30 +745,72 @@ pub(crate) async fn attach_to_items(
     directory: Option<&str>,
     items: &mut [TimelineItem],
 ) {
+    attach_rows(
+        state,
+        asid,
+        directory.map_or(ImageDirectory::Discover, |dir| {
+            ImageDirectory::Snapshot(Some(dir))
+        }),
+        items,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ImageDirectory<'a> {
+    Discover,
+    Snapshot(Option<&'a str>),
+}
+
+/// A snapshot already carries the provider's directory. A retained read must
+/// also handle a missing directory without asking the provider to discover it.
+pub(crate) async fn attach_window(
+    state: &AppState,
+    asid: &str,
+    snapshot: &mut super::ports::mirror::AgentSessionSnapshot,
+) {
+    let directory = ImageDirectory::Snapshot(snapshot.info.directory.as_deref());
+    attach_rows(state, asid, directory, &mut snapshot.timeline).await;
+    attach_inbox_files(state, asid, directory, &mut snapshot.inbox).await;
+}
+
+async fn attach_rows(
+    state: &AppState,
+    asid: &str,
+    directory: ImageDirectory<'_>,
+    items: &mut [TimelineItem],
+) {
+    // Same client-side recovery the App runs in `parseTimelineItem`, so HTTP
+    // and Desktop both attach originals for ByPath handoffs.
+    promote_uploaded_attachment_suffix(items);
+    for item in items.iter_mut() {
+        if let AgentPart::Tool(call) = &mut item.part {
+            tool_media::normalize_tool_call(call);
+        }
+    }
     let needs_files = items.iter().any(|item| {
         item.attachments.is_some()
-            || matches!(&item.part, AgentPart::Tool(call) if call.content.is_some())
+            || matches!(
+                &item.part,
+                AgentPart::Tool(call)
+                    if call.content.is_some()
+                        || tool_media::needs_workspace_read_enrichment(call)
+            )
     });
     if !needs_files && !items.iter().any(may_embed_image) {
         return;
     }
     let root = match directory {
-        Some(directory) => state.message_images.remember_root(asid, Some(directory)),
-        None => None,
+        ImageDirectory::Discover => session_root(state, asid).await,
+        ImageDirectory::Snapshot(dir) => state
+            .message_images
+            .remember_root(asid, dir)
+            .or_else(|| state.message_images.root_for(asid)),
     };
-    let root = match root {
-        Some(root) => root,
-        None => match session_root(state, asid).await {
-            Some(root) => root,
-            None => {
-                // Inline originals do not need a workspace. Host paths do.
-                originals::attach(state, asid, None, items).await;
-                return;
-            }
-        },
-    };
-    originals::attach(state, asid, Some(root.clone()), items).await;
-    state.message_images.attach(&root, items);
+    originals::attach(state, asid, root.clone(), items).await;
+    if let Some(root) = root {
+        state.message_images.attach(&root, items);
+    }
 }
 
 /// Give queued prompts the fields a transcript user row carries for its files,
@@ -423,6 +819,15 @@ pub(crate) async fn attach_to_items(
 /// and `image_assets`, keyed by those sources. Read from `payload.files[].uri`
 /// for OpenCode and Codex alike; `payload` stays exactly as the agent sent it.
 pub(crate) async fn attach_to_inbox(state: &AppState, asid: &str, items: &mut [serde_json::Value]) {
+    attach_inbox_files(state, asid, ImageDirectory::Discover, items).await
+}
+
+async fn attach_inbox_files(
+    state: &AppState,
+    asid: &str,
+    directory: ImageDirectory<'_>,
+    items: &mut [serde_json::Value],
+) {
     let mut rows = Vec::new();
     for (index, item) in items.iter().enumerate() {
         let Some(files) = item
@@ -458,6 +863,7 @@ pub(crate) async fn attach_to_inbox(state: &AppState, asid: &str, items: &mut [s
                 attachments: Some(sources),
                 image_assets: None,
                 generation: None,
+                origin: None,
             },
         ));
     }
@@ -465,7 +871,7 @@ pub(crate) async fn attach_to_inbox(state: &AppState, asid: &str, items: &mut [s
         return;
     }
     let (indexes, mut rows): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
-    attach_to_items(state, asid, None, &mut rows).await;
+    attach_rows(state, asid, directory, &mut rows).await;
     for (index, row) in indexes.into_iter().zip(rows) {
         let Some(item) = items[index].as_object_mut() else {
             continue;
@@ -728,6 +1134,9 @@ fn hosted_roots(session_root: &Path) -> Vec<PathBuf> {
 fn resolve_in_fences(src: &str, fences: Vec<PathBuf>) -> Option<(PathBuf, PathBuf)> {
     fences.into_iter().find_map(|fence| {
         let path = resolve_image_path(src, &fence)?;
+        if crate::platform::assets::is_gateway_private_path(&path) {
+            return None;
+        }
         Some((path, fence))
     })
 }
@@ -770,6 +1179,10 @@ fn generated_images_root() -> Option<PathBuf> {
 }
 
 /// `file://` paths written in prose, such as `Saved to: file:///…/page.pdf`.
+/// Markdown inline links `[label](file://…)` / `[label](<file://…>)` are
+/// skipped so code citations in Markdown do not turn into attachment rows
+/// beneath the message; Markdown images `![alt](file://…)` are handled
+/// separately by [`image_sources`].
 /// Balanced path parentheses are retained; unmatched closing parentheses and
 /// sentence punctuation delimit prose. Encode literal punctuation in filenames
 /// with `%XX` to distinguish it from the surrounding sentence.
@@ -778,6 +1191,11 @@ fn file_uris(text: &str) -> Vec<String> {
     for_each_prose_segment(text, |segment| {
         let mut rest = segment;
         while let Some(index) = rest.find("file://") {
+            let before = rest[..index].trim_end();
+            let in_markdown_link = before.ends_with("](")
+                || before
+                    .strip_suffix('<')
+                    .is_some_and(|prefix| prefix.trim_end().ends_with("]("));
             let after = &rest[index + "file://".len()..];
             let mut parens = 0usize;
             let mut end = after.len();
@@ -809,13 +1227,200 @@ fn file_uris(text: &str) -> Vec<String> {
                 }
             }
             let path = after[..end].trim_end_matches(['.', ',', ';', ':', '!', '?']);
-            if path.starts_with('/') && !path.chars().any(char::is_control) {
+            if !in_markdown_link && path.starts_with('/') && !path.chars().any(char::is_control) {
                 out.push(format!("file://{path}"));
             }
             rest = &after[end..];
         }
     });
     out
+}
+
+/// Bare absolute paths strictly under the session's canonical workspace `root`
+/// (e.g. `/home/user/repo/docs/guide.md`). Agents often emit these in prose or
+/// in plain unlabeled fenced path lists when listing files for the user to open.
+///
+/// Inline Markdown links `[label](/root/...)`, `file://` URIs (handled by
+/// [`file_uris`]), inline code spans, and source-code fenced blocks are skipped.
+fn workspace_file_paths(text: &str, root: &Path) -> Vec<String> {
+    let Some(root_str) = root.to_str() else {
+        return Vec::new();
+    };
+    let root_prefix = format!("{}/", root_str.trim_end_matches('/'));
+    if root_prefix == "/" || !text.contains(&root_prefix) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for_each_prose_segment(text, |segment| {
+        extract_prose_workspace_paths(segment, &root_prefix, &mut out);
+    });
+    extract_path_list_fence_paths(text, &root_prefix, &mut out);
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|src| seen.insert(src.clone()));
+    out
+}
+
+fn extract_prose_workspace_paths(segment: &str, root_prefix: &str, out: &mut Vec<String>) {
+    let mut rest = segment;
+    while let Some(index) = rest.find(root_prefix) {
+        let prefix = &rest[..index];
+        let lower_tail = prefix
+            .get(prefix.len().saturating_sub(16)..)
+            .unwrap_or(prefix)
+            .to_ascii_lowercase();
+        let after_file_scheme =
+            lower_tail.ends_with("file://") || lower_tail.ends_with("file://localhost");
+        let before = prefix.trim_end();
+        let in_markdown_link = before.ends_with("](")
+            || before
+                .strip_suffix('<')
+                .is_some_and(|p| p.trim_end().ends_with("]("));
+        let valid_start = match prefix.chars().next_back() {
+            None => true,
+            Some(c) => {
+                c.is_whitespace()
+                    || matches!(
+                        c,
+                        '(' | '<'
+                            | '['
+                            | '"'
+                            | '\''
+                            | ':'
+                            | ','
+                            | ';'
+                            | '*'
+                            | '：'
+                            | '（'
+                            | '【'
+                            | '「'
+                            | '『'
+                            | '、'
+                            | '，'
+                    )
+            }
+        };
+        let after = &rest[index..];
+        let mut parens = 0usize;
+        let mut end = after.len();
+        for (at, c) in after.char_indices() {
+            if c.is_whitespace()
+                || matches!(
+                    c,
+                    ']' | '"'
+                        | '\''
+                        | '>'
+                        | '`'
+                        | '。'
+                        | '，'
+                        | '；'
+                        | '：'
+                        | '！'
+                        | '？'
+                        | '）'
+                        | '】'
+                        | '」'
+                        | '』'
+                        | '、'
+                )
+                || (c == ')' && parens == 0)
+            {
+                end = at;
+                break;
+            }
+            match c {
+                '(' => parens += 1,
+                ')' => parens -= 1,
+                _ => {}
+            }
+        }
+        let candidate = after[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', '*']);
+        if valid_start
+            && !after_file_scheme
+            && !in_markdown_link
+            && candidate.len() > root_prefix.len()
+            && !candidate.chars().any(char::is_control)
+        {
+            out.push(candidate.to_owned());
+        }
+        rest = &after[end.max(root_prefix.len())..];
+    }
+}
+
+fn is_plain_path_list_fence(info: &str) -> bool {
+    let lang = info.trim().to_ascii_lowercase();
+    lang.is_empty()
+        || matches!(
+            lang.as_str(),
+            "text" | "txt" | "plain" | "plaintext" | "path" | "paths"
+        )
+}
+
+fn looks_like_bare_workspace_path_line(line: &str, root_prefix: &str) -> bool {
+    line.starts_with(root_prefix)
+        && line.len() > root_prefix.len()
+        && !line.chars().any(char::is_control)
+        && !line.contains(" && ")
+        && !line.contains(" || ")
+        && !line.contains("; ")
+        && !line.contains(" | ")
+        && !line.contains(" > ")
+        && !line.contains(" < ")
+        && !line.contains('`')
+        && !line.contains("$(")
+}
+
+fn extract_path_list_fence_paths(markdown: &str, root_prefix: &str, out: &mut Vec<String>) {
+    let mut fence: Option<(u8, usize, bool)> = None;
+    let mut block_lines: Vec<&str> = Vec::new();
+    let flush = |lines: &mut Vec<&str>, allowed: bool, out: &mut Vec<String>| {
+        if allowed {
+            let non_empty: Vec<&str> = lines
+                .iter()
+                .map(|line| line.trim())
+                .filter(|line| !line.is_empty())
+                .collect();
+            if !non_empty.is_empty()
+                && non_empty
+                    .iter()
+                    .all(|line| looks_like_bare_workspace_path_line(line, root_prefix))
+            {
+                for line in non_empty {
+                    out.push(line.to_owned());
+                }
+            }
+        }
+        lines.clear();
+    };
+    for line in markdown.lines() {
+        if let Some((marker, count, rest)) = fence_marker(line) {
+            match fence {
+                None => {
+                    fence = Some((marker, count, is_plain_path_list_fence(rest)));
+                    block_lines.clear();
+                    continue;
+                }
+                Some((open, open_count, allowed))
+                    if open == marker && count >= open_count && rest.trim().is_empty() =>
+                {
+                    flush(&mut block_lines, allowed, out);
+                    fence = None;
+                    continue;
+                }
+                Some((_, _, allowed)) => {
+                    if allowed {
+                        block_lines.push(line);
+                    }
+                    continue;
+                }
+            }
+        }
+        if let Some((_, _, true)) = fence {
+            block_lines.push(line);
+        }
+    }
+    if let Some((_, _, allowed)) = fence {
+        flush(&mut block_lines, allowed, out);
+    }
 }
 
 /// The file an image source names, if it is a regular file strictly inside
@@ -893,6 +1498,17 @@ fn percent_decode(text: &str) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
+}
+
+/// Width / height from an image file's header when the format is known.
+/// Best effort: layout can proceed without them.
+pub fn peek_image_dimensions(path: &Path) -> Option<(u32, u32)> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).ok()?;
+    // JPEG SOF can sit past the first few KB; 256 KiB covers typical EXIF.
+    let mut head = Vec::new();
+    file.take(256 * 1024).read_to_end(&mut head).ok()?;
+    image_dimensions(&head)
 }
 
 /// Width and height from the first bytes of a PNG, GIF, WebP or JPEG, when
@@ -1378,6 +1994,7 @@ mod tests {
             attachments: None,
             image_assets: None,
             generation: None,
+            origin: None,
         }
     }
 
@@ -1733,5 +2350,143 @@ mod tests {
         ];
         assert_eq!(image_dimensions(&jpeg), Some((64, 32)));
         assert_eq!(image_dimensions(b"not an image"), None);
+    }
+
+    #[test]
+    fn desktop_resolve_finds_session_and_absolute_paths() {
+        let (_dir, root) = workspace();
+        let flow = root.join("out/flow.png");
+        assert_eq!(
+            resolve_host_media("./out/flow.png", root.to_str()),
+            Some(flow.clone())
+        );
+        assert_eq!(
+            resolve_host_media(flow.to_str().unwrap(), None),
+            Some(std::fs::canonicalize(&flow).unwrap())
+        );
+        assert_eq!(
+            asset_id_from_api(&format!("/api/assets/{}/content", asset_id(&flow))),
+            Some(asset_id(&flow))
+        );
+        assert_eq!(
+            asset_id_from_api("/api/agent-images/ai_abc/thumbnail"),
+            Some("ai_abc".into())
+        );
+    }
+
+    #[test]
+    fn markdown_inline_file_links_are_not_attached_as_prose_files() {
+        let (_dir, root) = workspace();
+        let notes = root.join("notes.md");
+        let flow = root.join("out/flow.png");
+        let notes_uri = format!("file://{}", notes.display());
+        let flow_uri = format!("file://{}", flow.display());
+
+        let linked_only = format!(
+            "Updated [notes.md]({notes_uri}), [`notes.md`]({notes_uri}), and [notes](<{notes_uri}>)."
+        );
+        assert!(attached(&root, &linked_only).is_empty());
+
+        let mixed =
+            format!("See [`notes.md`]({notes_uri}) and ![flow]({flow_uri})\nSaved to: {notes_uri}");
+        let assets = attached(&root, &mixed);
+        assert_eq!(
+            assets
+                .iter()
+                .map(|asset| asset.src.as_str())
+                .collect::<Vec<_>>(),
+            vec![flow_uri.as_str(), notes_uri.as_str()]
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_workspace_paths_in_plain_fences_and_prose_register_assets() {
+        use crate::platform::assets::asset_download;
+        use crate::{bearer_headers, test_device, test_state};
+        use axum::extract::{Path as RoutePath, State};
+        use axum::http::StatusCode;
+
+        let (scratch, root) = workspace();
+        let docs = root.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        let doc_a = docs.join("order-flow-platform-managed.md");
+        let doc_b = docs.join("order-flow-hupun-erp.md");
+        std::fs::write(&doc_a, "# Platform managed\n").unwrap();
+        std::fs::write(&doc_b, "# Hupun ERP\n").unwrap();
+        let notes = root.join("notes.md");
+        let outside = scratch.path().join("outside.png");
+
+        // Exact pattern agents emit when asked for file paths: plain unlabeled
+        // fenced blocks containing one absolute workspace path per line, plus
+        // bare paths in prose.
+        let text = format!(
+            "第一对：\n\n```\n{}\n{}\n```\n\n备注：{}。\n",
+            doc_a.display(),
+            doc_b.display(),
+            notes.display(),
+        );
+        let state = test_state("admin", vec![test_device("d1", "token")]);
+        let mut items = vec![item(&text)];
+        attach_to_items(&state, "bare-workspace-files", root.to_str(), &mut items).await;
+        let assets = items[0]
+            .image_assets
+            .as_ref()
+            .expect("bare workspace file assets");
+        assert_eq!(
+            assets.iter().map(|a| a.src.as_str()).collect::<Vec<_>>(),
+            vec![
+                notes.to_string_lossy().as_ref(),
+                doc_a.to_string_lossy().as_ref(),
+                doc_b.to_string_lossy().as_ref(),
+            ]
+        );
+        for asset in assets {
+            assert_eq!(asset.mime, "text/markdown; charset=utf-8");
+            assert!(asset.download_url.is_some());
+        }
+        let response = asset_download(
+            State(state.clone()),
+            RoutePath(assets[1].asset_id.clone()),
+            bearer_headers("token"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"# Platform managed\n"
+        );
+
+        // In-process Desktop `enrich_timeline` gets the same file assets.
+        let mut desktop_items = vec![item(&text)];
+        enrich_timeline("bare-desktop", root.to_str(), &mut desktop_items);
+        let desktop_assets = desktop_items[0]
+            .image_assets
+            .as_ref()
+            .expect("desktop bare workspace file assets");
+        assert_eq!(desktop_assets.len(), 3);
+
+        // Inline code, language-tagged code fences, mixed non-path fences,
+        // markdown links, missing files, directories, and outside paths must
+        // NOT register as bare workspace assets.
+        for ignored in [
+            format!("`{}`", notes.display()),
+            format!("```rust\n{}\n```", notes.display()),
+            format!("```sh\n{}\n```", notes.display()),
+            format!("```\n{}\necho hello\n```", notes.display()),
+            format!("[notes]({})", notes.display()),
+            format!("[notes](<{}>)", notes.display()),
+            format!("```\n{}\n```", outside.display()),
+            format!("```\n{}/../outside.png\n```", root.display()),
+            format!("```\n{}\n```", root.join("out").display()),
+            format!("```\n{}/missing.md\n```", root.display()),
+        ] {
+            let mut items = vec![item(&ignored)];
+            attach_to_items(&state, "bare-ignored", root.to_str(), &mut items).await;
+            assert!(items[0].image_assets.is_none(), "{ignored}");
+        }
     }
 }

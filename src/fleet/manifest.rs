@@ -56,6 +56,8 @@ pub(crate) struct CompactManifest {
     pub suitable_for: Vec<String>,
 }
 
+const COMPACT_MODELS_CAP: usize = 10;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CompactAgent {
@@ -65,6 +67,12 @@ pub(crate) struct CompactAgent {
     pub version: Option<String>,
     pub modes: Vec<String>,
     pub model_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_health: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,13 +97,30 @@ impl Manifest {
             agents: self
                 .agents
                 .into_iter()
-                .map(|agent| CompactAgent {
-                    model_count: agent.models.len(),
-                    modes: agent.modes.into_iter().map(|mode| mode.id).collect(),
-                    id: agent.id,
-                    kind: agent.kind,
-                    status: agent.status,
-                    version: agent.version,
+                .map(|agent| {
+                    let model_count = agent.models.len();
+                    let mut models = Vec::new();
+                    for m in agent.models.into_iter().take(COMPACT_MODELS_CAP) {
+                        let label = if !m.provider_id.is_empty() && !m.id.contains('/') {
+                            format!("{}/{}", m.provider_id, m.id)
+                        } else {
+                            m.id
+                        };
+                        if !label.is_empty() && !models.contains(&label) {
+                            models.push(label);
+                        }
+                    }
+                    CompactAgent {
+                        model_count,
+                        models,
+                        modes: agent.modes.into_iter().map(|mode| mode.id).collect(),
+                        id: agent.id,
+                        kind: agent.kind,
+                        status: agent.status,
+                        version: agent.version,
+                        quota_health: None,
+                        quota_note: None,
+                    }
                 })
                 .collect(),
             terminal: self
@@ -154,8 +179,34 @@ pub(crate) fn compact_json(full: Value) -> Value {
                 .map(|mode| scalar(&mode["id"]))
                 .collect::<Vec<_>>();
             compact["modes"] = modes.into();
-            let models = agent["models"].as_array().map_or(0, Vec::len);
-            compact["modelCount"] = models.into();
+            let model_items = list(&agent["models"]);
+            compact["modelCount"] = agent["models"].as_array().map_or(0, Vec::len).into();
+            let model_ids: Vec<Value> = model_items
+                .iter()
+                .take(COMPACT_MODELS_CAP)
+                .filter_map(|m| {
+                    let id = m["id"].as_str()?;
+                    let provider = m["providerId"]
+                        .as_str()
+                        .or_else(|| m["provider_id"].as_str())
+                        .unwrap_or("");
+                    let label = if !provider.is_empty() && !id.contains('/') {
+                        format!("{provider}/{id}")
+                    } else {
+                        id.to_owned()
+                    };
+                    Some(scalar(&Value::String(label)))
+                })
+                .collect();
+            if !model_ids.is_empty() {
+                compact["models"] = model_ids.into();
+            }
+            if agent["quotaHealth"].is_string() {
+                compact["quotaHealth"] = scalar(&agent["quotaHealth"]);
+            }
+            if agent["quotaNote"].is_string() {
+                compact["quotaNote"] = scalar(&agent["quotaNote"]);
+            }
             compact
         })
         .collect();
@@ -548,7 +599,33 @@ impl FleetService {
         let (id, label) = (&state.config.server_id, &state.config.label);
         if is_self(machine, id, label, &state.peers.selectors()) {
             let (manifest, peers) = tokio::join!(self.manifest(state), heard(state));
-            let mut answer = json!(manifest.compact());
+            let mut compact = manifest.compact();
+            for agent in &mut compact.agents {
+                if !matches!(
+                    agent.status,
+                    AgentAvailability::Connected | AgentAvailability::Reachable
+                ) {
+                    continue;
+                }
+                if let Some(manager) = state.agent_runtime.manager_for_agent(&agent.id).await {
+                    if let Ok(Ok(limits)) = tokio::time::timeout(
+                        Duration::from_millis(400),
+                        manager.agent().account_limits(),
+                    )
+                    .await
+                    {
+                        if let Some((reason, _)) =
+                            crate::orchestration::is_account_limits_exhausted(&limits, None)
+                        {
+                            agent.quota_health = Some("exhausted".into());
+                            agent.quota_note = Some(reason);
+                        } else {
+                            agent.quota_health = Some("healthy".into());
+                        }
+                    }
+                }
+            }
+            let mut answer = json!(compact);
             answer["peers"] = json!(peers.iter().map(Heard::entry).collect::<Vec<_>>());
             return Ok(answer);
         }

@@ -12,9 +12,12 @@
 pub(crate) mod auth;
 pub(crate) mod files;
 pub(crate) mod hosts;
+pub(crate) mod hub;
 pub(crate) mod inject;
 pub(crate) mod issue;
 pub(crate) mod lineage;
+pub(crate) mod reducer;
+pub(crate) mod skills;
 pub(crate) mod token_routes;
 pub(crate) mod tokens;
 pub(crate) mod tokens_sqlite;
@@ -358,11 +361,11 @@ pub(crate) fn local_url(listen: &str) -> String {
 }
 
 pub(crate) fn mount(router: Router<AppState>) -> Router<AppState> {
-    files::mount(token_routes::mount(
+    hub::mount(files::mount(token_routes::mount(
         router
             .route(MCP_PATH, any(serve))
             .route("/mcp/identity", axum::routing::post(identity)),
-    ))
+    )))
 }
 
 /// The request reaches rmcp unread, so axum's `DefaultBodyLimit` does not
@@ -406,11 +409,13 @@ async fn serve(
     } else {
         None
     };
+    let underscore_tool_names = tools::uses_underscore_tool_names(&state, &session).await;
     let service = StreamableHttpService::new(
         move || {
             Ok(tools::MuqunMcp::new(state.clone(), session.clone())
                 .in_task(in_task)
-                .fleet(fleet.clone()))
+                .fleet(fleet.clone())
+                .underscore_tool_names(underscore_tool_names))
         },
         Arc::new(NeverSessionManager::default()),
         config(),
@@ -596,6 +601,72 @@ mod tests {
         let machines = answer["machines"].as_array().unwrap();
         assert_eq!(machines.len(), 1, "{answer}");
         assert_eq!(machines[0]["machineId"], state.config.server_id, "{answer}");
+    }
+
+    #[tokio::test]
+    async fn antigravity_caller_lists_underscore_tools_and_calls_them_over_mcp() {
+        let state = crate::test_state("admin", Vec::new());
+        let token = state
+            .mcp_tokens
+            .issue(
+                TokenBinding::Runtime {
+                    agent_id: "antigravity".into(),
+                },
+                "antigravity (native sessions)".into(),
+                60_000,
+            )
+            .await
+            .unwrap()
+            .token;
+        let (status, body) = send(&state, post("127.0.0.1:5", Some(&token), &[])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let names: Vec<&str> = body["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"exec_run"), "{body}");
+        assert!(names.contains(&"fleet_list"), "{body}");
+        assert!(names.contains(&"tasks_delegate"), "{body}");
+        assert!(
+            names.iter().all(|name| {
+                let prefixed = format!("mcp_muqun_{name}");
+                prefixed.len() <= 64
+                    && prefixed
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            }),
+            "every tool exposed to Antigravity must satisfy strict ^[a-zA-Z0-9_-]{{1,64}}$: {names:?}"
+        );
+        let call_req = rpc(
+            "127.0.0.1:5",
+            Some(&token),
+            &[("mcp-name", "fleet_list")],
+            "tools/call",
+            json!({ "name": "fleet_list", "arguments": {} }),
+        );
+        let (status, body) = send(&state, call_req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_ne!(body["result"]["isError"], true, "{body}");
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let answer: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            answer["machines"][0]["machineId"], state.config.server_id,
+            "{answer}"
+        );
+
+        let standard_token = issue(&state).await;
+        let alias_req = rpc(
+            "127.0.0.1:5",
+            Some(&standard_token),
+            &[("mcp-name", "fleet_list")],
+            "tools/call",
+            json!({ "name": "fleet_list", "arguments": {} }),
+        );
+        let (status, body) = send(&state, alias_req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_ne!(body["result"]["isError"], true, "{body}");
     }
 
     /// The listener's 128 KiB body limit holds on `/mcp` too: a 200 KiB call
@@ -911,5 +982,230 @@ mod tests {
         let headers = crate::bearer_headers("tok");
         assert!(crate::require_device(&state, &headers).is_err());
         assert!(crate::require_admin(&state.config, &headers).is_err());
+    }
+
+    #[tokio::test]
+    async fn skills_over_mcp_resources_and_fallback_tool_roundtrip() {
+        use sha2::{Digest as _, Sha256};
+
+        let state = crate::test_state("admin", Vec::new());
+        let token = issue(&state).await;
+
+        // 1. initialize advertises resources + io.modelcontextprotocol/skills extension.
+        let init_req = rpc(
+            "127.0.0.1:5",
+            Some(&token),
+            &[],
+            "initialize",
+            json!({
+                "protocolVersion": "2026-07-28",
+                "capabilities": {},
+                "clientInfo": { "name": "test-client", "version": "1.0" },
+            }),
+        );
+        let (status, body) = send(&state, init_req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body["result"]["capabilities"]["resources"].is_object(),
+            "expected resources capability: {body}"
+        );
+        assert!(
+            body["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/skills"]
+                .is_object(),
+            "expected io.modelcontextprotocol/skills extension: {body}"
+        );
+        assert_eq!(
+            body["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/skills"]
+                ["directoryRead"],
+            true,
+            "expected directoryRead in skills capability: {body}"
+        );
+        assert!(
+            body["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/tasks"]
+                .is_object(),
+            "expected io.modelcontextprotocol/tasks extension: {body}"
+        );
+
+        // 2. resources/list exposes skill://muqun/*/SKILL.md resources.
+        let (status, list_body) = send(
+            &state,
+            rpc(
+                "127.0.0.1:5",
+                Some(&token),
+                &[],
+                "resources/list",
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{list_body}");
+        let resources = list_body["result"]["resources"].as_array().unwrap();
+        assert_eq!(resources.len(), skills::BUILTIN_SKILLS.len());
+        assert!(resources
+            .iter()
+            .any(|r| r["uri"] == "skill://muqun/parallel-tasks/SKILL.md"));
+
+        // 3. resources/read returns SKILL.md markdown and rejects unknown URIs.
+        let (status, read_body) = send(
+            &state,
+            rpc(
+                "127.0.0.1:5",
+                Some(&token),
+                &[("mcp-name", "skill://muqun/parallel-tasks/SKILL.md")],
+                "resources/read",
+                json!({ "uri": "skill://muqun/parallel-tasks/SKILL.md" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{read_body}");
+        let md = read_body["result"]["contents"][0]["text"].as_str().unwrap();
+        assert!(md.contains("barrier_group"), "{md}");
+        let expected_sha = hex::encode(Sha256::digest(md.as_bytes()));
+
+        let (_, missing_body) = send(
+            &state,
+            rpc(
+                "127.0.0.1:5",
+                Some(&token),
+                &[("mcp-name", "skill://muqun/does-not-exist/SKILL.md")],
+                "resources/read",
+                json!({ "uri": "skill://muqun/does-not-exist/SKILL.md" }),
+            ),
+        )
+        .await;
+        assert!(missing_body.get("error").is_some(), "{missing_body}");
+
+        // 4. SEP-2640 skills/list + skills/get carry matching SHA-256 digests.
+        let (status, skills_list_body) = send(
+            &state,
+            rpc("127.0.0.1:5", Some(&token), &[], "skills/list", json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{skills_list_body}");
+        let entries = skills_list_body["result"]["skills"].as_array().unwrap();
+        assert_eq!(entries.len(), skills::BUILTIN_SKILLS.len());
+        let parallel = entries
+            .iter()
+            .find(|s| s["uri"] == "skill://muqun/parallel-tasks/SKILL.md")
+            .unwrap();
+        assert_eq!(
+            parallel["resources"][0]["digest"],
+            format!("sha256:{expected_sha}")
+        );
+
+        let (status, skills_get_body) = send(
+            &state,
+            rpc(
+                "127.0.0.1:5",
+                Some(&token),
+                &[("mcp-name", "skill://muqun/parallel-tasks/SKILL.md")],
+                "skills/get",
+                json!({ "uri": "skill://muqun/parallel-tasks/SKILL.md" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{skills_get_body}");
+        assert_eq!(
+            skills_get_body["result"]["skill"]["frontmatter"]["name"],
+            "parallel-tasks"
+        );
+
+        // 5. Fallback skills.read tool works for non-SEP-2640 clients.
+        let (status, catalog_body) = send(
+            &state,
+            rpc(
+                "127.0.0.1:5",
+                Some(&token),
+                &[("mcp-name", "skills.read")],
+                "tools/call",
+                json!({ "name": "skills.read", "arguments": {} }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{catalog_body}");
+        let catalog_text = catalog_body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(catalog_text.contains("parallel-tasks"), "{catalog_text}");
+
+        let (status, item_body) = send(
+            &state,
+            rpc(
+                "127.0.0.1:5",
+                Some(&token),
+                &[("mcp-name", "skills.read")],
+                "tools/call",
+                json!({ "name": "skills.read", "arguments": { "name": "parallel-tasks" } }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{item_body}");
+        let item_text = item_body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(item_text.contains("barrier_group"), "{item_text}");
+
+        // 6. Native SEP-2663 tasks/get + tasks/cancel respect ownership and redact secrets.
+        let owned_task = crate::tasks::domain::Task {
+            id: crate::tasks::domain::TaskId::new(),
+            kind: crate::tasks::domain::TaskKind::Delegation,
+            goal: "check secrets".into(),
+            cwd: None,
+            binding: crate::tasks::domain::TaskBinding::None,
+            state: crate::tasks::domain::TaskState::Done,
+            summary: Some("Bearer eyJhbGciOiJIUzI1NiJ9.secret123456 ok".into()),
+            exit_code: Some(0),
+            created_by: crate::tasks::domain::TaskPrincipal {
+                kind: crate::tasks::domain::PrincipalKind::Assistant,
+                id: pane().owner_key(),
+            },
+            created_ms: 1_700_000_000_000,
+            updated_ms: 1_700_000_005_000,
+            seq: 1,
+            parent: None,
+            origin: crate::tasks::domain::TaskOrigin::Mcp,
+            label: None,
+            requester_name: None,
+            session_title: None,
+            mentions: Vec::new(),
+            client_ref: None,
+            requester_server_id: None,
+            reopened_ms: None,
+            reopen_count: 0,
+        };
+        let task_id = state.tasks.insert_for_test(&owned_task).await;
+        let mut get_task_params = json!({ "taskId": task_id.0 });
+        get_task_params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": { "name": "test", "version": "0" },
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": { "io.modelcontextprotocol/tasks": {} }
+            }
+        });
+        let mut get_task_req = Request::post(MCP_PATH)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("host", "127.0.0.1:23999")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tasks/get")
+            .header("mcp-name", &task_id.0)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tasks/get",
+                    "params": get_task_params,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        get_task_req
+            .extensions_mut()
+            .insert(ConnectInfo("127.0.0.1:5".parse::<SocketAddr>().unwrap()));
+        let (status, task_body) = send(&state, get_task_req).await;
+        assert_eq!(status, StatusCode::OK, "{task_body}");
+        assert_eq!(task_body["result"]["status"], "completed", "{task_body}");
+        let status_msg = task_body["result"]["statusMessage"].as_str().unwrap();
+        assert!(!status_msg.contains("eyJhbGciOiJIUzI1NiJ9"), "{status_msg}");
+        assert!(status_msg.contains("Bearer [REDACTED]"), "{status_msg}");
     }
 }

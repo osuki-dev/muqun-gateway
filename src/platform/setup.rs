@@ -60,6 +60,7 @@ pub(crate) fn setup(
     port: u16,
     socket_path: Option<String>,
     backend: Option<BackendKind>,
+    desktop_terminal: bool,
     transport_encryption: Option<TransportEncryptionMode>,
 ) -> anyhow::Result<()> {
     let config_dir = config_dir()?;
@@ -75,7 +76,18 @@ pub(crate) fn setup(
         &config_dir.join(PAIRING_FILE),
     );
 
-    let backend = resolve_setup_backend(backend, existing.as_ref().map(|install| &install.config));
+    let existing_config = existing.as_ref().map(|install| &install.config);
+    let desktop_terminal = desktop_terminal
+        || (backend.is_none()
+            && socket_path.is_none()
+            && existing_config
+                .and_then(|config| config.sessions.first())
+                .is_some_and(SessionConfig::is_desktop_terminal));
+    let backend = if desktop_terminal {
+        BackendKind::Herdr
+    } else {
+        resolve_setup_backend(backend, existing_config)
+    };
     ensure_backend_available(backend)?;
 
     let (server_id, token, token_hash) = match &existing {
@@ -146,6 +158,7 @@ pub(crate) fn setup(
             codex: agents::runtime::CodexConfig::default(),
             fx: agents::runtime::FxConfig::default(),
             qoder: agents::runtime::QoderConfig::default(),
+            copilot: agents::runtime::CopilotConfig::default(),
             claude: agents::runtime::ClaudeConfig::default(),
             antigravity: agents::runtime::AntigravityConfig::default(),
             cursor: agents::runtime::CursorConfig::default(),
@@ -160,7 +173,31 @@ pub(crate) fn setup(
     if let Some(mode) = transport_encryption {
         config.transport_encryption = mode;
     }
-    upsert_backend_session(&mut config, backend, None, None, socket_path)?;
+    if desktop_terminal {
+        let socket = crate::backend::muqun_term::default_socket_path();
+        anyhow::ensure!(
+            config
+                .sessions
+                .iter()
+                .all(|session| session.id != SessionConfig::DESKTOP_ID
+                    || session.is_desktop_terminal()),
+            "an existing backend uses the Desktop terminal id; its configuration has been retained"
+        );
+        upsert_backend_session(
+            &mut config,
+            backend,
+            Some(SessionConfig::DESKTOP_ID.into()),
+            Some(crate::backend::muqun_term::MUQUN_WORKSPACE_LABEL.into()),
+            Some(
+                socket
+                    .to_str()
+                    .context("Desktop terminal socket path is not UTF-8")?
+                    .into(),
+            ),
+        )?;
+    } else {
+        upsert_backend_session(&mut config, backend, None, None, socket_path)?;
+    }
 
     let path = config_dir.join(CONFIG_FILE);
     write_config(&path, &config)?;
@@ -275,7 +312,10 @@ pub(crate) fn upsert_backend_session(
 ) -> anyhow::Result<String> {
     ensure_backend_available(backend)?;
     if let Some(session) = config.sessions.iter_mut().find(|session| {
-        session.backend == backend && requested_id.as_deref().is_none_or(|id| session.id == id)
+        session.backend == backend
+            && requested_id
+                .as_deref()
+                .map_or_else(|| !session.is_desktop_terminal(), |id| session.id == id)
     }) {
         if let Some(label) = label {
             validate_label(&label)?;
@@ -363,7 +403,7 @@ pub(crate) fn configure_backend(command: BackendCommand) -> anyhow::Result<()> {
                 println!(
                     "{}\t{}\t{}\t{}",
                     session.id,
-                    session.backend.as_str(),
+                    session.backend_display_name(),
                     session.label,
                     endpoint
                 );

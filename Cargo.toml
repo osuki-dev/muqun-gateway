@@ -1,3 +1,7 @@
+[workspace]
+resolver = "2"
+members = [".", "desktop"]
+
 [package]
 name = "muqun-gateway"
 version = "0.14.0"
@@ -8,6 +12,14 @@ repository = "https://github.com/osuki-dev/muqun-gateway"
 readme = "README.md"
 keywords = ["terminal", "gateway", "tmux", "herdr", "tailscale"]
 categories = ["command-line-utilities"]
+
+[lib]
+name = "muqun_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "muqun-gateway"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.103"
@@ -60,20 +72,46 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 # the tree through reqwest, so this adds no compiled crate.
 tokio-util = "0.7.20"
 rmcp = { version = "3.7.0", features = ["server", "transport-streamable-http-server", "macros"] }
-rusqlite = { version = "0.41.0", features = ["bundled-sqlcipher-vendored-openssl"] }
+tempfile = "3.27"
+rusqlite = { version = "0.42.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 hex = "0.4"
 # `ServiceExt::oneshot`: `/mcp` drives a per-request rmcp service with it, and
 # tests drive a Router. Already in the tree through axum.
 tower = { version = "0.5", default-features = false, features = ["util"] }
 toml = "1.1.8"
+# Bounded metadata-only recognition of legacy Word/Excel/PowerPoint uploads.
+cfb = { version = "0.16.0", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1.53.3", features = ["test-util"] }
 
 [profile.release]
-# The gateway ships as a single prebuilt binary per platform. Thin LTO and one
+# Gateway and Desktop ship as prebuilt binaries per platform. Thin LTO and one
 # codegen unit trade a slower release build for a smaller, faster artifact;
 # stripping drops the symbol tables nothing needs at runtime.
+opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# The desktop terminal's emulator is Zig code built by libghostty-vt-sys; in a
+# dev build without this it compiles in Zig's Debug mode, several times slower
+# at parsing a flood of output. Release-fast it, debug builds stay debuggable.
+[profile.dev.package.libghostty-vt-sys]
+debug = false
+opt-level = 3
+
+# Optional local override (not required for CI): point at a sibling checkout
+# with `cargo --config 'patch."https://github.com/ryuhzk/rune".rune.path="../rune/crates/rune"'`
+# (and the matching rune-kit path) while iterating on Rune itself.
+
+# Rune platform patches, pinned with the UI framework.
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f" }
+naga = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f" }
+winit = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f" }
+sctk-adwaita = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f" }
+parley_engine = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f" }
+accesskit_windows = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f" }
+accesskit_atspi_common = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f" }
+accesskit_macos = { git = "https://github.com/ryuhzk/rune", rev = "4be704393eecc9114dcda0ebf912db6ca21d400f" }

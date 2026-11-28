@@ -10,9 +10,22 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
 
 ## Shape of the codebase
 
-- `src/main.rs`: composition root only -- module declarations, the legacy
-  crate-root re-exports, `AppState`, and `fn main`. Domain code lives in the
-  module tree below.
+- `src/lib.rs`: the `muqun_gateway` library and composition root -- module
+  declarations, the legacy crate-root re-exports, `AppState`, and `run_main`.
+  `src/main.rs` is a thin binary that calls `muqun_gateway::run_main`. Domain
+  code lives in the module tree below. The root `Cargo.toml` is also a
+  (single-member) workspace. The only public surface is `agents`
+  (`AgentRuntime`, the adapter config types, `domain`, `use_cases`, `manager`,
+  `ports`, `compose`), `platform::discovery`, `platform::i18n` and
+  `set_directories`; everything else is `pub(crate)`, so a host crate can embed
+  the agents plane without the HTTP server.
+- `src/agents/compose.rs`: the one place that builds the `AgentRuntime` from
+  settings (`RuntimeSettings`, `build_runtime`) and opens/attaches the shared
+  store (`open_store`, `attach_store`); the server, the `agent` command and an
+  embedding host all go through it.
+- `set_directories` (`platform/store.rs`): pins the config and state
+  directories once per process, ahead of `MUQUN_GATEWAY_*_DIR` and the
+  platform defaults, for hosts that own where their files live.
 - `src/cli/`: CLI arguments, subcommands, and dispatch.
 - `src/test_support.rs`: shared test fixtures and fakes, compiled only for
   test builds.
@@ -29,7 +42,10 @@ The retired `herdr.gateway` identifier remains only for migration compatibility.
     and capability differences. Their drivers own session children and domain
     events; other service event streams are folded under `manager/`
     (`deepseek.rs`, `t3.rs`, `codex.rs`, `pi.rs`). See `docs/fx-protocol.md` and
-    `docs/qoder-protocol.md` for their separate upstream contracts.
+    `docs/qoder-protocol.md` for their separate upstream contracts. Copilot
+    (`adapters/copilot/`) also uses this private ACP driver, behind an opt-in
+    `copilot` config block; see `docs/copilot-protocol.md` for discovery, existing
+    authentication, advertised modes and permission boundaries.
   - `manager.rs`, `runtime.rs`, `use_cases/`: agent supervision and the
     session/prompt/interaction services. `runtime/t3.rs` holds T3's config
     block, its pairing-token-to-bearer credential (persisted by

@@ -21,15 +21,18 @@ pub(crate) struct Migration {
 pub(crate) const ALL_MIGRATIONS: &[Migration] = &[
     crate::agents::adapters::codex::native_sessions::MIGRATION,
     crate::agents::adapters::codex::native_sessions::PRESENTATION_MIGRATION,
+    crate::agents::adapters::acp::session::LAUNCH_BYPASS_MIGRATION,
     crate::agents::runtime::SESSION_ROUTES_MIGRATION,
     crate::connectivity::replay_store::MIGRATION,
     crate::tasks::store_sqlite::MIGRATION,
+    crate::orchestration::MIGRATION,
     crate::mcp::tokens::MIGRATION,
     crate::fleet::peers::MIGRATION,
     crate::fleet::home_grants::MIGRATION,
     crate::terminal::history_sqlite::MIGRATION,
     super::t3_credentials::MIGRATION,
     crate::agents::session_defaults::MIGRATION,
+    crate::agents::preview_cache::MIGRATION,
 ];
 
 type Boxed = Box<dyn Any + Send>;
@@ -125,6 +128,10 @@ fn open_connection(path: &Path, key: Option<&DbKey>) -> anyhow::Result<Connectio
     connection.busy_timeout(std::time::Duration::from_secs(1))?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
+    // Bound SQLite's page cache (4 MiB) and disable mmap so large FTS5/store
+    // files (hundreds of MB) do not inflate process RSS.
+    connection.pragma_update(None, "cache_size", -4096)?;
+    connection.pragma_update(None, "mmap_size", 0)?;
     super::lock_down_secret_file(path)?;
     Ok(connection)
 }

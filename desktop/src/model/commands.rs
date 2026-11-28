@@ -1,0 +1,422 @@
+//! UI → core. The UI thread only ever sends one of these; it never awaits,
+//! never takes a runtime lock, never calls the hub (architecture §2).
+
+use std::path::PathBuf;
+
+use muqun_gateway::agents::{AgentSessionId, PermissionDecision};
+use tokio::sync::mpsc;
+
+use crate::config::{ConfigEdit, Scheme};
+
+/// Start dictation (`model/voice.rs`): the service, the meter the waveform
+/// reads, and the control channel the composer's buttons drive.
+pub struct VoiceStart {
+    pub config: crate::config::VoiceConfig,
+    pub meter: std::sync::Arc<super::voice::Meter>,
+    pub control: std::sync::Mutex<Option<mpsc::UnboundedReceiver<super::voice::VoiceControl>>>,
+}
+
+impl std::fmt::Debug for VoiceStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VoiceStart")
+            .field("mode", &self.config.mode)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Command {
+    Orchestration {
+        computer: String,
+        ticket: u64,
+        request: crate::hub::OrchestrationRequest,
+    },
+    /// Record and transcribe into the composer.
+    Voice(std::sync::Arc<VoiceStart>),
+    /// Re-read agent status and the session list.
+    Refresh,
+    /// Switch active computer target: reconnect or swap the hub and reload data.
+    SwitchComputer(String),
+    /// Request a pairing code from a remote computer.
+    PairComputerRequest {
+        attempt: u64,
+        server_id: String,
+        url: String,
+    },
+    /// Claim pairing token with code.
+    PairComputerClaim {
+        attempt: u64,
+        server_id: String,
+        url: String,
+        request_id: String,
+        code: String,
+        transport_required: bool,
+    },
+    /// Save a manually entered or verified token.
+    PairComputerToken {
+        attempt: u64,
+        server_id: String,
+        url: String,
+        token: String,
+    },
+    /// Make a session the active one and read its snapshot.
+    OpenSession(AgentSessionId),
+    /// Read a session's snapshot for a read-only look (a subagent's detail
+    /// sheet): never prepares it, never makes it the active one.
+    ReadDetail(AgentSessionId),
+    /// Read one file from the active remote computer through its Gateway.
+    ReadRemoteFile {
+        asid: AgentSessionId,
+        path: String,
+    },
+    /// An agent's account rate windows (`Update::AccountLimits`).
+    LoadAccountLimits {
+        agent: String,
+        refresh: bool,
+    },
+    /// Open a session into a split tile: read its snapshot and stream its
+    /// events, without taking the active (focused) place.
+    OpenTile(AgentSessionId),
+    /// Focus an already open session (e.g. switching between split tiles):
+    /// updates the active session and heartbeat without reloading snapshot.
+    FocusSession(AgentSessionId),
+    /// The sessions on screen besides the active one (split tiles). Their
+    /// events stream like the active session's; the rest are filtered.
+    WatchSessions(Vec<AgentSessionId>),
+    /// Start a session for `agent` in `cwd`, remember `cwd`, open it. (The
+    /// composer starts sessions through `Compose`; the QA harness uses this.)
+    #[allow(dead_code)]
+    CreateSession {
+        agent: String,
+        cwd: PathBuf,
+    },
+    #[allow(dead_code)]
+    SendPrompt {
+        asid: AgentSessionId,
+        text: String,
+    },
+    Interrupt(AgentSessionId),
+    ReplyPermission {
+        asid: AgentSessionId,
+        id: String,
+        decision: PermissionDecision,
+    },
+    /// Show the session's changes (one file's, or all) in the diff panel.
+    OpenDiff {
+        asid: AgentSessionId,
+        file: Option<String>,
+    },
+    /// Refresh the session's working tree diff from the gateway.
+    RefreshDiff(AgentSessionId),
+    /// Stage a rollback to `message_id`, to be confirmed or cancelled
+    /// (§6.1c item 9).
+    StageRevert {
+        asid: AgentSessionId,
+        message_id: String,
+    },
+    /// Apply the staged rollback.
+    CommitRevert {
+        asid: AgentSessionId,
+    },
+    /// Drop the staged rollback.
+    ClearRevert {
+        asid: AgentSessionId,
+    },
+    /// Compact the session into a summary.
+    CompactSession {
+        asid: AgentSessionId,
+    },
+    /// The next older page of the session's history (architecture §3
+    /// `earlier`).
+    LoadEarlier(AgentSessionId),
+    /// Search every session's content (`Update::Search`). A first page waits
+    /// out the typing; a newer search cancels the one in flight.
+    Search {
+        generation: u64,
+        query: crate::hub::SearchQuery,
+    },
+    ReplyForm {
+        asid: AgentSessionId,
+        id: String,
+        /// `{ field key: value }`, as the gateway's form route takes it.
+        answers: serde_json::Value,
+    },
+    /// Folders under a typed prefix. Debounced on the core side; only the
+    /// answer for the newest prefix is delivered. (The start page picks
+    /// folders with the system dialog; this waits for a typed path field.)
+    #[allow(dead_code)]
+    CompleteDirectory {
+        prefix: String,
+    },
+    /// The folders `agent` already knows as projects.
+    LoadProjects {
+        agent: String,
+    },
+    /// The owner changed a setting or arranged the window. Applied at once
+    /// in memory, written to disk after 500 ms without another edit.
+    Edit(ConfigEdit),
+    /// The composer's work (`model/compose.rs`): files, catalogue, staging,
+    /// delivery, the queue.
+    Compose(super::compose::ComposeCommand),
+    /// Themes (`theme/service.rs`). The library list, and the gallery index
+    /// (from its 1 h cache when fresh) with its card pictures.
+    ThemeRefresh,
+    /// Download theme `id` from the gallery, check its SHA-256, install it.
+    ThemeInstall(String),
+    /// Remove an installed theme (built-ins cannot be).
+    ThemeRemove(String),
+    /// Make theme `id` current in `scheme`, and remember both.
+    ThemeApply(String, Scheme),
+    /// Install a `.muqun-theme` from disk (file dialog or drop).
+    ThemeImportFile(PathBuf),
+    /// Download and install a public HTTPS `.muqun-theme` link (App link import).
+    ThemeImportUrl(String),
+    /// Rename a listed session.
+    RenameSession {
+        asid: AgentSessionId,
+        title: String,
+    },
+    /// Delete a listed session (and clear it if it is open).
+    DeleteSession(AgentSessionId),
+    /// Fork a session into a new one and open it.
+    ForkSession {
+        asid: AgentSessionId,
+        message_id: Option<String>,
+    },
+    /// Read the sessions below `asid` (its sub-agents, at any depth).
+    LoadDescendants {
+        asid: AgentSessionId,
+    },
+    /// Read the project's remembered "always allow" decisions.
+    LoadSavedPermissions {
+        asid: AgentSessionId,
+    },
+    /// Forget one remembered decision.
+    ForgetSavedPermission {
+        asid: AgentSessionId,
+        id: String,
+    },
+    /// Re-read background shells for the open session's agent/folder.
+    LoadShells {
+        agent: String,
+        directory: Option<String>,
+    },
+    /// Stop one background shell.
+    KillShell {
+        agent: String,
+        id: String,
+        directory: Option<String>,
+    },
+    /// Park the open session's current turn in the background.
+    BackgroundSession {
+        asid: AgentSessionId,
+    },
+    /// Re-read worktrees for the open session's project folder.
+    LoadWorktrees {
+        agent: String,
+        directory: String,
+    },
+    /// Remove a linked worktree.
+    RemoveWorktree {
+        agent: String,
+        project: String,
+        worktree: String,
+    },
+    /// Rediscover worktrees for a project folder.
+    RefreshWorktrees {
+        agent: String,
+        directory: String,
+    },
+    /// Load repository overview (branch, ahead/behind, branches, remote, worktrees)
+    /// and changed files (`working` or `branch`) for the target session.
+    VcsLoadOverview {
+        asid: AgentSessionId,
+        mode: String,
+    },
+    /// Stage one or more paths (or all working changes) for a session's repo.
+    VcsStage {
+        asid: AgentSessionId,
+        paths: Vec<String>,
+        all: bool,
+        mode: String,
+    },
+    /// Unstage one or more paths (or all staged changes) for a session's repo.
+    VcsUnstage {
+        asid: AgentSessionId,
+        paths: Vec<String>,
+        all: bool,
+        mode: String,
+    },
+    /// Discard one changed or untracked file via Gateway.
+    VcsDiscard {
+        asid: AgentSessionId,
+        path: String,
+        mode: String,
+    },
+    /// Switch to a branch or check out a Pull Request.
+    VcsCheckout {
+        asid: AgentSessionId,
+        branch: Option<String>,
+        pr_number: Option<u64>,
+        mode: String,
+    },
+    /// Commit staged changes (or stage all then commit), optionally pushing after.
+    VcsCommit {
+        asid: AgentSessionId,
+        message: String,
+        stage_all: bool,
+        push: bool,
+        mode: String,
+    },
+    /// Fetch, pull, or push the session's repository.
+    VcsSync {
+        asid: AgentSessionId,
+        action: String,
+        mode: String,
+    },
+    /// Load one page of recent commits (`offset == 0` replaces, `> 0` appends).
+    VcsLoadCommits {
+        asid: AgentSessionId,
+        offset: usize,
+        limit: usize,
+    },
+    /// Load one page of Pull Requests (`page == 1` replaces, `> 1` appends).
+    VcsLoadPrs {
+        asid: AgentSessionId,
+        state: String,
+        author: String,
+        page: u32,
+        limit: u32,
+        refresh: bool,
+    },
+    /// Re-read the delegated task list (and the default folder).
+    RefreshTasks,
+    CheckDesktopUpdate,
+    InstallDesktopUpdate(String),
+    CheckGatewayUpdate,
+    InstallGatewayUpdate {
+        version: String,
+        channel: String,
+    },
+    CheckpointForUpdateRestart,
+    RefreshLocalPairings,
+    ReadLocalInvite(u64),
+    RevokeLocalPairing(String),
+    RefreshLocalGatewayControl,
+    RunLocalGatewayControl(muqun_gateway::gateway_control::GatewayControlAction),
+    UnpairComputer {
+        computer: String,
+        request: uuid::Uuid,
+        gateway: crate::hub::LocalGateway,
+    },
+    /// Measure what the desktop keeps on disk (Settings → Storage).
+    ScanStorage,
+    /// Delete the rebuildable caches (theme previews, gallery index), then measure again.
+    ClearStorage,
+    /// Delegate `goal` as a task (`agent` / `cwd` default on the gateway).
+    CreateTask {
+        goal: String,
+        agent: Option<String>,
+        cwd: Option<String>,
+    },
+    /// Cancel a task.
+    CancelTask {
+        id: String,
+    },
+    /// Confirm a paused delegation is finished.
+    CompleteTask {
+        id: String,
+    },
+    /// Read a task's state history (`Update::TaskHistory`).
+    TaskHistory {
+        id: String,
+    },
+    /// Git commit staged changes or all changes in `cwd`.
+    GitCommit {
+        cwd: String,
+        message: String,
+        push: bool,
+        asid: Option<AgentSessionId>,
+    },
+    /// Git push current branch in `cwd`.
+    GitPush {
+        cwd: String,
+        asid: Option<AgentSessionId>,
+    },
+    /// Merge a task's worktree branch into current base checkout.
+    MergeTaskWorktree {
+        task_id: String,
+        base_dir: String,
+        branch: String,
+        worktree_dir: Option<String>,
+    },
+    /// Clean up a task's worktree folder and prune worktrees.
+    CleanTaskWorktree {
+        task_id: String,
+        base_dir: String,
+        worktree_dir: Option<String>,
+        branch: Option<String>,
+    },
+    /// Probe managed & system runtimes (Bun & Herdr) on the background worker.
+    ProbeRuntimes,
+    PluginPackage(uuid::Uuid, crate::plugin::packages::Operation, Vec<String>),
+    /// Download and install a managed runtime (Bun or Herdr) on the background worker.
+    InstallManagedRuntime(muqun_gateway::platform::runtimes::RuntimeKind),
+    /// Best-effort pre-warm of an ACP agent runtime while the user composes on Home.
+    WarmAgent {
+        agent: String,
+        directory: Option<String>,
+        auto_approve: bool,
+    },
+    /// Capture baseline git commits asynchronously off the main UI thread when an MAO run starts.
+    MaoCaptureBaseline {
+        run_id: String,
+        cwd: String,
+        goal: String,
+    },
+    /// Gather git diff/changed-file context for an MAO Coder -> Reviewer handoff.
+    MaoPrepareReview {
+        run_id: String,
+        coder_asid: String,
+        cwd: String,
+        goal: String,
+        base_commit: Option<String>,
+        base_commits: std::collections::BTreeMap<String, String>,
+    },
+    /// Load external upstream MCP servers from the active Gateway's MCP Hub.
+    LoadMcpUpstreams,
+    /// Create or update one upstream MCP server in the active Gateway's MCP Hub.
+    UpsertMcpUpstream {
+        id: String,
+        body: crate::hub::McpUpstreamUpsert,
+    },
+    /// Delete one upstream MCP server from the active Gateway's MCP Hub.
+    DeleteMcpUpstream {
+        id: String,
+    },
+    /// Live-probe one upstream MCP server in the active Gateway's MCP Hub.
+    ProbeMcpUpstream {
+        id: String,
+    },
+    /// Call one tool on an enabled upstream MCP server in the active Gateway's MCP Hub.
+    CallMcpUpstreamTool {
+        id: String,
+        tool: String,
+        arguments: serde_json::Value,
+    },
+}
+
+pub type CommandSender = mpsc::UnboundedSender<Command>;
+pub type CommandReceiver = mpsc::UnboundedReceiver<Command>;
+
+pub fn channel() -> (CommandSender, CommandReceiver) {
+    mpsc::unbounded_channel()
+}
+
+/// Send, from the UI thread. The receiver only goes away when the core
+/// thread has ended, at which point there is nothing left to tell.
+pub fn send(tx: &CommandSender, command: Command) {
+    if tx.send(command).is_err() {
+        tracing::warn!("the core thread is gone; a UI command was dropped");
+    }
+}

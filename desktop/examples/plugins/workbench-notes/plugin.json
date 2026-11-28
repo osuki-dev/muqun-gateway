@@ -1,0 +1,18 @@
+{
+  "id": "workbench-notes",
+  "name": "Workbench Notes",
+  "version": "1.0.0",
+  "description": "A custom developer workspace panel.",
+  "category": "extensions",
+  "icon": "task",
+  "surfaces": [
+    "tile",
+    "page",
+    "drawer"
+  ],
+  "tile": {
+    "kind": "markdown",
+    "title": "Workbench Notes",
+    "entry": "README.md"
+  }
+}

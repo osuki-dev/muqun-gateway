@@ -780,6 +780,109 @@ pub fn openapi_spec() -> Value {
             }
         }
     });
+    spec["paths"]["/api/agent-sessions/{asid}/vcs/overview"] = json!({
+        "get": {
+            "summary": "Repository overview: summary, local branches (up to 200), normalized remote URL/host, and worktrees. Returns is_repo: false outside a checkout rather than 404. Announced as vcs_git_ops_v1",
+            "parameters": [path_param("asid")],
+            "responses": ok_response()
+        }
+    });
+    spec["paths"]["/api/agent-sessions/{asid}/vcs/stage"] = json!({
+        "post": {
+            "summary": "Stage validated repo-relative paths or all changes. Announced as vcs_git_ops_v1",
+            "parameters": [path_param("asid")],
+            "requestBody": json_body(json!({
+                "type": "object",
+                "properties": {
+                    "paths": { "type": "array", "items": { "type": "string" } },
+                    "all": { "type": "boolean" }
+                }
+            })),
+            "responses": ok_response()
+        }
+    });
+    spec["paths"]["/api/agent-sessions/{asid}/vcs/unstage"] = json!({
+        "post": {
+            "summary": "Unstage validated repo-relative paths or all staged changes (including unborn HEAD). Announced as vcs_git_ops_v1",
+            "parameters": [path_param("asid")],
+            "requestBody": json_body(json!({
+                "type": "object",
+                "properties": {
+                    "paths": { "type": "array", "items": { "type": "string" } },
+                    "all": { "type": "boolean" }
+                }
+            })),
+            "responses": ok_response()
+        }
+    });
+    spec["paths"]["/api/agent-sessions/{asid}/vcs/checkout"] = json!({
+        "post": {
+            "summary": "Switch to an existing local/origin branch or check out a pull request by number. Announced as vcs_git_ops_v1 / vcs_prs_v1",
+            "parameters": [path_param("asid")],
+            "requestBody": json_body(json!({
+                "type": "object",
+                "properties": {
+                    "branch": { "type": "string" },
+                    "pr_number": { "type": "integer", "minimum": 1 }
+                }
+            })),
+            "responses": ok_response()
+        }
+    });
+    spec["paths"]["/api/agent-sessions/{asid}/vcs/commit"] = json!({
+        "post": {
+            "summary": "Create a git commit (optionally staging all changes first). Announced as vcs_git_ops_v1",
+            "parameters": [path_param("asid")],
+            "requestBody": json_body(json!({
+                "type": "object",
+                "required": ["message"],
+                "properties": {
+                    "message": { "type": "string" },
+                    "stage_all": { "type": "boolean" }
+                }
+            })),
+            "responses": ok_response()
+        }
+    });
+    spec["paths"]["/api/agent-sessions/{asid}/vcs/sync"] = json!({
+        "post": {
+            "summary": "Run fetch (--prune), pull (--ff-only), or push (auto-setting upstream on origin when absent). Announced as vcs_git_ops_v1",
+            "parameters": [path_param("asid")],
+            "requestBody": json_body(json!({
+                "type": "object",
+                "required": ["action"],
+                "properties": {
+                    "action": { "type": "string", "enum": ["fetch", "pull", "push"] }
+                }
+            })),
+            "responses": ok_response()
+        }
+    });
+    spec["paths"]["/api/agent-sessions/{asid}/vcs/commits"] = json!({
+        "get": {
+            "summary": "Paginated recent commits (limit clamped 1..=50). Announced as vcs_git_ops_v1",
+            "parameters": [
+                path_param("asid"),
+                query_param("offset", "Number of commits to skip (default 0)"),
+                query_param("limit", "Commits per page, clamped 1..=50 (default 10)")
+            ],
+            "responses": ok_response()
+        }
+    });
+    spec["paths"]["/api/agent-sessions/{asid}/vcs/prs"] = json!({
+        "get": {
+            "summary": "Paginated pull requests for the checkout's origin remote (GitHub via gh CLI, Gitea via tea CLI), with a 30s TTL cache. Announced as vcs_prs_v1",
+            "parameters": [
+                path_param("asid"),
+                query_param("state", "open (default), closed, or all"),
+                query_param("author", "all (default) or me"),
+                query_param("page", "1-based page number (default 1)"),
+                query_param("limit", "Items per page, clamped 1..=30 (default 10)"),
+                query_param("refresh", "Bypass the 30s cache when true")
+            ],
+            "responses": ok_response()
+        }
+    });
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history"] = captured_history_path();
     spec["paths"]["/api/sessions/{sessionId}/panes/{paneId}/history/segments"] =
         captured_history_segments_path();
@@ -885,6 +988,15 @@ pub fn openapi_spec() -> Value {
             "501":{"description":"feature_unsupported: the owning adapter does not implement earlier timeline pages"},
             "502":{"description":"agent_error: provider or bounded history traversal failed; cursor not consumed"},
             "503":{"description":"agent_unavailable"}
+        }
+    }});
+    spec["paths"]["/api/pty/ws"] = json!({"get": {
+        "summary": "Interactive remote PTY over WebSocket",
+        "description": "Upgrade to a paired-device WebSocket backed by a real pseudo-terminal running the host owner's login shell. Frames use the same per-connection E2EE sealing as /api/ws. Client sends open(cwd, cols, rows), input(base64), resize, ping, close; server sends hello, opened, output(base64), exit, pong, error. Announced as remote_pty_v1 on Unix hosts.",
+        "responses": {
+            "101": {"description": "Switched to the WebSocket protocol"},
+            "429": {"description": "too_many_ptys: device or gateway PTY cap reached"},
+            "501": {"description": "pty_unsupported: host platform does not support remote PTY"}
         }
     }});
     spec["paths"]["/api/agent-sessions/{asid}/file-asset"] = json!({"get": {
@@ -1126,6 +1238,68 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
     );
     vec![
         (
+            "/api/orchestrations",
+            json!({"get": {
+                "summary": "List the newest 100 orchestration runs visible to paired Apps; requires agent_orchestration_preview_v1",
+                "responses": {"200":{"description":"Run records; read an individual run for current execution state"},"401":{"description":"Authentication required"},"403":{"description":"App device required"}}
+            },"post": {
+                "summary": "Start a goal-driven coordinator using native agent and Muqun task tools; requires agent_orchestration_preview_v1",
+                "requestBody": json_body(json!({"type":"object","additionalProperties":false,
+                    "required":["client_ref","goal","cwd","coordinator"],
+                    "properties":{
+                        "client_ref":{"type":"string","description":"Required idempotency key, scoped to this device; reuse only for an identical request"},
+                        "goal":{"type":"string","description":"User objective and constraints, maximum 24 KiB"},
+                        "cwd":{"type":"string","description":"Existing absolute project directory"},
+                        "coordinator":{"type":"string","description":"Attached native agent that supports Muqun MCP registration"},
+                        "model":{"type":"string"},
+                        "variant":{"type":"string"},
+                        "asid":{"type":"string"},
+                        "attachments":{"type":"array","items":{"type":"string"}},
+                        "mode":{"type":"string"},
+                        "reviewer":{"type":"object","additionalProperties":false,"required":["agent"],"properties":{
+                            "agent":{"type":"string"},
+                            "model":{"type":"string"},
+                            "variant":{"type":"string"}
+                        }},
+                        "max_review_rounds":{"type":"integer","minimum":1,"maximum":5}
+                    }})),
+                "responses":{"200":{"description":"Run and observed task tree. dispatch_unconfirmed means delivery is not confirmed; never automatically resubmit with a new key. accepted is false: execution is not quality verification."},"400":{"description":"Invalid request or directory"},"401":{"description":"Authentication required"},"403":{"description":"App device required"},"409":{"description":"Coordinator unavailable or idempotency key reused with a different request"}}
+            }}),
+        ),
+        (
+            "/api/orchestrations/{id}",
+            json!({"get": {
+                "summary":"Read a run, reconcile MAO pipeline state, and return universal deliverables, quality gates, steps, and current task tree; idle runs require explicit acceptance",
+                "parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+                "responses":{"200":{"description":"Run, phase, mao_phase, round, max_review_rounds, coder, reviewer, deliverables, quality_gates, steps, tasks, truncation flag and accepted flag. A truncated tree is incomplete_observation. Follow task IDs through the existing task API for history and cancellation."},"401":{"description":"Authentication required"},"403":{"description":"App device required"},"404":{"description":"Unknown run"}}
+            }}),
+        ),
+        (
+            "/api/orchestrations/{id}/approve",
+            json!({"post": {
+                "summary":"Accept and close a MAO orchestration run after reviewing deliverables and quality gates",
+                "parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+                "responses":{"200":{"description":"Updated orchestration run state with mao_phase=done and accepted=true"},"401":{"description":"Authentication required"},"403":{"description":"App device required"},"404":{"description":"Unknown run"}}
+            }}),
+        ),
+        (
+            "/api/orchestrations/{id}/rework",
+            json!({"post": {
+                "summary":"Send feedback to the coder agent and start a new rework round in the orchestration run",
+                "parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+                "requestBody":{"required":false,"content":{"application/json":{"schema":{"type":"object","properties":{"feedback":{"type":"string"}}}}}},
+                "responses":{"200":{"description":"Updated orchestration run state with mao_phase=reworking"},"401":{"description":"Authentication required"},"403":{"description":"App device required"},"404":{"description":"Unknown run"}}
+            }}),
+        ),
+        (
+            "/api/orchestrations/{id}/cancel",
+            json!({"post": {
+                "summary":"Cancel active coder/reviewer tasks and mark the orchestration run cancelled",
+                "parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+                "responses":{"200":{"description":"Updated orchestration run state with mao_phase=cancelled and accepted=false"},"401":{"description":"Authentication required"},"403":{"description":"App device required"},"404":{"description":"Unknown run"}}
+            }}),
+        ),
+        (
             "/api/tasks",
             json!({ "get": {
                 "summary": "List tasks. Requires the task_ledger capability and a device token",
@@ -1302,6 +1476,75 @@ fn tasks_fleet_mcp_paths() -> Vec<(&'static str, Value)> {
                 "summary": "Revoke an assistant token. Requires a device token",
                 "parameters": [path_param("id")],
                 "responses": revoke_responses
+            }}),
+        ),
+        (
+            "/api/mcp/upstreams",
+            json!({ "get": {
+                "summary": "List Muqun's built-in MCP server status/tools/skills and external upstream MCP servers registered in Muqun's unified MCP Hub (sensitive headers/env masked). Requires a device token and mcp_hub_v1",
+                "responses": ok_response()
+            }}),
+        ),
+        (
+            "/api/mcp/upstreams/{id}",
+            json!({
+                "put": {
+                    "summary": "Create or update an external upstream MCP server in Muqun's unified MCP Hub. Requires a device token and mcp_hub_v1",
+                    "parameters": [path_param("id")],
+                    "responses": ok_response()
+                },
+                "delete": {
+                    "summary": "Remove an external upstream MCP server from Muqun's unified MCP Hub. Requires a device token and mcp_hub_v1",
+                    "parameters": [path_param("id")],
+                    "responses": ok_response()
+                }
+            }),
+        ),
+        (
+            "/api/mcp/upstreams/{id}/probe",
+            json!({ "post": {
+                "summary": "Connect to an upstream MCP server, refresh its cached tools/skills catalog, and return live health status. Requires a device token and mcp_hub_v1",
+                "parameters": [path_param("id")],
+                "responses": ok_response()
+            }}),
+        ),
+        (
+            "/api/mcp/upstreams/{id}/call",
+            json!({ "post": {
+                "summary": "Call a tool on an enabled upstream MCP server with ACL, timeout, size cap, and secret redaction enforcement. Requires a device token and mcp_hub_v1",
+                "parameters": [path_param("id")],
+                "requestBody": json_body(json!({
+                    "type": "object",
+                    "required": ["tool"],
+                    "properties": {
+                        "tool": { "type": "string", "description": "Name of the tool exposed by this upstream MCP server" },
+                        "arguments": { "type": "object", "description": "Optional JSON object of tool arguments (defaults to {})", "additionalProperties": true }
+                    }
+                })),
+                "responses": with_errors(json_ok("Tool call result", json!({
+                    "type": "object",
+                    "required": ["ok", "data"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "data": {
+                            "type": "object",
+                            "required": ["upstream", "tool", "result", "redacted", "duration_ms"],
+                            "properties": {
+                                "upstream": { "type": "string" },
+                                "tool": { "type": "string" },
+                                "result": {},
+                                "redacted": { "type": "boolean" },
+                                "duration_ms": { "type": "integer" }
+                            }
+                        }
+                    }
+                })), &[
+                    ("400", "invalid_request, invalid_tool, invalid_arguments"),
+                    ("403", "upstream_disabled, scope_denied, tool_denied"),
+                    ("404", "upstream_not_found"),
+                    ("502", "upstream_call_failed"),
+                    ("504", "upstream_timeout"),
+                ])
             }}),
         ),
         (
