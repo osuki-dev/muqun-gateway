@@ -220,11 +220,28 @@ impl Look {
     }
 
     /// Unified floating surface for dropdown popups, anchored pickers, modals,
-    /// and overlays: [`Self::panel`] (frosted glass / raised fill + rounded
-    /// clip), a consistent 1 px hairline border, and standard overlay elevation
-    /// shadow layers.
+    /// and overlays: a denser raised fill (so underlying text never bleeds
+    /// through in Light or Dark mode), rounded clip, hairline border, and
+    /// standard overlay elevation shadow layers.
     pub fn floating_surface(&self, k: &Kit, e: El, radius: f32) -> El {
-        let mut e = self.panel(k, e, radius).border(1.0, k.c.border_muted);
+        let fill = if self.glass {
+            let alpha = match (self.blur, self.dark) {
+                (true, true) => 0.94,
+                (true, false) => 0.96,
+                (false, _) => 0.99,
+            };
+            k.c.surface_raised_base.alpha(alpha)
+        } else {
+            k.c.surface_raised_base
+        };
+        let mut e = e
+            .radius(radius)
+            .clip_rounded(radius)
+            .fill(fill)
+            .border(1.0, k.c.border_muted);
+        if self.glass && self.blur {
+            e = e.backdrop_blur(20.0);
+        }
         for shadow in k.shadow_layers(&k.elevation.overlay) {
             e = e.box_shadow(shadow);
         }

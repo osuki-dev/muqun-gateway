@@ -2787,9 +2787,9 @@ pub fn view(s: &UiState, k: &Kit, layer: &mut Vec<El>) -> El {
             .map(Vec::as_slice)
             .unwrap_or_default();
         if !pending.is_empty() || !permissions.is_empty() {
-            let height = rune::memo::layout_with("main", |r| r[3] * 0.4)
-                .unwrap_or(320.0)
-                .clamp(140.0, 360.0);
+            let height = rune::memo::layout_with("main", |r| r[3] * 0.56)
+                .unwrap_or(480.0)
+                .clamp(180.0, 540.0);
             deck = deck.child(
                 col()
                     .key("pending-questions")

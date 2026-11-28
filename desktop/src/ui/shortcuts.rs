@@ -44,7 +44,7 @@ fn matches(entry: &Entry, language: Language, query: &str) -> bool {
 /// A chord as keycaps: each key a small raised cap in the window's own
 /// surface, so it reads as a key and not a tag. Every place that shows a
 /// chord in a sentence or list (this sheet, Settings) draws it so.
-pub(super) fn keycaps<S: AsRef<str>>(k: &Kit, keys: &[S]) -> El {
+pub(crate) fn keycaps<S: AsRef<str>>(k: &Kit, keys: &[S]) -> El {
     let label = keys.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(" ");
     let font = rune::TextStyle {
         line_height: 14.0,

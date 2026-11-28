@@ -141,19 +141,22 @@ fn option_pill(k: &Kit, key: String, label: &str, description: Option<&str>, cho
         .key(key)
         .gap(6.0)
         .px(10.0)
-        .py(5.0)
+        .py(6.0)
         .radius(k.radius.md)
-        .border(0.0, c0.alpha(0.0))
-        .max_w(360.0);
+        .max_w(360.0)
+        .token_motion(k.motion.disclosure);
     if chosen {
         pill = pill
+            .border(1.0, c0.alpha(0.60))
             .linear_gradient(
                 std::f32::consts::FRAC_PI_2,
-                [(0.0, c0.alpha(0.18)), (1.0, c1.alpha(0.12))],
+                [(0.0, c0.alpha(0.20)), (1.0, c1.alpha(0.13))],
             )
             .child(icon(&glyphs::DONE, 12.0).color(c0).mt(2.0));
     } else {
-        pill = pill.fill(k.c.layer_01.alpha(0.45));
+        pill = pill
+            .border(1.0, k.c.border_weak)
+            .fill(k.c.layer_01.alpha(if k.dark { 0.55 } else { 0.92 }));
     }
     pill.child(copy)
 }
@@ -280,16 +283,59 @@ fn pick(form: &str, key: &str, value: String, multi: bool) -> impl Fn(&mut UiSta
             value.clone()
         };
         s.form_inputs.insert(slot.clone(), TextEdit::new(next));
+        s.draft.focused = false;
     }
 }
 
-fn text_input(s: &UiState, k: &Kit, slot: &str, current: &str, placeholder: &str) -> El {
+fn submit_form(s: &mut UiState, form: &FormRequest) -> bool {
+    if missing_required(s, form) {
+        return false;
+    }
+    let answers = form_answers(s, form);
+    if let Some(list) = s.waiting_forms.get_mut(&form.asid.0) {
+        list.retain(|f| f.id != form.id);
+    }
+    s.send(Command::ReplyForm {
+        asid: form.asid.clone(),
+        id: form.id.clone(),
+        answers,
+    });
+    s.draft.focused = true;
+    true
+}
+
+/// Submit the first ready pending question form for the active session.
+/// Called when the user presses Enter after picking an option pill.
+pub fn submit_active_form(s: &mut UiState) -> bool {
+    let Some(asid) = s.selected.clone() else {
+        return false;
+    };
+    let form = s
+        .waiting_forms
+        .get(&asid)
+        .and_then(|forms| forms.iter().find(|f| !missing_required(s, f)))
+        .cloned();
+    let Some(form) = form else {
+        return false;
+    };
+    submit_form(s, &form)
+}
+
+fn text_input(
+    s: &UiState,
+    k: &Kit,
+    form: &FormRequest,
+    slot: &str,
+    current: &str,
+    placeholder: &str,
+) -> El {
     let edit = s
         .form_inputs
         .get(slot)
         .cloned()
         .unwrap_or_else(|| TextEdit::new(current.to_string()));
     let (target, current) = (slot.to_string(), current.to_string());
+    let submit_target = form.clone();
     TextInput::new(&edit)
         .placeholder(placeholder)
         .on_edit(move |s: &mut UiState| {
@@ -297,6 +343,20 @@ fn text_input(s: &UiState, k: &Kit, slot: &str, current: &str, placeholder: &str
                 .entry(target.clone())
                 .or_insert_with(|| TextEdit::new(current.clone()))
         })
+        .on_key(
+            move |s: &mut UiState, ev: &rune::KeyEvent, _: &mut rune::Tx| {
+                if ev.key == rune::Key::Enter
+                    && !(ev.mods.shift
+                        || ev.mods.ctrl
+                        || ev.mods.cmd
+                        || ev.mods.alt
+                        || ev.mods.logo)
+                {
+                    return submit_form(s, &submit_target);
+                }
+                false
+            },
+        )
         .build(k)
         .key(format!("in-{slot}"))
 }
@@ -347,6 +407,7 @@ fn field_input(s: &UiState, k: &Kit, form: &FormRequest, field: &FormField) -> E
                     let on = s.form_inputs.get(&slot).is_some_and(|e| e.text == "true");
                     s.form_inputs
                         .insert(slot.clone(), TextEdit::new((!on).to_string()));
+                    s.draft.focused = false;
                 }
             })
             .build(k),
@@ -389,6 +450,7 @@ fn field_input(s: &UiState, k: &Kit, form: &FormRequest, field: &FormField) -> E
                 list = list.child(text_input(
                     s,
                     k,
+                    form,
                     &slot,
                     &typed,
                     tr_ref(language, "Or type an answer"),
@@ -399,13 +461,14 @@ fn field_input(s: &UiState, k: &Kit, form: &FormRequest, field: &FormField) -> E
         FormField::String { placeholder, .. } => text_input(
             s,
             k,
+            form,
             &slot,
             &current,
             placeholder
                 .as_deref()
                 .unwrap_or(tr_ref(language, "Type here")),
         ),
-        _ => text_input(s, k, &slot, &current, title),
+        _ => text_input(s, k, form, &slot, &current, title),
     };
     let mut block = col().key(format!("field-{slot}")).w_full().gap(6.0);
     if !matches!(field, FormField::Boolean { .. }) {
@@ -432,32 +495,36 @@ pub fn form_fields(s: &UiState, k: &Kit, form: &FormRequest, compact: bool) -> E
     for field in form.fields.iter().filter(|f| visible(s, form, f)) {
         body = body.child(field_input(s, k, form, field));
     }
-    let (asid, id) = (form.asid.clone(), form.id.clone());
     let blocked = missing_required(s, form);
-    body.child(
-        row().key("submit-row").w_full().child(
-            Button::new(tr_ref(language, "Submit"))
-                .variant(ButtonVariant::Submit)
-                .control_size(ControlSize::Small)
-                .disabled(blocked)
-                .on_press({
-                    let form = form.clone();
-                    move |s: &mut UiState| {
-                        let answers = form_answers(s, &form);
-                        if let Some(list) = s.waiting_forms.get_mut(&asid.0) {
-                            list.retain(|f| f.id != id);
-                        }
-                        s.send(Command::ReplyForm {
-                            asid: asid.clone(),
-                            id: id.clone(),
-                            answers,
-                        });
-                    }
-                })
-                .build(k)
-                .key(format!("form-submit-{}", form.id)),
-        ),
-    )
+    let mut submit_row = row().key("submit-row").w_full().center_y().gap(8.0).child(
+        Button::new(tr_ref(language, "Submit"))
+            .variant(ButtonVariant::Submit)
+            .control_size(ControlSize::Small)
+            .shortcut("↵")
+            .disabled(blocked)
+            .on_press({
+                let form = form.clone();
+                move |s: &mut UiState| {
+                    submit_form(s, &form);
+                }
+            })
+            .build(k)
+            .key(format!("form-submit-{}", form.id)),
+    );
+    if !blocked {
+        submit_row = submit_row.child(
+            row()
+                .gap(4.0)
+                .center_y()
+                .child(crate::ui::shortcuts::keycaps(k, &["↵"]))
+                .child(
+                    text(tr_ref(language, "Enter to submit"))
+                        .font(k.ty.caption())
+                        .color(k.c.text_faint),
+                ),
+        );
+    }
+    body.child(submit_row)
 }
 
 fn form_pending(s: &UiState, form: &FormRequest) -> bool {
@@ -523,4 +590,90 @@ pub fn form_card(s: &UiState, k: &Kit, form: &FormRequest) -> El {
         card = card.child(form_fields(s, k, form, false));
     }
     card
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use muqun_gateway::agents::FormRequest;
+
+    fn sample_form(required: bool) -> FormRequest {
+        serde_json::from_value(serde_json::json!({
+            "asid": "s-1",
+            "id": "f-1",
+            "title": "Choose deployment target",
+            "fields": [{
+                "type": "string",
+                "key": "target",
+                "title": "Target",
+                "required": required,
+                "placeholder": "staging or prod",
+                "options": [
+                    { "value": "staging", "label": "Staging" },
+                    { "value": "prod", "label": "Production" }
+                ],
+                "custom": true
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn enter_submits_ready_form_and_ignores_missing_required() {
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        while rx.try_recv().is_ok() {}
+        s.selected = Some("s-1".into());
+        s.waiting_forms
+            .insert("s-1".into(), vec![sample_form(true)]);
+
+        // Required field is still empty -> must NOT submit.
+        assert!(!submit_active_form(&mut s));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(s.waiting_forms["s-1"].len(), 1);
+
+        // Selecting an option satisfies the required field -> Enter submits immediately.
+        pick("f-1", "target", "staging".into(), false)(&mut s);
+        assert!(submit_active_form(&mut s));
+        assert!(s.waiting_forms["s-1"].is_empty());
+
+        let cmd = rx.try_recv().expect("expected ReplyForm command");
+        match cmd {
+            Command::ReplyForm { asid, id, answers } => {
+                assert_eq!(asid.0, "s-1");
+                assert_eq!(id, "f-1");
+                assert_eq!(answers["target"], serde_json::json!("staging"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_enter_submits_after_option_pick() {
+        use rune::{Key, KeyEvent, Mods, Tx};
+
+        let (tx, mut rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        while rx.try_recv().is_ok() {}
+        s.mode = crate::ui::Mode::Session;
+        s.selected = Some("s-1".into());
+        s.waiting_forms
+            .insert("s-1".into(), vec![sample_form(true)]);
+        pick("f-1", "target", "prod".into(), false)(&mut s);
+
+        let ev = KeyEvent {
+            key: Key::Enter,
+            mods: Mods::default(),
+        };
+        let mut rtx = Tx::default();
+        assert!(crate::ui::keymap::dispatch_window(&mut s, &ev, &mut rtx));
+        assert!(s.waiting_forms["s-1"].is_empty());
+
+        let cmd = rx.try_recv().expect("expected ReplyForm command");
+        assert!(matches!(
+            cmd,
+            Command::ReplyForm { ref id, ref answers, .. }
+                if id == "f-1" && answers["target"] == serde_json::json!("prod")
+        ));
+    }
 }

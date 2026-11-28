@@ -917,6 +917,12 @@ fn base_scenes() -> &'static [Scene] {
             s.right.set_open(false);
             s.open_git_panel();
         }),
+        ("split-pick", |s| {
+            session_scene(s);
+            s.right_open = false;
+            s.right.set_open(false);
+            s.split();
+        }),
         ("desktop-update-toast", |s| {
             session_scene(s);
             s.right_open = false;

@@ -685,6 +685,9 @@ pub struct UiState {
     tray_shown: Option<(crate::config::Language, Vec<(String, String)>)>,
     /// The command palette (`ui/palette.rs`), when open.
     pub palette: Option<palette::Palette>,
+    /// Filter query and keyboard cursor inside an empty split pane's session picker.
+    pub tile_pick_query: TextEdit,
+    pub tile_pick_selected: usize,
     /// The keyboard shortcuts sheet (`ui/shortcuts.rs`), when open.
     pub keys_sheet: Option<shortcuts::Sheet>,
     /// Global leader key timestamp when armed (`Which-Key` mode).
@@ -946,6 +949,8 @@ impl UiState {
             viewer: None,
             voice: None,
             palette: None,
+            tile_pick_query: TextEdit::new(""),
+            tile_pick_selected: 0,
             keys_sheet: None,
             leader_armed: None,
             leader_group: None,

@@ -14,6 +14,7 @@
 use rune::{col, el, row, text, Cursor, El, Key, Phase, Tx};
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem,
+    ScrollBar,
 };
 
 use super::copy::{tr, tr_ref};
@@ -228,6 +229,8 @@ fn fill_tile(s: &mut UiState, i: usize, asid: &str) {
         return;
     }
     s.tiles[i].set_session(asid);
+    s.tile_pick_query = rune::TextEdit::new("");
+    s.tile_pick_selected = 0;
     s.tiles[i].slot = super::SessionSlot {
         draft: rune::TextEdit::new(s.cfg.general.drafts.get(asid).cloned().unwrap_or_default()),
         ..Default::default()
@@ -994,62 +997,187 @@ fn parked_composer(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         .child(footer.max_w(super::timeline::FEED_MAX_W))
 }
 
-/// An empty tile: pick a recent session or start a new one into it.
+fn picker_candidates<'a>(
+    s: &'a UiState,
+    open: &[&str],
+    query: &str,
+) -> Vec<&'a muqun_gateway::agents::AgentSessionInfo> {
+    let needle = query.trim().to_ascii_lowercase();
+    let mut rows: Vec<&muqun_gateway::agents::AgentSessionInfo> = s
+        .sessions
+        .iter()
+        .filter(|x| !open.contains(&x.asid.0.as_str()))
+        .filter(|x| !super::sessions::is_hidden_sidebar_session(s, x))
+        .filter(|x| {
+            if needle.is_empty() {
+                return true;
+            }
+            let title = title_of(x).to_ascii_lowercase();
+            let dir = x.directory.as_deref().unwrap_or("").to_ascii_lowercase();
+            let agent = s.agent_name(&x.agent_id).to_ascii_lowercase();
+            title.contains(&needle) || dir.contains(&needle) || agent.contains(&needle)
+        })
+        .collect();
+    rows.sort_by_key(|info| std::cmp::Reverse(info.updated_ms));
+    rows
+}
+
+/// An empty tile: search/pick a recent session, start a new one, or open a tool.
 fn picker(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
     let language = s.cfg.general.language;
     let now = now_ms();
     let open: Vec<&str> = s.tiles.iter().filter_map(|t| t.asid.as_deref()).collect();
-    let mut list = col().key("tile-pick").w_full().max_w(420.0).gap(6.0);
-    for info in s
-        .sessions
-        .iter()
-        .filter(|x| !open.contains(&x.asid.0.as_str()))
-        .take(PICK_ROWS)
-    {
-        let asid = info.asid.0.clone();
-        let activity = s.activity(info);
-        let mut line = row()
-            .key(format!("pick-{}", info.asid.0))
-            .w_full()
-            .h(44.0)
-            .px(12.0)
-            .gap(10.0)
-            .center_y()
-            .role("button")
-            .label(title_of(info))
-            .on_press(move |s: &mut UiState| fill_tile(s, i, &asid))
-            .child(super::agents::mark(&info.agent_id, 16.0, s.dark).a11y_hidden())
-            .child(
-                col()
-                    .grow(1.0)
-                    .shrink()
-                    .min_w(0.0)
-                    .gap(1.0)
-                    .child(
-                        text(title_of(info))
-                            .font(k.ty.ui_medium)
-                            .color(k.c.text_base)
-                            .truncate(),
-                    )
-                    .child(
-                        text(format!(
-                            "{} · {}",
-                            s.agent_name(&info.agent_id),
-                            ago(info.updated_ms, now, language)
-                        ))
-                        .font(k.ty.caption())
-                        .color(k.c.text_faint)
-                        .truncate(),
-                    ),
-            );
-        if activity != Activity::Idle {
-            line = line.child(activity_pill(k, look, activity, language));
-        }
-        list = list.child(look.pressable(k, look.row_card(k, line, 10.0)));
+    let candidates = picker_candidates(s, &open, &s.tile_pick_query.text);
+    let selected = if candidates.is_empty() {
+        0
+    } else {
+        s.tile_pick_selected.min(candidates.len() - 1)
+    };
+    let match_ids: Vec<String> = candidates.iter().map(|c| c.asid.0.clone()).collect();
+
+    let mut search_input = rune_kit::TextInput::new(&s.tile_pick_query)
+        .placeholder(tr_ref(language, "Search sessions"))
+        .leading_icon(&rune_kit::glyphs::SEARCH)
+        .leading_icon_size(14.0)
+        .width(None)
+        .on_edit(|s: &mut UiState| {
+            s.tile_pick_selected = 0;
+            &mut s.tile_pick_query
+        })
+        .on_key({
+            let ids = match_ids.clone();
+            move |s: &mut UiState, ev: &rune::KeyEvent, _: &mut Tx| match ev.key {
+                Key::Down if !ids.is_empty() => {
+                    s.tile_pick_selected = (s.tile_pick_selected + 1) % ids.len();
+                    true
+                }
+                Key::Up if !ids.is_empty() => {
+                    s.tile_pick_selected = if s.tile_pick_selected == 0 {
+                        ids.len() - 1
+                    } else {
+                        s.tile_pick_selected - 1
+                    };
+                    true
+                }
+                Key::Enter if !ev.mods.shift && !ids.is_empty() => {
+                    let pick = s.tile_pick_selected.min(ids.len() - 1);
+                    fill_tile(s, i, &ids[pick]);
+                    true
+                }
+                Key::Escape if !s.tile_pick_query.text.is_empty() => {
+                    s.tile_pick_query = rune::TextEdit::new("");
+                    s.tile_pick_selected = 0;
+                    true
+                }
+                _ => false,
+            }
+        });
+    if !s.tile_pick_query.text.is_empty() {
+        search_input = search_input
+            .clear_button()
+            .on_action(|s: &mut UiState, _: &mut Tx| {
+                s.tile_pick_query = rune::TextEdit::new("");
+                s.tile_pick_selected = 0;
+            });
     }
+
+    let mut list_inner = col().key("tile-pick").w_full().gap(5.0);
+    if candidates.is_empty() {
+        let msg = if s.tile_pick_query.text.trim().is_empty() {
+            tr(language, "No other sessions yet")
+        } else {
+            tr(language, "No matching sessions")
+        };
+        list_inner = list_inner.child(
+            row()
+                .w_full()
+                .py(20.0)
+                .center()
+                .radius(k.radius.lg)
+                .border(1.0, k.c.border_weak)
+                .fill(k.c.layer_01.alpha(if s.dark { 0.25 } else { 0.55 }))
+                .child(text(msg).font(k.ty.small).color(k.c.text_faint)),
+        );
+    } else {
+        for (idx, info) in candidates.iter().take(PICK_ROWS * 3).enumerate() {
+            let asid = info.asid.0.clone();
+            let activity = s.activity(info);
+            let is_sel = idx == selected;
+            let folder = info
+                .directory
+                .as_deref()
+                .and_then(|d| std::path::Path::new(d).file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let subtitle = if folder.is_empty() {
+                format!(
+                    "{} · {}",
+                    s.agent_name(&info.agent_id),
+                    ago(info.updated_ms, now, language)
+                )
+            } else {
+                format!(
+                    "{} · {} · {}",
+                    s.agent_name(&info.agent_id),
+                    folder,
+                    ago(info.updated_ms, now, language)
+                )
+            };
+            let mut line = row()
+                .key(format!("pick-{}", info.asid.0))
+                .w_full()
+                .h(46.0)
+                .px(12.0)
+                .gap(10.0)
+                .center_y()
+                .role("button")
+                .label(title_of(info))
+                .on_hover(move |s: &mut UiState| {
+                    s.tile_pick_selected = idx;
+                })
+                .on_press(move |s: &mut UiState| fill_tile(s, i, &asid))
+                .child(super::agents::mark(&info.agent_id, 16.0, s.dark).a11y_hidden())
+                .child(
+                    col()
+                        .grow(1.0)
+                        .shrink()
+                        .min_w(0.0)
+                        .gap(1.0)
+                        .child(
+                            text(title_of(info))
+                                .font(k.ty.ui_medium)
+                                .color(k.c.text_base)
+                                .truncate(),
+                        )
+                        .child(
+                            text(subtitle)
+                                .font(k.ty.caption())
+                                .color(k.c.text_faint)
+                                .truncate(),
+                        ),
+                );
+            if activity != Activity::Idle {
+                line = line.child(activity_pill(k, look, activity, language));
+            }
+            let mut card = look.pressable(k, look.row_card(k, line, 10.0));
+            if is_sel {
+                card = look.accent_rim(k, card, k.c.bg_accent);
+            }
+            list_inner = list_inner.child(card);
+        }
+    }
+
+    let list = list_inner
+        .max_h(320.0)
+        .scroll(rune::ScrollSpec {
+            stick_bottom: false,
+        })
+        .scroll_bar(k)
+        .w_full();
+
     let new_session = Button::new(tr_ref(language, "New session…"))
-        .variant(ButtonVariant::Outline)
-        .control_size(ControlSize::Regular)
+        .variant(ButtonVariant::Submit)
+        .control_size(ControlSize::Small)
         .on_press(move |s: &mut UiState| {
             s.pending_tile = Some(i);
             s.go(Mode::Home);
@@ -1057,45 +1185,92 @@ fn picker(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         .build(k)
         .key(format!("tile-new-{i}"));
 
-    // Icon grid for tile plugins: labels live in tooltips so many entries
-    // wrap cleanly inside the same width as the session list.
+    let header = row()
+        .w_full()
+        .center_y()
+        .gap(8.0)
+        .child(
+            text(tr(language, "Open a session in this pane"))
+                .font(k.ty.body_medium)
+                .color(k.c.text_base)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate(),
+        )
+        .child(new_session);
+
+    // Labeled tool chips: readable at a glance instead of bare mystery icons.
     let mut plugins = row()
         .key("tile-pick-plugins")
         .w_full()
-        .max_w(420.0)
-        .gap(4.0)
+        .gap(6.0)
         .flex_wrap()
-        .justify_center()
         .center_y();
-    for plugin in s.plugins.tile_plugins_enabled(&s.cfg.plugins_disabled) {
+    let enabled_plugins = s.plugins.tile_plugins_enabled(&s.cfg.plugins_disabled);
+    for plugin in &enabled_plugins {
         let plugin_id = plugin.id();
         let plugin_title = plugin.title(language);
-        let plugin_icon = plugin.render_icon(s, 16.0, k.c.icon_muted);
+        let plugin_icon = plugin.render_icon(s, 14.0, k.c.icon_muted);
         let pid = plugin_id.to_string();
+        let label_text = plugin_title.clone();
         plugins = plugins.child(
-            Button::new(plugin_title.clone())
-                .label_with(move |_, _| plugin_icon)
-                .variant(ButtonVariant::GhostMuted)
-                .control_size(ControlSize::Regular)
-                .help(plugin_title)
-                .on_press(move |s: &mut UiState| {
-                    fill_plugin_tile(s, i, &pid);
-                })
-                .build(k)
-                .size(28.0, 28.0)
-                .px(4.0)
-                .key(format!("tile-plugin-{plugin_id}-{i}")),
+            k.interactive(
+                row()
+                    .key(format!("tile-plugin-{plugin_id}-{i}"))
+                    .h(28.0)
+                    .px(10.0)
+                    .gap(6.0)
+                    .center_y()
+                    .radius(k.radius.md)
+                    .border(1.0, k.c.border_weak)
+                    .fill(k.c.layer_01.alpha(if s.dark { 0.42 } else { 0.78 }))
+                    .role("button")
+                    .label(plugin_title.clone())
+                    .help(plugin_title)
+                    .child(plugin_icon)
+                    .child(text(label_text).font(k.ty.small).color(k.c.text_muted)),
+            )
+            .on_press(move |s: &mut UiState| {
+                s.tile_pick_query = rune::TextEdit::new("");
+                s.tile_pick_selected = 0;
+                fill_plugin_tile(s, i, &pid);
+            }),
         );
     }
 
-    let actions = col()
-        .key("tile-pick-actions")
+    let mut content = col()
+        .key("tile-pick-card")
         .w_full()
-        .max_w(420.0)
-        .gap(10.0)
-        .items_center()
-        .child(new_session)
-        .child(plugins);
+        .max_w(460.0)
+        .gap(12.0)
+        .child(header)
+        .child(search_input.build(k).key(format!("tile-pick-search-{i}")))
+        .child(list);
+
+    if !enabled_plugins.is_empty() {
+        content = content
+            .child(el().w_full().h(1.0).fill(k.c.border_weak).a11y_hidden())
+            .child(
+                col()
+                    .key("tile-pick-actions")
+                    .w_full()
+                    .gap(8.0)
+                    .child(
+                        text(tr(language, "Plugins"))
+                            .font(k.ty.caption())
+                            .color(k.c.text_faint),
+                    )
+                    .child(plugins),
+            );
+    }
+
+    let content = if look.motion {
+        content
+            .transition(rune::Transition::opacity().combined(rune::Transition::scale(0.98)))
+            .motion(look.focus_fade())
+    } else {
+        content
+    };
 
     col()
         .key("tile-empty")
@@ -1103,15 +1278,9 @@ fn picker(s: &UiState, k: &Kit, look: &Look, i: usize) -> El {
         .w_full()
         .min_h(0.0)
         .center()
-        .gap(16.0)
         .px(20.0)
-        .child(
-            text(tr(language, "Open a session in this pane"))
-                .font(k.ty.body_medium)
-                .color(k.c.text_base),
-        )
-        .child(list)
-        .child(actions)
+        .py(16.0)
+        .child(content)
 }
 
 /// Where pane `i` sits among the others, for what its header carries.
@@ -3027,5 +3196,47 @@ mod tests {
             "mention popup for right tile must anchor on the right tile, got {:?}",
             popup.rect
         );
+    }
+
+    #[test]
+    fn picker_candidates_filter_hidden_sort_recent_and_match_query() {
+        use muqun_gateway::agents::AgentSessionInfo;
+
+        let (tx, _rx) = crate::model::commands::channel();
+        let mut s = UiState::new(tx);
+        let mk = |asid: &str, title: &str, dir: &str, updated_ms: u64, parent: Option<&str>| {
+            let mut val = serde_json::json!({
+                "asid": asid,
+                "agent_id": "claude",
+                "title": title,
+                "directory": dir,
+                "status": "idle",
+                "updated_ms": updated_ms,
+            });
+            if let Some(p) = parent {
+                val["parent_id"] = serde_json::json!(p);
+            }
+            serde_json::from_value::<AgentSessionInfo>(val).unwrap()
+        };
+        s.sessions = vec![
+            mk("s-open", "Already Open", "/work/app", 5000, None),
+            mk("s-old", "Refactor Auth", "/work/auth", 1000, None),
+            mk("s-new", "Build Gateway", "/work/gateway", 4000, None),
+            mk(
+                "s-child",
+                "Hidden Subagent",
+                "/work/gateway",
+                9000,
+                Some("s-new"),
+            ),
+        ];
+
+        let all = picker_candidates(&s, &["s-open"], "");
+        let ids: Vec<&str> = all.iter().map(|c| c.asid.0.as_str()).collect();
+        assert_eq!(ids, vec!["s-new", "s-old"]);
+
+        let filtered = picker_candidates(&s, &["s-open"], "auth");
+        let fids: Vec<&str> = filtered.iter().map(|c| c.asid.0.as_str()).collect();
+        assert_eq!(fids, vec!["s-old"]);
     }
 }

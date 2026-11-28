@@ -1515,6 +1515,32 @@ pub fn dispatch_plugin_shortcut(s: &mut UiState, ev: &KeyEvent, tx: &Tx) -> bool
 /// `Route::App` handoff so it does not loop back into `terminal_key`).
 pub fn dispatch_window(s: &mut UiState, ev: &KeyEvent, tx: &mut Tx) -> bool {
     sync_active_keymap(&s.cfg.keymap);
+    // When an agent question form is waiting on the active session and no
+    // modal, editor, or timeline cursor owns Enter, pressing Enter submits the
+    // ready answer immediately (e.g. right after selecting an option pill).
+    if s.mode == Mode::Session
+        && ev.key == rune::Key::Enter
+        && !(ev.mods.shift || ev.mods.alt || ev.mods.ctrl || ev.mods.cmd || ev.mods.logo)
+        && s.palette.is_none()
+        && s.keys_sheet.is_none()
+        && s.menu.is_none()
+        && s.row_menu.is_none()
+        && s.pairing_target.is_none()
+        && s.zoom.is_none()
+        && !s.show_diff
+        && !s.draft.focused
+        && !s.start_draft.focused
+        && !s.search.focused
+        && !s.timeline_search.active
+        && !s.is_terminal_focused()
+        && s.selected
+            .as_deref()
+            .and_then(|a| s.timelines.get(a))
+            .is_none_or(|t| t.selected.is_none())
+        && super::parts::question::submit_active_form(s)
+    {
+        return true;
+    }
     // The arrows step the Inbox's and Tasks' lists as j and k do.
     if matches!(s.mode, Mode::Inbox | Mode::Tasks)
         && matches!(ev.key, rune::Key::Up | rune::Key::Down)
